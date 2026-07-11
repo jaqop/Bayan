@@ -119,9 +119,32 @@ const FONT_SIZE: f32 = 15.0;
 // bundled so connected Arabic works from a fresh clone (same font EasyTer ships)
 const AMIRI: &[u8] = include_bytes!("../fonts/Amiri-Regular.ttf");
 
+/// Primary-font preference order. Nerd Font variants first: oh-my-posh
+/// prompts are built from their private-use icons and powerline separators,
+/// and a non-NF primary renders those as ugly boxes/blocks.
+const FAMILY_CANDIDATES: &[&str] = &[
+    "Cascadia Mono NF",
+    "Cascadia Code NF",
+    "CaskaydiaCove Nerd Font Mono",
+    "JetBrainsMono Nerd Font Mono",
+    "Cascadia Mono",
+    "Consolas",
+];
+
+fn pick_family(db: &cosmic_text::fontdb::Database) -> String {
+    for cand in FAMILY_CANDIDATES {
+        if db
+            .faces()
+            .any(|f| f.families.iter().any(|(name, _)| name == cand))
+        {
+            return (*cand).to_string();
+        }
+    }
+    "Consolas".to_string()
+}
+
 fn base_attrs<'a>() -> Attrs<'a> {
-    // primary Latin monospace; cosmic-text falls back per-script (Amiri for
-    // Arabic) automatically when a glyph is missing
+    // used by tests; the renderer itself uses the picked family
     Attrs::new().family(Family::Name("Consolas"))
 }
 
@@ -129,6 +152,7 @@ pub struct Renderer {
     font_system: FontSystem,
     cache: SwashCache,
     buffer: Buffer,
+    family: String,
     pub cell_w: f32,
     pub cell_h: f32,
 }
@@ -137,6 +161,7 @@ impl Renderer {
     pub fn new(scale: f32) -> Self {
         let mut font_system = FontSystem::new();
         font_system.db_mut().load_font_data(AMIRI.to_vec());
+        let family = pick_family(font_system.db());
         let size = FONT_SIZE * scale;
         let metrics = Metrics::new(size, (size * 1.4).ceil());
         let mut buffer = Buffer::new(&mut font_system, metrics);
@@ -145,7 +170,12 @@ impl Renderer {
         let mut probe = Buffer::new(&mut font_system, metrics);
         probe.set_wrap(&mut font_system, Wrap::None);
         probe.set_size(&mut font_system, Some(1000.0), Some(metrics.line_height));
-        probe.set_text(&mut font_system, "M", base_attrs(), Shaping::Advanced);
+        probe.set_text(
+            &mut font_system,
+            "M",
+            Attrs::new().family(Family::Name(&family)),
+            Shaping::Advanced,
+        );
         probe.shape_until_scroll(&mut font_system, false);
         let cell_w = probe
             .layout_runs()
@@ -157,6 +187,7 @@ impl Renderer {
             font_system,
             cache: SwashCache::new(),
             buffer,
+            family,
             cell_w,
             cell_h: metrics.line_height,
         }
@@ -221,7 +252,7 @@ impl Renderer {
                 }
             }
         }
-        let base = base_attrs();
+        let base = Attrs::new().family(Family::Name(self.family.as_str()));
         let rich: Vec<(&str, Attrs)> = segs
             .iter()
             .map(|(s, c)| (s.as_str(), base.color(Color::rgb(c.0, c.1, c.2))))
