@@ -1,0 +1,20 @@
+[package]
+name = "bayan"
+version = "0.1.0"
+edition = "2021"
+description = "Bayan (بيان) — an Arabic-first, agent-ready terminal emulator"
+license = "MIT"
+
+[dependencies]
+# VT emulation: Alacritty's battle-tested core, published as a library
+alacritty_terminal = "0.24"
+# ConPTY (Windows) / openpty (unix), extracted from WezTerm
+portable-pty = "0.8"
+# windowing + CPU present + text shaping (HarfBuzz-class, BiDi, fallback)
+winit = "0.30"
+softbuffer = "0.4"
+cosmic-text = "0.12"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

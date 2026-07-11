@@ -1,0 +1,141 @@
+//! PTY session + terminal state: ConPTY via portable-pty, VT emulation via
+//! alacritty_terminal. Mirrors EasyTer's proven architecture: a reader thread
+//! feeds the emulator behind a mutex and nudges the UI thread to repaint.
+
+use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
+
+use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::vte::ansi::Processor;
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use winit::event_loop::EventLoopProxy;
+
+use crate::UserEvent;
+
+pub const DEFAULT_SHELL: &str = "powershell.exe";
+pub const SCROLLBACK: usize = 10_000;
+
+/// Grid dimensions handed to alacritty_terminal.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub struct TermSize {
+    pub cols: usize,
+    pub rows: usize,
+}
+
+impl Dimensions for TermSize {
+    fn total_lines(&self) -> usize {
+        self.rows
+    }
+    fn screen_lines(&self) -> usize {
+        self.rows
+    }
+    fn columns(&self) -> usize {
+        self.cols
+    }
+}
+
+/// Routes emulator events to the winit loop. PtyWrite matters most: TUIs
+/// (Claude Code among them) send ESC[6n and block waiting for the cursor
+/// position reply — the exact lesson EasyTer's ReportingScreen taught us.
+#[derive(Clone)]
+pub struct EventProxy(pub EventLoopProxy<UserEvent>);
+
+impl EventListener for EventProxy {
+    fn send_event(&self, event: Event) {
+        let mapped = match event {
+            Event::PtyWrite(text) => UserEvent::PtyWrite(text),
+            Event::Wakeup => UserEvent::Wakeup,
+            Event::Exit => UserEvent::Exit,
+            _ => return,
+        };
+        let _ = self.0.send_event(mapped);
+    }
+}
+
+pub struct Session {
+    pub term: Arc<Mutex<Term<EventProxy>>>,
+    writer: Box<dyn Write + Send>,
+    master: Box<dyn MasterPty + Send>,
+    _child: Box<dyn Child + Send + Sync>,
+}
+
+impl Session {
+    pub fn spawn(
+        size: TermSize,
+        proxy: EventLoopProxy<UserEvent>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let pty = native_pty_system();
+        let pair = pty.openpty(PtySize {
+            rows: size.rows as u16,
+            cols: size.cols as u16,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        let mut cmd = CommandBuilder::new(DEFAULT_SHELL);
+        // never inherit the launcher's directory (often system32): start home
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            cmd.cwd(home);
+        }
+        let child = pair.slave.spawn_command(cmd)?;
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader()?;
+        let writer = pair.master.take_writer()?;
+
+        let config = Config {
+            scrolling_history: SCROLLBACK,
+            ..Config::default()
+        };
+        let term = Arc::new(Mutex::new(Term::new(
+            config,
+            &size,
+            EventProxy(proxy.clone()),
+        )));
+
+        let term2 = Arc::clone(&term);
+        std::thread::spawn(move || {
+            let mut parser: Processor = Processor::new();
+            let mut buf = [0u8; 65536];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        {
+                            let mut t = term2.lock().unwrap();
+                            for &b in &buf[..n] {
+                                parser.advance(&mut *t, b);
+                            }
+                        }
+                        if proxy.send_event(UserEvent::Wakeup).is_err() {
+                            break; // the event loop is gone
+                        }
+                    }
+                }
+            }
+            let _ = proxy.send_event(UserEvent::Exit);
+        });
+
+        Ok(Self {
+            term,
+            writer,
+            master: pair.master,
+            _child: child,
+        })
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) {
+        let _ = self.writer.write_all(bytes);
+        let _ = self.writer.flush();
+    }
+
+    pub fn resize(&mut self, size: TermSize) {
+        let _ = self.master.resize(PtySize {
+            rows: size.rows as u16,
+            cols: size.cols as u16,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+        self.term.lock().unwrap().resize(size);
+    }
+}
