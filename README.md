@@ -111,9 +111,55 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       ASCII-run shaping that forms `-> => != …` the moment the shaper enables
       `calt` (dormant today: cosmic-text 0.12 builds its shape plan with no
       user features — an upstream limit, honestly flagged, not a Bayan bug)
-- [ ] **M15 (backlog)** — real ligatures via a direct rustybuzz+swash ASCII
+- [x] **M15** — a real in-app settings panel (Ctrl+, or the tab-bar gear —
+      a clickable button is layout-proof where a comma shortcut fought the
+      Arabic layout): clickable theme tiles with palette previews, live
+      apply, persisted to ~/.bayan/config.json on close
+- [x] **M16** — the table-stakes settings set, from a survey of what
+      Windows Terminal / Alacritty / WezTerm / Ghostty / kitty ALL offer:
+      cursor style (block/bar/underline) + blink (530ms rhythm that parks
+      solid after 15s idle, so M14's still-terminal-stops-rendering win
+      survives), scrollback size, font-family cycler over INSTALLED
+      monospace fonts, copy-on-select toggle, bell modes (attention dot /
+      system sound / silent), default shell for new tabs (PowerShell 5 /
+      pwsh 7 / cmd — the PS family keeps UTF-8 + oh-my-posh + OSC 133,
+      others degrade gracefully), content padding, window opacity (layered
+      alpha; winit wipes the bit on set_visible, so it's reapplied),
+      hide-tab-bar-with-one-tab, and a close guard (Enter/Esc card when
+      closing a pane or the window mid-command). The panel itself became a
+      ledger: every row reads [control] ··· leader dots ··· [label], the
+      book-index idiom. Bonus fix: a UTF-8 BOM in config.json (what
+      Windows editors write) no longer silently discards the whole config
+- [x] **M17** — the keybinding editor: 12 rebindable actions behind one
+      keymap (chords resolve by PHYSICAL key, extending the Arabic-layout
+      guarantee to custom bindings), keycap-chip rows, press-to-capture
+      with conflict detection, Delete restores defaults, only non-default
+      bindings persist. Fixed by design: Ctrl+Tab, zoom, Alt+arrows,
+      plain Ctrl+C, the quake hotkey
+- [ ] **M18 (backlog)** — real ligatures via a direct rustybuzz+swash ASCII
       shaper (bypassing cosmic-text's featureless plan); native toast; a
       cosmic-text bump if it grows a features API
+
+## Settings
+
+Everything lives in the in-app panel (Ctrl+, or the tab-bar gear); the
+shortcuts editor is the الاختصارات button in its header. State persists to
+`~/.bayan/config.json` — optional, human-editable, BOM-tolerant, and every
+key falls back to a sane default:
+
+```json
+{
+  "theme": "Bayan", "font_family": "Cascadia Code NF", "font_size": 15.0,
+  "cursor_style": "bar", "cursor_blink": true, "scrollback": 20000,
+  "copy_on_select": true, "ligatures": true, "bell": "attention",
+  "shell": "pwsh.exe", "padding": 8, "opacity": 0.9,
+  "hide_single_tab": true, "confirm_close": true,
+  "keybinds": { "new-tab": "ctrl+shift+n" }
+}
+```
+
+Shell and scrollback apply to new tabs (no terminal restarts a live
+session); everything else applies immediately.
 
 ## Build
 
