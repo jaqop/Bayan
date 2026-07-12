@@ -10,6 +10,10 @@
 //!   BiDi (mixed directions, LTR islands): correct text outranks column
 //!   fidelity for prose.
 //!
+//! Since M7 the unit of drawing is a PANE (a rect + its own Term): tabs can
+//! split into side-by-side or stacked panes, each clipped to its rect.
+//! Window-level chrome (tab bar, search bar, Claude badge) draws separately.
+//!
 //! cosmic-text does shaping/BiDi/fallback; softbuffer presents the pixels.
 //! GPU (wgpu) lands in a later milestone behind this same boundary.
 
@@ -98,7 +102,7 @@ fn pack((r, g, b): (u8, u8, u8)) -> u32 {
 }
 
 /// The background as a packed pixel — for the instant first frame drawn
-/// before the font system finishes loading.
+/// before the font system finishes loading (and inter-pane gaps).
 pub fn bg_packed() -> u32 {
     pack(BG)
 }
@@ -107,23 +111,28 @@ pub fn bg_packed() -> u32 {
 pub struct TabInfo {
     pub title: String,
     pub busy: bool,
+    /// a pane in this background tab rang the bell (Claude asking for an
+    /// approval): amber beats the green busy dot
+    pub attention: bool,
     pub active: bool,
 }
 
 /// Fixed tab width in cells — the app's click hit-test relies on this.
 pub const TAB_CELLS: f32 = 24.0;
 
-/// UI state rendered on top of the grid (owned by the app, drawn here).
-pub struct Overlay<'a> {
-    /// Some(query) = the search bar is open with this text.
-    pub search_query: Option<&'a str>,
-    /// The current search hit, highlighted stronger than a selection.
-    pub search_match: Option<&'a std::ops::RangeInclusive<alacritty_terminal::index::Point>>,
-    /// Claude mode: cells hold VISUAL-order Arabic that must be restored
-    /// to logical before shaping (and a badge is drawn).
+/// A rect in frame pixels: (x, y, w, h).
+pub type Rect = (i32, i32, i32, i32);
+
+/// One pane's draw parameters.
+pub struct PaneView<'a> {
+    pub rect: Rect,
+    pub focused: bool,
+    /// draw a border (only when the tab actually has multiple panes)
+    pub bordered: bool,
+    /// Claude mode for THIS pane's content.
     pub claude: bool,
-    /// The tab bar (always visible: titles, busy dots).
-    pub tabs: &'a [TabInfo],
+    /// The current search hit (focused pane only).
+    pub search_match: Option<&'a std::ops::RangeInclusive<alacritty_terminal::index::Point>>,
     /// Command blocks: (absolute prompt line, exit code) — gutter lights.
     pub marks: &'a [(usize, Option<i32>)],
 }
@@ -281,7 +290,7 @@ impl Renderer {
         }
     }
 
-    /// Height of the tab bar in pixels — the grid starts below it.
+    /// Height of the tab bar in pixels — pane content starts below it.
     pub fn tab_bar_h(&self) -> f32 {
         self.cell_h + 10.0
     }
@@ -313,9 +322,15 @@ impl Renderer {
     }
 
     /// Blit the scratch buffer at (x_off, y_off), optionally compressed
-    /// horizontally (EasyTer's fit for glyphs wider than their grid box).
-    fn blit_scratch(&mut self, frame: &mut [u32], fw: usize, fh: usize,
+    /// horizontally (EasyTer's fit), clipped to `clip` — a pane's text can
+    /// never bleed into a neighbouring pane.
+    fn blit_scratch(&mut self, frame: &mut [u32], fw: usize, fh: usize, clip: Rect,
                     x_off: f32, y_off: i32, scale: f32) {
+        let (cx, cy, cw2, ch2) = clip;
+        let cx0 = cx.max(0);
+        let cy0 = cy.max(0);
+        let cx1 = (cx + cw2).min(fw as i32);
+        let cy1 = (cy + ch2).min(fh as i32);
         self.buffer.draw(
             &mut self.font_system,
             &mut self.cache,
@@ -330,13 +345,13 @@ impl Renderer {
                 let ws = ((w as f32 * scale).ceil() as i32).max(1);
                 for dy in 0..h as i32 {
                     let py = y_off + y + dy;
-                    if py < 0 || py as usize >= fh {
+                    if py < cy0 || py >= cy1 {
                         continue;
                     }
                     let row = py as usize * fw;
                     for dx in 0..ws {
                         let px = xs + dx;
-                        if px < 0 || px as usize >= fw {
+                        if px < cx0 || px >= cx1 {
                             continue;
                         }
                         let i = row + px as usize;
@@ -348,16 +363,11 @@ impl Renderer {
     }
 
     /// A row containing Arabic: shape the WHOLE line so cosmic-text applies
-    /// UAX#9 BiDi (mixed directions, LTR islands). Correct text outranks
-    /// column fidelity for prose output.
-    ///
-    /// Grid fit (M2b): a shaped Arabic line wider than the window compresses
-    /// horizontally to fit (EasyTer's fix, applied at line level). When the
-    /// terminal cursor sits on this row, its pixel position is resolved
-    /// THROUGH the shaped layout — in RTL, logical column N is not at
-    /// N*cell_w — and returned as (x, w).
-    fn draw_line_bidi(&mut self, frame: &mut [u32], fw: usize, fh: usize,
-                      y: i32, cells: &[CellInfo], claude: bool,
+    /// UAX#9 BiDi (mixed directions, LTR islands). Compressed to the pane
+    /// when overflowing; the cursor resolves THROUGH the shaped layout.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_line_bidi(&mut self, frame: &mut [u32], fw: usize, fh: usize, clip: Rect,
+                      x0: i32, y: i32, pane_w: i32, cells: &[CellInfo], claude: bool,
                       cursor_col: Option<usize>) -> Option<(i32, i32)> {
         let mut end = cells.len();
         while end > 0 && cells[end - 1].c == ' ' {
@@ -394,17 +404,17 @@ impl Renderer {
                 cur_bytes = None;
             }
         }
-        // shape unconstrained, then compress to the window if it overflows
+        // shape unconstrained, then compress to the pane if it overflows
         let natw = self.shape_scratch(&segs, 1_000_000.0, true);
-        let scale = if natw > fw as f32 { fw as f32 / natw } else { 1.0 };
-        self.blit_scratch(frame, fw, fh, 0.0, y, scale);
+        let scale = if natw > pane_w as f32 { pane_w as f32 / natw } else { 1.0 };
+        self.blit_scratch(frame, fw, fh, clip, x0 as f32, y, scale);
         if let Some((b0, b1)) = cur_bytes {
             let c0 = cosmic_text::Cursor::new(0, b0);
             let c1 = cosmic_text::Cursor::new(0, b1);
             for run in self.buffer.layout_runs() {
                 if let Some((x, w)) = run.highlight(c0, c1) {
                     return Some((
-                        (x * scale).round() as i32,
+                        x0 + (x * scale).round() as i32,
                         ((w * scale).ceil() as i32).max(2),
                     ));
                 }
@@ -414,12 +424,10 @@ impl Renderer {
     }
 
     /// A row without Arabic (prompts, code, TUIs): strict grid placement.
-    /// ASCII batches into runs pinned at col*cell_w (uniform advance in a
-    /// mono font, so columns stay exact); every other glyph — Nerd Font
-    /// icons, powerline separators, box drawing, CJK — draws per cell,
-    /// compressed into its box when wider. Backgrounds and glyphs can't drift.
-    fn draw_line_grid(&mut self, frame: &mut [u32], fw: usize, fh: usize,
-                      y: i32, cells: &[CellInfo]) {
+    /// ASCII batches into runs pinned at col*cell_w; every other glyph draws
+    /// per cell, compressed into its box when wider.
+    fn draw_line_grid(&mut self, frame: &mut [u32], fw: usize, fh: usize, clip: Rect,
+                      x0: i32, y: i32, cells: &[CellInfo]) {
         let n = cells.len();
         let mut i = 0;
         while i < n {
@@ -458,7 +466,8 @@ impl Renderer {
                 }
                 if !segs.is_empty() {
                     self.shape_scratch(&segs, 1_000_000.0, false);
-                    self.blit_scratch(frame, fw, fh, col0 as f32 * self.cell_w, y, 1.0);
+                    self.blit_scratch(frame, fw, fh, clip,
+                                      x0 as f32 + col0 as f32 * self.cell_w, y, 1.0);
                 }
                 i = j;
             } else {
@@ -470,17 +479,19 @@ impl Renderer {
                 let natw = self.shape_scratch(&seg, 1_000_000.0, false);
                 let boxw = ci.w as f32 * self.cell_w;
                 let scale = if natw > boxw + 0.5 { boxw / natw } else { 1.0 };
-                self.blit_scratch(frame, fw, fh, ci.col as f32 * self.cell_w, y, scale);
+                self.blit_scratch(frame, fw, fh, clip,
+                                  x0 as f32 + ci.col as f32 * self.cell_w, y, scale);
                 i += 1;
             }
         }
     }
 
-    pub fn draw(&mut self, frame: &mut [u32], width: usize, height: usize,
-                term: &Term<EventProxy>, overlay: &Overlay) {
-        frame.fill(pack(BG));
-        // everything below the tab bar
-        let oy = self.tab_bar_h().round() as i32;
+    /// Draw one pane's terminal into its rect.
+    pub fn draw_pane(&mut self, frame: &mut [u32], width: usize, height: usize,
+                     view: &PaneView, term: &Term<EventProxy>) {
+        let (px, py, pw, ph) = view.rect;
+        fill_rect(frame, width, height, px, py, pw, ph, pack(BG));
+        let clip = view.rect;
         let rows = term.screen_lines();
         let history = term.grid().history_size();
         let content = term.renderable_content();
@@ -513,16 +524,16 @@ impl Renderer {
                 std::mem::swap(&mut fg, &mut bg);
             }
             if bg != BG {
-                let x0 = (col as f32 * self.cell_w).round() as i32;
-                let x1 = ((col + w) as f32 * self.cell_w).round() as i32;
-                let y0 = oy + (li as f32 * self.cell_h).round() as i32;
-                let y1 = oy + ((li + 1) as f32 * self.cell_h).round() as i32;
+                let x0 = px + (col as f32 * self.cell_w).round() as i32;
+                let x1 = px + ((col + w) as f32 * self.cell_w).round() as i32;
+                let y0 = py + (li as f32 * self.cell_h).round() as i32;
+                let y1 = py + ((li + 1) as f32 * self.cell_h).round() as i32;
                 fill_rect(frame, width, height, x0, y0, x1 - x0, y1 - y0, pack(bg));
             }
             if selection.is_some_and(|s| s.contains(cell.point)) {
                 sel_cells.push((li, col, w));
             }
-            if overlay
+            if view
                 .search_match
                 .is_some_and(|m| *m.start() <= cell.point && cell.point <= *m.end())
             {
@@ -539,17 +550,17 @@ impl Renderer {
             if cells.is_empty() {
                 continue;
             }
-            let y = oy + (li as f32 * self.cell_h).round() as i32;
+            let y = py + (li as f32 * self.cell_h).round() as i32;
             if cells.iter().any(|ci| is_arabic(ci.c)) {
                 let on_row = cursor_vrow >= 0 && cursor_vrow as usize == li;
-                let r = self.draw_line_bidi(frame, width, height, y, cells,
-                                            overlay.claude,
+                let r = self.draw_line_bidi(frame, width, height, clip, px, y, pw, cells,
+                                            view.claude,
                                             if on_row { Some(ccol) } else { None });
                 if r.is_some() {
                     cursor_rect = r;
                 }
             } else {
-                self.draw_line_grid(frame, width, height, y, cells);
+                self.draw_line_grid(frame, width, height, clip, px, y, cells);
             }
         }
 
@@ -557,31 +568,30 @@ impl Renderer {
         // blue, current search hit amber
         for (cells, ((r, g, b), a)) in [(&sel_cells, SELECTION_RGBA), (&hit_cells, SEARCH_RGBA)] {
             for &(li, col, w) in cells.iter() {
-                let x0 = (col as f32 * self.cell_w).round() as i32;
-                let x1 = ((col + w) as f32 * self.cell_w).round() as i32;
-                let y0 = oy + (li as f32 * self.cell_h).round() as i32;
-                let y1 = oy + ((li + 1) as f32 * self.cell_h).round() as i32;
+                let x0 = px + (col as f32 * self.cell_w).round() as i32;
+                let x1 = px + ((col + w) as f32 * self.cell_w).round() as i32;
+                let y0 = py + (li as f32 * self.cell_h).round() as i32;
+                let y1 = py + ((li + 1) as f32 * self.cell_h).round() as i32;
                 blend_rect(frame, width, height, x0, y0, x1 - x0, y1 - y0, (r, g, b), a);
             }
         }
 
-        // cursor: translucent block over the text so the glyph stays legible.
-        // Grid rows are column-exact; on Arabic rows the position comes from
-        // the shaped layout (logical col != visual x under RTL).
-        if cursor_vrow >= 0 && (cursor_vrow as usize) < rows {
+        // cursor: only the focused pane shows the block (translucent, so the
+        // glyph stays legible); grid rows are column-exact, Arabic rows map
+        // through the shaped layout
+        if view.focused && cursor_vrow >= 0 && (cursor_vrow as usize) < rows {
             let (x0, wpx) = cursor_rect.unwrap_or((
-                (ccol as f32 * self.cell_w).round() as i32,
+                px + (ccol as f32 * self.cell_w).round() as i32,
                 self.cell_w.round() as i32,
             ));
-            let y0 = oy + (cursor_vrow as f32 * self.cell_h).round() as i32;
+            let y0 = py + (cursor_vrow as f32 * self.cell_h).round() as i32;
             blend_rect(frame, width, height,
                        x0, y0, wpx, self.cell_h.round() as i32,
                        FG, 170);
         }
 
-        // command-block lights in the left gutter (EasyTer's bars):
-        // green = succeeded, red = failed, grey = still running/unknown
-        for &(abs, exit) in overlay.marks {
+        // command-block lights in the pane's left gutter (EasyTer's bars)
+        for &(abs, exit) in view.marks {
             let vrow = abs as i64 - history as i64 + off as i64;
             if vrow < 0 || vrow >= rows as i64 {
                 continue;
@@ -591,38 +601,57 @@ impl Renderer {
                 Some(_) => (0xcf, 0x22, 0x2e),
                 None => (0x6e, 0x76, 0x81),
             };
-            let y0 = oy + (vrow as f32 * self.cell_h).round() as i32;
-            fill_rect(frame, width, height, 0, y0, 3,
+            let y0 = py + (vrow as f32 * self.cell_h).round() as i32;
+            fill_rect(frame, width, height, px, y0, 3,
                       self.cell_h.round() as i32, pack(color));
         }
 
         // scroll position indicator while in history (EasyTer's slim bar)
         if off > 0 && history > 0 {
-            let vh = height as i32 - oy;
-            let th = ((vh as f32 * rows as f32 / (history + rows) as f32) as i32).max(24);
-            let ty = oy + ((vh - th) as f32 * (1.0 - off as f32 / history as f32)) as i32;
-            blend_rect(frame, width, height, width as i32 - 7, ty, 4, th, FG, 70);
+            let th = ((ph as f32 * rows as f32 / (history + rows) as f32) as i32).max(24);
+            let ty = py + ((ph - th) as f32 * (1.0 - off as f32 / history as f32)) as i32;
+            blend_rect(frame, width, height, px + pw - 7, ty, 4, th, FG, 70);
         }
 
+        // pane border when split: green marks the focused pane (EasyTer)
+        if view.bordered {
+            let c = if view.focused {
+                (0x2e, 0xa0, 0x43)
+            } else {
+                (0x30, 0x36, 0x3d)
+            };
+            fill_rect(frame, width, height, px, py, pw, 1, pack(c));
+            fill_rect(frame, width, height, px, py + ph - 1, pw, 1, pack(c));
+            fill_rect(frame, width, height, px, py, 1, ph, pack(c));
+            fill_rect(frame, width, height, px + pw - 1, py, 1, ph, pack(c));
+        }
+    }
+
+    /// Window-level chrome: tab bar, search bar, Claude badge.
+    pub fn draw_chrome(&mut self, frame: &mut [u32], width: usize, height: usize,
+                       tabs: &[TabInfo], search_query: Option<&str>, claude: bool) {
+        let oy = self.tab_bar_h().round() as i32;
+        let whole: Rect = (0, 0, width as i32, height as i32);
+
         // Claude-mode badge, top-right below the tab bar (EasyTer's green badge)
-        if overlay.claude {
+        if claude {
             let label = "● وضع كلود".to_string();
             let segs = [(label, (0xff, 0xff, 0xff))];
             let tw = self.shape_scratch(&segs, 1_000_000.0, true);
             let bw = tw as i32 + 16;
             let bh = (self.cell_h + 8.0) as i32;
             let bx = width as i32 - bw - 10;
-            let by = oy + if overlay.search_query.is_some() {
+            let by = oy + if search_query.is_some() {
                 (self.cell_h + 24.0) as i32
             } else {
                 6
             };
             fill_rect(frame, width, height, bx, by, bw, bh, pack((0x2e, 0xa0, 0x43)));
-            self.blit_scratch(frame, width, height, (bx + 8) as f32, by + 4, 1.0);
+            self.blit_scratch(frame, width, height, whole, (bx + 8) as f32, by + 4, 1.0);
         }
 
         // search bar, top-right below the tab bar
-        if let Some(q) = overlay.search_query {
+        if let Some(q) = search_query {
             let bar_w = (self.cell_w * 34.0) as i32;
             let bar_h = (self.cell_h + 10.0) as i32;
             let bx = width as i32 - bar_w - 10;
@@ -633,16 +662,10 @@ impl Renderer {
             let label = format!("بحث: {q}_");
             let segs = [(label, FG)];
             self.shape_scratch(&segs, 1_000_000.0, true);
-            self.blit_scratch(frame, width, height, (bx + 8) as f32, by + 5, 1.0);
+            self.blit_scratch(frame, width, height, whole, (bx + 8) as f32, by + 5, 1.0);
         }
 
-        // the tab bar itself, drawn last (nothing may bleed into it)
-        self.draw_tab_bar(frame, width, height, overlay.tabs);
-    }
-
-    fn draw_tab_bar(&mut self, frame: &mut [u32], width: usize, height: usize,
-                    tabs: &[TabInfo]) {
-        let oy = self.tab_bar_h().round() as i32;
+        // the tab bar, drawn last (nothing may bleed into it)
         fill_rect(frame, width, height, 0, 0, width as i32, oy, pack((0x16, 0x1b, 0x22)));
         let tw = (self.cell_w * TAB_CELLS) as i32;
         for (i, tab) in tabs.iter().enumerate() {
@@ -661,13 +684,18 @@ impl Renderer {
             let title: String = tab.title.chars().take(max_chars).collect();
             let segs = [(title, fg)];
             self.shape_scratch(&segs, 1_000_000.0, true);
-            self.blit_scratch(frame, width, height, (x0 + 10) as f32, 5, 1.0);
-            if tab.busy {
-                // green dot: this background tab is producing output —
-                // the agent-cockpit seed (a Claude finishing while you look away)
+            self.blit_scratch(frame, width, height, whole, (x0 + 10) as f32, 5, 1.0);
+            // dots: amber attention (a Claude waiting on you) beats green busy
+            let dot = if tab.attention {
+                Some((0xf2, 0xcc, 0x60))
+            } else if tab.busy {
+                Some((0x56, 0xd3, 0x64))
+            } else {
+                None
+            };
+            if let Some(c) = dot {
                 let d = 6;
-                blend_rect(frame, width, height, x0 + tw - 16, oy / 2 - d / 2, d, d,
-                           (0x56, 0xd3, 0x64), 255);
+                blend_rect(frame, width, height, x0 + tw - 16, oy / 2 - d / 2, d, d, c, 255);
             }
         }
     }

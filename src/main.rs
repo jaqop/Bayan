@@ -165,7 +165,7 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::search::{Match, RegexSearch};
 use alacritty_terminal::term::TermMode;
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -182,20 +182,71 @@ pub enum UserEvent {
     RendererReady(Box<render::Renderer>),
     /// A program set the clipboard via OSC 52 (yank over SSH ...).
     ClipboardSet(String),
-    /// Tab `id`'s shell reported its working directory (OSC 9;9).
+    /// Pane `id`'s shell reported its working directory (OSC 9;9).
     Cwd(u64, String),
-    /// Tab `id`'s shell exited.
+    /// Pane `id` rang the bell (Claude waiting for an approval).
+    Bell(u64),
+    /// Pane `id`'s shell exited.
     Exit(u64),
 }
 
-/// One terminal tab.
-struct Tab {
+/// One terminal pane (a tab holds one or more).
+struct Pane {
     id: u64,
     session: Session,
-    /// cwd basename (falls back to a plain name)
-    title: String,
-    /// when this tab last produced output — feeds the busy dot
+    /// when this pane last produced output — feeds the busy dot
     last_output: Option<Instant>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Orientation {
+    Row,    // side by side (Ctrl+Shift+E)
+    Column, // stacked (Ctrl+Shift+O)
+}
+
+/// One tab: a set of panes split along one axis (v1 of EasyTer's tree).
+struct Tab {
+    panes: Vec<Pane>,
+    focused: usize,
+    orientation: Orientation,
+    /// cwd basename of the focused pane (falls back to a plain name)
+    title: String,
+    /// a background pane rang the bell: show the amber dot until visited
+    attention: bool,
+}
+
+impl Tab {
+    fn busy(&self, now_active: bool) -> bool {
+        !now_active
+            && self.panes.iter().any(|p| {
+                p.last_output
+                    .is_some_and(|ts| ts.elapsed() < std::time::Duration::from_secs(2))
+            })
+    }
+}
+
+/// Equal split of a content rect along one axis, 1px gaps between panes.
+fn split_rects(content: render::Rect, n: usize, orientation: Orientation) -> Vec<render::Rect> {
+    let (x, y, w, h) = content;
+    let n = n.max(1) as i32;
+    let gap = 1;
+    (0..n)
+        .map(|i| match orientation {
+            Orientation::Row => {
+                let pw = (w - gap * (n - 1)) / n;
+                let x0 = x + i * (pw + gap);
+                // the last pane absorbs the rounding remainder
+                let pw = if i == n - 1 { x + w - x0 } else { pw };
+                (x0, y, pw, h)
+            }
+            Orientation::Column => {
+                let ph = (h - gap * (n - 1)) / n;
+                let y0 = y + i * (ph + gap);
+                let ph = if i == n - 1 { y + h - y0 } else { ph };
+                (x, y0, w, ph)
+            }
+        })
+        .collect()
 }
 
 /// What survives a restart: each tab's cwd + the active index.
@@ -254,6 +305,8 @@ struct App {
     first_output: bool,
     cursor_pos: PhysicalPosition<f64>,
     mouse_left_down: bool,
+    /// the pane a mouse selection started in (drags don't cross panes)
+    sel_pane: usize,
     clicks: ClickTracker,
     wheel_accum: f32,
     search: Option<SearchState>,
@@ -313,28 +366,133 @@ impl App {
         self.request_redraw();
     }
 
+    /// The focused pane's session in the active tab.
     fn session(&self) -> Option<&Session> {
-        self.tabs.get(self.active).map(|t| &t.session)
+        let t = self.tabs.get(self.active)?;
+        t.panes.get(t.focused).map(|p| &p.session)
     }
 
     fn session_mut(&mut self) -> Option<&mut Session> {
-        self.tabs.get_mut(self.active).map(|t| &mut t.session)
+        let t = self.tabs.get_mut(self.active)?;
+        let f = t.focused;
+        t.panes.get_mut(f).map(|p| &mut p.session)
+    }
+
+    /// (tab index, pane index) for a pane id, wherever it lives.
+    fn find_pane(&self, id: u64) -> Option<(usize, usize)> {
+        for (ti, t) in self.tabs.iter().enumerate() {
+            if let Some(pi) = t.panes.iter().position(|p| p.id == id) {
+                return Some((ti, pi));
+            }
+        }
+        None
+    }
+
+    fn spawn_pane(&mut self, cwd: Option<&str>) -> Option<Pane> {
+        let id = self.next_id;
+        self.next_id += 1;
+        match Session::spawn(self.size, self.proxy.clone(), id, cwd) {
+            Ok(session) => Some(Pane { id, session, last_output: None }),
+            Err(e) => {
+                eprintln!("bayan: spawn failed: {e}");
+                None
+            }
+        }
     }
 
     fn spawn_tab(&mut self, cwd: Option<String>) {
-        let id = self.next_id;
-        self.next_id += 1;
-        match Session::spawn(self.size, self.proxy.clone(), id, cwd.as_deref()) {
-            Ok(session) => {
-                let title = cwd
-                    .as_deref()
-                    .and_then(|c| c.rsplit(['\\', '/']).next().map(str::to_string))
-                    .unwrap_or_else(|| "بيان".to_string());
-                self.tabs.push(Tab { id, session, title, last_output: None });
+        let title = cwd
+            .as_deref()
+            .and_then(|c| c.rsplit(['\\', '/']).next().map(str::to_string))
+            .unwrap_or_else(|| "بيان".to_string());
+        if let Some(pane) = self.spawn_pane(cwd.as_deref()) {
+            self.tabs.push(Tab {
+                panes: vec![pane],
+                focused: 0,
+                orientation: Orientation::Row,
+                title,
+                attention: false,
+            });
+            self.active = self.tabs.len() - 1;
+            self.relayout_active();
+        }
+    }
+
+    /// Pane rects for the active tab within the window's content area.
+    fn pane_rects(&self) -> Vec<render::Rect> {
+        let (Some(r), Some(w), Some(t)) =
+            (self.renderer.as_ref(), self.window.as_ref(), self.tabs.get(self.active))
+        else {
+            return Vec::new();
+        };
+        let px = w.inner_size();
+        let bar = r.tab_bar_h().round() as i32;
+        let content = (0, bar, px.width as i32, px.height as i32 - bar);
+        split_rects(content, t.panes.len(), t.orientation)
+    }
+
+    /// Resize every pane of the ACTIVE tab to its rect (background tabs
+    /// re-layout when they become active — the standard terminal tradeoff).
+    fn relayout_active(&mut self) {
+        let rects = self.pane_rects();
+        let Some(r) = self.renderer.as_ref() else { return };
+        let (cw, ch) = (r.cell_w, r.cell_h);
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            for (pane, rect) in t.panes.iter_mut().zip(&rects) {
+                let g = TermSize {
+                    cols: ((rect.2 as f32 / cw) as usize).max(10),
+                    rows: ((rect.3 as f32 / ch) as usize).max(3),
+                };
+                pane.session.resize(g);
+            }
+        }
+    }
+
+    /// Split the active tab (EasyTer: Ctrl+Shift+E side-by-side, O stacked).
+    fn split(&mut self, orientation: Orientation) {
+        // four panes per tab is the v1 cap (one axis, equal sizes)
+        if self.tabs.get(self.active).map_or(true, |t| t.panes.len() >= 4) {
+            return;
+        }
+        let cwd = self
+            .session()
+            .and_then(|s| s.meta.lock().unwrap().cwd.clone());
+        let Some(pane) = self.spawn_pane(cwd.as_deref()) else { return };
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            if t.panes.len() == 1 {
+                t.orientation = orientation;
+            }
+            t.panes.push(pane);
+            t.focused = t.panes.len() - 1;
+        }
+        self.relayout_active();
+        self.request_redraw();
+    }
+
+    /// Remove one pane; a tab with no panes closes, the last tab closes Bayan.
+    fn remove_pane(&mut self, ti: usize, pi: usize, el: &ActiveEventLoop) {
+        let Some(t) = self.tabs.get_mut(ti) else { return };
+        if pi >= t.panes.len() {
+            return;
+        }
+        let mut pane = t.panes.remove(pi);
+        pane.session.kill();
+        if t.panes.is_empty() {
+            self.tabs.remove(ti);
+            if self.tabs.is_empty() {
+                self.save_state();
+                el.exit();
+                return;
+            }
+            if self.active >= self.tabs.len() {
                 self.active = self.tabs.len() - 1;
             }
-            Err(e) => eprintln!("bayan: spawn tab failed: {e}"),
+        } else if t.focused >= t.panes.len() {
+            t.focused = t.panes.len() - 1;
         }
+        self.relayout_active();
+        self.update_title();
+        self.request_redraw();
     }
 
     fn switch_tab(&mut self, idx: usize) {
@@ -342,25 +500,11 @@ impl App {
             return;
         }
         self.active = idx;
+        if let Some(t) = self.tabs.get_mut(idx) {
+            t.attention = false; // you're looking at it now
+        }
         self.search = None; // the bar belongs to the tab that opened it
-        self.update_title();
-        self.request_redraw();
-    }
-
-    fn close_tab(&mut self, idx: usize, el: &ActiveEventLoop) {
-        if idx >= self.tabs.len() {
-            return;
-        }
-        let mut tab = self.tabs.remove(idx);
-        tab.session.kill();
-        if self.tabs.is_empty() {
-            self.save_state();
-            el.exit();
-            return;
-        }
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len() - 1;
-        }
+        self.relayout_active(); // this tab's layout may differ
         self.update_title();
         self.request_redraw();
     }
@@ -377,7 +521,11 @@ impl App {
             tabs: self
                 .tabs
                 .iter()
-                .map(|t| t.session.meta.lock().unwrap().cwd.clone())
+                .map(|t| {
+                    t.panes
+                        .get(t.focused)
+                        .and_then(|p| p.session.meta.lock().unwrap().cwd.clone())
+                })
                 .collect(),
             active: self.active,
         };
@@ -425,23 +573,27 @@ impl App {
         bidi::cmd_is_claude(&s.meta.lock().unwrap().running_cmd)
     }
 
-    /// Pixel position -> (viewport row, col, cell side) for selection.
+    /// Pixel position -> (pane index, viewport row, col, cell side).
     /// None inside the tab bar (that region belongs to tab switching).
-    fn cell_at(&self, pos: PhysicalPosition<f64>) -> Option<(usize, usize, Side)> {
+    fn pane_cell_at(&self, pos: PhysicalPosition<f64>) -> Option<(usize, usize, usize, Side)> {
         let r = self.renderer.as_ref()?;
-        if self.size.cols == 0 || self.size.rows == 0 {
-            return None;
-        }
-        let y = pos.y - r.tab_bar_h() as f64;
-        if y < 0.0 {
-            return None;
-        }
-        let colf = pos.x / r.cell_w as f64;
-        let col = (colf.floor().max(0.0) as usize).min(self.size.cols - 1);
-        let row = ((y / r.cell_h as f64).floor().max(0.0) as usize)
-            .min(self.size.rows - 1);
+        let rects = self.pane_rects();
+        let (pi, rect) = rects.iter().enumerate().find(|(_, (x, y, w, h))| {
+            pos.x >= *x as f64
+                && pos.x < (*x + *w) as f64
+                && pos.y >= *y as f64
+                && pos.y < (*y + *h) as f64
+        })?;
+        let (rx, ry, rw, rh) = *rect;
+        let lx = pos.x - rx as f64;
+        let ly = pos.y - ry as f64;
+        let max_col = ((rw as f32 / r.cell_w) as usize).max(1) - 1;
+        let max_row = ((rh as f32 / r.cell_h) as usize).max(1) - 1;
+        let colf = lx / r.cell_w as f64;
+        let col = (colf.floor().max(0.0) as usize).min(max_col);
+        let row = ((ly / r.cell_h as f64).floor().max(0.0) as usize).min(max_row);
         let side = if colf - col as f64 <= 0.5 { Side::Left } else { Side::Right };
-        Some((row, col, side))
+        Some((pi, row, col, side))
     }
 
     /// Tab index under a pixel position, if it's in the tab bar.
@@ -455,13 +607,9 @@ impl App {
     }
 
     fn pointer_cell_1based(&self) -> (usize, usize) {
-        let (cw, ch, bar) = self
-            .renderer
-            .as_ref()
-            .map_or((9.0, 20.0, 0.0), |r| (r.cell_w, r.cell_h, r.tab_bar_h()));
-        let col = (self.cursor_pos.x / cw as f64).floor().max(0.0) as usize + 1;
-        let row = (((self.cursor_pos.y - bar as f64) / ch as f64).floor().max(0.0)) as usize + 1;
-        (row, col)
+        self.pane_cell_at(self.cursor_pos)
+            .map(|(_, row, col, _)| (row + 1, col + 1))
+            .unwrap_or((1, 1))
     }
 
     fn has_selection(&self) -> bool {
@@ -490,6 +638,13 @@ impl App {
         };
         match text {
             Some(s) if !s.is_empty() => {
+                // Claude rows hold VISUAL-order Arabic: restore logical so a
+                // paste elsewhere reads correctly (M7 gap closed)
+                let s = if self.claude_active() {
+                    bidi::restore_block(&s)
+                } else {
+                    s
+                };
                 self.set_clipboard(s);
                 true
             }
@@ -589,24 +744,20 @@ impl App {
         self.request_redraw();
     }
 
-    fn grid_for(&self, px: PhysicalSize<u32>) -> TermSize {
-        let r = self.renderer.as_ref().expect("renderer initialized");
-        TermSize {
-            cols: ((px.width as f32 / r.cell_w) as usize).max(20),
-            rows: (((px.height as f32 - r.tab_bar_h()) / r.cell_h) as usize).max(5),
-        }
-    }
-
-    /// The grid changed (resize, new metrics): every tab's PTY follows.
-    fn resize_all(&mut self, size: TermSize) {
-        self.size = size;
-        for tab in &mut self.tabs {
-            tab.session.resize(size);
-        }
-    }
-
     fn redraw(&mut self) {
-        let claude = self.claude_active();
+        // computed before the surface borrow (they read &self broadly)
+        let rects = self.pane_rects();
+        let tab_infos: Vec<render::TabInfo> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| render::TabInfo {
+                title: t.title.clone(),
+                busy: t.busy(i == self.active),
+                attention: t.attention,
+                active: i == self.active,
+            })
+            .collect();
         let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut())
         else {
             return;
@@ -619,34 +770,58 @@ impl App {
             Ok(b) => b,
             Err(_) => return,
         };
-        let tab_infos: Vec<render::TabInfo> = self
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(i, t)| render::TabInfo {
-                title: t.title.clone(),
-                busy: i != self.active
-                    && t.last_output
-                        .is_some_and(|ts| ts.elapsed() < std::time::Duration::from_secs(2)),
-                active: i == self.active,
-            })
-            .collect();
         match (self.renderer.as_mut(), self.tabs.get(self.active)) {
-            (Some(renderer), Some(tab)) => {
-                // marks snapshot BEFORE the term lock (avoids holding both)
-                let marks: Vec<(usize, Option<i32>)> = {
-                    let m = tab.session.meta.lock().unwrap();
-                    m.marks.iter().map(|c| (c.abs, c.exit)).collect()
-                };
-                let overlay = render::Overlay {
-                    search_query: self.search.as_ref().map(|s| s.query.as_str()),
-                    search_match: self.search.as_ref().and_then(|s| s.hl.as_ref()),
-                    claude,
-                    tabs: &tab_infos,
-                    marks: &marks,
-                };
-                let t = tab.session.term.lock().unwrap();
-                renderer.draw(&mut buffer, px.width as usize, px.height as usize, &t, &overlay);
+            (Some(renderer), Some(tab)) if !rects.is_empty() => {
+                // inter-pane gaps + any rounding slack
+                buffer.fill(render::bg_packed());
+                let bordered = tab.panes.len() > 1;
+                let (auto_follow, claude_manual) = (self.auto_follow, self.claude_manual);
+                let mut focused_claude = false;
+                for (pi, (pane, rect)) in tab.panes.iter().zip(&rects).enumerate() {
+                    let focused = pi == tab.focused;
+                    // meta snapshot BEFORE the term lock (lock order term>meta
+                    // only applies when holding both; here they don't overlap)
+                    let (marks, running_cmd): (Vec<(usize, Option<i32>)>, String) = {
+                        let m = pane.session.meta.lock().unwrap();
+                        (
+                            m.marks.iter().map(|c| (c.abs, c.exit)).collect(),
+                            m.running_cmd.clone(),
+                        )
+                    };
+                    let t = pane.session.term.lock().unwrap();
+                    // Claude mode is a per-PANE fact: this pane's TUI + command
+                    let claude_pane = if !auto_follow {
+                        claude_manual
+                    } else {
+                        t.mode().contains(TermMode::ALT_SCREEN)
+                            && bidi::cmd_is_claude(&running_cmd)
+                    };
+                    if focused {
+                        focused_claude = claude_pane;
+                    }
+                    let view = render::PaneView {
+                        rect: *rect,
+                        focused,
+                        bordered,
+                        claude: claude_pane,
+                        search_match: if focused {
+                            self.search.as_ref().and_then(|s| s.hl.as_ref())
+                        } else {
+                            None
+                        },
+                        marks: &marks,
+                    };
+                    renderer.draw_pane(&mut buffer, px.width as usize,
+                                       px.height as usize, &view, &t);
+                }
+                renderer.draw_chrome(
+                    &mut buffer,
+                    px.width as usize,
+                    px.height as usize,
+                    &tab_infos,
+                    self.search.as_ref().map(|s| s.query.as_str()),
+                    focused_claude,
+                );
             }
             // renderer still warming up on its thread: dark frame, instantly
             _ => buffer.fill(render::bg_packed()),
@@ -686,6 +861,11 @@ impl ApplicationHandler<UserEvent> for App {
         // once cell metrics exist (EasyTer starts 110x32 the same way).
         // Restores yesterday's tabs (each in its saved cwd) or opens one.
         self.restore_state();
+        // debug hook: BAYAN_SPLIT=1 opens the first tab pre-split, so the
+        // pane machinery can be verified without injecting any input
+        if std::env::var_os("BAYAN_SPLIT").is_some() {
+            self.split(Orientation::Row);
+        }
         crate::prof::mark("session spawned");
         // FontSystem::new scans every installed font — the documented
         // cosmic-text startup cost (pop-os/cosmic-text#247): keep it off
@@ -700,29 +880,36 @@ impl ApplicationHandler<UserEvent> for App {
                     self.first_output = true;
                     crate::prof::mark("first pty output");
                 }
-                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
-                    t.last_output = Some(Instant::now());
+                if let Some((ti, pi)) = self.find_pane(id) {
+                    self.tabs[ti].panes[pi].last_output = Some(Instant::now());
                 }
                 self.request_redraw();
             }
             UserEvent::PtyWrite(id, text) => {
-                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
-                    t.session.write(text.as_bytes());
+                if let Some((ti, pi)) = self.find_pane(id) {
+                    self.tabs[ti].panes[pi].session.write(text.as_bytes());
                 }
             }
             UserEvent::ClipboardSet(text) => self.set_clipboard(text),
+            UserEvent::Bell(id) => {
+                // the cockpit signal: a pane you're NOT looking at wants you
+                if let Some((ti, _)) = self.find_pane(id) {
+                    if ti != self.active {
+                        self.tabs[ti].attention = true;
+                        self.request_redraw();
+                    }
+                }
+            }
             UserEvent::Cwd(id, cwd) => {
                 let base = cwd.rsplit(['\\', '/']).next().unwrap_or(&cwd).to_string();
-                let is_active = self
-                    .tabs
-                    .iter()
-                    .position(|t| t.id == id)
-                    .is_some_and(|i| i == self.active);
-                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
-                    t.title = base;
-                }
-                if is_active {
-                    self.update_title();
+                if let Some((ti, pi)) = self.find_pane(id) {
+                    // the tab is named after its FOCUSED pane's directory
+                    if self.tabs[ti].focused == pi {
+                        self.tabs[ti].title = base;
+                        if ti == self.active {
+                            self.update_title();
+                        }
+                    }
                 }
                 self.request_redraw(); // tab titles live in the frame
             }
@@ -730,13 +917,8 @@ impl ApplicationHandler<UserEvent> for App {
                 crate::prof::mark("renderer ready");
                 self.renderer = Some(*r);
                 self.renderer_building = false;
-                if let Some(px) = self.window.as_ref().map(|w| w.inner_size()) {
-                    // now that cell metrics exist, snap the grid to the window
-                    let g = self.grid_for(px);
-                    if g != self.size {
-                        self.resize_all(g);
-                    }
-                }
+                // now that cell metrics exist, snap every pane to its rect
+                self.relayout_active();
                 // the zoom moved again while this build ran: chase it
                 if (self.font_delta - self.inflight_delta).abs() > f32::EPSILON {
                     self.rebuild_renderer();
@@ -744,9 +926,10 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_redraw();
             }
             UserEvent::Exit(id) => {
-                // that tab's shell ended: close it; last one closes Bayan
-                if let Some(i) = self.tabs.iter().position(|t| t.id == id) {
-                    self.close_tab(i, el);
+                // that pane's shell ended: close it; the last pane of the
+                // last tab closes Bayan
+                if let Some((ti, pi)) = self.find_pane(id) {
+                    self.remove_pane(ti, pi, el);
                 }
             }
         }
@@ -755,11 +938,11 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         // busy dots decay after ~2s of quiet: keep repainting on a slow
         // heartbeat only while any background tab is (or just was) active
-        let any_busy = self.tabs.iter().enumerate().any(|(i, t)| {
-            i != self.active
-                && t.last_output
-                    .is_some_and(|ts| ts.elapsed() < std::time::Duration::from_secs(3))
-        });
+        let any_busy = self
+            .tabs
+            .iter()
+            .enumerate()
+            .any(|(i, t)| t.busy(i == self.active));
         if any_busy {
             el.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + std::time::Duration::from_millis(600),
@@ -794,27 +977,25 @@ impl ApplicationHandler<UserEvent> for App {
                         let _ = surface.resize(w, h);
                     }
                 }
-                if self.renderer.is_some() {
-                    let g = self.grid_for(px);
-                    if g != self.size {
-                        self.resize_all(g);
-                    }
-                }
+                self.relayout_active();
                 self.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = position;
                 if self.mouse_left_down {
-                    if let Some((row, col, side)) = self.cell_at(position) {
-                        if let Some(s) = self.session() {
-                            let mut t = s.term.lock().unwrap();
-                            let off = t.grid().display_offset() as i32;
-                            let point = Point::new(Line(row as i32 - off), Column(col));
-                            if let Some(sel) = t.selection.as_mut() {
-                                sel.update(point, side);
+                    // the drag stays in the pane where it started
+                    if let Some((pi, row, col, side)) = self.pane_cell_at(position) {
+                        if pi == self.sel_pane {
+                            if let Some(s) = self.session() {
+                                let mut t = s.term.lock().unwrap();
+                                let off = t.grid().display_offset() as i32;
+                                let point = Point::new(Line(row as i32 - off), Column(col));
+                                if let Some(sel) = t.selection.as_mut() {
+                                    sel.update(point, side);
+                                }
                             }
+                            self.request_redraw();
                         }
-                        self.request_redraw();
                     }
                 }
             }
@@ -825,7 +1006,15 @@ impl ApplicationHandler<UserEvent> for App {
                         self.switch_tab(idx);
                         return;
                     }
-                    if let Some((row, col, side)) = self.cell_at(self.cursor_pos) {
+                    if let Some((pi, row, col, side)) = self.pane_cell_at(self.cursor_pos) {
+                        // clicking a pane focuses it
+                        if let Some(t) = self.tabs.get_mut(self.active) {
+                            if t.focused != pi {
+                                t.focused = pi;
+                                self.update_title();
+                            }
+                        }
+                        self.sel_pane = pi;
                         // 1 click = simple drag anchor, 2 = word, 3 = line
                         let n = self.clicks.click(Instant::now(), (row, col));
                         let ty = match n {
@@ -946,7 +1135,49 @@ impl ApplicationHandler<UserEvent> for App {
                             self.paste();
                             return;
                         }
+                        // splits (EasyTer): E side-by-side, O stacked
+                        Some('e') => {
+                            self.split(Orientation::Row);
+                            return;
+                        }
+                        Some('o') => {
+                            self.split(Orientation::Column);
+                            return;
+                        }
+                        // close the focused pane (the last one closes the tab)
+                        Some('w') => {
+                            let (ti, pi) = (
+                                self.active,
+                                self.tabs.get(self.active).map_or(0, |t| t.focused),
+                            );
+                            self.remove_pane(ti, pi, el);
+                            return;
+                        }
                         _ => {}
+                    }
+                }
+                // Alt+arrows move focus between panes (EasyTer's binding)
+                if alt && !ctrl {
+                    let step = match key {
+                        Key::Named(NamedKey::ArrowLeft) | Key::Named(NamedKey::ArrowUp) => {
+                            Some(-1i32)
+                        }
+                        Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::ArrowDown) => {
+                            Some(1)
+                        }
+                        _ => None,
+                    };
+                    if let Some(d) = step {
+                        if let Some(t) = self.tabs.get_mut(self.active) {
+                            if t.panes.len() > 1 {
+                                let n = t.panes.len() as i32;
+                                t.focused =
+                                    ((t.focused as i32 + d + n) % n) as usize;
+                                self.update_title();
+                                self.request_redraw();
+                                return;
+                            }
+                        }
                     }
                 } else if ctrl {
                     // Ctrl+Tab / Ctrl+Shift+Tab cycle tabs (shift handled here
@@ -974,11 +1205,6 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                     if let Some(l) = key_letter(&event) {
-                        if shift && l == 'w' {
-                            // Ctrl+Shift+W closes the tab (EasyTer's binding)
-                            self.close_tab(self.active, el);
-                            return;
-                        }
                         // Ctrl+C copies when a selection exists (Windows
                         // convention); otherwise falls through to \x03
                         if !shift && l == 'c' && self.has_selection() {
@@ -1078,6 +1304,7 @@ fn main() {
         first_output: false,
         cursor_pos: PhysicalPosition::new(0.0, 0.0),
         mouse_left_down: false,
+        sel_pane: 0,
         clicks: ClickTracker::new(),
         wheel_accum: 0.0,
         search: None,
@@ -1096,6 +1323,22 @@ fn main() {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn split_rects_divide_the_content_evenly() {
+        let content = (0, 30, 1000, 700);
+        let one = split_rects(content, 1, Orientation::Row);
+        assert_eq!(one, vec![(0, 30, 1000, 700)]);
+        let two = split_rects(content, 2, Orientation::Row);
+        assert_eq!(two[0], (0, 30, 499, 700));
+        assert_eq!(two[1], (500, 30, 500, 700)); // absorbs the rounding
+        assert_eq!(two[0].0 + two[0].2 + 1, two[1].0); // 1px divider gap
+        let stacked = split_rects(content, 3, Orientation::Column);
+        assert_eq!(stacked.len(), 3);
+        assert_eq!(stacked[2].1 + stacked[2].3, 30 + 700); // flush bottom
+        // widths untouched in a column split
+        assert!(stacked.iter().all(|r| r.2 == 1000));
+    }
 
     #[test]
     fn jump_offset_walks_prompts() {

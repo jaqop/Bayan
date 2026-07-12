@@ -139,6 +139,15 @@ pub fn restore_bidi_line(text: &str) -> Option<String> {
     None
 }
 
+/// A whole copied block (selection in Claude mode): restore each line, so
+/// pasted text is logical-order Arabic, not Claude's visual order.
+pub fn restore_block(text: &str) -> String {
+    text.split('\n')
+        .map(|l| restore_bidi_line(l).unwrap_or_else(|| l.to_string()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Is the command that entered the alternate screen Claude itself? Other
 /// full-screen tools (vim, less, htop) emit LOGICAL Arabic and must NOT be
 /// reversed. Matches the INVOKED PROGRAM (basename, extension stripped),
@@ -221,6 +230,15 @@ mod tests {
         let logical = "\u{645}\u{639}\u{627}\u{64b}";
         let visual = rev_clusters(logical);
         assert_eq!(restore_bidi_line(&visual).as_deref(), Some(logical));
+    }
+
+    #[test]
+    fn copied_blocks_restore_line_by_line() {
+        let block = "ابحرم\nplain english\nWhat are you working on ؟كتدعاسم";
+        assert_eq!(
+            restore_block(block),
+            "مرحبا\nplain english\nWhat are you working on مساعدتك؟"
+        );
     }
 
     #[test]

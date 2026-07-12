@@ -367,6 +367,9 @@ impl EventListener for EventProxy {
         let mapped = match event {
             Event::PtyWrite(text) => UserEvent::PtyWrite(self.1, text),
             Event::Wakeup => UserEvent::Wakeup(self.1),
+            // the bell: Claude Code rings it when waiting for an approval —
+            // the cockpit's attention signal
+            Event::Bell => UserEvent::Bell(self.1),
             Event::Exit => UserEvent::Exit(self.1),
             _ => return,
         };

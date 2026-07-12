@@ -59,8 +59,14 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       133 exit codes) with Ctrl+Shift+Up/Down prompt jumping; optional
       ~/.bayan/config.json (font_family, font_size); Ctrl+wheel live font
       zoom with Ctrl+0 reset (debounced background renderer rebuilds)
-- [ ] **M7 (backlog)** — splits, full agent cockpit (status/approvals
-      across tabs), wgpu renderer, Claude-row logical-order copy
+- [x] **M7** — splits: Ctrl+Shift+E side-by-side / Ctrl+Shift+O stacked
+      (up to 4 panes per tab, one axis), Alt+arrows cycle focus, click
+      focuses, green border marks the focused pane, every pane has its own
+      PTY size; Claude-row selections now copy LOGICAL-order Arabic; BEL
+      from a background pane lights an amber attention dot on its tab
+      (Claude asking for an approval — the cockpit signal)
+- [ ] **M8 (backlog)** — resizable panes, cockpit dashboard view, wgpu
+      renderer, scrollback-cap-proof command marks
 
 ## Build
 
