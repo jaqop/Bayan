@@ -411,11 +411,35 @@ pub struct SettingsLayout {
     pub head_h: i32,
     pub rowh: i32,
     pub theme_tiles: Vec<Rect>,
+    pub font_label_y: i32,
+    pub font_prev: Rect,
+    pub font_next: Rect,
     pub size_label_y: i32,
     pub size_minus: Rect,
     pub size_plus: Rect,
+    pub cursor_label_y: i32,
+    pub cursor_btns: [Rect; 3],
+    pub scroll_label_y: i32,
+    pub scroll_minus: Rect,
+    pub scroll_plus: Rect,
+    pub copy_label_y: i32,
+    pub copy_toggle: Rect,
     pub liga_label_y: i32,
     pub liga_toggle: Rect,
+    pub bell_label_y: i32,
+    pub bell_btn: Rect,
+}
+
+/// Everything the settings panel displays (current values of each control).
+pub struct SettingsView<'a> {
+    pub theme: usize,
+    pub font_family: &'a str,
+    pub font_size: i32,
+    pub cursor: crate::config::CursorStyle,
+    pub scrollback: usize,
+    pub copy_on_select: bool,
+    pub ligatures: bool,
+    pub bell: crate::config::BellMode,
 }
 
 /// Is (px, py) inside a rect?
@@ -437,6 +461,8 @@ pub struct CockpitEntry {
 pub struct PaneView<'a> {
     pub rect: Rect,
     pub focused: bool,
+    /// block / bar / underline (the settings panel's cursor row)
+    pub cursor: crate::config::CursorStyle,
     /// draw a border (only when the tab actually has multiple panes)
     pub bordered: bool,
     /// Claude mode for THIS pane's content.
@@ -513,6 +539,30 @@ const FAMILY_MONO: &[&str] = &[
     "Cascadia Mono",
     "Cascadia Code NF",
     "Consolas",
+];
+
+/// Families the settings panel's font cycler offers — the preference lists
+/// plus the popular monospace fonts a Windows dev box tends to have. Only
+/// the INSTALLED ones are shown.
+const FONT_CANDIDATES: &[&str] = &[
+    "Cascadia Code NF",
+    "Cascadia Code",
+    "Cascadia Mono NF",
+    "Cascadia Mono",
+    "CaskaydiaCove Nerd Font Mono",
+    "FiraCode Nerd Font",
+    "Fira Code",
+    "JetBrainsMono Nerd Font",
+    "JetBrainsMono Nerd Font Mono",
+    "JetBrains Mono",
+    "Consolas",
+    "Courier New",
+    "Hack",
+    "Source Code Pro",
+    "IBM Plex Mono",
+    "Iosevka",
+    "Victor Mono",
+    "MesloLGS NF",
 ];
 
 fn pick_family(db: &cosmic_text::fontdb::Database, preferred: Option<&str>,
@@ -657,6 +707,30 @@ impl Renderer {
             cell_w,
             cell_h: metrics.line_height,
         }
+    }
+
+    /// The primary family actually in use (post-fallback) — what the
+    /// settings panel displays.
+    pub fn family(&self) -> &str {
+        &self.family
+    }
+
+    /// Installed candidates for the settings panel's font cycler. Always
+    /// contains the current family so the cycle has a starting point.
+    pub fn font_choices(&self) -> Vec<String> {
+        let db = self.font_system.db();
+        let has = |name: &str| {
+            db.faces().any(|f| f.families.iter().any(|(n, _)| n == name))
+        };
+        let mut out: Vec<String> = FONT_CANDIDATES
+            .iter()
+            .filter(|c| has(c))
+            .map(|c| c.to_string())
+            .collect();
+        if !out.iter().any(|c| *c == self.family) {
+            out.insert(0, self.family.clone());
+        }
+        out
     }
 
     fn named_rgb(&self, name: NamedColor) -> (u8, u8, u8) {
@@ -1048,17 +1122,29 @@ impl Renderer {
             }
         }
 
-        // cursor: only the focused pane shows the block (translucent, so the
-        // glyph stays legible); grid rows are column-exact, Arabic rows map
-        // through the shaped layout
+        // cursor: only the focused pane shows it (the block is translucent,
+        // so the glyph stays legible); grid rows are column-exact, Arabic
+        // rows map through the shaped layout
         if view.focused && cursor_vrow >= 0 && (cursor_vrow as usize) < rows {
             let (x0, wpx) = cursor_rect.unwrap_or((
                 px + (ccol as f32 * self.cell_w).round() as i32,
                 self.cell_w.round() as i32,
             ));
             let y0 = py + (cursor_vrow as f32 * self.cell_h).round() as i32;
-            push_rect(out, clip, x0, y0, wpx, self.cell_h.round() as i32,
-                      c4(self.fg, 170));
+            let hpx = self.cell_h.round() as i32;
+            use crate::config::CursorStyle::*;
+            match view.cursor {
+                Block => push_rect(out, clip, x0, y0, wpx, hpx, c4(self.fg, 170)),
+                // thin shapes don't cover the glyph, so they draw opaque
+                Bar => {
+                    let bw = ((self.cell_w * 0.15).round() as i32).max(2);
+                    push_rect(out, clip, x0, y0, bw, hpx, c4(self.fg, 230));
+                }
+                Underline => {
+                    let bh = ((self.cell_h * 0.1).round() as i32).max(2);
+                    push_rect(out, clip, x0, y0 + hpx - bh, wpx, bh, c4(self.fg, 230));
+                }
+            }
         }
 
         // command-block lights in the pane's left gutter (EasyTer's bars)
@@ -1204,7 +1290,7 @@ impl Renderer {
         let tile_w = ((w - pad * 2 - 6 * 6) / 7).max(30); // 7 theme tiles
         let tile_h = (self.cell_h * 1.6) as i32;
         let head_h = (self.cell_h + 26.0) as i32;
-        let h = head_h + tile_h + 16 + rowh * 2 + 44;
+        let h = head_h + tile_h + 16 + rowh * 7 + 44;
         let x = (fw as i32 - w) / 2;
         let y = (self.tab_bar_h() as i32 + (fh as i32 - h) / 3)
             .max(self.tab_bar_h() as i32 + 12);
@@ -1214,35 +1300,71 @@ impl Renderer {
             .map(|i| (x + pad + i * (tile_w + 6), theme_y, tile_w, tile_h))
             .collect();
 
-        // font-size row: label on the right, [−  15  +] on the left
-        let size_y = theme_y + tile_h + 16;
+        // rows below the tiles: label on the right (RTL), controls on the
+        // left, one control block per row
         let btn = rowh - 8;
+        let row_y = |i: i32| theme_y + tile_h + 16 + rowh * i;
+
+        // font family: [‹] name [›]
+        let font_y = row_y(0);
+        let font_prev = (x + pad, font_y + 4, btn, btn);
+        let font_next = (x + pad + btn + 220, font_y + 4, btn, btn);
+
+        // font size: [−  15  +]
+        let size_y = row_y(1);
         let size_minus = (x + pad, size_y + 4, btn, btn);
         let size_plus = (x + pad + btn + 54, size_y + 4, btn, btn);
 
-        // ligatures row: a toggle pill on the left
-        let liga_y = size_y + rowh;
+        // cursor style: three shape swatches
+        let cursor_y = row_y(2);
+        let cursor_btns = [0, 1, 2].map(|i| (x + pad + i * (btn + 8), cursor_y + 4, btn, btn));
+
+        // scrollback: [−  10k  +]
+        let scroll_y = row_y(3);
+        let scroll_minus = (x + pad, scroll_y + 4, btn, btn);
+        let scroll_plus = (x + pad + btn + 76, scroll_y + 4, btn, btn);
+
+        // copy-on-select / ligatures: toggle pills
+        let copy_y = row_y(4);
+        let copy_toggle = (x + pad, copy_y + 4, 64, rowh - 10);
+        let liga_y = row_y(5);
         let liga_toggle = (x + pad, liga_y + 4, 64, rowh - 10);
+
+        // bell: one button cycling through the three modes
+        let bell_y = row_y(6);
+        let bell_btn = (x + pad, bell_y + 4, 110, rowh - 10);
 
         SettingsLayout {
             card: (x, y, w, h),
             head_h,
             rowh,
             theme_tiles,
+            font_label_y: font_y,
+            font_prev,
+            font_next,
             size_label_y: size_y,
             size_minus,
             size_plus,
+            cursor_label_y: cursor_y,
+            cursor_btns,
+            scroll_label_y: scroll_y,
+            scroll_minus,
+            scroll_plus,
+            copy_label_y: copy_y,
+            copy_toggle,
             liga_label_y: liga_y,
             liga_toggle,
+            bell_label_y: bell_y,
+            bell_btn,
         }
     }
 
     /// A real settings panel: clickable theme tiles (bg + palette dots, the
-    /// active one green-bordered), a −/+ font-size stepper, and a ligatures
-    /// toggle pill. Every control is a hit region in SettingsLayout.
-    #[allow(clippy::too_many_arguments)]
+    /// active one green-bordered), a font cycler, −/+ steppers for size and
+    /// scrollback, cursor-shape swatches, toggle pills and a bell-mode
+    /// cycler. Every control is a hit region in SettingsLayout.
     pub fn draw_settings(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
-                         active_theme: usize, font_size: i32, ligatures: bool) {
+                         v: &SettingsView) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
         let lay = self.settings_layout(fw, fh);
         let (x, y, w, h) = lay.card;
@@ -1255,11 +1377,15 @@ impl Renderer {
         let hw = self.measure(&head, true);
         self.draw_run(&head, true, out, whole, (x + w - 20) as f32 - hw, y + 12, 1.0);
 
+        // right-aligned row label (every row has one)
+        let label = |r: &mut Self, out: &mut Vec<Vertex>, text: &str, ly: i32| {
+            let seg = [Seg::plain(text, (0x9a, 0xa4, 0xb2))];
+            let lw = r.measure(&seg, true);
+            r.draw_run(&seg, true, out, whole, (x + w - 20) as f32 - lw, ly, 1.0);
+        };
+
         // ---- theme tiles ----
-        let tlbl = [Seg::plain("المظهر", (0x9a, 0xa4, 0xb2))];
-        let tlw = self.measure(&tlbl, true);
-        self.draw_run(&tlbl, true, out, whole,
-                      (x + w - 20) as f32 - tlw, y + lay.head_h - 4, 1.0);
+        label(self, out, "المظهر", y + lay.head_h - 4);
         for (i, tile) in lay.theme_tiles.iter().enumerate() {
             let (tx, ty, tw2, th) = *tile;
             let t = &THEMES[i];
@@ -1271,7 +1397,7 @@ impl Renderer {
                 push_rect(out, whole, tx + 4 + k as i32 * dw, ty + th - 8, dw - 2, 4, c4(*c, 255));
             }
             // border: green + thick for the active theme, faint otherwise
-            let (bc, bt) = if i == active_theme {
+            let (bc, bt) = if i == v.theme {
                 ((0x2e, 0xa0, 0x43), 2)
             } else {
                 ((0x30, 0x36, 0x3d), 1)
@@ -1282,11 +1408,6 @@ impl Renderer {
             push_rect(out, whole, tx + tw2 - bt, ty, bt, th, c4(bc, 255));
         }
 
-        // ---- font size stepper ----
-        let slbl = [Seg::plain("حجم الخطّ", (0x9a, 0xa4, 0xb2))];
-        let slw = self.measure(&slbl, true);
-        self.draw_run(&slbl, true, out, whole,
-                      (x + w - 20) as f32 - slw, lay.size_label_y + 6, 1.0);
         let draw_btn = |r: &mut Self, out: &mut Vec<Vertex>, rect: Rect, label: &str| {
             let (bx, by, bw, bh) = rect;
             push_rect(out, whole, bx, by, bw, bh, c4((0x30, 0x36, 0x3d), 255));
@@ -1295,25 +1416,88 @@ impl Renderer {
             r.draw_run(&seg, false, out, whole,
                        bx as f32 + (bw as f32 - lw) / 2.0, by + 2, 1.0);
         };
+        // green value text centered between two stepper buttons
+        let draw_val = |r: &mut Self, out: &mut Vec<Vertex>, text: String,
+                        left: Rect, right: Rect, ly: i32| {
+            let seg = [Seg { text, fg: (0x7e, 0xe7, 0x87), style: ST_BOLD }];
+            let vw = r.measure(&seg, false);
+            let mid = (left.0 + left.2 + right.0) / 2;
+            r.draw_run(&seg, false, out, whole, mid as f32 - vw / 2.0, ly, 1.0);
+        };
+        let draw_toggle = |out: &mut Vec<Vertex>, rect: Rect, on: bool| {
+            let (gx, gy, gw, gh) = rect;
+            let track = if on { (0x2e, 0xa0, 0x43) } else { (0x30, 0x36, 0x3d) };
+            push_rect(out, whole, gx, gy, gw, gh, c4(track, 255));
+            let knob = gh - 6;
+            let kx = if on { gx + gw - knob - 3 } else { gx + 3 };
+            push_rect(out, whole, kx, gy + 3, knob, knob, c4((0xff, 0xff, 0xff), 255));
+        };
+
+        // ---- font family cycler ----
+        label(self, out, "الخطّ", lay.font_label_y + 6);
+        draw_btn(self, out, lay.font_prev, "‹");
+        draw_btn(self, out, lay.font_next, "›");
+        draw_val(self, out, v.font_family.to_string(),
+                 lay.font_prev, lay.font_next, lay.font_label_y + 6);
+
+        // ---- font size stepper ----
+        label(self, out, "حجم الخطّ", lay.size_label_y + 6);
         draw_btn(self, out, lay.size_minus, "−");
         draw_btn(self, out, lay.size_plus, "+");
-        let val = [Seg { text: format!("{font_size}"), fg: (0x7e, 0xe7, 0x87), style: ST_BOLD }];
-        let vw = self.measure(&val, false);
-        let mid = (lay.size_minus.0 + lay.size_minus.2 + lay.size_plus.0) / 2;
-        self.draw_run(&val, false, out, whole, mid as f32 - vw / 2.0,
-                      lay.size_label_y + 6, 1.0);
+        draw_val(self, out, format!("{}", v.font_size),
+                 lay.size_minus, lay.size_plus, lay.size_label_y + 6);
 
-        // ---- ligatures toggle ----
-        let llbl = [Seg::plain("الأربطة", (0x9a, 0xa4, 0xb2))];
-        let llw = self.measure(&llbl, true);
-        self.draw_run(&llbl, true, out, whole,
-                      (x + w - 20) as f32 - llw, lay.liga_label_y + 6, 1.0);
-        let (gx, gy, gw, gh) = lay.liga_toggle;
-        let track = if ligatures { (0x2e, 0xa0, 0x43) } else { (0x30, 0x36, 0x3d) };
-        push_rect(out, whole, gx, gy, gw, gh, c4(track, 255));
-        let knob = gh - 6;
-        let kx = if ligatures { gx + gw - knob - 3 } else { gx + 3 };
-        push_rect(out, whole, kx, gy + 3, knob, knob, c4((0xff, 0xff, 0xff), 255));
+        // ---- cursor shape swatches (block / bar / underline) ----
+        label(self, out, "المؤشّر", lay.cursor_label_y + 6);
+        for (i, &(bx, by, bw, bh)) in lay.cursor_btns.iter().enumerate() {
+            let active = crate::config::CursorStyle::ALL[i] == v.cursor;
+            let bgc = if active { (0x1f, 0x3a, 0x2a) } else { (0x30, 0x36, 0x3d) };
+            push_rect(out, whole, bx, by, bw, bh, c4(bgc, 255));
+            if active {
+                push_rect(out, whole, bx, by + bh - 2, bw, 2, c4((0x2e, 0xa0, 0x43), 255));
+            }
+            // the shape itself, drawn as rects — no glyphs to go missing
+            let c = c4(self.fg, 255);
+            match crate::config::CursorStyle::ALL[i] {
+                crate::config::CursorStyle::Block =>
+                    push_rect(out, whole, bx + 8, by + 7, bw - 16, bh - 14, c),
+                crate::config::CursorStyle::Bar =>
+                    push_rect(out, whole, bx + bw / 2 - 1, by + 7, 3, bh - 14, c),
+                crate::config::CursorStyle::Underline =>
+                    push_rect(out, whole, bx + 8, by + bh - 10, bw - 16, 3, c),
+            }
+        }
+
+        // ---- scrollback stepper (new tabs only) ----
+        label(self, out, "سجلّ التمرير (التبويبات الجديدة)", lay.scroll_label_y + 6);
+        draw_btn(self, out, lay.scroll_minus, "−");
+        draw_btn(self, out, lay.scroll_plus, "+");
+        let sb = if v.scrollback % 1000 == 0 {
+            format!("{}k", v.scrollback / 1000)
+        } else {
+            format!("{}", v.scrollback)
+        };
+        draw_val(self, out, sb, lay.scroll_minus, lay.scroll_plus, lay.scroll_label_y + 6);
+
+        // ---- copy-on-select / ligatures toggles ----
+        label(self, out, "النسخ عند التحديد", lay.copy_label_y + 6);
+        draw_toggle(out, lay.copy_toggle, v.copy_on_select);
+        label(self, out, "الأربطة", lay.liga_label_y + 6);
+        draw_toggle(out, lay.liga_toggle, v.ligatures);
+
+        // ---- bell mode cycler ----
+        label(self, out, "الجرس", lay.bell_label_y + 6);
+        let (bx, by, bw, bh) = lay.bell_btn;
+        push_rect(out, whole, bx, by, bw, bh, c4((0x30, 0x36, 0x3d), 255));
+        let bell_txt = match v.bell {
+            crate::config::BellMode::Attention => "تنبيه",
+            crate::config::BellMode::Sound => "صوت",
+            crate::config::BellMode::Silent => "صامت",
+        };
+        let seg = [Seg { text: bell_txt.into(), fg: (0x7e, 0xe7, 0x87), style: ST_BOLD }];
+        let lw = self.measure(&seg, true);
+        self.draw_run(&seg, true, out, whole,
+                      bx as f32 + (bw as f32 - lw) / 2.0, by + 2, 1.0);
 
         // footer hint
         let hint = [Seg::plain("انقر للتغيير · Esc للإغلاق والحفظ", (0x8a, 0x94, 0xa3))];
@@ -1721,12 +1905,25 @@ mod cache_tests {
             assert!(tx >= last_right, "tiles must not overlap");
             last_right = tx + tw;
         }
-        // the three action controls are distinct rects
-        assert_ne!(lay.size_minus, lay.size_plus);
-        assert!(rect_hit(lay.size_minus,
-                         (lay.size_minus.0 + 2) as f64, (lay.size_minus.1 + 2) as f64));
-        assert!(rect_hit(lay.liga_toggle,
-                         (lay.liga_toggle.0 + 2) as f64, (lay.liga_toggle.1 + 2) as f64));
+        // every control is a distinct rect, inside the card, and none of
+        // them overlap (each row's controls sit in their own band)
+        let mut controls: Vec<Rect> = vec![
+            lay.font_prev, lay.font_next,
+            lay.size_minus, lay.size_plus,
+            lay.scroll_minus, lay.scroll_plus,
+            lay.copy_toggle, lay.liga_toggle, lay.bell_btn,
+        ];
+        controls.extend(lay.cursor_btns);
+        for (i, &(rx, ry, rw, rh)) in controls.iter().enumerate() {
+            assert!(rx >= cx && rx + rw <= cx + cw && ry >= cy && ry + rh <= cy + ch,
+                    "control {i} escapes the card");
+            assert!(rect_hit(controls[i], (rx + 2) as f64, (ry + 2) as f64));
+            for &other in &controls[i + 1..] {
+                let (ox, oy, ow, oh) = other;
+                let disjoint = rx + rw <= ox || ox + ow <= rx || ry + rh <= oy || oy + oh <= ry;
+                assert!(disjoint, "controls overlap: {:?} vs {:?}", controls[i], other);
+            }
+        }
         // a point in the first tile does NOT hit the +/− or toggle
         let (t0x, t0y, _, _) = lay.theme_tiles[0];
         assert!(!rect_hit(lay.size_plus, (t0x + 2) as f64, (t0y + 2) as f64));

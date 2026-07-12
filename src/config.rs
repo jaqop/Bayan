@@ -31,6 +31,111 @@ pub struct UserConfig {
     /// ligature-capable font (Cascadia Code, JetBrains Mono, Fira Code).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ligatures: Option<bool>,
+    /// Cursor shape: "block" (default), "bar", "underline".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_style: Option<String>,
+    /// Scrollback lines per pane (default 10000). New tabs only — the
+    /// universal terminal convention; live sessions keep their buffer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scrollback: Option<u32>,
+    /// Auto-copy a mouse selection to the clipboard on release (default on,
+    /// EasyTer's convention). Explicit Ctrl+C copy always works.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copy_on_select: Option<bool>,
+    /// BEL behavior: "attention" (amber tab dot, default), "sound"
+    /// (dot + system beep), "silent" (nothing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bell: Option<String>,
+}
+
+/// Cursor shape (the trio every terminal offers: block / bar / underline).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CursorStyle {
+    Block,
+    Bar,
+    Underline,
+}
+
+impl CursorStyle {
+    pub const ALL: [CursorStyle; 3] =
+        [CursorStyle::Block, CursorStyle::Bar, CursorStyle::Underline];
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "bar" => CursorStyle::Bar,
+            "underline" => CursorStyle::Underline,
+            _ => CursorStyle::Block,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CursorStyle::Block => "block",
+            CursorStyle::Bar => "bar",
+            CursorStyle::Underline => "underline",
+        }
+    }
+}
+
+/// What a BEL does (beyond a TUI's own visuals).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BellMode {
+    /// amber attention dot on the tab (the cockpit signal) — default
+    Attention,
+    /// the dot plus a system beep
+    Sound,
+    /// nothing at all
+    Silent,
+}
+
+impl BellMode {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "sound" => BellMode::Sound,
+            "silent" => BellMode::Silent,
+            _ => BellMode::Attention,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BellMode::Attention => "attention",
+            BellMode::Sound => "sound",
+            BellMode::Silent => "silent",
+        }
+    }
+
+    /// The settings panel cycles attention → sound → silent → …
+    pub fn next(self) -> Self {
+        match self {
+            BellMode::Attention => BellMode::Sound,
+            BellMode::Sound => BellMode::Silent,
+            BellMode::Silent => BellMode::Attention,
+        }
+    }
+}
+
+pub const DEFAULT_SCROLLBACK: usize = 10_000;
+/// The −/+ stepper in the settings panel walks these.
+pub const SCROLLBACK_STEPS: [usize; 6] = [1_000, 5_000, 10_000, 20_000, 50_000, 100_000];
+
+impl UserConfig {
+    pub fn cursor(&self) -> CursorStyle {
+        self.cursor_style.as_deref().map(CursorStyle::parse).unwrap_or(CursorStyle::Block)
+    }
+
+    pub fn bell_mode(&self) -> BellMode {
+        self.bell.as_deref().map(BellMode::parse).unwrap_or(BellMode::Attention)
+    }
+
+    pub fn scrollback_lines(&self) -> usize {
+        (self.scrollback.map(|n| n as usize).unwrap_or(DEFAULT_SCROLLBACK))
+            .clamp(100, 100_000)
+    }
+
+    pub fn copy_on_select_on(&self) -> bool {
+        self.copy_on_select.unwrap_or(true)
+    }
 }
 
 /// "#rrggbb" (or "rrggbb") -> rgb. None on anything malformed.
@@ -54,7 +159,8 @@ fn config_path() -> Option<std::path::PathBuf> {
 pub fn load() -> UserConfig {
     config_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
+        // Windows editors love a UTF-8 BOM; serde_json rejects it
+        .and_then(|s| serde_json::from_str(s.trim_start_matches('\u{feff}')).ok())
         .unwrap_or_default()
 }
 
@@ -87,6 +193,42 @@ mod tests {
         assert!(extra.font_size.is_none());
         // garbage must not panic the loader path
         assert!(serde_json::from_str::<UserConfig>("{oops").is_err());
+        // a UTF-8 BOM (Windows editors) must not kill the whole config
+        let bom = "\u{feff}{\"font_size\":12.0}";
+        let cfg: UserConfig =
+            serde_json::from_str(bom.trim_start_matches('\u{feff}')).unwrap();
+        assert_eq!(cfg.font_size, Some(12.0));
+    }
+
+    #[test]
+    fn behavior_settings_resolve_with_defaults() {
+        // absent keys resolve to the documented defaults
+        let d = UserConfig::default();
+        assert_eq!(d.cursor(), CursorStyle::Block);
+        assert_eq!(d.bell_mode(), BellMode::Attention);
+        assert_eq!(d.scrollback_lines(), DEFAULT_SCROLLBACK);
+        assert!(d.copy_on_select_on());
+        // explicit values parse; unknown strings fall back, never panic
+        let c: UserConfig = serde_json::from_str(
+            r#"{"cursor_style":"bar","scrollback":50000,"copy_on_select":false,"bell":"silent"}"#,
+        )
+        .unwrap();
+        assert_eq!(c.cursor(), CursorStyle::Bar);
+        assert_eq!(c.scrollback_lines(), 50_000);
+        assert!(!c.copy_on_select_on());
+        assert_eq!(c.bell_mode(), BellMode::Silent);
+        assert_eq!(CursorStyle::parse("banana"), CursorStyle::Block);
+        assert_eq!(BellMode::parse("banana"), BellMode::Attention);
+        // scrollback is clamped to sane bounds
+        let tiny: UserConfig = serde_json::from_str(r#"{"scrollback":1}"#).unwrap();
+        assert_eq!(tiny.scrollback_lines(), 100);
+        // the bell cycle visits all three states and returns home
+        let m = BellMode::Attention;
+        assert_eq!(m.next().next().next(), m);
+        // round-trip through as_str/parse
+        for s in CursorStyle::ALL {
+            assert_eq!(CursorStyle::parse(s.as_str()), s);
+        }
     }
 
     #[test]

@@ -19,6 +19,16 @@ fn hex((r, g, b): (u8, u8, u8)) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
 }
 
+/// The system notification sound (bell mode "sound"). Async — never blocks
+/// the UI thread.
+fn beep() {
+    unsafe {
+        // windows-sys files MessageBeep under Diagnostics::Debug (user32's
+        // winuser.h function, but that's where the metadata puts it)
+        windows_sys::Win32::System::Diagnostics::Debug::MessageBeep(0);
+    }
+}
+
 /// The quake hotkey (Ctrl+Alt+`) fires from ANYWHERE via RegisterHotKey;
 /// winit's msg hook flags it and about_to_wait toggles the window.
 static QUAKE_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -470,6 +480,54 @@ impl App {
         self.request_redraw();
     }
 
+    /// Step to the previous/next installed monospace family. The renderer
+    /// rebuild applies it live (same path as the theme).
+    fn cycle_font(&mut self, dir: i32) {
+        let Some(r) = self.renderer.as_ref() else { return };
+        let choices = r.font_choices();
+        if choices.len() < 2 {
+            return;
+        }
+        let cur = r.family();
+        let i = choices.iter().position(|c| c == cur).unwrap_or(0) as i32;
+        let n = choices.len() as i32;
+        let next = choices[(((i + dir) % n + n) % n) as usize].clone();
+        self.config.font_family = Some(next);
+        self.rebuild_renderer();
+        self.request_redraw();
+    }
+
+    fn set_cursor_style(&mut self, s: config::CursorStyle) {
+        self.config.cursor_style = Some(s.as_str().to_string());
+        self.request_redraw(); // read per-frame; no rebuild needed
+    }
+
+    /// Walk the scrollback presets. Applies to new tabs only (the universal
+    /// terminal convention — live sessions keep their buffer).
+    fn change_scrollback(&mut self, dir: i32) {
+        let cur = self.config.scrollback_lines();
+        let steps = config::SCROLLBACK_STEPS;
+        // nearest preset, then step
+        let i = steps.iter().position(|&s| s >= cur).unwrap_or(steps.len() - 1) as i32;
+        let j = (i + dir).clamp(0, steps.len() as i32 - 1) as usize;
+        self.config.scrollback = Some(steps[j] as u32);
+        self.request_redraw();
+    }
+
+    fn toggle_copy_on_select(&mut self) {
+        self.config.copy_on_select = Some(!self.config.copy_on_select_on());
+        self.request_redraw();
+    }
+
+    fn cycle_bell(&mut self) {
+        let next = self.config.bell_mode().next();
+        self.config.bell = Some(next.as_str().to_string());
+        if next == config::BellMode::Sound {
+            beep(); // preview the mode you just picked
+        }
+        self.request_redraw();
+    }
+
     fn close_settings(&mut self) {
         self.settings = None;
         config::save(&self.config); // persist on close
@@ -494,12 +552,28 @@ impl App {
         }
         if let Some(i) = lay.theme_tiles.iter().position(|&t| render::rect_hit(t, px, py)) {
             self.apply_theme(i);
+        } else if render::rect_hit(lay.font_prev, px, py) {
+            self.cycle_font(-1);
+        } else if render::rect_hit(lay.font_next, px, py) {
+            self.cycle_font(1);
         } else if render::rect_hit(lay.size_minus, px, py) {
             self.change_font_size(-1);
         } else if render::rect_hit(lay.size_plus, px, py) {
             self.change_font_size(1);
+        } else if let Some(i) =
+            lay.cursor_btns.iter().position(|&b| render::rect_hit(b, px, py))
+        {
+            self.set_cursor_style(config::CursorStyle::ALL[i]);
+        } else if render::rect_hit(lay.scroll_minus, px, py) {
+            self.change_scrollback(-1);
+        } else if render::rect_hit(lay.scroll_plus, px, py) {
+            self.change_scrollback(1);
+        } else if render::rect_hit(lay.copy_toggle, px, py) {
+            self.toggle_copy_on_select();
         } else if render::rect_hit(lay.liga_toggle, px, py) {
             self.toggle_ligatures();
+        } else if render::rect_hit(lay.bell_btn, px, py) {
+            self.cycle_bell();
         }
     }
 
@@ -632,7 +706,8 @@ impl App {
     fn spawn_pane(&mut self, cwd: Option<&str>) -> Option<Pane> {
         let id = self.next_id;
         self.next_id += 1;
-        match Session::spawn(self.size, self.proxy.clone(), id, cwd) {
+        match Session::spawn(self.size, self.proxy.clone(), id, cwd,
+                             self.config.scrollback_lines()) {
             Ok(session) => Some(Pane { id, session, last_output: None }),
             Err(e) => {
                 eprintln!("bayan: spawn failed: {e}");
@@ -1100,7 +1175,13 @@ impl App {
         let settings_open = self.settings.is_some();
         let settings_theme = self.active_theme();
         let settings_size = self.config.font_size.unwrap_or(15.0) as i32;
-        let settings_liga = self.config.ligatures.unwrap_or(true);
+        // the family ACTUALLY in use (post-fallback), not the config wish
+        let settings_family = self
+            .renderer
+            .as_ref()
+            .map(|r| r.family().to_string())
+            .unwrap_or_default();
+        let cursor_style = self.config.cursor();
         let rects = self.pane_rects();
         let tab_infos: Vec<render::TabInfo> = self
             .tabs
@@ -1154,6 +1235,7 @@ impl App {
                     let view = render::PaneView {
                         rect: *rect,
                         focused,
+                        cursor: cursor_style,
                         bordered,
                         claude: claude_pane,
                         search_match: if focused {
@@ -1187,9 +1269,16 @@ impl App {
                         &mut verts,
                         px.width as usize,
                         px.height as usize,
-                        settings_theme,
-                        settings_size,
-                        settings_liga,
+                        &render::SettingsView {
+                            theme: settings_theme,
+                            font_family: &settings_family,
+                            font_size: settings_size,
+                            cursor: cursor_style,
+                            scrollback: self.config.scrollback_lines(),
+                            copy_on_select: self.config.copy_on_select_on(),
+                            ligatures: self.config.ligatures.unwrap_or(true),
+                            bell: self.config.bell_mode(),
+                        },
                     );
                 }
                 if let Some(p) = &self.pending_paste {
@@ -1350,10 +1439,20 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ClipboardSet(text) => self.set_clipboard(text),
             UserEvent::Bell(id) => {
                 // the cockpit signal: a pane you're NOT looking at wants you
+                let mode = self.config.bell_mode();
+                if mode == config::BellMode::Silent {
+                    return;
+                }
                 if let Some((ti, _)) = self.find_pane(id) {
-                    if ti != self.active {
+                    let background = ti != self.active;
+                    if background {
                         self.tabs[ti].attention = true;
                         self.request_redraw();
+                    }
+                    // sound only when you could have missed it: another tab,
+                    // or the window itself is unfocused
+                    if mode == config::BellMode::Sound && (background || !self.focused) {
+                        beep();
                     }
                 }
             }
@@ -1573,7 +1672,7 @@ impl ApplicationHandler<UserEvent> for App {
                             t.selection = Some(Selection::new(ty, point, side));
                         }
                         self.mouse_left_down = true;
-                        if n >= 2 {
+                        if n >= 2 && self.config.copy_on_select_on() {
                             // word/line selections are complete on click
                             self.copy_selection(false);
                         }
@@ -1586,7 +1685,11 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     self.mouse_left_down = false;
                     // EasyTer convention: auto-copy the selection on release
-                    self.copy_selection(false);
+                    // (the settings panel can turn this off; explicit
+                    // Ctrl+C / Ctrl+Shift+C always copy)
+                    if self.config.copy_on_select_on() {
+                        self.copy_selection(false);
+                    }
                 }
             },
             WindowEvent::MouseWheel { delta, .. } => {

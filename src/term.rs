@@ -17,7 +17,6 @@ use winit::event_loop::EventLoopProxy;
 use crate::UserEvent;
 
 pub const DEFAULT_SHELL: &str = "powershell.exe";
-pub const SCROLLBACK: usize = 10_000;
 const MAX_CARRY: usize = 4096;
 
 /// OSC 133 prompt wrapper injected into PowerShell (EasyTer's __et_wrap,
@@ -446,6 +445,7 @@ impl Session {
         proxy: EventLoopProxy<UserEvent>,
         id: u64,
         start_cwd: Option<&str>,
+        scrollback: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let pty = native_pty_system();
         let pair = pty.openpty(PtySize {
@@ -490,7 +490,7 @@ impl Session {
         let writer = pair.master.take_writer()?;
 
         let config = Config {
-            scrolling_history: SCROLLBACK,
+            scrolling_history: scrollback,
             ..Config::default()
         };
         let term = Arc::new(Mutex::new(Term::new(
