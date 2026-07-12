@@ -22,9 +22,11 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::Term;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 use cosmic_text::{
-    Align, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap,
+    Align, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache,
+    SwashContent, Wrap,
 };
 
+use crate::gpu::Vertex;
 use crate::term::EventProxy;
 
 // EasyTer heritage colors: the palette that proved itself for Arabic text
@@ -97,14 +99,214 @@ pub fn ansi_rgb(color: AnsiColor) -> (u8, u8, u8) {
     }
 }
 
-fn pack((r, g, b): (u8, u8, u8)) -> u32 {
-    ((r as u32) << 16) | ((g as u32) << 8) | b as u32
+/// Straight-alpha color for the quad batch.
+fn c4((r, g, b): (u8, u8, u8), a: u8) -> [f32; 4] {
+    [
+        r as f32 / 255.0,
+        g as f32 / 255.0,
+        b as f32 / 255.0,
+        a as f32 / 255.0,
+    ]
 }
 
-/// The background as a packed pixel — for the instant first frame drawn
-/// before the font system finishes loading (and inter-pane gaps).
-pub fn bg_packed() -> u32 {
-    pack(BG)
+pub const ATLAS_SIZE: u32 = 2048;
+/// uv of the white texel block at the atlas origin: solid quads sample it.
+const WHITE_UV: f32 = 1.0 / ATLAS_SIZE as f32;
+
+/// Emit one quad clipped to `clip` (uv adjusted proportionally): a pane's
+/// content can never bleed into a neighbouring pane.
+#[allow(clippy::too_many_arguments)]
+fn push_quad(out: &mut Vec<Vertex>, clip: Rect, x: f32, y: f32, w: f32, h: f32,
+             u0: f32, v0: f32, u1: f32, v1: f32, color: [f32; 4]) {
+    if w <= 0.0 || h <= 0.0 || color[3] <= 0.0 {
+        return;
+    }
+    let (cx, cy, cw, ch) = clip;
+    let (cx0, cy0) = (cx as f32, cy as f32);
+    let (cx1, cy1) = ((cx + cw) as f32, (cy + ch) as f32);
+    let (x1, y1) = (x + w, y + h);
+    let (nx0, ny0) = (x.max(cx0), y.max(cy0));
+    let (nx1, ny1) = (x1.min(cx1), y1.min(cy1));
+    if nx0 >= nx1 || ny0 >= ny1 {
+        return;
+    }
+    let du = (u1 - u0) / w;
+    let dv = (v1 - v0) / h;
+    let (mu0, mv0) = (u0 + (nx0 - x) * du, v0 + (ny0 - y) * dv);
+    let (mu1, mv1) = (u1 - (x1 - nx1) * du, v1 - (y1 - ny1) * dv);
+    let v = |px: f32, py: f32, u: f32, vv: f32| Vertex {
+        pos: [px, py],
+        uv: [u, vv],
+        color,
+    };
+    out.extend_from_slice(&[
+        v(nx0, ny0, mu0, mv0),
+        v(nx1, ny0, mu1, mv0),
+        v(nx0, ny1, mu0, mv1),
+        v(nx1, ny0, mu1, mv0),
+        v(nx1, ny1, mu1, mv1),
+        v(nx0, ny1, mu0, mv1),
+    ]);
+}
+
+/// Solid rect (samples the atlas's white texel).
+fn push_rect(out: &mut Vec<Vertex>, clip: Rect, x: i32, y: i32, w: i32, h: i32,
+             color: [f32; 4]) {
+    push_quad(out, clip, x as f32, y as f32, w as f32, h as f32,
+              WHITE_UV, WHITE_UV, WHITE_UV, WHITE_UV, color);
+}
+
+/// One rasterized glyph's slot in the atlas.
+#[derive(Clone, Copy)]
+struct GlyphEntry {
+    u0: f32,
+    v0: f32,
+    u1: f32,
+    v1: f32,
+    w: u32,
+    h: u32,
+    left: i32,
+    top: i32,
+    is_color: bool,
+}
+
+/// CPU-side glyph atlas (shelf-packed RGBA); the GPU uploads it when dirty.
+pub struct Atlas {
+    pub pixels: Vec<u8>,
+    pub dirty: bool,
+    map: std::collections::HashMap<cosmic_text::CacheKey, Option<GlyphEntry>>,
+    shelf_x: u32,
+    shelf_y: u32,
+    shelf_h: u32,
+}
+
+impl Atlas {
+    fn new() -> Self {
+        let mut a = Atlas {
+            pixels: vec![0; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize],
+            dirty: true,
+            map: std::collections::HashMap::new(),
+            shelf_x: 4,
+            shelf_y: 0,
+            shelf_h: 4,
+        };
+        a.write_white_texel();
+        a
+    }
+
+    fn write_white_texel(&mut self) {
+        for y in 0..3u32 {
+            for x in 0..3u32 {
+                let i = ((y * ATLAS_SIZE + x) * 4) as usize;
+                self.pixels[i..i + 4].copy_from_slice(&[255; 4]);
+            }
+        }
+    }
+
+    fn alloc(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
+        let pad = 1;
+        if self.shelf_x + w + pad > ATLAS_SIZE {
+            self.shelf_y += self.shelf_h + pad;
+            self.shelf_x = 0;
+            self.shelf_h = 0;
+        }
+        if self.shelf_y + h + pad > ATLAS_SIZE {
+            // full: reset wholesale (rare — thousands of glyphs fit; at worst
+            // one frame shows stale uvs before the next repaint)
+            self.map.clear();
+            self.pixels.fill(0);
+            self.shelf_x = 4;
+            self.shelf_y = 0;
+            self.shelf_h = 4;
+            self.write_white_texel();
+            if w + pad > ATLAS_SIZE || h + pad > ATLAS_SIZE {
+                return None;
+            }
+        }
+        let pos = (self.shelf_x, self.shelf_y);
+        self.shelf_x += w + pad;
+        self.shelf_h = self.shelf_h.max(h);
+        Some(pos)
+    }
+
+    /// Get-or-rasterize a glyph (None = zero-size, e.g. spaces).
+    fn entry(&mut self, fs: &mut FontSystem, swash: &mut SwashCache,
+             key: cosmic_text::CacheKey) -> Option<GlyphEntry> {
+        if let Some(e) = self.map.get(&key) {
+            return *e;
+        }
+        let entry = swash.get_image_uncached(fs, key).and_then(|img| {
+            let (w, h) = (img.placement.width, img.placement.height);
+            if w == 0 || h == 0 {
+                return None;
+            }
+            let (ax, ay) = self.alloc(w, h)?;
+            let is_color = matches!(img.content, SwashContent::Color);
+            for row in 0..h {
+                for col in 0..w {
+                    let dst = (((ay + row) * ATLAS_SIZE + ax + col) * 4) as usize;
+                    let px: [u8; 4] = match img.content {
+                        SwashContent::Mask => {
+                            let a = img.data[(row * w + col) as usize];
+                            [255, 255, 255, a]
+                        }
+                        SwashContent::Color => {
+                            let s = ((row * w + col) * 4) as usize;
+                            [img.data[s], img.data[s + 1], img.data[s + 2], img.data[s + 3]]
+                        }
+                        SwashContent::SubpixelMask => {
+                            let s = ((row * w + col) * 4) as usize;
+                            [255, 255, 255, img.data[s]]
+                        }
+                    };
+                    self.pixels[dst..dst + 4].copy_from_slice(&px);
+                }
+            }
+            self.dirty = true;
+            let s = ATLAS_SIZE as f32;
+            Some(GlyphEntry {
+                u0: ax as f32 / s,
+                v0: ay as f32 / s,
+                u1: (ax + w) as f32 / s,
+                v1: (ay + h) as f32 / s,
+                w,
+                h,
+                left: img.placement.left,
+                top: img.placement.top,
+                is_color,
+            })
+        });
+        self.map.insert(key, entry);
+        entry
+    }
+}
+
+/// Emit a shaped buffer's glyphs as atlas quads at (x_off, y_off), with the
+/// horizontal compression `scale` (EasyTer's fit — now a free GPU transform).
+#[allow(clippy::too_many_arguments)]
+fn push_shaped(out: &mut Vec<Vertex>, fs: &mut FontSystem, swash: &mut SwashCache,
+               atlas: &mut Atlas, buf: &Buffer, clip: Rect,
+               x_off: f32, y_off: i32, scale: f32) {
+    for run in buf.layout_runs() {
+        for glyph in run.glyphs.iter() {
+            let phys = glyph.physical((0.0, 0.0), 1.0);
+            let Some(e) = atlas.entry(fs, swash, phys.cache_key) else {
+                continue;
+            };
+            let color = if e.is_color {
+                [1.0, 1.0, 1.0, 1.0]
+            } else {
+                glyph
+                    .color_opt
+                    .map(|c| c4((c.r(), c.g(), c.b()), c.a()))
+                    .unwrap_or_else(|| c4(FG, 255))
+            };
+            let gx = x_off + (phys.x as f32 + e.left as f32) * scale;
+            let gy = y_off as f32 + run.line_y + phys.y as f32 - e.top as f32;
+            push_quad(out, clip, gx, gy, e.w as f32 * scale, e.h as f32,
+                      e.u0, e.v0, e.u1, e.v1, color);
+        }
+    }
 }
 
 /// One tab as the bar renders it.
@@ -150,34 +352,6 @@ pub struct PaneView<'a> {
 // translucent overlays, EasyTer's colors: selection blue, search amber
 const SELECTION_RGBA: ((u8, u8, u8), u32) = ((80, 140, 255), 90);
 const SEARCH_RGBA: ((u8, u8, u8), u32) = ((240, 180, 40), 120);
-
-fn blend(dst: u32, (sr, sg, sb): (u8, u8, u8), a: u32) -> u32 {
-    let (dr, dg, db) = ((dst >> 16) & 0xff, (dst >> 8) & 0xff, dst & 0xff);
-    let r = (sr as u32 * a + dr * (255 - a)) / 255;
-    let g = (sg as u32 * a + dg * (255 - a)) / 255;
-    let b = (sb as u32 * a + db * (255 - a)) / 255;
-    (r << 16) | (g << 8) | b
-}
-
-fn fill_rect(frame: &mut [u32], fw: usize, fh: usize, x0: i32, y0: i32, w: i32, h: i32, c: u32) {
-    for y in y0.max(0)..(y0 + h).min(fh as i32) {
-        let row = y as usize * fw;
-        for x in x0.max(0)..(x0 + w).min(fw as i32) {
-            frame[row + x as usize] = c;
-        }
-    }
-}
-
-fn blend_rect(frame: &mut [u32], fw: usize, fh: usize, x0: i32, y0: i32, w: i32, h: i32,
-              c: (u8, u8, u8), a: u32) {
-    for y in y0.max(0)..(y0 + h).min(fh as i32) {
-        let row = y as usize * fw;
-        for x in x0.max(0)..(x0 + w).min(fw as i32) {
-            let i = row + x as usize;
-            frame[i] = blend(frame[i], c, a);
-        }
-    }
-}
 
 fn is_arabic(c: char) -> bool {
     matches!(c as u32,
@@ -274,51 +448,10 @@ pub struct Renderer {
     metrics: Metrics,
     cache_hot: std::collections::HashMap<RunKey, ShapedRun>,
     cache_cold: std::collections::HashMap<RunKey, ShapedRun>,
+    pub atlas: Atlas,
     family: String,
     pub cell_w: f32,
     pub cell_h: f32,
-}
-
-/// Blit one shaped buffer (free function: callers hold disjoint field
-/// borrows of the Renderer while the cached run stays borrowed).
-#[allow(clippy::too_many_arguments)]
-fn blit_run(font_system: &mut FontSystem, swash: &mut SwashCache, buf: &Buffer,
-            frame: &mut [u32], fw: usize, fh: usize, clip: Rect,
-            x_off: f32, y_off: i32, scale: f32) {
-    let (cx, cy, cw2, ch2) = clip;
-    let cx0 = cx.max(0);
-    let cy0 = cy.max(0);
-    let cx1 = (cx + cw2).min(fw as i32);
-    let cy1 = (cy + ch2).min(fh as i32);
-    buf.draw(
-        font_system,
-        swash,
-        Color::rgb(FG.0, FG.1, FG.2),
-        |x, y, w, h, color| {
-            let a = color.a() as u32;
-            if a == 0 {
-                return;
-            }
-            let rgb = (color.r(), color.g(), color.b());
-            let xs = (x_off + x as f32 * scale).round() as i32;
-            let ws = ((w as f32 * scale).ceil() as i32).max(1);
-            for dy in 0..h as i32 {
-                let py = y_off + y + dy;
-                if py < cy0 || py >= cy1 {
-                    continue;
-                }
-                let row = py as usize * fw;
-                for dx in 0..ws {
-                    let px = xs + dx;
-                    if px < cx0 || px >= cx1 {
-                        continue;
-                    }
-                    let i = row + px as usize;
-                    frame[i] = blend(frame[i], rgb, a);
-                }
-            }
-        },
-    );
 }
 
 impl Renderer {
@@ -353,6 +486,7 @@ impl Renderer {
             metrics,
             cache_hot: std::collections::HashMap::new(),
             cache_cold: std::collections::HashMap::new(),
+            atlas: Atlas::new(),
             family,
             cell_w,
             cell_h: metrics.line_height,
@@ -408,17 +542,16 @@ impl Renderer {
         self.cache_hot[&key].natw
     }
 
-    /// Shape (cached) and blit a run at (x, y), optionally compressed
-    /// horizontally (EasyTer's fit), clipped to `clip` — a pane's text can
-    /// never bleed into a neighbouring pane. Returns the natural width.
+    /// Shape (cached) and emit a run's glyph quads at (x, y), optionally
+    /// compressed horizontally, clipped to `clip`. Returns the natural width.
     #[allow(clippy::too_many_arguments)]
     fn draw_run(&mut self, segs: &[(String, (u8, u8, u8))], align_left: bool,
-                frame: &mut [u32], fw: usize, fh: usize, clip: Rect,
+                out: &mut Vec<Vertex>, clip: Rect,
                 x: f32, y: i32, scale: f32) -> f32 {
         let key = self.ensure_shaped(segs, align_left);
-        let Renderer { cache_hot, font_system, cache, .. } = self;
+        let Renderer { cache_hot, font_system, cache, atlas, .. } = self;
         let run = &cache_hot[&key];
-        blit_run(font_system, cache, &run.buffer, frame, fw, fh, clip, x, y, scale);
+        push_shaped(out, font_system, cache, atlas, &run.buffer, clip, x, y, scale);
         run.natw
     }
 
@@ -426,7 +559,7 @@ impl Renderer {
     /// UAX#9 BiDi (mixed directions, LTR islands). Compressed to the pane
     /// when overflowing; the cursor resolves THROUGH the shaped layout.
     #[allow(clippy::too_many_arguments)]
-    fn draw_line_bidi(&mut self, frame: &mut [u32], fw: usize, fh: usize, clip: Rect,
+    fn draw_line_bidi(&mut self, out: &mut Vec<Vertex>, clip: Rect,
                       x0: i32, y: i32, pane_w: i32, cells: &[CellInfo], claude: bool,
                       cursor_col: Option<usize>) -> Option<(i32, i32)> {
         let mut end = cells.len();
@@ -467,7 +600,7 @@ impl Renderer {
         // shape unconstrained (cached), then compress to the pane on overflow
         let natw = self.measure(&segs, true);
         let scale = if natw > pane_w as f32 { pane_w as f32 / natw } else { 1.0 };
-        self.draw_run(&segs, true, frame, fw, fh, clip, x0 as f32, y, scale);
+        self.draw_run(&segs, true, out, clip, x0 as f32, y, scale);
         if let Some((b0, b1)) = cur_bytes {
             let c0 = cosmic_text::Cursor::new(0, b0);
             let c1 = cosmic_text::Cursor::new(0, b1);
@@ -487,7 +620,7 @@ impl Renderer {
     /// A row without Arabic (prompts, code, TUIs): strict grid placement.
     /// ASCII batches into runs pinned at col*cell_w; every other glyph draws
     /// per cell, compressed into its box when wider.
-    fn draw_line_grid(&mut self, frame: &mut [u32], fw: usize, fh: usize, clip: Rect,
+    fn draw_line_grid(&mut self, out: &mut Vec<Vertex>, clip: Rect,
                       x0: i32, y: i32, cells: &[CellInfo]) {
         let n = cells.len();
         let mut i = 0;
@@ -526,7 +659,7 @@ impl Renderer {
                     }
                 }
                 if !segs.is_empty() {
-                    self.draw_run(&segs, false, frame, fw, fh, clip,
+                    self.draw_run(&segs, false, out, clip,
                                   x0 as f32 + col0 as f32 * self.cell_w, y, 1.0);
                 }
                 i = j;
@@ -539,7 +672,7 @@ impl Renderer {
                 let natw = self.measure(&seg, false);
                 let boxw = ci.w as f32 * self.cell_w;
                 let scale = if natw > boxw + 0.5 { boxw / natw } else { 1.0 };
-                self.draw_run(&seg, false, frame, fw, fh, clip,
+                self.draw_run(&seg, false, out, clip,
                               x0 as f32 + ci.col as f32 * self.cell_w, y, scale);
                 i += 1;
             }
@@ -547,10 +680,9 @@ impl Renderer {
     }
 
     /// Draw one pane's terminal into its rect.
-    pub fn draw_pane(&mut self, frame: &mut [u32], width: usize, height: usize,
+    pub fn draw_pane(&mut self, out: &mut Vec<Vertex>,
                      view: &PaneView, term: &Term<EventProxy>) {
         let (px, py, pw, ph) = view.rect;
-        fill_rect(frame, width, height, px, py, pw, ph, pack(BG));
         let clip = view.rect;
         let rows = term.screen_lines();
         let history = term.grid().history_size();
@@ -588,7 +720,7 @@ impl Renderer {
                 let x1 = px + ((col + w) as f32 * self.cell_w).round() as i32;
                 let y0 = py + (li as f32 * self.cell_h).round() as i32;
                 let y1 = py + ((li + 1) as f32 * self.cell_h).round() as i32;
-                fill_rect(frame, width, height, x0, y0, x1 - x0, y1 - y0, pack(bg));
+                push_rect(out, clip, x0, y0, x1 - x0, y1 - y0, c4(bg, 255));
             }
             if selection.is_some_and(|s| s.contains(cell.point)) {
                 sel_cells.push((li, col, w));
@@ -613,14 +745,14 @@ impl Renderer {
             let y = py + (li as f32 * self.cell_h).round() as i32;
             if cells.iter().any(|ci| is_arabic(ci.c)) {
                 let on_row = cursor_vrow >= 0 && cursor_vrow as usize == li;
-                let r = self.draw_line_bidi(frame, width, height, clip, px, y, pw, cells,
+                let r = self.draw_line_bidi(out, clip, px, y, pw, cells,
                                             view.claude,
                                             if on_row { Some(ccol) } else { None });
                 if r.is_some() {
                     cursor_rect = r;
                 }
             } else {
-                self.draw_line_grid(frame, width, height, clip, px, y, cells);
+                self.draw_line_grid(out, clip, px, y, cells);
             }
         }
 
@@ -632,7 +764,7 @@ impl Renderer {
                 let x1 = px + ((col + w) as f32 * self.cell_w).round() as i32;
                 let y0 = py + (li as f32 * self.cell_h).round() as i32;
                 let y1 = py + ((li + 1) as f32 * self.cell_h).round() as i32;
-                blend_rect(frame, width, height, x0, y0, x1 - x0, y1 - y0, (r, g, b), a);
+                push_rect(out, clip, x0, y0, x1 - x0, y1 - y0, c4((r, g, b), a as u8));
             }
         }
 
@@ -645,9 +777,8 @@ impl Renderer {
                 self.cell_w.round() as i32,
             ));
             let y0 = py + (cursor_vrow as f32 * self.cell_h).round() as i32;
-            blend_rect(frame, width, height,
-                       x0, y0, wpx, self.cell_h.round() as i32,
-                       FG, 170);
+            push_rect(out, clip, x0, y0, wpx, self.cell_h.round() as i32,
+                      c4(FG, 170));
         }
 
         // command-block lights in the pane's left gutter (EasyTer's bars)
@@ -662,28 +793,28 @@ impl Renderer {
                 None => (0x6e, 0x76, 0x81),
             };
             let y0 = py + (vrow as f32 * self.cell_h).round() as i32;
-            fill_rect(frame, width, height, px, y0, 3,
-                      self.cell_h.round() as i32, pack(color));
+            push_rect(out, clip, px, y0, 3, self.cell_h.round() as i32,
+                      c4(color, 255));
         }
 
         // scroll position indicator while in history (EasyTer's slim bar)
         if off > 0 && history > 0 {
             let th = ((ph as f32 * rows as f32 / (history + rows) as f32) as i32).max(24);
             let ty = py + ((ph - th) as f32 * (1.0 - off as f32 / history as f32)) as i32;
-            blend_rect(frame, width, height, px + pw - 7, ty, 4, th, FG, 70);
+            push_rect(out, clip, px + pw - 7, ty, 4, th, c4(FG, 70));
         }
 
         // pane border when split: green marks the focused pane (EasyTer)
         if view.bordered {
             let c = if view.focused {
-                (0x2e, 0xa0, 0x43)
+                c4((0x2e, 0xa0, 0x43), 255)
             } else {
-                (0x30, 0x36, 0x3d)
+                c4((0x30, 0x36, 0x3d), 255)
             };
-            fill_rect(frame, width, height, px, py, pw, 1, pack(c));
-            fill_rect(frame, width, height, px, py + ph - 1, pw, 1, pack(c));
-            fill_rect(frame, width, height, px, py, 1, ph, pack(c));
-            fill_rect(frame, width, height, px + pw - 1, py, 1, ph, pack(c));
+            push_rect(out, clip, px, py, pw, 1, c);
+            push_rect(out, clip, px, py + ph - 1, pw, 1, c);
+            push_rect(out, clip, px, py, 1, ph, c);
+            push_rect(out, clip, px + pw - 1, py, 1, ph, c);
         }
     }
 
@@ -716,23 +847,23 @@ impl Renderer {
 
     /// The agent cockpit: every tab's state on one card. Amber = waiting for
     /// you (bell), green = working, dim = idle. Enter/click jumps.
-    pub fn draw_cockpit(&mut self, frame: &mut [u32], fw: usize, fh: usize,
+    pub fn draw_cockpit(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
                         entries: &[CockpitEntry], sel: usize) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
         let (x, y, w, h) = self.cockpit_rect(fw, fh, entries.len());
         // dim the world behind the card
-        blend_rect(frame, fw, fh, 0, 0, fw as i32, fh as i32, (0, 0, 0), 110);
-        fill_rect(frame, fw, fh, x, y, w, h, pack((0x1c, 0x21, 0x28)));
-        fill_rect(frame, fw, fh, x, y, w, 2, pack((0x2e, 0xa0, 0x43))); // accent
+        push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 110));
+        push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 255));
+        push_rect(out, whole, x, y, w, 2, c4((0x2e, 0xa0, 0x43), 255)); // accent
         let row_h = self.cockpit_row_h();
         // header
         let head = [("مقصورة الوكلاء".to_string(), FG)];
-        self.draw_run(&head, true, frame, fw, fh, whole, (x + 14) as f32, y + 8, 1.0);
+        self.draw_run(&head, true, out, whole, (x + 14) as f32, y + 8, 1.0);
         let rows_top = y + row_h + 6;
         for (i, e) in entries.iter().enumerate() {
             let ry = rows_top + i as i32 * row_h;
             if i == sel {
-                fill_rect(frame, fw, fh, x + 4, ry, w - 8, row_h, pack((0x24, 0x2b, 0x36)));
+                push_rect(out, whole, x + 4, ry, w - 8, row_h, c4((0x24, 0x2b, 0x36), 255));
             }
             // state dot: attention (amber) beats busy (green) beats idle (dim)
             let dot = if e.attention {
@@ -743,7 +874,7 @@ impl Renderer {
                 (0x6e, 0x76, 0x81)
             };
             let d = 8;
-            blend_rect(frame, fw, fh, x + 14, ry + row_h / 2 - d / 2, d, d, dot, 255);
+            push_rect(out, whole, x + 14, ry + row_h / 2 - d / 2, d, d, c4(dot, 255));
             let fg = if e.active { FG } else { (0xb0, 0xb8, 0xc4) };
             let mark = if e.active { "● " } else { "" };
             let title: String = e.title.chars().take(22).collect();
@@ -753,12 +884,12 @@ impl Renderer {
                 ("   —   ".to_string(), (0x6e, 0x76, 0x81)),
                 (status, (0x9a, 0xa4, 0xb2)),
             ];
-            self.draw_run(&segs, true, frame, fw, fh, whole, (x + 32) as f32, ry + 6, 1.0);
+            self.draw_run(&segs, true, out, whole, (x + 32) as f32, ry + 6, 1.0);
         }
     }
 
     /// Window-level chrome: tab bar, search bar, Claude badge.
-    pub fn draw_chrome(&mut self, frame: &mut [u32], width: usize, height: usize,
+    pub fn draw_chrome(&mut self, out: &mut Vec<Vertex>, width: usize, height: usize,
                        tabs: &[TabInfo], search_query: Option<&str>, claude: bool) {
         let oy = self.tab_bar_h().round() as i32;
         let whole: Rect = (0, 0, width as i32, height as i32);
@@ -776,9 +907,8 @@ impl Renderer {
             } else {
                 6
             };
-            fill_rect(frame, width, height, bx, by, bw, bh, pack((0x2e, 0xa0, 0x43)));
-            self.draw_run(&segs, true, frame, width, height, whole,
-                          (bx + 8) as f32, by + 4, 1.0);
+            push_rect(out, whole, bx, by, bw, bh, c4((0x2e, 0xa0, 0x43), 255));
+            self.draw_run(&segs, true, out, whole, (bx + 8) as f32, by + 4, 1.0);
         }
 
         // search bar, top-right below the tab bar
@@ -787,17 +917,16 @@ impl Renderer {
             let bar_h = (self.cell_h + 10.0) as i32;
             let bx = width as i32 - bar_w - 10;
             let by = oy + 6;
-            fill_rect(frame, width, height, bx, by, bar_w, bar_h, pack((0x1c, 0x21, 0x28)));
-            blend_rect(frame, width, height, bx, by + bar_h - 2, bar_w, 2,
-                       PALETTE[11], 200); // amber underline = search accent
+            push_rect(out, whole, bx, by, bar_w, bar_h, c4((0x1c, 0x21, 0x28), 255));
+            push_rect(out, whole, bx, by + bar_h - 2, bar_w, 2,
+                      c4(PALETTE[11], 200)); // amber underline = search accent
             let label = format!("بحث: {q}_");
             let segs = [(label, FG)];
-            self.draw_run(&segs, true, frame, width, height, whole,
-                          (bx + 8) as f32, by + 5, 1.0);
+            self.draw_run(&segs, true, out, whole, (bx + 8) as f32, by + 5, 1.0);
         }
 
         // the tab bar, drawn last (nothing may bleed into it)
-        fill_rect(frame, width, height, 0, 0, width as i32, oy, pack((0x16, 0x1b, 0x22)));
+        push_rect(out, whole, 0, 0, width as i32, oy, c4((0x16, 0x1b, 0x22), 255));
         let tw = (self.cell_w * TAB_CELLS) as i32;
         for (i, tab) in tabs.iter().enumerate() {
             let x0 = i as i32 * tw;
@@ -806,16 +935,15 @@ impl Renderer {
             } else {
                 ((0x16, 0x1b, 0x22), (0x8a, 0x94, 0xa3))
             };
-            fill_rect(frame, width, height, x0, 0, tw - 2, oy, pack(bg));
+            push_rect(out, whole, x0, 0, tw - 2, oy, c4(bg, 255));
             if tab.active {
                 // accent line on top: the focused tab is unmistakable
-                fill_rect(frame, width, height, x0, 0, tw - 2, 2, pack((0x2e, 0xa0, 0x43)));
+                push_rect(out, whole, x0, 0, tw - 2, 2, c4((0x2e, 0xa0, 0x43), 255));
             }
             let max_chars = TAB_CELLS as usize - 5;
             let title: String = tab.title.chars().take(max_chars).collect();
             let segs = [(title, fg)];
-            self.draw_run(&segs, true, frame, width, height, whole,
-                          (x0 + 10) as f32, 5, 1.0);
+            self.draw_run(&segs, true, out, whole, (x0 + 10) as f32, 5, 1.0);
             // dots: amber attention (a Claude waiting on you) beats green busy
             let dot = if tab.attention {
                 Some((0xf2, 0xcc, 0x60))
@@ -826,7 +954,7 @@ impl Renderer {
             };
             if let Some(c) = dot {
                 let d = 6;
-                blend_rect(frame, width, height, x0 + tw - 16, oy / 2 - d / 2, d, d, c, 255);
+                push_rect(out, whole, x0 + tw - 16, oy / 2 - d / 2, d, d, c4(c, 255));
             }
         }
     }

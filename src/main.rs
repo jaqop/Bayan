@@ -9,6 +9,7 @@
 
 mod bidi;
 mod config;
+mod gpu;
 mod keys;
 mod render;
 mod term;
@@ -155,8 +156,7 @@ mod prof {
     }
 }
 
-use std::num::NonZeroU32;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -350,8 +350,8 @@ struct SearchState {
 
 struct App {
     proxy: EventLoopProxy<UserEvent>,
-    window: Option<Rc<Window>>,
-    surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
+    window: Option<Arc<Window>>,
+    gpu: Option<gpu::Gpu>,
     renderer: Option<render::Renderer>,
     tabs: Vec<Tab>,
     active: usize,
@@ -966,7 +966,7 @@ impl App {
     }
 
     fn redraw(&mut self) {
-        // computed before the surface borrow (they read &self broadly)
+        // computed before the gpu/renderer borrows (they read &self broadly)
         let cockpit_entries = if self.cockpit {
             self.cockpit_entries()
         } else {
@@ -984,22 +984,14 @@ impl App {
                 active: i == self.active,
             })
             .collect();
-        let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut())
-        else {
-            return;
-        };
+        let Some(window) = self.window.as_ref() else { return };
         let px = window.inner_size();
         if px.width == 0 || px.height == 0 {
             return;
         }
-        let mut buffer = match surface.buffer_mut() {
-            Ok(b) => b,
-            Err(_) => return,
-        };
+        let mut verts: Vec<gpu::Vertex> = Vec::new();
         match (self.renderer.as_mut(), self.tabs.get(self.active)) {
             (Some(renderer), Some(tab)) if !rects.is_empty() => {
-                // inter-pane gaps + any rounding slack
-                buffer.fill(render::bg_packed());
                 let bordered = tab.panes.len() > 1;
                 let (auto_follow, claude_manual) = (self.auto_follow, self.claude_manual);
                 let mut focused_claude = false;
@@ -1037,11 +1029,10 @@ impl App {
                         },
                         marks: &marks,
                     };
-                    renderer.draw_pane(&mut buffer, px.width as usize,
-                                       px.height as usize, &view, &t);
+                    renderer.draw_pane(&mut verts, &view, &t);
                 }
                 renderer.draw_chrome(
-                    &mut buffer,
+                    &mut verts,
                     px.width as usize,
                     px.height as usize,
                     &tab_infos,
@@ -1050,7 +1041,7 @@ impl App {
                 );
                 if self.cockpit {
                     renderer.draw_cockpit(
-                        &mut buffer,
+                        &mut verts,
                         px.width as usize,
                         px.height as usize,
                         &cockpit_entries,
@@ -1058,12 +1049,21 @@ impl App {
                     );
                 }
             }
-            // renderer still warming up on its thread: dark frame, instantly
-            _ => buffer.fill(render::bg_packed()),
+            // renderer still warming up on its thread: clear-only dark frame
+            _ => {}
         }
-        let _ = buffer.present();
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        // new glyphs were rasterized this frame: sync the atlas texture
+        if let Some(renderer) = self.renderer.as_mut() {
+            if renderer.atlas.dirty {
+                gpu.upload_atlas(&renderer.atlas.pixels);
+                renderer.atlas.dirty = false;
+            }
+        }
+        gpu.render(&verts, render::BG);
         if !self.first_frame {
             self.first_frame = true;
+            window.set_visible(true);
             crate::prof::mark("first frame presented");
         }
     }
@@ -1074,19 +1074,19 @@ impl ApplicationHandler<UserEvent> for App {
         if self.window.is_some() {
             return;
         }
+        // hidden until the GPU presents the first dark frame (~0.4s): a
+        // fully-drawn window appearing beats a white flash while DX12 warms up
         let attrs = Window::default_attributes()
             .with_title("Bayan — بيان")
+            .with_visible(false)
             .with_inner_size(LogicalSize::new(1100.0, 700.0));
-        let window = Rc::new(el.create_window(attrs).expect("create window"));
+        let window = Arc::new(el.create_window(attrs).expect("create window"));
         crate::prof::mark("window created");
-        let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
-        let mut surface =
-            softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
         let px = window.inner_size();
-        if let (Some(w), Some(h)) = (NonZeroU32::new(px.width), NonZeroU32::new(px.height)) {
-            let _ = surface.resize(w, h);
-        }
-        self.surface = Some(surface);
+        let gpu = gpu::Gpu::new(window.clone(), px.width, px.height, render::ATLAS_SIZE)
+            .expect("gpu init (DX12/Vulkan/GL via wgpu)");
+        crate::prof::mark("gpu ready");
+        self.gpu = Some(gpu);
         self.window = Some(window.clone());
         // first frame NOW: a dark window on screen beats a frozen launcher.
         // The shell and the font system warm up behind it, in parallel.
@@ -1209,12 +1209,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if px.width == 0 || px.height == 0 {
                     return;
                 }
-                if let Some(surface) = self.surface.as_mut() {
-                    if let (Some(w), Some(h)) =
-                        (NonZeroU32::new(px.width), NonZeroU32::new(px.height))
-                    {
-                        let _ = surface.resize(w, h);
-                    }
+                if let Some(gpu) = self.gpu.as_mut() {
+                    gpu.resize(px.width, px.height);
                 }
                 self.relayout_active();
                 self.request_redraw();
@@ -1578,7 +1574,7 @@ fn main() {
     let mut app = App {
         proxy,
         window: None,
-        surface: None,
+        gpu: None,
         renderer: None,
         tabs: Vec::new(),
         active: 0,

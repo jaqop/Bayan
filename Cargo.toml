@@ -10,9 +10,11 @@ license = "MIT"
 alacritty_terminal = "0.24"
 # ConPTY (Windows) / openpty (unix), extracted from WezTerm
 portable-pty = "0.8"
-# windowing + CPU present + text shaping (HarfBuzz-class, BiDi, fallback)
+# windowing + GPU present + text shaping (HarfBuzz-class, BiDi, fallback)
 winit = "0.30"
-softbuffer = "0.4"
+wgpu = "24"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
 cosmic-text = "0.12"
 # system clipboard (copy on select / paste)
 arboard = "3"

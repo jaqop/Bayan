@@ -21,7 +21,7 @@ the intersection nobody serves.
 | VT emulation | `alacritty_terminal` | Alacritty's battle-tested core |
 | ConPTY | `portable-pty` | extracted from WezTerm |
 | Shaping / BiDi / fallback | `cosmic-text` | System76's text engine |
-| Window / present | `winit` + `softbuffer` | CPU present now, `wgpu` later |
+| Window / GPU | `winit` + `wgpu` | glyph-atlas quads, one pipeline, vsync |
 
 A reader thread feeds the emulator behind a mutex and nudges the UI thread —
 the same architecture EasyTer proved in production. EasyTer's regression
@@ -76,10 +76,16 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       (~340×), which is the honest 80% of what a GPU renderer buys; full
       layout persistence: every tab's panes, split axis, weights and focus
       survive a restart (pre-M9 session files still restore)
-- [ ] **M10 (backlog)** — wgpu renderer (a dedicated session: atlas +
-      shaders deserve their own runway, and the CPU path is now fast);
-      scrollback-cap-proof command marks (needs an eviction hook upstream
-      in alacritty_terminal — pyte allowed overriding HistoryScreen.index)
+- [x] **M10** — the wgpu renderer: every frame is one draw call of quads
+      (glyphs from a shelf-packed 2048² atlas, solid rects via a white
+      texel), WGSL pipeline with straight-alpha blending, vsync'd present,
+      DX12-first with GL fallback; Arabic shapes through the same cosmic-text
+      cache and rasterizes into the atlas — verified pixel-identical to the
+      CPU renderer. The window stays hidden until the first frame (~0.4s,
+      GPU init) so there's no white flash.
+- [ ] **M11 (backlog)** — scrollback-cap-proof command marks (needs an
+      eviction hook upstream in alacritty_terminal); atlas page growth
+      instead of reset; damage-based partial redraw
 
 ## Build
 
