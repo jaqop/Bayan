@@ -31,6 +31,17 @@ $c=$global:LASTEXITCODE;if($null -eq $c){if($?){$c=0}else{$c=1}};\
 $([char]27)]9;9;$($PWD.ProviderPath)$([char]7)\"\
 +(& $global:__BY_OP)+\"$([char]27)]133;B$([char]7)\"}}}; __by_wrap";
 
+/// One command block: where its prompt sits and how the command ended.
+/// `abs` = history size at mark time + cursor row: stable as output scrolls,
+/// converted back via `abs - history_now`. Honest limitation (EasyTer had
+/// the same until its eviction counter): once the scrollback cap is reached
+/// and old lines are evicted, marks past the cap drift — the content they
+/// pointed at is on its way out anyway.
+pub struct CmdMark {
+    pub abs: usize,
+    pub exit: Option<i32>,
+}
+
 /// Shared shell-integration state, updated by the reader thread's scanners.
 /// Lock order everywhere: term FIRST, then meta.
 #[derive(Default)]
@@ -43,6 +54,8 @@ pub struct SessionMeta {
     pub running_cmd: String,
     /// working directory from OSC 9;9
     pub cwd: Option<String>,
+    /// command blocks (OSC 133 A/D): gutter lights + prompt jumping
+    pub marks: Vec<CmdMark>,
 }
 
 /// Events one PTY chunk produced, delivered to the UI thread by the reader.
@@ -99,9 +112,9 @@ fn osc_opener_before(data: &[u8], esc: usize) -> Option<usize> {
     }
 }
 
-/// OSC 133 markers in a chunk: (start, end, kind). The carry logic above
-/// guarantees whole sequences, so an unterminated marker can't appear.
-fn find_osc133(data: &[u8]) -> Vec<(usize, usize, u8)> {
+/// OSC 133 markers in a chunk: (start, end, kind, exit code for D marks).
+/// The carry logic above guarantees whole sequences.
+fn find_osc133(data: &[u8]) -> Vec<(usize, usize, u8, Option<i32>)> {
     const P: &[u8] = b"\x1b]133;";
     let mut out = Vec::new();
     let mut i = 0;
@@ -123,7 +136,13 @@ fn find_osc133(data: &[u8]) -> Vec<(usize, usize, u8)> {
             }
             match end {
                 Some(e) => {
-                    out.push((i, e, kind));
+                    // "D;<code>" carries the exit status
+                    let exit = data[i + P.len() + 1..j]
+                        .strip_prefix(b";")
+                        .and_then(|p| std::str::from_utf8(p).ok())
+                        .and_then(|p| p.split(';').next())
+                        .and_then(|p| p.parse().ok());
+                    out.push((i, e, kind, exit));
                     i = e;
                     continue;
                 }
@@ -172,9 +191,28 @@ fn scan_cwd(data: &[u8]) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
-fn handle_osc133<T: EventListener>(t: &Term<T>, meta: &mut SessionMeta, kind: u8) {
+fn handle_osc133<T: EventListener>(
+    t: &Term<T>,
+    meta: &mut SessionMeta,
+    kind: u8,
+    exit: Option<i32>,
+) {
     match kind {
-        b'A' | b'D' => meta.running_cmd.clear(), // back to idle
+        b'A' => {
+            meta.running_cmd.clear();
+            // a new prompt starts on the cursor's row: record its block
+            let abs = t.grid().history_size() + t.grid().cursor.point.line.0.max(0) as usize;
+            meta.marks.push(CmdMark { abs, exit: None });
+            if meta.marks.len() > 2000 {
+                meta.marks.drain(..1000); // EasyTer's trim
+            }
+        }
+        b'D' => {
+            meta.running_cmd.clear();
+            if let Some(m) = meta.marks.last_mut() {
+                m.exit = exit;
+            }
+        }
         b'B' => {
             meta.at_prompt = true;
             meta.prompt_col = Some(t.grid().cursor.point.column.0);
@@ -207,11 +245,11 @@ pub(crate) fn process_chunk<T: EventListener>(
         ev.cwd = Some(c);
     }
     let mut pos = 0;
-    for (s, e, kind) in find_osc133(&buf) {
+    for (s, e, kind, exit) in find_osc133(&buf) {
         for &b in &buf[pos..s] {
             parser.advance(t, b);
         }
-        handle_osc133(t, meta, kind);
+        handle_osc133(t, meta, kind, exit);
         pos = e;
     }
     for &b in &buf[pos..] {

@@ -55,8 +55,12 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       directory), and the agent-cockpit seed: a green busy dot on any
       background tab producing output — you see the Claude that finished
       while you were elsewhere
-- [ ] **M6 (backlog)** — splits, command-blocks gutter + jump, full agent
-      cockpit (status/approvals across tabs), wgpu renderer, config file
+- [x] **M6** — command-block lights in the gutter (green/red/grey from OSC
+      133 exit codes) with Ctrl+Shift+Up/Down prompt jumping; optional
+      ~/.bayan/config.json (font_family, font_size); Ctrl+wheel live font
+      zoom with Ctrl+0 reset (debounced background renderer rebuilds)
+- [ ] **M7 (backlog)** — splits, full agent cockpit (status/approvals
+      across tabs), wgpu renderer, Claude-row logical-order copy
 
 ## Build
 

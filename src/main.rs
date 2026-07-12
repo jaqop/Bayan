@@ -8,6 +8,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod bidi;
+mod config;
 mod keys;
 mod render;
 mod term;
@@ -81,6 +82,19 @@ fn find_match<T: alacritty_terminal::event::EventListener>(
         };
         t.search_next(&mut rs, wrap, dir, side, None)
     })
+}
+
+/// The display offset that brings the previous/next prompt to the top of
+/// the view (EasyTer's _jump_command math). `abs_top` = absolute line of
+/// the viewport's first row.
+fn jump_offset(marks: &[usize], hist: usize, off: usize, dir: i32) -> Option<usize> {
+    let abs_top = hist as i64 - off as i64;
+    let target = if dir < 0 {
+        marks.iter().map(|&a| a as i64).filter(|&a| a < abs_top).max()
+    } else {
+        marks.iter().map(|&a| a as i64).filter(|&a| a > abs_top).min()
+    }?;
+    Some((hist as i64 - target + 1).clamp(0, hist as i64) as usize)
 }
 
 /// One cell step in the search direction, clamped to the buffer (used to
@@ -248,6 +262,11 @@ struct App {
     /// F2 switches to manual and back (EasyTer's toggle semantics).
     auto_follow: bool,
     claude_manual: bool,
+    config: config::UserConfig,
+    /// Ctrl+wheel zoom, in points on top of the configured size.
+    font_delta: f32,
+    renderer_building: bool,
+    inflight_delta: f32,
 }
 
 impl App {
@@ -255,6 +274,43 @@ impl App {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
+    }
+
+    /// (Re)build the renderer off-thread for the current scale, config and
+    /// zoom. Debounced: one build in flight; a stale result triggers another.
+    fn rebuild_renderer(&mut self) {
+        if self.renderer_building {
+            return;
+        }
+        let Some(w) = &self.window else { return };
+        self.renderer_building = true;
+        self.inflight_delta = self.font_delta;
+        let proxy = self.proxy.clone();
+        let scale = w.scale_factor() as f32;
+        let cfg = self.config.clone();
+        let delta = self.font_delta;
+        std::thread::spawn(move || {
+            let r = render::Renderer::new(scale, &cfg, delta);
+            let _ = proxy.send_event(UserEvent::RendererReady(Box::new(r)));
+        });
+    }
+
+    /// Scroll to the previous (dir<0) or next command prompt (OSC 133 marks).
+    fn jump_command(&mut self, dir: i32) {
+        let Some(s) = self.session() else { return };
+        {
+            let mut t = s.term.lock().unwrap();
+            let hist = t.grid().history_size();
+            let off = t.grid().display_offset();
+            let marks: Vec<usize> = {
+                let m = s.meta.lock().unwrap();
+                m.marks.iter().map(|c| c.abs).collect()
+            };
+            if let Some(new_off) = jump_offset(&marks, hist, off, dir) {
+                t.scroll_display(Scroll::Delta(new_off as i32 - off as i32));
+            }
+        }
+        self.request_redraw();
     }
 
     fn session(&self) -> Option<&Session> {
@@ -577,11 +633,17 @@ impl App {
             .collect();
         match (self.renderer.as_mut(), self.tabs.get(self.active)) {
             (Some(renderer), Some(tab)) => {
+                // marks snapshot BEFORE the term lock (avoids holding both)
+                let marks: Vec<(usize, Option<i32>)> = {
+                    let m = tab.session.meta.lock().unwrap();
+                    m.marks.iter().map(|c| (c.abs, c.exit)).collect()
+                };
                 let overlay = render::Overlay {
                     search_query: self.search.as_ref().map(|s| s.query.as_str()),
                     search_match: self.search.as_ref().and_then(|s| s.hl.as_ref()),
                     claude,
                     tabs: &tab_infos,
+                    marks: &marks,
                 };
                 let t = tab.session.term.lock().unwrap();
                 renderer.draw(&mut buffer, px.width as usize, px.height as usize, &t, &overlay);
@@ -628,12 +690,7 @@ impl ApplicationHandler<UserEvent> for App {
         // FontSystem::new scans every installed font — the documented
         // cosmic-text startup cost (pop-os/cosmic-text#247): keep it off
         // the UI thread and swap the renderer in when it's ready
-        let proxy = self.proxy.clone();
-        let scale = window.scale_factor() as f32;
-        std::thread::spawn(move || {
-            let r = render::Renderer::new(scale);
-            let _ = proxy.send_event(UserEvent::RendererReady(Box::new(r)));
-        });
+        self.rebuild_renderer();
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
@@ -672,12 +729,17 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::RendererReady(r) => {
                 crate::prof::mark("renderer ready");
                 self.renderer = Some(*r);
+                self.renderer_building = false;
                 if let Some(px) = self.window.as_ref().map(|w| w.inner_size()) {
                     // now that cell metrics exist, snap the grid to the window
                     let g = self.grid_for(px);
                     if g != self.size {
                         self.resize_all(g);
                     }
+                }
+                // the zoom moved again while this build ran: chase it
+                if (self.font_delta - self.inflight_delta).abs() > f32::EPSILON {
+                    self.rebuild_renderer();
                 }
                 self.request_redraw();
             }
@@ -715,16 +777,11 @@ impl ApplicationHandler<UserEvent> for App {
                 el.exit();
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
-            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+            WindowEvent::ScaleFactorChanged { .. } => {
                 // HiDPI: the window moved to a monitor with another scale.
                 // Rebuild cell metrics off-thread; the current renderer keeps
                 // painting until RendererReady swaps it in and re-snaps the grid.
-                let proxy = self.proxy.clone();
-                let scale = scale_factor as f32;
-                std::thread::spawn(move || {
-                    let r = render::Renderer::new(scale);
-                    let _ = proxy.send_event(UserEvent::RendererReady(Box::new(r)));
-                });
+                self.rebuild_renderer();
             }
             WindowEvent::Resized(px) => {
                 if px.width == 0 || px.height == 0 {
@@ -809,6 +866,12 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 self.wheel_accum -= n as f32;
+                // Ctrl+wheel = live font zoom (EasyTer's favorite)
+                if self.modifiers.control_key() {
+                    self.font_delta = (self.font_delta + n as f32).clamp(-7.0, 25.0);
+                    self.rebuild_renderer();
+                    return;
+                }
                 let mode = self.term_mode();
                 if mode.contains(TermMode::ALT_SCREEN) {
                     // a full-screen TUI owns scrolling. EasyTer's rule: SGR
@@ -862,6 +925,18 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // ---- app-level shortcuts (EasyTer's rules) ----
                 if ctrl && shift {
+                    // Ctrl+Shift+Up/Down: jump between command prompts
+                    match key {
+                        Key::Named(NamedKey::ArrowUp) => {
+                            self.jump_command(-1);
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            self.jump_command(1);
+                            return;
+                        }
+                        _ => {}
+                    }
                     match key_letter(&event) {
                         Some('c') => {
                             self.copy_selection(false);
@@ -885,6 +960,18 @@ impl ApplicationHandler<UserEvent> for App {
                         };
                         self.switch_tab(next);
                         return;
+                    }
+                    // Ctrl+0 resets the font zoom (physical digit key:
+                    // works on the Arabic layout too)
+                    {
+                        use winit::keyboard::{KeyCode, PhysicalKey};
+                        if !shift
+                            && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Digit0))
+                        {
+                            self.font_delta = 0.0;
+                            self.rebuild_renderer();
+                            return;
+                        }
                     }
                     if let Some(l) = key_letter(&event) {
                         if shift && l == 'w' {
@@ -997,6 +1084,10 @@ fn main() {
         clipboard: None,
         auto_follow: true,
         claude_manual: false,
+        config: config::load(),
+        font_delta: 0.0,
+        renderer_building: false,
+        inflight_delta: 0.0,
     };
     event_loop.run_app(&mut app).expect("run event loop");
 }
@@ -1005,6 +1096,47 @@ fn main() {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn jump_offset_walks_prompts() {
+        // prompts at absolute lines 10, 40, 80; history 100, at the bottom
+        let marks = [10usize, 40, 80];
+        // viewport top = 100: previous prompt is 80 -> off = 100-80+1 = 21
+        assert_eq!(jump_offset(&marks, 100, 0, -1), Some(21));
+        // from there (top=79), previous is 40 -> off = 61
+        assert_eq!(jump_offset(&marks, 100, 21, -1), Some(61));
+        // and next from top=39 is 40 -> off = 61? no: 40 > 39 -> off = 100-40+1
+        assert_eq!(jump_offset(&marks, 100, 61, 1), Some(61));
+        // nothing above the very first prompt
+        assert_eq!(jump_offset(&marks, 100, 91, -1), None);
+        // no marks, no jump
+        assert_eq!(jump_offset(&[], 100, 0, -1), None);
+    }
+
+    /// Command marks accumulate with exit codes through the OSC 133 stream.
+    #[test]
+    fn command_marks_record_prompts_and_exits() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+        let size = TermSize { cols: 20, rows: 4 };
+        let mut t = Term::new(Config::default(), &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        let mut meta = term::SessionMeta::default();
+        let mut carry = Vec::new();
+        let feed = |p: &mut Processor, t: &mut Term<VoidListener>,
+                    m: &mut term::SessionMeta, c: &mut Vec<u8>, d: &[u8]| {
+            term::process_chunk(p, t, m, c, d);
+        };
+        feed(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;A\x07> ok\r\n");
+        feed(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;D;0\x07");
+        feed(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;A\x07> bad\r\n");
+        feed(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;D;1\x07");
+        assert_eq!(meta.marks.len(), 2);
+        assert_eq!(meta.marks[0].exit, Some(0));
+        assert_eq!(meta.marks[1].exit, Some(1));
+        assert!(meta.marks[1].abs > meta.marks[0].abs);
+    }
 
     #[test]
     fn saved_state_round_trips() {

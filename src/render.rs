@@ -124,6 +124,8 @@ pub struct Overlay<'a> {
     pub claude: bool,
     /// The tab bar (always visible: titles, busy dots).
     pub tabs: &'a [TabInfo],
+    /// Command blocks: (absolute prompt line, exit code) — gutter lights.
+    pub marks: &'a [(usize, Option<i32>)],
 }
 
 // translucent overlays, EasyTer's colors: selection blue, search amber
@@ -209,12 +211,18 @@ const FAMILY_CANDIDATES: &[&str] = &[
     "Consolas",
 ];
 
-fn pick_family(db: &cosmic_text::fontdb::Database) -> String {
+fn pick_family(db: &cosmic_text::fontdb::Database, preferred: Option<&str>) -> String {
+    let has = |name: &str| {
+        db.faces()
+            .any(|f| f.families.iter().any(|(n, _)| n == name))
+    };
+    if let Some(p) = preferred {
+        if has(p) {
+            return p.to_string();
+        }
+    }
     for cand in FAMILY_CANDIDATES {
-        if db
-            .faces()
-            .any(|f| f.families.iter().any(|(name, _)| name == cand))
-        {
+        if has(cand) {
             return (*cand).to_string();
         }
     }
@@ -236,11 +244,13 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(scale: f32) -> Self {
+    /// `extra_pts` is the live Ctrl+wheel zoom delta on top of the
+    /// configured base size.
+    pub fn new(scale: f32, cfg: &crate::config::UserConfig, extra_pts: f32) -> Self {
         let mut font_system = FontSystem::new();
         font_system.db_mut().load_font_data(AMIRI.to_vec());
-        let family = pick_family(font_system.db());
-        let size = FONT_SIZE * scale;
+        let family = pick_family(font_system.db(), cfg.font_family.as_deref());
+        let size = (cfg.font_size.unwrap_or(FONT_SIZE) + extra_pts).clamp(8.0, 40.0) * scale;
         let metrics = Metrics::new(size, (size * 1.4).ceil());
         let mut buffer = Buffer::new(&mut font_system, metrics);
         buffer.set_wrap(&mut font_system, Wrap::None);
@@ -569,6 +579,23 @@ impl Renderer {
                        FG, 170);
         }
 
+        // command-block lights in the left gutter (EasyTer's bars):
+        // green = succeeded, red = failed, grey = still running/unknown
+        for &(abs, exit) in overlay.marks {
+            let vrow = abs as i64 - history as i64 + off as i64;
+            if vrow < 0 || vrow >= rows as i64 {
+                continue;
+            }
+            let color = match exit {
+                Some(0) => (0x2e, 0xa0, 0x43),
+                Some(_) => (0xcf, 0x22, 0x2e),
+                None => (0x6e, 0x76, 0x81),
+            };
+            let y0 = oy + (vrow as f32 * self.cell_h).round() as i32;
+            fill_rect(frame, width, height, 0, y0, 3,
+                      self.cell_h.round() as i32, pack(color));
+        }
+
         // scroll position indicator while in history (EasyTer's slim bar)
         if off > 0 && history > 0 {
             let vh = height as i32 - oy;
@@ -773,7 +800,7 @@ mod startup_probe {
         fs.db_mut().load_font_data(AMIRI.to_vec());
         let t_amiri = t1.elapsed();
         let t2 = Instant::now();
-        let fam = pick_family(fs.db());
+        let fam = pick_family(fs.db(), None);
         let t_pick = t2.elapsed();
         let t3 = Instant::now();
         let mut b = Buffer::new(&mut fs, Metrics::new(15.0, 21.0));
