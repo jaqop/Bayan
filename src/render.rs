@@ -419,6 +419,8 @@ pub struct SettingsLayout {
     pub size_plus: Rect,
     pub cursor_label_y: i32,
     pub cursor_btns: [Rect; 3],
+    pub blink_label_y: i32,
+    pub blink_toggle: Rect,
     pub scroll_label_y: i32,
     pub scroll_minus: Rect,
     pub scroll_plus: Rect,
@@ -458,6 +460,7 @@ pub struct SettingsView<'a> {
     pub font_family: &'a str,
     pub font_size: i32,
     pub cursor: crate::config::CursorStyle,
+    pub cursor_blink: bool,
     pub scrollback: usize,
     pub copy_on_select: bool,
     pub ligatures: bool,
@@ -490,6 +493,8 @@ pub struct PaneView<'a> {
     pub focused: bool,
     /// block / bar / underline (the settings panel's cursor row)
     pub cursor: crate::config::CursorStyle,
+    /// blink phase: false = the off half of the blink, draw no cursor
+    pub cursor_on: bool,
     /// draw a border (only when the tab actually has multiple panes)
     pub bordered: bool,
     /// Claude mode for THIS pane's content.
@@ -1166,7 +1171,7 @@ impl Renderer {
         // cursor: only the focused pane shows it (the block is translucent,
         // so the glyph stays legible); grid rows are column-exact, Arabic
         // rows map through the shaped layout
-        if view.focused && cursor_vrow >= 0 && (cursor_vrow as usize) < rows {
+        if view.focused && view.cursor_on && cursor_vrow >= 0 && (cursor_vrow as usize) < rows {
             let (x0, wpx) = cursor_rect.unwrap_or((
                 px + (ccol as f32 * self.cell_w).round() as i32,
                 self.cell_w.round() as i32,
@@ -1339,7 +1344,7 @@ impl Renderer {
         let tile_w = ((w - pad * 2 - label_reserve - 6 * 6) / 7).max(30);
         let tile_h = (self.cell_h * 1.6) as i32;
         let theme_rowh = tile_h + 14;
-        let h = head_h + 6 + theme_rowh + rowh * 12 + foot_h;
+        let h = head_h + 6 + theme_rowh + rowh * 13 + foot_h;
         let x = (fw as i32 - w) / 2;
         let y = (self.tab_bar_h() as i32 + (fh as i32 - h) / 3)
             .max(self.tab_bar_h() as i32 + 12);
@@ -1365,51 +1370,53 @@ impl Renderer {
         let size_minus = (x + pad, cy(size_y), ctl, ctl);
         let size_plus = (x + pad + ctl + size_slot, cy(size_y), ctl, ctl);
 
-        // cursor style: three shape swatches
+        // cursor style: three shape swatches, then its blink toggle
         let cursor_y = row_y(2);
         let cursor_btns = [0, 1, 2].map(|i| (x + pad + i * (ctl + 8), cy(cursor_y), ctl, ctl));
 
+        // toggle pills (wide and shallow, so the track reads as a switch)
+        let pill_w = (self.cell_w * 4.2) as i32;
+        let pill_h = ctl - 8;
+        let pcy = |ry: i32| ry + (rowh - pill_h) / 2;
+        let blink_y = row_y(3);
+        let blink_toggle = (x + pad, pcy(blink_y), pill_w, pill_h);
+
         // scrollback: [−  10k  +]
-        let scroll_y = row_y(3);
+        let scroll_y = row_y(4);
         let scroll_slot = (self.cell_w * 5.0) as i32;
         let scroll_minus = (x + pad, cy(scroll_y), ctl, ctl);
         let scroll_plus = (x + pad + ctl + scroll_slot, cy(scroll_y), ctl, ctl);
 
         // padding / opacity: the same stepper shape
-        let pad_y = row_y(4);
+        let pad_y = row_y(5);
         let pad_slot = (self.cell_w * 4.0) as i32;
         let pad_minus = (x + pad, cy(pad_y), ctl, ctl);
         let pad_plus = (x + pad + ctl + pad_slot, cy(pad_y), ctl, ctl);
-        let opacity_y = row_y(5);
+        let opacity_y = row_y(6);
         let op_slot = (self.cell_w * 5.0) as i32;
         let opacity_minus = (x + pad, cy(opacity_y), ctl, ctl);
         let opacity_plus = (x + pad + ctl + op_slot, cy(opacity_y), ctl, ctl);
 
-        // copy-on-select / ligatures: toggle pills (wide and shallow, so
-        // the track reads as a switch, not a filled box)
-        let pill_w = (self.cell_w * 4.2) as i32;
-        let pill_h = ctl - 8;
-        let pcy = |ry: i32| ry + (rowh - pill_h) / 2;
-        let copy_y = row_y(6);
+        let copy_y = row_y(7);
         let copy_toggle = (x + pad, pcy(copy_y), pill_w, pill_h);
-        let liga_y = row_y(7);
+        let liga_y = row_y(8);
         let liga_toggle = (x + pad, pcy(liga_y), pill_w, pill_h);
 
         // bell: a three-segment control (all options visible, one active)
-        let bell_y = row_y(8);
+        let bell_y = row_y(9);
         let seg_w = (self.cell_w * 4.6) as i32;
         let bell_btns = [0, 1, 2].map(|i| (x + pad + i * (seg_w + 6), cy(bell_y), seg_w, ctl));
 
         // shell cycler (new tabs only) — same shape as the font cycler
-        let shell_y = row_y(9);
+        let shell_y = row_y(10);
         let shell_w = (self.cell_w * 12.0) as i32;
         let shell_prev = (x + pad, cy(shell_y), ctl, ctl);
         let shell_next = (x + pad + ctl + shell_w, cy(shell_y), ctl, ctl);
 
         // hide-bar / confirm-close toggles
-        let bar_y = row_y(10);
+        let bar_y = row_y(11);
         let bar_toggle = (x + pad, pcy(bar_y), pill_w, pill_h);
-        let close_y = row_y(11);
+        let close_y = row_y(12);
         let close_toggle = (x + pad, pcy(close_y), pill_w, pill_h);
 
         SettingsLayout {
@@ -1425,6 +1432,8 @@ impl Renderer {
             size_plus,
             cursor_label_y: cursor_y,
             cursor_btns,
+            blink_label_y: blink_y,
+            blink_toggle,
             scroll_label_y: scroll_y,
             scroll_minus,
             scroll_plus,
@@ -1595,6 +1604,11 @@ impl Renderer {
                     push_rect(out, whole, bx + 8, by + bh - 10, bw - 16, 3, c),
             }
         }
+
+        // ---- cursor blink toggle ----
+        let ll = label(self, out, "وميض المؤشّر", lay.blink_label_y);
+        leader(out, lay.blink_toggle.0 + lay.blink_toggle.2, ll, lay.blink_label_y);
+        draw_toggle(out, lay.blink_toggle, v.cursor_blink);
 
         // ---- scrollback stepper (new tabs only) ----
         let ll = label(self, out, "سجلّ التمرير (التبويبات الجديدة)", lay.scroll_label_y);
@@ -2110,7 +2124,7 @@ mod cache_tests {
             lay.pad_minus, lay.pad_plus,
             lay.opacity_minus, lay.opacity_plus,
             lay.shell_prev, lay.shell_next,
-            lay.bar_toggle, lay.close_toggle,
+            lay.bar_toggle, lay.close_toggle, lay.blink_toggle,
         ];
         controls.extend(lay.cursor_btns);
         controls.extend(lay.bell_btns);

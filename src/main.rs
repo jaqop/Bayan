@@ -19,6 +19,10 @@ fn hex((r, g, b): (u8, u8, u8)) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
 }
 
+/// The Windows caret rhythm; kitty's idea on top: stop after 15s idle.
+const BLINK_MS: u128 = 530;
+const BLINK_STOP: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// What the close guard is protecting (confirm_close setting).
 #[derive(Clone, Copy)]
 enum CloseTarget {
@@ -407,6 +411,11 @@ struct App {
     pending_paste: Option<String>,
     /// a close awaiting Enter/Esc (a command is still running)
     pending_close: Option<CloseTarget>,
+    /// last keystroke sent to a PTY — the cursor blinks for 15s after it,
+    /// then parks solid so an idle window stops re-rendering (M14's win)
+    last_input: Instant,
+    /// the blink phase the last frame actually drew (change → redraw)
+    blink_drawn_on: bool,
     /// the settings panel (Ctrl+,) with its selected row, when open
     settings: Option<usize>,
     /// window focus (finish notifications only fire when nobody's looking)
@@ -513,6 +522,12 @@ impl App {
         self.request_redraw(); // read per-frame; no rebuild needed
     }
 
+    fn toggle_blink(&mut self) {
+        self.config.cursor_blink = Some(!self.config.cursor_blink_on());
+        self.last_input = Instant::now(); // preview the blink right away
+        self.request_redraw();
+    }
+
     /// Walk the scrollback presets. Applies to new tabs only (the universal
     /// terminal convention — live sessions keep their buffer).
     fn change_scrollback(&mut self, dir: i32) {
@@ -608,6 +623,25 @@ impl App {
         self.request_redraw();
     }
 
+    /// Blink phase now + when it next flips. (true, None) = solid cursor,
+    /// nothing to schedule: blink off, window unfocused, or 15s idle.
+    fn cursor_blink_state(&self) -> (bool, Option<Instant>) {
+        if !self.config.cursor_blink_on() || !self.focused {
+            return (true, None);
+        }
+        let elapsed = self.last_input.elapsed();
+        if elapsed >= BLINK_STOP {
+            return (true, None);
+        }
+        let k = elapsed.as_millis() / BLINK_MS;
+        let on = k % 2 == 0;
+        let next_flip = self.last_input
+            + std::time::Duration::from_millis(((k + 1) * BLINK_MS) as u64);
+        // the wake at the 15s mark restores the solid cursor
+        let deadline = self.last_input + BLINK_STOP;
+        (on, Some(next_flip.min(deadline)))
+    }
+
     /// The focused pane's running command, if any (drives the close guard).
     fn running_command(&self, ti: usize, pi: usize) -> Option<String> {
         let pane = self.tabs.get(ti)?.panes.get(pi)?;
@@ -660,6 +694,8 @@ impl App {
             lay.cursor_btns.iter().position(|&b| render::rect_hit(b, px, py))
         {
             self.set_cursor_style(config::CursorStyle::ALL[i]);
+        } else if render::rect_hit(lay.blink_toggle, px, py) {
+            self.toggle_blink();
         } else if render::rect_hit(lay.scroll_minus, px, py) {
             self.change_scrollback(-1);
         } else if render::rect_hit(lay.scroll_plus, px, py) {
@@ -1221,6 +1257,7 @@ impl App {
     fn send_paste(&mut self, txt: &str) {
         let bracketed = self.term_mode().contains(TermMode::BRACKETED_PASTE);
         let body = term::normalize_paste(txt, bracketed);
+        self.last_input = Instant::now(); // pasting is typing, blink-wise
         if let Some(s) = self.session_mut() {
             s.write(body.as_bytes());
         }
@@ -1314,6 +1351,8 @@ impl App {
             .map(|r| r.family().to_string())
             .unwrap_or_default();
         let cursor_style = self.config.cursor();
+        let (cursor_on, _) = self.cursor_blink_state();
+        self.blink_drawn_on = cursor_on;
         let close_msg: Option<String> = self.pending_close.map(|target| match target {
             CloseTarget::Pane(ti, pi) => {
                 let cmd = self.running_command(ti, pi).unwrap_or_default();
@@ -1377,6 +1416,7 @@ impl App {
                         rect: *rect,
                         focused,
                         cursor: cursor_style,
+                        cursor_on,
                         bordered,
                         claude: claude_pane,
                         search_match: if focused {
@@ -1415,6 +1455,7 @@ impl App {
                             font_family: &settings_family,
                             font_size: settings_size,
                             cursor: cursor_style,
+                            cursor_blink: self.config.cursor_blink_on(),
                             scrollback: self.config.scrollback_lines(),
                             copy_on_select: self.config.copy_on_select_on(),
                             ligatures: self.config.ligatures.unwrap_or(true),
@@ -1686,13 +1727,23 @@ impl ApplicationHandler<UserEvent> for App {
             .iter()
             .enumerate()
             .any(|(i, t)| t.busy(i == self.active));
+        let mut wake: Option<Instant> = None;
         if any_busy {
-            el.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + std::time::Duration::from_millis(600),
-            ));
+            wake = Some(Instant::now() + std::time::Duration::from_millis(600));
             self.request_redraw();
-        } else {
-            el.set_control_flow(ControlFlow::Wait);
+        }
+        // cursor blink: wake exactly at the next phase flip (or the 15s
+        // park); an idle window schedules nothing and truly sleeps
+        let (blink_on, blink_wake) = self.cursor_blink_state();
+        if blink_on != self.blink_drawn_on {
+            self.request_redraw();
+        }
+        if let Some(b) = blink_wake {
+            wake = Some(wake.map_or(b, |w| w.min(b)));
+        }
+        match wake {
+            Some(t) => el.set_control_flow(ControlFlow::WaitUntil(t)),
+            None => el.set_control_flow(ControlFlow::Wait),
         }
     }
 
@@ -2155,7 +2206,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 .or_else(|| keys::encode(key, text, shift, alt, ctrl));
                 if let Some(bytes) = bytes {
-                    // typing snaps to the bottom and clears any selection
+                    // typing snaps to the bottom and clears any selection;
+                    // it also restarts the blink window, cursor visible
+                    self.last_input = Instant::now();
                     if let Some(s) = self.session_mut() {
                         {
                             let mut t = s.term.lock().unwrap();
@@ -2212,6 +2265,8 @@ fn main() {
         cockpit_sel: 0,
         pending_paste: None,
         pending_close: None,
+        last_input: Instant::now(),
+        blink_drawn_on: true,
         settings: None,
         focused: true,
         clicks: ClickTracker::new(),

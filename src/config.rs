@@ -34,6 +34,10 @@ pub struct UserConfig {
     /// Cursor shape: "block" (default), "bar", "underline".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor_style: Option<String>,
+    /// Cursor blink (default on). Blinks for 15s after the last keystroke,
+    /// then parks solid — so an idle window stops re-rendering (M14).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_blink: Option<bool>,
     /// Scrollback lines per pane (default 10000). New tabs only — the
     /// universal terminal convention; live sessions keep their buffer.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,6 +152,10 @@ impl UserConfig {
         self.copy_on_select.unwrap_or(true)
     }
 
+    pub fn cursor_blink_on(&self) -> bool {
+        self.cursor_blink.unwrap_or(true)
+    }
+
     /// 0.5..=1.0 — anything outside is a typo, not a wish for invisibility.
     pub fn opacity_level(&self) -> f32 {
         self.opacity.unwrap_or(1.0).clamp(0.5, 1.0)
@@ -237,6 +245,7 @@ mod tests {
         // absent keys resolve to the documented defaults
         let d = UserConfig::default();
         assert_eq!(d.cursor(), CursorStyle::Block);
+        assert!(d.cursor_blink_on());
         assert_eq!(d.bell_mode(), BellMode::Attention);
         assert_eq!(d.scrollback_lines(), DEFAULT_SCROLLBACK);
         assert!(d.copy_on_select_on());
