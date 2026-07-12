@@ -5,21 +5,31 @@
 //! { "font_family": "JetBrains Mono", "font_size": 17.0 }
 //! ```
 
-#[derive(Clone, Default, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct UserConfig {
+    /// Named built-in theme (set by the in-app settings). Explicit
+    /// bg/fg/palette below still override it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
     /// Primary font family; must be installed. Falls back to the built-in
     /// Nerd-Font-first candidate list when absent or not found.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub font_family: Option<String>,
     /// Base font size in points (default 15).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub font_size: Option<f32>,
     /// Background / foreground as "#rrggbb" (EasyTer's heritage defaults).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fg: Option<String>,
     /// The 16 ANSI colors as "#rrggbb", normal 0-7 then bright 8-15.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub palette: Option<Vec<String>>,
     /// Programming ligatures (-> => != >= ...). Default on; needs a
     /// ligature-capable font (Cascadia Code, JetBrains Mono, Fira Code).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ligatures: Option<bool>,
 }
 
@@ -36,15 +46,27 @@ pub fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
     ))
 }
 
+fn config_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("USERPROFILE")?;
+    Some(std::path::Path::new(&home).join(".bayan").join("config.json"))
+}
+
 pub fn load() -> UserConfig {
-    let Some(home) = std::env::var_os("USERPROFILE") else {
-        return UserConfig::default();
-    };
-    let path = std::path::Path::new(&home).join(".bayan").join("config.json");
-    std::fs::read_to_string(path)
-        .ok()
+    config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// Persist the config (the in-app settings panel writes it on close).
+pub fn save(cfg: &UserConfig) {
+    let Some(path) = config_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(cfg) {
+        let _ = std::fs::write(path, json);
+    }
 }
 
 #[cfg(test)]

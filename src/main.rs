@@ -14,6 +14,11 @@ mod keys;
 mod render;
 mod term;
 
+/// rgb -> "#rrggbb" for the config file.
+fn hex((r, g, b): (u8, u8, u8)) -> String {
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
 /// The quake hotkey (Ctrl+Alt+`) fires from ANYWHERE via RegisterHotKey;
 /// winit's msg hook flags it and about_to_wait toggles the window.
 static QUAKE_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -382,6 +387,8 @@ struct App {
     cockpit_sel: usize,
     /// a big paste awaiting Enter/Esc (EasyTer's paste guard)
     pending_paste: Option<String>,
+    /// the settings panel (Ctrl+,) with its selected row, when open
+    settings: Option<usize>,
     /// window focus (finish notifications only fire when nobody's looking)
     focused: bool,
     clicks: ClickTracker,
@@ -425,6 +432,87 @@ impl App {
             let r = render::Renderer::new(scale, &cfg, delta);
             let _ = proxy.send_event(UserEvent::RendererReady(Box::new(r)));
         });
+    }
+
+    // ---- settings panel ----
+    const SETTINGS_ROWS: usize = 3;
+
+    /// The three settings rows as (label, current value) for the renderer.
+    fn settings_rows(&self) -> Vec<(String, String)> {
+        let theme = self
+            .config
+            .theme
+            .clone()
+            .unwrap_or_else(|| render::THEMES[0].name.to_string());
+        let size = self.config.font_size.unwrap_or(15.0);
+        let liga = if self.config.ligatures.unwrap_or(true) { "تشغيل" } else { "إيقاف" };
+        vec![
+            ("المظهر".into(), theme),
+            ("حجم الخطّ".into(), format!("{}", size as i32)),
+            ("الأربطة".into(), liga.to_string()),
+        ]
+    }
+
+    /// Palette swatches of the currently selected theme (for the preview strip).
+    fn settings_swatches(&self) -> [(u8, u8, u8); 16] {
+        let name = self.config.theme.as_deref().unwrap_or(render::THEMES[0].name);
+        render::theme_by_name(name)
+            .map(|t| t.palette)
+            .unwrap_or(render::THEMES[0].palette)
+    }
+
+    /// Change the selected setting by `dir` (-1/+1) and apply live.
+    fn settings_change(&mut self, row: usize, dir: i32) {
+        match row {
+            0 => {
+                // cycle themes; copy the chosen theme's colors into config
+                let cur = self
+                    .config
+                    .theme
+                    .as_deref()
+                    .and_then(|n| render::THEMES.iter().position(|t| t.name == n))
+                    .unwrap_or(0);
+                let n = render::THEMES.len() as i32;
+                let idx = ((cur as i32 + dir).rem_euclid(n)) as usize;
+                let t = &render::THEMES[idx];
+                self.config.theme = Some(t.name.to_string());
+                self.config.bg = Some(hex(t.bg));
+                self.config.fg = Some(hex(t.fg));
+                self.config.palette = Some(t.palette.iter().map(|&c| hex(c)).collect());
+            }
+            1 => {
+                let s = (self.config.font_size.unwrap_or(15.0) + dir as f32).clamp(8.0, 40.0);
+                self.config.font_size = Some(s);
+            }
+            2 => {
+                let v = !self.config.ligatures.unwrap_or(true);
+                self.config.ligatures = Some(v);
+            }
+            _ => {}
+        }
+        self.rebuild_renderer(); // live preview
+        self.request_redraw();
+    }
+
+    /// Keyboard handling while the settings panel is open.
+    fn settings_input(&mut self, event: &KeyEvent) {
+        let Some(sel) = self.settings else { return };
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter) => {
+                self.settings = None;
+                config::save(&self.config); // persist on close
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.settings = Some(sel.saturating_sub(1));
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                self.settings = Some((sel + 1).min(Self::SETTINGS_ROWS - 1));
+            }
+            Key::Named(NamedKey::ArrowRight) => self.settings_change(sel, 1),
+            Key::Named(NamedKey::ArrowLeft) => self.settings_change(sel, -1),
+            _ => {}
+        }
+        self.request_redraw();
     }
 
     /// Cockpit row under the pointer (needs renderer + tab count).
@@ -720,7 +808,10 @@ impl App {
 
     fn update_title(&self) {
         if let (Some(w), Some(t)) = (&self.window, self.tabs.get(self.active)) {
-            w.set_title(&format!("Bayan — بيان · {}", t.title));
+            // the window title stays just "Bayan"; the folder shows in the
+            // tab (no app-name-looking cwd suffix in the title bar)
+            let _ = t;
+            w.set_title("Bayan — بيان");
         }
     }
 
@@ -1003,6 +1094,12 @@ impl App {
         } else {
             Vec::new()
         };
+        let settings_state = self.settings;
+        let (settings_rows, settings_swatches) = if settings_state.is_some() {
+            (self.settings_rows(), self.settings_swatches())
+        } else {
+            (Vec::new(), [(0, 0, 0); 16])
+        };
         let rects = self.pane_rects();
         let tab_infos: Vec<render::TabInfo> = self
             .tabs
@@ -1082,6 +1179,16 @@ impl App {
                         px.height as usize,
                         &cockpit_entries,
                         self.cockpit_sel,
+                    );
+                }
+                if let Some(sel) = settings_state {
+                    renderer.draw_settings(
+                        &mut verts,
+                        px.width as usize,
+                        px.height as usize,
+                        &settings_rows,
+                        sel,
+                        Some(settings_swatches),
                     );
                 }
                 if let Some(p) = &self.pending_paste {
@@ -1188,6 +1295,9 @@ impl ApplicationHandler<UserEvent> for App {
         }
         if std::env::var_os("BAYAN_GUARD").is_some() {
             self.pending_paste = Some("echo one\necho two\necho three\n".into());
+        }
+        if std::env::var_os("BAYAN_SETTINGS").is_some() {
+            self.settings = Some(0);
         }
         crate::prof::mark("session spawned");
         // FontSystem::new scans every installed font — the documented
@@ -1393,6 +1503,27 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
                 ElementState::Pressed => {
+                    // the settings panel swallows clicks: pick a row, or a
+                    // click outside closes + saves
+                    if self.settings.is_some() {
+                        let hit = self.renderer.as_ref().zip(self.window.as_ref()).and_then(
+                            |(r, w)| {
+                                let px = w.inner_size();
+                                r.settings_row_at(px.width as usize, px.height as usize,
+                                                  Self::SETTINGS_ROWS,
+                                                  self.cursor_pos.x, self.cursor_pos.y)
+                            },
+                        );
+                        match hit {
+                            Some(row) => self.settings = Some(row),
+                            None => {
+                                self.settings = None;
+                                config::save(&self.config);
+                            }
+                        }
+                        self.request_redraw();
+                        return;
+                    }
                     // the cockpit swallows clicks: pick a row or dismiss
                     if self.cockpit {
                         let hit = self.cockpit_row_hit(self.cursor_pos);
@@ -1519,6 +1650,11 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_redraw();
                     return;
                 }
+                // the settings panel owns the keyboard while open
+                if self.settings.is_some() {
+                    self.settings_input(&event);
+                    return;
+                }
                 // the cockpit owns the keyboard while open
                 if self.cockpit {
                     self.cockpit_input(&event);
@@ -1616,6 +1752,12 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 } else if ctrl {
+                    // Ctrl+, opens the settings panel (EasyTer's binding)
+                    if !shift && matches!(key, Key::Character(s) if s.as_str() == ",") {
+                        self.settings = Some(0);
+                        self.request_redraw();
+                        return;
+                    }
                     // Ctrl+Tab / Ctrl+Shift+Tab cycle tabs (shift handled here
                     // because winit reports Tab+shift with the shift modifier)
                     if matches!(key, Key::Named(NamedKey::Tab)) && !self.tabs.is_empty() {
@@ -1757,6 +1899,7 @@ fn main() {
         cockpit: false,
         cockpit_sel: 0,
         pending_paste: None,
+        settings: None,
         focused: true,
         clicks: ClickTracker::new(),
         wheel_accum: 0.0,

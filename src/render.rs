@@ -54,6 +54,97 @@ const PALETTE: [(u8, u8, u8); 16] = [
 
 // (color resolution lives on Renderer: bg/fg/palette are config-themable)
 
+/// A named built-in theme: bg, fg, and the 16 ANSI colors (EasyTer heritage).
+pub struct Theme {
+    pub name: &'static str,
+    pub bg: (u8, u8, u8),
+    pub fg: (u8, u8, u8),
+    pub palette: [(u8, u8, u8); 16],
+}
+
+const fn rgb(v: u32) -> (u8, u8, u8) {
+    ((v >> 16) as u8, (v >> 8) as u8, v as u8)
+}
+
+/// A theme by name (used to resolve the config's `theme` field).
+pub fn theme_by_name(name: &str) -> Option<&'static Theme> {
+    THEMES.iter().find(|t| t.name == name)
+}
+
+/// The theme presets the settings panel cycles through.
+pub const THEMES: &[Theme] = &[
+    Theme {
+        name: "بيان",
+        bg: rgb(0x0d1117), fg: rgb(0xe6edf3),
+        palette: [
+            rgb(0x0d1117), rgb(0xff6b6b), rgb(0x7ee787), rgb(0xe3b341),
+            rgb(0x6ca0f6), rgb(0xd2a8ff), rgb(0x56d4dd), rgb(0xe6edf3),
+            rgb(0x6e7681), rgb(0xff8a8a), rgb(0xa2f5b0), rgb(0xf2cc60),
+            rgb(0x8db4f8), rgb(0xe0c1ff), rgb(0x7ee0e6), rgb(0xffffff),
+        ],
+    },
+    Theme {
+        name: "أسود مطلق",
+        bg: rgb(0x000000), fg: rgb(0xd0d0d0),
+        palette: [
+            rgb(0x000000), rgb(0xff5555), rgb(0x50fa7b), rgb(0xf1fa8c),
+            rgb(0x6ca0f6), rgb(0xff79c6), rgb(0x8be9fd), rgb(0xd0d0d0),
+            rgb(0x555555), rgb(0xff6e6e), rgb(0x69ff94), rgb(0xffffa5),
+            rgb(0x8db4f8), rgb(0xff92df), rgb(0xa4ffff), rgb(0xffffff),
+        ],
+    },
+    Theme {
+        name: "Dracula",
+        bg: rgb(0x282a36), fg: rgb(0xf8f8f2),
+        palette: [
+            rgb(0x21222c), rgb(0xff5555), rgb(0x50fa7b), rgb(0xf1fa8c),
+            rgb(0xbd93f9), rgb(0xff79c6), rgb(0x8be9fd), rgb(0xf8f8f2),
+            rgb(0x6272a4), rgb(0xff6e6e), rgb(0x69ff94), rgb(0xffffa5),
+            rgb(0xd6acff), rgb(0xff92df), rgb(0xa4ffff), rgb(0xffffff),
+        ],
+    },
+    Theme {
+        name: "Gruvbox",
+        bg: rgb(0x282828), fg: rgb(0xebdbb2),
+        palette: [
+            rgb(0x282828), rgb(0xcc241d), rgb(0x98971a), rgb(0xd79921),
+            rgb(0x458588), rgb(0xb16286), rgb(0x689d6a), rgb(0xa89984),
+            rgb(0x928374), rgb(0xfb4934), rgb(0xb8bb26), rgb(0xfabd2f),
+            rgb(0x83a598), rgb(0xd3869b), rgb(0x8ec07c), rgb(0xebdbb2),
+        ],
+    },
+    Theme {
+        name: "Nord",
+        bg: rgb(0x2e3440), fg: rgb(0xd8dee9),
+        palette: [
+            rgb(0x3b4252), rgb(0xbf616a), rgb(0xa3be8c), rgb(0xebcb8b),
+            rgb(0x81a1c1), rgb(0xb48ead), rgb(0x88c0d0), rgb(0xe5e9f0),
+            rgb(0x4c566a), rgb(0xbf616a), rgb(0xa3be8c), rgb(0xebcb8b),
+            rgb(0x81a1c1), rgb(0xb48ead), rgb(0x8fbcbb), rgb(0xeceff4),
+        ],
+    },
+    Theme {
+        name: "Solarized",
+        bg: rgb(0x002b36), fg: rgb(0x93a1a1),
+        palette: [
+            rgb(0x073642), rgb(0xdc322f), rgb(0x859900), rgb(0xb58900),
+            rgb(0x268bd2), rgb(0xd33682), rgb(0x2aa198), rgb(0xeee8d5),
+            rgb(0x586e75), rgb(0xcb4b16), rgb(0x859900), rgb(0x657b83),
+            rgb(0x839496), rgb(0x6c71c4), rgb(0x93a1a1), rgb(0xfdf6e3),
+        ],
+    },
+    Theme {
+        name: "Tokyo Night",
+        bg: rgb(0x1a1b26), fg: rgb(0xc0caf5),
+        palette: [
+            rgb(0x15161e), rgb(0xf7768e), rgb(0x9ece6a), rgb(0xe0af68),
+            rgb(0x7aa2f7), rgb(0xbb9af7), rgb(0x7dcfff), rgb(0xa9b1d6),
+            rgb(0x414868), rgb(0xf7768e), rgb(0x9ece6a), rgb(0xe0af68),
+            rgb(0x7aa2f7), rgb(0xbb9af7), rgb(0x7dcfff), rgb(0xc0caf5),
+        ],
+    },
+];
+
 /// Straight-alpha color for the quad batch.
 fn c4((r, g, b): (u8, u8, u8), a: u8) -> [f32; 4] {
     [
@@ -513,7 +604,19 @@ impl Renderer {
             .map(|r| r.line_w)
             .filter(|w| *w > 1.0)
             .unwrap_or(size * 0.6);
-        let mut palette = PALETTE;
+        // start from a named theme (if any), then let explicit config
+        // bg/fg/palette override individual colors on top of it
+        let theme = cfg.theme.as_deref().and_then(theme_by_name);
+        let (mut bg, mut fg, mut palette) = match theme {
+            Some(t) => (t.bg, t.fg, t.palette),
+            None => (BG, FG, PALETTE),
+        };
+        if let Some(c) = cfg.bg.as_deref().and_then(crate::config::parse_hex) {
+            bg = c;
+        }
+        if let Some(c) = cfg.fg.as_deref().and_then(crate::config::parse_hex) {
+            fg = c;
+        }
         if let Some(p) = &cfg.palette {
             for (slot, hex) in palette.iter_mut().zip(p.iter()) {
                 if let Some(c) = crate::config::parse_hex(hex) {
@@ -529,8 +632,8 @@ impl Renderer {
             cache_cold: std::collections::HashMap::new(),
             atlas: Atlas::new(),
             family,
-            bg: cfg.bg.as_deref().and_then(crate::config::parse_hex).unwrap_or(BG),
-            fg: cfg.fg.as_deref().and_then(crate::config::parse_hex).unwrap_or(FG),
+            bg,
+            fg,
             palette,
             ligatures,
             cell_w,
@@ -1073,6 +1176,81 @@ impl Renderer {
         self.draw_run(&tag, false, out, whole, 4.0, fh as i32 - 30, 1.0);
     }
 
+    pub fn settings_row_h(&self) -> i32 {
+        (self.cell_h + 14.0) as i32
+    }
+
+    /// The settings panel geometry (shared with the click hit-test).
+    pub fn settings_rect(&self, fw: usize, fh: usize, n: usize) -> Rect {
+        let w = ((self.cell_w * 52.0) as i32).min(fw as i32 - 60);
+        let row_h = self.settings_row_h();
+        let h = row_h + 8 + row_h * n as i32 + 40;
+        let x = (fw as i32 - w) / 2;
+        let y = (self.tab_bar_h() as i32 + (fh as i32 - h) / 4).max(self.tab_bar_h() as i32 + 8);
+        (x, y, w, h)
+    }
+
+    /// Which settings row a pixel hits (None = outside the rows).
+    pub fn settings_row_at(&self, fw: usize, fh: usize, n: usize, px: f64, py: f64)
+                           -> Option<usize> {
+        let (x, y, w, _h) = self.settings_rect(fw, fh, n);
+        let row_h = self.settings_row_h();
+        let top = y + row_h + 8;
+        if px < x as f64 || px >= (x + w) as f64 || py < top as f64 {
+            return None;
+        }
+        let r = ((py - top as f64) / row_h as f64) as usize;
+        (r < n).then_some(r)
+    }
+
+    /// The in-app settings panel. Each row is (label, value); the selected
+    /// row shows ‹ value › arrows. `swatches` (theme palette) draws under the
+    /// selected row when present, so a colour change previews at a glance.
+    pub fn draw_settings(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
+                         rows: &[(String, String)], sel: usize,
+                         swatches: Option<[(u8, u8, u8); 16]>) {
+        let whole: Rect = (0, 0, fw as i32, fh as i32);
+        let (x, y, w, h) = self.settings_rect(fw, fh, rows.len());
+        push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 120));
+        push_rect(out, whole, x, y, w, h, c4((0x16, 0x1b, 0x22), 255));
+        push_rect(out, whole, x, y, w, 2, c4((0x2e, 0xa0, 0x43), 255)); // accent
+        let row_h = self.settings_row_h();
+        let head = [Seg { text: "الإعدادات".into(), fg: self.fg, style: ST_BOLD }];
+        self.draw_run(&head, true, out, whole, (x + 14) as f32, y + 9, 1.0);
+        let top = y + row_h + 8;
+        for (i, (label, value)) in rows.iter().enumerate() {
+            let ry = top + i as i32 * row_h;
+            if i == sel {
+                push_rect(out, whole, x + 4, ry, w - 8, row_h, c4((0x24, 0x2b, 0x36), 255));
+            }
+            let fg = if i == sel { self.fg } else { (0xb0, 0xb8, 0xc4) };
+            // label on the right (RTL), value on the left with arrows
+            let lbl = [Seg::plain(label.clone(), fg)];
+            let lw = self.measure(&lbl, true);
+            self.draw_run(&lbl, true, out, whole,
+                          (x + w) as f32 - 16.0 - lw, ry + 6, 1.0);
+            let shown = if i == sel {
+                format!("‹ {value} ›")
+            } else {
+                value.clone()
+            };
+            let vseg = [Seg { text: shown, fg: (0x7e, 0xe7, 0x87), style: ST_BOLD }];
+            self.draw_run(&vseg, false, out, whole, (x + 16) as f32, ry + 6, 1.0);
+        }
+        // theme swatches strip under the last row
+        if let Some(sw) = swatches {
+            let sy = top + rows.len() as i32 * row_h + 6;
+            let cellw = (w - 28) / 16;
+            for (k, c) in sw.iter().enumerate() {
+                push_rect(out, whole, x + 14 + k as i32 * cellw, sy,
+                          cellw - 2, 12, c4(*c, 255));
+            }
+        }
+        // footer hint
+        let hint = [Seg::plain("↑↓ اختر · ←→ غيّر · Esc حفظ وإغلاق", (0x8a, 0x94, 0xa3))];
+        self.draw_run(&hint, true, out, whole, (x + 14) as f32, y + h - 26, 1.0);
+    }
+
     /// The paste guard (EasyTer's protection): a multi-line/huge paste can
     /// execute commands on arrival — confirm before sending it to the shell.
     pub fn draw_paste_guard(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
@@ -1361,6 +1539,41 @@ mod cache_tests {
              but dormant until an upstream shaper feature bump",
             r.family
         );
+    }
+
+    /// The settings→look path: a config with a theme name (or explicit
+    /// colors) must actually change the renderer's bg/fg/palette. This is the
+    /// heart of "settings change the appearance" — the complaint that started
+    /// M15. Verified without any GUI.
+    #[test]
+    fn a_theme_changes_the_renderer_colors() {
+        // default theme = بيان (dark GitHub-ish)
+        let def = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        assert_eq!(def.bg, THEMES[0].bg);
+
+        // a named theme flows all the way to the renderer's colors
+        let dracula = theme_by_name("Dracula").unwrap();
+        let mut cfg = crate::config::UserConfig {
+            theme: Some("Dracula".into()),
+            ..Default::default()
+        };
+        let r = Renderer::new(1.0, &cfg, 0.0);
+        assert_eq!(r.bg, dracula.bg, "theme bg must reach the renderer");
+        assert_eq!(r.fg, dracula.fg);
+        assert_eq!(r.palette, dracula.palette);
+        assert_eq!(r.ansi_rgb(AnsiColor::Named(NamedColor::Red)), dracula.palette[1]);
+
+        // an explicit bg overrides the theme (config precedence)
+        cfg.bg = Some("#123456".into());
+        let r2 = Renderer::new(1.0, &cfg, 0.0);
+        assert_eq!(r2.bg, (0x12, 0x34, 0x56));
+        assert_eq!(r2.fg, dracula.fg, "unset fg still comes from the theme");
+
+        // the settings config round-trips through the file format
+        let saved: crate::config::UserConfig =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(saved.theme.as_deref(), Some("Dracula"));
+        assert_eq!(saved.bg.as_deref(), Some("#123456"));
     }
 
     /// The ligatures toggle picks a Mono-leading font family when off (so a
