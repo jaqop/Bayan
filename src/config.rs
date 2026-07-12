@@ -68,6 +68,10 @@ pub struct UserConfig {
     /// Padding in px between the window edges and the terminal content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub padding: Option<u32>,
+    /// Shortcut overrides: action id -> chord ("new-tab": "ctrl+shift+n").
+    /// Only NON-default bindings live here (the editor prunes defaults).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keybinds: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Cursor shape (the trio every terminal offers: block / bar / underline).

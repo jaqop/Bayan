@@ -405,11 +405,30 @@ pub const TAB_CELLS: f32 = 24.0;
 /// A rect in frame pixels: (x, y, w, h).
 pub type Rect = (i32, i32, i32, i32);
 
+/// One row of the shortcuts editor.
+pub struct ShortcutRow {
+    pub label: String,
+    /// display form, "Ctrl+Shift+T"
+    pub chord: String,
+    /// a non-default binding (drawn in the value green)
+    pub custom: bool,
+}
+
+/// Clickable regions of the shortcuts editor (draw + hit-test agree).
+pub struct ShortcutsLayout {
+    pub card: Rect,
+    pub rowh: i32,
+    /// full-width hit strip per action row
+    pub rows: Vec<Rect>,
+}
+
 /// Every clickable region of the settings panel (draw + hit-test agree).
 pub struct SettingsLayout {
     pub card: Rect,
     pub head_h: i32,
     pub rowh: i32,
+    /// header button that opens the shortcuts editor
+    pub shortcuts_btn: Rect,
     pub theme_tiles: Vec<Rect>,
     pub font_label_y: i32,
     pub font_prev: Rect,
@@ -1349,6 +1368,10 @@ impl Renderer {
         let y = (self.tab_bar_h() as i32 + (fh as i32 - h) / 3)
             .max(self.tab_bar_h() as i32 + 12);
 
+        // the shortcuts-editor button lives in the header, left side
+        let sb_w = (self.cell_w * 10.0) as i32;
+        let shortcuts_btn = (x + pad, y + 10, sb_w, (self.cell_h + 8.0) as i32);
+
         let theme_y = y + head_h + 6 + (theme_rowh - tile_h) / 2;
         let theme_tiles: Vec<Rect> = (0..THEMES.len() as i32)
             .map(|i| (x + pad + i * (tile_w + 6), theme_y, tile_w, tile_h))
@@ -1423,6 +1446,7 @@ impl Renderer {
             card: (x, y, w, h),
             head_h,
             rowh,
+            shortcuts_btn,
             theme_tiles,
             font_label_y: font_y,
             font_prev,
@@ -1491,6 +1515,17 @@ impl Renderer {
         let hw = self.measure(&head, true);
         self.draw_run(&head, true, out, whole, (x + w - pad) as f32 - hw, y + 14, 1.0);
         push_rect(out, whole, x + pad, y + lay.head_h, w - pad * 2, 1, c4(EDGE, 255));
+
+        // the shortcuts-editor button (header, left)
+        {
+            let (bx, by, bw, bh) = lay.shortcuts_btn;
+            push_rect(out, whole, bx - 1, by - 1, bw + 2, bh + 2, c4(EDGE, 255));
+            push_rect(out, whole, bx, by, bw, bh, c4(CTL_BG, 255));
+            let seg = [Seg::plain("الاختصارات ‹", MUTED)];
+            let lw = self.measure(&seg, true);
+            self.draw_run(&seg, true, out, whole,
+                          bx as f32 + (bw as f32 - lw) / 2.0, by + 3, 1.0);
+        }
 
         // right-aligned row label; returns where the leader dots must stop
         let label = |r: &mut Self, out: &mut Vec<Vertex>, text: &str, row_top: i32| -> i32 {
@@ -1684,6 +1719,122 @@ impl Renderer {
         let hint = [Seg::plain("انقر للتغيير · Esc للإغلاق والحفظ", (0x6e, 0x78, 0x85))];
         let fw2 = self.measure(&hint, true);
         self.draw_run(&hint, true, out, whole, (x + w - pad) as f32 - fw2,
+                      y + h - (self.cell_h as i32 + 14), 1.0);
+    }
+
+    /// Geometry of the shortcuts editor: one full-width clickable strip per
+    /// action row (draw + hit-test agree, like the settings panel).
+    pub fn shortcuts_layout(&self, fw: usize, fh: usize, n: usize) -> ShortcutsLayout {
+        let w = ((self.cell_w * 44.0) as i32).clamp(380, fw as i32 - 60);
+        let rowh = (self.cell_h + 18.0) as i32;
+        let head_h = (self.cell_h + 30.0) as i32;
+        let foot_h = (self.cell_h + 30.0) as i32;
+        let h = head_h + 6 + rowh * n as i32 + foot_h;
+        let x = (fw as i32 - w) / 2;
+        let y = (self.tab_bar_h() as i32 + (fh as i32 - h) / 3)
+            .max(self.tab_bar_h() as i32 + 12);
+        let rows_top = y + head_h + 6;
+        let rows = (0..n as i32)
+            .map(|i| (x + 8, rows_top + rowh * i, w - 16, rowh))
+            .collect();
+        ShortcutsLayout { card: (x, y, w, h), rowh, rows }
+    }
+
+    /// The shortcuts editor: the settings ledger grammar again — keycap
+    /// chips left ··· action label right. The selected row highlights; a
+    /// capturing row swaps its chips for an amber "press the new chord".
+    pub fn draw_shortcuts(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
+                          rows: &[ShortcutRow], sel: usize, capturing: bool,
+                          flash: Option<&str>) {
+        const CARD: (u8, u8, u8) = (0x14, 0x19, 0x20);
+        const EDGE: (u8, u8, u8) = (0x2a, 0x31, 0x3a);
+        const CTL_BG: (u8, u8, u8) = (0x24, 0x2b, 0x34);
+        const GREEN: (u8, u8, u8) = (0x2e, 0xa0, 0x43);
+        const VALUE: (u8, u8, u8) = (0x7e, 0xe7, 0x87);
+        const MUTED: (u8, u8, u8) = (0x9a, 0xa4, 0xb2);
+        const DOT: (u8, u8, u8) = (0x33, 0x3b, 0x45);
+        const AMBER: (u8, u8, u8) = (0xf2, 0xcc, 0x60);
+
+        let whole: Rect = (0, 0, fw as i32, fh as i32);
+        let lay = self.shortcuts_layout(fw, fh, rows.len());
+        let (x, y, w, h) = lay.card;
+        let pad = 24;
+        let tc = (lay.rowh as f32 - self.cell_h) as i32 / 2;
+
+        push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 140));
+        push_rect(out, whole, x - 1, y - 1, w + 2, h + 2, c4(EDGE, 255));
+        push_rect(out, whole, x, y, w, h, c4(CARD, 255));
+        push_rect(out, whole, x, y, w, 3, c4(GREEN, 255));
+
+        let head = [Seg { text: "الاختصارات".into(), fg: self.fg, style: ST_BOLD }];
+        let hw = self.measure(&head, true);
+        self.draw_run(&head, true, out, whole, (x + w - pad) as f32 - hw, y + 14, 1.0);
+        push_rect(out, whole, x + pad, y + (self.cell_h + 30.0) as i32, w - pad * 2, 1,
+                  c4(EDGE, 255));
+
+        for (i, row) in rows.iter().enumerate() {
+            let (rx, ry, rw, rh) = lay.rows[i];
+            let selected = i == sel;
+            if selected {
+                // RTL accent: the highlight bar hugs the right edge
+                push_rect(out, whole, rx, ry, rw, rh, c4((0x1b, 0x21, 0x29), 255));
+                push_rect(out, whole, rx + rw - 3, ry + 2, 3, rh - 4, c4(GREEN, 255));
+            }
+            // label, right-aligned
+            let lseg = [Seg::plain(row.label.clone(),
+                                   if selected { self.fg } else { MUTED })];
+            let lw = self.measure(&lseg, true);
+            let label_x = (x + w - pad) as f32 - lw;
+            self.draw_run(&lseg, true, out, whole, label_x, ry + tc, 1.0);
+
+            let chips_end;
+            if selected && capturing {
+                // amber capture prompt in place of the chips
+                let seg = [Seg { text: "اضغط الاختصار الجديد…".into(),
+                                 fg: AMBER, style: ST_BOLD }];
+                let cw = self.measure(&seg, true);
+                self.draw_run(&seg, true, out, whole, (x + pad) as f32, ry + tc, 1.0);
+                chips_end = x + pad + cw as i32;
+            } else {
+                // keycap chips, one per token: Ctrl / Shift / T
+                let ch = lay.rowh - 12;
+                let mut cx = x + pad;
+                let cy = ry + (lay.rowh - ch) / 2;
+                for token in row.chord.split('+') {
+                    let fg = if row.custom { VALUE } else { self.fg };
+                    let seg = [Seg { text: token.to_string(), fg, style: 0 }];
+                    let tw = self.measure(&seg, false);
+                    let cw = tw as i32 + 14;
+                    push_rect(out, whole, cx - 1, cy - 1, cw + 2, ch + 2, c4(EDGE, 255));
+                    push_rect(out, whole, cx, cy, cw, ch, c4(CTL_BG, 255));
+                    self.draw_run(&seg, false, out, whole, (cx + 7) as f32,
+                                  cy + ((ch as f32 - self.cell_h) / 2.0) as i32, 1.0);
+                    cx += cw + 6;
+                }
+                chips_end = cx - 6;
+            }
+            // the ledger dots tie chips to label
+            let dy = ry + lay.rowh / 2 - 1;
+            let mut dx = chips_end + 16;
+            while dx + 2 <= label_x as i32 - 14 {
+                push_rect(out, whole, dx, dy, 2, 2, c4(DOT, 255));
+                dx += 9;
+            }
+        }
+
+        // footer: hairline + flash (amber, right) or the hint
+        push_rect(out, whole, x + pad, y + h - (self.cell_h as i32 + 24), w - pad * 2, 1,
+                  c4(EDGE, 255));
+        let (text, color) = match flash {
+            Some(f) => (f.to_string(), AMBER),
+            None => (
+                "Enter تغيير · Delete افتراضي · Esc إغلاق".to_string(),
+                (0x6e, 0x78, 0x85),
+            ),
+        };
+        let seg = [Seg::plain(text, color)];
+        let fw2 = self.measure(&seg, true);
+        self.draw_run(&seg, true, out, whole, (x + w - pad) as f32 - fw2,
                       y + h - (self.cell_h as i32 + 14), 1.0);
     }
 
@@ -2141,6 +2292,29 @@ mod cache_tests {
         // a point in the first tile does NOT hit the +/− or toggle
         let (t0x, t0y, _, _) = lay.theme_tiles[0];
         assert!(!rect_hit(lay.size_plus, (t0x + 2) as f64, (t0y + 2) as f64));
+    }
+
+    /// The shortcuts editor layout: one clickable strip per action, all
+    /// inside the card, none overlapping, in row order top to bottom.
+    #[test]
+    fn shortcuts_layout_places_one_strip_per_action() {
+        let r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let n = crate::keybinds::Action::ALL.len();
+        let lay = r.shortcuts_layout(1400, 900, n);
+        assert_eq!(lay.rows.len(), n);
+        let (cx, cy, cw, ch) = lay.card;
+        assert!(cx > 0 && cy > 0 && cx + cw <= 1400 && cy + ch <= 900);
+        let mut last_bottom = 0;
+        for &(rx, ry, rw, rh) in &lay.rows {
+            assert!(rx >= cx && rx + rw <= cx + cw && ry >= cy && ry + rh <= cy + ch);
+            assert!(ry >= last_bottom, "rows must stack without overlap");
+            last_bottom = ry + rh;
+        }
+        // the settings panel's header button exists and sits inside ITS card
+        let slay = r.settings_layout(1400, 900);
+        let (bx, by, bw, bh) = slay.shortcuts_btn;
+        let (scx, scy, scw, sch) = slay.card;
+        assert!(bx >= scx && bx + bw <= scx + scw && by >= scy && by + bh <= scy + sch);
     }
 
     /// The settings gear button hit-test: a click on it registers, a click

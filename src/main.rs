@@ -10,6 +10,7 @@
 mod bidi;
 mod config;
 mod gpu;
+mod keybinds;
 mod keys;
 mod render;
 mod term;
@@ -22,6 +23,16 @@ fn hex((r, g, b): (u8, u8, u8)) -> String {
 /// The Windows caret rhythm; kitty's idea on top: stop after 15s idle.
 const BLINK_MS: u128 = 530;
 const BLINK_STOP: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The shortcuts editor overlay's state.
+#[derive(Default)]
+struct ShortcutsState {
+    sel: usize,
+    /// waiting for the new chord's keypress
+    capturing: bool,
+    /// a one-shot footer message (conflict / invalid chord)
+    flash: Option<String>,
+}
 
 /// What the close guard is protecting (confirm_close setting).
 #[derive(Clone, Copy)]
@@ -429,6 +440,10 @@ struct App {
     auto_follow: bool,
     claude_manual: bool,
     config: config::UserConfig,
+    /// every rebindable action's effective chord (defaults + config)
+    keymap: Vec<(keybinds::Action, keybinds::Chord)>,
+    /// the shortcuts editor overlay, when open
+    shortcuts: Option<ShortcutsState>,
     /// last seen atlas generation (a reset schedules a healing redraw)
     atlas_generation: u32,
     /// Ctrl+wheel zoom, in points on top of the configured size.
@@ -623,6 +638,196 @@ impl App {
         self.request_redraw();
     }
 
+    /// Run one rebindable action (the keymap's dispatch target).
+    fn perform_action(&mut self, action: keybinds::Action, el: &ActiveEventLoop) {
+        use keybinds::Action::*;
+        match action {
+            NewTab => {
+                // new tab inherits the active tab's directory
+                let cwd = self
+                    .session()
+                    .and_then(|s| s.meta.lock().unwrap().cwd.clone());
+                self.spawn_tab(cwd);
+                self.update_title();
+                self.request_redraw();
+            }
+            ClosePane => {
+                let (ti, pi) = (
+                    self.active,
+                    self.tabs.get(self.active).map_or(0, |t| t.focused),
+                );
+                if self.config.confirm_close_on() && self.running_command(ti, pi).is_some()
+                {
+                    self.pending_close = Some(CloseTarget::Pane(ti, pi));
+                    self.request_redraw();
+                    return;
+                }
+                self.remove_pane(ti, pi, el);
+            }
+            Search => {
+                self.search = Some(SearchState::default());
+                self.request_redraw();
+            }
+            Settings => {
+                self.settings = Some(0);
+                self.request_redraw();
+            }
+            Copy => {
+                self.copy_selection(false);
+            }
+            Paste => self.paste(),
+            SplitH => self.split(Orientation::Row),
+            SplitV => self.split(Orientation::Column),
+            Cockpit => {
+                self.cockpit = true;
+                self.cockpit_sel = self.active;
+                self.request_redraw();
+            }
+            PromptPrev => self.jump_command(-1),
+            PromptNext => self.jump_command(1),
+            ClaudeToggle => {
+                // auto -> manual flip -> auto (EasyTer's toggle semantics)
+                if self.auto_follow {
+                    self.claude_manual = !self.claude_active();
+                    self.auto_follow = false;
+                } else {
+                    self.auto_follow = true;
+                }
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// Keyboard while the shortcuts editor is open: arrows select, Enter
+    /// captures, Delete restores a default, Esc closes (or cancels a
+    /// capture). A capture takes the next bindable chord.
+    fn shortcuts_input(&mut self, event: &KeyEvent, el: &ActiveEventLoop) {
+        let _ = el;
+        let Some(st) = self.shortcuts.as_mut() else { return };
+        let n = keybinds::Action::ALL.len();
+        if st.capturing {
+            if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
+                st.capturing = false;
+                self.request_redraw();
+                return;
+            }
+            let (ctrl, shift, alt) = (
+                self.modifiers.control_key(),
+                self.modifiers.shift_key(),
+                self.modifiers.alt_key(),
+            );
+            let Some(chord) = keybinds::chord_from(event.physical_key, ctrl, shift, alt)
+            else {
+                return; // a bare modifier — keep waiting for the real key
+            };
+            if !chord.is_bindable() {
+                st.flash = Some("الاختصار يحتاج Ctrl أو Alt أو مفتاح F".to_string());
+                st.capturing = false;
+                self.request_redraw();
+                return;
+            }
+            let action = keybinds::Action::ALL[st.sel];
+            if let Some(owner) = keybinds::lookup(&self.keymap, chord) {
+                if owner != action {
+                    st.flash =
+                        Some(format!("«{}» يستخدم هذا الاختصار", owner.label()));
+                    st.capturing = false;
+                    self.request_redraw();
+                    return;
+                }
+            }
+            st.capturing = false;
+            st.flash = None;
+            self.set_binding(action, chord);
+            return;
+        }
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.shortcuts = None;
+                config::save(&self.config);
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                st.sel = (st.sel + n - 1) % n;
+                st.flash = None;
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                st.sel = (st.sel + 1) % n;
+                st.flash = None;
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::Enter) => {
+                st.capturing = true;
+                st.flash = None;
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) => {
+                let action = keybinds::Action::ALL[st.sel];
+                st.flash = None;
+                self.clear_binding(action);
+            }
+            _ => {}
+        }
+    }
+
+    /// Store a binding (pruned back out if it IS the default) and rebuild
+    /// the live keymap.
+    fn set_binding(&mut self, action: keybinds::Action, chord: keybinds::Chord) {
+        let kb = self.config.keybinds.get_or_insert_with(Default::default);
+        if chord == action.default_chord() {
+            kb.remove(action.id());
+        } else {
+            kb.insert(action.id().to_string(), chord.to_config());
+        }
+        if self.config.keybinds.as_ref().is_some_and(|m| m.is_empty()) {
+            self.config.keybinds = None;
+        }
+        self.keymap = keybinds::effective_map(&self.config);
+        self.request_redraw();
+    }
+
+    fn clear_binding(&mut self, action: keybinds::Action) {
+        if let Some(kb) = self.config.keybinds.as_mut() {
+            kb.remove(action.id());
+            if kb.is_empty() {
+                self.config.keybinds = None;
+            }
+        }
+        self.keymap = keybinds::effective_map(&self.config);
+        self.request_redraw();
+    }
+
+    /// A click while the shortcuts editor is open: a row selects and starts
+    /// a capture; anywhere else closes (saving).
+    fn shortcuts_click(&mut self, px: f64, py: f64) {
+        let Some((fw, fh)) = self.window.as_ref().map(|w| {
+            let s = w.inner_size();
+            (s.width as usize, s.height as usize)
+        }) else {
+            return;
+        };
+        let n = keybinds::Action::ALL.len();
+        let Some(lay) = self.renderer.as_ref().map(|r| r.shortcuts_layout(fw, fh, n))
+        else {
+            return;
+        };
+        if !render::rect_hit(lay.card, px, py) {
+            self.shortcuts = None;
+            config::save(&self.config);
+            self.request_redraw();
+            return;
+        }
+        if let Some(i) = lay.rows.iter().position(|&r| render::rect_hit(r, px, py)) {
+            if let Some(st) = self.shortcuts.as_mut() {
+                st.sel = i;
+                st.capturing = true;
+                st.flash = None;
+                self.request_redraw();
+            }
+        }
+    }
+
     /// Blink phase now + when it next flips. (true, None) = solid cursor,
     /// nothing to schedule: blink off, window unfocused, or 15s idle.
     fn cursor_blink_state(&self) -> (bool, Option<Instant>) {
@@ -680,7 +885,14 @@ impl App {
             self.close_settings();
             return;
         }
-        if let Some(i) = lay.theme_tiles.iter().position(|&t| render::rect_hit(t, px, py)) {
+        if render::rect_hit(lay.shortcuts_btn, px, py) {
+            // hand the stage to the shortcuts editor (settings saves first)
+            self.close_settings();
+            self.shortcuts = Some(ShortcutsState::default());
+            self.request_redraw();
+        } else if let Some(i) =
+            lay.theme_tiles.iter().position(|&t| render::rect_hit(t, px, py))
+        {
             self.apply_theme(i);
         } else if render::rect_hit(lay.font_prev, px, py) {
             self.cycle_font(-1);
@@ -1353,6 +1565,19 @@ impl App {
         let cursor_style = self.config.cursor();
         let (cursor_on, _) = self.cursor_blink_state();
         self.blink_drawn_on = cursor_on;
+        let shortcuts_view: Option<(Vec<render::ShortcutRow>, usize, bool, Option<String>)> =
+            self.shortcuts.as_ref().map(|st| {
+                let rows = self
+                    .keymap
+                    .iter()
+                    .map(|(a, c)| render::ShortcutRow {
+                        label: a.label().to_string(),
+                        chord: c.display(),
+                        custom: *c != a.default_chord(),
+                    })
+                    .collect();
+                (rows, st.sel, st.capturing, st.flash.clone())
+            });
         let close_msg: Option<String> = self.pending_close.map(|target| match target {
             CloseTarget::Pane(ti, pi) => {
                 let cmd = self.running_command(ti, pi).unwrap_or_default();
@@ -1480,6 +1705,17 @@ impl App {
                         );
                     }
                 }
+                if let Some((rows, sel, capturing, flash)) = &shortcuts_view {
+                    renderer.draw_shortcuts(
+                        &mut verts,
+                        px.width as usize,
+                        px.height as usize,
+                        rows,
+                        *sel,
+                        *capturing,
+                        flash.as_deref(),
+                    );
+                }
                 if let Some(msg) = &close_msg {
                     renderer.draw_close_guard(
                         &mut verts,
@@ -1590,6 +1826,9 @@ impl ApplicationHandler<UserEvent> for App {
         }
         if std::env::var_os("BAYAN_SETTINGS").is_some() {
             self.settings = Some(0);
+        }
+        if std::env::var_os("BAYAN_SHORTCUTS").is_some() {
+            self.shortcuts = Some(ShortcutsState::default());
         }
         // BAYAN_PICK_THEME=<n>: open settings and apply theme n, so a click's
         // live effect can be verified in a screenshot without input injection
@@ -1833,6 +2072,12 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
                 ElementState::Pressed => {
+                    // the shortcuts editor swallows clicks: a row starts a
+                    // capture, outside the card closes + saves
+                    if self.shortcuts.is_some() {
+                        self.shortcuts_click(self.cursor_pos.x, self.cursor_pos.y);
+                        return;
+                    }
                     // the settings panel swallows clicks: apply the control
                     // hit, or a click outside the card closes + saves
                     if self.settings.is_some() {
@@ -1998,6 +2243,11 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_redraw();
                     return;
                 }
+                // the shortcuts editor owns the keyboard while open
+                if self.shortcuts.is_some() {
+                    self.shortcuts_input(&event, el);
+                    return;
+                }
                 // the settings panel owns the keyboard while open
                 if self.settings.is_some() {
                     self.settings_input(&event);
@@ -2014,73 +2264,19 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 let key = &event.logical_key;
-                // F2: Claude mode manual toggle (auto -> manual flip -> auto)
-                if matches!(key, Key::Named(NamedKey::F2)) {
-                    if self.auto_follow {
-                        self.claude_manual = !self.claude_active();
-                        self.auto_follow = false;
-                    } else {
-                        self.auto_follow = true;
-                    }
-                    self.request_redraw();
-                    return;
-                }
-                // ---- app-level shortcuts (EasyTer's rules) ----
-                if ctrl && shift {
-                    // Ctrl+Shift+Up/Down: jump between command prompts
-                    match key {
-                        Key::Named(NamedKey::ArrowUp) => {
-                            self.jump_command(-1);
+                // ---- rebindable shortcuts (the keymap; Ctrl+, ⌨ edits it).
+                // EasyTer's TUI rule, generalized: a PLAIN ctrl+letter chord
+                // belongs to a full-screen TUI when one is up — pass it on.
+                if let Some(chord) =
+                    keybinds::chord_from(event.physical_key, ctrl, shift, alt)
+                {
+                    if let Some(action) = keybinds::lookup(&self.keymap, chord) {
+                        let tui_owns = chord.is_plain_ctrl_letter()
+                            && self.term_mode().contains(TermMode::ALT_SCREEN);
+                        if !tui_owns {
+                            self.perform_action(action, el);
                             return;
                         }
-                        Key::Named(NamedKey::ArrowDown) => {
-                            self.jump_command(1);
-                            return;
-                        }
-                        _ => {}
-                    }
-                    match key_letter(&event) {
-                        Some('c') => {
-                            self.copy_selection(false);
-                            return;
-                        }
-                        Some('v') => {
-                            self.paste();
-                            return;
-                        }
-                        // the agent cockpit: every tab's state, one glance
-                        Some('d') => {
-                            self.cockpit = true;
-                            self.cockpit_sel = self.active;
-                            self.request_redraw();
-                            return;
-                        }
-                        // splits (EasyTer): E side-by-side, O stacked
-                        Some('e') => {
-                            self.split(Orientation::Row);
-                            return;
-                        }
-                        Some('o') => {
-                            self.split(Orientation::Column);
-                            return;
-                        }
-                        // close the focused pane (the last one closes the tab)
-                        Some('w') => {
-                            let (ti, pi) = (
-                                self.active,
-                                self.tabs.get(self.active).map_or(0, |t| t.focused),
-                            );
-                            if self.config.confirm_close_on()
-                                && self.running_command(ti, pi).is_some()
-                            {
-                                self.pending_close = Some(CloseTarget::Pane(ti, pi));
-                                self.request_redraw();
-                                return;
-                            }
-                            self.remove_pane(ti, pi, el);
-                            return;
-                        }
-                        _ => {}
                     }
                 }
                 // Alt+arrows move focus between panes (EasyTer's binding)
@@ -2107,21 +2303,6 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 } else if ctrl {
-                    // Ctrl+, opens the settings panel (EasyTer's binding).
-                    // Match the PHYSICAL comma key: on an Arabic layout the
-                    // comma key's logical char is "،" (U+060C), not ASCII ",",
-                    // so logical matching never fired (the same layout trap as
-                    // Ctrl+letters — resolve by KeyCode).
-                    {
-                        use winit::keyboard::{KeyCode, PhysicalKey};
-                        if !shift
-                            && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Comma))
-                        {
-                            self.settings = Some(0);
-                            self.request_redraw();
-                            return;
-                        }
-                    }
                     // Ctrl+Tab / Ctrl+Shift+Tab cycle tabs (shift handled here
                     // because winit reports Tab+shift with the shift modifier)
                     if matches!(key, Key::Named(NamedKey::Tab)) && !self.tabs.is_empty() {
@@ -2146,37 +2327,13 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                     }
+                    // Ctrl+C copies when a selection exists (Windows
+                    // convention); otherwise falls through to \x03
                     if let Some(l) = key_letter(&event) {
-                        // Ctrl+C copies when a selection exists (Windows
-                        // convention); otherwise falls through to \x03
                         if !shift && l == 'c' && self.has_selection() {
                             self.copy_selection(true);
                             self.request_redraw();
                             return;
-                        }
-                        // plain Ctrl+T/V/F belong to a full-screen TUI
-                        if !shift && (l == 'v' || l == 'f' || l == 't') {
-                            let alt_screen =
-                                self.term_mode().contains(TermMode::ALT_SCREEN);
-                            if l == 't' && !alt_screen {
-                                // new tab inherits the active tab's directory
-                                let cwd = self
-                                    .session()
-                                    .and_then(|s| s.meta.lock().unwrap().cwd.clone());
-                                self.spawn_tab(cwd);
-                                self.update_title();
-                                self.request_redraw();
-                                return;
-                            }
-                            if l == 'v' && !alt_screen {
-                                self.paste();
-                                return;
-                            }
-                            if l == 'f' && !alt_screen {
-                                self.search = Some(SearchState::default());
-                                self.request_redraw();
-                                return;
-                            }
                         }
                     }
                 }
@@ -2244,6 +2401,8 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Wait);
     prof::mark("event loop built");
     let proxy = event_loop.create_proxy();
+    let cfg = config::load();
+    let keymap = keybinds::effective_map(&cfg);
     let mut app = App {
         proxy,
         window: None,
@@ -2275,7 +2434,9 @@ fn main() {
         clipboard: None,
         auto_follow: true,
         claude_manual: false,
-        config: config::load(),
+        config: cfg,
+        keymap,
+        shortcuts: None,
         atlas_generation: 0,
         font_delta: 0.0,
         renderer_building: false,
