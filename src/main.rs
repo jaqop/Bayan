@@ -368,6 +368,9 @@ struct App {
     first_frame: bool,
     first_output: bool,
     stressed: bool,
+    /// last frame's quad bytes — an identical frame skips the GPU submit
+    /// (a still terminal stops re-rendering; laptop battery thanks you)
+    last_frame: Vec<u8>,
     cursor_pos: PhysicalPosition<f64>,
     mouse_left_down: bool,
     /// the pane a mouse selection started in (drags don't cross panes)
@@ -1123,6 +1126,17 @@ impl App {
                 }
             }
         }
+        // differential redraw: an identical quad set + unchanged atlas means
+        // the frame is pixel-for-pixel the last one — skip the submit. (An
+        // atlas upload this frame always redraws; so does a heal.)
+        let frame_bytes = bytemuck::cast_slice::<gpu::Vertex, u8>(&verts);
+        // never skip the very first present (it reveals the hidden window)
+        let unchanged = self.first_frame && !heal && frame_bytes == self.last_frame.as_slice();
+        if unchanged {
+            return;
+        }
+        self.last_frame.clear();
+        self.last_frame.extend_from_slice(frame_bytes);
         let bg = self.renderer.as_ref().map_or(render::BG, |r| r.bg);
         gpu.render(&verts, bg);
         if heal {
@@ -1735,6 +1749,7 @@ fn main() {
         first_frame: false,
         first_output: false,
         stressed: false,
+        last_frame: Vec::new(),
         cursor_pos: PhysicalPosition::new(0.0, 0.0),
         mouse_left_down: false,
         sel_pane: 0,

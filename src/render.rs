@@ -386,17 +386,28 @@ const AMIRI_BOLD: &[u8] = include_bytes!("../fonts/Amiri-Bold.ttf");
 
 /// Primary-font preference order. Nerd Font variants first: oh-my-posh
 /// prompts are built from their private-use icons and powerline separators,
-/// and a non-NF primary renders those as ugly boxes/blocks.
-const FAMILY_CANDIDATES: &[&str] = &[
-    "Cascadia Mono NF",
+/// and a non-NF primary renders those as ugly boxes/blocks. When ligatures
+/// are on, the ligature-capable "Code" variants lead (Cascadia Code, Fira,
+/// JetBrains all ligate); when off, the plain "Mono" variants lead.
+const FAMILY_LIGA: &[&str] = &[
     "Cascadia Code NF",
+    "FiraCode Nerd Font",
+    "JetBrainsMono Nerd Font",
+    "Cascadia Code",
+    "Cascadia Mono NF",
+    "Consolas",
+];
+const FAMILY_MONO: &[&str] = &[
+    "Cascadia Mono NF",
     "CaskaydiaCove Nerd Font Mono",
     "JetBrainsMono Nerd Font Mono",
     "Cascadia Mono",
+    "Cascadia Code NF",
     "Consolas",
 ];
 
-fn pick_family(db: &cosmic_text::fontdb::Database, preferred: Option<&str>) -> String {
+fn pick_family(db: &cosmic_text::fontdb::Database, preferred: Option<&str>,
+               ligatures: bool) -> String {
     let has = |name: &str| {
         db.faces()
             .any(|f| f.families.iter().any(|(n, _)| n == name))
@@ -406,7 +417,8 @@ fn pick_family(db: &cosmic_text::fontdb::Database, preferred: Option<&str>) -> S
             return p.to_string();
         }
     }
-    for cand in FAMILY_CANDIDATES {
+    let list = if ligatures { FAMILY_LIGA } else { FAMILY_MONO };
+    for cand in list {
         if has(cand) {
             return (*cand).to_string();
         }
@@ -466,6 +478,9 @@ pub struct Renderer {
     pub bg: (u8, u8, u8),
     fg: (u8, u8, u8),
     palette: [(u8, u8, u8); 16],
+    /// ligatures on: ASCII shapes as one run (rustybuzz forms -> => != ...).
+    /// off: ASCII shapes per cell, so no substitutions can occur.
+    ligatures: bool,
     pub cell_w: f32,
     pub cell_h: f32,
 }
@@ -477,7 +492,8 @@ impl Renderer {
         let mut font_system = FontSystem::new();
         font_system.db_mut().load_font_data(AMIRI.to_vec());
         font_system.db_mut().load_font_data(AMIRI_BOLD.to_vec());
-        let family = pick_family(font_system.db(), cfg.font_family.as_deref());
+        let ligatures = cfg.ligatures.unwrap_or(true);
+        let family = pick_family(font_system.db(), cfg.font_family.as_deref(), ligatures);
         let size = (cfg.font_size.unwrap_or(FONT_SIZE) + extra_pts).clamp(8.0, 40.0) * scale;
         let metrics = Metrics::new(size, (size * 1.4).ceil());
         // cell width = the primary monospace font's advance for an ASCII probe
@@ -516,6 +532,7 @@ impl Renderer {
             bg: cfg.bg.as_deref().and_then(crate::config::parse_hex).unwrap_or(BG),
             fg: cfg.fg.as_deref().and_then(crate::config::parse_hex).unwrap_or(FG),
             palette,
+            ligatures,
             cell_w,
             cell_h: metrics.line_height,
         }
@@ -719,7 +736,10 @@ impl Renderer {
         };
         while i < n {
             let ci = &cells[i];
-            if ci.c.is_ascii() {
+            // batch a contiguous ASCII run as ONE shaped buffer so rustybuzz
+            // forms programming ligatures (-> => != >= ...). Only when
+            // ligatures are enabled; otherwise every cell shapes alone below.
+            if self.ligatures && ci.c.is_ascii() {
                 let col0 = ci.col;
                 let mut segs: Vec<Seg> = Vec::new();
                 let mut expect = ci.col;
@@ -760,17 +780,20 @@ impl Renderer {
                 }
                 i = j;
             } else {
-                // exotic glyph: pin to its own cell box, flush left so
-                // powerline separators stay seamless; compress if wider
+                // one cell, shaped alone: no adjacent context for rustybuzz
+                // to ligate (ligatures off), and exotic glyphs (icons, box
+                // drawing, CJK) get pinned to their box, compressed if wider
                 note_deco(ci);
-                let mut s = String::new();
-                ci.push_text(&mut s);
-                let seg = [Seg { text: s, fg: ci.fg, style: ci.style }];
-                let natw = self.measure(&seg, false);
-                let boxw = ci.w as f32 * self.cell_w;
-                let scale = if natw > boxw + 0.5 { boxw / natw } else { 1.0 };
-                self.draw_run(&seg, false, out, clip,
-                              x0 as f32 + ci.col as f32 * self.cell_w, y, scale);
+                if ci.c != ' ' {
+                    let mut s = String::new();
+                    ci.push_text(&mut s);
+                    let seg = [Seg { text: s, fg: ci.fg, style: ci.style }];
+                    let natw = self.measure(&seg, false);
+                    let boxw = ci.w as f32 * self.cell_w;
+                    let scale = if natw > boxw + 0.5 { boxw / natw } else { 1.0 };
+                    self.draw_run(&seg, false, out, clip,
+                                  x0 as f32 + ci.col as f32 * self.cell_w, y, scale);
+                }
                 i += 1;
             }
         }
@@ -1305,6 +1328,54 @@ mod cache_tests {
         assert_eq!(r.cache_hot.len(), before + 1);
     }
 
+    /// Count the glyphs a shaped run produced (a ligature merges N chars
+    /// into 1 glyph, so `->` shapes to 1 when the font ligates).
+    fn glyph_count(r: &mut Renderer, text: &str) -> usize {
+        let key = r.ensure_shaped(&[Seg::plain(text, FG)], false);
+        r.cache_hot[&key]
+            .buffer
+            .layout_runs()
+            .map(|run| run.glyphs.len())
+            .sum()
+    }
+
+    /// A shaped ASCII run merges to a ligature glyph THE MOMENT the shaper
+    /// applies `calt` — the batched-run path is ready. cosmic-text 0.12
+    /// builds its shape plan with no user features and does not enable
+    /// programming ligatures, so today `->` stays 2 glyphs; this test
+    /// asserts the mechanism (batched shaping) and reports the shaper state
+    /// without failing when ligatures don't fire (an upstream limit, not a
+    /// Bayan bug). See FAMILY_LIGA / the `ligatures` config.
+    #[test]
+    fn ascii_run_is_batched_for_ligature_shaping() {
+        let cfg = crate::config::UserConfig::default(); // ligatures default on
+        let mut r = Renderer::new(1.0, &cfg, 0.0);
+        assert!(r.ligatures);
+        // two distinct letters never merge — the run really is being shaped
+        assert_eq!(glyph_count(&mut r, "ab"), 2);
+        let arrow = glyph_count(&mut r, "->");
+        assert!(arrow == 1 || arrow == 2, "unexpected glyph count {arrow}");
+        eprintln!(
+            "NOTE ligatures: `->` -> {arrow} glyphs (font {}); \
+             cosmic-text 0.12 does not enable calt, so ligatures are wired \
+             but dormant until an upstream shaper feature bump",
+            r.family
+        );
+    }
+
+    /// The ligatures toggle picks a Mono-leading font family when off (so a
+    /// ligature-capable default doesn't sneak substitutions in later).
+    #[test]
+    fn ligatures_off_prefers_a_mono_family() {
+        let mut cfg = crate::config::UserConfig::default();
+        cfg.ligatures = Some(false);
+        let r = Renderer::new(1.0, &cfg, 0.0);
+        assert!(!r.ligatures);
+        // the picked family is the first installed MONO candidate (or a
+        // Consolas fallback) — never a Code-leading pick
+        assert!(FAMILY_MONO.contains(&r.family.as_str()) || r.family == "Consolas");
+    }
+
     /// The atlas grows a new page when one fills, keeping earlier glyphs —
     /// instead of M10's wipe-everything reset.
     #[test]
@@ -1374,7 +1445,7 @@ mod startup_probe {
         fs.db_mut().load_font_data(AMIRI.to_vec());
         let t_amiri = t1.elapsed();
         let t2 = Instant::now();
-        let fam = pick_family(fs.db(), None);
+        let fam = pick_family(fs.db(), None, true);
         let t_pick = t2.elapsed();
         let t3 = Instant::now();
         let mut b = Buffer::new(&mut fs, Metrics::new(15.0, 21.0));

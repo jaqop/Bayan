@@ -18,6 +18,9 @@ pub struct UserConfig {
     pub fg: Option<String>,
     /// The 16 ANSI colors as "#rrggbb", normal 0-7 then bright 8-15.
     pub palette: Option<Vec<String>>,
+    /// Programming ligatures (-> => != >= ...). Default on; needs a
+    /// ligature-capable font (Cascadia Code, JetBrains Mono, Fira Code).
+    pub ligatures: Option<bool>,
 }
 
 /// "#rrggbb" (or "rrggbb") -> rgb. None on anything malformed.

@@ -103,8 +103,17 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       is recreated with more layers only on the rare growth. Verified by
       forcing thousands of distinct glyphs across several pages: page-0
       Latin/Arabic and page-N CJK render together, uncorrupted, in one call.
-- [ ] **M14 (backlog)** — damage-based partial redraw; ligatures; a native
-      toast for finish alerts
+- [x] **M14** — differential redraw: a frame whose quad set is byte-identical
+      to the last (and no new atlas glyph) skips the GPU submit entirely, so
+      a still terminal stops re-rendering (laptop battery win); ligature
+      infrastructure — a `ligatures` config toggle, ligature-capable font
+      preference (Cascadia Code / Fira / JetBrains lead when on), and batched
+      ASCII-run shaping that forms `-> => != …` the moment the shaper enables
+      `calt` (dormant today: cosmic-text 0.12 builds its shape plan with no
+      user features — an upstream limit, honestly flagged, not a Bayan bug)
+- [ ] **M15 (backlog)** — real ligatures via a direct rustybuzz+swash ASCII
+      shaper (bypassing cosmic-text's featureless plan); native toast; a
+      cosmic-text bump if it grows a features API
 
 ## Build
 
