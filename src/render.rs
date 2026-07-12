@@ -155,6 +155,15 @@ impl CellInfo {
             s.extend(z.iter());
         }
     }
+
+    /// UTF-8 length this cell contributes to the shaped text.
+    fn text_len(&self) -> usize {
+        self.c.len_utf8()
+            + self
+                .zw
+                .as_ref()
+                .map_or(0, |z| z.iter().map(|c| c.len_utf8()).sum())
+    }
 }
 
 const FONT_SIZE: f32 = 15.0;
@@ -299,14 +308,27 @@ impl Renderer {
     /// A row containing Arabic: shape the WHOLE line so cosmic-text applies
     /// UAX#9 BiDi (mixed directions, LTR islands). Correct text outranks
     /// column fidelity for prose output.
+    ///
+    /// Grid fit (M2b): a shaped Arabic line wider than the window compresses
+    /// horizontally to fit (EasyTer's fix, applied at line level). When the
+    /// terminal cursor sits on this row, its pixel position is resolved
+    /// THROUGH the shaped layout — in RTL, logical column N is not at
+    /// N*cell_w — and returned as (x, w).
     fn draw_line_bidi(&mut self, frame: &mut [u32], fw: usize, fh: usize,
-                      y: i32, cells: &[CellInfo]) {
+                      y: i32, cells: &[CellInfo],
+                      cursor_col: Option<usize>) -> Option<(i32, i32)> {
         let mut end = cells.len();
         while end > 0 && cells[end - 1].c == ' ' {
             end -= 1;
         }
         let mut segs: Vec<(String, (u8, u8, u8))> = Vec::new();
+        let mut cur_bytes: Option<(usize, usize)> = None;
+        let mut nbytes = 0usize;
         for ci in &cells[..end] {
+            if cursor_col == Some(ci.col) {
+                cur_bytes = Some((nbytes, nbytes + ci.c.len_utf8()));
+            }
+            nbytes += ci.text_len();
             match segs.last_mut() {
                 Some((s, c)) if *c == ci.fg => ci.push_text(s),
                 _ => {
@@ -317,10 +339,25 @@ impl Renderer {
             }
         }
         if segs.is_empty() {
-            return;
+            return None;
         }
-        self.shape_scratch(&segs, fw as f32, true);
-        self.blit_scratch(frame, fw, fh, 0.0, y, 1.0);
+        // shape unconstrained, then compress to the window if it overflows
+        let natw = self.shape_scratch(&segs, 1_000_000.0, true);
+        let scale = if natw > fw as f32 { fw as f32 / natw } else { 1.0 };
+        self.blit_scratch(frame, fw, fh, 0.0, y, scale);
+        if let Some((b0, b1)) = cur_bytes {
+            let c0 = cosmic_text::Cursor::new(0, b0);
+            let c1 = cosmic_text::Cursor::new(0, b1);
+            for run in self.buffer.layout_runs() {
+                if let Some((x, w)) = run.highlight(c0, c1) {
+                    return Some((
+                        (x * scale).round() as i32,
+                        ((w * scale).ceil() as i32).max(2),
+                    ));
+                }
+            }
+        }
+        None
     }
 
     /// A row without Arabic (prompts, code, TUIs): strict grid placement.
@@ -424,26 +461,37 @@ impl Renderer {
             lines[li].push(CellInfo { col, w, c: cell.c, zw, fg });
         }
 
+        let cl = cursor.point.line.0;
+        let ccol = cursor.point.column.0;
+        let mut cursor_rect: Option<(i32, i32)> = None; // (x, w) via shaped layout
         for (li, cells) in lines.iter().enumerate() {
             if cells.is_empty() {
                 continue;
             }
             let y = (li as f32 * self.cell_h).round() as i32;
             if cells.iter().any(|ci| is_arabic(ci.c)) {
-                self.draw_line_bidi(frame, width, height, y, cells);
+                let on_row = cl >= 0 && cl as usize == li;
+                let r = self.draw_line_bidi(frame, width, height, y, cells,
+                                            if on_row { Some(ccol) } else { None });
+                if r.is_some() {
+                    cursor_rect = r;
+                }
             } else {
                 self.draw_line_grid(frame, width, height, y, cells);
             }
         }
 
-        // cursor: translucent block over the text so the glyph stays legible
-        // (grid rows are column-exact now; Arabic rows remain approximate)
-        let cl = cursor.point.line.0;
+        // cursor: translucent block over the text so the glyph stays legible.
+        // Grid rows are column-exact; on Arabic rows the position comes from
+        // the shaped layout (logical col != visual x under RTL).
         if cl >= 0 && (cl as usize) < rows {
-            let x0 = (cursor.point.column.0 as f32 * self.cell_w).round() as i32;
+            let (x0, wpx) = cursor_rect.unwrap_or((
+                (ccol as f32 * self.cell_w).round() as i32,
+                self.cell_w.round() as i32,
+            ));
             let y0 = (cl as f32 * self.cell_h).round() as i32;
             blend_rect(frame, width, height,
-                       x0, y0, self.cell_w.round() as i32, self.cell_h.round() as i32,
+                       x0, y0, wpx, self.cell_h.round() as i32,
                        FG, 170);
         }
     }
@@ -486,6 +534,41 @@ mod tests {
         b.shape_until_scroll(&mut fs, false);
         let run = b.layout_runs().next().expect("one layout run");
         assert_eq!(run.glyphs.iter().filter(|g| g.glyph_id == 0).count(), 0);
+    }
+
+    /// The cursor on an RTL row must map through the layout: logical char 0
+    /// (rightmost visually) sits at a HIGHER x than the last logical char.
+    /// This is what makes the block cursor land on the letter it edits.
+    #[test]
+    fn rtl_cursor_maps_through_the_layout() {
+        let mut fs = FontSystem::new();
+        fs.db_mut().load_font_data(AMIRI.to_vec());
+        let mut b = Buffer::new(&mut fs, Metrics::new(15.0, 21.0));
+        b.set_wrap(&mut fs, Wrap::None);
+        b.set_size(&mut fs, Some(1_000_000.0), Some(21.0));
+        let text = "مرحبا"; // 5 chars x 2 bytes
+        b.set_text(&mut fs, text, base_attrs(), Shaping::Advanced);
+        for line in b.lines.iter_mut() {
+            line.set_align(Some(Align::Left));
+        }
+        b.shape_until_scroll(&mut fs, false);
+        let hl = |b: &Buffer, b0: usize, b1: usize| -> f32 {
+            for run in b.layout_runs() {
+                if let Some((x, _)) = run.highlight(
+                    cosmic_text::Cursor::new(0, b0),
+                    cosmic_text::Cursor::new(0, b1),
+                ) {
+                    return x;
+                }
+            }
+            panic!("no highlight for byte range {b0}..{b1}");
+        };
+        let first = hl(&b, 0, 2); // م — visually rightmost
+        let last = hl(&b, 8, 10); // ا — visually leftmost
+        assert!(
+            first > last,
+            "RTL mapping inverted: first logical char at x={first}, last at x={last}"
+        );
     }
 
     /// The line classifier: Arabic rows take the BiDi path, others the grid.

@@ -195,6 +195,17 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // HiDPI: the window moved to a monitor with another scale.
+                // Rebuild cell metrics off-thread; the current renderer keeps
+                // painting until RendererReady swaps it in and re-snaps the grid.
+                let proxy = self.proxy.clone();
+                let scale = scale_factor as f32;
+                std::thread::spawn(move || {
+                    let r = render::Renderer::new(scale);
+                    let _ = proxy.send_event(UserEvent::RendererReady(Box::new(r)));
+                });
+            }
             WindowEvent::Resized(px) => {
                 if px.width == 0 || px.height == 0 {
                     return;

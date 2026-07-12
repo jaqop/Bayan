@@ -35,7 +35,9 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       (column-pinned ASCII runs; icons/powerline/box-drawing per cell,
       compressed to fit), Nerd Font auto-pick, zero-width diacritics
       (tashkeel) render
-- [ ] **M2b** — Arabic-row grid fit, cursor position inside RTL, HiDPI polish
+- [x] **M2b** — Arabic rows compress to the window when the shaped line
+      overflows; the cursor on RTL rows resolves through the shaped layout
+      (logical column ≠ visual x); live monitor-scale changes rebuild metrics
 - [ ] **M3** — selection, clipboard, scrollback UI, search
 - [ ] **M4** — Claude mode (visual→logical reversal), OSC 133/52/9;9 blocks
 - [ ] **M5** — tabs/splits, session persistence, agent cockpit, wgpu renderer
