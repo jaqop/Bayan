@@ -209,9 +209,52 @@ impl Session {
     }
 }
 
+/// Prepare clipboard text for the PTY: newlines become carriage returns, and
+/// under bracketed paste the payload is wrapped — with any embedded end
+/// marker stripped so pasted content can't terminate paste mode early and
+/// smuggle the remainder in as executed input (EasyTer's paste-injection fix).
+pub fn normalize_paste(text: &str, bracketed: bool) -> String {
+    let body = text.replace("\r\n", "\r").replace('\n', "\r");
+    if bracketed {
+        format!("\x1b[200~{}\x1b[201~", body.replace("\x1b[201~", ""))
+    } else {
+        body
+    }
+}
+
+/// Escape a literal so RegexSearch treats it verbatim (search is literal
+/// text, not regex, from the user's point of view).
+pub fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for c in s.chars() {
+        if r"\.+*?()|[]{}^$#&-~".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_normalizes_newlines_and_blocks_injection() {
+        assert_eq!(normalize_paste("a\r\nb\nc", false), "a\rb\rc");
+        // bracketed: wrapped, and an embedded end marker cannot break out
+        assert_eq!(
+            normalize_paste("safe\x1b[201~evil\n", true),
+            "\x1b[200~safeevil\r\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn regex_escape_makes_literals() {
+        assert_eq!(regex_escape("a.b*c"), r"a\.b\*c");
+        assert_eq!(regex_escape("plain"), "plain");
+        assert_eq!(regex_escape("x(1)[2]{3}"), r"x\(1\)\[2\]\{3\}");
+    }
 
     #[test]
     fn posh_config_parses_common_profile_lines() {

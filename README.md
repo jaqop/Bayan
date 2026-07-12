@@ -38,7 +38,11 @@ specification; `src/keys.rs` carries the same key-encoding tests.
 - [x] **M2b** — Arabic rows compress to the window when the shaped line
       overflows; the cursor on RTL rows resolves through the shaped layout
       (logical column ≠ visual x); live monitor-scale changes rebuild metrics
-- [ ] **M3** — selection, clipboard, scrollback UI, search
+- [x] **M3** — mouse selection (drag / double-click word / triple-click
+      line, auto-copy on release), clipboard (Ctrl+V pass-through in TUIs,
+      bracketed-paste injection guard), wheel scrollback + indicator +
+      Shift+PageUp/Down, Ctrl+F literal search with wrap-around; Ctrl
+      shortcuts resolve by PHYSICAL key so they work on Arabic layouts
 - [ ] **M4** — Claude mode (visual→logical reversal), OSC 133/52/9;9 blocks
 - [ ] **M5** — tabs/splits, session persistence, agent cockpit, wgpu renderer
 

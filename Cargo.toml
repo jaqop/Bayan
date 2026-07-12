@@ -14,6 +14,8 @@ portable-pty = "0.8"
 winit = "0.30"
 softbuffer = "0.4"
 cosmic-text = "0.12"
+# system clipboard (copy on select / paste)
+arboard = "3"
 
 [profile.release]
 opt-level = 3

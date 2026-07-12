@@ -66,13 +66,20 @@ pub fn encode(
         Key::Named(NamedKey::PageUp) => csi_tilde(5, m),
         Key::Named(NamedKey::PageDown) => csi_tilde(6, m),
         Key::Named(NamedKey::Delete) => csi_tilde(3, m),
-        // Ctrl+letter -> C0 control byte (Ctrl+C = \x03 ...)
+        // Ctrl+letter -> C0 control byte (Ctrl+C = \x03 ...). On Windows,
+        // winit may hand us the control char itself instead of the letter —
+        // pass it straight through.
         Key::Character(s) if ctrl => {
-            let c = s.chars().next()?.to_ascii_lowercase();
-            if c.is_ascii_lowercase() {
-                vec![c as u8 - b'a' + 1]
+            let c = s.chars().next()?;
+            if ('\u{1}'..='\u{1a}').contains(&c) {
+                vec![c as u8]
             } else {
-                return None;
+                let c = c.to_ascii_lowercase();
+                if c.is_ascii_lowercase() {
+                    vec![c as u8 - b'a' + 1]
+                } else {
+                    return None;
+                }
             }
         }
         _ => text?.as_bytes().to_vec(),
@@ -118,6 +125,9 @@ mod tests {
         assert_eq!(encode(&c, Some("c"), false, false, true).unwrap(), vec![0x03]);
         let t = Key::Character("t".into());
         assert_eq!(encode(&t, Some("t"), false, false, true).unwrap(), vec![0x14]);
+        // Windows hands over the pre-composed control char with Ctrl held
+        let raw = Key::Character("\u{6}".into());
+        assert_eq!(encode(&raw, None, false, false, true).unwrap(), vec![0x06]);
     }
 
     #[test]

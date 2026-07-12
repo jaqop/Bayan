@@ -103,6 +103,18 @@ pub fn bg_packed() -> u32 {
     pack(BG)
 }
 
+/// UI state rendered on top of the grid (owned by the app, drawn here).
+pub struct Overlay<'a> {
+    /// Some(query) = the search bar is open with this text.
+    pub search_query: Option<&'a str>,
+    /// The current search hit, highlighted stronger than a selection.
+    pub search_match: Option<&'a std::ops::RangeInclusive<alacritty_terminal::index::Point>>,
+}
+
+// translucent overlays, EasyTer's colors: selection blue, search amber
+const SELECTION_RGBA: ((u8, u8, u8), u32) = ((80, 140, 255), 90);
+const SEARCH_RGBA: ((u8, u8, u8), u32) = ((240, 180, 40), 120);
+
 fn blend(dst: u32, (sr, sg, sb): (u8, u8, u8), a: u32) -> u32 {
     let (dr, dg, db) = ((dst >> 16) & 0xff, (dst >> 8) & 0xff, dst & 0xff);
     let r = (sr as u32 * a + dr * (255 - a)) / 255;
@@ -423,23 +435,30 @@ impl Renderer {
         }
     }
 
-    pub fn draw(&mut self, frame: &mut [u32], width: usize, height: usize, term: &Term<EventProxy>) {
+    pub fn draw(&mut self, frame: &mut [u32], width: usize, height: usize,
+                term: &Term<EventProxy>, overlay: &Overlay) {
         frame.fill(pack(BG));
         let rows = term.screen_lines();
+        let history = term.grid().history_size();
         let content = term.renderable_content();
         let cursor = content.cursor;
+        let selection = content.selection;
+        // scrolled into history: viewport row = grid line + display offset
+        let off = content.display_offset as i32;
 
         // collect the visible grid; paint non-default cell backgrounds as
         // pixel-snapped rects (EasyTer lesson: snap both edges so adjacent
         // cells share a boundary — no 1px seams)
         let mut lines: Vec<Vec<CellInfo>> = Vec::with_capacity(rows);
         lines.resize_with(rows, Vec::new);
+        let mut sel_cells: Vec<(usize, usize, usize)> = Vec::new(); // (vrow, col, w)
+        let mut hit_cells: Vec<(usize, usize, usize)> = Vec::new();
         for cell in content.display_iter {
-            let line = cell.point.line.0;
-            if line < 0 || line as usize >= rows {
+            let vrow = cell.point.line.0 + off;
+            if vrow < 0 || vrow as usize >= rows {
                 continue;
             }
-            let li = line as usize;
+            let li = vrow as usize;
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                 continue;
             }
@@ -457,11 +476,20 @@ impl Renderer {
                 let y1 = ((li + 1) as f32 * self.cell_h).round() as i32;
                 fill_rect(frame, width, height, x0, y0, x1 - x0, y1 - y0, pack(bg));
             }
+            if selection.is_some_and(|s| s.contains(cell.point)) {
+                sel_cells.push((li, col, w));
+            }
+            if overlay
+                .search_match
+                .is_some_and(|m| *m.start() <= cell.point && cell.point <= *m.end())
+            {
+                hit_cells.push((li, col, w));
+            }
             let zw = cell.zerowidth().map(|z| z.to_vec());
             lines[li].push(CellInfo { col, w, c: cell.c, zw, fg });
         }
 
-        let cl = cursor.point.line.0;
+        let cursor_vrow = cursor.point.line.0 + off;
         let ccol = cursor.point.column.0;
         let mut cursor_rect: Option<(i32, i32)> = None; // (x, w) via shaped layout
         for (li, cells) in lines.iter().enumerate() {
@@ -470,7 +498,7 @@ impl Renderer {
             }
             let y = (li as f32 * self.cell_h).round() as i32;
             if cells.iter().any(|ci| is_arabic(ci.c)) {
-                let on_row = cl >= 0 && cl as usize == li;
+                let on_row = cursor_vrow >= 0 && cursor_vrow as usize == li;
                 let r = self.draw_line_bidi(frame, width, height, y, cells,
                                             if on_row { Some(ccol) } else { None });
                 if r.is_some() {
@@ -481,18 +509,52 @@ impl Renderer {
             }
         }
 
+        // translucent overlays above the text (EasyTer's stacking): selection
+        // blue, current search hit amber
+        for (cells, ((r, g, b), a)) in [(&sel_cells, SELECTION_RGBA), (&hit_cells, SEARCH_RGBA)] {
+            for &(li, col, w) in cells.iter() {
+                let x0 = (col as f32 * self.cell_w).round() as i32;
+                let x1 = ((col + w) as f32 * self.cell_w).round() as i32;
+                let y0 = (li as f32 * self.cell_h).round() as i32;
+                let y1 = ((li + 1) as f32 * self.cell_h).round() as i32;
+                blend_rect(frame, width, height, x0, y0, x1 - x0, y1 - y0, (r, g, b), a);
+            }
+        }
+
         // cursor: translucent block over the text so the glyph stays legible.
         // Grid rows are column-exact; on Arabic rows the position comes from
         // the shaped layout (logical col != visual x under RTL).
-        if cl >= 0 && (cl as usize) < rows {
+        if cursor_vrow >= 0 && (cursor_vrow as usize) < rows {
             let (x0, wpx) = cursor_rect.unwrap_or((
                 (ccol as f32 * self.cell_w).round() as i32,
                 self.cell_w.round() as i32,
             ));
-            let y0 = (cl as f32 * self.cell_h).round() as i32;
+            let y0 = (cursor_vrow as f32 * self.cell_h).round() as i32;
             blend_rect(frame, width, height,
                        x0, y0, wpx, self.cell_h.round() as i32,
                        FG, 170);
+        }
+
+        // scroll position indicator while in history (EasyTer's slim bar)
+        if off > 0 && history > 0 {
+            let vh = height as i32;
+            let th = ((vh as f32 * rows as f32 / (history + rows) as f32) as i32).max(24);
+            let ty = ((vh - th) as f32 * (1.0 - off as f32 / history as f32)) as i32;
+            blend_rect(frame, width, height, width as i32 - 7, ty, 4, th, FG, 70);
+        }
+
+        // search bar, top-right (drawn last: floats above everything)
+        if let Some(q) = overlay.search_query {
+            let bar_w = (self.cell_w * 34.0) as i32;
+            let bar_h = (self.cell_h + 10.0) as i32;
+            let bx = width as i32 - bar_w - 10;
+            fill_rect(frame, width, height, bx, 6, bar_w, bar_h, pack((0x1c, 0x21, 0x28)));
+            blend_rect(frame, width, height, bx, 6 + bar_h - 2, bar_w, 2,
+                       PALETTE[11], 200); // amber underline = search accent
+            let label = format!("بحث: {q}_");
+            let segs = [(label, FG)];
+            self.shape_scratch(&segs, 1_000_000.0, true);
+            self.blit_scratch(frame, width, height, (bx + 8) as f32, 11, 1.0);
         }
     }
 }
