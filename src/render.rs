@@ -22,8 +22,8 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::Term;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 use cosmic_text::{
-    Align, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache,
-    SwashContent, Wrap,
+    Align, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, SwashCache,
+    SwashContent, Weight, Wrap,
 };
 
 use crate::gpu::Vertex;
@@ -174,6 +174,9 @@ struct GlyphEntry {
 pub struct Atlas {
     pub pixels: Vec<u8>,
     pub dirty: bool,
+    /// bumps on a wholesale reset: quads emitted before the reset hold
+    /// stale uvs, so the app schedules one healing redraw
+    pub generation: u32,
     map: std::collections::HashMap<cosmic_text::CacheKey, Option<GlyphEntry>>,
     shelf_x: u32,
     shelf_y: u32,
@@ -185,6 +188,7 @@ impl Atlas {
         let mut a = Atlas {
             pixels: vec![0; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize],
             dirty: true,
+            generation: 0,
             map: std::collections::HashMap::new(),
             shelf_x: 4,
             shelf_y: 0,
@@ -211,10 +215,11 @@ impl Atlas {
             self.shelf_h = 0;
         }
         if self.shelf_y + h + pad > ATLAS_SIZE {
-            // full: reset wholesale (rare — thousands of glyphs fit; at worst
-            // one frame shows stale uvs before the next repaint)
+            // full: reset wholesale (rare — thousands of glyphs fit); the
+            // generation bump makes the app schedule one healing redraw
             self.map.clear();
             self.pixels.fill(0);
+            self.generation = self.generation.wrapping_add(1);
             self.shelf_x = 4;
             self.shelf_y = 0;
             self.shelf_h = 4;
@@ -368,6 +373,7 @@ struct CellInfo {
     // tanwin, shadda ... ) — dropping them loses the diacritics
     zw: Option<Vec<char>>,
     fg: (u8, u8, u8),
+    style: u8,
 }
 
 impl CellInfo {
@@ -389,8 +395,10 @@ impl CellInfo {
 }
 
 const FONT_SIZE: f32 = 15.0;
-// bundled so connected Arabic works from a fresh clone (same font EasyTer ships)
+// bundled so connected Arabic works from a fresh clone (same fonts EasyTer
+// ships) — bold included, so Arabic bold is a real weight, not a fake
 const AMIRI: &[u8] = include_bytes!("../fonts/Amiri-Regular.ttf");
+const AMIRI_BOLD: &[u8] = include_bytes!("../fonts/Amiri-Bold.ttf");
 
 /// Primary-font preference order. Nerd Font variants first: oh-my-posh
 /// prompts are built from their private-use icons and powerline separators,
@@ -427,6 +435,26 @@ fn base_attrs<'a>() -> Attrs<'a> {
     Attrs::new().family(Family::Name("Consolas"))
 }
 
+// text style bits carried per segment (baked into the shaped run)
+pub(crate) const ST_BOLD: u8 = 1;
+pub(crate) const ST_ITALIC: u8 = 2;
+pub(crate) const ST_UNDERLINE: u8 = 4;
+pub(crate) const ST_STRIKE: u8 = 8;
+
+/// One rich-text segment: text + color + style.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct Seg {
+    text: String,
+    fg: (u8, u8, u8),
+    style: u8,
+}
+
+impl Seg {
+    fn plain(text: impl Into<String>, fg: (u8, u8, u8)) -> Self {
+        Seg { text: text.into(), fg, style: 0 }
+    }
+}
+
 /// One shaped run, cached: shaping is the paint loop's dominant cost, and a
 /// terminal redraws the same lines almost every frame.
 struct ShapedRun {
@@ -434,8 +462,8 @@ struct ShapedRun {
     natw: f32,
 }
 
-/// Cache key: the exact rich-text content (text + colors) and alignment.
-type RunKey = (Vec<(String, (u8, u8, u8))>, bool);
+/// Cache key: the exact rich-text content (text + color + style) + alignment.
+type RunKey = (Vec<Seg>, bool);
 
 /// Generational cap: on overflow the hot map becomes the cold one and a
 /// fresh hot map starts — the working set survives, stale runs age out
@@ -460,6 +488,7 @@ impl Renderer {
     pub fn new(scale: f32, cfg: &crate::config::UserConfig, extra_pts: f32) -> Self {
         let mut font_system = FontSystem::new();
         font_system.db_mut().load_font_data(AMIRI.to_vec());
+        font_system.db_mut().load_font_data(AMIRI_BOLD.to_vec());
         let family = pick_family(font_system.db(), cfg.font_family.as_deref());
         let size = (cfg.font_size.unwrap_or(FONT_SIZE) + extra_pts).clamp(8.0, 40.0) * scale;
         let metrics = Metrics::new(size, (size * 1.4).ceil());
@@ -496,7 +525,7 @@ impl Renderer {
     /// Get-or-shape a run. Hits are the common case: a terminal repaints
     /// the same content nearly every frame, and shaping is the expensive
     /// part of the CPU renderer (the honest 80% of what wgpu would buy).
-    fn ensure_shaped(&mut self, segs: &[(String, (u8, u8, u8))], align_left: bool) -> RunKey {
+    fn ensure_shaped(&mut self, segs: &[Seg], align_left: bool) -> RunKey {
         let key: RunKey = (segs.to_vec(), align_left);
         if self.cache_hot.contains_key(&key) {
             return key;
@@ -508,7 +537,16 @@ impl Renderer {
         let base = Attrs::new().family(Family::Name(self.family.as_str()));
         let rich: Vec<(&str, Attrs)> = segs
             .iter()
-            .map(|(s, c)| (s.as_str(), base.color(Color::rgb(c.0, c.1, c.2))))
+            .map(|s| {
+                let mut a = base.color(Color::rgb(s.fg.0, s.fg.1, s.fg.2));
+                if s.style & ST_BOLD != 0 {
+                    a = a.weight(Weight::BOLD);
+                }
+                if s.style & ST_ITALIC != 0 {
+                    a = a.style(Style::Italic);
+                }
+                (s.text.as_str(), a)
+            })
             .collect();
         let mut buffer = Buffer::new(&mut self.font_system, self.metrics);
         buffer.set_wrap(&mut self.font_system, Wrap::None);
@@ -537,7 +575,7 @@ impl Renderer {
     }
 
     /// Natural width of a run (shaping it into the cache if new).
-    fn measure(&mut self, segs: &[(String, (u8, u8, u8))], align_left: bool) -> f32 {
+    fn measure(&mut self, segs: &[Seg], align_left: bool) -> f32 {
         let key = self.ensure_shaped(segs, align_left);
         self.cache_hot[&key].natw
     }
@@ -545,7 +583,7 @@ impl Renderer {
     /// Shape (cached) and emit a run's glyph quads at (x, y), optionally
     /// compressed horizontally, clipped to `clip`. Returns the natural width.
     #[allow(clippy::too_many_arguments)]
-    fn draw_run(&mut self, segs: &[(String, (u8, u8, u8))], align_left: bool,
+    fn draw_run(&mut self, segs: &[Seg], align_left: bool,
                 out: &mut Vec<Vertex>, clip: Rect,
                 x: f32, y: i32, scale: f32) -> f32 {
         let key = self.ensure_shaped(segs, align_left);
@@ -566,7 +604,7 @@ impl Renderer {
         while end > 0 && cells[end - 1].c == ' ' {
             end -= 1;
         }
-        let mut segs: Vec<(String, (u8, u8, u8))> = Vec::new();
+        let mut segs: Vec<Seg> = Vec::new();
         let mut cur_bytes: Option<(usize, usize)> = None;
         let mut nbytes = 0usize;
         for ci in &cells[..end] {
@@ -575,11 +613,11 @@ impl Renderer {
             }
             nbytes += ci.text_len();
             match segs.last_mut() {
-                Some((s, c)) if *c == ci.fg => ci.push_text(s),
+                Some(s) if s.fg == ci.fg && s.style == ci.style => ci.push_text(&mut s.text),
                 _ => {
                     let mut s = String::new();
                     ci.push_text(&mut s);
-                    segs.push((s, ci.fg));
+                    segs.push(Seg { text: s, fg: ci.fg, style: ci.style });
                 }
             }
         }
@@ -591,9 +629,9 @@ impl Renderer {
         // colors can't survive the reordering (EasyTer draws these lines in
         // the default FG too), and the cursor byte-mapping no longer holds.
         if claude {
-            let full: String = segs.iter().map(|(s, _)| s.as_str()).collect();
+            let full: String = segs.iter().map(|s| s.text.as_str()).collect();
             if let Some(fixed) = crate::bidi::restore_bidi_line(&full) {
-                segs = vec![(fixed, FG)];
+                segs = vec![Seg::plain(fixed, FG)];
                 cur_bytes = None;
             }
         }
@@ -624,11 +662,24 @@ impl Renderer {
                       x0: i32, y: i32, cells: &[CellInfo]) {
         let n = cells.len();
         let mut i = 0;
+        // underline/strikethrough decorations: (col_start, col_end, style, fg)
+        let mut decos: Vec<(usize, usize, u8, (u8, u8, u8))> = Vec::new();
+        let mut note_deco = |ci: &CellInfo| {
+            if ci.style & (ST_UNDERLINE | ST_STRIKE) == 0 {
+                return;
+            }
+            match decos.last_mut() {
+                Some((_, end, st, fg)) if *end == ci.col && *st == ci.style && *fg == ci.fg => {
+                    *end = ci.col + ci.w;
+                }
+                _ => decos.push((ci.col, ci.col + ci.w, ci.style, ci.fg)),
+            }
+        };
         while i < n {
             let ci = &cells[i];
             if ci.c.is_ascii() {
                 let col0 = ci.col;
-                let mut segs: Vec<(String, (u8, u8, u8))> = Vec::new();
+                let mut segs: Vec<Seg> = Vec::new();
                 let mut expect = ci.col;
                 let mut j = i;
                 while j < n {
@@ -636,23 +687,26 @@ impl Renderer {
                     if !cj.c.is_ascii() || cj.col != expect {
                         break;
                     }
+                    note_deco(cj);
                     match segs.last_mut() {
-                        Some((s, c)) if *c == cj.fg => cj.push_text(s),
+                        Some(s) if s.fg == cj.fg && s.style == cj.style => {
+                            cj.push_text(&mut s.text)
+                        }
                         _ => {
                             let mut s = String::new();
                             cj.push_text(&mut s);
-                            segs.push((s, cj.fg));
+                            segs.push(Seg { text: s, fg: cj.fg, style: cj.style });
                         }
                     }
                     expect = cj.col + cj.w;
                     j += 1;
                 }
                 // trailing blanks paint nothing (bg rects are separate)
-                while let Some((s, _)) = segs.last_mut() {
-                    while s.ends_with(' ') {
-                        s.pop();
+                while let Some(s) = segs.last_mut() {
+                    while s.text.ends_with(' ') {
+                        s.text.pop();
                     }
-                    if s.is_empty() {
+                    if s.text.is_empty() {
                         segs.pop();
                     } else {
                         break;
@@ -666,15 +720,30 @@ impl Renderer {
             } else {
                 // exotic glyph: pin to its own cell box, flush left so
                 // powerline separators stay seamless; compress if wider
+                note_deco(ci);
                 let mut s = String::new();
                 ci.push_text(&mut s);
-                let seg = [(s, ci.fg)];
+                let seg = [Seg { text: s, fg: ci.fg, style: ci.style }];
                 let natw = self.measure(&seg, false);
                 let boxw = ci.w as f32 * self.cell_w;
                 let scale = if natw > boxw + 0.5 { boxw / natw } else { 1.0 };
                 self.draw_run(&seg, false, out, clip,
                               x0 as f32 + ci.col as f32 * self.cell_w, y, scale);
                 i += 1;
+            }
+        }
+        // decoration lines over the text (underline hugs the cell bottom)
+        let th = (self.cell_h / 14.0).max(1.0) as i32;
+        for (c0, c1, style, fg) in decos {
+            let dx0 = x0 + (c0 as f32 * self.cell_w).round() as i32;
+            let dx1 = x0 + (c1 as f32 * self.cell_w).round() as i32;
+            if style & ST_UNDERLINE != 0 {
+                let uy = y + self.cell_h.round() as i32 - th - 1;
+                push_rect(out, clip, dx0, uy, dx1 - dx0, th, c4(fg, 255));
+            }
+            if style & ST_STRIKE != 0 {
+                let sy = y + (self.cell_h * 0.55).round() as i32;
+                push_rect(out, clip, dx0, sy, dx1 - dx0, th, c4(fg, 255));
             }
         }
     }
@@ -715,6 +784,31 @@ impl Renderer {
             if cell.flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
             }
+            // text attributes -> style bits (weight/slant shape into the run;
+            // under/strike draw as rects; DIM fades the color; HIDDEN blanks)
+            let mut style = 0u8;
+            if cell.flags.intersects(Flags::BOLD) {
+                style |= ST_BOLD;
+            }
+            if cell.flags.intersects(Flags::ITALIC) {
+                style |= ST_ITALIC;
+            }
+            if cell.flags.intersects(
+                Flags::UNDERLINE
+                    | Flags::DOUBLE_UNDERLINE
+                    | Flags::UNDERCURL
+                    | Flags::DOTTED_UNDERLINE
+                    | Flags::DASHED_UNDERLINE,
+            ) {
+                style |= ST_UNDERLINE;
+            }
+            if cell.flags.intersects(Flags::STRIKEOUT) {
+                style |= ST_STRIKE;
+            }
+            if cell.flags.intersects(Flags::DIM) {
+                fg = (fg.0 * 2 / 3, fg.1 * 2 / 3, fg.2 * 2 / 3);
+            }
+            let ch = if cell.flags.intersects(Flags::HIDDEN) { ' ' } else { cell.c };
             if bg != BG {
                 let x0 = px + (col as f32 * self.cell_w).round() as i32;
                 let x1 = px + ((col + w) as f32 * self.cell_w).round() as i32;
@@ -732,7 +826,7 @@ impl Renderer {
                 hit_cells.push((li, col, w));
             }
             let zw = cell.zerowidth().map(|z| z.to_vec());
-            lines[li].push(CellInfo { col, w, c: cell.c, zw, fg });
+            lines[li].push(CellInfo { col, w, c: ch, zw, fg, style });
         }
 
         let cursor_vrow = cursor.point.line.0 + off;
@@ -856,8 +950,8 @@ impl Renderer {
         push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 255));
         push_rect(out, whole, x, y, w, 2, c4((0x2e, 0xa0, 0x43), 255)); // accent
         let row_h = self.cockpit_row_h();
-        // header
-        let head = [("مقصورة الوكلاء".to_string(), FG)];
+        // header (bold — and a live proof the style pipeline works)
+        let head = [Seg { text: "مقصورة الوكلاء".into(), fg: FG, style: ST_BOLD }];
         self.draw_run(&head, true, out, whole, (x + 14) as f32, y + 8, 1.0);
         let rows_top = y + row_h + 6;
         for (i, e) in entries.iter().enumerate() {
@@ -880,9 +974,9 @@ impl Renderer {
             let title: String = e.title.chars().take(22).collect();
             let status: String = e.status.chars().take(48).collect();
             let segs = [
-                (format!("{mark}{title}"), fg),
-                ("   —   ".to_string(), (0x6e, 0x76, 0x81)),
-                (status, (0x9a, 0xa4, 0xb2)),
+                Seg::plain(format!("{mark}{title}"), fg),
+                Seg::plain("   —   ", (0x6e, 0x76, 0x81)),
+                Seg::plain(status, (0x9a, 0xa4, 0xb2)),
             ];
             self.draw_run(&segs, true, out, whole, (x + 32) as f32, ry + 6, 1.0);
         }
@@ -896,8 +990,7 @@ impl Renderer {
 
         // Claude-mode badge, top-right below the tab bar (EasyTer's green badge)
         if claude {
-            let label = "● وضع كلود".to_string();
-            let segs = [(label, (0xff, 0xff, 0xff))];
+            let segs = [Seg::plain("● وضع كلود", (0xff, 0xff, 0xff))];
             let tw = self.measure(&segs, true);
             let bw = tw as i32 + 16;
             let bh = (self.cell_h + 8.0) as i32;
@@ -920,8 +1013,7 @@ impl Renderer {
             push_rect(out, whole, bx, by, bar_w, bar_h, c4((0x1c, 0x21, 0x28), 255));
             push_rect(out, whole, bx, by + bar_h - 2, bar_w, 2,
                       c4(PALETTE[11], 200)); // amber underline = search accent
-            let label = format!("بحث: {q}_");
-            let segs = [(label, FG)];
+            let segs = [Seg::plain(format!("بحث: {q}_"), FG)];
             self.draw_run(&segs, true, out, whole, (bx + 8) as f32, by + 5, 1.0);
         }
 
@@ -942,7 +1034,7 @@ impl Renderer {
             }
             let max_chars = TAB_CELLS as usize - 5;
             let title: String = tab.title.chars().take(max_chars).collect();
-            let segs = [(title, fg)];
+            let segs = [Seg::plain(title, fg)];
             self.draw_run(&segs, true, out, whole, (x0 + 10) as f32, 5, 1.0);
             // dots: amber attention (a Claude waiting on you) beats green busy
             let dot = if tab.attention {
@@ -1082,23 +1174,27 @@ mod cache_tests {
         Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0)
     }
 
-    /// Same content -> same cached run (no re-shape); different colors are
-    /// different runs (colors are baked into the shaped buffer).
+    /// Same content -> same cached run (no re-shape); different colors or
+    /// styles are different runs (both bake into the shaped buffer).
     #[test]
-    fn shaped_runs_are_cached_by_content_and_color() {
+    fn shaped_runs_are_cached_by_content_color_and_style() {
         let mut r = test_renderer();
-        let a = [("hello بيان".to_string(), FG)];
+        let a = [Seg::plain("hello بيان", FG)];
         let w1 = r.measure(&a, false);
         assert_eq!(r.cache_hot.len(), 1);
         let w2 = r.measure(&a, false);
         assert_eq!(r.cache_hot.len(), 1, "second measure must hit the cache");
         assert_eq!(w1, w2);
-        let b = [("hello بيان".to_string(), (0xff, 0, 0))];
+        let b = [Seg::plain("hello بيان", (0xff, 0, 0))];
         r.measure(&b, false);
         assert_eq!(r.cache_hot.len(), 2, "a different color is a new run");
+        // bold is a different run too (and usually a different width)
+        let bold = [Seg { text: "hello بيان".into(), fg: FG, style: ST_BOLD }];
+        r.measure(&bold, false);
+        assert_eq!(r.cache_hot.len(), 3, "a different style is a new run");
         // alignment is part of the key too
         r.measure(&a, true);
-        assert_eq!(r.cache_hot.len(), 3);
+        assert_eq!(r.cache_hot.len(), 4);
     }
 
     /// The generational cap keeps the hot set: overflow demotes, a hit on a
@@ -1106,10 +1202,10 @@ mod cache_tests {
     #[test]
     fn cache_overflow_keeps_the_working_set() {
         let mut r = test_renderer();
-        let hot = [("keep me".to_string(), FG)];
+        let hot = [Seg::plain("keep me", FG)];
         r.measure(&hot, false);
         for i in 0..CACHE_CAP {
-            r.measure(&[(format!("filler {i}"), FG)], false);
+            r.measure(&[Seg::plain(format!("filler {i}"), FG)], false);
         }
         assert!(r.cache_hot.len() <= CACHE_CAP);
         // "keep me" was demoted to cold; hitting it promotes without growth
@@ -1122,8 +1218,8 @@ mod cache_tests {
     #[test]
     fn measure_cache_speedup_probe() {
         let mut r = test_renderer();
-        let rows: Vec<[(String, (u8, u8, u8)); 1]> = (0..40)
-            .map(|i| [(format!("line {i} of some shell output مع عربية"), FG)])
+        let rows: Vec<[Seg; 1]> = (0..40)
+            .map(|i| [Seg::plain(format!("line {i} of some shell output مع عربية"), FG)])
             .collect();
         let t0 = Instant::now();
         for row in &rows {

@@ -83,9 +83,17 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       cache and rasterizes into the atlas — verified pixel-identical to the
       CPU renderer. The window stays hidden until the first frame (~0.4s,
       GPU init) so there's no white flash.
-- [ ] **M11 (backlog)** — scrollback-cap-proof command marks (needs an
-      eviction hook upstream in alacritty_terminal); atlas page growth
-      instead of reset; damage-based partial redraw
+- [x] **M11** — cap-proof command marks WITHOUT upstream changes: Grid's
+      scroll_up advances a non-zero display_offset by exactly the scrolled
+      amount, so the feed parks the offset at 1, reads how far it moved,
+      subtracts history growth — an exact eviction counter (EasyTer's
+      dropped counter, reborn); text attribute fidelity: bold (real Amiri
+      Bold bundled), italic, underline, strikethrough, dim, hidden, all
+      through the shaping cache and quad pipeline; atlas resets now
+      self-heal with one scheduled redraw
+- [ ] **M12 (backlog)** — paste guard (multi-line confirm), drag & drop
+      file paths, finished-command notifications, quake hotkey, theme
+      colors in config — the EasyTer parity tail
 
 ## Build
 

@@ -378,6 +378,8 @@ struct App {
     auto_follow: bool,
     claude_manual: bool,
     config: config::UserConfig,
+    /// last seen atlas generation (a reset schedules a healing redraw)
+    atlas_generation: u32,
     /// Ctrl+wheel zoom, in points on top of the configured size.
     font_delta: f32,
     renderer_building: bool,
@@ -486,7 +488,11 @@ impl App {
             let off = t.grid().display_offset();
             let marks: Vec<usize> = {
                 let m = s.meta.lock().unwrap();
-                m.marks.iter().map(|c| c.abs).collect()
+                m.marks
+                    .iter()
+                    .filter(|c| c.abs >= m.evicted)
+                    .map(|c| (c.abs - m.evicted) as usize)
+                    .collect()
             };
             if let Some(new_off) = jump_offset(&marks, hist, off, dir) {
                 t.scroll_display(Scroll::Delta(new_off as i32 - off as i32));
@@ -1002,7 +1008,12 @@ impl App {
                     let (marks, running_cmd): (Vec<(usize, Option<i32>)>, String) = {
                         let m = pane.session.meta.lock().unwrap();
                         (
-                            m.marks.iter().map(|c| (c.abs, c.exit)).collect(),
+                            // global -> grid space: subtract the evictions
+                            m.marks
+                                .iter()
+                                .filter(|c| c.abs >= m.evicted)
+                                .map(|c| ((c.abs - m.evicted) as usize, c.exit))
+                                .collect(),
                             m.running_cmd.clone(),
                         )
                     };
@@ -1054,13 +1065,21 @@ impl App {
         }
         let Some(gpu) = self.gpu.as_mut() else { return };
         // new glyphs were rasterized this frame: sync the atlas texture
+        let mut heal = false;
         if let Some(renderer) = self.renderer.as_mut() {
             if renderer.atlas.dirty {
                 gpu.upload_atlas(&renderer.atlas.pixels);
                 renderer.atlas.dirty = false;
             }
+            // an atlas reset mid-frame leaves earlier quads with stale uvs:
+            // one more redraw re-emits everything from the fresh atlas
+            heal = renderer.atlas.generation != self.atlas_generation;
+            self.atlas_generation = renderer.atlas.generation;
         }
         gpu.render(&verts, render::BG);
+        if heal {
+            window.request_redraw();
+        }
         if !self.first_frame {
             self.first_frame = true;
             window.set_visible(true);
@@ -1596,6 +1615,7 @@ fn main() {
         auto_follow: true,
         claude_manual: false,
         config: config::load(),
+        atlas_generation: 0,
         font_delta: 0.0,
         renderer_building: false,
         inflight_delta: 0.0,

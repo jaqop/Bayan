@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Column;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
@@ -32,13 +32,11 @@ $([char]27)]9;9;$($PWD.ProviderPath)$([char]7)\"\
 +(& $global:__BY_OP)+\"$([char]27)]133;B$([char]7)\"}}}; __by_wrap";
 
 /// One command block: where its prompt sits and how the command ended.
-/// `abs` = history size at mark time + cursor row: stable as output scrolls,
-/// converted back via `abs - history_now`. Honest limitation (EasyTer had
-/// the same until its eviction counter): once the scrollback cap is reached
-/// and old lines are evicted, marks past the cap drift — the content they
-/// pointed at is on its way out anyway.
+/// `abs` is GLOBAL: evicted lines + history size + cursor row at mark time —
+/// stable across scrolling AND past the scrollback cap (EasyTer's dropped
+/// counter, reborn; see the eviction accounting in feed_counted).
 pub struct CmdMark {
-    pub abs: usize,
+    pub abs: u64,
     pub exit: Option<i32>,
 }
 
@@ -56,6 +54,9 @@ pub struct SessionMeta {
     pub cwd: Option<String>,
     /// command blocks (OSC 133 A/D): gutter lights + prompt jumping
     pub marks: Vec<CmdMark>,
+    /// history lines evicted past the scrollback cap (+ ED3-cleared lines):
+    /// keeps mark positions anchored to content forever
+    pub evicted: u64,
 }
 
 /// Events one PTY chunk produced, delivered to the UI thread by the reader.
@@ -201,7 +202,10 @@ fn handle_osc133<T: EventListener>(
         b'A' => {
             meta.running_cmd.clear();
             // a new prompt starts on the cursor's row: record its block
-            let abs = t.grid().history_size() + t.grid().cursor.point.line.0.max(0) as usize;
+            // GLOBALLY (evicted + history + row — never drifts)
+            let abs = meta.evicted
+                + t.grid().history_size() as u64
+                + t.grid().cursor.point.line.0.max(0) as u64;
             meta.marks.push(CmdMark { abs, exit: None });
             if meta.marks.len() > 2000 {
                 meta.marks.drain(..1000); // EasyTer's trim
@@ -218,6 +222,46 @@ fn handle_osc133<T: EventListener>(
             meta.prompt_col = Some(t.grid().cursor.point.column.0);
         }
         _ => {}
+    }
+}
+
+/// Feed one segment and count history evictions EXACTLY. The trick: Grid's
+/// scroll_up() advances display_offset by the scrolled amount whenever the
+/// offset is non-zero (that's how "stay scrolled up" works) — so park the
+/// offset at 1 for the duration of the feed, read how far it moved, and
+/// subtract the history growth. What's left is lines evicted past the cap.
+/// (Saturates only if one segment scrolls more than the whole scrollback.)
+fn feed_counted<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    meta: &mut SessionMeta,
+    bytes: &[u8],
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    let alt = t.mode().contains(TermMode::ALT_SCREEN);
+    let hist_before = t.grid().history_size();
+    let off_before = t.grid().display_offset();
+    let parked = !alt && off_before == 0 && hist_before > 0;
+    if parked {
+        t.scroll_display(Scroll::Delta(1));
+    }
+    for &b in bytes {
+        parser.advance(t, b);
+    }
+    let off_after = t.grid().display_offset();
+    let hist_after = t.grid().history_size();
+    let base = if parked { 1 } else { off_before };
+    let scrolled = off_after.saturating_sub(base) as i64;
+    if parked {
+        t.scroll_display(Scroll::Bottom);
+    }
+    // history that shrank (ED3/RIS) counts as evicted too, EasyTer-style
+    let growth = hist_after as i64 - hist_before as i64;
+    let evict = scrolled - growth;
+    if evict > 0 {
+        meta.evicted += evict as u64;
     }
 }
 
@@ -246,15 +290,11 @@ pub(crate) fn process_chunk<T: EventListener>(
     }
     let mut pos = 0;
     for (s, e, kind, exit) in find_osc133(&buf) {
-        for &b in &buf[pos..s] {
-            parser.advance(t, b);
-        }
+        feed_counted(parser, t, meta, &buf[pos..s]);
         handle_osc133(t, meta, kind, exit);
         pos = e;
     }
-    for &b in &buf[pos..] {
-        parser.advance(t, b);
-    }
+    feed_counted(parser, t, meta, &buf[pos..]);
     ev
 }
 
@@ -629,6 +669,32 @@ mod tests {
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?1049l\x1b]133;D;0\x07");
         assert!(!t.mode().contains(TermMode::ALT_SCREEN));
         assert!(meta.running_cmd.is_empty());
+    }
+
+    /// The eviction counter (EasyTer's dropped counter, alacritty edition):
+    /// flood far past a tiny scrollback cap and verify marks stay anchored.
+    #[test]
+    fn marks_survive_scrollback_eviction() {
+        let size = TermSize { cols: 20, rows: 4 };
+        let config = Config { scrolling_history: 8, ..Config::default() };
+        let mut t = Term::new(config, &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        let mut meta = SessionMeta::default();
+        let mut carry = Vec::new();
+        // 30 lines through a 4-row screen: 27 scroll into an 8-line history
+        for i in 0..30 {
+            let line = format!("L{i}\r\n");
+            process_chunk(&mut p, &mut t, &mut meta, &mut carry, line.as_bytes());
+        }
+        assert_eq!(t.grid().history_size(), 8, "history is at its cap");
+        assert_eq!(meta.evicted, 19, "27 scrolled - 8 kept = 19 evicted");
+        // a new prompt mark lands exactly on the cursor row in grid space
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;A\x07");
+        let m = meta.marks.last().unwrap();
+        let grid_line = (m.abs - meta.evicted) as i64 - t.grid().history_size() as i64;
+        assert_eq!(grid_line, t.grid().cursor.point.line.0 as i64);
+        // the display offset was left untouched by the parking trick
+        assert_eq!(t.grid().display_offset(), 0);
     }
 
     #[test]
