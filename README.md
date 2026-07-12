@@ -65,8 +65,15 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       PTY size; Claude-row selections now copy LOGICAL-order Arabic; BEL
       from a background pane lights an amber attention dot on its tab
       (Claude asking for an approval — the cockpit signal)
-- [ ] **M8 (backlog)** — resizable panes, cockpit dashboard view, wgpu
-      renderer, scrollback-cap-proof command marks
+- [x] **M8** — resizable panes (drag the divider; weighted layout, resize
+      cursor on hover) and the agent cockpit (Ctrl+Shift+D): a card listing
+      every tab — amber = waiting for your approval, green = working, dim =
+      idle, with the running command or idle directory; arrows + Enter or a
+      click to jump
+- [ ] **M9 (backlog)** — wgpu renderer; scrollback-cap-proof command marks
+      (needs an eviction hook upstream in alacritty_terminal — pyte allowed
+      overriding HistoryScreen.index, alacritty's Grid does not); pane
+      weights in the session file
 
 ## Build
 

@@ -207,6 +207,8 @@ enum Orientation {
 /// One tab: a set of panes split along one axis (v1 of EasyTer's tree).
 struct Tab {
     panes: Vec<Pane>,
+    /// relative pane sizes along the axis (dragging a divider edits these)
+    weights: Vec<f32>,
     focused: usize,
     orientation: Orientation,
     /// cwd basename of the focused pane (falls back to a plain name)
@@ -225,28 +227,42 @@ impl Tab {
     }
 }
 
-/// Equal split of a content rect along one axis, 1px gaps between panes.
-fn split_rects(content: render::Rect, n: usize, orientation: Orientation) -> Vec<render::Rect> {
+/// Weighted split of a content rect along one axis, 1px gaps between panes.
+fn split_rects(
+    content: render::Rect,
+    weights: &[f32],
+    orientation: Orientation,
+) -> Vec<render::Rect> {
     let (x, y, w, h) = content;
-    let n = n.max(1) as i32;
+    let n = weights.len().max(1) as i32;
     let gap = 1;
-    (0..n)
-        .map(|i| match orientation {
-            Orientation::Row => {
-                let pw = (w - gap * (n - 1)) / n;
-                let x0 = x + i * (pw + gap);
-                // the last pane absorbs the rounding remainder
-                let pw = if i == n - 1 { x + w - x0 } else { pw };
-                (x0, y, pw, h)
+    let total: f32 = weights.iter().sum::<f32>().max(f32::EPSILON);
+    let avail = match orientation {
+        Orientation::Row => w - gap * (n - 1),
+        Orientation::Column => h - gap * (n - 1),
+    } as f32;
+    let mut out = Vec::with_capacity(weights.len());
+    let mut cursor = match orientation {
+        Orientation::Row => x,
+        Orientation::Column => y,
+    };
+    for (i, wt) in weights.iter().enumerate() {
+        let len = if i as i32 == n - 1 {
+            // the last pane absorbs all rounding remainders
+            match orientation {
+                Orientation::Row => x + w - cursor,
+                Orientation::Column => y + h - cursor,
             }
-            Orientation::Column => {
-                let ph = (h - gap * (n - 1)) / n;
-                let y0 = y + i * (ph + gap);
-                let ph = if i == n - 1 { y + h - y0 } else { ph };
-                (x, y0, w, ph)
-            }
-        })
-        .collect()
+        } else {
+            (avail * wt / total) as i32
+        };
+        out.push(match orientation {
+            Orientation::Row => (cursor, y, len, h),
+            Orientation::Column => (x, cursor, w, len),
+        });
+        cursor += len + gap;
+    }
+    out
 }
 
 /// What survives a restart: each tab's cwd + the active index.
@@ -307,6 +323,11 @@ struct App {
     mouse_left_down: bool,
     /// the pane a mouse selection started in (drags don't cross panes)
     sel_pane: usize,
+    /// divider being dragged (between pane i and i+1)
+    drag_divider: Option<usize>,
+    /// the agent cockpit overlay (Ctrl+Shift+D): one glance at every tab
+    cockpit: bool,
+    cockpit_sel: usize,
     clicks: ClickTracker,
     wheel_accum: f32,
     search: Option<SearchState>,
@@ -346,6 +367,73 @@ impl App {
             let r = render::Renderer::new(scale, &cfg, delta);
             let _ = proxy.send_event(UserEvent::RendererReady(Box::new(r)));
         });
+    }
+
+    /// Cockpit row under the pointer (needs renderer + tab count).
+    fn cockpit_row_hit(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
+        let r = self.renderer.as_ref()?;
+        let w = self.window.as_ref()?;
+        let px = w.inner_size();
+        r.cockpit_row_at(px.width as usize, px.height as usize, self.tabs.len(),
+                         pos.x, pos.y)
+    }
+
+    /// One cockpit row per tab: focused pane's command or idle directory.
+    fn cockpit_entries(&self) -> Vec<render::CockpitEntry> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let status = t
+                    .panes
+                    .get(t.focused)
+                    .map(|p| {
+                        let m = p.session.meta.lock().unwrap();
+                        if !m.running_cmd.is_empty() {
+                            format!("▶ {}", m.running_cmd)
+                        } else if let Some(cwd) = &m.cwd {
+                            format!("خامل · {cwd}")
+                        } else {
+                            "خامل".to_string()
+                        }
+                    })
+                    .unwrap_or_default();
+                let n = t.panes.len();
+                let status = if n > 1 {
+                    format!("{status}   ({n} لوحات)")
+                } else {
+                    status
+                };
+                render::CockpitEntry {
+                    title: t.title.clone(),
+                    status,
+                    busy: t.busy(i == self.active),
+                    attention: t.attention,
+                    active: i == self.active,
+                }
+            })
+            .collect()
+    }
+
+    /// Keyboard handling while the cockpit is open.
+    fn cockpit_input(&mut self, event: &KeyEvent) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.cockpit = false,
+            Key::Named(NamedKey::Enter) => {
+                self.cockpit = false;
+                let sel = self.cockpit_sel;
+                self.switch_tab(sel);
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.cockpit_sel = self.cockpit_sel.saturating_sub(1);
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                self.cockpit_sel =
+                    (self.cockpit_sel + 1).min(self.tabs.len().saturating_sub(1));
+            }
+            _ => {}
+        }
+        self.request_redraw();
     }
 
     /// Scroll to the previous (dir<0) or next command prompt (OSC 133 marks).
@@ -408,6 +496,7 @@ impl App {
         if let Some(pane) = self.spawn_pane(cwd.as_deref()) {
             self.tabs.push(Tab {
                 panes: vec![pane],
+                weights: vec![1.0],
                 focused: 0,
                 orientation: Orientation::Row,
                 title,
@@ -428,7 +517,61 @@ impl App {
         let px = w.inner_size();
         let bar = r.tab_bar_h().round() as i32;
         let content = (0, bar, px.width as i32, px.height as i32 - bar);
-        split_rects(content, t.panes.len(), t.orientation)
+        split_rects(content, &t.weights, t.orientation)
+    }
+
+    /// Divider index under the pointer (between pane i and i+1), if any.
+    fn divider_at(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
+        let t = self.tabs.get(self.active)?;
+        if t.panes.len() < 2 {
+            return None;
+        }
+        let rects = self.pane_rects();
+        const GRAB: f64 = 4.0;
+        for i in 0..rects.len() - 1 {
+            let (x, y, w, h) = rects[i];
+            let hit = match t.orientation {
+                Orientation::Row => {
+                    (pos.x - (x + w) as f64).abs() <= GRAB
+                        && pos.y >= y as f64
+                        && pos.y < (y + h) as f64
+                }
+                Orientation::Column => {
+                    (pos.y - (y + h) as f64).abs() <= GRAB
+                        && pos.x >= x as f64
+                        && pos.x < (x + w) as f64
+                }
+            };
+            if hit {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Drag divider `i` to the pointer: redistribute the PAIR's weight.
+    fn drag_divider_to(&mut self, i: usize, pos: PhysicalPosition<f64>) {
+        let rects = self.pane_rects();
+        let Some(t) = self.tabs.get_mut(self.active) else { return };
+        if i + 1 >= rects.len() {
+            return;
+        }
+        let (a, b) = (rects[i], rects[i + 1]);
+        let (start, span, p) = match t.orientation {
+            Orientation::Row => (a.0 as f64, (b.0 + b.2 - a.0) as f64, pos.x),
+            Orientation::Column => (a.1 as f64, (b.1 + b.3 - a.1) as f64, pos.y),
+        };
+        if span <= 0.0 {
+            return;
+        }
+        // keep both panes usable: at least ~80px each
+        let min = (80.0 / span).min(0.45);
+        let rel = ((p - start) / span).clamp(min, 1.0 - min) as f32;
+        let pair = t.weights[i] + t.weights[i + 1];
+        t.weights[i] = pair * rel;
+        t.weights[i + 1] = pair - t.weights[i];
+        self.relayout_active();
+        self.request_redraw();
     }
 
     /// Resize every pane of the ACTIVE tab to its rect (background tabs
@@ -463,6 +606,7 @@ impl App {
                 t.orientation = orientation;
             }
             t.panes.push(pane);
+            t.weights.push(1.0);
             t.focused = t.panes.len() - 1;
         }
         self.relayout_active();
@@ -476,6 +620,9 @@ impl App {
             return;
         }
         let mut pane = t.panes.remove(pi);
+        if pi < t.weights.len() {
+            t.weights.remove(pi);
+        }
         pane.session.kill();
         if t.panes.is_empty() {
             self.tabs.remove(ti);
@@ -746,6 +893,11 @@ impl App {
 
     fn redraw(&mut self) {
         // computed before the surface borrow (they read &self broadly)
+        let cockpit_entries = if self.cockpit {
+            self.cockpit_entries()
+        } else {
+            Vec::new()
+        };
         let rects = self.pane_rects();
         let tab_infos: Vec<render::TabInfo> = self
             .tabs
@@ -822,6 +974,15 @@ impl App {
                     self.search.as_ref().map(|s| s.query.as_str()),
                     focused_claude,
                 );
+                if self.cockpit {
+                    renderer.draw_cockpit(
+                        &mut buffer,
+                        px.width as usize,
+                        px.height as usize,
+                        &cockpit_entries,
+                        self.cockpit_sel,
+                    );
+                }
             }
             // renderer still warming up on its thread: dark frame, instantly
             _ => buffer.fill(render::bg_packed()),
@@ -865,6 +1026,10 @@ impl ApplicationHandler<UserEvent> for App {
         // pane machinery can be verified without injecting any input
         if std::env::var_os("BAYAN_SPLIT").is_some() {
             self.split(Orientation::Row);
+        }
+        if std::env::var_os("BAYAN_COCKPIT").is_some() {
+            self.cockpit = true;
+            self.cockpit_sel = self.active;
         }
         crate::prof::mark("session spawned");
         // FontSystem::new scans every installed font — the documented
@@ -982,6 +1147,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = position;
+                if let Some(i) = self.drag_divider {
+                    self.drag_divider_to(i, position);
+                    return;
+                }
                 if self.mouse_left_down {
                     // the drag stays in the pane where it started
                     if let Some((pi, row, col, side)) = self.pane_cell_at(position) {
@@ -997,10 +1166,37 @@ impl ApplicationHandler<UserEvent> for App {
                             self.request_redraw();
                         }
                     }
+                } else if let Some(w) = &self.window {
+                    // hovering a divider shows the resize cursor
+                    use winit::window::CursorIcon;
+                    let icon = if self.divider_at(position).is_some() {
+                        match self.tabs.get(self.active).map(|t| t.orientation) {
+                            Some(Orientation::Column) => CursorIcon::NsResize,
+                            _ => CursorIcon::EwResize,
+                        }
+                    } else {
+                        CursorIcon::Default
+                    };
+                    w.set_cursor(icon);
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
                 ElementState::Pressed => {
+                    // the cockpit swallows clicks: pick a row or dismiss
+                    if self.cockpit {
+                        let hit = self.cockpit_row_hit(self.cursor_pos);
+                        self.cockpit = false;
+                        if let Some(row) = hit {
+                            self.switch_tab(row);
+                        }
+                        self.request_redraw();
+                        return;
+                    }
+                    // grabbing a divider starts a resize drag
+                    if let Some(i) = self.divider_at(self.cursor_pos) {
+                        self.drag_divider = Some(i);
+                        return;
+                    }
                     // a click in the tab bar switches tabs
                     if let Some(idx) = self.tab_at(self.cursor_pos) {
                         self.switch_tab(idx);
@@ -1037,6 +1233,9 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 ElementState::Released => {
+                    if self.drag_divider.take().is_some() {
+                        return; // a resize drag copies nothing
+                    }
                     self.mouse_left_down = false;
                     // EasyTer convention: auto-copy the selection on release
                     self.copy_selection(false);
@@ -1095,6 +1294,11 @@ impl ApplicationHandler<UserEvent> for App {
                     "key {:?} text={:?} ctrl={ctrl} shift={shift}",
                     event.logical_key, event.text
                 ));
+                // the cockpit owns the keyboard while open
+                if self.cockpit {
+                    self.cockpit_input(&event);
+                    return;
+                }
                 // the search bar owns the keyboard while open
                 if self.search.is_some() {
                     self.search_input(&event, shift);
@@ -1133,6 +1337,13 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         Some('v') => {
                             self.paste();
+                            return;
+                        }
+                        // the agent cockpit: every tab's state, one glance
+                        Some('d') => {
+                            self.cockpit = true;
+                            self.cockpit_sel = self.active;
+                            self.request_redraw();
                             return;
                         }
                         // splits (EasyTer): E side-by-side, O stacked
@@ -1305,6 +1516,9 @@ fn main() {
         cursor_pos: PhysicalPosition::new(0.0, 0.0),
         mouse_left_down: false,
         sel_pane: 0,
+        drag_divider: None,
+        cockpit: false,
+        cockpit_sel: 0,
         clicks: ClickTracker::new(),
         wheel_accum: 0.0,
         search: None,
@@ -1325,15 +1539,19 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn split_rects_divide_the_content_evenly() {
+    fn split_rects_divide_by_weight() {
         let content = (0, 30, 1000, 700);
-        let one = split_rects(content, 1, Orientation::Row);
+        let one = split_rects(content, &[1.0], Orientation::Row);
         assert_eq!(one, vec![(0, 30, 1000, 700)]);
-        let two = split_rects(content, 2, Orientation::Row);
+        let two = split_rects(content, &[1.0, 1.0], Orientation::Row);
         assert_eq!(two[0], (0, 30, 499, 700));
         assert_eq!(two[1], (500, 30, 500, 700)); // absorbs the rounding
         assert_eq!(two[0].0 + two[0].2 + 1, two[1].0); // 1px divider gap
-        let stacked = split_rects(content, 3, Orientation::Column);
+        // a dragged divider: 3:1 weights give a 3:1 width split
+        let uneven = split_rects(content, &[3.0, 1.0], Orientation::Row);
+        assert_eq!(uneven[0].2, 749); // 999 * 0.75
+        assert_eq!(uneven[1].0 + uneven[1].2, 1000); // flush right
+        let stacked = split_rects(content, &[1.0, 1.0, 1.0], Orientation::Column);
         assert_eq!(stacked.len(), 3);
         assert_eq!(stacked[2].1 + stacked[2].3, 30 + 700); // flush bottom
         // widths untouched in a column split

@@ -123,6 +123,16 @@ pub const TAB_CELLS: f32 = 24.0;
 /// A rect in frame pixels: (x, y, w, h).
 pub type Rect = (i32, i32, i32, i32);
 
+/// One row of the agent cockpit (Ctrl+Shift+D): a tab at a glance.
+pub struct CockpitEntry {
+    pub title: String,
+    /// running command, or the idle directory
+    pub status: String,
+    pub busy: bool,
+    pub attention: bool,
+    pub active: bool,
+}
+
 /// One pane's draw parameters.
 pub struct PaneView<'a> {
     pub rect: Rect,
@@ -624,6 +634,78 @@ impl Renderer {
             fill_rect(frame, width, height, px, py + ph - 1, pw, 1, pack(c));
             fill_rect(frame, width, height, px, py, 1, ph, pack(c));
             fill_rect(frame, width, height, px + pw - 1, py, 1, ph, pack(c));
+        }
+    }
+
+    /// Cockpit panel geometry (shared with the app's click hit-test).
+    pub fn cockpit_rect(&self, fw: usize, fh: usize, n: usize) -> Rect {
+        let w = ((self.cell_w * 64.0) as i32).min(fw as i32 - 60);
+        let row_h = self.cockpit_row_h();
+        let header = row_h + 6;
+        let h = header + row_h * n.max(1) as i32 + 14;
+        let x = (fw as i32 - w) / 2;
+        let y = (self.tab_bar_h() as i32 + (fh as i32 - h) / 4).max(self.tab_bar_h() as i32 + 8);
+        (x, y, w, h)
+    }
+
+    pub fn cockpit_row_h(&self) -> i32 {
+        (self.cell_h + 12.0) as i32
+    }
+
+    /// Which cockpit row a pixel position lands on.
+    pub fn cockpit_row_at(&self, fw: usize, fh: usize, n: usize, px: f64, py: f64) -> Option<usize> {
+        let (x, y, w, _h) = self.cockpit_rect(fw, fh, n);
+        let row_h = self.cockpit_row_h();
+        let rows_top = y + row_h + 6;
+        if px < x as f64 || px >= (x + w) as f64 || py < rows_top as f64 {
+            return None;
+        }
+        let row = ((py - rows_top as f64) / row_h as f64) as usize;
+        (row < n).then_some(row)
+    }
+
+    /// The agent cockpit: every tab's state on one card. Amber = waiting for
+    /// you (bell), green = working, dim = idle. Enter/click jumps.
+    pub fn draw_cockpit(&mut self, frame: &mut [u32], fw: usize, fh: usize,
+                        entries: &[CockpitEntry], sel: usize) {
+        let whole: Rect = (0, 0, fw as i32, fh as i32);
+        let (x, y, w, h) = self.cockpit_rect(fw, fh, entries.len());
+        // dim the world behind the card
+        blend_rect(frame, fw, fh, 0, 0, fw as i32, fh as i32, (0, 0, 0), 110);
+        fill_rect(frame, fw, fh, x, y, w, h, pack((0x1c, 0x21, 0x28)));
+        fill_rect(frame, fw, fh, x, y, w, 2, pack((0x2e, 0xa0, 0x43))); // accent
+        let row_h = self.cockpit_row_h();
+        // header
+        let head = [("مقصورة الوكلاء".to_string(), FG)];
+        self.shape_scratch(&head, 1_000_000.0, true);
+        self.blit_scratch(frame, fw, fh, whole, (x + 14) as f32, y + 8, 1.0);
+        let rows_top = y + row_h + 6;
+        for (i, e) in entries.iter().enumerate() {
+            let ry = rows_top + i as i32 * row_h;
+            if i == sel {
+                fill_rect(frame, fw, fh, x + 4, ry, w - 8, row_h, pack((0x24, 0x2b, 0x36)));
+            }
+            // state dot: attention (amber) beats busy (green) beats idle (dim)
+            let dot = if e.attention {
+                (0xf2, 0xcc, 0x60)
+            } else if e.busy {
+                (0x56, 0xd3, 0x64)
+            } else {
+                (0x6e, 0x76, 0x81)
+            };
+            let d = 8;
+            blend_rect(frame, fw, fh, x + 14, ry + row_h / 2 - d / 2, d, d, dot, 255);
+            let fg = if e.active { FG } else { (0xb0, 0xb8, 0xc4) };
+            let mark = if e.active { "● " } else { "" };
+            let title: String = e.title.chars().take(22).collect();
+            let status: String = e.status.chars().take(48).collect();
+            let segs = [
+                (format!("{mark}{title}"), fg),
+                ("   —   ".to_string(), (0x6e, 0x76, 0x81)),
+                (status, (0x9a, 0xa4, 0xb2)),
+            ];
+            self.shape_scratch(&segs, 1_000_000.0, true);
+            self.blit_scratch(frame, fw, fh, whole, (x + 32) as f32, ry + 6, 1.0);
         }
     }
 
