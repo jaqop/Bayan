@@ -31,7 +31,11 @@ specification; `src/keys.rs` carries the same key-encoding tests.
 ## Milestones
 
 - [x] **M1** — window + PowerShell over ConPTY + shaped, BiDi-correct text
-- [ ] **M2** — Arabic grid fit (run compression), cursor-in-RTL, HiDPI polish
+- [x] **M2a** — dual text engine: non-Arabic rows on a strict grid
+      (column-pinned ASCII runs; icons/powerline/box-drawing per cell,
+      compressed to fit), Nerd Font auto-pick, zero-width diacritics
+      (tashkeel) render
+- [ ] **M2b** — Arabic-row grid fit, cursor position inside RTL, HiDPI polish
 - [ ] **M3** — selection, clipboard, scrollback UI, search
 - [ ] **M4** — Claude mode (visual→logical reversal), OSC 133/52/9;9 blocks
 - [ ] **M5** — tabs/splits, session persistence, agent cockpit, wgpu renderer
