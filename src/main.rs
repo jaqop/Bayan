@@ -1263,10 +1263,12 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         // hidden until the GPU presents the first dark frame (~0.4s): a
-        // fully-drawn window appearing beats a white flash while DX12 warms up
+        // fully-drawn window appearing beats a white flash while DX12 warms up.
+        // BAYAN_SHOW_NOW forces it visible at creation (for on-screen capture).
+        let visible = std::env::var_os("BAYAN_SHOW_NOW").is_some();
         let attrs = Window::default_attributes()
             .with_title("Bayan — بيان")
-            .with_visible(false)
+            .with_visible(visible)
             .with_inner_size(LogicalSize::new(1100.0, 700.0));
         let window = Arc::new(el.create_window(attrs).expect("create window"));
         crate::prof::mark("window created");
@@ -1523,6 +1525,16 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         self.request_redraw();
                         return;
+                    }
+                    // the settings gear button in the tab bar opens settings
+                    // (a click — layout-proof, unlike a comma shortcut)
+                    if let (Some(r), Some(w)) = (self.renderer.as_ref(), self.window.as_ref()) {
+                        let pw = w.inner_size().width as usize;
+                        if r.settings_button_hit(pw, self.cursor_pos.x, self.cursor_pos.y) {
+                            self.settings = Some(0);
+                            self.request_redraw();
+                            return;
+                        }
                     }
                     // the cockpit swallows clicks: pick a row or dismiss
                     if self.cockpit {

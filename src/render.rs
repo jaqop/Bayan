@@ -1341,6 +1341,28 @@ impl Renderer {
                 push_rect(out, whole, x0 + tw - 16, oy / 2 - d / 2, d, d, c4(c, 255));
             }
         }
+
+        // a clickable settings button (gear) at the tab bar's right end —
+        // discoverable and layout-proof (a shortcut fights an Arabic layout)
+        let (bx, by, bw, bh) = self.settings_button_rect(width);
+        push_rect(out, whole, bx, by, bw, bh, c4((0x24, 0x2b, 0x36), 255));
+        let seg = [Seg::plain("⚙", (0xc0, 0xca, 0xf5))];
+        let gw = self.measure(&seg, false);
+        self.draw_run(&seg, false, out, whole,
+                      bx as f32 + (bw as f32 - gw) / 2.0, by + 3, 1.0);
+    }
+
+    /// The settings-gear button rect in the tab bar (shared with hit-test).
+    pub fn settings_button_rect(&self, width: usize) -> Rect {
+        let oy = self.tab_bar_h().round() as i32;
+        let bw = (self.cell_w * 3.0).max(28.0) as i32;
+        (width as i32 - bw - 6, 3, bw, oy - 6)
+    }
+
+    /// Is (px, py) on the settings-gear button?
+    pub fn settings_button_hit(&self, width: usize, px: f64, py: f64) -> bool {
+        let (bx, by, bw, bh) = self.settings_button_rect(width);
+        px >= bx as f64 && px < (bx + bw) as f64 && py >= by as f64 && py < (by + bh) as f64
     }
 }
 
@@ -1609,6 +1631,22 @@ mod cache_tests {
         assert_eq!(a.generation, 0, "no wholesale reset while under the cap");
         // page 0's white texel survived the growth (still opaque white)
         assert_eq!(&a.pages[0][0..4], &[255, 255, 255, 255]);
+    }
+
+    /// The settings gear button hit-test: a click on it registers, a click
+    /// elsewhere on the tab bar does not (so settings is reachable by mouse
+    /// regardless of keyboard layout).
+    #[test]
+    fn settings_button_is_clickable() {
+        let r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let w = 1000;
+        let (bx, by, bw, bh) = r.settings_button_rect(w);
+        // a point inside the button hits
+        assert!(r.settings_button_hit(w, (bx + bw / 2) as f64, (by + bh / 2) as f64));
+        // the far left of the tab bar (where tabs live) does not
+        assert!(!r.settings_button_hit(w, 20.0, (by + bh / 2) as f64));
+        // the button sits at the right edge
+        assert!(bx + bw <= w as i32 && bx > w as i32 / 2);
     }
 
     /// Solid rects always reference page 0 (the white texel lives there).
