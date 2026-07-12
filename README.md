@@ -43,8 +43,14 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       bracketed-paste injection guard), wheel scrollback + indicator +
       Shift+PageUp/Down, Ctrl+F literal search with wrap-around; Ctrl
       shortcuts resolve by PHYSICAL key so they work on Arabic layouts
-- [ ] **M4** — Claude mode (visual→logical reversal), OSC 133/52/9;9 blocks
-- [ ] **M5** — tabs/splits, session persistence, agent cockpit, wgpu renderer
+- [x] **M4** — Claude mode: visual→logical BiDi reversal (EasyTer's
+      algorithms, ported with their edge cases), auto-enabled when the
+      alternate screen belongs to a `claude` command (F2 = manual toggle,
+      green badge); OSC 133 prompt marks injected into PowerShell power the
+      command detection; OSC 52 sets the clipboard; OSC 9;9 tracks the cwd
+      into the window title — all scanned split-safe with carry
+- [ ] **M5** — tabs/splits, session persistence, agent cockpit, command
+      blocks UI, wgpu renderer
 
 ## Build
 

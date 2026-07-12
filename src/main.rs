@@ -7,6 +7,7 @@
 // release builds are pure GUI apps: no companion console window
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod bidi;
 mod keys;
 mod render;
 mod term;
@@ -165,6 +166,10 @@ pub enum UserEvent {
     PtyWrite(String),
     /// The font system finished loading on its background thread.
     RendererReady(Box<render::Renderer>),
+    /// A program set the clipboard via OSC 52 (yank over SSH ...).
+    ClipboardSet(String),
+    /// The shell reported its working directory (OSC 9;9).
+    Cwd(String),
     /// The shell exited or the reader thread died.
     Exit,
 }
@@ -215,6 +220,10 @@ struct App {
     wheel_accum: f32,
     search: Option<SearchState>,
     clipboard: Option<arboard::Clipboard>,
+    /// Claude mode follows (alt screen + claude command) automatically;
+    /// F2 switches to manual and back (EasyTer's toggle semantics).
+    auto_follow: bool,
+    claude_manual: bool,
 }
 
 impl App {
@@ -228,6 +237,22 @@ impl App {
         self.session
             .as_ref()
             .map_or(TermMode::empty(), |s| *s.term.lock().unwrap().mode())
+    }
+
+    /// Claude mode: auto = a full-screen TUI is active AND the command that
+    /// started it is Claude itself (vim/less emit logical Arabic — never
+    /// reverse those). F2 overrides manually.
+    fn claude_active(&self) -> bool {
+        if !self.auto_follow {
+            return self.claude_manual;
+        }
+        let Some(s) = self.session.as_ref() else {
+            return false;
+        };
+        if !self.term_mode().contains(TermMode::ALT_SCREEN) {
+            return false;
+        }
+        bidi::cmd_is_claude(&s.meta.lock().unwrap().running_cmd)
     }
 
     /// Pixel position -> (viewport row, col, cell side) for selection.
@@ -388,6 +413,7 @@ impl App {
     }
 
     fn redraw(&mut self) {
+        let claude = self.claude_active();
         let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut())
         else {
             return;
@@ -405,6 +431,7 @@ impl App {
                 let overlay = render::Overlay {
                     search_query: self.search.as_ref().map(|s| s.query.as_str()),
                     search_match: self.search.as_ref().and_then(|s| s.hl.as_ref()),
+                    claude,
                 };
                 let t = session.term.lock().unwrap();
                 renderer.draw(&mut buffer, px.width as usize, px.height as usize, &t, &overlay);
@@ -473,6 +500,13 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::PtyWrite(text) => {
                 if let Some(s) = self.session.as_mut() {
                     s.write(text.as_bytes());
+                }
+            }
+            UserEvent::ClipboardSet(text) => self.set_clipboard(text),
+            UserEvent::Cwd(cwd) => {
+                if let Some(w) = &self.window {
+                    let base = cwd.rsplit(['\\', '/']).next().unwrap_or(&cwd);
+                    w.set_title(&format!("Bayan — بيان · {base}"));
                 }
             }
             UserEvent::RendererReady(r) => {
@@ -632,6 +666,17 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 let key = &event.logical_key;
+                // F2: Claude mode manual toggle (auto -> manual flip -> auto)
+                if matches!(key, Key::Named(NamedKey::F2)) {
+                    if self.auto_follow {
+                        self.claude_manual = !self.claude_active();
+                        self.auto_follow = false;
+                    } else {
+                        self.auto_follow = true;
+                    }
+                    self.request_redraw();
+                    return;
+                }
                 // ---- app-level shortcuts (EasyTer's rules) ----
                 if ctrl && shift {
                     match key_letter(&event) {
@@ -738,6 +783,8 @@ fn main() {
         wheel_accum: 0.0,
         search: None,
         clipboard: None,
+        auto_follow: true,
+        claude_manual: false,
     };
     event_loop.run_app(&mut app).expect("run event loop");
 }

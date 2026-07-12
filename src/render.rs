@@ -109,6 +109,9 @@ pub struct Overlay<'a> {
     pub search_query: Option<&'a str>,
     /// The current search hit, highlighted stronger than a selection.
     pub search_match: Option<&'a std::ops::RangeInclusive<alacritty_terminal::index::Point>>,
+    /// Claude mode: cells hold VISUAL-order Arabic that must be restored
+    /// to logical before shaping (and a badge is drawn).
+    pub claude: bool,
 }
 
 // translucent overlays, EasyTer's colors: selection blue, search amber
@@ -327,7 +330,7 @@ impl Renderer {
     /// THROUGH the shaped layout — in RTL, logical column N is not at
     /// N*cell_w — and returned as (x, w).
     fn draw_line_bidi(&mut self, frame: &mut [u32], fw: usize, fh: usize,
-                      y: i32, cells: &[CellInfo],
+                      y: i32, cells: &[CellInfo], claude: bool,
                       cursor_col: Option<usize>) -> Option<(i32, i32)> {
         let mut end = cells.len();
         while end > 0 && cells[end - 1].c == ' ' {
@@ -352,6 +355,17 @@ impl Renderer {
         }
         if segs.is_empty() {
             return None;
+        }
+        // Claude mode: the cells hold Claude's pre-reversed VISUAL order.
+        // Restore logical so cosmic-text's BiDi shows it right. Per-cell
+        // colors can't survive the reordering (EasyTer draws these lines in
+        // the default FG too), and the cursor byte-mapping no longer holds.
+        if claude {
+            let full: String = segs.iter().map(|(s, _)| s.as_str()).collect();
+            if let Some(fixed) = crate::bidi::restore_bidi_line(&full) {
+                segs = vec![(fixed, FG)];
+                cur_bytes = None;
+            }
         }
         // shape unconstrained, then compress to the window if it overflows
         let natw = self.shape_scratch(&segs, 1_000_000.0, true);
@@ -500,6 +514,7 @@ impl Renderer {
             if cells.iter().any(|ci| is_arabic(ci.c)) {
                 let on_row = cursor_vrow >= 0 && cursor_vrow as usize == li;
                 let r = self.draw_line_bidi(frame, width, height, y, cells,
+                                            overlay.claude,
                                             if on_row { Some(ccol) } else { None });
                 if r.is_some() {
                     cursor_rect = r;
@@ -541,6 +556,23 @@ impl Renderer {
             let th = ((vh as f32 * rows as f32 / (history + rows) as f32) as i32).max(24);
             let ty = ((vh - th) as f32 * (1.0 - off as f32 / history as f32)) as i32;
             blend_rect(frame, width, height, width as i32 - 7, ty, 4, th, FG, 70);
+        }
+
+        // Claude-mode badge, top-right (EasyTer's green badge)
+        if overlay.claude {
+            let label = "● وضع كلود".to_string();
+            let segs = [(label, (0xff, 0xff, 0xff))];
+            let tw = self.shape_scratch(&segs, 1_000_000.0, true);
+            let bw = tw as i32 + 16;
+            let bh = (self.cell_h + 8.0) as i32;
+            let bx = width as i32 - bw - 10;
+            let by = if overlay.search_query.is_some() {
+                (self.cell_h + 24.0) as i32
+            } else {
+                6
+            };
+            fill_rect(frame, width, height, bx, by, bw, bh, pack((0x2e, 0xa0, 0x43)));
+            self.blit_scratch(frame, width, height, (bx + 8) as f32, by + 4, 1.0);
         }
 
         // search bar, top-right (drawn last: floats above everything)

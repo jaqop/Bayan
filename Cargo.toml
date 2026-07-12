@@ -16,6 +16,8 @@ softbuffer = "0.4"
 cosmic-text = "0.12"
 # system clipboard (copy on select / paste)
 arboard = "3"
+# OSC 52 payloads (programs setting the clipboard, e.g. yank over SSH)
+base64 = "0.22"
 
 [profile.release]
 opt-level = 3
