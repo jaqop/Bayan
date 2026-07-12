@@ -367,6 +367,7 @@ struct App {
     modifiers: ModifiersState,
     first_frame: bool,
     first_output: bool,
+    stressed: bool,
     cursor_pos: PhysicalPosition<f64>,
     mouse_left_down: bool,
     /// the pane a mouse selection started in (drags don't cross panes)
@@ -1100,13 +1101,27 @@ impl App {
         let mut heal = false;
         if let Some(renderer) = self.renderer.as_mut() {
             if renderer.atlas.dirty {
-                gpu.upload_atlas(&renderer.atlas.pixels);
+                gpu.upload_atlas(&renderer.atlas.pages);
                 renderer.atlas.dirty = false;
             }
             // an atlas reset mid-frame leaves earlier quads with stale uvs:
             // one more redraw re-emits everything from the fresh atlas
             heal = renderer.atlas.generation != self.atlas_generation;
             self.atlas_generation = renderer.atlas.generation;
+        }
+        // BAYAN_ATLAS_STRESS: shape a big spread of unique glyphs before the
+        // first present, forcing a page grow — proves the array texture path
+        // draws page-1 glyphs without corrupting page 0 (no input injection).
+        if std::env::var_os("BAYAN_ATLAS_STRESS").is_some() {
+            if let Some(r) = self.renderer.as_mut() {
+                // persistent overlay (re-emitted every frame) so the second
+                // atlas page's glyphs stay on screen for verification
+                r.stress_atlas(&mut verts, px.width as usize, px.height as usize);
+                if r.atlas.dirty {
+                    gpu.upload_atlas(&r.atlas.pages);
+                    r.atlas.dirty = false;
+                }
+            }
         }
         let bg = self.renderer.as_ref().map_or(render::BG, |r| r.bg);
         gpu.render(&verts, bg);
@@ -1719,6 +1734,7 @@ fn main() {
         modifiers: ModifiersState::default(),
         first_frame: false,
         first_output: false,
+        stressed: false,
         cursor_pos: PhysicalPosition::new(0.0, 0.0),
         mouse_left_down: false,
         sel_pane: 0,

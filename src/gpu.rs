@@ -8,12 +8,14 @@ use std::sync::Arc;
 
 use winit::window::Window;
 
-/// One vertex: pixel-space position, atlas uv, straight-alpha color.
+/// One vertex: pixel-space position, atlas uv, atlas page (layer), and
+/// straight-alpha color.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
     pub pos: [f32; 2],
     pub uv: [f32; 2],
+    pub layer: f32,
     pub color: [f32; 4],
 }
 
@@ -27,18 +29,20 @@ struct Globals {
 const SHADER: &str = r#"
 struct Globals { screen: vec2<f32>, pad: vec2<f32> };
 @group(0) @binding(0) var<uniform> globals: Globals;
-@group(0) @binding(1) var atlas_tex: texture_2d<f32>;
+@group(0) @binding(1) var atlas_tex: texture_2d_array<f32>;
 @group(0) @binding(2) var atlas_smp: sampler;
 
 struct VsIn {
     @location(0) pos: vec2<f32>,
     @location(1) uv: vec2<f32>,
-    @location(2) color: vec4<f32>,
+    @location(2) layer: f32,
+    @location(3) color: vec4<f32>,
 };
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
-    @location(1) color: vec4<f32>,
+    @location(1) @interpolate(flat) layer: i32,
+    @location(2) color: vec4<f32>,
 };
 
 @vertex
@@ -50,13 +54,14 @@ fn vs(in: VsIn) -> VsOut {
     );
     out.pos = vec4<f32>(ndc, 0.0, 1.0);
     out.uv = in.uv;
+    out.layer = i32(in.layer + 0.5);
     out.color = in.color;
     return out;
 }
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    return in.color * textureSample(atlas_tex, atlas_smp, in.uv);
+    return in.color * textureSample(atlas_tex, atlas_smp, in.uv, in.layer);
 }
 "#;
 
@@ -67,9 +72,12 @@ pub struct Gpu {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
+    bgl: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
     globals_buf: wgpu::Buffer,
     atlas_tex: wgpu::Texture,
     atlas_size: u32,
+    layers: u32,
 }
 
 impl Gpu {
@@ -122,21 +130,12 @@ impl Gpu {
         };
         surface.configure(&device, &config);
 
-        let atlas_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("glyph atlas"),
-            size: wgpu::Extent3d {
-                width: atlas_size,
-                height: atlas_size,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
+        let layers = 1u32;
+        let atlas_tex = Self::make_atlas(&device, atlas_size, layers);
+        let atlas_view = atlas_tex.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
         });
-        let atlas_view = atlas_tex.create_view(&Default::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
@@ -167,7 +166,7 @@ impl Gpu {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
                         multisampled: false,
                     },
                     count: None,
@@ -219,7 +218,7 @@ impl Gpu {
                     array_stride: std::mem::size_of::<Vertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &wgpu::vertex_attr_array![
-                        0 => Float32x2, 1 => Float32x2, 2 => Float32x4
+                        0 => Float32x2, 1 => Float32x2, 2 => Float32, 3 => Float32x4
                     ],
                 }],
             },
@@ -247,10 +246,55 @@ impl Gpu {
             config,
             pipeline,
             bind_group,
+            bgl,
+            sampler,
             globals_buf,
             atlas_tex,
             atlas_size,
+            layers,
         })
+    }
+
+    fn make_atlas(device: &wgpu::Device, size: u32, layers: u32) -> wgpu::Texture {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("glyph atlas"),
+            size: wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: layers,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        })
+    }
+
+    fn rebind_atlas(&mut self) {
+        let view = self.atlas_tex.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.globals_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -262,28 +306,38 @@ impl Gpu {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// Upload the whole CPU atlas (only called on frames that rasterized a
-    /// NEW glyph; 2048x2048 RGBA has a bytes_per_row already 256-aligned).
-    pub fn upload_atlas(&self, pixels: &[u8]) {
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.atlas_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            pixels,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(self.atlas_size * 4),
-                rows_per_image: Some(self.atlas_size),
-            },
-            wgpu::Extent3d {
-                width: self.atlas_size,
-                height: self.atlas_size,
-                depth_or_array_layers: 1,
-            },
-        );
+    /// Sync the CPU atlas pages to the GPU (only on frames that rasterized a
+    /// new glyph). When the page count grew, the texture array is recreated
+    /// with more layers and the bind group rebound — rare, a few times a
+    /// session at most. 2048² RGBA has a bytes_per_row already 256-aligned.
+    pub fn upload_atlas(&mut self, pages: &[Vec<u8>]) {
+        let n = pages.len() as u32;
+        if n != self.layers {
+            self.atlas_tex = Self::make_atlas(&self.device, self.atlas_size, n);
+            self.layers = n;
+            self.rebind_atlas();
+        }
+        for (layer, page) in pages.iter().enumerate() {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.atlas_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: layer as u32 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                page,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.atlas_size * 4),
+                    rows_per_image: Some(self.atlas_size),
+                },
+                wgpu::Extent3d {
+                    width: self.atlas_size,
+                    height: self.atlas_size,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
     }
 
     /// Render one frame of quads (painter's order). BG is the clear color.

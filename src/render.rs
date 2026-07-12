@@ -69,10 +69,10 @@ pub const ATLAS_SIZE: u32 = 2048;
 const WHITE_UV: f32 = 1.0 / ATLAS_SIZE as f32;
 
 /// Emit one quad clipped to `clip` (uv adjusted proportionally): a pane's
-/// content can never bleed into a neighbouring pane.
+/// content can never bleed into a neighbouring pane. `layer` is the atlas page.
 #[allow(clippy::too_many_arguments)]
 fn push_quad(out: &mut Vec<Vertex>, clip: Rect, x: f32, y: f32, w: f32, h: f32,
-             u0: f32, v0: f32, u1: f32, v1: f32, color: [f32; 4]) {
+             layer: u32, u0: f32, v0: f32, u1: f32, v1: f32, color: [f32; 4]) {
     if w <= 0.0 || h <= 0.0 || color[3] <= 0.0 {
         return;
     }
@@ -89,9 +89,11 @@ fn push_quad(out: &mut Vec<Vertex>, clip: Rect, x: f32, y: f32, w: f32, h: f32,
     let dv = (v1 - v0) / h;
     let (mu0, mv0) = (u0 + (nx0 - x) * du, v0 + (ny0 - y) * dv);
     let (mu1, mv1) = (u1 - (x1 - nx1) * du, v1 - (y1 - ny1) * dv);
+    let lf = layer as f32;
     let v = |px: f32, py: f32, u: f32, vv: f32| Vertex {
         pos: [px, py],
         uv: [u, vv],
+        layer: lf,
         color,
     };
     out.extend_from_slice(&[
@@ -104,16 +106,22 @@ fn push_quad(out: &mut Vec<Vertex>, clip: Rect, x: f32, y: f32, w: f32, h: f32,
     ]);
 }
 
-/// Solid rect (samples the atlas's white texel).
+/// Solid rect (samples the white texel on page 0).
 fn push_rect(out: &mut Vec<Vertex>, clip: Rect, x: i32, y: i32, w: i32, h: i32,
              color: [f32; 4]) {
     push_quad(out, clip, x as f32, y as f32, w as f32, h as f32,
-              WHITE_UV, WHITE_UV, WHITE_UV, WHITE_UV, color);
+              0, WHITE_UV, WHITE_UV, WHITE_UV, WHITE_UV, color);
 }
 
-/// One rasterized glyph's slot in the atlas.
+/// Hard ceiling on atlas pages (each is ATLAS_SIZE² RGBA = 16MB). Reached
+/// only after ~tens of thousands of distinct glyphs — then, and only then,
+/// the oldest content resets. In practice a session never exceeds 1-2 pages.
+pub const MAX_PAGES: u32 = 8;
+
+/// One rasterized glyph's slot in the atlas: which page, and its uv rect.
 #[derive(Clone, Copy)]
 struct GlyphEntry {
+    layer: u32,
     u0: f32,
     v0: f32,
     u1: f32,
@@ -125,14 +133,20 @@ struct GlyphEntry {
     is_color: bool,
 }
 
-/// CPU-side glyph atlas (shelf-packed RGBA); the GPU uploads it when dirty.
+/// CPU-side glyph atlas: a stack of shelf-packed RGBA pages that GROWS a new
+/// page when the current one fills, instead of wiping everything (M10's
+/// reset-loses-all became a visible flash with big fonts + emoji + Arabic).
 pub struct Atlas {
-    pub pixels: Vec<u8>,
+    pub pages: Vec<Vec<u8>>,
+    /// pixels changed since the last GPU sync (per-page dirty flag)
     pub dirty: bool,
-    /// bumps on a wholesale reset: quads emitted before the reset hold
-    /// stale uvs, so the app schedules one healing redraw
+    /// bumps when a NEW page is added — the GPU must recreate its texture
+    /// array with more layers (rare: a handful of times per session at most)
+    pub layer_gen: u32,
+    /// bumps on the wholesale reset at MAX_PAGES — one healing redraw
     pub generation: u32,
     map: std::collections::HashMap<cosmic_text::CacheKey, Option<GlyphEntry>>,
+    cur: u32, // page currently being filled
     shelf_x: u32,
     shelf_y: u32,
     shelf_h: u32,
@@ -141,10 +155,12 @@ pub struct Atlas {
 impl Atlas {
     fn new() -> Self {
         let mut a = Atlas {
-            pixels: vec![0; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize],
+            pages: vec![vec![0; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize]],
             dirty: true,
+            layer_gen: 0,
             generation: 0,
             map: std::collections::HashMap::new(),
+            cur: 0,
             shelf_x: 4,
             shelf_y: 0,
             shelf_h: 4,
@@ -153,37 +169,48 @@ impl Atlas {
         a
     }
 
+    /// The white texel lives at (0,0) of page 0 — solid quads sample it.
     fn write_white_texel(&mut self) {
         for y in 0..3u32 {
             for x in 0..3u32 {
                 let i = ((y * ATLAS_SIZE + x) * 4) as usize;
-                self.pixels[i..i + 4].copy_from_slice(&[255; 4]);
+                self.pages[0][i..i + 4].copy_from_slice(&[255; 4]);
             }
         }
     }
 
-    fn alloc(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
+    /// Reserve a w×h slot, opening a new page (or resetting at the cap).
+    /// Returns (layer, x, y).
+    fn alloc(&mut self, w: u32, h: u32) -> Option<(u32, u32, u32)> {
         let pad = 1;
+        if w + pad > ATLAS_SIZE || h + pad > ATLAS_SIZE {
+            return None; // a single glyph larger than a whole page
+        }
         if self.shelf_x + w + pad > ATLAS_SIZE {
             self.shelf_y += self.shelf_h + pad;
             self.shelf_x = 0;
             self.shelf_h = 0;
         }
         if self.shelf_y + h + pad > ATLAS_SIZE {
-            // full: reset wholesale (rare — thousands of glyphs fit); the
-            // generation bump makes the app schedule one healing redraw
-            self.map.clear();
-            self.pixels.fill(0);
-            self.generation = self.generation.wrapping_add(1);
-            self.shelf_x = 4;
-            self.shelf_y = 0;
-            self.shelf_h = 4;
-            self.write_white_texel();
-            if w + pad > ATLAS_SIZE || h + pad > ATLAS_SIZE {
-                return None;
+            // this page is full: grow a new one (no loss), or reset at the cap
+            if (self.pages.len() as u32) < MAX_PAGES {
+                self.pages.push(vec![0; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize]);
+                self.cur = self.pages.len() as u32 - 1;
+                self.layer_gen = self.layer_gen.wrapping_add(1);
+            } else {
+                self.map.clear();
+                for p in &mut self.pages {
+                    p.fill(0);
+                }
+                self.cur = 0;
+                self.write_white_texel();
+                self.generation = self.generation.wrapping_add(1);
             }
+            self.shelf_x = 0;
+            self.shelf_y = 0;
+            self.shelf_h = 0;
         }
-        let pos = (self.shelf_x, self.shelf_y);
+        let pos = (self.cur, self.shelf_x, self.shelf_y);
         self.shelf_x += w + pad;
         self.shelf_h = self.shelf_h.max(h);
         Some(pos)
@@ -200,8 +227,9 @@ impl Atlas {
             if w == 0 || h == 0 {
                 return None;
             }
-            let (ax, ay) = self.alloc(w, h)?;
+            let (layer, ax, ay) = self.alloc(w, h)?;
             let is_color = matches!(img.content, SwashContent::Color);
+            let page = &mut self.pages[layer as usize];
             for row in 0..h {
                 for col in 0..w {
                     let dst = (((ay + row) * ATLAS_SIZE + ax + col) * 4) as usize;
@@ -219,12 +247,13 @@ impl Atlas {
                             [255, 255, 255, img.data[s]]
                         }
                     };
-                    self.pixels[dst..dst + 4].copy_from_slice(&px);
+                    page[dst..dst + 4].copy_from_slice(&px);
                 }
             }
             self.dirty = true;
             let s = ATLAS_SIZE as f32;
             Some(GlyphEntry {
+                layer,
                 u0: ax as f32 / s,
                 v0: ay as f32 / s,
                 u1: (ax + w) as f32 / s,
@@ -264,7 +293,7 @@ fn push_shaped(out: &mut Vec<Vertex>, fs: &mut FontSystem, swash: &mut SwashCach
             let gx = x_off + (phys.x as f32 + e.left as f32) * scale;
             let gy = y_off as f32 + run.line_y + phys.y as f32 - e.top as f32;
             push_quad(out, clip, gx, gy, e.w as f32 * scale, e.h as f32,
-                      e.u0, e.v0, e.u1, e.v1, color);
+                      e.layer, e.u0, e.v0, e.u1, e.v1, color);
         }
     }
 }
@@ -995,6 +1024,32 @@ impl Renderer {
         }
     }
 
+    /// Debug (BAYAN_ATLAS_STRESS): draw a big grid of large distinct glyphs
+    /// to force the atlas past one page, then a line of ASCII whose glyphs
+    /// were rasterized into page 0 first — if paging is correct both render.
+    pub fn stress_atlas(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize) {
+        let whole: Rect = (0, 0, fw as i32, fh as i32);
+        let mut y = self.tab_bar_h() as i32 + 4;
+        // many CJK glyphs at a big scale chew through page space fast
+        for base in 0x4E00u32..0x4E00 + 900 {
+            if y > fh as i32 - 40 {
+                break;
+            }
+            let mut line = String::new();
+            for k in 0..40 {
+                if let Some(c) = char::from_u32(base + k * 20) {
+                    line.push(c);
+                }
+            }
+            let seg = [Seg::plain(line, self.fg)];
+            self.draw_run(&seg, false, out, whole, 4.0, y, 1.0);
+            y += self.cell_h as i32;
+        }
+        // page count now > 1; this ASCII line's glyphs live on page 0
+        let tag = [Seg { text: "ATLAS PAGE OK — الصفحة تعمل".into(), fg: (0x7e, 0xe7, 0x87), style: ST_BOLD }];
+        self.draw_run(&tag, false, out, whole, 4.0, fh as i32 - 30, 1.0);
+    }
+
     /// The paste guard (EasyTer's protection): a multi-line/huge paste can
     /// execute commands on arrival — confirm before sending it to the shell.
     pub fn draw_paste_guard(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
@@ -1248,6 +1303,36 @@ mod cache_tests {
         let before = r.cache_hot.len();
         r.measure(&hot, false);
         assert_eq!(r.cache_hot.len(), before + 1);
+    }
+
+    /// The atlas grows a new page when one fills, keeping earlier glyphs —
+    /// instead of M10's wipe-everything reset.
+    #[test]
+    fn atlas_grows_pages_without_losing_earlier_glyphs() {
+        let mut a = Atlas::new();
+        assert_eq!(a.pages.len(), 1);
+        // pack rows of tall slots until the first page must overflow. A
+        // near-full-width slot per shelf forces a new shelf each alloc.
+        let (w, h) = (ATLAS_SIZE - 8, 64);
+        let rows_per_page = (ATLAS_SIZE / (h + 1)) as usize;
+        let first = a.alloc(10, 10).unwrap();
+        assert_eq!(first.0, 0, "first glyph on page 0");
+        for _ in 0..rows_per_page + 1 {
+            a.alloc(w, h);
+        }
+        assert_eq!(a.pages.len(), 2, "a second page was grown");
+        assert!(a.layer_gen >= 1, "layer generation bumped for the GPU");
+        assert_eq!(a.generation, 0, "no wholesale reset while under the cap");
+        // page 0's white texel survived the growth (still opaque white)
+        assert_eq!(&a.pages[0][0..4], &[255, 255, 255, 255]);
+    }
+
+    /// Solid rects always reference page 0 (the white texel lives there).
+    #[test]
+    fn solid_rects_target_page_zero() {
+        let mut out = Vec::new();
+        push_rect(&mut out, (0, 0, 100, 100), 10, 10, 20, 20, [1.0, 0.0, 0.0, 1.0]);
+        assert!(out.iter().all(|v| v.layer == 0.0));
     }
 
     /// Not a strict assert (CI timing is flaky) — prints the win.

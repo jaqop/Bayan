@@ -97,8 +97,14 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       + amber tab dot when unfocused), a global quake hotkey (Ctrl+Alt+`
       summons/hides Bayan from anywhere), and full theme colors
       (bg/fg/16-color palette) in ~/.bayan/config.json
-- [ ] **M13 (backlog)** — atlas page growth; damage-based partial redraw;
-      ligatures; a proper toast for finish alerts
+- [x] **M13** — the glyph atlas grows a NEW page (texture-array layer)
+      when one fills, instead of M10's wipe-everything reset — no flash even
+      with big fonts + emoji + Arabic + CJK all live; the GPU texture array
+      is recreated with more layers only on the rare growth. Verified by
+      forcing thousands of distinct glyphs across several pages: page-0
+      Latin/Arabic and page-N CJK render together, uncorrupted, in one call.
+- [ ] **M14 (backlog)** — damage-based partial redraw; ligatures; a native
+      toast for finish alerts
 
 ## Build
 
