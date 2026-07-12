@@ -405,6 +405,24 @@ pub const TAB_CELLS: f32 = 24.0;
 /// A rect in frame pixels: (x, y, w, h).
 pub type Rect = (i32, i32, i32, i32);
 
+/// Every clickable region of the settings panel (draw + hit-test agree).
+pub struct SettingsLayout {
+    pub card: Rect,
+    pub head_h: i32,
+    pub rowh: i32,
+    pub theme_tiles: Vec<Rect>,
+    pub size_label_y: i32,
+    pub size_minus: Rect,
+    pub size_plus: Rect,
+    pub liga_label_y: i32,
+    pub liga_toggle: Rect,
+}
+
+/// Is (px, py) inside a rect?
+pub fn rect_hit((rx, ry, rw, rh): Rect, px: f64, py: f64) -> bool {
+    px >= rx as f64 && px < (rx + rw) as f64 && py >= ry as f64 && py < (ry + rh) as f64
+}
+
 /// One row of the agent cockpit (Ctrl+Shift+D): a tab at a glance.
 pub struct CockpitEntry {
     pub title: String,
@@ -1176,79 +1194,131 @@ impl Renderer {
         self.draw_run(&tag, false, out, whole, 4.0, fh as i32 - 30, 1.0);
     }
 
-    pub fn settings_row_h(&self) -> i32 {
-        (self.cell_h + 14.0) as i32
-    }
-
-    /// The settings panel geometry (shared with the click hit-test).
-    pub fn settings_rect(&self, fw: usize, fh: usize, n: usize) -> Rect {
-        let w = ((self.cell_w * 52.0) as i32).min(fw as i32 - 60);
-        let row_h = self.settings_row_h();
-        let h = row_h + 8 + row_h * n as i32 + 40;
+    /// Geometry of every interactive element in the settings panel, computed
+    /// once and shared by the renderer (draw) and the app (click hit-test) so
+    /// they never disagree.
+    pub fn settings_layout(&self, fw: usize, fh: usize) -> SettingsLayout {
+        let pad = 20;
+        let w = ((self.cell_w * 62.0) as i32).clamp(360, fw as i32 - 60);
+        let rowh = (self.cell_h + 22.0) as i32;
+        let tile_w = ((w - pad * 2 - 6 * 6) / 7).max(30); // 7 theme tiles
+        let tile_h = (self.cell_h * 1.6) as i32;
+        let head_h = (self.cell_h + 26.0) as i32;
+        let h = head_h + tile_h + 16 + rowh * 2 + 44;
         let x = (fw as i32 - w) / 2;
-        let y = (self.tab_bar_h() as i32 + (fh as i32 - h) / 4).max(self.tab_bar_h() as i32 + 8);
-        (x, y, w, h)
-    }
+        let y = (self.tab_bar_h() as i32 + (fh as i32 - h) / 3)
+            .max(self.tab_bar_h() as i32 + 12);
 
-    /// Which settings row a pixel hits (None = outside the rows).
-    pub fn settings_row_at(&self, fw: usize, fh: usize, n: usize, px: f64, py: f64)
-                           -> Option<usize> {
-        let (x, y, w, _h) = self.settings_rect(fw, fh, n);
-        let row_h = self.settings_row_h();
-        let top = y + row_h + 8;
-        if px < x as f64 || px >= (x + w) as f64 || py < top as f64 {
-            return None;
+        let theme_y = y + head_h + 4;
+        let theme_tiles: Vec<Rect> = (0..THEMES.len() as i32)
+            .map(|i| (x + pad + i * (tile_w + 6), theme_y, tile_w, tile_h))
+            .collect();
+
+        // font-size row: label on the right, [−  15  +] on the left
+        let size_y = theme_y + tile_h + 16;
+        let btn = rowh - 8;
+        let size_minus = (x + pad, size_y + 4, btn, btn);
+        let size_plus = (x + pad + btn + 54, size_y + 4, btn, btn);
+
+        // ligatures row: a toggle pill on the left
+        let liga_y = size_y + rowh;
+        let liga_toggle = (x + pad, liga_y + 4, 64, rowh - 10);
+
+        SettingsLayout {
+            card: (x, y, w, h),
+            head_h,
+            rowh,
+            theme_tiles,
+            size_label_y: size_y,
+            size_minus,
+            size_plus,
+            liga_label_y: liga_y,
+            liga_toggle,
         }
-        let r = ((py - top as f64) / row_h as f64) as usize;
-        (r < n).then_some(r)
     }
 
-    /// The in-app settings panel. Each row is (label, value); the selected
-    /// row shows ‹ value › arrows. `swatches` (theme palette) draws under the
-    /// selected row when present, so a colour change previews at a glance.
+    /// A real settings panel: clickable theme tiles (bg + palette dots, the
+    /// active one green-bordered), a −/+ font-size stepper, and a ligatures
+    /// toggle pill. Every control is a hit region in SettingsLayout.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_settings(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
-                         rows: &[(String, String)], sel: usize,
-                         swatches: Option<[(u8, u8, u8); 16]>) {
+                         active_theme: usize, font_size: i32, ligatures: bool) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
-        let (x, y, w, h) = self.settings_rect(fw, fh, rows.len());
-        push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 120));
+        let lay = self.settings_layout(fw, fh);
+        let (x, y, w, h) = lay.card;
+        push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 130));
         push_rect(out, whole, x, y, w, h, c4((0x16, 0x1b, 0x22), 255));
-        push_rect(out, whole, x, y, w, 2, c4((0x2e, 0xa0, 0x43), 255)); // accent
-        let row_h = self.settings_row_h();
+        push_rect(out, whole, x, y, w, 3, c4((0x2e, 0xa0, 0x43), 255)); // accent
+
+        // title (right-aligned)
         let head = [Seg { text: "الإعدادات".into(), fg: self.fg, style: ST_BOLD }];
-        self.draw_run(&head, true, out, whole, (x + 14) as f32, y + 9, 1.0);
-        let top = y + row_h + 8;
-        for (i, (label, value)) in rows.iter().enumerate() {
-            let ry = top + i as i32 * row_h;
-            if i == sel {
-                push_rect(out, whole, x + 4, ry, w - 8, row_h, c4((0x24, 0x2b, 0x36), 255));
+        let hw = self.measure(&head, true);
+        self.draw_run(&head, true, out, whole, (x + w - 20) as f32 - hw, y + 12, 1.0);
+
+        // ---- theme tiles ----
+        let tlbl = [Seg::plain("المظهر", (0x9a, 0xa4, 0xb2))];
+        let tlw = self.measure(&tlbl, true);
+        self.draw_run(&tlbl, true, out, whole,
+                      (x + w - 20) as f32 - tlw, y + lay.head_h - 4, 1.0);
+        for (i, tile) in lay.theme_tiles.iter().enumerate() {
+            let (tx, ty, tw2, th) = *tile;
+            let t = &THEMES[i];
+            push_rect(out, whole, tx, ty, tw2, th, c4(t.bg, 255));
+            // four palette dots as a mini preview
+            let dots = [t.palette[1], t.palette[2], t.palette[4], t.palette[3]];
+            let dw = (tw2 - 8) / 4;
+            for (k, c) in dots.iter().enumerate() {
+                push_rect(out, whole, tx + 4 + k as i32 * dw, ty + th - 8, dw - 2, 4, c4(*c, 255));
             }
-            let fg = if i == sel { self.fg } else { (0xb0, 0xb8, 0xc4) };
-            // label on the right (RTL), value on the left with arrows
-            let lbl = [Seg::plain(label.clone(), fg)];
-            let lw = self.measure(&lbl, true);
-            self.draw_run(&lbl, true, out, whole,
-                          (x + w) as f32 - 16.0 - lw, ry + 6, 1.0);
-            let shown = if i == sel {
-                format!("‹ {value} ›")
+            // border: green + thick for the active theme, faint otherwise
+            let (bc, bt) = if i == active_theme {
+                ((0x2e, 0xa0, 0x43), 2)
             } else {
-                value.clone()
+                ((0x30, 0x36, 0x3d), 1)
             };
-            let vseg = [Seg { text: shown, fg: (0x7e, 0xe7, 0x87), style: ST_BOLD }];
-            self.draw_run(&vseg, false, out, whole, (x + 16) as f32, ry + 6, 1.0);
+            push_rect(out, whole, tx, ty, tw2, bt, c4(bc, 255));
+            push_rect(out, whole, tx, ty + th - bt, tw2, bt, c4(bc, 255));
+            push_rect(out, whole, tx, ty, bt, th, c4(bc, 255));
+            push_rect(out, whole, tx + tw2 - bt, ty, bt, th, c4(bc, 255));
         }
-        // theme swatches strip under the last row
-        if let Some(sw) = swatches {
-            let sy = top + rows.len() as i32 * row_h + 6;
-            let cellw = (w - 28) / 16;
-            for (k, c) in sw.iter().enumerate() {
-                push_rect(out, whole, x + 14 + k as i32 * cellw, sy,
-                          cellw - 2, 12, c4(*c, 255));
-            }
-        }
+
+        // ---- font size stepper ----
+        let slbl = [Seg::plain("حجم الخطّ", (0x9a, 0xa4, 0xb2))];
+        let slw = self.measure(&slbl, true);
+        self.draw_run(&slbl, true, out, whole,
+                      (x + w - 20) as f32 - slw, lay.size_label_y + 6, 1.0);
+        let draw_btn = |r: &mut Self, out: &mut Vec<Vertex>, rect: Rect, label: &str| {
+            let (bx, by, bw, bh) = rect;
+            push_rect(out, whole, bx, by, bw, bh, c4((0x30, 0x36, 0x3d), 255));
+            let seg = [Seg { text: label.into(), fg: r.fg, style: ST_BOLD }];
+            let lw = r.measure(&seg, false);
+            r.draw_run(&seg, false, out, whole,
+                       bx as f32 + (bw as f32 - lw) / 2.0, by + 2, 1.0);
+        };
+        draw_btn(self, out, lay.size_minus, "−");
+        draw_btn(self, out, lay.size_plus, "+");
+        let val = [Seg { text: format!("{font_size}"), fg: (0x7e, 0xe7, 0x87), style: ST_BOLD }];
+        let vw = self.measure(&val, false);
+        let mid = (lay.size_minus.0 + lay.size_minus.2 + lay.size_plus.0) / 2;
+        self.draw_run(&val, false, out, whole, mid as f32 - vw / 2.0,
+                      lay.size_label_y + 6, 1.0);
+
+        // ---- ligatures toggle ----
+        let llbl = [Seg::plain("الأربطة", (0x9a, 0xa4, 0xb2))];
+        let llw = self.measure(&llbl, true);
+        self.draw_run(&llbl, true, out, whole,
+                      (x + w - 20) as f32 - llw, lay.liga_label_y + 6, 1.0);
+        let (gx, gy, gw, gh) = lay.liga_toggle;
+        let track = if ligatures { (0x2e, 0xa0, 0x43) } else { (0x30, 0x36, 0x3d) };
+        push_rect(out, whole, gx, gy, gw, gh, c4(track, 255));
+        let knob = gh - 6;
+        let kx = if ligatures { gx + gw - knob - 3 } else { gx + 3 };
+        push_rect(out, whole, kx, gy + 3, knob, knob, c4((0xff, 0xff, 0xff), 255));
+
         // footer hint
-        let hint = [Seg::plain("↑↓ اختر · ←→ غيّر · Esc حفظ وإغلاق", (0x8a, 0x94, 0xa3))];
-        self.draw_run(&hint, true, out, whole, (x + 14) as f32, y + h - 26, 1.0);
+        let hint = [Seg::plain("انقر للتغيير · Esc للإغلاق والحفظ", (0x8a, 0x94, 0xa3))];
+        let fw2 = self.measure(&hint, true);
+        self.draw_run(&hint, true, out, whole, (x + w - 20) as f32 - fw2, y + h - 28, 1.0);
     }
 
     /// The paste guard (EasyTer's protection): a multi-line/huge paste can
@@ -1631,6 +1701,35 @@ mod cache_tests {
         assert_eq!(a.generation, 0, "no wholesale reset while under the cap");
         // page 0's white texel survived the growth (still opaque white)
         assert_eq!(&a.pages[0][0..4], &[255, 255, 255, 255]);
+    }
+
+    /// The settings panel layout: one clickable tile per theme, distinct
+    /// −/+ and toggle regions, all inside the card and on-screen.
+    #[test]
+    fn settings_layout_places_clickable_controls() {
+        let r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let (fw, fh) = (1400usize, 900usize);
+        let lay = r.settings_layout(fw, fh);
+        assert_eq!(lay.theme_tiles.len(), THEMES.len());
+        let (cx, cy, cw, ch) = lay.card;
+        // the card is centered and fully on-screen
+        assert!(cx > 0 && cy > 0 && cx + cw <= fw as i32 && cy + ch <= fh as i32);
+        // every theme tile is inside the card and non-overlapping (left to right)
+        let mut last_right = 0;
+        for &(tx, ty, tw, th) in &lay.theme_tiles {
+            assert!(tx >= cx && tx + tw <= cx + cw && ty >= cy && ty + th <= cy + ch);
+            assert!(tx >= last_right, "tiles must not overlap");
+            last_right = tx + tw;
+        }
+        // the three action controls are distinct rects
+        assert_ne!(lay.size_minus, lay.size_plus);
+        assert!(rect_hit(lay.size_minus,
+                         (lay.size_minus.0 + 2) as f64, (lay.size_minus.1 + 2) as f64));
+        assert!(rect_hit(lay.liga_toggle,
+                         (lay.liga_toggle.0 + 2) as f64, (lay.liga_toggle.1 + 2) as f64));
+        // a point in the first tile does NOT hit the +/− or toggle
+        let (t0x, t0y, _, _) = lay.theme_tiles[0];
+        assert!(!rect_hit(lay.size_plus, (t0x + 2) as f64, (t0y + 2) as f64));
     }
 
     /// The settings gear button hit-test: a click on it registers, a click

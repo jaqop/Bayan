@@ -372,7 +372,6 @@ struct App {
     modifiers: ModifiersState,
     first_frame: bool,
     first_output: bool,
-    stressed: bool,
     /// last frame's quad bytes — an identical frame skips the GPU submit
     /// (a still terminal stops re-rendering; laptop battery thanks you)
     last_frame: Vec<u8>,
@@ -435,84 +434,88 @@ impl App {
     }
 
     // ---- settings panel ----
-    const SETTINGS_ROWS: usize = 3;
 
-    /// The three settings rows as (label, current value) for the renderer.
-    fn settings_rows(&self) -> Vec<(String, String)> {
-        let theme = self
-            .config
+    /// Index of the active theme (which the panel highlights).
+    fn active_theme(&self) -> usize {
+        self.config
             .theme
-            .clone()
-            .unwrap_or_else(|| render::THEMES[0].name.to_string());
-        let size = self.config.font_size.unwrap_or(15.0);
-        let liga = if self.config.ligatures.unwrap_or(true) { "تشغيل" } else { "إيقاف" };
-        vec![
-            ("المظهر".into(), theme),
-            ("حجم الخطّ".into(), format!("{}", size as i32)),
-            ("الأربطة".into(), liga.to_string()),
-        ]
+            .as_deref()
+            .and_then(|n| render::THEMES.iter().position(|t| t.name == n))
+            .unwrap_or(0)
     }
 
-    /// Palette swatches of the currently selected theme (for the preview strip).
-    fn settings_swatches(&self) -> [(u8, u8, u8); 16] {
-        let name = self.config.theme.as_deref().unwrap_or(render::THEMES[0].name);
-        render::theme_by_name(name)
-            .map(|t| t.palette)
-            .unwrap_or(render::THEMES[0].palette)
-    }
-
-    /// Change the selected setting by `dir` (-1/+1) and apply live.
-    fn settings_change(&mut self, row: usize, dir: i32) {
-        match row {
-            0 => {
-                // cycle themes; copy the chosen theme's colors into config
-                let cur = self
-                    .config
-                    .theme
-                    .as_deref()
-                    .and_then(|n| render::THEMES.iter().position(|t| t.name == n))
-                    .unwrap_or(0);
-                let n = render::THEMES.len() as i32;
-                let idx = ((cur as i32 + dir).rem_euclid(n)) as usize;
-                let t = &render::THEMES[idx];
-                self.config.theme = Some(t.name.to_string());
-                self.config.bg = Some(hex(t.bg));
-                self.config.fg = Some(hex(t.fg));
-                self.config.palette = Some(t.palette.iter().map(|&c| hex(c)).collect());
-            }
-            1 => {
-                let s = (self.config.font_size.unwrap_or(15.0) + dir as f32).clamp(8.0, 40.0);
-                self.config.font_size = Some(s);
-            }
-            2 => {
-                let v = !self.config.ligatures.unwrap_or(true);
-                self.config.ligatures = Some(v);
-            }
-            _ => {}
+    /// Apply theme `idx` (copy its colors into the config), live.
+    fn apply_theme(&mut self, idx: usize) {
+        if let Some(t) = render::THEMES.get(idx) {
+            self.config.theme = Some(t.name.to_string());
+            self.config.bg = Some(hex(t.bg));
+            self.config.fg = Some(hex(t.fg));
+            self.config.palette = Some(t.palette.iter().map(|&c| hex(c)).collect());
+            self.rebuild_renderer();
+            self.request_redraw();
         }
-        self.rebuild_renderer(); // live preview
+    }
+
+    fn change_font_size(&mut self, delta: i32) {
+        let s = (self.config.font_size.unwrap_or(15.0) + delta as f32).clamp(8.0, 40.0);
+        self.config.font_size = Some(s);
+        self.rebuild_renderer();
         self.request_redraw();
     }
 
-    /// Keyboard handling while the settings panel is open.
+    fn toggle_ligatures(&mut self) {
+        let v = !self.config.ligatures.unwrap_or(true);
+        self.config.ligatures = Some(v);
+        self.rebuild_renderer();
+        self.request_redraw();
+    }
+
+    fn close_settings(&mut self) {
+        self.settings = None;
+        config::save(&self.config); // persist on close
+        self.request_redraw();
+    }
+
+    /// A click at (px, py) while the settings panel is open: apply the
+    /// control it hit, or close if the click was outside the card.
+    fn settings_click(&mut self, px: f64, py: f64) {
+        let Some((fw, fh)) = self.window.as_ref().map(|w| {
+            let s = w.inner_size();
+            (s.width as usize, s.height as usize)
+        }) else {
+            return;
+        };
+        let Some(lay) = self.renderer.as_ref().map(|r| r.settings_layout(fw, fh)) else {
+            return;
+        };
+        if !render::rect_hit(lay.card, px, py) {
+            self.close_settings();
+            return;
+        }
+        if let Some(i) = lay.theme_tiles.iter().position(|&t| render::rect_hit(t, px, py)) {
+            self.apply_theme(i);
+        } else if render::rect_hit(lay.size_minus, px, py) {
+            self.change_font_size(-1);
+        } else if render::rect_hit(lay.size_plus, px, py) {
+            self.change_font_size(1);
+        } else if render::rect_hit(lay.liga_toggle, px, py) {
+            self.toggle_ligatures();
+        }
+    }
+
+    /// Keyboard while the settings panel is open: Esc/Enter closes, arrows
+    /// nudge the font size (a convenience; the panel is click-first).
     fn settings_input(&mut self, event: &KeyEvent) {
-        let Some(sel) = self.settings else { return };
         match &event.logical_key {
-            Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter) => {
-                self.settings = None;
-                config::save(&self.config); // persist on close
+            Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter) => self.close_settings(),
+            Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::ArrowUp) => {
+                self.change_font_size(1)
             }
-            Key::Named(NamedKey::ArrowUp) => {
-                self.settings = Some(sel.saturating_sub(1));
+            Key::Named(NamedKey::ArrowLeft) | Key::Named(NamedKey::ArrowDown) => {
+                self.change_font_size(-1)
             }
-            Key::Named(NamedKey::ArrowDown) => {
-                self.settings = Some((sel + 1).min(Self::SETTINGS_ROWS - 1));
-            }
-            Key::Named(NamedKey::ArrowRight) => self.settings_change(sel, 1),
-            Key::Named(NamedKey::ArrowLeft) => self.settings_change(sel, -1),
             _ => {}
         }
-        self.request_redraw();
     }
 
     /// Cockpit row under the pointer (needs renderer + tab count).
@@ -1094,12 +1097,10 @@ impl App {
         } else {
             Vec::new()
         };
-        let settings_state = self.settings;
-        let (settings_rows, settings_swatches) = if settings_state.is_some() {
-            (self.settings_rows(), self.settings_swatches())
-        } else {
-            (Vec::new(), [(0, 0, 0); 16])
-        };
+        let settings_open = self.settings.is_some();
+        let settings_theme = self.active_theme();
+        let settings_size = self.config.font_size.unwrap_or(15.0) as i32;
+        let settings_liga = self.config.ligatures.unwrap_or(true);
         let rects = self.pane_rects();
         let tab_infos: Vec<render::TabInfo> = self
             .tabs
@@ -1181,14 +1182,14 @@ impl App {
                         self.cockpit_sel,
                     );
                 }
-                if let Some(sel) = settings_state {
+                if settings_open {
                     renderer.draw_settings(
                         &mut verts,
                         px.width as usize,
                         px.height as usize,
-                        &settings_rows,
-                        sel,
-                        Some(settings_swatches),
+                        settings_theme,
+                        settings_size,
+                        settings_liga,
                     );
                 }
                 if let Some(p) = &self.pending_paste {
@@ -1300,6 +1301,14 @@ impl ApplicationHandler<UserEvent> for App {
         }
         if std::env::var_os("BAYAN_SETTINGS").is_some() {
             self.settings = Some(0);
+        }
+        // BAYAN_PICK_THEME=<n>: open settings and apply theme n, so a click's
+        // live effect can be verified in a screenshot without input injection
+        if let Some(v) = std::env::var_os("BAYAN_PICK_THEME") {
+            self.settings = Some(0);
+            if let Some(n) = v.to_str().and_then(|s| s.parse::<usize>().ok()) {
+                self.apply_theme(n);
+            }
         }
         crate::prof::mark("session spawned");
         // FontSystem::new scans every installed font — the documented
@@ -1505,25 +1514,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
                 ElementState::Pressed => {
-                    // the settings panel swallows clicks: pick a row, or a
-                    // click outside closes + saves
+                    // the settings panel swallows clicks: apply the control
+                    // hit, or a click outside the card closes + saves
                     if self.settings.is_some() {
-                        let hit = self.renderer.as_ref().zip(self.window.as_ref()).and_then(
-                            |(r, w)| {
-                                let px = w.inner_size();
-                                r.settings_row_at(px.width as usize, px.height as usize,
-                                                  Self::SETTINGS_ROWS,
-                                                  self.cursor_pos.x, self.cursor_pos.y)
-                            },
-                        );
-                        match hit {
-                            Some(row) => self.settings = Some(row),
-                            None => {
-                                self.settings = None;
-                                config::save(&self.config);
-                            }
-                        }
-                        self.request_redraw();
+                        self.settings_click(self.cursor_pos.x, self.cursor_pos.y);
                         return;
                     }
                     // the settings gear button in the tab bar opens settings
@@ -1911,7 +1905,6 @@ fn main() {
         modifiers: ModifiersState::default(),
         first_frame: false,
         first_output: false,
-        stressed: false,
         last_frame: Vec::new(),
         cursor_pos: PhysicalPosition::new(0.0, 0.0),
         mouse_left_down: false,
