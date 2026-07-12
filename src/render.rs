@@ -97,6 +97,12 @@ fn pack((r, g, b): (u8, u8, u8)) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | b as u32
 }
 
+/// The background as a packed pixel — for the instant first frame drawn
+/// before the font system finishes loading.
+pub fn bg_packed() -> u32 {
+    pack(BG)
+}
+
 fn blend(dst: u32, (sr, sg, sb): (u8, u8, u8), a: u32) -> u32 {
     let (dr, dg, db) = ((dst >> 16) & 0xff, (dst >> 8) & 0xff, dst & 0xff);
     let r = (sr as u32 * a + dr * (255 - a)) / 255;
@@ -518,5 +524,34 @@ mod align_tests {
             first_x < 5,
             "RTL line starts at x={first_x}, expected pinned to the left edge"
         );
+    }
+}
+
+#[cfg(test)]
+mod startup_probe {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn measure_startup_costs() {
+        let t0 = Instant::now();
+        let mut fs = FontSystem::new();
+        let t_fontsystem = t0.elapsed();
+        let t1 = Instant::now();
+        fs.db_mut().load_font_data(AMIRI.to_vec());
+        let t_amiri = t1.elapsed();
+        let t2 = Instant::now();
+        let fam = pick_family(fs.db());
+        let t_pick = t2.elapsed();
+        let t3 = Instant::now();
+        let mut b = Buffer::new(&mut fs, Metrics::new(15.0, 21.0));
+        b.set_size(&mut fs, Some(100.0), Some(21.0));
+        b.set_text(&mut fs, "M", Attrs::new().family(Family::Name(&fam)), Shaping::Advanced);
+        b.shape_until_scroll(&mut fs, false);
+        let t_first_shape = t3.elapsed();
+        eprintln!("PROBE FontSystem::new = {:?}", t_fontsystem);
+        eprintln!("PROBE load amiri      = {:?}", t_amiri);
+        eprintln!("PROBE pick_family     = {:?} (faces: {})", t_pick, fs.db().faces().count());
+        eprintln!("PROBE first shape     = {:?}", t_first_shape);
     }
 }

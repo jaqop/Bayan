@@ -11,6 +11,39 @@ mod keys;
 mod render;
 mod term;
 
+/// Startup timeline profiling (EasyTer's `EASYTER_PROFILE` pattern): set
+/// BAYAN_PROFILE=1 and marks land in %TEMP%\bayan_profile.log. Zero cost
+/// when unset; a file because release builds have no console.
+mod prof {
+    use std::io::Write;
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static T0: OnceLock<Instant> = OnceLock::new();
+
+    pub fn init() {
+        T0.get_or_init(Instant::now);
+        if std::env::var_os("BAYAN_PROFILE").is_some() {
+            let _ = std::fs::write(std::env::temp_dir().join("bayan_profile.log"), "");
+        }
+    }
+
+    pub fn mark(label: &str) {
+        if std::env::var_os("BAYAN_PROFILE").is_none() {
+            return;
+        }
+        let t0 = *T0.get_or_init(Instant::now);
+        let line = format!("{:9.1} ms  {}\n", t0.elapsed().as_secs_f64() * 1000.0, label);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::env::temp_dir().join("bayan_profile.log"))
+        {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+}
+
 use std::num::NonZeroU32;
 use std::rc::Rc;
 
@@ -23,12 +56,13 @@ use winit::window::{Window, WindowId};
 
 use term::{Session, TermSize};
 
-#[derive(Debug)]
 pub enum UserEvent {
     /// New PTY output was parsed: repaint.
     Wakeup,
     /// The emulator wants to answer the child (DSR/DA replies TUIs block on).
     PtyWrite(String),
+    /// The font system finished loading on its background thread.
+    RendererReady(Box<render::Renderer>),
     /// The shell exited or the reader thread died.
     Exit,
 }
@@ -41,6 +75,8 @@ struct App {
     session: Option<Session>,
     size: TermSize,
     modifiers: ModifiersState,
+    first_frame: bool,
+    first_output: bool,
 }
 
 impl App {
@@ -53,12 +89,8 @@ impl App {
     }
 
     fn redraw(&mut self) {
-        let (Some(window), Some(surface), Some(renderer), Some(session)) = (
-            self.window.as_ref(),
-            self.surface.as_mut(),
-            self.renderer.as_mut(),
-            self.session.as_ref(),
-        ) else {
+        let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut())
+        else {
             return;
         };
         let px = window.inner_size();
@@ -69,11 +101,19 @@ impl App {
             Ok(b) => b,
             Err(_) => return,
         };
-        {
-            let t = session.term.lock().unwrap();
-            renderer.draw(&mut buffer, px.width as usize, px.height as usize, &t);
+        match (self.renderer.as_mut(), self.session.as_ref()) {
+            (Some(renderer), Some(session)) => {
+                let t = session.term.lock().unwrap();
+                renderer.draw(&mut buffer, px.width as usize, px.height as usize, &t);
+            }
+            // renderer still warming up on its thread: dark frame, instantly
+            _ => buffer.fill(render::bg_packed()),
         }
         let _ = buffer.present();
+        if !self.first_frame {
+            self.first_frame = true;
+            crate::prof::mark("first frame presented");
+        }
     }
 }
 
@@ -86,7 +126,7 @@ impl ApplicationHandler<UserEvent> for App {
             .with_title("Bayan — بيان")
             .with_inner_size(LogicalSize::new(1100.0, 700.0));
         let window = Rc::new(el.create_window(attrs).expect("create window"));
-        self.renderer = Some(render::Renderer::new(window.scale_factor() as f32));
+        crate::prof::mark("window created");
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
         let mut surface =
             softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
@@ -95,15 +135,34 @@ impl ApplicationHandler<UserEvent> for App {
             let _ = surface.resize(w, h);
         }
         self.surface = Some(surface);
-        self.size = self.grid_for(px);
+        self.window = Some(window.clone());
+        // first frame NOW: a dark window on screen beats a frozen launcher.
+        // The shell and the font system warm up behind it, in parallel.
+        self.redraw();
+        // the PTY + conhost + PowerShell chain is the slowest dependency:
+        // start it immediately with a default grid; the exact grid follows
+        // once cell metrics exist (EasyTer starts 110x32 the same way)
         self.session =
             Some(Session::spawn(self.size, self.proxy.clone()).expect("spawn shell"));
-        self.window = Some(window);
+        crate::prof::mark("session spawned");
+        // FontSystem::new scans every installed font — the documented
+        // cosmic-text startup cost (pop-os/cosmic-text#247): keep it off
+        // the UI thread and swap the renderer in when it's ready
+        let proxy = self.proxy.clone();
+        let scale = window.scale_factor() as f32;
+        std::thread::spawn(move || {
+            let r = render::Renderer::new(scale);
+            let _ = proxy.send_event(UserEvent::RendererReady(Box::new(r)));
+        });
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Wakeup => {
+                if !self.first_output {
+                    self.first_output = true;
+                    crate::prof::mark("first pty output");
+                }
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -111,6 +170,21 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::PtyWrite(text) => {
                 if let Some(s) = self.session.as_mut() {
                     s.write(text.as_bytes());
+                }
+            }
+            UserEvent::RendererReady(r) => {
+                crate::prof::mark("renderer ready");
+                self.renderer = Some(*r);
+                if let Some(w) = &self.window {
+                    // now that cell metrics exist, snap the grid to the window
+                    let g = self.grid_for(w.inner_size());
+                    if g != self.size {
+                        self.size = g;
+                        if let Some(s) = self.session.as_mut() {
+                            s.resize(g);
+                        }
+                    }
+                    w.request_redraw();
                 }
             }
             UserEvent::Exit => el.exit(),
@@ -169,10 +243,13 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 fn main() {
+    prof::init();
+    prof::mark("main start");
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
+    prof::mark("event loop built");
     let proxy = event_loop.create_proxy();
     let mut app = App {
         proxy,
@@ -182,6 +259,8 @@ fn main() {
         session: None,
         size: TermSize { cols: 110, rows: 32 },
         modifiers: ModifiersState::default(),
+        first_frame: false,
+        first_output: false,
     };
     event_loop.run_app(&mut app).expect("run event loop");
 }
