@@ -13,6 +13,24 @@ pub struct UserConfig {
     pub font_family: Option<String>,
     /// Base font size in points (default 15).
     pub font_size: Option<f32>,
+    /// Background / foreground as "#rrggbb" (EasyTer's heritage defaults).
+    pub bg: Option<String>,
+    pub fg: Option<String>,
+    /// The 16 ANSI colors as "#rrggbb", normal 0-7 then bright 8-15.
+    pub palette: Option<Vec<String>>,
+}
+
+/// "#rrggbb" (or "rrggbb") -> rgb. None on anything malformed.
+pub fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
+    let h = s.trim().trim_start_matches('#');
+    if h.len() != 6 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((
+        u8::from_str_radix(&h[0..2], 16).ok()?,
+        u8::from_str_radix(&h[2..4], 16).ok()?,
+        u8::from_str_radix(&h[4..6], 16).ok()?,
+    ))
 }
 
 pub fn load() -> UserConfig {
@@ -44,5 +62,14 @@ mod tests {
         assert!(extra.font_size.is_none());
         // garbage must not panic the loader path
         assert!(serde_json::from_str::<UserConfig>("{oops").is_err());
+    }
+
+    #[test]
+    fn hex_colors_parse_strictly() {
+        assert_eq!(parse_hex("#0d1117"), Some((0x0d, 0x11, 0x17)));
+        assert_eq!(parse_hex("FFffFF"), Some((255, 255, 255)));
+        assert_eq!(parse_hex("#fff"), None);
+        assert_eq!(parse_hex("#zzzzzz"), None);
+        assert_eq!(parse_hex(""), None);
     }
 }

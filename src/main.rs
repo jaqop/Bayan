@@ -14,6 +14,11 @@ mod keys;
 mod render;
 mod term;
 
+/// The quake hotkey (Ctrl+Alt+`) fires from ANYWHERE via RegisterHotKey;
+/// winit's msg hook flags it and about_to_wait toggles the window.
+static QUAKE_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const QUAKE_ID: usize = 0xB1AA;
+
 /// The letter a Ctrl+<letter> event represents, resolved the way real
 /// terminals do it: by the PHYSICAL key position first. This is what makes
 /// Ctrl+C/Ctrl+F work on an Arabic keyboard layout, where the F key's
@@ -186,6 +191,8 @@ pub enum UserEvent {
     Cwd(u64, String),
     /// Pane `id` rang the bell (Claude waiting for an approval).
     Bell(u64),
+    /// A command that ran ≥6s in pane `id` just finished (ok?).
+    CommandFinished(u64, bool),
     /// Pane `id`'s shell exited.
     Exit(u64),
 }
@@ -369,6 +376,10 @@ struct App {
     /// the agent cockpit overlay (Ctrl+Shift+D): one glance at every tab
     cockpit: bool,
     cockpit_sel: usize,
+    /// a big paste awaiting Enter/Esc (EasyTer's paste guard)
+    pending_paste: Option<String>,
+    /// window focus (finish notifications only fire when nobody's looking)
+    focused: bool,
     clicks: ClickTracker,
     wheel_accum: f32,
     search: Option<SearchState>,
@@ -898,8 +909,18 @@ impl App {
         if txt.is_empty() {
             return;
         }
+        // EasyTer's paste guard: confirm before a multi-line/huge paste
+        if term::needs_paste_guard(&txt).is_some() {
+            self.pending_paste = Some(txt);
+            self.request_redraw();
+            return;
+        }
+        self.send_paste(&txt);
+    }
+
+    fn send_paste(&mut self, txt: &str) {
         let bracketed = self.term_mode().contains(TermMode::BRACKETED_PASTE);
-        let body = term::normalize_paste(&txt, bracketed);
+        let body = term::normalize_paste(txt, bracketed);
         if let Some(s) = self.session_mut() {
             s.write(body.as_bytes());
         }
@@ -1059,6 +1080,17 @@ impl App {
                         self.cockpit_sel,
                     );
                 }
+                if let Some(p) = &self.pending_paste {
+                    if let Some((lines, chars)) = term::needs_paste_guard(p) {
+                        renderer.draw_paste_guard(
+                            &mut verts,
+                            px.width as usize,
+                            px.height as usize,
+                            lines,
+                            chars,
+                        );
+                    }
+                }
             }
             // renderer still warming up on its thread: clear-only dark frame
             _ => {}
@@ -1076,7 +1108,8 @@ impl App {
             heal = renderer.atlas.generation != self.atlas_generation;
             self.atlas_generation = renderer.atlas.generation;
         }
-        gpu.render(&verts, render::BG);
+        let bg = self.renderer.as_ref().map_or(render::BG, |r| r.bg);
+        gpu.render(&verts, bg);
         if heal {
             window.request_redraw();
         }
@@ -1124,11 +1157,27 @@ impl ApplicationHandler<UserEvent> for App {
             self.cockpit = true;
             self.cockpit_sel = self.active;
         }
+        if std::env::var_os("BAYAN_GUARD").is_some() {
+            self.pending_paste = Some("echo one\necho two\necho three\n".into());
+        }
         crate::prof::mark("session spawned");
         // FontSystem::new scans every installed font — the documented
         // cosmic-text startup cost (pop-os/cosmic-text#247): keep it off
         // the UI thread and swap the renderer in when it's ready
         self.rebuild_renderer();
+        // the quake hotkey (Ctrl+Alt+`): a null-hwnd registration posts
+        // WM_HOTKEY to this thread's queue, where the msg hook catches it
+        unsafe {
+            use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+                RegisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, VK_OEM_3,
+            };
+            RegisterHotKey(
+                std::ptr::null_mut(),
+                QUAKE_ID as i32,
+                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
+                VK_OEM_3 as u32,
+            );
+        }
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
@@ -1154,6 +1203,21 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some((ti, _)) = self.find_pane(id) {
                     if ti != self.active {
                         self.tabs[ti].attention = true;
+                        self.request_redraw();
+                    }
+                }
+            }
+            UserEvent::CommandFinished(id, _ok) => {
+                // a long command ended while nobody was looking: flash the
+                // taskbar (native, no toast plumbing) + the amber tab dot
+                if let Some((ti, _)) = self.find_pane(id) {
+                    if !self.focused || ti != self.active {
+                        self.tabs[ti].attention = true;
+                        if let Some(w) = &self.window {
+                            w.request_user_attention(Some(
+                                winit::window::UserAttentionType::Informational,
+                            ));
+                        }
                         self.request_redraw();
                     }
                 }
@@ -1194,6 +1258,18 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // quake toggle: summon Bayan from anywhere / tuck it away again
+        if QUAKE_HIT.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            if let Some(w) = &self.window {
+                if self.focused && w.is_visible().unwrap_or(true) {
+                    w.set_visible(false);
+                } else {
+                    w.set_visible(true);
+                    w.set_minimized(false);
+                    w.focus_window();
+                }
+            }
+        }
         // busy dots decay after ~2s of quiet: keep repainting on a slow
         // heartbeat only while any background tab is (or just was) active
         let any_busy = self
@@ -1216,6 +1292,23 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => {
                 self.save_state(); // tabs + cwds greet you tomorrow
                 el.exit();
+            }
+            WindowEvent::Focused(f) => {
+                self.focused = f;
+                if f {
+                    // you're here now: the active tab's attention is served
+                    if let Some(t) = self.tabs.get_mut(self.active) {
+                        t.attention = false;
+                    }
+                    self.request_redraw();
+                }
+            }
+            WindowEvent::DroppedFile(path) => {
+                // a dropped file lands at the prompt as a shell-ready path
+                let arg = term::dropped_path_arg(&path);
+                if let Some(s) = self.session_mut() {
+                    s.write(arg.as_bytes());
+                }
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::ScaleFactorChanged { .. } => {
@@ -1383,6 +1476,20 @@ impl ApplicationHandler<UserEvent> for App {
                     "key {:?} text={:?} ctrl={ctrl} shift={shift}",
                     event.logical_key, event.text
                 ));
+                // a pending paste owns the keyboard: Enter sends, Esc drops
+                if self.pending_paste.is_some() {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Enter) => {
+                            if let Some(txt) = self.pending_paste.take() {
+                                self.send_paste(&txt);
+                            }
+                        }
+                        Key::Named(NamedKey::Escape) => self.pending_paste = None,
+                        _ => {}
+                    }
+                    self.request_redraw();
+                    return;
+                }
                 // the cockpit owns the keyboard while open
                 if self.cockpit {
                     self.cockpit_input(&event);
@@ -1584,7 +1691,17 @@ impl ApplicationHandler<UserEvent> for App {
 fn main() {
     prof::init();
     prof::mark("main start");
+    use winit::platform::windows::EventLoopBuilderExtWindows;
     let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .with_msg_hook(|msg| {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_HOTKEY};
+            let m = unsafe { &*(msg as *const MSG) };
+            if m.message == WM_HOTKEY && m.wParam == QUAKE_ID {
+                QUAKE_HIT.store(true, std::sync::atomic::Ordering::Relaxed);
+                return true; // consumed
+            }
+            false
+        })
         .build()
         .expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -1608,6 +1725,8 @@ fn main() {
         drag_divider: None,
         cockpit: false,
         cockpit_sel: 0,
+        pending_paste: None,
+        focused: true,
         clicks: ClickTracker::new(),
         wheel_accum: 0.0,
         search: None,

@@ -57,6 +57,8 @@ pub struct SessionMeta {
     /// history lines evicted past the scrollback cap (+ ED3-cleared lines):
     /// keeps mark positions anchored to content forever
     pub evicted: u64,
+    /// when the running command was submitted — feeds the finish notification
+    pub cmd_started: Option<std::time::Instant>,
 }
 
 /// Events one PTY chunk produced, delivered to the UI thread by the reader.
@@ -64,7 +66,12 @@ pub struct SessionMeta {
 pub(crate) struct ChunkEvents {
     pub clipboard: Option<String>,
     pub cwd: Option<String>,
+    /// a LONG command just ended (ok?) — worth a notification if unfocused
+    pub finished: Option<bool>,
 }
+
+/// Commands shorter than this end silently (EasyTer's threshold).
+const NOTIFY_AFTER: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// Where an incomplete trailing escape sequence starts (carried to the next
 /// read so scanners never see a split marker), or data.len() if none.
@@ -197,6 +204,7 @@ fn handle_osc133<T: EventListener>(
     meta: &mut SessionMeta,
     kind: u8,
     exit: Option<i32>,
+    ev: &mut ChunkEvents,
 ) {
     match kind {
         b'A' => {
@@ -215,6 +223,12 @@ fn handle_osc133<T: EventListener>(
             meta.running_cmd.clear();
             if let Some(m) = meta.marks.last_mut() {
                 m.exit = exit;
+            }
+            // a long-running command finished: notify if nobody's watching
+            if let Some(t0) = meta.cmd_started.take() {
+                if t0.elapsed() >= NOTIFY_AFTER {
+                    ev.finished = Some(exit.unwrap_or(0) == 0);
+                }
             }
         }
         b'B' => {
@@ -291,7 +305,7 @@ pub(crate) fn process_chunk<T: EventListener>(
     let mut pos = 0;
     for (s, e, kind, exit) in find_osc133(&buf) {
         feed_counted(parser, t, meta, &buf[pos..s]);
-        handle_osc133(t, meta, kind, exit);
+        handle_osc133(t, meta, kind, exit, &mut ev);
         pos = e;
     }
     feed_counted(parser, t, meta, &buf[pos..]);
@@ -321,6 +335,7 @@ pub(crate) fn capture_command_core<T: EventListener>(t: &Term<T>, meta: &mut Ses
     let s = s.trim();
     if !s.is_empty() {
         meta.running_cmd = s.to_string();
+        meta.cmd_started = Some(std::time::Instant::now());
     }
 }
 
@@ -506,6 +521,9 @@ impl Session {
                         if let Some(cwd) = ev.cwd {
                             let _ = proxy.send_event(UserEvent::Cwd(id, cwd));
                         }
+                        if let Some(ok) = ev.finished {
+                            let _ = proxy.send_event(UserEvent::CommandFinished(id, ok));
+                        }
                         if proxy.send_event(UserEvent::Wakeup(id)).is_err() {
                             break; // the event loop is gone
                         }
@@ -552,6 +570,29 @@ impl Session {
     }
 }
 
+/// Multi-line / huge pastes can execute commands on arrival (EasyTer's paste
+/// protection, tightened: even a single trailing newline auto-runs the line,
+/// so ANY newline asks first): Some((lines, chars)) when confirmation is due.
+pub fn needs_paste_guard(text: &str) -> Option<(usize, usize)> {
+    if text.contains('\n') || text.len() > 2000 {
+        let lines = text.matches('\n').count() + usize::from(!text.ends_with('\n'));
+        Some((lines, text.chars().count()))
+    } else {
+        None
+    }
+}
+
+/// A file dropped onto a pane becomes its shell-ready path (EasyTer's rule:
+/// backslashes, quoted when it contains whitespace) plus a trailing space.
+pub fn dropped_path_arg(path: &std::path::Path) -> String {
+    let p = path.to_string_lossy().replace('/', "\\");
+    if p.contains(' ') || p.contains('\t') {
+        format!("\"{}\" ", p.replace('"', "\\\""))
+    } else {
+        format!("{p} ")
+    }
+}
+
 /// Prepare clipboard text for the PTY: newlines become carriage returns, and
 /// under bracketed paste the payload is wrapped — with any embedded end
 /// marker stripped so pasted content can't terminate paste mode early and
@@ -589,6 +630,29 @@ mod tests {
         assert_eq!(
             normalize_paste("safe\x1b[201~evil\n", true),
             "\x1b[200~safeevil\r\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn paste_guard_triggers_on_danger_only() {
+        assert_eq!(needs_paste_guard("ls -la"), None);
+        assert_eq!(needs_paste_guard("line1\nline2"), Some((2, 11)));
+        // a single trailing newline still counts as multi-line intent
+        assert_eq!(needs_paste_guard("rm -rf x\n").map(|g| g.0), Some(1));
+        let huge = "x".repeat(3000);
+        assert_eq!(needs_paste_guard(&huge).map(|g| g.0), Some(1));
+    }
+
+    #[test]
+    fn dropped_paths_are_shell_ready() {
+        use std::path::Path;
+        assert_eq!(
+            dropped_path_arg(Path::new(r"C:\tools\app.exe")),
+            r"C:\tools\app.exe "
+        );
+        assert_eq!(
+            dropped_path_arg(Path::new(r"C:\My Files\doc.txt")),
+            "\"C:\\My Files\\doc.txt\" "
         );
     }
 

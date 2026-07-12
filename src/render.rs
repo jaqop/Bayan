@@ -52,52 +52,7 @@ const PALETTE: [(u8, u8, u8); 16] = [
     (0xff, 0xff, 0xff), // bright white
 ];
 
-fn named_rgb(name: NamedColor) -> (u8, u8, u8) {
-    use NamedColor::*;
-    match name {
-        Black | DimBlack => PALETTE[0],
-        Red | DimRed => PALETTE[1],
-        Green | DimGreen => PALETTE[2],
-        Yellow | DimYellow => PALETTE[3],
-        Blue | DimBlue => PALETTE[4],
-        Magenta | DimMagenta => PALETTE[5],
-        Cyan | DimCyan => PALETTE[6],
-        White | DimWhite => PALETTE[7],
-        BrightBlack => PALETTE[8],
-        BrightRed => PALETTE[9],
-        BrightGreen => PALETTE[10],
-        BrightYellow => PALETTE[11],
-        BrightBlue => PALETTE[12],
-        BrightMagenta => PALETTE[13],
-        BrightCyan => PALETTE[14],
-        BrightWhite => PALETTE[15],
-        Background => BG,
-        _ => FG, // Foreground / BrightForeground / DimForeground / Cursor
-    }
-}
-
-fn indexed_rgb(i: u8) -> (u8, u8, u8) {
-    match i {
-        0..=15 => PALETTE[i as usize],
-        16..=231 => {
-            let n = i - 16;
-            let f = |c: u8| if c == 0 { 0 } else { 55 + 40 * c };
-            (f(n / 36), f((n % 36) / 6), f(n % 6))
-        }
-        _ => {
-            let v = 8 + 10 * (i - 232);
-            (v, v, v)
-        }
-    }
-}
-
-pub fn ansi_rgb(color: AnsiColor) -> (u8, u8, u8) {
-    match color {
-        AnsiColor::Named(n) => named_rgb(n),
-        AnsiColor::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
-        AnsiColor::Indexed(i) => indexed_rgb(i),
-    }
-}
+// (color resolution lives on Renderer: bg/fg/palette are config-themable)
 
 /// Straight-alpha color for the quad batch.
 fn c4((r, g, b): (u8, u8, u8), a: u8) -> [f32; 4] {
@@ -291,7 +246,7 @@ impl Atlas {
 #[allow(clippy::too_many_arguments)]
 fn push_shaped(out: &mut Vec<Vertex>, fs: &mut FontSystem, swash: &mut SwashCache,
                atlas: &mut Atlas, buf: &Buffer, clip: Rect,
-               x_off: f32, y_off: i32, scale: f32) {
+               x_off: f32, y_off: i32, scale: f32, default_fg: (u8, u8, u8)) {
     for run in buf.layout_runs() {
         for glyph in run.glyphs.iter() {
             let phys = glyph.physical((0.0, 0.0), 1.0);
@@ -304,7 +259,7 @@ fn push_shaped(out: &mut Vec<Vertex>, fs: &mut FontSystem, swash: &mut SwashCach
                 glyph
                     .color_opt
                     .map(|c| c4((c.r(), c.g(), c.b()), c.a()))
-                    .unwrap_or_else(|| c4(FG, 255))
+                    .unwrap_or_else(|| c4(default_fg, 255))
             };
             let gx = x_off + (phys.x as f32 + e.left as f32) * scale;
             let gy = y_off as f32 + run.line_y + phys.y as f32 - e.top as f32;
@@ -478,6 +433,10 @@ pub struct Renderer {
     cache_cold: std::collections::HashMap<RunKey, ShapedRun>,
     pub atlas: Atlas,
     family: String,
+    // theme (config-overridable; defaults are EasyTer's heritage colors)
+    pub bg: (u8, u8, u8),
+    fg: (u8, u8, u8),
+    palette: [(u8, u8, u8); 16],
     pub cell_w: f32,
     pub cell_h: f32,
 }
@@ -509,6 +468,14 @@ impl Renderer {
             .map(|r| r.line_w)
             .filter(|w| *w > 1.0)
             .unwrap_or(size * 0.6);
+        let mut palette = PALETTE;
+        if let Some(p) = &cfg.palette {
+            for (slot, hex) in palette.iter_mut().zip(p.iter()) {
+                if let Some(c) = crate::config::parse_hex(hex) {
+                    *slot = c;
+                }
+            }
+        }
         Self {
             font_system,
             cache: SwashCache::new(),
@@ -517,8 +484,54 @@ impl Renderer {
             cache_cold: std::collections::HashMap::new(),
             atlas: Atlas::new(),
             family,
+            bg: cfg.bg.as_deref().and_then(crate::config::parse_hex).unwrap_or(BG),
+            fg: cfg.fg.as_deref().and_then(crate::config::parse_hex).unwrap_or(FG),
+            palette,
             cell_w,
             cell_h: metrics.line_height,
+        }
+    }
+
+    fn named_rgb(&self, name: NamedColor) -> (u8, u8, u8) {
+        use NamedColor::*;
+        match name {
+            Black | DimBlack => self.palette[0],
+            Red | DimRed => self.palette[1],
+            Green | DimGreen => self.palette[2],
+            Yellow | DimYellow => self.palette[3],
+            Blue | DimBlue => self.palette[4],
+            Magenta | DimMagenta => self.palette[5],
+            Cyan | DimCyan => self.palette[6],
+            White | DimWhite => self.palette[7],
+            BrightBlack => self.palette[8],
+            BrightRed => self.palette[9],
+            BrightGreen => self.palette[10],
+            BrightYellow => self.palette[11],
+            BrightBlue => self.palette[12],
+            BrightMagenta => self.palette[13],
+            BrightCyan => self.palette[14],
+            BrightWhite => self.palette[15],
+            Background => self.bg,
+            _ => self.fg, // Foreground / BrightForeground / DimForeground
+        }
+    }
+
+    fn ansi_rgb(&self, color: AnsiColor) -> (u8, u8, u8) {
+        match color {
+            AnsiColor::Named(n) => self.named_rgb(n),
+            AnsiColor::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
+            AnsiColor::Indexed(i) => match i {
+                0..=15 => self.palette[i as usize],
+                16..=231 => {
+                    let n = i - 16;
+                    let f = |c: u8| if c == 0 { 0 } else { 55 + 40 * c };
+                    (f(n / 36), f((n % 36) / 6), f(n % 6))
+                }
+                _ => {
+                    let v = 8 + 10 * (i - 232);
+                    (v, v, v)
+                }
+            },
         }
     }
 
@@ -587,9 +600,9 @@ impl Renderer {
                 out: &mut Vec<Vertex>, clip: Rect,
                 x: f32, y: i32, scale: f32) -> f32 {
         let key = self.ensure_shaped(segs, align_left);
-        let Renderer { cache_hot, font_system, cache, atlas, .. } = self;
+        let Renderer { cache_hot, font_system, cache, atlas, fg, .. } = self;
         let run = &cache_hot[&key];
-        push_shaped(out, font_system, cache, atlas, &run.buffer, clip, x, y, scale);
+        push_shaped(out, font_system, cache, atlas, &run.buffer, clip, x, y, scale, *fg);
         run.natw
     }
 
@@ -631,7 +644,7 @@ impl Renderer {
         if claude {
             let full: String = segs.iter().map(|s| s.text.as_str()).collect();
             if let Some(fixed) = crate::bidi::restore_bidi_line(&full) {
-                segs = vec![Seg::plain(fixed, FG)];
+                segs = vec![Seg::plain(fixed, self.fg)];
                 cur_bytes = None;
             }
         }
@@ -779,8 +792,8 @@ impl Renderer {
             }
             let col = cell.point.column.0;
             let w = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
-            let mut fg = ansi_rgb(cell.fg);
-            let mut bg = ansi_rgb(cell.bg);
+            let mut fg = self.ansi_rgb(cell.fg);
+            let mut bg = self.ansi_rgb(cell.bg);
             if cell.flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
             }
@@ -809,7 +822,7 @@ impl Renderer {
                 fg = (fg.0 * 2 / 3, fg.1 * 2 / 3, fg.2 * 2 / 3);
             }
             let ch = if cell.flags.intersects(Flags::HIDDEN) { ' ' } else { cell.c };
-            if bg != BG {
+            if bg != self.bg {
                 let x0 = px + (col as f32 * self.cell_w).round() as i32;
                 let x1 = px + ((col + w) as f32 * self.cell_w).round() as i32;
                 let y0 = py + (li as f32 * self.cell_h).round() as i32;
@@ -872,7 +885,7 @@ impl Renderer {
             ));
             let y0 = py + (cursor_vrow as f32 * self.cell_h).round() as i32;
             push_rect(out, clip, x0, y0, wpx, self.cell_h.round() as i32,
-                      c4(FG, 170));
+                      c4(self.fg, 170));
         }
 
         // command-block lights in the pane's left gutter (EasyTer's bars)
@@ -895,7 +908,7 @@ impl Renderer {
         if off > 0 && history > 0 {
             let th = ((ph as f32 * rows as f32 / (history + rows) as f32) as i32).max(24);
             let ty = py + ((ph - th) as f32 * (1.0 - off as f32 / history as f32)) as i32;
-            push_rect(out, clip, px + pw - 7, ty, 4, th, c4(FG, 70));
+            push_rect(out, clip, px + pw - 7, ty, 4, th, c4(self.fg, 70));
         }
 
         // pane border when split: green marks the focused pane (EasyTer)
@@ -951,7 +964,7 @@ impl Renderer {
         push_rect(out, whole, x, y, w, 2, c4((0x2e, 0xa0, 0x43), 255)); // accent
         let row_h = self.cockpit_row_h();
         // header (bold — and a live proof the style pipeline works)
-        let head = [Seg { text: "مقصورة الوكلاء".into(), fg: FG, style: ST_BOLD }];
+        let head = [Seg { text: "مقصورة الوكلاء".into(), fg: self.fg, style: ST_BOLD }];
         self.draw_run(&head, true, out, whole, (x + 14) as f32, y + 8, 1.0);
         let rows_top = y + row_h + 6;
         for (i, e) in entries.iter().enumerate() {
@@ -969,7 +982,7 @@ impl Renderer {
             };
             let d = 8;
             push_rect(out, whole, x + 14, ry + row_h / 2 - d / 2, d, d, c4(dot, 255));
-            let fg = if e.active { FG } else { (0xb0, 0xb8, 0xc4) };
+            let fg = if e.active { self.fg } else { (0xb0, 0xb8, 0xc4) };
             let mark = if e.active { "● " } else { "" };
             let title: String = e.title.chars().take(22).collect();
             let status: String = e.status.chars().take(48).collect();
@@ -980,6 +993,29 @@ impl Renderer {
             ];
             self.draw_run(&segs, true, out, whole, (x + 32) as f32, ry + 6, 1.0);
         }
+    }
+
+    /// The paste guard (EasyTer's protection): a multi-line/huge paste can
+    /// execute commands on arrival — confirm before sending it to the shell.
+    pub fn draw_paste_guard(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
+                            lines: usize, chars: usize) {
+        let whole: Rect = (0, 0, fw as i32, fh as i32);
+        push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 110));
+        let w = ((self.cell_w * 56.0) as i32).min(fw as i32 - 60);
+        let h = (self.cell_h * 2.0 + 24.0) as i32;
+        let x = (fw as i32 - w) / 2;
+        let y = self.tab_bar_h() as i32 + (fh as i32 - h) / 4;
+        push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 255));
+        push_rect(out, whole, x, y, w, 2, c4((0xf2, 0xcc, 0x60), 255)); // warn accent
+        let l1 = [Seg {
+            text: format!("لصق {lines} سطراً ({chars} حرفاً)؟ اللصق متعدد الأسطر قد ينفّذ أوامر فوراً."),
+            fg: self.fg,
+            style: ST_BOLD,
+        }];
+        self.draw_run(&l1, true, out, whole, (x + 14) as f32, y + 8, 1.0);
+        let l2 = [Seg::plain("Enter تأكيد   ·   Esc إلغاء", (0x9a, 0xa4, 0xb2))];
+        self.draw_run(&l2, true, out, whole, (x + 14) as f32,
+                      y + 12 + self.cell_h as i32, 1.0);
     }
 
     /// Window-level chrome: tab bar, search bar, Claude badge.
@@ -1013,7 +1049,7 @@ impl Renderer {
             push_rect(out, whole, bx, by, bar_w, bar_h, c4((0x1c, 0x21, 0x28), 255));
             push_rect(out, whole, bx, by + bar_h - 2, bar_w, 2,
                       c4(PALETTE[11], 200)); // amber underline = search accent
-            let segs = [Seg::plain(format!("بحث: {q}_"), FG)];
+            let segs = [Seg::plain(format!("بحث: {q}_"), self.fg)];
             self.draw_run(&segs, true, out, whole, (bx + 8) as f32, by + 5, 1.0);
         }
 
@@ -1023,7 +1059,7 @@ impl Renderer {
         for (i, tab) in tabs.iter().enumerate() {
             let x0 = i as i32 * tw;
             let (bg, fg): ((u8, u8, u8), (u8, u8, u8)) = if tab.active {
-                ((0x24, 0x2b, 0x36), FG)
+                ((0x24, 0x2b, 0x36), self.fg)
             } else {
                 ((0x16, 0x1b, 0x22), (0x8a, 0x94, 0xa3))
             };

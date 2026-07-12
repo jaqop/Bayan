@@ -91,9 +91,14 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       Bold bundled), italic, underline, strikethrough, dim, hidden, all
       through the shaping cache and quad pipeline; atlas resets now
       self-heal with one scheduled redraw
-- [ ] **M12 (backlog)** — paste guard (multi-line confirm), drag & drop
-      file paths, finished-command notifications, quake hotkey, theme
-      colors in config — the EasyTer parity tail
+- [x] **M12** — the EasyTer parity tail: paste guard (a confirm card before
+      any multi-line/huge paste — Enter sends, Esc drops), drag & drop file
+      paths (quoted, shell-ready), long-command finish alerts (taskbar flash
+      + amber tab dot when unfocused), a global quake hotkey (Ctrl+Alt+`
+      summons/hides Bayan from anywhere), and full theme colors
+      (bg/fg/16-color palette) in ~/.bayan/config.json
+- [ ] **M13 (backlog)** — atlas page growth; damage-based partial redraw;
+      ligatures; a proper toast for finish alerts
 
 ## Build
 
