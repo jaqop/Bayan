@@ -186,6 +186,7 @@ dependencies = [
  "cosmic-text",
  "pollster",
  "portable-pty",
+ "rustybuzz",
  "serde",
  "serde_json",
  "wgpu",

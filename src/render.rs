@@ -661,11 +661,40 @@ impl Seg {
     }
 }
 
+/// One glyph of a rustybuzz-shaped ASCII run: an atlas key plus its pen
+/// position (relative to the run start / the baseline).
+struct DirectGlyph {
+    key: cosmic_text::CacheKey,
+    x: f32,
+    y: f32,
+    color: (u8, u8, u8),
+}
+
+/// How a cached run was shaped.
+enum RunLayout {
+    /// cosmic-text Buffer: Arabic/BiDi, styled UI text, fallback chains
+    Cosmic(Buffer),
+    /// rustybuzz with the font's default features (calt/liga fire): the
+    /// M18 path that finally forms -> => != on the grid
+    Direct(Vec<DirectGlyph>),
+}
+
 /// One shaped run, cached: shaping is the paint loop's dominant cost, and a
 /// terminal redraws the same lines almost every frame.
 struct ShapedRun {
-    buffer: Buffer,
+    layout: RunLayout,
     natw: f32,
+}
+
+impl ShapedRun {
+    /// The cosmic Buffer, when this run has one (the BiDi cursor mapping
+    /// needs it; Direct runs are ASCII and never asked for it).
+    fn buffer(&self) -> Option<&Buffer> {
+        match &self.layout {
+            RunLayout::Cosmic(b) => Some(b),
+            RunLayout::Direct(_) => None,
+        }
+    }
 }
 
 /// Cache key: the exact rich-text content (text + color + style) + alignment.
@@ -694,6 +723,12 @@ pub struct Renderer {
     /// hide-tab-bar-with-one-tab, resolved per frame by the app (the
     /// renderer can't know the tab count)
     bar_hidden: bool,
+    /// cosmic-text's baseline for this font+size (from the startup probe):
+    /// the Direct path must sit its glyphs on the exact same line
+    baseline: f32,
+    /// style-quadrant faces for the rustybuzz path:
+    /// [regular, bold, italic, bold-italic] (None = quadrant not installed)
+    direct_faces: [Option<cosmic_text::fontdb::ID>; 4],
     pub cell_w: f32,
     pub cell_h: f32,
 }
@@ -726,6 +761,32 @@ impl Renderer {
             .map(|r| r.line_w)
             .filter(|w| *w > 1.0)
             .unwrap_or(size * 0.6);
+        // the probe also yields cosmic's baseline — the Direct (rustybuzz)
+        // path reuses it so both shapers draw on the identical line
+        let baseline = probe
+            .layout_runs()
+            .next()
+            .map(|r| r.line_y)
+            .unwrap_or(size * 0.8);
+        // resolve the four style-quadrant faces the Direct path shapes with
+        let direct_faces = {
+            use cosmic_text::fontdb::{Family as DbFamily, Query, Style as DbStyle,
+                                      Weight as DbWeight};
+            let q = |weight, style| {
+                font_system.db().query(&Query {
+                    families: &[DbFamily::Name(&family)],
+                    weight,
+                    stretch: Default::default(),
+                    style,
+                })
+            };
+            [
+                q(DbWeight::NORMAL, DbStyle::Normal),
+                q(DbWeight::BOLD, DbStyle::Normal),
+                q(DbWeight::NORMAL, DbStyle::Italic),
+                q(DbWeight::BOLD, DbStyle::Italic),
+            ]
+        };
         // start from a named theme (if any), then let explicit config
         // bg/fg/palette override individual colors on top of it
         let theme = cfg.theme.as_deref().and_then(theme_by_name);
@@ -759,6 +820,8 @@ impl Renderer {
             palette,
             ligatures,
             bar_hidden: false,
+            baseline,
+            direct_faces,
             cell_w,
             cell_h: metrics.line_height,
         }
@@ -836,6 +899,72 @@ impl Renderer {
         }
     }
 
+    /// Shape a pure-ASCII run directly with rustybuzz — WITH the font's
+    /// default features, so calt/liga finally fire (cosmic-text 0.12 builds
+    /// a featureless shape plan; this is the M18 bypass). Returns None
+    /// whenever the contract doesn't hold — no face for the style, or a
+    /// font whose substituted advances leave the terminal grid — and the
+    /// caller falls back to the cosmic path.
+    fn shape_direct(&mut self, segs: &[Seg]) -> Option<(Vec<DirectGlyph>, f32)> {
+        let font_size = self.metrics.font_size;
+        let db = self.font_system.db();
+        let mut glyphs: Vec<DirectGlyph> = Vec::new();
+        let mut pen = 0.0f32;
+        for seg in segs {
+            if seg.text.is_empty() {
+                continue;
+            }
+            // a style change breaks the run (and rightly breaks ligatures)
+            let quad = ((seg.style & ST_BOLD != 0) as usize)
+                | (((seg.style & ST_ITALIC != 0) as usize) << 1);
+            let face_id = self.direct_faces[quad].or(self.direct_faces[0])?;
+            let shaped = db.with_face_data(face_id, |data, index| {
+                let face = rustybuzz::Face::from_slice(data, index)?;
+                let scale = font_size / face.units_per_em() as f32;
+                let mut buf = rustybuzz::UnicodeBuffer::new();
+                buf.push_str(&seg.text);
+                let out = rustybuzz::shape(&face, &[], buf);
+                let (infos, poss) = (out.glyph_infos(), out.glyph_positions());
+                let mut v = Vec::with_capacity(infos.len());
+                let mut x = 0.0f32;
+                for (gi, gp) in infos.iter().zip(poss) {
+                    v.push((
+                        gi.glyph_id as u16,
+                        x + gp.x_offset as f32 * scale,
+                        -(gp.y_offset as f32) * scale,
+                    ));
+                    x += gp.x_advance as f32 * scale;
+                }
+                Some((v, x))
+            })??;
+            let (seg_glyphs, seg_w) = shaped;
+            // the grid contract: programming-ligature fonts keep per-cell
+            // advances (that's WHY they encode -> as glyph pairs). A font
+            // that reflows widths would break column pinning — bail out.
+            let cells = seg.text.chars().count() as f32;
+            if (seg_w - cells * self.cell_w).abs() > 1.0 {
+                return None;
+            }
+            for (gid, gx, gy) in seg_glyphs {
+                glyphs.push(DirectGlyph {
+                    key: cosmic_text::CacheKey {
+                        font_id: face_id,
+                        glyph_id: gid,
+                        font_size_bits: font_size.to_bits(),
+                        x_bin: cosmic_text::SubpixelBin::Zero,
+                        y_bin: cosmic_text::SubpixelBin::Zero,
+                        flags: cosmic_text::CacheKeyFlags::empty(),
+                    },
+                    x: pen + gx,
+                    y: gy,
+                    color: seg.fg,
+                });
+            }
+            pen += seg_w;
+        }
+        Some((glyphs, pen))
+    }
+
     /// Get-or-shape a run. Hits are the common case: a terminal repaints
     /// the same content nearly every frame, and shaping is the expensive
     /// part of the CPU renderer (the honest 80% of what wgpu would buy).
@@ -847,6 +976,20 @@ impl Renderer {
         if let Some(run) = self.cache_cold.remove(&key) {
             self.cache_hot.insert(key.clone(), run);
             return key;
+        }
+        // pure-ASCII grid runs take the rustybuzz path while ligatures are
+        // on (align_left runs are UI/BiDi text — cosmic handles those)
+        if self.ligatures && !align_left && segs.iter().all(|s| s.text.is_ascii()) {
+            if let Some((glyphs, natw)) = self.shape_direct(segs) {
+                if self.cache_hot.len() >= CACHE_CAP {
+                    self.cache_cold = std::mem::take(&mut self.cache_hot);
+                }
+                self.cache_hot.insert(
+                    key.clone(),
+                    ShapedRun { layout: RunLayout::Direct(glyphs), natw },
+                );
+                return key;
+            }
         }
         let base = Attrs::new().family(Family::Name(self.family.as_str()));
         let rich: Vec<(&str, Attrs)> = segs
@@ -879,7 +1022,8 @@ impl Renderer {
         if self.cache_hot.len() >= CACHE_CAP {
             self.cache_cold = std::mem::take(&mut self.cache_hot);
         }
-        self.cache_hot.insert(key.clone(), ShapedRun { buffer, natw });
+        self.cache_hot
+            .insert(key.clone(), ShapedRun { layout: RunLayout::Cosmic(buffer), natw });
         key
     }
 
@@ -906,9 +1050,24 @@ impl Renderer {
                 out: &mut Vec<Vertex>, clip: Rect,
                 x: f32, y: i32, scale: f32) -> f32 {
         let key = self.ensure_shaped(segs, align_left);
-        let Renderer { cache_hot, font_system, cache, atlas, fg, .. } = self;
+        let Renderer { cache_hot, font_system, cache, atlas, fg, baseline, .. } = self;
         let run = &cache_hot[&key];
-        push_shaped(out, font_system, cache, atlas, &run.buffer, clip, x, y, scale, *fg);
+        match &run.layout {
+            RunLayout::Cosmic(buf) => {
+                push_shaped(out, font_system, cache, atlas, buf, clip, x, y, scale, *fg)
+            }
+            RunLayout::Direct(glyphs) => {
+                for g in glyphs {
+                    let Some(e) = atlas.entry(font_system, cache, g.key) else {
+                        continue;
+                    };
+                    let gx = x + (g.x + e.left as f32) * scale;
+                    let gy = y as f32 + *baseline + g.y - e.top as f32;
+                    push_quad(out, clip, gx, gy, e.w as f32 * scale, e.h as f32,
+                              e.layer, e.u0, e.v0, e.u1, e.v1, c4(g.color, 255));
+                }
+            }
+        }
         run.natw
     }
 
@@ -962,7 +1121,9 @@ impl Renderer {
             let c0 = cosmic_text::Cursor::new(0, b0);
             let c1 = cosmic_text::Cursor::new(0, b1);
             let key = self.ensure_shaped(&segs, true);
-            for run in self.cache_hot[&key].buffer.layout_runs() {
+            // BiDi lines are align_left=true and thus always Cosmic
+            let Some(buf) = self.cache_hot[&key].buffer() else { return None };
+            for run in buf.layout_runs() {
                 if let Some((x, w)) = run.highlight(c0, c1) {
                     return Some((
                         x0 + (x * scale).round() as i32,
@@ -2142,24 +2303,19 @@ mod cache_tests {
         assert_eq!(r.cache_hot.len(), before + 1);
     }
 
-    /// Count the glyphs a shaped run produced (a ligature merges N chars
-    /// into 1 glyph, so `->` shapes to 1 when the font ligates).
+    /// Count the glyphs a shaped run produced, whichever shaper made it.
     fn glyph_count(r: &mut Renderer, text: &str) -> usize {
         let key = r.ensure_shaped(&[Seg::plain(text, FG)], false);
-        r.cache_hot[&key]
-            .buffer
-            .layout_runs()
-            .map(|run| run.glyphs.len())
-            .sum()
+        match &r.cache_hot[&key].layout {
+            RunLayout::Cosmic(b) => b.layout_runs().map(|run| run.glyphs.len()).sum(),
+            RunLayout::Direct(g) => g.len(),
+        }
     }
 
-    /// A shaped ASCII run merges to a ligature glyph THE MOMENT the shaper
-    /// applies `calt` — the batched-run path is ready. cosmic-text 0.12
-    /// builds its shape plan with no user features and does not enable
-    /// programming ligatures, so today `->` stays 2 glyphs; this test
-    /// asserts the mechanism (batched shaping) and reports the shaper state
-    /// without failing when ligatures don't fire (an upstream limit, not a
-    /// Bayan bug). See FAMILY_LIGA / the `ligatures` config.
+    /// The batched ASCII run shapes as ONE unit (two letters stay two
+    /// glyphs — shaping really ran), and with M18 it routes through
+    /// rustybuzz, so `->` gets calt applied instead of cosmic-text 0.12's
+    /// featureless plan.
     #[test]
     fn ascii_run_is_batched_for_ligature_shaping() {
         let cfg = crate::config::UserConfig::default(); // ligatures default on
@@ -2167,14 +2323,55 @@ mod cache_tests {
         assert!(r.ligatures);
         // two distinct letters never merge — the run really is being shaped
         assert_eq!(glyph_count(&mut r, "ab"), 2);
+        // ligature fonts keep -> two glyphs WIDE (a substituted pair), so
+        // any count in 1..=2 is legal; the ID substitution test below is
+        // the real ligation proof
         let arrow = glyph_count(&mut r, "->");
         assert!(arrow == 1 || arrow == 2, "unexpected glyph count {arrow}");
-        eprintln!(
-            "NOTE ligatures: `->` -> {arrow} glyphs (font {}); \
-             cosmic-text 0.12 does not enable calt, so ligatures are wired \
-             but dormant until an upstream shaper feature bump",
-            r.family
-        );
+    }
+
+    /// M18: the direct rustybuzz path — ASCII lands exactly on the grid,
+    /// `->` substitutes to different glyph IDs than '-','>' in a calt font,
+    /// and routing sends ASCII→Direct / Arabic→Cosmic / ligatures-off→Cosmic.
+    #[test]
+    fn direct_shaping_ligates_on_the_grid() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        assert!(r.ligatures);
+        let (g, natw) = r
+            .shape_direct(&[Seg::plain("let x = 42;", FG)])
+            .expect("the picked monospace font must direct-shape ASCII");
+        assert!(!g.is_empty());
+        assert!((natw - 11.0 * r.cell_w).abs() <= 1.0, "natw {natw} left the grid");
+        let fam = r.family.clone();
+        if fam.contains("Cascadia") || fam.contains("Fira") || fam.contains("JetBrains")
+        {
+            let ids = |r: &mut Renderer, t: &str| -> Vec<u16> {
+                r.shape_direct(&[Seg::plain(t, FG)])
+                    .unwrap()
+                    .0
+                    .iter()
+                    .map(|g| g.key.glyph_id)
+                    .collect()
+            };
+            let arrow = ids(&mut r, "->");
+            let mut apart = ids(&mut r, "-");
+            apart.extend(ids(&mut r, ">"));
+            assert_ne!(arrow, apart, "calt must substitute -> in {fam}");
+            eprintln!("M18: ligatures LIVE — -> is {arrow:?} vs {apart:?} in {fam}");
+        } else {
+            eprintln!("NOTE: {fam} has no calt — the ID check is skipped here");
+        }
+        // routing: ASCII → Direct, Arabic → Cosmic
+        let k = r.ensure_shaped(&[Seg::plain("abc", FG)], false);
+        assert!(matches!(r.cache_hot[&k].layout, RunLayout::Direct(_)));
+        let k = r.ensure_shaped(&[Seg::plain("عربي", FG)], false);
+        assert!(matches!(r.cache_hot[&k].layout, RunLayout::Cosmic(_)));
+        // ligatures OFF shapes per cell through cosmic — no substitutions
+        let cfg =
+            crate::config::UserConfig { ligatures: Some(false), ..Default::default() };
+        let mut r2 = Renderer::new(1.0, &cfg, 0.0);
+        let k = r2.ensure_shaped(&[Seg::plain("->", FG)], false);
+        assert!(matches!(r2.cache_hot[&k].layout, RunLayout::Cosmic(_)));
     }
 
     /// The settings→look path: a config with a theme name (or explicit

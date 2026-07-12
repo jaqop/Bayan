@@ -1830,6 +1830,16 @@ impl ApplicationHandler<UserEvent> for App {
         if std::env::var_os("BAYAN_SHORTCUTS").is_some() {
             self.shortcuts = Some(ShortcutsState::default());
         }
+        // BAYAN_TYPE=<text>: feed text into the first pane's PTY — the
+        // visual-verification hook (ligatures, shaping) with no keyboard
+        if let Some(v) = std::env::var_os("BAYAN_TYPE") {
+            if let Some(t) = v.to_str() {
+                let t = t.to_string();
+                if let Some(s) = self.session_mut() {
+                    s.write(t.as_bytes());
+                }
+            }
+        }
         // BAYAN_PICK_THEME=<n>: open settings and apply theme n, so a click's
         // live effect can be verified in a screenshot without input injection
         if let Some(v) = std::env::var_os("BAYAN_PICK_THEME") {

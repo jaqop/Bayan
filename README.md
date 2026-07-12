@@ -136,9 +136,19 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       with conflict detection, Delete restores defaults, only non-default
       bindings persist. Fixed by design: Ctrl+Tab, zoom, Alt+arrows,
       plain Ctrl+C, the quake hotkey
-- [ ] **M18 (backlog)** — real ligatures via a direct rustybuzz+swash ASCII
-      shaper (bypassing cosmic-text's featureless plan); native toast; a
-      cosmic-text bump if it grows a features API
+- [x] **M18** — real programming ligatures: pure-ASCII grid runs shape
+      directly through rustybuzz WITH the font's default features (calt/liga
+      finally fire — cosmic-text 0.12's shape plan is featureless), then
+      rasterize through the SAME SwashCache/atlas via hand-built CacheKeys.
+      The baseline comes from the startup probe so both shapers draw on the
+      identical line; a font whose substituted advances leave the terminal
+      grid falls back to cosmic (ligature fonts encode -> as glyph PAIRS
+      precisely to keep per-cell advances). Style quadrants (bold/italic)
+      resolve their own faces; Arabic, mixed text and ligatures-off keep
+      the cosmic path untouched. Verified live: -> => != === ~~> render as
+      joined glyphs in Cascadia Code NF, column-exact, and toggle off cleanly
+- [ ] **M19 (backlog)** — native toast notifications; a cosmic-text bump
+      if it grows a features API (would retire the M18 bypass)
 
 ## Settings
 
