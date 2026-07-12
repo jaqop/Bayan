@@ -265,11 +265,52 @@ fn split_rects(
     out
 }
 
-/// What survives a restart: each tab's cwd + the active index.
+/// What survives a restart: every tab's FULL layout — each pane's cwd, the
+/// split axis and weights, and which pane was focused.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedTab {
+    cwds: Vec<Option<String>>,
+    #[serde(default)]
+    weights: Vec<f32>,
+    /// 0 = Row (side by side), 1 = Column (stacked)
+    #[serde(default)]
+    orientation: u8,
+    #[serde(default)]
+    focused: usize,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SavedState {
+    tabs: Vec<SavedTab>,
+    active: usize,
+}
+
+/// The pre-M9 file format (one cwd per tab) — read it rather than dropping
+/// the user's layout on upgrade.
+#[derive(serde::Deserialize)]
+struct LegacyState {
     tabs: Vec<Option<String>>,
     active: usize,
+}
+
+fn parse_state(json: &str) -> Option<SavedState> {
+    if let Ok(s) = serde_json::from_str::<SavedState>(json) {
+        return Some(s);
+    }
+    let legacy: LegacyState = serde_json::from_str(json).ok()?;
+    Some(SavedState {
+        tabs: legacy
+            .tabs
+            .into_iter()
+            .map(|cwd| SavedTab {
+                cwds: vec![cwd],
+                weights: vec![1.0],
+                orientation: 0,
+                focused: 0,
+            })
+            .collect(),
+        active: legacy.active,
+    })
 }
 
 fn state_path() -> Option<std::path::PathBuf> {
@@ -668,10 +709,18 @@ impl App {
             tabs: self
                 .tabs
                 .iter()
-                .map(|t| {
-                    t.panes
-                        .get(t.focused)
-                        .and_then(|p| p.session.meta.lock().unwrap().cwd.clone())
+                .map(|t| SavedTab {
+                    cwds: t
+                        .panes
+                        .iter()
+                        .map(|p| p.session.meta.lock().unwrap().cwd.clone())
+                        .collect(),
+                    weights: t.weights.clone(),
+                    orientation: match t.orientation {
+                        Orientation::Row => 0,
+                        Orientation::Column => 1,
+                    },
+                    focused: t.focused,
                 })
                 .collect(),
             active: self.active,
@@ -687,13 +736,38 @@ impl App {
     fn restore_state(&mut self) {
         let saved: Option<SavedState> = state_path()
             .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str(&s).ok());
+            .and_then(|s| parse_state(&s));
         match saved {
             Some(state) if !state.tabs.is_empty() => {
-                for cwd in state.tabs {
-                    self.spawn_tab(cwd);
+                for st in state.tabs {
+                    let mut cwds = st.cwds.into_iter();
+                    self.spawn_tab(cwds.next().flatten());
+                    for cwd in cwds.take(3) {
+                        // re-split with the saved axis; weights come after
+                        if let Some(pane) = self.spawn_pane(cwd.as_deref()) {
+                            if let Some(t) = self.tabs.last_mut() {
+                                t.panes.push(pane);
+                                t.weights.push(1.0);
+                            }
+                        }
+                    }
+                    if let Some(t) = self.tabs.last_mut() {
+                        t.orientation = if st.orientation == 1 {
+                            Orientation::Column
+                        } else {
+                            Orientation::Row
+                        };
+                        if st.weights.len() == t.panes.len() {
+                            let sane = st.weights.iter().all(|w| w.is_finite() && *w > 0.0);
+                            if sane {
+                                t.weights = st.weights;
+                            }
+                        }
+                        t.focused = st.focused.min(t.panes.len() - 1);
+                    }
                 }
                 self.active = state.active.min(self.tabs.len().saturating_sub(1));
+                self.relayout_active();
             }
             _ => self.spawn_tab(None),
         }
@@ -1600,18 +1674,30 @@ mod tests {
     }
 
     #[test]
-    fn saved_state_round_trips() {
+    fn saved_state_round_trips_with_layout() {
         let s = SavedState {
-            tabs: vec![Some(r"C:\Users\Admin\Bayan".into()), None],
-            active: 1,
+            tabs: vec![SavedTab {
+                cwds: vec![Some(r"C:\Users\Admin\Bayan".into()), None],
+                weights: vec![3.0, 1.0],
+                orientation: 1,
+                focused: 1,
+            }],
+            active: 0,
         };
         let json = serde_json::to_string(&s).unwrap();
-        let back: SavedState = serde_json::from_str(&json).unwrap();
+        let back = parse_state(&json).unwrap();
+        assert_eq!(back.tabs[0].cwds.len(), 2);
+        assert_eq!(back.tabs[0].weights, vec![3.0, 1.0]);
+        assert_eq!(back.tabs[0].orientation, 1);
+        assert_eq!(back.tabs[0].focused, 1);
+        // the pre-M9 format (one cwd per tab) still restores
+        let legacy = r#"{"tabs":["C:\\x","C:\\y"],"active":1}"#;
+        let back = parse_state(legacy).unwrap();
         assert_eq!(back.tabs.len(), 2);
-        assert_eq!(back.tabs[0].as_deref(), Some(r"C:\Users\Admin\Bayan"));
+        assert_eq!(back.tabs[0].cwds[0].as_deref(), Some(r"C:\x"));
         assert_eq!(back.active, 1);
         // a corrupt file must not crash restore (it falls back to one tab)
-        assert!(serde_json::from_str::<SavedState>("{broken").is_err());
+        assert!(parse_state("{broken").is_none());
     }
 
     #[test]

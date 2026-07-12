@@ -253,13 +253,72 @@ fn base_attrs<'a>() -> Attrs<'a> {
     Attrs::new().family(Family::Name("Consolas"))
 }
 
+/// One shaped run, cached: shaping is the paint loop's dominant cost, and a
+/// terminal redraws the same lines almost every frame.
+struct ShapedRun {
+    buffer: Buffer,
+    natw: f32,
+}
+
+/// Cache key: the exact rich-text content (text + colors) and alignment.
+type RunKey = (Vec<(String, (u8, u8, u8))>, bool);
+
+/// Generational cap: on overflow the hot map becomes the cold one and a
+/// fresh hot map starts — the working set survives, stale runs age out
+/// without a clear-everything stall (EasyTer's LRU lesson, generational).
+const CACHE_CAP: usize = 4096;
+
 pub struct Renderer {
     font_system: FontSystem,
     cache: SwashCache,
-    buffer: Buffer, // scratch: one shaped run/line at a time
+    metrics: Metrics,
+    cache_hot: std::collections::HashMap<RunKey, ShapedRun>,
+    cache_cold: std::collections::HashMap<RunKey, ShapedRun>,
     family: String,
     pub cell_w: f32,
     pub cell_h: f32,
+}
+
+/// Blit one shaped buffer (free function: callers hold disjoint field
+/// borrows of the Renderer while the cached run stays borrowed).
+#[allow(clippy::too_many_arguments)]
+fn blit_run(font_system: &mut FontSystem, swash: &mut SwashCache, buf: &Buffer,
+            frame: &mut [u32], fw: usize, fh: usize, clip: Rect,
+            x_off: f32, y_off: i32, scale: f32) {
+    let (cx, cy, cw2, ch2) = clip;
+    let cx0 = cx.max(0);
+    let cy0 = cy.max(0);
+    let cx1 = (cx + cw2).min(fw as i32);
+    let cy1 = (cy + ch2).min(fh as i32);
+    buf.draw(
+        font_system,
+        swash,
+        Color::rgb(FG.0, FG.1, FG.2),
+        |x, y, w, h, color| {
+            let a = color.a() as u32;
+            if a == 0 {
+                return;
+            }
+            let rgb = (color.r(), color.g(), color.b());
+            let xs = (x_off + x as f32 * scale).round() as i32;
+            let ws = ((w as f32 * scale).ceil() as i32).max(1);
+            for dy in 0..h as i32 {
+                let py = y_off + y + dy;
+                if py < cy0 || py >= cy1 {
+                    continue;
+                }
+                let row = py as usize * fw;
+                for dx in 0..ws {
+                    let px = xs + dx;
+                    if px < cx0 || px >= cx1 {
+                        continue;
+                    }
+                    let i = row + px as usize;
+                    frame[i] = blend(frame[i], rgb, a);
+                }
+            }
+        },
+    );
 }
 
 impl Renderer {
@@ -271,8 +330,6 @@ impl Renderer {
         let family = pick_family(font_system.db(), cfg.font_family.as_deref());
         let size = (cfg.font_size.unwrap_or(FONT_SIZE) + extra_pts).clamp(8.0, 40.0) * scale;
         let metrics = Metrics::new(size, (size * 1.4).ceil());
-        let mut buffer = Buffer::new(&mut font_system, metrics);
-        buffer.set_wrap(&mut font_system, Wrap::None);
         // cell width = the primary monospace font's advance for an ASCII probe
         let mut probe = Buffer::new(&mut font_system, metrics);
         probe.set_wrap(&mut font_system, Wrap::None);
@@ -293,11 +350,51 @@ impl Renderer {
         Self {
             font_system,
             cache: SwashCache::new(),
-            buffer,
+            metrics,
+            cache_hot: std::collections::HashMap::new(),
+            cache_cold: std::collections::HashMap::new(),
             family,
             cell_w,
             cell_h: metrics.line_height,
         }
+    }
+
+    /// Get-or-shape a run. Hits are the common case: a terminal repaints
+    /// the same content nearly every frame, and shaping is the expensive
+    /// part of the CPU renderer (the honest 80% of what wgpu would buy).
+    fn ensure_shaped(&mut self, segs: &[(String, (u8, u8, u8))], align_left: bool) -> RunKey {
+        let key: RunKey = (segs.to_vec(), align_left);
+        if self.cache_hot.contains_key(&key) {
+            return key;
+        }
+        if let Some(run) = self.cache_cold.remove(&key) {
+            self.cache_hot.insert(key.clone(), run);
+            return key;
+        }
+        let base = Attrs::new().family(Family::Name(self.family.as_str()));
+        let rich: Vec<(&str, Attrs)> = segs
+            .iter()
+            .map(|(s, c)| (s.as_str(), base.color(Color::rgb(c.0, c.1, c.2))))
+            .collect();
+        let mut buffer = Buffer::new(&mut self.font_system, self.metrics);
+        buffer.set_wrap(&mut self.font_system, Wrap::None);
+        buffer.set_size(&mut self.font_system, Some(1_000_000.0), Some(self.cell_h));
+        buffer.set_rich_text(&mut self.font_system, rich, base, Shaping::Advanced);
+        if align_left {
+            for line in buffer.lines.iter_mut() {
+                line.set_align(Some(Align::Left));
+            }
+        }
+        buffer.shape_until_scroll(&mut self.font_system, false);
+        let natw = buffer
+            .layout_runs()
+            .map(|r| r.line_w)
+            .fold(0.0_f32, f32::max);
+        if self.cache_hot.len() >= CACHE_CAP {
+            self.cache_cold = std::mem::take(&mut self.cache_hot);
+        }
+        self.cache_hot.insert(key.clone(), ShapedRun { buffer, natw });
+        key
     }
 
     /// Height of the tab bar in pixels — pane content starts below it.
@@ -305,71 +402,24 @@ impl Renderer {
         self.cell_h + 10.0
     }
 
-    /// Shape `segs` (text + color spans) into the scratch buffer; returns the
-    /// natural width. `align_left` pins RTL-base lines to the left edge
-    /// (cosmic-text otherwise pushes them to the buffer's right edge).
-    fn shape_scratch(&mut self, segs: &[(String, (u8, u8, u8))], buf_w: f32, align_left: bool) -> f32 {
-        let base = Attrs::new().family(Family::Name(self.family.as_str()));
-        let rich: Vec<(&str, Attrs)> = segs
-            .iter()
-            .map(|(s, c)| (s.as_str(), base.color(Color::rgb(c.0, c.1, c.2))))
-            .collect();
-        self.buffer
-            .set_size(&mut self.font_system, Some(buf_w), Some(self.cell_h));
-        self.buffer
-            .set_rich_text(&mut self.font_system, rich, base, Shaping::Advanced);
-        if align_left {
-            for line in self.buffer.lines.iter_mut() {
-                line.set_align(Some(Align::Left));
-            }
-        }
-        self.buffer
-            .shape_until_scroll(&mut self.font_system, false);
-        self.buffer
-            .layout_runs()
-            .map(|r| r.line_w)
-            .fold(0.0_f32, f32::max)
+    /// Natural width of a run (shaping it into the cache if new).
+    fn measure(&mut self, segs: &[(String, (u8, u8, u8))], align_left: bool) -> f32 {
+        let key = self.ensure_shaped(segs, align_left);
+        self.cache_hot[&key].natw
     }
 
-    /// Blit the scratch buffer at (x_off, y_off), optionally compressed
+    /// Shape (cached) and blit a run at (x, y), optionally compressed
     /// horizontally (EasyTer's fit), clipped to `clip` — a pane's text can
-    /// never bleed into a neighbouring pane.
-    fn blit_scratch(&mut self, frame: &mut [u32], fw: usize, fh: usize, clip: Rect,
-                    x_off: f32, y_off: i32, scale: f32) {
-        let (cx, cy, cw2, ch2) = clip;
-        let cx0 = cx.max(0);
-        let cy0 = cy.max(0);
-        let cx1 = (cx + cw2).min(fw as i32);
-        let cy1 = (cy + ch2).min(fh as i32);
-        self.buffer.draw(
-            &mut self.font_system,
-            &mut self.cache,
-            Color::rgb(FG.0, FG.1, FG.2),
-            |x, y, w, h, color| {
-                let a = color.a() as u32;
-                if a == 0 {
-                    return;
-                }
-                let rgb = (color.r(), color.g(), color.b());
-                let xs = (x_off + x as f32 * scale).round() as i32;
-                let ws = ((w as f32 * scale).ceil() as i32).max(1);
-                for dy in 0..h as i32 {
-                    let py = y_off + y + dy;
-                    if py < cy0 || py >= cy1 {
-                        continue;
-                    }
-                    let row = py as usize * fw;
-                    for dx in 0..ws {
-                        let px = xs + dx;
-                        if px < cx0 || px >= cx1 {
-                            continue;
-                        }
-                        let i = row + px as usize;
-                        frame[i] = blend(frame[i], rgb, a);
-                    }
-                }
-            },
-        );
+    /// never bleed into a neighbouring pane. Returns the natural width.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_run(&mut self, segs: &[(String, (u8, u8, u8))], align_left: bool,
+                frame: &mut [u32], fw: usize, fh: usize, clip: Rect,
+                x: f32, y: i32, scale: f32) -> f32 {
+        let key = self.ensure_shaped(segs, align_left);
+        let Renderer { cache_hot, font_system, cache, .. } = self;
+        let run = &cache_hot[&key];
+        blit_run(font_system, cache, &run.buffer, frame, fw, fh, clip, x, y, scale);
+        run.natw
     }
 
     /// A row containing Arabic: shape the WHOLE line so cosmic-text applies
@@ -414,14 +464,15 @@ impl Renderer {
                 cur_bytes = None;
             }
         }
-        // shape unconstrained, then compress to the pane if it overflows
-        let natw = self.shape_scratch(&segs, 1_000_000.0, true);
+        // shape unconstrained (cached), then compress to the pane on overflow
+        let natw = self.measure(&segs, true);
         let scale = if natw > pane_w as f32 { pane_w as f32 / natw } else { 1.0 };
-        self.blit_scratch(frame, fw, fh, clip, x0 as f32, y, scale);
+        self.draw_run(&segs, true, frame, fw, fh, clip, x0 as f32, y, scale);
         if let Some((b0, b1)) = cur_bytes {
             let c0 = cosmic_text::Cursor::new(0, b0);
             let c1 = cosmic_text::Cursor::new(0, b1);
-            for run in self.buffer.layout_runs() {
+            let key = self.ensure_shaped(&segs, true);
+            for run in self.cache_hot[&key].buffer.layout_runs() {
                 if let Some((x, w)) = run.highlight(c0, c1) {
                     return Some((
                         x0 + (x * scale).round() as i32,
@@ -475,9 +526,8 @@ impl Renderer {
                     }
                 }
                 if !segs.is_empty() {
-                    self.shape_scratch(&segs, 1_000_000.0, false);
-                    self.blit_scratch(frame, fw, fh, clip,
-                                      x0 as f32 + col0 as f32 * self.cell_w, y, 1.0);
+                    self.draw_run(&segs, false, frame, fw, fh, clip,
+                                  x0 as f32 + col0 as f32 * self.cell_w, y, 1.0);
                 }
                 i = j;
             } else {
@@ -486,11 +536,11 @@ impl Renderer {
                 let mut s = String::new();
                 ci.push_text(&mut s);
                 let seg = [(s, ci.fg)];
-                let natw = self.shape_scratch(&seg, 1_000_000.0, false);
+                let natw = self.measure(&seg, false);
                 let boxw = ci.w as f32 * self.cell_w;
                 let scale = if natw > boxw + 0.5 { boxw / natw } else { 1.0 };
-                self.blit_scratch(frame, fw, fh, clip,
-                                  x0 as f32 + ci.col as f32 * self.cell_w, y, scale);
+                self.draw_run(&seg, false, frame, fw, fh, clip,
+                              x0 as f32 + ci.col as f32 * self.cell_w, y, scale);
                 i += 1;
             }
         }
@@ -677,8 +727,7 @@ impl Renderer {
         let row_h = self.cockpit_row_h();
         // header
         let head = [("مقصورة الوكلاء".to_string(), FG)];
-        self.shape_scratch(&head, 1_000_000.0, true);
-        self.blit_scratch(frame, fw, fh, whole, (x + 14) as f32, y + 8, 1.0);
+        self.draw_run(&head, true, frame, fw, fh, whole, (x + 14) as f32, y + 8, 1.0);
         let rows_top = y + row_h + 6;
         for (i, e) in entries.iter().enumerate() {
             let ry = rows_top + i as i32 * row_h;
@@ -704,8 +753,7 @@ impl Renderer {
                 ("   —   ".to_string(), (0x6e, 0x76, 0x81)),
                 (status, (0x9a, 0xa4, 0xb2)),
             ];
-            self.shape_scratch(&segs, 1_000_000.0, true);
-            self.blit_scratch(frame, fw, fh, whole, (x + 32) as f32, ry + 6, 1.0);
+            self.draw_run(&segs, true, frame, fw, fh, whole, (x + 32) as f32, ry + 6, 1.0);
         }
     }
 
@@ -719,7 +767,7 @@ impl Renderer {
         if claude {
             let label = "● وضع كلود".to_string();
             let segs = [(label, (0xff, 0xff, 0xff))];
-            let tw = self.shape_scratch(&segs, 1_000_000.0, true);
+            let tw = self.measure(&segs, true);
             let bw = tw as i32 + 16;
             let bh = (self.cell_h + 8.0) as i32;
             let bx = width as i32 - bw - 10;
@@ -729,7 +777,8 @@ impl Renderer {
                 6
             };
             fill_rect(frame, width, height, bx, by, bw, bh, pack((0x2e, 0xa0, 0x43)));
-            self.blit_scratch(frame, width, height, whole, (bx + 8) as f32, by + 4, 1.0);
+            self.draw_run(&segs, true, frame, width, height, whole,
+                          (bx + 8) as f32, by + 4, 1.0);
         }
 
         // search bar, top-right below the tab bar
@@ -743,8 +792,8 @@ impl Renderer {
                        PALETTE[11], 200); // amber underline = search accent
             let label = format!("بحث: {q}_");
             let segs = [(label, FG)];
-            self.shape_scratch(&segs, 1_000_000.0, true);
-            self.blit_scratch(frame, width, height, whole, (bx + 8) as f32, by + 5, 1.0);
+            self.draw_run(&segs, true, frame, width, height, whole,
+                          (bx + 8) as f32, by + 5, 1.0);
         }
 
         // the tab bar, drawn last (nothing may bleed into it)
@@ -765,8 +814,8 @@ impl Renderer {
             let max_chars = TAB_CELLS as usize - 5;
             let title: String = tab.title.chars().take(max_chars).collect();
             let segs = [(title, fg)];
-            self.shape_scratch(&segs, 1_000_000.0, true);
-            self.blit_scratch(frame, width, height, whole, (x0 + 10) as f32, 5, 1.0);
+            self.draw_run(&segs, true, frame, width, height, whole,
+                          (x0 + 10) as f32, 5, 1.0);
             // dots: amber attention (a Claude waiting on you) beats green busy
             let dot = if tab.attention {
                 Some((0xf2, 0xcc, 0x60))
@@ -893,6 +942,76 @@ mod align_tests {
             first_x < 5,
             "RTL line starts at x={first_x}, expected pinned to the left edge"
         );
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn test_renderer() -> Renderer {
+        Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0)
+    }
+
+    /// Same content -> same cached run (no re-shape); different colors are
+    /// different runs (colors are baked into the shaped buffer).
+    #[test]
+    fn shaped_runs_are_cached_by_content_and_color() {
+        let mut r = test_renderer();
+        let a = [("hello بيان".to_string(), FG)];
+        let w1 = r.measure(&a, false);
+        assert_eq!(r.cache_hot.len(), 1);
+        let w2 = r.measure(&a, false);
+        assert_eq!(r.cache_hot.len(), 1, "second measure must hit the cache");
+        assert_eq!(w1, w2);
+        let b = [("hello بيان".to_string(), (0xff, 0, 0))];
+        r.measure(&b, false);
+        assert_eq!(r.cache_hot.len(), 2, "a different color is a new run");
+        // alignment is part of the key too
+        r.measure(&a, true);
+        assert_eq!(r.cache_hot.len(), 3);
+    }
+
+    /// The generational cap keeps the hot set: overflow demotes, a hit on a
+    /// demoted run promotes it back instead of re-shaping.
+    #[test]
+    fn cache_overflow_keeps_the_working_set() {
+        let mut r = test_renderer();
+        let hot = [("keep me".to_string(), FG)];
+        r.measure(&hot, false);
+        for i in 0..CACHE_CAP {
+            r.measure(&[(format!("filler {i}"), FG)], false);
+        }
+        assert!(r.cache_hot.len() <= CACHE_CAP);
+        // "keep me" was demoted to cold; hitting it promotes without growth
+        let before = r.cache_hot.len();
+        r.measure(&hot, false);
+        assert_eq!(r.cache_hot.len(), before + 1);
+    }
+
+    /// Not a strict assert (CI timing is flaky) — prints the win.
+    #[test]
+    fn measure_cache_speedup_probe() {
+        let mut r = test_renderer();
+        let rows: Vec<[(String, (u8, u8, u8)); 1]> = (0..40)
+            .map(|i| [(format!("line {i} of some shell output مع عربية"), FG)])
+            .collect();
+        let t0 = Instant::now();
+        for row in &rows {
+            r.measure(row, false);
+        }
+        let cold = t0.elapsed();
+        let t1 = Instant::now();
+        for _frame in 0..100 {
+            for row in &rows {
+                r.measure(row, false);
+            }
+        }
+        let warm_100 = t1.elapsed();
+        eprintln!("PROBE shape 40 rows cold  = {cold:?}");
+        eprintln!("PROBE 100 cached frames   = {warm_100:?} (per frame: {:?})",
+                  warm_100 / 100);
     }
 }
 

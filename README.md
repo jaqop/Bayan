@@ -70,10 +70,16 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       every tab — amber = waiting for your approval, green = working, dim =
       idle, with the running command or idle directory; arrows + Enter or a
       click to jump
-- [ ] **M9 (backlog)** — wgpu renderer; scrollback-cap-proof command marks
-      (needs an eviction hook upstream in alacritty_terminal — pyte allowed
-      overriding HistoryScreen.index, alacritty's Grid does not); pane
-      weights in the session file
+- [x] **M9** — the shaped-run cache: the paint loop now re-shapes only
+      CHANGED lines (generational LRU, EasyTer's dirty-row lesson) — a
+      fully-cached frame's shaping cost dropped from ~1.5ms to ~4µs
+      (~340×), which is the honest 80% of what a GPU renderer buys; full
+      layout persistence: every tab's panes, split axis, weights and focus
+      survive a restart (pre-M9 session files still restore)
+- [ ] **M10 (backlog)** — wgpu renderer (a dedicated session: atlas +
+      shaders deserve their own runway, and the CPU path is now fast);
+      scrollback-cap-proof command marks (needs an eviction hook upstream
+      in alacritty_terminal — pyte allowed overriding HistoryScreen.index)
 
 ## Build
 
