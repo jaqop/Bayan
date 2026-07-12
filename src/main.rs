@@ -1633,8 +1633,8 @@ impl ApplicationHandler<UserEvent> for App {
                 let m = self.modifiers;
                 let (ctrl, shift, alt) = (m.control_key(), m.shift_key(), m.alt_key());
                 crate::prof::mark(&format!(
-                    "key {:?} text={:?} ctrl={ctrl} shift={shift}",
-                    event.logical_key, event.text
+                    "key logical={:?} physical={:?} text={:?} ctrl={ctrl} shift={shift}",
+                    event.logical_key, event.physical_key, event.text
                 ));
                 // a pending paste owns the keyboard: Enter sends, Esc drops
                 if self.pending_paste.is_some() {
@@ -1752,11 +1752,20 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 } else if ctrl {
-                    // Ctrl+, opens the settings panel (EasyTer's binding)
-                    if !shift && matches!(key, Key::Character(s) if s.as_str() == ",") {
-                        self.settings = Some(0);
-                        self.request_redraw();
-                        return;
+                    // Ctrl+, opens the settings panel (EasyTer's binding).
+                    // Match the PHYSICAL comma key: on an Arabic layout the
+                    // comma key's logical char is "،" (U+060C), not ASCII ",",
+                    // so logical matching never fired (the same layout trap as
+                    // Ctrl+letters — resolve by KeyCode).
+                    {
+                        use winit::keyboard::{KeyCode, PhysicalKey};
+                        if !shift
+                            && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Comma))
+                        {
+                            self.settings = Some(0);
+                            self.request_redraw();
+                            return;
+                        }
                     }
                     // Ctrl+Tab / Ctrl+Shift+Tab cycle tabs (shift handled here
                     // because winit reports Tab+shift with the shift modifier)
