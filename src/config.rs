@@ -104,15 +104,6 @@ impl BellMode {
             BellMode::Silent => "silent",
         }
     }
-
-    /// The settings panel cycles attention → sound → silent → …
-    pub fn next(self) -> Self {
-        match self {
-            BellMode::Attention => BellMode::Sound,
-            BellMode::Sound => BellMode::Silent,
-            BellMode::Silent => BellMode::Attention,
-        }
-    }
 }
 
 pub const DEFAULT_SCROLLBACK: usize = 10_000;
@@ -222,9 +213,6 @@ mod tests {
         // scrollback is clamped to sane bounds
         let tiny: UserConfig = serde_json::from_str(r#"{"scrollback":1}"#).unwrap();
         assert_eq!(tiny.scrollback_lines(), 100);
-        // the bell cycle visits all three states and returns home
-        let m = BellMode::Attention;
-        assert_eq!(m.next().next().next(), m);
         // round-trip through as_str/parse
         for s in CursorStyle::ALL {
             assert_eq!(CursorStyle::parse(s.as_str()), s);

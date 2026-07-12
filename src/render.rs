@@ -427,8 +427,17 @@ pub struct SettingsLayout {
     pub liga_label_y: i32,
     pub liga_toggle: Rect,
     pub bell_label_y: i32,
-    pub bell_btn: Rect,
+    /// segmented control, left→right: [صامت, صوت, تنبيه] (RTL: تنبيه first)
+    pub bell_btns: [Rect; 3],
 }
+
+/// The bell segments' modes in bell_btns order (left→right on screen, so
+/// the RTL-first default تنبيه sits rightmost, beside the label).
+pub const BELL_SEGMENTS: [crate::config::BellMode; 3] = [
+    crate::config::BellMode::Silent,
+    crate::config::BellMode::Sound,
+    crate::config::BellMode::Attention,
+];
 
 /// Everything the settings panel displays (current values of each control).
 pub struct SettingsView<'a> {
@@ -1284,55 +1293,70 @@ impl Renderer {
     /// once and shared by the renderer (draw) and the app (click hit-test) so
     /// they never disagree.
     pub fn settings_layout(&self, fw: usize, fh: usize) -> SettingsLayout {
-        let pad = 20;
-        let w = ((self.cell_w * 62.0) as i32).clamp(360, fw as i32 - 60);
-        let rowh = (self.cell_h + 22.0) as i32;
-        let tile_w = ((w - pad * 2 - 6 * 6) / 7).max(30); // 7 theme tiles
+        // The ledger grammar: every row is [control]···dotted leader···[label],
+        // controls left, labels right (RTL), one shared control height.
+        let pad = 24;
+        let w = ((self.cell_w * 52.0) as i32).clamp(430, fw as i32 - 60);
+        let rowh = (self.cell_h + 24.0) as i32;
+        let ctl = rowh - 12; // every square control is this tall
+        let head_h = (self.cell_h + 30.0) as i32;
+        let foot_h = (self.cell_h + 30.0) as i32;
+        // the theme row obeys the same grammar: tiles left, label right,
+        // so the strip leaves room for the "المظهر" label
+        let label_reserve = (self.cell_w * 6.0) as i32;
+        let tile_w = ((w - pad * 2 - label_reserve - 6 * 6) / 7).max(30);
         let tile_h = (self.cell_h * 1.6) as i32;
-        let head_h = (self.cell_h + 26.0) as i32;
-        let h = head_h + tile_h + 16 + rowh * 7 + 44;
+        let theme_rowh = tile_h + 14;
+        let h = head_h + 6 + theme_rowh + rowh * 7 + foot_h;
         let x = (fw as i32 - w) / 2;
         let y = (self.tab_bar_h() as i32 + (fh as i32 - h) / 3)
             .max(self.tab_bar_h() as i32 + 12);
 
-        let theme_y = y + head_h + 4;
+        let theme_y = y + head_h + 6 + (theme_rowh - tile_h) / 2;
         let theme_tiles: Vec<Rect> = (0..THEMES.len() as i32)
             .map(|i| (x + pad + i * (tile_w + 6), theme_y, tile_w, tile_h))
             .collect();
 
-        // rows below the tiles: label on the right (RTL), controls on the
-        // left, one control block per row
-        let btn = rowh - 8;
-        let row_y = |i: i32| theme_y + tile_h + 16 + rowh * i;
+        let rows_top = y + head_h + 6 + theme_rowh;
+        let row_y = |i: i32| rows_top + rowh * i;
+        let cy = |ry: i32| ry + (rowh - ctl) / 2; // control vertically centered
 
         // font family: [‹] name [›]
         let font_y = row_y(0);
-        let font_prev = (x + pad, font_y + 4, btn, btn);
-        let font_next = (x + pad + btn + 220, font_y + 4, btn, btn);
+        let name_w = (self.cell_w * 17.0) as i32;
+        let font_prev = (x + pad, cy(font_y), ctl, ctl);
+        let font_next = (x + pad + ctl + name_w, cy(font_y), ctl, ctl);
 
         // font size: [−  15  +]
         let size_y = row_y(1);
-        let size_minus = (x + pad, size_y + 4, btn, btn);
-        let size_plus = (x + pad + btn + 54, size_y + 4, btn, btn);
+        let size_slot = (self.cell_w * 4.0) as i32;
+        let size_minus = (x + pad, cy(size_y), ctl, ctl);
+        let size_plus = (x + pad + ctl + size_slot, cy(size_y), ctl, ctl);
 
         // cursor style: three shape swatches
         let cursor_y = row_y(2);
-        let cursor_btns = [0, 1, 2].map(|i| (x + pad + i * (btn + 8), cursor_y + 4, btn, btn));
+        let cursor_btns = [0, 1, 2].map(|i| (x + pad + i * (ctl + 8), cy(cursor_y), ctl, ctl));
 
         // scrollback: [−  10k  +]
         let scroll_y = row_y(3);
-        let scroll_minus = (x + pad, scroll_y + 4, btn, btn);
-        let scroll_plus = (x + pad + btn + 76, scroll_y + 4, btn, btn);
+        let scroll_slot = (self.cell_w * 5.0) as i32;
+        let scroll_minus = (x + pad, cy(scroll_y), ctl, ctl);
+        let scroll_plus = (x + pad + ctl + scroll_slot, cy(scroll_y), ctl, ctl);
 
-        // copy-on-select / ligatures: toggle pills
+        // copy-on-select / ligatures: toggle pills (wide and shallow, so
+        // the track reads as a switch, not a filled box)
+        let pill_w = (self.cell_w * 4.2) as i32;
+        let pill_h = ctl - 10;
+        let pcy = |ry: i32| ry + (rowh - pill_h) / 2;
         let copy_y = row_y(4);
-        let copy_toggle = (x + pad, copy_y + 4, 64, rowh - 10);
+        let copy_toggle = (x + pad, pcy(copy_y), pill_w, pill_h);
         let liga_y = row_y(5);
-        let liga_toggle = (x + pad, liga_y + 4, 64, rowh - 10);
+        let liga_toggle = (x + pad, pcy(liga_y), pill_w, pill_h);
 
-        // bell: one button cycling through the three modes
+        // bell: a three-segment control (all options visible, one active)
         let bell_y = row_y(6);
-        let bell_btn = (x + pad, bell_y + 4, 110, rowh - 10);
+        let seg_w = (self.cell_w * 4.6) as i32;
+        let bell_btns = [0, 1, 2].map(|i| (x + pad + i * (seg_w + 6), cy(bell_y), seg_w, ctl));
 
         SettingsLayout {
             card: (x, y, w, h),
@@ -1355,109 +1379,146 @@ impl Renderer {
             liga_label_y: liga_y,
             liga_toggle,
             bell_label_y: bell_y,
-            bell_btn,
+            bell_btns,
         }
     }
 
-    /// A real settings panel: clickable theme tiles (bg + palette dots, the
-    /// active one green-bordered), a font cycler, −/+ steppers for size and
-    /// scrollback, cursor-shape swatches, toggle pills and a bell-mode
-    /// cycler. Every control is a hit region in SettingsLayout.
+    /// The settings ledger: every row reads [control] ··· [label], leader
+    /// dots tying each control to its name the way a book index does. One
+    /// control height, one border color, labels vertically centered — the
+    /// grid IS the design. Every control is a hit region in SettingsLayout.
     pub fn draw_settings(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
                          v: &SettingsView) {
+        const CARD: (u8, u8, u8) = (0x14, 0x19, 0x20);
+        const EDGE: (u8, u8, u8) = (0x2a, 0x31, 0x3a); // card + control borders
+        const CTL_BG: (u8, u8, u8) = (0x24, 0x2b, 0x34);
+        const GREEN: (u8, u8, u8) = (0x2e, 0xa0, 0x43);
+        const GREEN_DIM: (u8, u8, u8) = (0x1c, 0x33, 0x24);
+        const VALUE: (u8, u8, u8) = (0x7e, 0xe7, 0x87);
+        const MUTED: (u8, u8, u8) = (0x9a, 0xa4, 0xb2);
+        const DOT: (u8, u8, u8) = (0x33, 0x3b, 0x45);
+
         let whole: Rect = (0, 0, fw as i32, fh as i32);
         let lay = self.settings_layout(fw, fh);
         let (x, y, w, h) = lay.card;
-        push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 130));
-        push_rect(out, whole, x, y, w, h, c4((0x16, 0x1b, 0x22), 255));
-        push_rect(out, whole, x, y, w, 3, c4((0x2e, 0xa0, 0x43), 255)); // accent
+        let pad = 24;
+        // label baseline offset: text vertically centered in its row
+        let tc = (lay.rowh as f32 - self.cell_h) as i32 / 2;
 
-        // title (right-aligned)
+        push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 140));
+        push_rect(out, whole, x - 1, y - 1, w + 2, h + 2, c4(EDGE, 255)); // border
+        push_rect(out, whole, x, y, w, h, c4(CARD, 255));
+        push_rect(out, whole, x, y, w, 3, c4(GREEN, 255)); // accent
+
+        // title + hairline under it
         let head = [Seg { text: "الإعدادات".into(), fg: self.fg, style: ST_BOLD }];
         let hw = self.measure(&head, true);
-        self.draw_run(&head, true, out, whole, (x + w - 20) as f32 - hw, y + 12, 1.0);
+        self.draw_run(&head, true, out, whole, (x + w - pad) as f32 - hw, y + 14, 1.0);
+        push_rect(out, whole, x + pad, y + lay.head_h, w - pad * 2, 1, c4(EDGE, 255));
 
-        // right-aligned row label (every row has one)
-        let label = |r: &mut Self, out: &mut Vec<Vertex>, text: &str, ly: i32| {
-            let seg = [Seg::plain(text, (0x9a, 0xa4, 0xb2))];
+        // right-aligned row label; returns where the leader dots must stop
+        let label = |r: &mut Self, out: &mut Vec<Vertex>, text: &str, row_top: i32| -> i32 {
+            let seg = [Seg::plain(text, MUTED)];
             let lw = r.measure(&seg, true);
-            r.draw_run(&seg, true, out, whole, (x + w - 20) as f32 - lw, ly, 1.0);
+            let lx = (x + w - pad) as f32 - lw;
+            r.draw_run(&seg, true, out, whole, lx, row_top + tc, 1.0);
+            lx as i32
+        };
+        // the ledger dots: from a control's right edge to its label
+        let leader = |out: &mut Vec<Vertex>, from_x: i32, to_x: i32, row_top: i32| {
+            let dy = row_top + lay.rowh / 2 - 1;
+            let mut dx = from_x + 16;
+            while dx + 2 <= to_x - 14 {
+                push_rect(out, whole, dx, dy, 2, 2, c4(DOT, 255));
+                dx += 9;
+            }
+        };
+        let bordered = |out: &mut Vec<Vertex>, (bx, by, bw, bh): Rect,
+                        bg: (u8, u8, u8), edge: (u8, u8, u8)| {
+            push_rect(out, whole, bx - 1, by - 1, bw + 2, bh + 2, c4(edge, 255));
+            push_rect(out, whole, bx, by, bw, bh, c4(bg, 255));
         };
 
-        // ---- theme tiles ----
-        label(self, out, "المظهر", y + lay.head_h - 4);
+        // ---- theme row (same grammar: tiles ··· label) ----
+        let theme_top = lay.theme_tiles[0].1;
+        let theme_row_top = theme_top - (lay.rowh - lay.theme_tiles[0].3) / 2;
+        let tl = label(self, out, "المظهر", theme_row_top);
+        let last = lay.theme_tiles[lay.theme_tiles.len() - 1];
+        leader(out, last.0 + last.2, tl, theme_row_top);
         for (i, tile) in lay.theme_tiles.iter().enumerate() {
             let (tx, ty, tw2, th) = *tile;
             let t = &THEMES[i];
-            push_rect(out, whole, tx, ty, tw2, th, c4(t.bg, 255));
+            let edge = if i == v.theme { GREEN } else { EDGE };
+            bordered(out, (tx, ty, tw2, th), t.bg, edge);
+            if i == v.theme {
+                // second border ring so the active tile reads at a glance
+                push_rect(out, whole, tx, ty, tw2, 2, c4(GREEN, 255));
+                push_rect(out, whole, tx, ty + th - 2, tw2, 2, c4(GREEN, 255));
+                push_rect(out, whole, tx, ty, 2, th, c4(GREEN, 255));
+                push_rect(out, whole, tx + tw2 - 2, ty, 2, th, c4(GREEN, 255));
+            }
             // four palette dots as a mini preview
             let dots = [t.palette[1], t.palette[2], t.palette[4], t.palette[3]];
-            let dw = (tw2 - 8) / 4;
+            let dw = (tw2 - 10) / 4;
             for (k, c) in dots.iter().enumerate() {
-                push_rect(out, whole, tx + 4 + k as i32 * dw, ty + th - 8, dw - 2, 4, c4(*c, 255));
+                push_rect(out, whole, tx + 5 + k as i32 * dw, ty + th - 9, dw - 2, 4,
+                          c4(*c, 255));
             }
-            // border: green + thick for the active theme, faint otherwise
-            let (bc, bt) = if i == v.theme {
-                ((0x2e, 0xa0, 0x43), 2)
-            } else {
-                ((0x30, 0x36, 0x3d), 1)
-            };
-            push_rect(out, whole, tx, ty, tw2, bt, c4(bc, 255));
-            push_rect(out, whole, tx, ty + th - bt, tw2, bt, c4(bc, 255));
-            push_rect(out, whole, tx, ty, bt, th, c4(bc, 255));
-            push_rect(out, whole, tx + tw2 - bt, ty, bt, th, c4(bc, 255));
         }
 
-        let draw_btn = |r: &mut Self, out: &mut Vec<Vertex>, rect: Rect, label: &str| {
+        let draw_btn = |r: &mut Self, out: &mut Vec<Vertex>, rect: Rect, glyph: &str| {
+            bordered(out, rect, CTL_BG, EDGE);
             let (bx, by, bw, bh) = rect;
-            push_rect(out, whole, bx, by, bw, bh, c4((0x30, 0x36, 0x3d), 255));
-            let seg = [Seg { text: label.into(), fg: r.fg, style: ST_BOLD }];
+            let seg = [Seg { text: glyph.into(), fg: r.fg, style: ST_BOLD }];
             let lw = r.measure(&seg, false);
+            let gy = by + ((bh as f32 - r.cell_h) / 2.0) as i32;
             r.draw_run(&seg, false, out, whole,
-                       bx as f32 + (bw as f32 - lw) / 2.0, by + 2, 1.0);
+                       bx as f32 + (bw as f32 - lw) / 2.0, gy, 1.0);
         };
-        // green value text centered between two stepper buttons
         let draw_val = |r: &mut Self, out: &mut Vec<Vertex>, text: String,
-                        left: Rect, right: Rect, ly: i32| {
-            let seg = [Seg { text, fg: (0x7e, 0xe7, 0x87), style: ST_BOLD }];
+                        left: Rect, right: Rect, row_top: i32| {
+            let seg = [Seg { text, fg: VALUE, style: ST_BOLD }];
             let vw = r.measure(&seg, false);
             let mid = (left.0 + left.2 + right.0) / 2;
-            r.draw_run(&seg, false, out, whole, mid as f32 - vw / 2.0, ly, 1.0);
+            r.draw_run(&seg, false, out, whole, mid as f32 - vw / 2.0, row_top + tc, 1.0);
         };
         let draw_toggle = |out: &mut Vec<Vertex>, rect: Rect, on: bool| {
             let (gx, gy, gw, gh) = rect;
-            let track = if on { (0x2e, 0xa0, 0x43) } else { (0x30, 0x36, 0x3d) };
-            push_rect(out, whole, gx, gy, gw, gh, c4(track, 255));
-            let knob = gh - 6;
-            let kx = if on { gx + gw - knob - 3 } else { gx + 3 };
-            push_rect(out, whole, kx, gy + 3, knob, knob, c4((0xff, 0xff, 0xff), 255));
+            let track = if on { GREEN } else { CTL_BG };
+            bordered(out, rect, track, if on { GREEN } else { EDGE });
+            let knob = gh - 8;
+            let kx = if on { gx + gw - knob - 4 } else { gx + 4 };
+            let kc = if on { (0xff, 0xff, 0xff) } else { (0x8a, 0x94, 0xa3) };
+            push_rect(out, whole, kx, gy + 4, knob, knob, c4(kc, 255));
         };
 
         // ---- font family cycler ----
-        label(self, out, "الخطّ", lay.font_label_y + 6);
+        let ll = label(self, out, "الخطّ", lay.font_label_y);
+        leader(out, lay.font_next.0 + lay.font_next.2, ll, lay.font_label_y);
         draw_btn(self, out, lay.font_prev, "‹");
         draw_btn(self, out, lay.font_next, "›");
         draw_val(self, out, v.font_family.to_string(),
-                 lay.font_prev, lay.font_next, lay.font_label_y + 6);
+                 lay.font_prev, lay.font_next, lay.font_label_y);
 
         // ---- font size stepper ----
-        label(self, out, "حجم الخطّ", lay.size_label_y + 6);
+        let ll = label(self, out, "حجم الخطّ", lay.size_label_y);
+        leader(out, lay.size_plus.0 + lay.size_plus.2, ll, lay.size_label_y);
         draw_btn(self, out, lay.size_minus, "−");
         draw_btn(self, out, lay.size_plus, "+");
         draw_val(self, out, format!("{}", v.font_size),
-                 lay.size_minus, lay.size_plus, lay.size_label_y + 6);
+                 lay.size_minus, lay.size_plus, lay.size_label_y);
 
         // ---- cursor shape swatches (block / bar / underline) ----
-        label(self, out, "المؤشّر", lay.cursor_label_y + 6);
+        let ll = label(self, out, "المؤشّر", lay.cursor_label_y);
+        let lastc = lay.cursor_btns[2];
+        leader(out, lastc.0 + lastc.2, ll, lay.cursor_label_y);
         for (i, &(bx, by, bw, bh)) in lay.cursor_btns.iter().enumerate() {
             let active = crate::config::CursorStyle::ALL[i] == v.cursor;
-            let bgc = if active { (0x1f, 0x3a, 0x2a) } else { (0x30, 0x36, 0x3d) };
-            push_rect(out, whole, bx, by, bw, bh, c4(bgc, 255));
-            if active {
-                push_rect(out, whole, bx, by + bh - 2, bw, 2, c4((0x2e, 0xa0, 0x43), 255));
-            }
+            bordered(out, (bx, by, bw, bh),
+                     if active { GREEN_DIM } else { CTL_BG },
+                     if active { GREEN } else { EDGE });
             // the shape itself, drawn as rects — no glyphs to go missing
-            let c = c4(self.fg, 255);
+            let c = c4(if active { (0xff, 0xff, 0xff) } else { MUTED }, 255);
             match crate::config::CursorStyle::ALL[i] {
                 crate::config::CursorStyle::Block =>
                     push_rect(out, whole, bx + 8, by + 7, bw - 16, bh - 14, c),
@@ -1469,7 +1530,8 @@ impl Renderer {
         }
 
         // ---- scrollback stepper (new tabs only) ----
-        label(self, out, "سجلّ التمرير (التبويبات الجديدة)", lay.scroll_label_y + 6);
+        let ll = label(self, out, "سجلّ التمرير (التبويبات الجديدة)", lay.scroll_label_y);
+        leader(out, lay.scroll_plus.0 + lay.scroll_plus.2, ll, lay.scroll_label_y);
         draw_btn(self, out, lay.scroll_minus, "−");
         draw_btn(self, out, lay.scroll_plus, "+");
         let sb = if v.scrollback % 1000 == 0 {
@@ -1477,32 +1539,41 @@ impl Renderer {
         } else {
             format!("{}", v.scrollback)
         };
-        draw_val(self, out, sb, lay.scroll_minus, lay.scroll_plus, lay.scroll_label_y + 6);
+        draw_val(self, out, sb, lay.scroll_minus, lay.scroll_plus, lay.scroll_label_y);
 
         // ---- copy-on-select / ligatures toggles ----
-        label(self, out, "النسخ عند التحديد", lay.copy_label_y + 6);
+        let ll = label(self, out, "النسخ عند التحديد", lay.copy_label_y);
+        leader(out, lay.copy_toggle.0 + lay.copy_toggle.2, ll, lay.copy_label_y);
         draw_toggle(out, lay.copy_toggle, v.copy_on_select);
-        label(self, out, "الأربطة", lay.liga_label_y + 6);
+        let ll = label(self, out, "الأربطة", lay.liga_label_y);
+        leader(out, lay.liga_toggle.0 + lay.liga_toggle.2, ll, lay.liga_label_y);
         draw_toggle(out, lay.liga_toggle, v.ligatures);
 
-        // ---- bell mode cycler ----
-        label(self, out, "الجرس", lay.bell_label_y + 6);
-        let (bx, by, bw, bh) = lay.bell_btn;
-        push_rect(out, whole, bx, by, bw, bh, c4((0x30, 0x36, 0x3d), 255));
-        let bell_txt = match v.bell {
-            crate::config::BellMode::Attention => "تنبيه",
-            crate::config::BellMode::Sound => "صوت",
-            crate::config::BellMode::Silent => "صامت",
-        };
-        let seg = [Seg { text: bell_txt.into(), fg: (0x7e, 0xe7, 0x87), style: ST_BOLD }];
-        let lw = self.measure(&seg, true);
-        self.draw_run(&seg, true, out, whole,
-                      bx as f32 + (bw as f32 - lw) / 2.0, by + 2, 1.0);
+        // ---- bell: segmented, all three options visible ----
+        let ll = label(self, out, "الجرس", lay.bell_label_y);
+        let lastb = lay.bell_btns[2];
+        leader(out, lastb.0 + lastb.2, ll, lay.bell_label_y);
+        let names = ["صامت", "صوت", "تنبيه"];
+        for (i, &(bx, by, bw, bh)) in lay.bell_btns.iter().enumerate() {
+            let active = BELL_SEGMENTS[i] == v.bell;
+            bordered(out, (bx, by, bw, bh),
+                     if active { GREEN_DIM } else { CTL_BG },
+                     if active { GREEN } else { EDGE });
+            let fg = if active { (0xff, 0xff, 0xff) } else { MUTED };
+            let seg = [Seg { text: names[i].into(), fg, style: if active { ST_BOLD } else { 0 } }];
+            let lw = self.measure(&seg, true);
+            let gy = by + ((bh as f32 - self.cell_h) / 2.0) as i32;
+            self.draw_run(&seg, true, out, whole,
+                          bx as f32 + (bw as f32 - lw) / 2.0, gy, 1.0);
+        }
 
-        // footer hint
-        let hint = [Seg::plain("انقر للتغيير · Esc للإغلاق والحفظ", (0x8a, 0x94, 0xa3))];
+        // footer: hairline + hint
+        push_rect(out, whole, x + pad, y + h - (self.cell_h as i32 + 24), w - pad * 2, 1,
+                  c4(EDGE, 255));
+        let hint = [Seg::plain("انقر للتغيير · Esc للإغلاق والحفظ", (0x6e, 0x78, 0x85))];
         let fw2 = self.measure(&hint, true);
-        self.draw_run(&hint, true, out, whole, (x + w - 20) as f32 - fw2, y + h - 28, 1.0);
+        self.draw_run(&hint, true, out, whole, (x + w - pad) as f32 - fw2,
+                      y + h - (self.cell_h as i32 + 14), 1.0);
     }
 
     /// The paste guard (EasyTer's protection): a multi-line/huge paste can
@@ -1911,9 +1982,10 @@ mod cache_tests {
             lay.font_prev, lay.font_next,
             lay.size_minus, lay.size_plus,
             lay.scroll_minus, lay.scroll_plus,
-            lay.copy_toggle, lay.liga_toggle, lay.bell_btn,
+            lay.copy_toggle, lay.liga_toggle,
         ];
         controls.extend(lay.cursor_btns);
+        controls.extend(lay.bell_btns);
         for (i, &(rx, ry, rw, rh)) in controls.iter().enumerate() {
             assert!(rx >= cx && rx + rw <= cx + cw && ry >= cy && ry + rh <= cy + ch,
                     "control {i} escapes the card");

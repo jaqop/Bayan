@@ -519,10 +519,9 @@ impl App {
         self.request_redraw();
     }
 
-    fn cycle_bell(&mut self) {
-        let next = self.config.bell_mode().next();
-        self.config.bell = Some(next.as_str().to_string());
-        if next == config::BellMode::Sound {
+    fn set_bell(&mut self, mode: config::BellMode) {
+        self.config.bell = Some(mode.as_str().to_string());
+        if mode == config::BellMode::Sound {
             beep(); // preview the mode you just picked
         }
         self.request_redraw();
@@ -572,8 +571,10 @@ impl App {
             self.toggle_copy_on_select();
         } else if render::rect_hit(lay.liga_toggle, px, py) {
             self.toggle_ligatures();
-        } else if render::rect_hit(lay.bell_btn, px, py) {
-            self.cycle_bell();
+        } else if let Some(i) =
+            lay.bell_btns.iter().position(|&b| render::rect_hit(b, px, py))
+        {
+            self.set_bell(render::BELL_SEGMENTS[i]);
         }
     }
 
