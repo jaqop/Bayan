@@ -19,6 +19,31 @@ use crate::UserEvent;
 pub const DEFAULT_SHELL: &str = "powershell.exe";
 const MAX_CARRY: usize = 4096;
 
+/// Shells the settings panel offers — the installed subset of the usual
+/// Windows trio. PowerShell 5 and cmd ship with Windows; pwsh 7 only
+/// appears when it's actually on PATH.
+pub fn shell_choices() -> Vec<String> {
+    let mut out = vec![DEFAULT_SHELL.to_string()];
+    let on_path = |exe: &str| {
+        std::env::var_os("PATH").is_some_and(|p| {
+            std::env::split_paths(&p).any(|d| d.join(exe).is_file())
+        })
+    };
+    if on_path("pwsh.exe") {
+        out.push("pwsh.exe".to_string());
+    }
+    out.push("cmd.exe".to_string());
+    out
+}
+
+/// The PowerShell family gets the full treatment (UTF-8, prompt theme,
+/// OSC 133 marks); other shells launch bare and the mark-driven features
+/// (command lights, prompt jumps, Claude auto-detect) degrade gracefully.
+fn is_powershell(shell: &str) -> bool {
+    let base = shell.rsplit(['\\', '/']).next().unwrap_or(shell);
+    base.eq_ignore_ascii_case("powershell.exe") || base.eq_ignore_ascii_case("pwsh.exe")
+}
+
 /// OSC 133 prompt wrapper injected into PowerShell (EasyTer's __et_wrap,
 /// ported): D=command end (exit code), A=prompt start, 9;9=cwd report,
 /// B=input begins. Command detection — and Claude mode's auto-enable —
@@ -446,6 +471,7 @@ impl Session {
         id: u64,
         start_cwd: Option<&str>,
         scrollback: usize,
+        shell: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let pty = native_pty_system();
         let pair = pty.openpty(PtySize {
@@ -454,7 +480,7 @@ impl Session {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        let mut cmd = CommandBuilder::new(DEFAULT_SHELL);
+        let mut cmd = CommandBuilder::new(shell);
         // requested dir (a restored tab, or "new tab inherits the cwd"),
         // else home — never the launcher's directory (often system32)
         match start_cwd.filter(|d| std::path::Path::new(d).is_dir()) {
@@ -465,25 +491,30 @@ impl Session {
                 }
             }
         }
-        // -NoProfile: the profile is seconds of avoidable startup (it re-runs
-        // oh-my-posh, chcp, modules). Self-provide what it gave us: UTF-8
-        // (Arabic!) and the user's own prompt theme, auto-detected.
-        cmd.args(["-NoProfile", "-NoExit", "-Command"]);
-        let mut setup = String::from(
-            "$OutputEncoding=[Console]::InputEncoding=[Console]::OutputEncoding=\
-             [Text.UTF8Encoding]::new();",
-        );
-        if let Some(theme) = detect_posh_theme() {
-            setup.push_str(&format!(
-                " $ErrorActionPreference='SilentlyContinue'; \
-                 & {{oh-my-posh init powershell --config '{}' | Invoke-Expression}} 2>$null; \
-                 $ErrorActionPreference='Continue';",
-                theme.replace('\'', "''")
-            ));
+        if is_powershell(shell) {
+            // -NoProfile: the profile is seconds of avoidable startup (it
+            // re-runs oh-my-posh, chcp, modules). Self-provide what it gave
+            // us: UTF-8 (Arabic!) and the user's prompt theme, auto-detected.
+            cmd.args(["-NoProfile", "-NoExit", "-Command"]);
+            let mut setup = String::from(
+                "$OutputEncoding=[Console]::InputEncoding=[Console]::OutputEncoding=\
+                 [Text.UTF8Encoding]::new();",
+            );
+            if let Some(theme) = detect_posh_theme() {
+                setup.push_str(&format!(
+                    " $ErrorActionPreference='SilentlyContinue'; \
+                     & {{oh-my-posh init powershell --config '{}' | Invoke-Expression}} 2>$null; \
+                     $ErrorActionPreference='Continue';",
+                    theme.replace('\'', "''")
+                ));
+            }
+            setup.push(' ');
+            setup.push_str(PS_MARKS);
+            cmd.arg(setup);
+        } else if shell.eq_ignore_ascii_case("cmd.exe") {
+            // UTF-8 code page so Arabic paths survive; no OSC 133 marks
+            cmd.args(["/K", "chcp 65001>nul"]);
         }
-        setup.push(' ');
-        setup.push_str(PS_MARKS);
-        cmd.arg(setup);
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader()?;
@@ -654,6 +685,19 @@ mod tests {
             dropped_path_arg(Path::new(r"C:\My Files\doc.txt")),
             "\"C:\\My Files\\doc.txt\" "
         );
+    }
+
+    #[test]
+    fn shell_choices_are_the_installed_trio() {
+        let c = shell_choices();
+        assert_eq!(c[0], DEFAULT_SHELL, "PowerShell 5 leads (always present)");
+        assert!(c.contains(&"cmd.exe".to_string()));
+        assert!(c.len() <= 3);
+        // family detection drives the setup injection
+        assert!(is_powershell("powershell.exe"));
+        assert!(is_powershell(r"C:\Program Files\PowerShell\7\pwsh.exe"));
+        assert!(!is_powershell("cmd.exe"));
+        assert!(!is_powershell("nu.exe"));
     }
 
     #[test]

@@ -46,6 +46,24 @@ pub struct UserConfig {
     /// (dot + system beep), "silent" (nothing).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bell: Option<String>,
+    /// Window opacity 0.5–1.0 (Windows layered-window alpha: the whole
+    /// window, text included). Default 1.0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f32>,
+    /// Default shell program for NEW tabs: "powershell.exe" (default),
+    /// "pwsh.exe", "cmd.exe". Live sessions keep their shell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    /// Hide the tab bar while only one tab is open (default off).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hide_single_tab: Option<bool>,
+    /// Ask before closing a pane/window whose command is still running
+    /// (default on).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirm_close: Option<bool>,
+    /// Padding in px between the window edges and the terminal content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub padding: Option<u32>,
 }
 
 /// Cursor shape (the trio every terminal offers: block / bar / underline).
@@ -107,8 +125,10 @@ impl BellMode {
 }
 
 pub const DEFAULT_SCROLLBACK: usize = 10_000;
-/// The −/+ stepper in the settings panel walks these.
+/// The −/+ steppers in the settings panel walk these.
 pub const SCROLLBACK_STEPS: [usize; 6] = [1_000, 5_000, 10_000, 20_000, 50_000, 100_000];
+pub const OPACITY_STEPS: [u32; 6] = [50, 60, 70, 80, 90, 100]; // percent
+pub const PADDING_STEPS: [u32; 6] = [0, 4, 8, 12, 16, 24]; // px
 
 impl UserConfig {
     pub fn cursor(&self) -> CursorStyle {
@@ -126,6 +146,27 @@ impl UserConfig {
 
     pub fn copy_on_select_on(&self) -> bool {
         self.copy_on_select.unwrap_or(true)
+    }
+
+    /// 0.5..=1.0 — anything outside is a typo, not a wish for invisibility.
+    pub fn opacity_level(&self) -> f32 {
+        self.opacity.unwrap_or(1.0).clamp(0.5, 1.0)
+    }
+
+    pub fn shell_program(&self) -> String {
+        self.shell.clone().unwrap_or_else(|| "powershell.exe".to_string())
+    }
+
+    pub fn hide_single_tab_on(&self) -> bool {
+        self.hide_single_tab.unwrap_or(false)
+    }
+
+    pub fn confirm_close_on(&self) -> bool {
+        self.confirm_close.unwrap_or(true)
+    }
+
+    pub fn padding_px(&self) -> i32 {
+        self.padding.unwrap_or(0).min(32) as i32
     }
 }
 
@@ -217,6 +258,31 @@ mod tests {
         for s in CursorStyle::ALL {
             assert_eq!(CursorStyle::parse(s.as_str()), s);
         }
+    }
+
+    #[test]
+    fn batch_two_settings_resolve_with_defaults() {
+        let d = UserConfig::default();
+        assert_eq!(d.opacity_level(), 1.0);
+        assert_eq!(d.shell_program(), "powershell.exe");
+        assert!(!d.hide_single_tab_on());
+        assert!(d.confirm_close_on());
+        assert_eq!(d.padding_px(), 0);
+        let c: UserConfig = serde_json::from_str(
+            r#"{"opacity":0.8,"shell":"pwsh.exe","hide_single_tab":true,
+                "confirm_close":false,"padding":12}"#,
+        )
+        .unwrap();
+        assert_eq!(c.opacity_level(), 0.8);
+        assert_eq!(c.shell_program(), "pwsh.exe");
+        assert!(c.hide_single_tab_on());
+        assert!(!c.confirm_close_on());
+        assert_eq!(c.padding_px(), 12);
+        // out-of-range values clamp instead of vanishing the window
+        let wild: UserConfig =
+            serde_json::from_str(r#"{"opacity":0.05,"padding":500}"#).unwrap();
+        assert_eq!(wild.opacity_level(), 0.5);
+        assert_eq!(wild.padding_px(), 32);
     }
 
     #[test]

@@ -19,6 +19,15 @@ fn hex((r, g, b): (u8, u8, u8)) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
 }
 
+/// What the close guard is protecting (confirm_close setting).
+#[derive(Clone, Copy)]
+enum CloseTarget {
+    /// the focused pane of tab .0 (Ctrl+Shift+W)
+    Pane(usize, usize),
+    /// the whole window (the titlebar X)
+    Window,
+}
+
 /// The system notification sound (bell mode "sound"). Async — never blocks
 /// the UI thread.
 fn beep() {
@@ -396,6 +405,8 @@ struct App {
     cockpit_sel: usize,
     /// a big paste awaiting Enter/Esc (EasyTer's paste guard)
     pending_paste: Option<String>,
+    /// a close awaiting Enter/Esc (a command is still running)
+    pending_close: Option<CloseTarget>,
     /// the settings panel (Ctrl+,) with its selected row, when open
     settings: Option<usize>,
     /// window focus (finish notifications only fire when nobody's looking)
@@ -527,6 +538,92 @@ impl App {
         self.request_redraw();
     }
 
+    /// Step to the previous/next installed shell. New tabs only.
+    fn cycle_shell(&mut self, dir: i32) {
+        let choices = term::shell_choices();
+        if choices.len() < 2 {
+            return;
+        }
+        let cur = self.config.shell_program();
+        let i = choices.iter().position(|c| *c == cur).unwrap_or(0) as i32;
+        let n = choices.len() as i32;
+        self.config.shell = Some(choices[(((i + dir) % n + n) % n) as usize].clone());
+        self.request_redraw();
+    }
+
+    fn change_padding(&mut self, dir: i32) {
+        let cur = self.config.padding_px() as u32;
+        let steps = config::PADDING_STEPS;
+        let i = steps.iter().position(|&s| s >= cur).unwrap_or(steps.len() - 1) as i32;
+        let j = (i + dir).clamp(0, steps.len() as i32 - 1) as usize;
+        self.config.padding = Some(steps[j]);
+        self.relayout_active(); // pane rects (and PTY sizes) follow the inset
+        self.request_redraw();
+    }
+
+    fn change_opacity(&mut self, dir: i32) {
+        let cur = (self.config.opacity_level() * 100.0).round() as u32;
+        let steps = config::OPACITY_STEPS;
+        let i = steps.iter().position(|&s| s >= cur).unwrap_or(steps.len() - 1) as i32;
+        let j = (i + dir).clamp(0, steps.len() as i32 - 1) as usize;
+        self.config.opacity = Some(steps[j] as f32 / 100.0);
+        self.apply_opacity();
+        self.request_redraw();
+    }
+
+    /// Window opacity via the layered-window alpha (whole window, text
+    /// included — per-pixel background alpha needs a transparent swapchain,
+    /// which DX12 flip-model doesn't offer wgpu today).
+    fn apply_opacity(&self) {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let Some(w) = &self.window else { return };
+        let Ok(handle) = w.window_handle() else { return };
+        let RawWindowHandle::Win32(h) = handle.as_raw() else { return };
+        let hwnd = h.hwnd.get() as windows_sys::Win32::Foundation::HWND;
+        let alpha = (self.config.opacity_level() * 255.0).round() as u8;
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW,
+                GWL_EXSTYLE, LWA_ALPHA, WS_EX_LAYERED,
+            };
+            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            if alpha == 255 {
+                // fully opaque: drop the layered style (no compositing tax)
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & !(WS_EX_LAYERED as isize));
+            } else {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED as isize);
+                SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+            }
+        }
+    }
+
+    fn toggle_hide_bar(&mut self) {
+        self.config.hide_single_tab = Some(!self.config.hide_single_tab_on());
+        self.relayout_active(); // the content area gains/loses the bar strip
+        self.request_redraw();
+    }
+
+    fn toggle_confirm_close(&mut self) {
+        self.config.confirm_close = Some(!self.config.confirm_close_on());
+        self.request_redraw();
+    }
+
+    /// The focused pane's running command, if any (drives the close guard).
+    fn running_command(&self, ti: usize, pi: usize) -> Option<String> {
+        let pane = self.tabs.get(ti)?.panes.get(pi)?;
+        let cmd = pane.session.meta.lock().unwrap().running_cmd.clone();
+        (!cmd.is_empty()).then_some(cmd)
+    }
+
+    /// How many panes across all tabs are mid-command right now.
+    fn running_count(&self) -> usize {
+        self.tabs
+            .iter()
+            .flat_map(|t| &t.panes)
+            .filter(|p| !p.session.meta.lock().unwrap().running_cmd.is_empty())
+            .count()
+    }
+
     fn close_settings(&mut self) {
         self.settings = None;
         config::save(&self.config); // persist on close
@@ -575,6 +672,22 @@ impl App {
             lay.bell_btns.iter().position(|&b| render::rect_hit(b, px, py))
         {
             self.set_bell(render::BELL_SEGMENTS[i]);
+        } else if render::rect_hit(lay.pad_minus, px, py) {
+            self.change_padding(-1);
+        } else if render::rect_hit(lay.pad_plus, px, py) {
+            self.change_padding(1);
+        } else if render::rect_hit(lay.opacity_minus, px, py) {
+            self.change_opacity(-1);
+        } else if render::rect_hit(lay.opacity_plus, px, py) {
+            self.change_opacity(1);
+        } else if render::rect_hit(lay.shell_prev, px, py) {
+            self.cycle_shell(-1);
+        } else if render::rect_hit(lay.shell_next, px, py) {
+            self.cycle_shell(1);
+        } else if render::rect_hit(lay.bar_toggle, px, py) {
+            self.toggle_hide_bar();
+        } else if render::rect_hit(lay.close_toggle, px, py) {
+            self.toggle_confirm_close();
         }
     }
 
@@ -708,7 +821,8 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
         match Session::spawn(self.size, self.proxy.clone(), id, cwd,
-                             self.config.scrollback_lines()) {
+                             self.config.scrollback_lines(),
+                             &self.config.shell_program()) {
             Ok(session) => Some(Pane { id, session, last_output: None }),
             Err(e) => {
                 eprintln!("bayan: spawn failed: {e}");
@@ -745,7 +859,14 @@ impl App {
         };
         let px = w.inner_size();
         let bar = r.tab_bar_h().round() as i32;
-        let content = (0, bar, px.width as i32, px.height as i32 - bar);
+        // the padding setting insets the whole content area evenly
+        let pad = self.config.padding_px();
+        let content = (
+            pad,
+            bar + pad,
+            (px.width as i32 - pad * 2).max(1),
+            (px.height as i32 - bar - pad * 2).max(1),
+        );
         split_rects(content, &t.weights, t.orientation)
     }
 
@@ -806,6 +927,11 @@ impl App {
     /// Resize every pane of the ACTIVE tab to its rect (background tabs
     /// re-layout when they become active — the standard terminal tradeoff).
     fn relayout_active(&mut self) {
+        // resolve "hide the bar with one tab" BEFORE measuring the content
+        let hide = self.config.hide_single_tab_on() && self.tabs.len() <= 1;
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_bar_hidden(hide);
+        }
         let rects = self.pane_rects();
         let Some(r) = self.renderer.as_ref() else { return };
         let (cw, ch) = (r.cell_w, r.cell_h);
@@ -1167,6 +1293,11 @@ impl App {
     }
 
     fn redraw(&mut self) {
+        // the bar's visibility is a per-frame fact (tab count × setting)
+        let hide = self.config.hide_single_tab_on() && self.tabs.len() <= 1;
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_bar_hidden(hide);
+        }
         // computed before the gpu/renderer borrows (they read &self broadly)
         let cockpit_entries = if self.cockpit {
             self.cockpit_entries()
@@ -1183,6 +1314,15 @@ impl App {
             .map(|r| r.family().to_string())
             .unwrap_or_default();
         let cursor_style = self.config.cursor();
+        let close_msg: Option<String> = self.pending_close.map(|target| match target {
+            CloseTarget::Pane(ti, pi) => {
+                let cmd = self.running_command(ti, pi).unwrap_or_default();
+                format!("الأمر «{cmd}» ما يزال يعمل — إغلاق اللوحة؟")
+            }
+            CloseTarget::Window => {
+                format!("{} أمر ما يزال يعمل — إغلاق بيان؟", self.running_count())
+            }
+        });
         let rects = self.pane_rects();
         let tab_infos: Vec<render::TabInfo> = self
             .tabs
@@ -1279,6 +1419,12 @@ impl App {
                             copy_on_select: self.config.copy_on_select_on(),
                             ligatures: self.config.ligatures.unwrap_or(true),
                             bell: self.config.bell_mode(),
+                            padding: self.config.padding_px(),
+                            opacity_pct: (self.config.opacity_level() * 100.0).round()
+                                as i32,
+                            shell: &self.config.shell_program(),
+                            hide_single_tab: self.config.hide_single_tab_on(),
+                            confirm_close: self.config.confirm_close_on(),
                         },
                     );
                 }
@@ -1292,6 +1438,14 @@ impl App {
                             chars,
                         );
                     }
+                }
+                if let Some(msg) = &close_msg {
+                    renderer.draw_close_guard(
+                        &mut verts,
+                        px.width as usize,
+                        px.height as usize,
+                        msg,
+                    );
                 }
             }
             // renderer still warming up on its thread: clear-only dark frame
@@ -1343,6 +1497,9 @@ impl App {
         if !self.first_frame {
             self.first_frame = true;
             window.set_visible(true);
+            // winit reapplies ITS OWN style flags on visibility changes,
+            // wiping the layered bit — restore the configured alpha after
+            self.apply_opacity();
             crate::prof::mark("first frame presented");
         }
     }
@@ -1369,6 +1526,7 @@ impl ApplicationHandler<UserEvent> for App {
         crate::prof::mark("gpu ready");
         self.gpu = Some(gpu);
         self.window = Some(window.clone());
+        self.apply_opacity(); // the configured window alpha, from frame one
         // first frame NOW: a dark window on screen beats a frozen launcher.
         // The shell and the font system warm up behind it, in parallel.
         self.redraw();
@@ -1517,6 +1675,7 @@ impl ApplicationHandler<UserEvent> for App {
                     w.set_visible(true);
                     w.set_minimized(false);
                     w.focus_window();
+                    self.apply_opacity(); // set_visible wipes the layered bit
                 }
             }
         }
@@ -1540,6 +1699,15 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
+                // a running command deserves a second look before the kill
+                if self.config.confirm_close_on()
+                    && self.pending_close.is_none()
+                    && self.running_count() > 0
+                {
+                    self.pending_close = Some(CloseTarget::Window);
+                    self.request_redraw();
+                    return;
+                }
                 self.save_state(); // tabs + cwds greet you tomorrow
                 el.exit();
             }
@@ -1746,6 +1914,25 @@ impl ApplicationHandler<UserEvent> for App {
                     "key logical={:?} physical={:?} text={:?} ctrl={ctrl} shift={shift}",
                     event.logical_key, event.physical_key, event.text
                 ));
+                // a pending close owns the keyboard: Enter closes, Esc keeps
+                if let Some(target) = self.pending_close {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Enter) => {
+                            self.pending_close = None;
+                            match target {
+                                CloseTarget::Pane(ti, pi) => self.remove_pane(ti, pi, el),
+                                CloseTarget::Window => {
+                                    self.save_state();
+                                    el.exit();
+                                }
+                            }
+                        }
+                        Key::Named(NamedKey::Escape) => self.pending_close = None,
+                        _ => {}
+                    }
+                    self.request_redraw();
+                    return;
+                }
                 // a pending paste owns the keyboard: Enter sends, Esc drops
                 if self.pending_paste.is_some() {
                     match &event.logical_key {
@@ -1832,6 +2019,13 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.active,
                                 self.tabs.get(self.active).map_or(0, |t| t.focused),
                             );
+                            if self.config.confirm_close_on()
+                                && self.running_command(ti, pi).is_some()
+                            {
+                                self.pending_close = Some(CloseTarget::Pane(ti, pi));
+                                self.request_redraw();
+                                return;
+                            }
                             self.remove_pane(ti, pi, el);
                             return;
                         }
@@ -2017,6 +2211,7 @@ fn main() {
         cockpit: false,
         cockpit_sel: 0,
         pending_paste: None,
+        pending_close: None,
         settings: None,
         focused: true,
         clicks: ClickTracker::new(),

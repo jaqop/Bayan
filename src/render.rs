@@ -429,6 +429,19 @@ pub struct SettingsLayout {
     pub bell_label_y: i32,
     /// segmented control, left→right: [صامت, صوت, تنبيه] (RTL: تنبيه first)
     pub bell_btns: [Rect; 3],
+    pub pad_label_y: i32,
+    pub pad_minus: Rect,
+    pub pad_plus: Rect,
+    pub opacity_label_y: i32,
+    pub opacity_minus: Rect,
+    pub opacity_plus: Rect,
+    pub shell_label_y: i32,
+    pub shell_prev: Rect,
+    pub shell_next: Rect,
+    pub bar_label_y: i32,
+    pub bar_toggle: Rect,
+    pub close_label_y: i32,
+    pub close_toggle: Rect,
 }
 
 /// The bell segments' modes in bell_btns order (left→right on screen, so
@@ -449,6 +462,11 @@ pub struct SettingsView<'a> {
     pub copy_on_select: bool,
     pub ligatures: bool,
     pub bell: crate::config::BellMode,
+    pub padding: i32,
+    pub opacity_pct: i32,
+    pub shell: &'a str,
+    pub hide_single_tab: bool,
+    pub confirm_close: bool,
 }
 
 /// Is (px, py) inside a rect?
@@ -649,6 +667,9 @@ pub struct Renderer {
     /// ligatures on: ASCII shapes as one run (rustybuzz forms -> => != ...).
     /// off: ASCII shapes per cell, so no substitutions can occur.
     ligatures: bool,
+    /// hide-tab-bar-with-one-tab, resolved per frame by the app (the
+    /// renderer can't know the tab count)
+    bar_hidden: bool,
     pub cell_w: f32,
     pub cell_h: f32,
 }
@@ -713,9 +734,15 @@ impl Renderer {
             fg,
             palette,
             ligatures,
+            bar_hidden: false,
             cell_w,
             cell_h: metrics.line_height,
         }
+    }
+
+    /// The app resolves "hide the bar with a single tab" each layout pass.
+    pub fn set_bar_hidden(&mut self, hidden: bool) {
+        self.bar_hidden = hidden;
     }
 
     /// The primary family actually in use (post-fallback) — what the
@@ -833,8 +860,13 @@ impl Renderer {
     }
 
     /// Height of the tab bar in pixels — pane content starts below it.
+    /// Zero while hidden (single tab + the hide_single_tab setting).
     pub fn tab_bar_h(&self) -> f32 {
-        self.cell_h + 10.0
+        if self.bar_hidden {
+            0.0
+        } else {
+            self.cell_h + 10.0
+        }
     }
 
     /// Natural width of a run (shaping it into the cache if new).
@@ -1297,8 +1329,8 @@ impl Renderer {
         // controls left, labels right (RTL), one shared control height.
         let pad = 24;
         let w = ((self.cell_w * 52.0) as i32).clamp(430, fw as i32 - 60);
-        let rowh = (self.cell_h + 24.0) as i32;
-        let ctl = rowh - 12; // every square control is this tall
+        let rowh = (self.cell_h + 20.0) as i32; // 12 rows now — keep them tight
+        let ctl = rowh - 10; // every square control is this tall
         let head_h = (self.cell_h + 30.0) as i32;
         let foot_h = (self.cell_h + 30.0) as i32;
         // the theme row obeys the same grammar: tiles left, label right,
@@ -1307,7 +1339,7 @@ impl Renderer {
         let tile_w = ((w - pad * 2 - label_reserve - 6 * 6) / 7).max(30);
         let tile_h = (self.cell_h * 1.6) as i32;
         let theme_rowh = tile_h + 14;
-        let h = head_h + 6 + theme_rowh + rowh * 7 + foot_h;
+        let h = head_h + 6 + theme_rowh + rowh * 12 + foot_h;
         let x = (fw as i32 - w) / 2;
         let y = (self.tab_bar_h() as i32 + (fh as i32 - h) / 3)
             .max(self.tab_bar_h() as i32 + 12);
@@ -1343,20 +1375,42 @@ impl Renderer {
         let scroll_minus = (x + pad, cy(scroll_y), ctl, ctl);
         let scroll_plus = (x + pad + ctl + scroll_slot, cy(scroll_y), ctl, ctl);
 
+        // padding / opacity: the same stepper shape
+        let pad_y = row_y(4);
+        let pad_slot = (self.cell_w * 4.0) as i32;
+        let pad_minus = (x + pad, cy(pad_y), ctl, ctl);
+        let pad_plus = (x + pad + ctl + pad_slot, cy(pad_y), ctl, ctl);
+        let opacity_y = row_y(5);
+        let op_slot = (self.cell_w * 5.0) as i32;
+        let opacity_minus = (x + pad, cy(opacity_y), ctl, ctl);
+        let opacity_plus = (x + pad + ctl + op_slot, cy(opacity_y), ctl, ctl);
+
         // copy-on-select / ligatures: toggle pills (wide and shallow, so
         // the track reads as a switch, not a filled box)
         let pill_w = (self.cell_w * 4.2) as i32;
-        let pill_h = ctl - 10;
+        let pill_h = ctl - 8;
         let pcy = |ry: i32| ry + (rowh - pill_h) / 2;
-        let copy_y = row_y(4);
+        let copy_y = row_y(6);
         let copy_toggle = (x + pad, pcy(copy_y), pill_w, pill_h);
-        let liga_y = row_y(5);
+        let liga_y = row_y(7);
         let liga_toggle = (x + pad, pcy(liga_y), pill_w, pill_h);
 
         // bell: a three-segment control (all options visible, one active)
-        let bell_y = row_y(6);
+        let bell_y = row_y(8);
         let seg_w = (self.cell_w * 4.6) as i32;
         let bell_btns = [0, 1, 2].map(|i| (x + pad + i * (seg_w + 6), cy(bell_y), seg_w, ctl));
+
+        // shell cycler (new tabs only) — same shape as the font cycler
+        let shell_y = row_y(9);
+        let shell_w = (self.cell_w * 12.0) as i32;
+        let shell_prev = (x + pad, cy(shell_y), ctl, ctl);
+        let shell_next = (x + pad + ctl + shell_w, cy(shell_y), ctl, ctl);
+
+        // hide-bar / confirm-close toggles
+        let bar_y = row_y(10);
+        let bar_toggle = (x + pad, pcy(bar_y), pill_w, pill_h);
+        let close_y = row_y(11);
+        let close_toggle = (x + pad, pcy(close_y), pill_w, pill_h);
 
         SettingsLayout {
             card: (x, y, w, h),
@@ -1380,6 +1434,19 @@ impl Renderer {
             liga_toggle,
             bell_label_y: bell_y,
             bell_btns,
+            pad_label_y: pad_y,
+            pad_minus,
+            pad_plus,
+            opacity_label_y: opacity_y,
+            opacity_minus,
+            opacity_plus,
+            shell_label_y: shell_y,
+            shell_prev,
+            shell_next,
+            bar_label_y: bar_y,
+            bar_toggle,
+            close_label_y: close_y,
+            close_toggle,
         }
     }
 
@@ -1541,6 +1608,20 @@ impl Renderer {
         };
         draw_val(self, out, sb, lay.scroll_minus, lay.scroll_plus, lay.scroll_label_y);
 
+        // ---- padding / opacity steppers ----
+        let ll = label(self, out, "الحواشي", lay.pad_label_y);
+        leader(out, lay.pad_plus.0 + lay.pad_plus.2, ll, lay.pad_label_y);
+        draw_btn(self, out, lay.pad_minus, "−");
+        draw_btn(self, out, lay.pad_plus, "+");
+        draw_val(self, out, format!("{}", v.padding),
+                 lay.pad_minus, lay.pad_plus, lay.pad_label_y);
+        let ll = label(self, out, "شفافية النافذة", lay.opacity_label_y);
+        leader(out, lay.opacity_plus.0 + lay.opacity_plus.2, ll, lay.opacity_label_y);
+        draw_btn(self, out, lay.opacity_minus, "−");
+        draw_btn(self, out, lay.opacity_plus, "+");
+        draw_val(self, out, format!("{}%", v.opacity_pct),
+                 lay.opacity_minus, lay.opacity_plus, lay.opacity_label_y);
+
         // ---- copy-on-select / ligatures toggles ----
         let ll = label(self, out, "النسخ عند التحديد", lay.copy_label_y);
         leader(out, lay.copy_toggle.0 + lay.copy_toggle.2, ll, lay.copy_label_y);
@@ -1567,6 +1648,22 @@ impl Renderer {
                           bx as f32 + (bw as f32 - lw) / 2.0, gy, 1.0);
         }
 
+        // ---- shell cycler (new tabs only) ----
+        let ll = label(self, out, "الصدفة (التبويبات الجديدة)", lay.shell_label_y);
+        leader(out, lay.shell_next.0 + lay.shell_next.2, ll, lay.shell_label_y);
+        draw_btn(self, out, lay.shell_prev, "‹");
+        draw_btn(self, out, lay.shell_next, "›");
+        draw_val(self, out, v.shell.trim_end_matches(".exe").to_string(),
+                 lay.shell_prev, lay.shell_next, lay.shell_label_y);
+
+        // ---- hide-bar / confirm-close toggles ----
+        let ll = label(self, out, "إخفاء الشريط مع تبويب واحد", lay.bar_label_y);
+        leader(out, lay.bar_toggle.0 + lay.bar_toggle.2, ll, lay.bar_label_y);
+        draw_toggle(out, lay.bar_toggle, v.hide_single_tab);
+        let ll = label(self, out, "تأكيد الإغلاق أثناء أمر جارٍ", lay.close_label_y);
+        leader(out, lay.close_toggle.0 + lay.close_toggle.2, ll, lay.close_label_y);
+        draw_toggle(out, lay.close_toggle, v.confirm_close);
+
         // footer: hairline + hint
         push_rect(out, whole, x + pad, y + h - (self.cell_h as i32 + 24), w - pad * 2, 1,
                   c4(EDGE, 255));
@@ -1574,6 +1671,25 @@ impl Renderer {
         let fw2 = self.measure(&hint, true);
         self.draw_run(&hint, true, out, whole, (x + w - pad) as f32 - fw2,
                       y + h - (self.cell_h as i32 + 14), 1.0);
+    }
+
+    /// The close guard (same family as the paste guard): a pane or the
+    /// window is about to close while a command still runs — confirm.
+    pub fn draw_close_guard(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
+                            msg: &str) {
+        let whole: Rect = (0, 0, fw as i32, fh as i32);
+        push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 110));
+        let w = ((self.cell_w * 56.0) as i32).min(fw as i32 - 60);
+        let h = (self.cell_h * 2.0 + 24.0) as i32;
+        let x = (fw as i32 - w) / 2;
+        let y = self.tab_bar_h() as i32 + (fh as i32 - h) / 4;
+        push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 255));
+        push_rect(out, whole, x, y, w, 2, c4((0xf2, 0xcc, 0x60), 255)); // warn accent
+        let l1 = [Seg { text: msg.into(), fg: self.fg, style: ST_BOLD }];
+        self.draw_run(&l1, true, out, whole, (x + 14) as f32, y + 8, 1.0);
+        let l2 = [Seg::plain("Enter إغلاق   ·   Esc إبقاء", (0x9a, 0xa4, 0xb2))];
+        self.draw_run(&l2, true, out, whole, (x + 14) as f32,
+                      y + 12 + self.cell_h as i32, 1.0);
     }
 
     /// The paste guard (EasyTer's protection): a multi-line/huge paste can
@@ -1634,7 +1750,11 @@ impl Renderer {
             self.draw_run(&segs, true, out, whole, (bx + 8) as f32, by + 5, 1.0);
         }
 
-        // the tab bar, drawn last (nothing may bleed into it)
+        // the tab bar, drawn last (nothing may bleed into it); hidden bar =
+        // no chrome at all, the content owns the full window
+        if self.bar_hidden {
+            return;
+        }
         push_rect(out, whole, 0, 0, width as i32, oy, c4((0x16, 0x1b, 0x22), 255));
         let tw = (self.cell_w * TAB_CELLS) as i32;
         for (i, tab) in tabs.iter().enumerate() {
@@ -1684,8 +1804,12 @@ impl Renderer {
         (width as i32 - bw - 6, 3, bw, oy - 6)
     }
 
-    /// Is (px, py) on the settings-gear button?
+    /// Is (px, py) on the settings-gear button? Never while the bar is
+    /// hidden (the gear hides with it; Ctrl+, still opens the panel).
     pub fn settings_button_hit(&self, width: usize, px: f64, py: f64) -> bool {
+        if self.bar_hidden {
+            return false;
+        }
         let (bx, by, bw, bh) = self.settings_button_rect(width);
         px >= bx as f64 && px < (bx + bw) as f64 && py >= by as f64 && py < (by + bh) as f64
     }
@@ -1983,6 +2107,10 @@ mod cache_tests {
             lay.size_minus, lay.size_plus,
             lay.scroll_minus, lay.scroll_plus,
             lay.copy_toggle, lay.liga_toggle,
+            lay.pad_minus, lay.pad_plus,
+            lay.opacity_minus, lay.opacity_plus,
+            lay.shell_prev, lay.shell_next,
+            lay.bar_toggle, lay.close_toggle,
         ];
         controls.extend(lay.cursor_btns);
         controls.extend(lay.bell_btns);
