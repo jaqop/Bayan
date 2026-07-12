@@ -18,6 +18,9 @@ cosmic-text = "0.12"
 arboard = "3"
 # OSC 52 payloads (programs setting the clipboard, e.g. yank over SSH)
 base64 = "0.22"
+# session persistence (~/.bayan/session.json)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.release]
 opt-level = 3

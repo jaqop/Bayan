@@ -49,8 +49,14 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       green badge); OSC 133 prompt marks injected into PowerShell power the
       command detection; OSC 52 sets the clipboard; OSC 9;9 tracks the cwd
       into the window title — all scanned split-safe with carry
-- [ ] **M5** — tabs/splits, session persistence, agent cockpit, command
-      blocks UI, wgpu renderer
+- [x] **M5** — tabs (Ctrl+T inherits the cwd, Ctrl+Tab cycles,
+      Ctrl+Shift+W closes, click to switch; renderer-drawn bar), session
+      persistence (~/.bayan/session.json restores every tab in its
+      directory), and the agent-cockpit seed: a green busy dot on any
+      background tab producing output — you see the Claude that finished
+      while you were elsewhere
+- [ ] **M6 (backlog)** — splits, command-blocks gutter + jump, full agent
+      cockpit (status/approvals across tabs), wgpu renderer, config file
 
 ## Build
 

@@ -160,18 +160,40 @@ use winit::window::{Window, WindowId};
 use term::{Session, TermSize};
 
 pub enum UserEvent {
-    /// New PTY output was parsed: repaint.
-    Wakeup,
-    /// The emulator wants to answer the child (DSR/DA replies TUIs block on).
-    PtyWrite(String),
+    /// New PTY output was parsed in tab `id`: repaint (and busy-dot it).
+    Wakeup(u64),
+    /// Tab `id`'s emulator answers its child (DSR/DA replies TUIs block on).
+    PtyWrite(u64, String),
     /// The font system finished loading on its background thread.
     RendererReady(Box<render::Renderer>),
     /// A program set the clipboard via OSC 52 (yank over SSH ...).
     ClipboardSet(String),
-    /// The shell reported its working directory (OSC 9;9).
-    Cwd(String),
-    /// The shell exited or the reader thread died.
-    Exit,
+    /// Tab `id`'s shell reported its working directory (OSC 9;9).
+    Cwd(u64, String),
+    /// Tab `id`'s shell exited.
+    Exit(u64),
+}
+
+/// One terminal tab.
+struct Tab {
+    id: u64,
+    session: Session,
+    /// cwd basename (falls back to a plain name)
+    title: String,
+    /// when this tab last produced output — feeds the busy dot
+    last_output: Option<Instant>,
+}
+
+/// What survives a restart: each tab's cwd + the active index.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedState {
+    tabs: Vec<Option<String>>,
+    active: usize,
+}
+
+fn state_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var("USERPROFILE").ok()?;
+    Some(std::path::Path::new(&home).join(".bayan").join("session.json"))
 }
 
 /// Multi-click detection: 1 = simple, 2 = word (semantic), 3 = line.
@@ -209,7 +231,9 @@ struct App {
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     renderer: Option<render::Renderer>,
-    session: Option<Session>,
+    tabs: Vec<Tab>,
+    active: usize,
+    next_id: u64,
     size: TermSize,
     modifiers: ModifiersState,
     first_frame: bool,
@@ -233,9 +257,99 @@ impl App {
         }
     }
 
+    fn session(&self) -> Option<&Session> {
+        self.tabs.get(self.active).map(|t| &t.session)
+    }
+
+    fn session_mut(&mut self) -> Option<&mut Session> {
+        self.tabs.get_mut(self.active).map(|t| &mut t.session)
+    }
+
+    fn spawn_tab(&mut self, cwd: Option<String>) {
+        let id = self.next_id;
+        self.next_id += 1;
+        match Session::spawn(self.size, self.proxy.clone(), id, cwd.as_deref()) {
+            Ok(session) => {
+                let title = cwd
+                    .as_deref()
+                    .and_then(|c| c.rsplit(['\\', '/']).next().map(str::to_string))
+                    .unwrap_or_else(|| "بيان".to_string());
+                self.tabs.push(Tab { id, session, title, last_output: None });
+                self.active = self.tabs.len() - 1;
+            }
+            Err(e) => eprintln!("bayan: spawn tab failed: {e}"),
+        }
+    }
+
+    fn switch_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() || idx == self.active {
+            return;
+        }
+        self.active = idx;
+        self.search = None; // the bar belongs to the tab that opened it
+        self.update_title();
+        self.request_redraw();
+    }
+
+    fn close_tab(&mut self, idx: usize, el: &ActiveEventLoop) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        let mut tab = self.tabs.remove(idx);
+        tab.session.kill();
+        if self.tabs.is_empty() {
+            self.save_state();
+            el.exit();
+            return;
+        }
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        }
+        self.update_title();
+        self.request_redraw();
+    }
+
+    fn update_title(&self) {
+        if let (Some(w), Some(t)) = (&self.window, self.tabs.get(self.active)) {
+            w.set_title(&format!("Bayan — بيان · {}", t.title));
+        }
+    }
+
+    fn save_state(&self) {
+        let Some(path) = state_path() else { return };
+        let state = SavedState {
+            tabs: self
+                .tabs
+                .iter()
+                .map(|t| t.session.meta.lock().unwrap().cwd.clone())
+                .collect(),
+            active: self.active,
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&state) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    fn restore_state(&mut self) {
+        let saved: Option<SavedState> = state_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str(&s).ok());
+        match saved {
+            Some(state) if !state.tabs.is_empty() => {
+                for cwd in state.tabs {
+                    self.spawn_tab(cwd);
+                }
+                self.active = state.active.min(self.tabs.len().saturating_sub(1));
+            }
+            _ => self.spawn_tab(None),
+        }
+    }
+
     fn term_mode(&self) -> TermMode {
-        self.session
-            .as_ref()
+        self.session()
             .map_or(TermMode::empty(), |s| *s.term.lock().unwrap().mode())
     }
 
@@ -246,7 +360,7 @@ impl App {
         if !self.auto_follow {
             return self.claude_manual;
         }
-        let Some(s) = self.session.as_ref() else {
+        let Some(s) = self.session() else {
             return false;
         };
         if !self.term_mode().contains(TermMode::ALT_SCREEN) {
@@ -256,31 +370,46 @@ impl App {
     }
 
     /// Pixel position -> (viewport row, col, cell side) for selection.
+    /// None inside the tab bar (that region belongs to tab switching).
     fn cell_at(&self, pos: PhysicalPosition<f64>) -> Option<(usize, usize, Side)> {
         let r = self.renderer.as_ref()?;
         if self.size.cols == 0 || self.size.rows == 0 {
             return None;
         }
+        let y = pos.y - r.tab_bar_h() as f64;
+        if y < 0.0 {
+            return None;
+        }
         let colf = pos.x / r.cell_w as f64;
         let col = (colf.floor().max(0.0) as usize).min(self.size.cols - 1);
-        let row = ((pos.y / r.cell_h as f64).floor().max(0.0) as usize)
+        let row = ((y / r.cell_h as f64).floor().max(0.0) as usize)
             .min(self.size.rows - 1);
         let side = if colf - col as f64 <= 0.5 { Side::Left } else { Side::Right };
         Some((row, col, side))
     }
 
+    /// Tab index under a pixel position, if it's in the tab bar.
+    fn tab_at(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
+        let r = self.renderer.as_ref()?;
+        if pos.y >= r.tab_bar_h() as f64 {
+            return None;
+        }
+        let idx = (pos.x / (r.cell_w * render::TAB_CELLS) as f64).floor() as usize;
+        (idx < self.tabs.len()).then_some(idx)
+    }
+
     fn pointer_cell_1based(&self) -> (usize, usize) {
-        let (cw, ch) = self
+        let (cw, ch, bar) = self
             .renderer
             .as_ref()
-            .map_or((9.0, 20.0), |r| (r.cell_w, r.cell_h));
+            .map_or((9.0, 20.0, 0.0), |r| (r.cell_w, r.cell_h, r.tab_bar_h()));
         let col = (self.cursor_pos.x / cw as f64).floor().max(0.0) as usize + 1;
-        let row = (self.cursor_pos.y / ch as f64).floor().max(0.0) as usize + 1;
+        let row = (((self.cursor_pos.y - bar as f64) / ch as f64).floor().max(0.0)) as usize + 1;
         (row, col)
     }
 
     fn has_selection(&self) -> bool {
-        self.session.as_ref().is_some_and(|s| {
+        self.session().is_some_and(|s| {
             s.term
                 .lock()
                 .unwrap()
@@ -292,7 +421,7 @@ impl App {
 
     /// Copy the current selection to the system clipboard; optionally clear it.
     fn copy_selection(&mut self, clear: bool) -> bool {
-        let Some(session) = self.session.as_ref() else {
+        let Some(session) = self.session() else {
             return false;
         };
         let text = {
@@ -333,13 +462,13 @@ impl App {
         }
         let bracketed = self.term_mode().contains(TermMode::BRACKETED_PASTE);
         let body = term::normalize_paste(&txt, bracketed);
-        if let Some(s) = self.session.as_mut() {
+        if let Some(s) = self.session_mut() {
             s.write(body.as_bytes());
         }
     }
 
     fn scroll_lines(&mut self, n: i32) {
-        if let Some(s) = self.session.as_ref() {
+        if let Some(s) = self.session() {
             s.term.lock().unwrap().scroll_display(Scroll::Delta(n));
         }
         self.request_redraw();
@@ -352,7 +481,7 @@ impl App {
             Some(st) if !st.query.is_empty() => st.query.clone(),
             _ => return,
         };
-        let Some(session) = self.session.as_ref() else {
+        let Some(session) = self.session() else {
             return;
         };
         let found = {
@@ -408,7 +537,15 @@ impl App {
         let r = self.renderer.as_ref().expect("renderer initialized");
         TermSize {
             cols: ((px.width as f32 / r.cell_w) as usize).max(20),
-            rows: ((px.height as f32 / r.cell_h) as usize).max(5),
+            rows: (((px.height as f32 - r.tab_bar_h()) / r.cell_h) as usize).max(5),
+        }
+    }
+
+    /// The grid changed (resize, new metrics): every tab's PTY follows.
+    fn resize_all(&mut self, size: TermSize) {
+        self.size = size;
+        for tab in &mut self.tabs {
+            tab.session.resize(size);
         }
     }
 
@@ -426,14 +563,27 @@ impl App {
             Ok(b) => b,
             Err(_) => return,
         };
-        match (self.renderer.as_mut(), self.session.as_ref()) {
-            (Some(renderer), Some(session)) => {
+        let tab_infos: Vec<render::TabInfo> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| render::TabInfo {
+                title: t.title.clone(),
+                busy: i != self.active
+                    && t.last_output
+                        .is_some_and(|ts| ts.elapsed() < std::time::Duration::from_secs(2)),
+                active: i == self.active,
+            })
+            .collect();
+        match (self.renderer.as_mut(), self.tabs.get(self.active)) {
+            (Some(renderer), Some(tab)) => {
                 let overlay = render::Overlay {
                     search_query: self.search.as_ref().map(|s| s.query.as_str()),
                     search_match: self.search.as_ref().and_then(|s| s.hl.as_ref()),
                     claude,
+                    tabs: &tab_infos,
                 };
-                let t = session.term.lock().unwrap();
+                let t = tab.session.term.lock().unwrap();
                 renderer.draw(&mut buffer, px.width as usize, px.height as usize, &t, &overlay);
             }
             // renderer still warming up on its thread: dark frame, instantly
@@ -471,9 +621,9 @@ impl ApplicationHandler<UserEvent> for App {
         self.redraw();
         // the PTY + conhost + PowerShell chain is the slowest dependency:
         // start it immediately with a default grid; the exact grid follows
-        // once cell metrics exist (EasyTer starts 110x32 the same way)
-        self.session =
-            Some(Session::spawn(self.size, self.proxy.clone()).expect("spawn shell"));
+        // once cell metrics exist (EasyTer starts 110x32 the same way).
+        // Restores yesterday's tabs (each in its saved cwd) or opens one.
+        self.restore_state();
         crate::prof::mark("session spawned");
         // FontSystem::new scans every installed font — the documented
         // cosmic-text startup cost (pop-os/cosmic-text#247): keep it off
@@ -488,49 +638,82 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Wakeup => {
+            UserEvent::Wakeup(id) => {
                 if !self.first_output {
                     self.first_output = true;
                     crate::prof::mark("first pty output");
                 }
-                if let Some(w) = &self.window {
-                    w.request_redraw();
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+                    t.last_output = Some(Instant::now());
                 }
+                self.request_redraw();
             }
-            UserEvent::PtyWrite(text) => {
-                if let Some(s) = self.session.as_mut() {
-                    s.write(text.as_bytes());
+            UserEvent::PtyWrite(id, text) => {
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+                    t.session.write(text.as_bytes());
                 }
             }
             UserEvent::ClipboardSet(text) => self.set_clipboard(text),
-            UserEvent::Cwd(cwd) => {
-                if let Some(w) = &self.window {
-                    let base = cwd.rsplit(['\\', '/']).next().unwrap_or(&cwd);
-                    w.set_title(&format!("Bayan — بيان · {base}"));
+            UserEvent::Cwd(id, cwd) => {
+                let base = cwd.rsplit(['\\', '/']).next().unwrap_or(&cwd).to_string();
+                let is_active = self
+                    .tabs
+                    .iter()
+                    .position(|t| t.id == id)
+                    .is_some_and(|i| i == self.active);
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+                    t.title = base;
                 }
+                if is_active {
+                    self.update_title();
+                }
+                self.request_redraw(); // tab titles live in the frame
             }
             UserEvent::RendererReady(r) => {
                 crate::prof::mark("renderer ready");
                 self.renderer = Some(*r);
-                if let Some(w) = &self.window {
+                if let Some(px) = self.window.as_ref().map(|w| w.inner_size()) {
                     // now that cell metrics exist, snap the grid to the window
-                    let g = self.grid_for(w.inner_size());
+                    let g = self.grid_for(px);
                     if g != self.size {
-                        self.size = g;
-                        if let Some(s) = self.session.as_mut() {
-                            s.resize(g);
-                        }
+                        self.resize_all(g);
                     }
-                    w.request_redraw();
+                }
+                self.request_redraw();
+            }
+            UserEvent::Exit(id) => {
+                // that tab's shell ended: close it; last one closes Bayan
+                if let Some(i) = self.tabs.iter().position(|t| t.id == id) {
+                    self.close_tab(i, el);
                 }
             }
-            UserEvent::Exit => el.exit(),
+        }
+    }
+
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // busy dots decay after ~2s of quiet: keep repainting on a slow
+        // heartbeat only while any background tab is (or just was) active
+        let any_busy = self.tabs.iter().enumerate().any(|(i, t)| {
+            i != self.active
+                && t.last_output
+                    .is_some_and(|ts| ts.elapsed() < std::time::Duration::from_secs(3))
+        });
+        if any_busy {
+            el.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + std::time::Duration::from_millis(600),
+            ));
+            self.request_redraw();
+        } else {
+            el.set_control_flow(ControlFlow::Wait);
         }
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::CloseRequested => {
+                self.save_state(); // tabs + cwds greet you tomorrow
+                el.exit();
+            }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 // HiDPI: the window moved to a monitor with another scale.
@@ -557,21 +740,16 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.renderer.is_some() {
                     let g = self.grid_for(px);
                     if g != self.size {
-                        self.size = g;
-                        if let Some(s) = self.session.as_mut() {
-                            s.resize(g);
-                        }
+                        self.resize_all(g);
                     }
                 }
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
+                self.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = position;
                 if self.mouse_left_down {
                     if let Some((row, col, side)) = self.cell_at(position) {
-                        if let Some(s) = self.session.as_ref() {
+                        if let Some(s) = self.session() {
                             let mut t = s.term.lock().unwrap();
                             let off = t.grid().display_offset() as i32;
                             let point = Point::new(Line(row as i32 - off), Column(col));
@@ -585,6 +763,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
                 ElementState::Pressed => {
+                    // a click in the tab bar switches tabs
+                    if let Some(idx) = self.tab_at(self.cursor_pos) {
+                        self.switch_tab(idx);
+                        return;
+                    }
                     if let Some((row, col, side)) = self.cell_at(self.cursor_pos) {
                         // 1 click = simple drag anchor, 2 = word, 3 = line
                         let n = self.clicks.click(Instant::now(), (row, col));
@@ -593,7 +776,7 @@ impl ApplicationHandler<UserEvent> for App {
                             3 => SelectionType::Lines,
                             _ => SelectionType::Simple,
                         };
-                        if let Some(s) = self.session.as_ref() {
+                        if let Some(s) = self.session() {
                             let mut t = s.term.lock().unwrap();
                             let off = t.grid().display_offset() as i32;
                             let point = Point::new(Line(row as i32 - off), Column(col));
@@ -644,7 +827,7 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     };
                     let payload = seq.repeat(n.unsigned_abs() as usize);
-                    if let Some(s) = self.session.as_mut() {
+                    if let Some(s) = self.session_mut() {
                         s.write(payload.as_bytes());
                     }
                 } else {
@@ -691,18 +874,45 @@ impl ApplicationHandler<UserEvent> for App {
                         _ => {}
                     }
                 } else if ctrl {
+                    // Ctrl+Tab / Ctrl+Shift+Tab cycle tabs (shift handled here
+                    // because winit reports Tab+shift with the shift modifier)
+                    if matches!(key, Key::Named(NamedKey::Tab)) && !self.tabs.is_empty() {
+                        let n = self.tabs.len();
+                        let next = if shift {
+                            (self.active + n - 1) % n
+                        } else {
+                            (self.active + 1) % n
+                        };
+                        self.switch_tab(next);
+                        return;
+                    }
                     if let Some(l) = key_letter(&event) {
+                        if shift && l == 'w' {
+                            // Ctrl+Shift+W closes the tab (EasyTer's binding)
+                            self.close_tab(self.active, el);
+                            return;
+                        }
                         // Ctrl+C copies when a selection exists (Windows
                         // convention); otherwise falls through to \x03
-                        if l == 'c' && self.has_selection() {
+                        if !shift && l == 'c' && self.has_selection() {
                             self.copy_selection(true);
                             self.request_redraw();
                             return;
                         }
-                        // plain Ctrl+V / Ctrl+F belong to a full-screen TUI
-                        if l == 'v' || l == 'f' {
+                        // plain Ctrl+T/V/F belong to a full-screen TUI
+                        if !shift && (l == 'v' || l == 'f' || l == 't') {
                             let alt_screen =
                                 self.term_mode().contains(TermMode::ALT_SCREEN);
+                            if l == 't' && !alt_screen {
+                                // new tab inherits the active tab's directory
+                                let cwd = self
+                                    .session()
+                                    .and_then(|s| s.meta.lock().unwrap().cwd.clone());
+                                self.spawn_tab(cwd);
+                                self.update_title();
+                                self.request_redraw();
+                                return;
+                            }
                             if l == 'v' && !alt_screen {
                                 self.paste();
                                 return;
@@ -742,7 +952,7 @@ impl ApplicationHandler<UserEvent> for App {
                 .or_else(|| keys::encode(key, text, shift, alt, ctrl));
                 if let Some(bytes) = bytes {
                     // typing snaps to the bottom and clears any selection
-                    if let Some(s) = self.session.as_mut() {
+                    if let Some(s) = self.session_mut() {
                         {
                             let mut t = s.term.lock().unwrap();
                             t.selection = None;
@@ -772,7 +982,9 @@ fn main() {
         window: None,
         surface: None,
         renderer: None,
-        session: None,
+        tabs: Vec::new(),
+        active: 0,
+        next_id: 0,
         size: TermSize { cols: 110, rows: 32 },
         modifiers: ModifiersState::default(),
         first_frame: false,
@@ -793,6 +1005,21 @@ fn main() {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn saved_state_round_trips() {
+        let s = SavedState {
+            tabs: vec![Some(r"C:\Users\Admin\Bayan".into()), None],
+            active: 1,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: SavedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tabs.len(), 2);
+        assert_eq!(back.tabs[0].as_deref(), Some(r"C:\Users\Admin\Bayan"));
+        assert_eq!(back.active, 1);
+        // a corrupt file must not crash restore (it falls back to one tab)
+        assert!(serde_json::from_str::<SavedState>("{broken").is_err());
+    }
 
     #[test]
     fn ctrl_letter_decodes_windows_control_chars() {

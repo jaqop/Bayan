@@ -103,6 +103,16 @@ pub fn bg_packed() -> u32 {
     pack(BG)
 }
 
+/// One tab as the bar renders it.
+pub struct TabInfo {
+    pub title: String,
+    pub busy: bool,
+    pub active: bool,
+}
+
+/// Fixed tab width in cells — the app's click hit-test relies on this.
+pub const TAB_CELLS: f32 = 24.0;
+
 /// UI state rendered on top of the grid (owned by the app, drawn here).
 pub struct Overlay<'a> {
     /// Some(query) = the search bar is open with this text.
@@ -112,6 +122,8 @@ pub struct Overlay<'a> {
     /// Claude mode: cells hold VISUAL-order Arabic that must be restored
     /// to logical before shaping (and a badge is drawn).
     pub claude: bool,
+    /// The tab bar (always visible: titles, busy dots).
+    pub tabs: &'a [TabInfo],
 }
 
 // translucent overlays, EasyTer's colors: selection blue, search amber
@@ -257,6 +269,11 @@ impl Renderer {
             cell_w,
             cell_h: metrics.line_height,
         }
+    }
+
+    /// Height of the tab bar in pixels — the grid starts below it.
+    pub fn tab_bar_h(&self) -> f32 {
+        self.cell_h + 10.0
     }
 
     /// Shape `segs` (text + color spans) into the scratch buffer; returns the
@@ -452,6 +469,8 @@ impl Renderer {
     pub fn draw(&mut self, frame: &mut [u32], width: usize, height: usize,
                 term: &Term<EventProxy>, overlay: &Overlay) {
         frame.fill(pack(BG));
+        // everything below the tab bar
+        let oy = self.tab_bar_h().round() as i32;
         let rows = term.screen_lines();
         let history = term.grid().history_size();
         let content = term.renderable_content();
@@ -486,8 +505,8 @@ impl Renderer {
             if bg != BG {
                 let x0 = (col as f32 * self.cell_w).round() as i32;
                 let x1 = ((col + w) as f32 * self.cell_w).round() as i32;
-                let y0 = (li as f32 * self.cell_h).round() as i32;
-                let y1 = ((li + 1) as f32 * self.cell_h).round() as i32;
+                let y0 = oy + (li as f32 * self.cell_h).round() as i32;
+                let y1 = oy + ((li + 1) as f32 * self.cell_h).round() as i32;
                 fill_rect(frame, width, height, x0, y0, x1 - x0, y1 - y0, pack(bg));
             }
             if selection.is_some_and(|s| s.contains(cell.point)) {
@@ -510,7 +529,7 @@ impl Renderer {
             if cells.is_empty() {
                 continue;
             }
-            let y = (li as f32 * self.cell_h).round() as i32;
+            let y = oy + (li as f32 * self.cell_h).round() as i32;
             if cells.iter().any(|ci| is_arabic(ci.c)) {
                 let on_row = cursor_vrow >= 0 && cursor_vrow as usize == li;
                 let r = self.draw_line_bidi(frame, width, height, y, cells,
@@ -530,8 +549,8 @@ impl Renderer {
             for &(li, col, w) in cells.iter() {
                 let x0 = (col as f32 * self.cell_w).round() as i32;
                 let x1 = ((col + w) as f32 * self.cell_w).round() as i32;
-                let y0 = (li as f32 * self.cell_h).round() as i32;
-                let y1 = ((li + 1) as f32 * self.cell_h).round() as i32;
+                let y0 = oy + (li as f32 * self.cell_h).round() as i32;
+                let y1 = oy + ((li + 1) as f32 * self.cell_h).round() as i32;
                 blend_rect(frame, width, height, x0, y0, x1 - x0, y1 - y0, (r, g, b), a);
             }
         }
@@ -544,7 +563,7 @@ impl Renderer {
                 (ccol as f32 * self.cell_w).round() as i32,
                 self.cell_w.round() as i32,
             ));
-            let y0 = (cursor_vrow as f32 * self.cell_h).round() as i32;
+            let y0 = oy + (cursor_vrow as f32 * self.cell_h).round() as i32;
             blend_rect(frame, width, height,
                        x0, y0, wpx, self.cell_h.round() as i32,
                        FG, 170);
@@ -552,13 +571,13 @@ impl Renderer {
 
         // scroll position indicator while in history (EasyTer's slim bar)
         if off > 0 && history > 0 {
-            let vh = height as i32;
+            let vh = height as i32 - oy;
             let th = ((vh as f32 * rows as f32 / (history + rows) as f32) as i32).max(24);
-            let ty = ((vh - th) as f32 * (1.0 - off as f32 / history as f32)) as i32;
+            let ty = oy + ((vh - th) as f32 * (1.0 - off as f32 / history as f32)) as i32;
             blend_rect(frame, width, height, width as i32 - 7, ty, 4, th, FG, 70);
         }
 
-        // Claude-mode badge, top-right (EasyTer's green badge)
+        // Claude-mode badge, top-right below the tab bar (EasyTer's green badge)
         if overlay.claude {
             let label = "● وضع كلود".to_string();
             let segs = [(label, (0xff, 0xff, 0xff))];
@@ -566,7 +585,7 @@ impl Renderer {
             let bw = tw as i32 + 16;
             let bh = (self.cell_h + 8.0) as i32;
             let bx = width as i32 - bw - 10;
-            let by = if overlay.search_query.is_some() {
+            let by = oy + if overlay.search_query.is_some() {
                 (self.cell_h + 24.0) as i32
             } else {
                 6
@@ -575,18 +594,54 @@ impl Renderer {
             self.blit_scratch(frame, width, height, (bx + 8) as f32, by + 4, 1.0);
         }
 
-        // search bar, top-right (drawn last: floats above everything)
+        // search bar, top-right below the tab bar
         if let Some(q) = overlay.search_query {
             let bar_w = (self.cell_w * 34.0) as i32;
             let bar_h = (self.cell_h + 10.0) as i32;
             let bx = width as i32 - bar_w - 10;
-            fill_rect(frame, width, height, bx, 6, bar_w, bar_h, pack((0x1c, 0x21, 0x28)));
-            blend_rect(frame, width, height, bx, 6 + bar_h - 2, bar_w, 2,
+            let by = oy + 6;
+            fill_rect(frame, width, height, bx, by, bar_w, bar_h, pack((0x1c, 0x21, 0x28)));
+            blend_rect(frame, width, height, bx, by + bar_h - 2, bar_w, 2,
                        PALETTE[11], 200); // amber underline = search accent
             let label = format!("بحث: {q}_");
             let segs = [(label, FG)];
             self.shape_scratch(&segs, 1_000_000.0, true);
-            self.blit_scratch(frame, width, height, (bx + 8) as f32, 11, 1.0);
+            self.blit_scratch(frame, width, height, (bx + 8) as f32, by + 5, 1.0);
+        }
+
+        // the tab bar itself, drawn last (nothing may bleed into it)
+        self.draw_tab_bar(frame, width, height, overlay.tabs);
+    }
+
+    fn draw_tab_bar(&mut self, frame: &mut [u32], width: usize, height: usize,
+                    tabs: &[TabInfo]) {
+        let oy = self.tab_bar_h().round() as i32;
+        fill_rect(frame, width, height, 0, 0, width as i32, oy, pack((0x16, 0x1b, 0x22)));
+        let tw = (self.cell_w * TAB_CELLS) as i32;
+        for (i, tab) in tabs.iter().enumerate() {
+            let x0 = i as i32 * tw;
+            let (bg, fg): ((u8, u8, u8), (u8, u8, u8)) = if tab.active {
+                ((0x24, 0x2b, 0x36), FG)
+            } else {
+                ((0x16, 0x1b, 0x22), (0x8a, 0x94, 0xa3))
+            };
+            fill_rect(frame, width, height, x0, 0, tw - 2, oy, pack(bg));
+            if tab.active {
+                // accent line on top: the focused tab is unmistakable
+                fill_rect(frame, width, height, x0, 0, tw - 2, 2, pack((0x2e, 0xa0, 0x43)));
+            }
+            let max_chars = TAB_CELLS as usize - 5;
+            let title: String = tab.title.chars().take(max_chars).collect();
+            let segs = [(title, fg)];
+            self.shape_scratch(&segs, 1_000_000.0, true);
+            self.blit_scratch(frame, width, height, (x0 + 10) as f32, 5, 1.0);
+            if tab.busy {
+                // green dot: this background tab is producing output —
+                // the agent-cockpit seed (a Claude finishing while you look away)
+                let d = 6;
+                blend_rect(frame, width, height, x0 + tw - 16, oy / 2 - d / 2, d, d,
+                           (0x56, 0xd3, 0x64), 255);
+            }
         }
     }
 }

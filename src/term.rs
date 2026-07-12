@@ -317,18 +317,19 @@ impl Dimensions for TermSize {
     }
 }
 
-/// Routes emulator events to the winit loop. PtyWrite matters most: TUIs
-/// (Claude Code among them) send ESC[6n and block waiting for the cursor
-/// position reply — the exact lesson EasyTer's ReportingScreen taught us.
+/// Routes emulator events to the winit loop, tagged with the owning tab's
+/// id. PtyWrite matters most: TUIs (Claude Code among them) send ESC[6n and
+/// block waiting for the cursor position reply — the exact lesson EasyTer's
+/// ReportingScreen taught us; the reply must reach the RIGHT tab's PTY.
 #[derive(Clone)]
-pub struct EventProxy(pub EventLoopProxy<UserEvent>);
+pub struct EventProxy(pub EventLoopProxy<UserEvent>, pub u64);
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         let mapped = match event {
-            Event::PtyWrite(text) => UserEvent::PtyWrite(text),
-            Event::Wakeup => UserEvent::Wakeup,
-            Event::Exit => UserEvent::Exit,
+            Event::PtyWrite(text) => UserEvent::PtyWrite(self.1, text),
+            Event::Wakeup => UserEvent::Wakeup(self.1),
+            Event::Exit => UserEvent::Exit(self.1),
             _ => return,
         };
         let _ = self.0.send_event(mapped);
@@ -340,13 +341,15 @@ pub struct Session {
     pub meta: Arc<Mutex<SessionMeta>>,
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
-    _child: Box<dyn Child + Send + Sync>,
+    child: Box<dyn Child + Send + Sync>,
 }
 
 impl Session {
     pub fn spawn(
         size: TermSize,
         proxy: EventLoopProxy<UserEvent>,
+        id: u64,
+        start_cwd: Option<&str>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let pty = native_pty_system();
         let pair = pty.openpty(PtySize {
@@ -356,9 +359,15 @@ impl Session {
             pixel_height: 0,
         })?;
         let mut cmd = CommandBuilder::new(DEFAULT_SHELL);
-        // never inherit the launcher's directory (often system32): start home
-        if let Ok(home) = std::env::var("USERPROFILE") {
-            cmd.cwd(home);
+        // requested dir (a restored tab, or "new tab inherits the cwd"),
+        // else home — never the launcher's directory (often system32)
+        match start_cwd.filter(|d| std::path::Path::new(d).is_dir()) {
+            Some(d) => cmd.cwd(d),
+            None => {
+                if let Ok(home) = std::env::var("USERPROFILE") {
+                    cmd.cwd(home);
+                }
+            }
         }
         // -NoProfile: the profile is seconds of avoidable startup (it re-runs
         // oh-my-posh, chcp, modules). Self-provide what it gave us: UTF-8
@@ -391,7 +400,7 @@ impl Session {
         let term = Arc::new(Mutex::new(Term::new(
             config,
             &size,
-            EventProxy(proxy.clone()),
+            EventProxy(proxy.clone(), id),
         )));
 
         let meta = Arc::new(Mutex::new(SessionMeta::default()));
@@ -414,15 +423,15 @@ impl Session {
                             let _ = proxy.send_event(UserEvent::ClipboardSet(txt));
                         }
                         if let Some(cwd) = ev.cwd {
-                            let _ = proxy.send_event(UserEvent::Cwd(cwd));
+                            let _ = proxy.send_event(UserEvent::Cwd(id, cwd));
                         }
-                        if proxy.send_event(UserEvent::Wakeup).is_err() {
+                        if proxy.send_event(UserEvent::Wakeup(id)).is_err() {
                             break; // the event loop is gone
                         }
                     }
                 }
             }
-            let _ = proxy.send_event(UserEvent::Exit);
+            let _ = proxy.send_event(UserEvent::Exit(id));
         });
 
         Ok(Self {
@@ -430,8 +439,13 @@ impl Session {
             meta,
             writer,
             master: pair.master,
-            _child: child,
+            child,
         })
+    }
+
+    /// Terminate the shell (closing a tab must not leave orphans).
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
