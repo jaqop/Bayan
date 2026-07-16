@@ -161,8 +161,17 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       RLM/RLO ignored (established by A/B captures) — so Arabic strings
       are handed over in VISUAL word order: Claude mode's philosophy,
       aimed the other way
-- [ ] **M20 (backlog)** — a cosmic-text bump if it grows a features API
-      (would retire the M18 bypass)
+- [x] **M20** — cosmic-text 0.12 → 0.19: the new engine shapes through
+      harfrust with default OpenType features (and grows an explicit
+      FontFeatures API), so the ordinary batched Buffer ligates — the M18
+      rustybuzz bypass is retired wholesale (enum, direct shaper, hand-built
+      CacheKeys, the dependency itself: rustybuzz left the tree, harfrust
+      arrived with the bump). Proven equivalent before surgery: a probe
+      crate showed 0.19 producing the IDENTICAL glyph pair for `->` that
+      the bypass produced. Bonus the bypass never had: mixed Arabic+code
+      lines go through the whole-line BiDi path, which now ligates its
+      ASCII segments too. Verified live: → ⇒ ≠ ≡ joined AND مرحبا بالعالم
+      connected, correctly ordered, on the same line
 
 ## Settings
 

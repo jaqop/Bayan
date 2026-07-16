@@ -15,11 +15,7 @@ winit = "0.30"
 wgpu = "24"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
-cosmic-text = "0.12"
-# direct ASCII shaping WITH font features (calt/liga) — cosmic-text 0.12's
-# shape plan is featureless, so programming ligatures go through rustybuzz
-# ourselves (same version cosmic-text already pulls in; zero new tree cost)
-rustybuzz = "0.14"
+cosmic-text = "0.19"
 # system clipboard (copy on select / paste)
 arboard = "3"
 # OSC 52 payloads (programs setting the clipboard, e.g. yank over SSH)
