@@ -156,7 +156,11 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       the tray icon — summons the window (the msg hook that already serves
       the quake hotkey). A settings toggle (default on) previews itself
       when flipped on; every exit path funnels through one quit() so no
-      ghost icon lingers in the tray
+      ghost icon lingers in the tray. The balloon text renderer turned out
+      to lay words in LOGICAL order left-to-right — no BiDi reordering,
+      RLM/RLO ignored (established by A/B captures) — so Arabic strings
+      are handed over in VISUAL word order: Claude mode's philosophy,
+      aimed the other way
 - [ ] **M20 (backlog)** — a cosmic-text bump if it grows a features API
       (would retire the M18 bypass)
 

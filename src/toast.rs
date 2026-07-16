@@ -21,6 +21,26 @@ pub const NIN_BALLOONUSERCLICK: u32 = 0x0405;
 pub const WM_LBUTTONUP: u32 = 0x0202;
 const TRAY_UID: u32 = 1;
 
+fn has_arabic(s: &str) -> bool {
+    s.chars().any(|c| matches!(c as u32,
+        0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF
+        | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF))
+}
+
+/// The balloon/toast text renderer lays runs out in LOGICAL order,
+/// left-to-right — no BiDi run reordering, and it ignores RLM/RLO
+/// direction marks (verified empirically on Windows 11: word order came
+/// out reversed while letter shaping stayed correct, with or without a
+/// U+200F prefix). So for Arabic-bearing strings we hand it the VISUAL
+/// word order — reverse the token sequence — and it comes out readable.
+/// The same visual-order philosophy as Claude mode, aimed the other way.
+fn visual_order(s: &str) -> String {
+    if !has_arabic(s) {
+        return s.to_string();
+    }
+    s.split(' ').rev().collect::<Vec<_>>().join(" ")
+}
+
 /// &str -> fixed UTF-16 buffer, truncated with a NUL guaranteed.
 fn wstr<const N: usize>(s: &str) -> [u16; N] {
     let mut out = [0u16; N];
@@ -63,8 +83,8 @@ pub fn show(hwnd: HWND, title: &str, body: &str) -> bool {
     let mut d = base(hwnd);
     d.uFlags = NIF_INFO;
     d.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
-    d.szInfoTitle = wstr(title);
-    d.szInfo = wstr(body);
+    d.szInfoTitle = wstr(&visual_order(title));
+    d.szInfo = wstr(&visual_order(body));
     unsafe { Shell_NotifyIconW(NIM_MODIFY, &d) != 0 }
 }
 
@@ -78,6 +98,18 @@ pub fn remove(hwnd: HWND) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn balloon_text_gets_visual_word_order() {
+        // Arabic: token sequence reverses (the renderer lays them LTR)
+        assert_eq!(visual_order("اكتمل الأمر"), "الأمر اكتمل");
+        // mixed: the LTR token rides along, its inside untouched
+        assert_eq!(visual_order("إشعار تجريبي (M19)"), "(M19) تجريبي إشعار");
+        // pure LTR passes through — reversing "cargo build" would wrong it
+        assert_eq!(visual_order("cargo build"), "cargo build");
+        // and the reversal is an involution on the Arabic strings we send
+        assert_eq!(visual_order(&visual_order("اكتمل الأمر")), "اكتمل الأمر");
+    }
 
     #[test]
     fn wstr_truncates_and_terminates() {

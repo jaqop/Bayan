@@ -1883,11 +1883,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
         }
-        // BAYAN_TOAST=1: fire a sample toast at startup (M19 verification;
-        // the accepted/rejected result goes to stderr for the harness)
-        if std::env::var_os("BAYAN_TOAST").is_some() {
+        // BAYAN_TOAST=<title|1>: fire a sample toast at startup (M19
+        // verification; a custom value becomes the title, so direction
+        // experiments run without rebuilding)
+        if let Some(v) = std::env::var_os("BAYAN_TOAST") {
             if let Some(h) = self.hwnd() {
-                let ok = toast::show(h, "اكتمل الأمر", "بيان — إشعار تجريبي (M19)");
+                let t = v.to_str().unwrap_or("1");
+                let title = if t == "1" { "اكتمل الأمر" } else { t };
+                let ok = toast::show(h, title, "بيان — إشعار تجريبي (M19)");
                 eprintln!("bayan: BAYAN_TOAST show accepted={ok}");
             }
         }
