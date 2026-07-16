@@ -147,8 +147,18 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       resolve their own faces; Arabic, mixed text and ligatures-off keep
       the cosmic path untouched. Verified live: -> => != === ~~> render as
       joined glyphs in Cascadia Code NF, column-exact, and toggle off cleanly
-- [ ] **M19 (backlog)** — native toast notifications; a cosmic-text bump
-      if it grows a features API (would retire the M18 bypass)
+- [x] **M19** — native toast notifications with zero WinRT/COM: a
+      Shell_NotifyIcon tray icon whose NIF_INFO balloons render as real
+      Windows 10/11 toasts (Action Center included). Fires when a long
+      command finishes while Bayan is unfocused; NIIF_RESPECT_QUIET_TIME
+      defers to focus assist, so do-not-disturb files them silently in the
+      notification center instead of interrupting. Clicking a toast — or
+      the tray icon — summons the window (the msg hook that already serves
+      the quake hotkey). A settings toggle (default on) previews itself
+      when flipped on; every exit path funnels through one quit() so no
+      ghost icon lingers in the tray
+- [ ] **M20 (backlog)** — a cosmic-text bump if it grows a features API
+      (would retire the M18 bypass)
 
 ## Settings
 

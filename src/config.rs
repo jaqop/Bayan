@@ -68,6 +68,10 @@ pub struct UserConfig {
     /// Padding in px between the window edges and the terminal content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub padding: Option<u32>,
+    /// Native toast when a long command finishes while Bayan is unfocused
+    /// (default on). Windows quiet hours are respected regardless.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<bool>,
     /// Shortcut overrides: action id -> chord ("new-tab": "ctrl+shift+n").
     /// Only NON-default bindings live here (the editor prunes defaults).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -180,6 +184,10 @@ impl UserConfig {
     pub fn padding_px(&self) -> i32 {
         self.padding.unwrap_or(0).min(32) as i32
     }
+
+    pub fn notifications_on(&self) -> bool {
+        self.notifications.unwrap_or(true)
+    }
 }
 
 /// "#rrggbb" (or "rrggbb") -> rgb. None on anything malformed.
@@ -277,6 +285,7 @@ mod tests {
     fn batch_two_settings_resolve_with_defaults() {
         let d = UserConfig::default();
         assert_eq!(d.opacity_level(), 1.0);
+        assert!(d.notifications_on());
         assert_eq!(d.shell_program(), "powershell.exe");
         assert!(!d.hide_single_tab_on());
         assert!(d.confirm_close_on());

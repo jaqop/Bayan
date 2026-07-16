@@ -450,6 +450,8 @@ pub struct SettingsLayout {
     pub bell_label_y: i32,
     /// segmented control, left→right: [صامت, صوت, تنبيه] (RTL: تنبيه first)
     pub bell_btns: [Rect; 3],
+    pub notif_label_y: i32,
+    pub notif_toggle: Rect,
     pub pad_label_y: i32,
     pub pad_minus: Rect,
     pub pad_plus: Rect,
@@ -484,6 +486,7 @@ pub struct SettingsView<'a> {
     pub copy_on_select: bool,
     pub ligatures: bool,
     pub bell: crate::config::BellMode,
+    pub notifications: bool,
     pub padding: i32,
     pub opacity_pct: i32,
     pub shell: &'a str,
@@ -1524,13 +1527,13 @@ impl Renderer {
         let tile_w = ((w - pad * 2 - label_reserve - 6 * 6) / 7).max(30);
         let tile_h = (self.cell_h * 1.6) as i32;
         let theme_rowh = tile_h + 14;
-        let h = head_h + 6 + theme_rowh + rowh * 13 + foot_h;
+        let h = head_h + 6 + theme_rowh + rowh * 14 + foot_h;
         let x = (fw as i32 - w) / 2;
         let y = (self.tab_bar_h() as i32 + (fh as i32 - h) / 3)
             .max(self.tab_bar_h() as i32 + 12);
 
         // the shortcuts-editor button lives in the header, left side
-        let sb_w = (self.cell_w * 10.0) as i32;
+        let sb_w = (self.cell_w * 12.0) as i32;
         let shortcuts_btn = (x + pad, y + 10, sb_w, (self.cell_h + 8.0) as i32);
 
         let theme_y = y + head_h + 6 + (theme_rowh - tile_h) / 2;
@@ -1591,16 +1594,20 @@ impl Renderer {
         let seg_w = (self.cell_w * 4.6) as i32;
         let bell_btns = [0, 1, 2].map(|i| (x + pad + i * (seg_w + 6), cy(bell_y), seg_w, ctl));
 
+        // native-toast toggle (M19)
+        let notif_y = row_y(10);
+        let notif_toggle = (x + pad, pcy(notif_y), pill_w, pill_h);
+
         // shell cycler (new tabs only) — same shape as the font cycler
-        let shell_y = row_y(10);
+        let shell_y = row_y(11);
         let shell_w = (self.cell_w * 12.0) as i32;
         let shell_prev = (x + pad, cy(shell_y), ctl, ctl);
         let shell_next = (x + pad + ctl + shell_w, cy(shell_y), ctl, ctl);
 
         // hide-bar / confirm-close toggles
-        let bar_y = row_y(11);
+        let bar_y = row_y(12);
         let bar_toggle = (x + pad, pcy(bar_y), pill_w, pill_h);
-        let close_y = row_y(12);
+        let close_y = row_y(13);
         let close_toggle = (x + pad, pcy(close_y), pill_w, pill_h);
 
         SettingsLayout {
@@ -1628,6 +1635,8 @@ impl Renderer {
             liga_toggle,
             bell_label_y: bell_y,
             bell_btns,
+            notif_label_y: notif_y,
+            notif_toggle,
             pad_label_y: pad_y,
             pad_minus,
             pad_plus,
@@ -1857,6 +1866,11 @@ impl Renderer {
             self.draw_run(&seg, true, out, whole,
                           bx as f32 + (bw as f32 - lw) / 2.0, gy, 1.0);
         }
+
+        // ---- native-toast toggle ----
+        let ll = label(self, out, "إشعار عند اكتمال الأوامر", lay.notif_label_y);
+        leader(out, lay.notif_toggle.0 + lay.notif_toggle.2, ll, lay.notif_label_y);
+        draw_toggle(out, lay.notif_toggle, v.notifications);
 
         // ---- shell cycler (new tabs only) ----
         let ll = label(self, out, "الصدفة (التبويبات الجديدة)", lay.shell_label_y);
@@ -2472,7 +2486,7 @@ mod cache_tests {
             lay.pad_minus, lay.pad_plus,
             lay.opacity_minus, lay.opacity_plus,
             lay.shell_prev, lay.shell_next,
-            lay.bar_toggle, lay.close_toggle, lay.blink_toggle,
+            lay.bar_toggle, lay.close_toggle, lay.blink_toggle, lay.notif_toggle,
         ];
         controls.extend(lay.cursor_btns);
         controls.extend(lay.bell_btns);

@@ -34,6 +34,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Diagnostics_Debug",
+    "Win32_UI_Shell", # Shell_NotifyIcon balloons = native toasts, no WinRT
 ] }
 
 [profile.release]

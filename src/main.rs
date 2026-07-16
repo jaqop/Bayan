@@ -12,6 +12,7 @@ mod config;
 mod gpu;
 mod keybinds;
 mod keys;
+mod toast;
 mod render;
 mod term;
 
@@ -56,6 +57,8 @@ fn beep() {
 /// The quake hotkey (Ctrl+Alt+`) fires from ANYWHERE via RegisterHotKey;
 /// winit's msg hook flags it and about_to_wait toggles the window.
 static QUAKE_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A toast/tray click wants the window raised (summon, never hide).
+static SUMMON_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const QUAKE_ID: usize = 0xB1AA;
 
 /// The letter a Ctrl+<letter> event represents, resolved the way real
@@ -604,6 +607,26 @@ impl App {
     /// Window opacity via the layered-window alpha (whole window, text
     /// included — per-pixel background alpha needs a transparent swapchain,
     /// which DX12 flip-model doesn't offer wgpu today).
+    /// The window's Win32 handle (tray icon, toasts, layered alpha).
+    fn hwnd(&self) -> Option<windows_sys::Win32::Foundation::HWND> {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let w = self.window.as_ref()?;
+        let RawWindowHandle::Win32(h) = w.window_handle().ok()?.as_raw() else {
+            return None;
+        };
+        Some(h.hwnd.get() as _)
+    }
+
+    /// Remove the tray icon, persist the session, leave. Every exit path
+    /// funnels here so no ghost icon lingers in the tray.
+    fn quit(&mut self, el: &ActiveEventLoop) {
+        if let Some(h) = self.hwnd() {
+            toast::remove(h);
+        }
+        self.save_state(); // tabs + cwds greet you tomorrow
+        el.exit();
+    }
+
     fn apply_opacity(&self) {
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let Some(w) = &self.window else { return };
@@ -635,6 +658,18 @@ impl App {
 
     fn toggle_confirm_close(&mut self) {
         self.config.confirm_close = Some(!self.config.confirm_close_on());
+        self.request_redraw();
+    }
+
+    fn toggle_notifications(&mut self) {
+        let on = !self.config.notifications_on();
+        self.config.notifications = Some(on);
+        if on {
+            // preview the toast you just turned on
+            if let Some(h) = self.hwnd() {
+                toast::show(h, "الإشعارات مفعّلة", "هكذا يبدو إشعار اكتمال الأمر");
+            }
+        }
         self.request_redraw();
     }
 
@@ -920,6 +955,8 @@ impl App {
             lay.bell_btns.iter().position(|&b| render::rect_hit(b, px, py))
         {
             self.set_bell(render::BELL_SEGMENTS[i]);
+        } else if render::rect_hit(lay.notif_toggle, px, py) {
+            self.toggle_notifications();
         } else if render::rect_hit(lay.pad_minus, px, py) {
             self.change_padding(-1);
         } else if render::rect_hit(lay.pad_plus, px, py) {
@@ -1230,8 +1267,7 @@ impl App {
         if t.panes.is_empty() {
             self.tabs.remove(ti);
             if self.tabs.is_empty() {
-                self.save_state();
-                el.exit();
+                self.quit(el);
                 return;
             }
             if self.active >= self.tabs.len() {
@@ -1685,6 +1721,7 @@ impl App {
                             copy_on_select: self.config.copy_on_select_on(),
                             ligatures: self.config.ligatures.unwrap_or(true),
                             bell: self.config.bell_mode(),
+                            notifications: self.config.notifications_on(),
                             padding: self.config.padding_px(),
                             opacity_pct: (self.config.opacity_level() * 100.0).round()
                                 as i32,
@@ -1804,6 +1841,12 @@ impl ApplicationHandler<UserEvent> for App {
         self.gpu = Some(gpu);
         self.window = Some(window.clone());
         self.apply_opacity(); // the configured window alpha, from frame one
+        if let Some(h) = self.hwnd() {
+            // the tray icon: toast anchor + summon target
+            if !toast::init(h) {
+                eprintln!("bayan: tray icon registration failed — no toasts");
+            }
+        }
         // first frame NOW: a dark window on screen beats a frozen launcher.
         // The shell and the font system warm up behind it, in parallel.
         self.redraw();
@@ -1838,6 +1881,14 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(s) = self.session_mut() {
                     s.write(t.as_bytes());
                 }
+            }
+        }
+        // BAYAN_TOAST=1: fire a sample toast at startup (M19 verification;
+        // the accepted/rejected result goes to stderr for the harness)
+        if std::env::var_os("BAYAN_TOAST").is_some() {
+            if let Some(h) = self.hwnd() {
+                let ok = toast::show(h, "اكتمل الأمر", "بيان — إشعار تجريبي (M19)");
+                eprintln!("bayan: BAYAN_TOAST show accepted={ok}");
             }
         }
         // BAYAN_PICK_THEME=<n>: open settings and apply theme n, so a click's
@@ -1905,9 +1956,11 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
-            UserEvent::CommandFinished(id, _ok) => {
+            UserEvent::CommandFinished(id, ok) => {
                 // a long command ended while nobody was looking: flash the
-                // taskbar (native, no toast plumbing) + the amber tab dot
+                // taskbar + the amber tab dot, and (M19) a native toast
+                // when the whole WINDOW is unfocused — a background tab
+                // while you're looking is the dot's job, not a popup's
                 if let Some((ti, _)) = self.find_pane(id) {
                     if !self.focused || ti != self.active {
                         self.tabs[ti].attention = true;
@@ -1915,6 +1968,13 @@ impl ApplicationHandler<UserEvent> for App {
                             w.request_user_attention(Some(
                                 winit::window::UserAttentionType::Informational,
                             ));
+                        }
+                        if self.config.notifications_on() && !self.focused {
+                            if let Some(h) = self.hwnd() {
+                                let title =
+                                    if ok { "اكتمل الأمر" } else { "فشل الأمر" };
+                                toast::show(h, title, &self.tabs[ti].title);
+                            }
                         }
                         self.request_redraw();
                     }
@@ -1969,6 +2029,15 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
         }
+        // a toast/tray click summons (never hides — that's the quake key)
+        if SUMMON_HIT.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            if let Some(w) = &self.window {
+                w.set_visible(true);
+                w.set_minimized(false);
+                w.focus_window();
+                self.apply_opacity(); // set_visible wipes the layered bit
+            }
+        }
         // busy dots decay after ~2s of quiet: keep repainting on a slow
         // heartbeat only while any background tab is (or just was) active
         let any_busy = self
@@ -2008,8 +2077,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_redraw();
                     return;
                 }
-                self.save_state(); // tabs + cwds greet you tomorrow
-                el.exit();
+                self.quit(el);
             }
             WindowEvent::Focused(f) => {
                 self.focused = f;
@@ -2227,10 +2295,7 @@ impl ApplicationHandler<UserEvent> for App {
                             self.pending_close = None;
                             match target {
                                 CloseTarget::Pane(ti, pi) => self.remove_pane(ti, pi, el),
-                                CloseTarget::Window => {
-                                    self.save_state();
-                                    el.exit();
-                                }
+                                CloseTarget::Window => self.quit(el),
                             }
                         }
                         Key::Named(NamedKey::Escape) => self.pending_close = None,
@@ -2403,6 +2468,14 @@ fn main() {
             if m.message == WM_HOTKEY && m.wParam == QUAKE_ID {
                 QUAKE_HIT.store(true, std::sync::atomic::Ordering::Relaxed);
                 return true; // consumed
+            }
+            // tray icon / toast callback: a click summons the window
+            if m.message == toast::TRAY_MSG {
+                let event = (m.lParam as u32) & 0xffff;
+                if event == toast::NIN_BALLOONUSERCLICK || event == toast::WM_LBUTTONUP {
+                    SUMMON_HIT.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                return true; // ours either way
             }
             false
         })
