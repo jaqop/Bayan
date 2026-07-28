@@ -64,6 +64,19 @@ cosmic-text 0.19, which shapes through harfrust with default OpenType features,
 so the ordinary batched `Buffer` ligates on its own. rustybuzz left the tree.
 If ligatures regress, fix the cosmic path; do not reintroduce a second shaper.
 
+**Mica and Acrylic are NOT reachable — do not retry.** Measured, not assumed:
+this machine's DX12 surface reports `alpha_modes = [Opaque]`, so the swapchain
+cannot carry per-pixel alpha, and wgpu exposes no composition swapchain
+(`CreateSwapChainForComposition`) to get one. Both Windows 11 materials show
+through per-pixel-transparent regions, so with an opaque surface there is
+nothing for them to show through. The pre-WinUI fallback fails too, and for a
+reason worth remembering: `SetWindowCompositionAttribute` with
+`ACCENT_ENABLE_ACRYLICBLURBEHIND` was tried and produced a sharp, unblurred
+desktop behind the window — `LWA_ALPHA` blends the whole window uniformly and
+bypasses DWM's blur, so the layered-window transparency Bayan already has and
+the accent blur are mutually exclusive. The existing `opacity` setting is the
+only transparency available on this path.
+
 **Two performance properties are load-bearing.** The shaped-run cache reshapes
 only changed lines (~1.5ms → ~4µs on a cached frame). Differential redraw skips
 the GPU submit entirely when the quad set is byte-identical to the last frame,
