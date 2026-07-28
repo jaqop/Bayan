@@ -1,9 +1,10 @@
 # Bayan (بيان) — working notes for Claude
 
 An Arabic-first, agent-ready terminal emulator in Rust, for Windows. Rust
-successor to [EasyTer](../EasyTer) (Python/Qt), which remains the behavioral
-specification: `../EasyTer/dev/test_input_ux.py` and friends define what the
-keyboard, selection and BiDi paths must do.
+successor to [EasyTer](https://github.com/jaqop/EasyTer) (Python/Qt), which
+remains the behavioral specification: checked out alongside this repo at
+`../EasyTer`, its `dev/test_input_ux.py` and friends define what the keyboard,
+selection and BiDi paths must do.
 
 ## Layout
 

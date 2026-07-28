@@ -3,7 +3,9 @@
 **An Arabic-first, agent-ready terminal emulator, written in Rust.**
 **طرفية بالعربية أولاً، جاهزة لوكلاء الذكاء الاصطناعي، مكتوبة بلغة Rust.**
 
-Bayan is the Rust successor to [EasyTer](../EasyTer): same mission — a
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+Bayan is the Rust successor to [EasyTer](https://github.com/jaqop/EasyTer): same mission — a
 terminal where Arabic is a first-class citizen and AI agents (Claude Code)
 are first-class tenants — rebuilt on a GPU-era foundation.
 
