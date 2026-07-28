@@ -7,9 +7,9 @@ license = "MIT"
 
 [dependencies]
 # VT emulation: Alacritty's battle-tested core, published as a library
-alacritty_terminal = "0.24"
+alacritty_terminal = "0.26"
 # ConPTY (Windows) / openpty (unix), extracted from WezTerm
-portable-pty = "0.8"
+portable-pty = "0.9"
 # windowing + GPU present + text shaping (HarfBuzz-class, BiDi, fallback)
 winit = "0.30"
 wgpu = "30"

@@ -2661,11 +2661,8 @@ mod tests {
         let mut t = Term::new(Config::default(), &size, VoidListener);
         let mut p: Processor = Processor::new();
         for line in ["alpha needle one", "plain line", "needle two", "tail"] {
-            for b in line.bytes() {
-                p.advance(&mut t, b);
-            }
-            p.advance(&mut t, b'\r');
-            p.advance(&mut t, b'\n');
+            p.advance(&mut t, line.as_bytes());
+            p.advance(&mut t, b"\r\n");
         }
 
         // Enter: nearest match above the bottom = "needle two" (row 2)

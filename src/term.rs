@@ -285,9 +285,10 @@ fn feed_counted<T: EventListener>(
     if parked {
         t.scroll_display(Scroll::Delta(1));
     }
-    for &b in bytes {
-        parser.advance(t, b);
-    }
+    // vte 0.15 takes the whole slice (it batches internally) instead of one
+    // byte per call. The counter brackets the entire feed, so this is a
+    // straight speedup, not a change in what gets measured.
+    parser.advance(t, bytes);
     let off_after = t.grid().display_offset();
     let hist_after = t.grid().history_size();
     let base = if parked { 1 } else { off_before };

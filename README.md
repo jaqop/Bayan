@@ -198,6 +198,18 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       clippy isn't installed on this toolchain (the build is warning-clean
       instead), and M14's differential redraw wasn't re-measured — the quad
       set is untouched by this change, but that's an argument, not a benchmark
+- [x] **M22** — alacritty_terminal 0.24 → 0.26 and portable-pty 0.8 → 0.9.
+      One breaking change in the whole tree: vte 0.15 takes `advance(handler,
+      &[u8])` instead of one byte per call, batching internally — so the feed
+      loop collapses into a single call and gets faster for free. The risk here
+      was never the compiler, it was silence: M11's cap-proof eviction counter
+      leans on Grid's exact `scroll_up`/`display_offset` semantics, and a minor
+      bump could have shifted them without breaking the build. That's what the
+      unit test pinning "27 scrolled - 8 kept = 19 evicted" is for, and it still
+      passes — 58/58 green. Verified live beyond the tests: the PTY spawns under
+      portable-pty 0.9 and real commands run, and the OSC 133 command-block
+      lights still read exit codes correctly — green beside `echo ok`, red
+      beside a failing command, in the same frame
 
 ## Settings
 
