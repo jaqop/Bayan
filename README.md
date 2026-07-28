@@ -210,6 +210,18 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       portable-pty 0.9 and real commands run, and the OSC 133 command-block
       lights still read exit codes correctly — green beside `echo ok`, red
       beside a failing command, in the same frame
+- [x] **M23** — the tail of the dependency sweep: base64 0.22 → 0.23,
+      pollster 0.4 → 1.0, windows-sys 0.59 → 0.61, plus a semver-compatible
+      refresh across the tree (bytemuck, serde, serde_json, libc, cc and
+      friends). Zero source changes — all three majors landed clean, which is
+      worth recording precisely because the two bumps before them didn't.
+      **winit stays at 0.30 deliberately:** 0.31 exists only as
+      `0.31.0-beta.2`, and a terminal people actually work in doesn't run on a
+      beta windowing layer. Verified: 58/58, and a live capture shows the
+      OSC 133 marks and Arabic shaping unchanged. Left honest: the toast path
+      (Shell_NotifyIcon, the biggest windows-sys consumer) compiles and the app
+      runs, but a balloon was not caught on camera — quiet hours file it to the
+      Action Center — so that one is built-and-running, not eyeball-verified
 
 ## Settings
 

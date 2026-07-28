@@ -13,19 +13,19 @@ portable-pty = "0.9"
 # windowing + GPU present + text shaping (HarfBuzz-class, BiDi, fallback)
 winit = "0.30"
 wgpu = "30"
-pollster = "0.4"
+pollster = "1"
 bytemuck = { version = "1", features = ["derive"] }
 cosmic-text = "0.19"
 # system clipboard (copy on select / paste)
 arboard = "3"
 # OSC 52 payloads (programs setting the clipboard, e.g. yank over SSH)
-base64 = "0.22"
+base64 = "0.23"
 # session persistence (~/.bayan/session.json)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # global quake hotkey (RegisterHotKey + WM_HOTKEY via the msg hook);
 # Diagnostics_Debug carries MessageBeep (the bell's "sound" mode)
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
