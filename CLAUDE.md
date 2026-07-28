@@ -77,6 +77,15 @@ bypasses DWM's blur, so the layered-window transparency Bayan already has and
 the accent blur are mutually exclusive. The existing `opacity` setting is the
 only transparency available on this path.
 
+**Start-directory precedence, in order:** a restored session's saved cwd, then
+the launcher's directory (a shortcut's "Start in"), then `USERPROFILE`. The
+session wins deliberately — restoring a tab in the wrong folder is worse than
+ignoring a shortcut — but it is also why a shortcut change appears to do
+nothing: `~/.bayan/session.json` is answering first. Delete it when testing
+start-directory behaviour, the same way `config.json` has to go before
+`cargo test`. The launcher directory is honoured EXCEPT under `%SystemRoot%`,
+because Explorer and the Start menu often hand a process `System32`.
+
 **Two performance properties are load-bearing.** The shaped-run cache reshapes
 only changed lines (~1.5ms → ~4µs on a cached frame). Differential redraw skips
 the GPU submit entirely when the quad set is byte-identical to the last frame,

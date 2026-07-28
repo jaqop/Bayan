@@ -2007,7 +2007,7 @@ impl Renderer {
         // swimming in three times its own width. Clamped at both ends so a
         // long path can't eat the bar and a short name stays clickable.
         let mut x_run = 0i32;
-        for (i, tab) in tabs.iter().enumerate() {
+        for tab in tabs.iter() {
             let tw = self.tab_width(&tab.title);
             let x0 = x_run;
             x_run += tw;

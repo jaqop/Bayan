@@ -27,6 +27,35 @@ pub fn shell_choices() -> Vec<String> {
     crate::shells::detect().into_iter().map(|s| s.command).collect()
 }
 
+/// The directory Bayan itself was started in — a shortcut's "Start in" field,
+/// which is the standard way to say where a terminal should open.
+///
+/// It used to be ignored outright, with the reasoning that Windows often hands
+/// a process `C:\Windows\System32`, which nobody wants a shell to open in.
+/// True, but throwing away every launcher directory to dodge that one case
+/// silently broke the shortcut field. So: honour it, unless it sits under the
+/// Windows directory.
+fn launcher_dir() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    if !cwd.is_dir() {
+        return None;
+    }
+    let s = cwd.to_str()?.to_string();
+    let win = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    if is_under(&s, &win) {
+        return None;
+    }
+    Some(s)
+}
+
+/// Case-insensitive "is `path` inside `root`" — Windows paths are not
+/// case-sensitive, so a plain starts_with would miss `c:\windows\system32`.
+fn is_under(path: &str, root: &str) -> bool {
+    let (p, r) = (path.to_lowercase().replace('/', "\\"), root.to_lowercase().replace('/', "\\"));
+    let r = r.trim_end_matches('\\');
+    p == r || p.starts_with(&format!("{r}\\"))
+}
+
 /// The PowerShell family gets the full treatment (UTF-8, prompt theme,
 /// OSC 133 marks); other shells launch bare and the mark-driven features
 /// (command lights, prompt jumps, Claude auto-detect) degrade gracefully.
@@ -507,14 +536,14 @@ impl Session {
             cmd.arg(a);
         }
         // requested dir (a restored tab, or "new tab inherits the cwd"),
-        // else home — never the launcher's directory (often system32)
-        match start_cwd.filter(|d| std::path::Path::new(d).is_dir()) {
-            Some(d) => cmd.cwd(d),
-            None => {
-                if let Ok(home) = std::env::var("USERPROFILE") {
-                    cmd.cwd(home);
-                }
-            }
+        // else the launcher's directory, else home
+        let dir = start_cwd
+            .filter(|d| std::path::Path::new(d).is_dir())
+            .map(str::to_string)
+            .or_else(launcher_dir)
+            .or_else(|| std::env::var("USERPROFILE").ok());
+        if let Some(d) = dir {
+            cmd.cwd(d);
         }
         if is_powershell(shell) {
             // -NoProfile: the profile is seconds of avoidable startup (it
@@ -733,6 +762,24 @@ mod tests {
         // the no-profile variant is still the PowerShell family: it must keep
         // UTF-8 setup and OSC 133 marks, or command lights die on that entry
         assert!(is_powershell("powershell.exe -NoProfile"));
+    }
+
+    #[test]
+    fn the_launcher_directory_is_honoured_except_under_windows() {
+        // a shortcut's "Start in" is the standard way to pick the open folder
+        assert!(!is_under(r"C:\Users\Admin\Desktop", r"C:\Windows"));
+        // ...but a process handed System32 must fall back, and Windows paths
+        // are case-insensitive, so a plain starts_with would miss these
+        assert!(is_under(r"C:\Windows\System32", r"C:\Windows"));
+        assert!(is_under(r"c:\windows\system32", r"C:\Windows"));
+        assert!(is_under(r"C:\WINDOWS\System32\WindowsPowerShell", r"c:\Windows"));
+        // the root itself counts as inside it
+        assert!(is_under(r"C:\Windows", r"C:\Windows"));
+        // a sibling that merely shares a prefix does NOT — the trap a naive
+        // starts_with falls into
+        assert!(!is_under(r"C:\WindowsApps\thing", r"C:\Windows"));
+        // forward slashes normalise to the same answer
+        assert!(is_under("C:/Windows/System32", r"C:\Windows"));
     }
 
     #[test]
