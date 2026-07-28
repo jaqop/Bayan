@@ -85,9 +85,11 @@ impl Gpu {
                -> Result<Self, String> {
         // DX12 first (native on Windows, fastest to initialize), GL as the
         // universal fallback — enumerating every backend cost ~800ms
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        // wgpu 30 dropped Default for InstanceDescriptor (a display handle is
+        // now an explicit choice); DX12/Vulkan ignore it, so "without" is ours.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::DX12 | wgpu::Backends::GL,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let surface = instance
             .create_surface(window)
@@ -97,15 +99,18 @@ impl Gpu {
                 power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                // browser-style fingerprinting defence; a native terminal wants
+                // the adapter's real limits, not a bucketed approximation
+                apply_limit_buckets: false,
             },
         ))
-        .ok_or("no graphics adapter")?;
+        .map_err(|e| format!("no graphics adapter: {e}"))?;
+        // wgpu 30 dropped the trace-path argument
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("bayan"),
                 ..Default::default()
             },
-            None,
         ))
         .map_err(|e| format!("request_device: {e}"))?;
 
@@ -121,6 +126,11 @@ impl Gpu {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
+            // wgpu 30 made the color space explicit. Its Default variant is
+            // documented as reproducing wgpu's historical behavior (Srgb for
+            // our non-sRGB-format case), which is what M10 verified as
+            // pixel-identical to the CPU renderer. Anything else changes the look.
+            color_space: wgpu::SurfaceColorSpace::default(),
             width: width.max(1),
             height: height.max(1),
             present_mode: wgpu::PresentMode::AutoVsync,
@@ -204,8 +214,10 @@ impl Gpu {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            // wgpu 30 replaced push_constant_ranges with immediate data;
+            // the quad pipeline uses neither
+            immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("bayan quads"),
@@ -214,13 +226,13 @@ impl Gpu {
                 module: &shader,
                 entry_point: Some("vs"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<Vertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &wgpu::vertex_attr_array![
                         0 => Float32x2, 1 => Float32x2, 2 => Float32, 3 => Float32x4
                     ],
-                }],
+                })],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -235,7 +247,7 @@ impl Gpu {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -343,16 +355,21 @@ impl Gpu {
     /// Render one frame of quads (painter's order). BG is the clear color.
     pub fn render(&mut self, verts: &[Vertex], bg: (u8, u8, u8)) {
         use wgpu::util::DeviceExt;
+        // wgpu 30 replaced Result<SurfaceTexture, SurfaceError> with an enum.
+        // Suboptimal still carries a usable texture — render it rather than
+        // dropping the frame, or a resize would blink.
+        use wgpu::CurrentSurfaceTexture as Cst;
         let frame = match self.surface.get_current_texture() {
-            Ok(f) => f,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            Cst::Success(f) | Cst::Suboptimal(f) => f,
+            Cst::Outdated | Cst::Lost => {
                 self.surface.configure(&self.device, &self.config);
                 match self.surface.get_current_texture() {
-                    Ok(f) => f,
-                    Err(_) => return,
+                    Cst::Success(f) | Cst::Suboptimal(f) => f,
+                    _ => return,
                 }
             }
-            Err(_) => return,
+            // Timeout, Occluded (window hidden), Validation: skip this frame.
+            _ => return,
         };
         let view = frame.texture.create_view(&Default::default());
         let globals = Globals {
@@ -375,6 +392,8 @@ impl Gpu {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
+                    // 2D surface texture: no 3D/array slice to select
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: bg.0 as f64 / 255.0,
@@ -385,6 +404,8 @@ impl Gpu {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
+                // single-view rendering: view 0 only
+                multiview_mask: None,
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
@@ -397,6 +418,7 @@ impl Gpu {
             }
         }
         self.queue.submit([encoder.finish()]);
-        frame.present();
+        // wgpu 30 moved present() from SurfaceTexture onto Queue
+        self.queue.present(frame);
     }
 }

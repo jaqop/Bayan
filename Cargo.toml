@@ -12,7 +12,7 @@ alacritty_terminal = "0.24"
 portable-pty = "0.8"
 # windowing + GPU present + text shaping (HarfBuzz-class, BiDi, fallback)
 winit = "0.30"
-wgpu = "24"
+wgpu = "30"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 cosmic-text = "0.19"
