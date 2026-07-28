@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "skills": {
+    "m15-anti-pattern": {
+      "source": "zhanghandong/rust-skills",
+      "sourceType": "github",
+      "skillPath": "skills/m15-anti-pattern/SKILL.md",
+      "computedHash": "f1734c43801554dd73419f6586af343c04bdf33361318b658641c0c22d094842"
+    },
+    "rust-best-practices": {
+      "source": "apollographql/skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust-best-practices/SKILL.md",
+      "computedHash": "3f89cd417842ca60bffefea01ee88fc28116b75a8e69329c4d6db446fbfcad02"
+    },
+    "rust-testing": {
+      "source": "affaan-m/everything-claude-code",
+      "sourceType": "github",
+      "skillPath": "skills/rust-testing/SKILL.md",
+      "computedHash": "9a8f2bb0e7aa498b56af699e4673fd3ec1f50c5cfe9019c86dc80a93ccd08e66"
+    },
+    "webgpu-specs": {
+      "source": "gfx-rs/wgpu",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/webgpu-specs/SKILL.md",
+      "computedHash": "81b64479f782c4a6715112053072fcaf708405ab9e147acc2c81a7f3e0653489"
+    },
+    "windows-desktop-e2e": {
+      "source": "affaan-m/everything-claude-code",
+      "sourceType": "github",
+      "skillPath": "skills/windows-desktop-e2e/SKILL.md",
+      "computedHash": "c6437bb2697022479d55835a0c4f5dd8c13acbcbe6938e4b42f00afb464e4cf6"
+    }
+  }
+}

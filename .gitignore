@@ -1,1 +1,7 @@
 /target
+
+# Agent skills are vendored copies of upstream repos — skills-lock.json
+# restores them with `skills experimental_install`, so the trees stay out.
+.claude/skills/
+# Machine-local: absolute paths, approved commands, stale pids.
+.claude/settings.local.json
