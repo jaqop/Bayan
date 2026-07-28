@@ -72,9 +72,22 @@ const fn rgb(v: u32) -> (u8, u8, u8) {
     ((v >> 16) as u8, (v >> 8) as u8, v as u8)
 }
 
-/// A theme by name (used to resolve the config's `theme` field).
-pub fn theme_by_name(name: &str) -> Option<&'static Theme> {
-    THEMES.iter().find(|t| t.name == name)
+/// A theme by name (used to resolve the config's `theme` field). Built-ins
+/// win; a plugin theme is consulted only if no built-in matches, so a plugin
+/// can add but never silently replace a shipped theme.
+pub fn theme_by_name(name: &str) -> Option<Theme> {
+    if let Some(t) = THEMES.iter().find(|t| t.name == name) {
+        return Some(Theme { name: t.name, bg: t.bg, fg: t.fg, palette: t.palette });
+    }
+    crate::plugins::theme_by_name(name).map(|p| Theme {
+        // the built-in table is &'static; a plugin name is not, and the field
+        // is only used for display, so leak-free borrowing is not worth a
+        // lifetime parameter across every call site
+        name: "",
+        bg: p.bg,
+        fg: p.fg,
+        palette: p.palette,
+    })
 }
 
 /// The theme presets the settings panel cycles through.

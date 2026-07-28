@@ -68,6 +68,8 @@ pub struct UserConfig {
     /// Padding in px between the window edges and the terminal content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub padding: Option<u32>,
+    /// Plugin file-stems to skip loading.
+    pub disabled_plugins: Option<Vec<String>>,
     /// Native toast when a long command finishes while Bayan is unfocused
     /// (default on). Windows quiet hours are respected regardless.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -183,6 +185,10 @@ impl UserConfig {
 
     /// Content inset. Default 10: text pressed flat against the window edge
     /// reads as unfinished, and every modern terminal ships a gutter.
+    pub fn disabled_plugins(&self) -> Vec<String> {
+        self.disabled_plugins.clone().unwrap_or_default()
+    }
+
     pub fn padding_px(&self) -> i32 {
         self.padding.unwrap_or(10).min(32) as i32
     }
@@ -205,9 +211,18 @@ pub fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
     ))
 }
 
+/// `~/.bayan` — config, session, plugin log and the plugins directory all
+/// live here. Falls back to the current directory if USERPROFILE is unset,
+/// so nothing panics on an odd environment.
+pub fn bayan_dir() -> std::path::PathBuf {
+    match std::env::var_os("USERPROFILE") {
+        Some(home) => std::path::Path::new(&home).join(".bayan"),
+        None => std::path::PathBuf::from(".bayan"),
+    }
+}
+
 fn config_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("USERPROFILE")?;
-    Some(std::path::Path::new(&home).join(".bayan").join("config.json"))
+    Some(bayan_dir().join("config.json"))
 }
 
 pub fn load() -> UserConfig {

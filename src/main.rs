@@ -8,6 +8,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod bidi;
+mod plugins;
 mod shells;
 mod config;
 mod gpu;
@@ -2637,6 +2638,16 @@ fn main() {
     prof::mark("event loop built");
     let proxy = event_loop.create_proxy();
     let cfg = config::load();
+    // plugins load once, before the first renderer, so a plugin theme named in
+    // the config resolves on the very first frame
+    let plug = plugins::init(&cfg.disabled_plugins());
+    if !plug.failed.is_empty() {
+        eprintln!(
+            "bayan: {} plugin(s) failed — see {}",
+            plug.failed.len(),
+            config::bayan_dir().join("plugins.log").display()
+        );
+    }
     let keymap = keybinds::effective_map(&cfg);
     let mut app = App {
         last_strip_click: None,
