@@ -443,6 +443,8 @@ pub struct TabInfo {
 
 /// Fixed tab width in cells — the app's click hit-test relies on this.
 pub const TAB_CELLS: f32 = 24.0;
+/// A tab never shrinks below this: "sh" must still be a clickable target.
+pub const TAB_MIN_CELLS: f32 = 9.0;
 
 /// A rect in frame pixels: (x, y, w, h).
 pub type Rect = (i32, i32, i32, i32);
@@ -931,6 +933,15 @@ impl Renderer {
         }
         self.cache_hot.insert(key.clone(), ShapedRun { buffer, natw });
         key
+    }
+
+    /// Width of the tab holding `title`: the title plus room for the status
+    /// dot and the gap, clamped between TAB_MIN_CELLS and TAB_CELLS. Counted
+    /// in chars rather than measured, because the tab bar is grid-aligned and
+    /// measuring here would cost a shape on every frame.
+    pub fn tab_width(&self, title: &str) -> i32 {
+        let cells = (title.chars().count() as f32 + 6.0).clamp(TAB_MIN_CELLS, TAB_CELLS);
+        (self.cell_w * cells) as i32
     }
 
     /// Height of the tab bar in pixels — pane content starts below it.
@@ -1992,9 +2003,14 @@ impl Renderer {
                       (self.bg.1 as f32 * 0.55) as u8,
                       (self.bg.2 as f32 * 0.55) as u8);
         push_rect(out, whole, 0, 0, width as i32, oy, c4(bar_bg, 255));
-        let tw = (self.cell_w * TAB_CELLS) as i32;
+        // widths follow the titles now (M26): a fixed 24 cells left "Admin"
+        // swimming in three times its own width. Clamped at both ends so a
+        // long path can't eat the bar and a short name stays clickable.
+        let mut x_run = 0i32;
         for (i, tab) in tabs.iter().enumerate() {
-            let x0 = i as i32 * tw;
+            let tw = self.tab_width(&tab.title);
+            let x0 = x_run;
+            x_run += tw;
             // The active tab takes the CONTENT background, so it reads as the
             // top of the pane below it rather than as a highlighted list row.
             // Inactive tabs recede into the bar instead of floating above it.
@@ -2021,7 +2037,7 @@ impl Renderer {
                               tabw - 2 * inset, 1, c4((0x2e, 0xa0, 0x43), 220));
                 }
             }
-            let max_chars = TAB_CELLS as usize - 5;
+            let max_chars = (tw as f32 / self.cell_w) as usize - 4;
             let title: String = tab.title.chars().take(max_chars).collect();
             let segs = [Seg::plain(title, fg)];
             self.draw_run(&segs, true, out, whole, (tx + 10) as f32, 6, 1.0);
@@ -2229,6 +2245,29 @@ mod cache_tests {
 
     fn test_renderer() -> Renderer {
         Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0)
+    }
+
+    #[test]
+    fn tab_width_follows_the_title_within_bounds() {
+        let r = test_renderer();
+        let short = r.tab_width("sh");
+        let normal = r.tab_width("Admin");
+        let huge = r.tab_width(&"x".repeat(200));
+        // clamped at both ends
+        assert_eq!(short, (r.cell_w * TAB_MIN_CELLS) as i32, "short titles hit the floor");
+        assert_eq!(huge, (r.cell_w * TAB_CELLS) as i32, "long titles hit the ceiling");
+        // and vary in between, which is the whole point of M26
+        assert!(normal > short && normal < huge, "Admin={normal} short={short} huge={huge}");
+        // monotonic: a longer title is never narrower
+        let mut last = 0;
+        for n in 1..40 {
+            let w = r.tab_width(&"x".repeat(n));
+            assert!(w >= last, "width shrank at n={n}");
+            last = w;
+        }
+        // the draw loop derives its truncation budget as (w / cell_w) - 4, so
+        // the narrowest tab must still leave that positive
+        assert!((short as f32 / r.cell_w) as usize > 4);
     }
 
     /// Same content -> same cached run (no re-shape); different colors or

@@ -1483,11 +1483,20 @@ impl App {
 
     fn tab_at(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
         let r = self.renderer.as_ref()?;
-        if pos.y >= r.tab_bar_h() as f64 {
+        if r.tab_bar_h() == 0.0 || pos.y >= r.tab_bar_h() as f64 {
             return None;
         }
-        let idx = (pos.x / (r.cell_w * render::TAB_CELLS) as f64).floor() as usize;
-        (idx < self.tabs.len()).then_some(idx)
+        // widths vary per title now, so walk them; the same tab_width the
+        // renderer uses, or a click would land on the neighbour
+        let mut x = 0i32;
+        for (i, t) in self.tabs.iter().enumerate() {
+            let w = r.tab_width(&t.title);
+            if pos.x >= x as f64 && pos.x < (x + w) as f64 {
+                return Some(i);
+            }
+            x += w;
+        }
+        None
     }
 
     fn pointer_cell_1based(&self) -> (usize, usize) {
