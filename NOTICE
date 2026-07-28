@@ -1,0 +1,18 @@
+Bayan (بيان)
+Copyright (c) 2026 jaqop
+
+This product includes third-party material distributed under its own terms.
+Bayan itself is MIT licensed; see LICENSE.
+
+--------------------------------------------------------------------------
+Bundled fonts — SIL Open Font License 1.1
+--------------------------------------------------------------------------
+
+The following font files are redistributed in fonts/ under the SIL Open Font
+License, Version 1.1. The full license text is in fonts/OFL.txt.
+
+  fonts/Amiri-Regular.ttf    Amiri
+  fonts/Amiri-Bold.ttf       Amiri
+
+Amiri is bundled so that connected Arabic renders correctly from a fresh
+clone, with no font installation step.
