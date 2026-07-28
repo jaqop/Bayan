@@ -724,6 +724,10 @@ type RunKey = (Vec<Seg>, bool);
 const CACHE_CAP: usize = 4096;
 
 pub struct Renderer {
+    /// which caption button the pointer is over (0..2) — hover feedback
+    pub hover_caption: Option<usize>,
+    /// pointer over the settings gear
+    pub hover_gear: bool,
     font_system: FontSystem,
     cache: SwashCache,
     metrics: Metrics,
@@ -794,6 +798,8 @@ impl Renderer {
             }
         }
         Self {
+            hover_caption: None,
+            hover_gear: false,
             font_system,
             cache: SwashCache::new(),
             metrics,
@@ -2033,21 +2039,65 @@ impl Renderer {
             }
         }
 
-        // a clickable settings button (gear) at the tab bar's right end —
-        // discoverable and layout-proof (a shortcut fights an Arabic layout)
+        // window controls, drawn by us because the OS title bar is gone
+        // (M24): minimise, maximise/restore, close — close hovers red, the
+        // one convention nobody should have to learn.
+        for (i, (rect, glyph)) in self
+            .window_buttons(width)
+            .iter()
+            .zip(["\u{2500}", "\u{25a1}", "\u{2715}"])
+            .enumerate()
+        {
+            let (bx, by, bw, bh) = *rect;
+            if self.hover_caption == Some(i) {
+                let tint = if i == 2 { (0xc4, 0x2b, 0x1c) } else { (0x33, 0x3c, 0x48) };
+                push_rect(out, whole, bx, by, bw, bh, c4(tint, 255));
+            }
+            let seg = [Seg::plain(glyph, if self.hover_caption == Some(2) && i == 2 {
+                (0xff, 0xff, 0xff)
+            } else {
+                (0xb6, 0xc2, 0xcf)
+            })];
+            let gw = self.measure(&seg, false);
+            self.draw_run(&seg, false, out, whole,
+                          bx as f32 + (bw as f32 - gw) / 2.0, by + bh / 2 - self.cell_h as i32 / 2, 1.0);
+        }
+
+        // the settings gear sits left of the window controls — discoverable
+        // and layout-proof (a shortcut fights an Arabic layout)
         let (bx, by, bw, bh) = self.settings_button_rect(width);
-        push_rect(out, whole, bx, by, bw, bh, c4((0x24, 0x2b, 0x36), 255));
-        let seg = [Seg::plain("⚙", (0xc0, 0xca, 0xf5))];
+        if self.hover_gear {
+            push_rect(out, whole, bx, by, bw, bh, c4((0x33, 0x3c, 0x48), 255));
+        }
+        let seg = [Seg::plain("⚙", (0xb6, 0xc2, 0xcf))];
         let gw = self.measure(&seg, false);
         self.draw_run(&seg, false, out, whole,
                       bx as f32 + (bw as f32 - gw) / 2.0, by + 3, 1.0);
     }
 
-    /// The settings-gear button rect in the tab bar (shared with hit-test).
+    /// Width of one caption button. Windows uses 46dip; match it so the
+    /// controls feel native even though we draw them.
+    pub fn caption_btn_w(&self) -> i32 {
+        (self.cell_w * 3.2).max(40.0) as i32
+    }
+
+    /// minimise, maximise, close — left to right, flush to the top-right.
+    pub fn window_buttons(&self, width: usize) -> [Rect; 3] {
+        let oy = self.tab_bar_h().round() as i32;
+        let w = self.caption_btn_w();
+        let right = width as i32;
+        [
+            (right - 3 * w, 0, w, oy),
+            (right - 2 * w, 0, w, oy),
+            (right - w, 0, w, oy),
+        ]
+    }
+
+    /// The settings-gear button rect, left of the caption buttons.
     pub fn settings_button_rect(&self, width: usize) -> Rect {
         let oy = self.tab_bar_h().round() as i32;
         let bw = (self.cell_w * 3.0).max(28.0) as i32;
-        (width as i32 - bw - 6, 3, bw, oy - 6)
+        (width as i32 - 3 * self.caption_btn_w() - bw - 4, 3, bw, oy - 6)
     }
 
     /// Is (px, py) on the settings-gear button? Never while the bar is

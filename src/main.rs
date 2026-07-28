@@ -217,7 +217,7 @@ use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{ResizeDirection, Window, WindowId};
 
 use term::{Session, TermSize};
 
@@ -399,6 +399,8 @@ struct SearchState {
 }
 
 struct App {
+    /// last click on the empty title strip — powers double-click-to-maximise
+    last_strip_click: Option<std::time::Instant>,
     proxy: EventLoopProxy<UserEvent>,
     window: Option<Arc<Window>>,
     gpu: Option<gpu::Gpu>,
@@ -1420,6 +1422,65 @@ impl App {
     }
 
     /// Tab index under a pixel position, if it's in the tab bar.
+
+    /// Which window edge the pointer is on, if any. 6px is the smallest band
+    /// that stays grabbable without stealing clicks from the content.
+    fn resize_edge_at(&self, pos: PhysicalPosition<f64>) -> Option<ResizeDirection> {
+        let w = self.window.as_ref()?;
+        if w.is_maximized() {
+            return None; // a maximized window has no edges to drag
+        }
+        const B: f64 = 6.0;
+        let s = w.inner_size();
+        let (x, y, ww, wh) = (pos.x, pos.y, s.width as f64, s.height as f64);
+        let l = x <= B;
+        let r = x >= ww - B;
+        let t = y <= B;
+        let b = y >= wh - B;
+        Some(match (l, r, t, b) {
+            (true, _, true, _) => ResizeDirection::NorthWest,
+            (_, true, true, _) => ResizeDirection::NorthEast,
+            (true, _, _, true) => ResizeDirection::SouthWest,
+            (_, true, _, true) => ResizeDirection::SouthEast,
+            (true, ..) => ResizeDirection::West,
+            (_, true, ..) => ResizeDirection::East,
+            (_, _, true, _) => ResizeDirection::North,
+            (_, _, _, true) => ResizeDirection::South,
+            _ => return None,
+        })
+    }
+
+    /// Caption button under the pointer: 0 minimise, 1 maximise, 2 close.
+    fn caption_button_at(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
+        let (r, w) = (self.renderer.as_ref()?, self.window.as_ref()?);
+        if r.tab_bar_h() == 0.0 {
+            return None;
+        }
+        let pw = w.inner_size().width as usize;
+        r.window_buttons(pw).iter().position(|&(bx, by, bw, bh)| {
+            pos.x >= bx as f64 && pos.x < (bx + bw) as f64
+                && pos.y >= by as f64 && pos.y < (by + bh) as f64
+        })
+    }
+
+    /// Empty title-strip space: dragging it moves the window, as a real
+    /// title bar would. Tabs, the gear and the caption buttons are excluded.
+    fn in_drag_strip(&self, pos: PhysicalPosition<f64>) -> bool {
+        let Some(r) = self.renderer.as_ref() else { return false };
+        let Some(w) = self.window.as_ref() else { return false };
+        if r.tab_bar_h() == 0.0 || pos.y >= r.tab_bar_h() as f64 {
+            return false;
+        }
+        if self.resize_edge_at(pos).is_some() || self.caption_button_at(pos).is_some() {
+            return false;
+        }
+        let pw = w.inner_size().width as usize;
+        if r.settings_button_hit(pw, pos.x, pos.y) {
+            return false;
+        }
+        self.tab_at(pos).is_none()
+    }
+
     fn tab_at(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
         let r = self.renderer.as_ref()?;
         if pos.y >= r.tab_bar_h() as f64 {
@@ -1836,6 +1897,10 @@ impl ApplicationHandler<UserEvent> for App {
         const ICON_RGBA: &[u8] = include_bytes!("../assets/icon_64.rgba");
         let icon = winit::window::Icon::from_rgba(ICON_RGBA.to_vec(), 64, 64).ok();
         let attrs = Window::default_attributes()
+            // M24: no OS title bar. The tab strip IS the title bar, so the
+            // window carries one row of chrome instead of two. We draw the
+            // caption buttons and handle drag/resize ourselves below.
+            .with_decorations(false)
             .with_title("Bayan — بيان")
             .with_window_icon(icon)
             .with_visible(visible)
@@ -2148,7 +2213,11 @@ impl ApplicationHandler<UserEvent> for App {
                 } else if let Some(w) = &self.window {
                     // hovering a divider shows the resize cursor
                     use winit::window::CursorIcon;
-                    let icon = if self.divider_at(position).is_some() {
+                    // M24: an undecorated window has to advertise its own
+                    // edges, or the user has no way to learn they can grab.
+                    let icon = if let Some(dir) = self.resize_edge_at(position) {
+                        CursorIcon::from(dir)
+                    } else if self.divider_at(position).is_some() {
                         match self.tabs.get(self.active).map(|t| t.orientation) {
                             Some(Orientation::Column) => CursorIcon::NsResize,
                             _ => CursorIcon::EwResize,
@@ -2157,10 +2226,57 @@ impl ApplicationHandler<UserEvent> for App {
                         CursorIcon::Default
                     };
                     w.set_cursor(icon);
+                    // caption/gear hover feedback
+                    let cap = self.caption_button_at(position);
+                    let pw = w.inner_size().width as usize;
+                    let gear = self.renderer.as_ref()
+                        .is_some_and(|r| r.settings_button_hit(pw, position.x, position.y));
+                    if let Some(r) = self.renderer.as_mut() {
+                        if r.hover_caption != cap || r.hover_gear != gear {
+                            r.hover_caption = cap;
+                            r.hover_gear = gear;
+                            self.request_redraw();
+                        }
+                    }
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
                 ElementState::Pressed => {
+                    // M24 order matters: edges are outermost, then the caption
+                    // buttons, and only then the panels — otherwise a resize
+                    // grab near the top-right would open settings instead.
+                    if self.shortcuts.is_none() && self.settings.is_none() {
+                        if let Some(dir) = self.resize_edge_at(self.cursor_pos) {
+                            if let Some(w) = self.window.as_ref() {
+                                let _ = w.drag_resize_window(dir);
+                            }
+                            return;
+                        }
+                        if let Some(i) = self.caption_button_at(self.cursor_pos) {
+                            if let Some(w) = self.window.as_ref() {
+                                match i {
+                                    0 => w.set_minimized(true),
+                                    1 => w.set_maximized(!w.is_maximized()),
+                                    _ => {
+                                        // identical to CloseRequested: the
+                                        // running-command guard must not be
+                                        // bypassed just because the button
+                                        // is ours now
+                                        if self.config.confirm_close_on()
+                                            && self.pending_close.is_none()
+                                            && self.running_count() > 0
+                                        {
+                                            self.pending_close = Some(CloseTarget::Window);
+                                            self.request_redraw();
+                                        } else {
+                                            self.quit(el);
+                                        }
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                    }
                     // the shortcuts editor swallows clicks: a row starts a
                     // capture, outside the card closes + saves
                     if self.shortcuts.is_some() {
@@ -2201,6 +2317,22 @@ impl ApplicationHandler<UserEvent> for App {
                     // a click in the tab bar switches tabs
                     if let Some(idx) = self.tab_at(self.cursor_pos) {
                         self.switch_tab(idx);
+                        return;
+                    }
+                    // empty title strip: double-click maximises, drag moves —
+                    // the two gestures a real title bar owes the user
+                    if self.in_drag_strip(self.cursor_pos) {
+                        if let Some(w) = self.window.as_ref() {
+                            let now = std::time::Instant::now();
+                            let dbl = self.last_strip_click
+                                .is_some_and(|t: std::time::Instant| now.duration_since(t).as_millis() < 400);
+                            self.last_strip_click = Some(now);
+                            if dbl {
+                                w.set_maximized(!w.is_maximized());
+                            } else {
+                                let _ = w.drag_window();
+                            }
+                        }
                         return;
                     }
                     if let Some((pi, row, col, side)) = self.pane_cell_at(self.cursor_pos) {
@@ -2498,6 +2630,7 @@ fn main() {
     let cfg = config::load();
     let keymap = keybinds::effective_map(&cfg);
     let mut app = App {
+        last_strip_click: None,
         proxy,
         window: None,
         gpu: None,
