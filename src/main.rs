@@ -1828,8 +1828,15 @@ impl ApplicationHandler<UserEvent> for App {
         // fully-drawn window appearing beats a white flash while DX12 warms up.
         // BAYAN_SHOW_NOW forces it visible at creation (for on-screen capture).
         let visible = std::env::var_os("BAYAN_SHOW_NOW").is_some();
+        // The exe's embedded resource covers Explorer and the taskbar, but the
+        // title bar and Alt-Tab read the WINDOW icon, which winit only sets if
+        // we hand it pixels. Raw RGBA rather than a decoder: 16KB, no new crate,
+        // and generated from assets/bayan.ico so the two can't drift apart.
+        const ICON_RGBA: &[u8] = include_bytes!("../assets/icon_64.rgba");
+        let icon = winit::window::Icon::from_rgba(ICON_RGBA.to_vec(), 64, 64).ok();
         let attrs = Window::default_attributes()
             .with_title("Bayan — بيان")
+            .with_window_icon(icon)
             .with_visible(visible)
             .with_inner_size(LogicalSize::new(1100.0, 700.0));
         let window = Arc::new(el.create_window(attrs).expect("create window"));
