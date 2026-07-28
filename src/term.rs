@@ -19,29 +19,47 @@ use crate::UserEvent;
 pub const DEFAULT_SHELL: &str = "powershell.exe";
 const MAX_CARRY: usize = 4096;
 
-/// Shells the settings panel offers — the installed subset of the usual
-/// Windows trio. PowerShell 5 and cmd ship with Windows; pwsh 7 only
-/// appears when it's actually on PATH.
+/// Shells the settings panel offers. Delegates to `shells::detect`, which
+/// finds what is actually installed — PowerShell with and without $PROFILE,
+/// pwsh when present, cmd, Git Bash, and every WSL distribution. Ported from
+/// EasyTer, whose generator this mirrors.
 pub fn shell_choices() -> Vec<String> {
-    let mut out = vec![DEFAULT_SHELL.to_string()];
-    let on_path = |exe: &str| {
-        std::env::var_os("PATH").is_some_and(|p| {
-            std::env::split_paths(&p).any(|d| d.join(exe).is_file())
-        })
-    };
-    if on_path("pwsh.exe") {
-        out.push("pwsh.exe".to_string());
-    }
-    out.push("cmd.exe".to_string());
-    out
+    crate::shells::detect().into_iter().map(|s| s.command).collect()
 }
 
 /// The PowerShell family gets the full treatment (UTF-8, prompt theme,
 /// OSC 133 marks); other shells launch bare and the mark-driven features
 /// (command lights, prompt jumps, Claude auto-detect) degrade gracefully.
 fn is_powershell(shell: &str) -> bool {
-    let base = shell.rsplit(['\\', '/']).next().unwrap_or(shell);
+    // `shell` is a COMMAND LINE now, not a program name: detection emits
+    // "powershell.exe -NoProfile", "wsl.exe -d Ubuntu", "…bash.exe --login -i".
+    let (prog, _) = split_command(shell);
+    let base = prog.rsplit(['\\', '/']).next().unwrap_or(&prog).to_string();
     base.eq_ignore_ascii_case("powershell.exe") || base.eq_ignore_ascii_case("pwsh.exe")
+}
+
+/// Split a stored command line into program + arguments.
+///
+/// Splitting on the first space is WRONG: a hand-edited config may hold
+/// `C:\Program Files\PowerShell\7\pwsh.exe`, whose program name contains two
+/// spaces. So find the program by its `.exe` boundary (or an explicit quote),
+/// and only then treat the remainder as arguments.
+pub fn split_command(cmd: &str) -> (String, Vec<String>) {
+    let c = cmd.trim();
+    let split_args = |s: &str| s.split_whitespace().map(str::to_string).collect();
+    // "quoted program" args…
+    if let Some(rest) = c.strip_prefix('"') {
+        if let Some(i) = rest.find('"') {
+            return (rest[..i].to_string(), split_args(&rest[i + 1..]));
+        }
+    }
+    // …otherwise the program ends at the first ".exe"
+    if let Some(i) = c.to_lowercase().find(".exe") {
+        let end = i + 4;
+        return (c[..end].to_string(), split_args(&c[end..]));
+    }
+    let mut it = c.split_whitespace();
+    (it.next().unwrap_or(c).to_string(), it.map(str::to_string).collect())
 }
 
 /// OSC 133 prompt wrapper injected into PowerShell (EasyTer's __et_wrap,
@@ -481,7 +499,13 @@ impl Session {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        let mut cmd = CommandBuilder::new(shell);
+        // program + args, or a shell with switches would be spawned as one
+        // absurd filename ("powershell.exe -NoProfile" is not a program)
+        let (prog, args) = split_command(shell);
+        let mut cmd = CommandBuilder::new(prog);
+        for a in &args {
+            cmd.arg(a);
+        }
         // requested dir (a restored tab, or "new tab inherits the cwd"),
         // else home — never the launcher's directory (often system32)
         match start_cwd.filter(|d| std::path::Path::new(d).is_dir()) {
@@ -689,16 +713,57 @@ mod tests {
     }
 
     #[test]
-    fn shell_choices_are_the_installed_trio() {
+    fn shell_choices_come_from_detection() {
+        // The old contract was "the installed trio" and capped the list at 3.
+        // Detection replaced it: Git Bash and every WSL distro now appear too,
+        // so the cap is gone deliberately, not by accident.
         let c = shell_choices();
         assert_eq!(c[0], DEFAULT_SHELL, "PowerShell 5 leads (always present)");
         assert!(c.contains(&"cmd.exe".to_string()));
-        assert!(c.len() <= 3);
+        assert_eq!(c, crate::shells::detect().into_iter().map(|s| s.command).collect::<Vec<_>>());
+        let mut sorted = c.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), c.len(), "cycling must not repeat a shell: {c:?}");
         // family detection drives the setup injection
         assert!(is_powershell("powershell.exe"));
         assert!(is_powershell(r"C:\Program Files\PowerShell\7\pwsh.exe"));
         assert!(!is_powershell("cmd.exe"));
         assert!(!is_powershell("nu.exe"));
+        // the no-profile variant is still the PowerShell family: it must keep
+        // UTF-8 setup and OSC 133 marks, or command lights die on that entry
+        assert!(is_powershell("powershell.exe -NoProfile"));
+    }
+
+    #[test]
+    fn command_lines_split_into_program_and_args() {
+        // guards: CommandBuilder::new(whole_line) would try to spawn a program
+        // literally named "powershell.exe -NoProfile"
+        assert_eq!(split_command("cmd.exe"), ("cmd.exe".into(), vec![]));
+        assert_eq!(
+            split_command("powershell.exe -NoProfile"),
+            ("powershell.exe".into(), vec!["-NoProfile".to_string()])
+        );
+        assert_eq!(
+            split_command(r"C:\PROGRA~1\Git\usr\bin\bash.exe --login -i"),
+            (r"C:\PROGRA~1\Git\usr\bin\bash.exe".into(),
+             vec!["--login".to_string(), "-i".to_string()])
+        );
+        assert_eq!(
+            split_command("wsl.exe -d Ubuntu"),
+            ("wsl.exe".into(), vec!["-d".to_string(), "Ubuntu".to_string()])
+        );
+        // a program path WITH spaces must survive: splitting on the first
+        // space would yield "C:\Program" and break is_powershell
+        assert_eq!(
+            split_command(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+            (r"C:\Program Files\PowerShell\7\pwsh.exe".into(), vec![])
+        );
+        // every detected shell splits to a real program
+        for c in shell_choices() {
+            let (prog, _) = split_command(&c);
+            assert!(prog.to_lowercase().ends_with(".exe"), "bad program in {c:?}");
+        }
     }
 
     #[test]

@@ -8,6 +8,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod bidi;
+mod shells;
 mod config;
 mod gpu;
 mod keybinds;
@@ -1725,7 +1726,7 @@ impl App {
                             padding: self.config.padding_px(),
                             opacity_pct: (self.config.opacity_level() * 100.0).round()
                                 as i32,
-                            shell: &self.config.shell_program(),
+                            shell: &shells::label_for(&self.config.shell_program()),
                             hide_single_tab: self.config.hide_single_tab_on(),
                             confirm_close: self.config.confirm_close_on(),
                         },

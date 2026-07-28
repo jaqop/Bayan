@@ -1722,7 +1722,7 @@ impl Renderer {
         leader(out, lay.shell_next.0 + lay.shell_next.2, ll, lay.shell_label_y);
         draw_btn(self, out, lay.shell_prev, "‹");
         draw_btn(self, out, lay.shell_next, "›");
-        draw_val(self, out, v.shell.trim_end_matches(".exe").to_string(),
+        draw_val(self, out, v.shell.to_string(),
                  lay.shell_prev, lay.shell_next, lay.shell_label_y);
 
         // ---- hide-bar / confirm-close toggles ----
