@@ -1,0 +1,103 @@
+{
+  "$comment": [
+    "Language-agnostic BiDi test corpus, generated from Bayan's src/bidi.rs and",
+    "self-validated: every pair below was proven to round-trip by the implementation",
+    "that produced it, not transcribed by hand.",
+    "",
+    "DIRECTION. Each case is a pair of representations of the SAME text:",
+    "  logical - the order the bytes arrive in / sit in memory",
+    "  visual  - the order a UAX#9-applying renderer puts on screen",
+    "A terminal that applies BiDi maps logical -> visual.",
+    "A terminal undoing a client that already applied BiDi maps visual -> logical.",
+    "The pairs are useful either direction; only the arrow changes.",
+    "",
+    "Codepoints are given explicitly because editors and terminals reorder RTL text",
+    "on display, which makes eyeballing a fixture file unreliable."
+  ],
+  "cases": [
+    {
+      "name": "arabic_word",
+      "pins": "Baseline whole-line reversal for a pure-Arabic line.",
+      "logical": "مرحبا",
+      "visual": "ابحرم",
+      "logical_codepoints": "0645 0631 062D 0628 0627",
+      "visual_codepoints": "0627 0628 062D 0631 0645"
+    },
+    {
+      "name": "arabic_sentence",
+      "pins": "Word order reverses as well as letter order; the space is preserved between the reordered words.",
+      "logical": "مرحبا بالعالم",
+      "visual": "ملاعلاب ابحرم",
+      "logical_codepoints": "0645 0631 062D 0628 0627 0020 0628 0627 0644 0639 0627 0644 0645",
+      "visual_codepoints": "0645 0644 0627 0639 0644 0627 0628 0020 0627 0628 062D 0631 0645"
+    },
+    {
+      "name": "combining_tanwin",
+      "pins": "THE CLUSTER RULE. U+064B (tanwin) must stay immediately after its base U+0627 (alef) in BOTH representations. A codepoint-level reverse emits 064B before 0627 and renders as garbage. Reorder grapheme clusters, not codepoints.",
+      "logical": "معاً",
+      "visual": "اًعم",
+      "logical_codepoints": "0645 0639 0627 064B",
+      "visual_codepoints": "0627 064B 0639 0645"
+    },
+    {
+      "name": "arabic_indic_digits",
+      "pins": "THE DIGIT RULE. U+0661 U+0667 U+0665 keep their internal order in both representations - Arabic-Indic digits are weak LTR, not RTL letters. An 'is this Arabic?' test that range-checks the whole 0600-06FF block sweeps digits in and reverses every number on the line.",
+      "logical": "رقم ١٧٥",
+      "visual": "١٧٥ مقر",
+      "logical_codepoints": "0631 0642 0645 0020 0661 0667 0665",
+      "visual_codepoints": "0661 0667 0665 0020 0645 0642 0631"
+    },
+    {
+      "name": "ltr_island_path",
+      "pins": "THE ISLAND RULE. 'config.txt' survives intact inside an RTL-base line: the dot is absorbed into the Latin run because a Latin character follows it. Absorb punctuation unconditionally and a TRAILING period flips ('01.' becomes '.01'), so the join needs a lookahead.",
+      "logical": "افتح ملف config.txt رجاء",
+      "visual": "ءاجر config.txt فلم حتفا",
+      "logical_codepoints": "0627 0641 062A 062D 0020 0645 0644 0641 0020 0063 006F 006E 0066 0069 0067 002E 0074 0078 0074 0020 0631 062C 0627 0621",
+      "visual_codepoints": "0621 0627 062C 0631 0020 0063 006F 006E 0066 0069 0067 002E 0074 0078 0074 0020 0641 0644 0645 0020 062D 062A 0641 0627"
+    },
+    {
+      "name": "ltr_base_arabic_tail",
+      "pins": "THE BASE-DIRECTION RULE. This line has more Latin than Arabic, so the base is LTR: only the Arabic RUN reverses, in place, and the Latin is untouched. Contrast arabic_sentence, where the whole line reverses. Note U+061F (Arabic question mark) travels with the Arabic run.",
+      "logical": "What are you working on مساعدتك؟",
+      "visual": "What are you working on ؟كتدعاسم",
+      "logical_codepoints": "0057 0068 0061 0074 0020 0061 0072 0065 0020 0079 006F 0075 0020 0077 006F 0072 006B 0069 006E 0067 0020 006F 006E 0020 0645 0633 0627 0639 062F 062A 0643 061F",
+      "visual_codepoints": "0057 0068 0061 0074 0020 0061 0072 0065 0020 0079 006F 0075 0020 0077 006F 0072 006B 0069 006E 0067 0020 006F 006E 0020 061F 0643 062A 062F 0639 0627 0633 0645"
+    },
+    {
+      "name": "no_arabic_untouched",
+      "pins": "A line with no Arabic must be returned byte-identical - no reordering, no normalisation. Guards against a transform that runs unconditionally.",
+      "logical": "pure english",
+      "visual": "pure english",
+      "logical_codepoints": "0070 0075 0072 0065 0020 0065 006E 0067 006C 0069 0073 0068",
+      "visual_codepoints": "0070 0075 0072 0065 0020 0065 006E 0067 006C 0069 0073 0068"
+    }
+  ],
+  "multiline_case": {
+    "$comment": "Selection/copy spans lines with different base directions. Each line classifies independently; a whole-block transform is wrong.",
+    "visual_block": "ابحرم\nplain english\nWhat are you working on ؟كتدعاسم",
+    "logical_block": "مرحبا\nplain english\nWhat are you working on مساعدتك؟"
+  },
+  "program_gating": {
+    "$comment": [
+      "Not BiDi, but adjacent and it caused real bugs. If a terminal ships a mode for",
+      "clients that pre-apply BiDi, it must key on the INVOKED PROGRAM - basename,",
+      "extension stripped, runner prefixes unwrapped - not on a substring of the",
+      "command line. Otherwise 'vim claude.py' silently enables it.",
+      "true = the client pre-applies BiDi; false = the client emits logical order."
+    ],
+    "matches": [
+      "claude",
+      "claude --continue",
+      "npx claude",
+      "\"C:\\tools\\claude.exe\" chat",
+      "& C:\\Users\\x\\claude.cmd"
+    ],
+    "does_not_match": [
+      "vim claude.py",
+      "less claude.txt",
+      "git log claude",
+      "htop",
+      ""
+    ]
+  }
+}
