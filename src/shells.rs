@@ -113,7 +113,7 @@ pub fn detect() -> Vec<Shell> {
 
     // $PROFILE is loaded, so the user's chosen oh-my-posh prompt shows up.
     v.push(Shell::new("PowerShell", "powershell.exe"));
-    v.push(Shell::new("PowerShell (سريع · بلا profile)", "powershell.exe -NoProfile"));
+    v.push(Shell::new("PowerShell سريع", "powershell.exe -NoProfile"));
 
     if on_path("pwsh") {
         v.push(Shell::new("PowerShell 7", "pwsh.exe -NoLogo"));
@@ -174,6 +174,21 @@ mod tests {
         let raw: Vec<u8> = "Ubuntu".encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
         assert_eq!(parse_wsl_list(&raw), vec!["Ubuntu"]);
         assert_ne!(String::from_utf8_lossy(&raw).trim(), "Ubuntu");
+    }
+
+    #[test]
+    fn shell_labels_stay_short_enough_for_the_settings_row() {
+        // the settings shell cycler is ~12 cells wide; a long label used to
+        // overflow it and collide with the row title. The renderer truncates
+        // now, but a name that ALWAYS truncates is a name nobody can read.
+        for s in detect() {
+            assert!(
+                s.name.chars().count() <= 20,
+                "shell label too long for the cycler: {:?} ({} chars)",
+                s.name,
+                s.name.chars().count()
+            );
+        }
     }
 
     #[test]

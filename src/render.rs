@@ -1675,10 +1675,26 @@ impl Renderer {
         };
         let draw_val = |r: &mut Self, out: &mut Vec<Vertex>, text: String,
                         left: Rect, right: Rect, row_top: i32| {
-            let seg = [Seg { text, fg: VALUE, style: ST_BOLD }];
-            let vw = r.measure(&seg, false);
-            let mid = (left.0 + left.2 + right.0) / 2;
-            r.draw_run(&seg, false, out, whole, mid as f32 - vw / 2.0, row_top + tc, 1.0);
+            // Clamp to the gap between the two arrows. Shell detection can hand
+            // us "PowerShell (سريع · بلا profile)" or a WSL distro name, and an
+            // uncapped centred label overflows in BOTH directions — it collided
+            // with the row's own title. Truncating here protects every row,
+            // including a long font family, not just the one that broke.
+            let gap = (right.0 - (left.0 + left.2) - 8).max(0);
+            let mut text = text;
+            loop {
+                let seg = [Seg { text: text.clone(), fg: VALUE, style: ST_BOLD }];
+                let vw = r.measure(&seg, false);
+                if vw as i32 <= gap || text.chars().count() <= 2 {
+                    let mid = (left.0 + left.2 + right.0) / 2;
+                    r.draw_run(&seg, false, out, whole, mid as f32 - vw / 2.0, row_top + tc, 1.0);
+                    return;
+                }
+                // drop a char and re-measure: cell width is not a reliable
+                // proxy here, because these labels mix Arabic with Latin
+                let keep = text.chars().count().saturating_sub(2);
+                text = text.chars().take(keep).collect::<String>() + "…";
+            }
         };
         let draw_toggle = |out: &mut Vec<Vertex>, rect: Rect, on: bool| {
             let (gx, gy, gw, gh) = rect;
