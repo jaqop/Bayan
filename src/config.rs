@@ -181,8 +181,10 @@ impl UserConfig {
         self.confirm_close.unwrap_or(true)
     }
 
+    /// Content inset. Default 10: text pressed flat against the window edge
+    /// reads as unfinished, and every modern terminal ships a gutter.
     pub fn padding_px(&self) -> i32 {
-        self.padding.unwrap_or(0).min(32) as i32
+        self.padding.unwrap_or(10).min(32) as i32
     }
 
     pub fn notifications_on(&self) -> bool {
@@ -289,7 +291,7 @@ mod tests {
         assert_eq!(d.shell_program(), "powershell.exe");
         assert!(!d.hide_single_tab_on());
         assert!(d.confirm_close_on());
-        assert_eq!(d.padding_px(), 0);
+        assert_eq!(d.padding_px(), 10, "a default gutter, not flush to the edge");
         let c: UserConfig = serde_json::from_str(
             r#"{"opacity":0.8,"shell":"pwsh.exe","hide_single_tab":true,
                 "confirm_close":false,"padding":12}"#,

@@ -29,27 +29,33 @@ use cosmic_text::{
 use crate::gpu::Vertex;
 use crate::term::EventProxy;
 
-// EasyTer heritage colors: the palette that proved itself for Arabic text
-pub const BG: (u8, u8, u8) = (0x0d, 0x11, 0x17);
-pub const FG: (u8, u8, u8) = (0xe6, 0xed, 0xf3);
+// Bayan's first look is Jonathan Blow's scheme, SAMPLED from two captures of
+// his editor rather than recalled. Five colours are measured medians, not
+// guesses: background #062626, foreground tan #c2b796, and — the pair that
+// carries the scheme — TWO greens. The darker grass green #62cc54 is his
+// comment colour; the lighter mint #58d1c0 is strings and types. White
+// #eefbfa marks keywords. Everything else is a muted derivation, because the
+// original uses almost no other hue and loud fillers would break it.
+pub const BG: (u8, u8, u8) = (0x06, 0x26, 0x26);
+pub const FG: (u8, u8, u8) = (0xc2, 0xb7, 0x96);
 
 const PALETTE: [(u8, u8, u8); 16] = [
-    (0x0d, 0x11, 0x17), // black
-    (0xff, 0x6b, 0x6b), // red
-    (0x7e, 0xe7, 0x87), // green
-    (0xe3, 0xb3, 0x41), // yellow
-    (0x6c, 0xa0, 0xf6), // blue
-    (0xd2, 0xa8, 0xff), // magenta
-    (0x56, 0xd4, 0xdd), // cyan
-    (0xe6, 0xed, 0xf3), // white
-    (0x6e, 0x76, 0x81), // bright black
-    (0xff, 0x8a, 0x8a), // bright red
-    (0xa2, 0xf5, 0xb0), // bright green
-    (0xf2, 0xcc, 0x60), // bright yellow
-    (0x8d, 0xb4, 0xf8), // bright blue
-    (0xe0, 0xc1, 0xff), // bright magenta
-    (0x7e, 0xe0, 0xe6), // bright cyan
-    (0xff, 0xff, 0xff), // bright white
+    (0x06, 0x26, 0x26), // black — MEASURED background
+    (0xc0, 0x50, 0x3f), // red — derived; the reference has no red
+    (0x62, 0xcc, 0x54), // green — MEASURED, the darker grass green (comments)
+    (0xcb, 0xa6, 0x4f), // yellow — derived, kept off the foreground tan
+    (0x4f, 0x8f, 0x95), // blue — derived, deliberately quiet
+    (0xa9, 0x7f, 0xb0), // magenta — derived
+    (0x58, 0xd1, 0xc0), // cyan — MEASURED, the lighter mint (strings, types)
+    (0xc2, 0xb7, 0x96), // white — MEASURED foreground tan
+    (0x2d, 0x54, 0x50), // bright black
+    (0xd9, 0x71, 0x60), // bright red
+    (0x7e, 0xe0, 0x6d), // bright green — the grass green, lifted
+    (0xdc, 0xc9, 0x8f), // bright yellow
+    (0x74, 0xaf, 0xb4), // bright blue
+    (0xc4, 0x9e, 0xd0), // bright magenta
+    (0x7f, 0xe4, 0xd5), // bright cyan — the mint, lifted
+    (0xee, 0xfb, 0xfa), // bright white — MEASURED
 ];
 
 // (color resolution lives on Renderer: bg/fg/palette are config-themable)
@@ -73,8 +79,23 @@ pub fn theme_by_name(name: &str) -> Option<&'static Theme> {
 
 /// The theme presets the settings panel cycles through.
 pub const THEMES: &[Theme] = &[
+    // Jonathan Blow's editor scheme, known as Naysayer. Its signature is tan
+    // text on dark petrol with very few hues: green 0x44b340 (comments),
+    // teal 0x2ec09c (strings), 0x8cde94 (types), 0x7ad0c6 (numbers). The
+    // remaining ANSI slots are filled with muted neighbours rather than the
+    // usual saturated set, so the restraint of the original survives.
     Theme {
-        name: "بيان",
+        name: "Jonathan Blow",
+        bg: rgb(0x062626), fg: rgb(0xc2b796),
+        palette: [
+            rgb(0x062626), rgb(0xc0503f), rgb(0x62cc54), rgb(0xcba64f),
+            rgb(0x4f8f95), rgb(0xa97fb0), rgb(0x58d1c0), rgb(0xc2b796),
+            rgb(0x2d5450), rgb(0xd97160), rgb(0x7ee06d), rgb(0xdcc98f),
+            rgb(0x74afb4), rgb(0xc49ed0), rgb(0x7fe4d5), rgb(0xeefbfa),
+        ],
+    },
+    Theme {
+        name: "بيان (الأزرق)",
         bg: rgb(0x0d1117), fg: rgb(0xe6edf3),
         palette: [
             rgb(0x0d1117), rgb(0xff6b6b), rgb(0x7ee787), rgb(0xe3b341),
@@ -202,6 +223,27 @@ fn push_rect(out: &mut Vec<Vertex>, clip: Rect, x: i32, y: i32, w: i32, h: i32,
              color: [f32; 4]) {
     push_quad(out, clip, x as f32, y as f32, w as f32, h as f32,
               0, WHITE_UV, WHITE_UV, WHITE_UV, WHITE_UV, color);
+}
+
+/// Per-row inset for a rounded top corner, radius 4. A true rounded rect would
+/// need an alpha mask in the atlas or a shader branch; at this radius a
+/// stair-step of four 1px rows is indistinguishable and stays inside the
+/// one-pipeline, quads-only design.
+const CORNER_INSET: [i32; 4] = [3, 2, 1, 1];
+
+/// Rect whose TOP corners are rounded. Bottom stays square: the tab meets the
+/// content area there and a curve would leave a notch.
+fn push_rect_top_rounded(out: &mut Vec<Vertex>, clip: Rect, x: i32, y: i32,
+                         w: i32, h: i32, color: [f32; 4]) {
+    let r = CORNER_INSET.len() as i32;
+    if w <= 2 * r || h <= r {
+        push_rect(out, clip, x, y, w, h, color);
+        return;
+    }
+    for (i, inset) in CORNER_INSET.iter().enumerate() {
+        push_rect(out, clip, x + inset, y + i as i32, w - 2 * inset, 1, color);
+    }
+    push_rect(out, clip, x, y + r, w, h - r, color);
 }
 
 /// Hard ceiling on atlas pages (each is ATLAS_SIZE² RGBA = 16MB). Reached
@@ -1940,24 +1982,43 @@ impl Renderer {
         if self.bar_hidden {
             return;
         }
-        push_rect(out, whole, 0, 0, width as i32, oy, c4((0x16, 0x1b, 0x22), 255));
+        let bar_bg = ((self.bg.0 as f32 * 0.55) as u8,
+                      (self.bg.1 as f32 * 0.55) as u8,
+                      (self.bg.2 as f32 * 0.55) as u8);
+        push_rect(out, whole, 0, 0, width as i32, oy, c4(bar_bg, 255));
         let tw = (self.cell_w * TAB_CELLS) as i32;
         for (i, tab) in tabs.iter().enumerate() {
             let x0 = i as i32 * tw;
-            let (bg, fg): ((u8, u8, u8), (u8, u8, u8)) = if tab.active {
-                ((0x24, 0x2b, 0x36), self.fg)
-            } else {
-                ((0x16, 0x1b, 0x22), (0x8a, 0x94, 0xa3))
+            // The active tab takes the CONTENT background, so it reads as the
+            // top of the pane below it rather than as a highlighted list row.
+            // Inactive tabs recede into the bar instead of floating above it.
+            let dim = |c: (u8, u8, u8), f: f32| {
+                ((c.0 as f32 * f) as u8, (c.1 as f32 * f) as u8, (c.2 as f32 * f) as u8)
             };
-            push_rect(out, whole, x0, 0, tw - 2, oy, c4(bg, 255));
+            let (bg, fg): ((u8, u8, u8), (u8, u8, u8)) = if tab.active {
+                (self.bg, self.fg)
+            } else {
+                (dim(self.bg, 0.72), dim(self.fg, 0.55))
+            };
+            // tabs sit IN the bar rather than filling it: a 3px gutter above
+            // and a real gap between them, so they read as separate cards
+            const TAB_GAP: i32 = 6;
+            const TAB_TOP: i32 = 3;
+            let tx = x0 + TAB_GAP / 2;
+            let tabw = tw - TAB_GAP;
+            push_rect_top_rounded(out, whole, tx, TAB_TOP, tabw, oy - TAB_TOP, c4(bg, 255));
             if tab.active {
-                // accent line on top: the focused tab is unmistakable
-                push_rect(out, whole, x0, 0, tw - 2, 2, c4((0x2e, 0xa0, 0x43), 255));
+                // a hairline that hugs the curve — enough to mark focus without
+                // shouting; the background match already does most of the work
+                for (i, inset) in CORNER_INSET.iter().enumerate().take(2) {
+                    push_rect(out, whole, tx + inset, TAB_TOP + i as i32,
+                              tabw - 2 * inset, 1, c4((0x2e, 0xa0, 0x43), 220));
+                }
             }
             let max_chars = TAB_CELLS as usize - 5;
             let title: String = tab.title.chars().take(max_chars).collect();
             let segs = [Seg::plain(title, fg)];
-            self.draw_run(&segs, true, out, whole, (x0 + 10) as f32, 5, 1.0);
+            self.draw_run(&segs, true, out, whole, (tx + 10) as f32, 6, 1.0);
             // dots: amber attention (a Claude waiting on you) beats green busy
             let dot = if tab.attention {
                 Some((0xf2, 0xcc, 0x60))
@@ -1968,7 +2029,7 @@ impl Renderer {
             };
             if let Some(c) = dot {
                 let d = 6;
-                push_rect(out, whole, x0 + tw - 16, oy / 2 - d / 2, d, d, c4(c, 255));
+                push_rect(out, whole, tx + tabw - 14, (oy + 3) / 2 - d / 2, d, d, c4(c, 255));
             }
         }
 
@@ -2218,6 +2279,19 @@ mod cache_tests {
         // default theme = بيان (dark GitHub-ish)
         let def = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
         assert_eq!(def.bg, THEMES[0].bg);
+        // The Blow scheme's five MEASURED colours, sampled from captures of his
+        // editor. Pinned so a future palette tweak cannot quietly drift off the
+        // reference: background, the two greens that carry the scheme, the tan
+        // foreground, and the keyword white.
+        assert_eq!(BG, (0x06, 0x26, 0x26), "measured background");
+        assert_eq!(FG, (0xc2, 0xb7, 0x96), "measured foreground tan");
+        assert_eq!(PALETTE[2], (0x62, 0xcc, 0x54), "darker grass green (comments)");
+        assert_eq!(PALETTE[6], (0x58, 0xd1, 0xc0), "lighter mint (strings, types)");
+        assert_eq!(PALETTE[15], (0xee, 0xfb, 0xfa), "keyword white");
+        // and THEMES[0] must be that same scheme, since it is the first look
+        assert_eq!(THEMES[0].name, "Jonathan Blow");
+        assert_eq!(THEMES[0].fg, FG);
+        assert_eq!(THEMES[0].palette, PALETTE);
 
         // a named theme flows all the way to the renderer's colors
         let dracula = theme_by_name("Dracula").unwrap();
