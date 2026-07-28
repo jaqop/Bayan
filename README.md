@@ -172,6 +172,32 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       lines go through the whole-line BiDi path, which now ligates its
       ASCII segments too. Verified live: → ⇒ ≠ ≡ joined AND مرحبا بالعالم
       connected, correctly ordered, on the same line
+- [x] **M21** — wgpu 24 → 30, six majors in one hop. The migration is 37
+      lines of `gpu.rs`; the obstacle was that wgpu 30 wouldn't build on
+      Windows AT ALL. wgpu-hal 30 depends on windows 0.62 directly and on
+      gpu-allocator 0.28, which declares `windows = ">=0.53, <=0.62"` — a
+      RANGE, and cargo resolved it to 0.58 off our old lockfile, so
+      dx12/suballocation.rs passed a 0.58 `ID3D12Heap` into a 0.62
+      `CreatePlacedResource` and failed inside a crate we don't own. The fix
+      is resolution, not code: `cargo update -p windows@0.58.0 --precise
+      0.62.2` pins the range to its ceiling and collapses the graph to one
+      windows-core (upstream, same family as gfx-rs/wgpu#6687). The API
+      changes that carried meaning: `get_current_texture` no longer returns
+      `Result` but a `CurrentSurfaceTexture` enum whose **Suboptimal variant
+      carries a usable texture** — render it, or resizes blink;
+      `SurfaceConfiguration` gained `color_space`, whose Default is
+      documented as reproducing wgpu's historical behavior, which is exactly
+      what M10 proved pixel-identical to the CPU renderer, so Default is the
+      correct choice and not the lazy one; `present()` moved to `Queue`;
+      push constants became `immediate_size`; `multiview` → `multiview_mask`.
+      Verified, not assumed: 58 tests pass, a live capture shows ligatures
+      still joining and مرحبا بالعالم still connected and ordered on the same
+      line (M20 intact through a GPU rewrite), and BAYAN_ATLAS_STRESS forces
+      page growth with thousands of CJK glyphs rendering uncorrupted beside
+      the page-0 powerline prompt in one frame (M13 intact). Honest scope:
+      clippy isn't installed on this toolchain (the build is warning-clean
+      instead), and M14's differential redraw wasn't re-measured — the quad
+      set is untouched by this change, but that's an argument, not a benchmark
 
 ## Settings
 
