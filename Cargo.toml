@@ -37,6 +37,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Shell", # Shell_NotifyIcon balloons = native toasts, no WinRT
 ] }
 
+[target."cfg(windows)".build-dependencies]
+winresource = "0.1"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
