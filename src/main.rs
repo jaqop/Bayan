@@ -874,7 +874,7 @@ impl App {
             return (true, None);
         }
         let k = elapsed.as_millis() / BLINK_MS;
-        let on = k % 2 == 0;
+        let on = k.is_multiple_of(2);
         let next_flip = self.last_input
             + std::time::Duration::from_millis(((k + 1) * BLINK_MS) as u64);
         // the wake at the 15s mark restores the solid cursor
@@ -1234,7 +1234,7 @@ impl App {
     /// Split the active tab (EasyTer: Ctrl+Shift+E side-by-side, O stacked).
     fn split(&mut self, orientation: Orientation) {
         // four panes per tab is the v1 cap (one axis, equal sizes)
-        if self.tabs.get(self.active).map_or(true, |t| t.panes.len() >= 4) {
+        if self.tabs.get(self.active).is_none_or(|t| t.panes.len() >= 4) {
             return;
         }
         let cwd = self

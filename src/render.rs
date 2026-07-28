@@ -792,7 +792,7 @@ impl Renderer {
             .filter(|c| has(c))
             .map(|c| c.to_string())
             .collect();
-        if !out.iter().any(|c| *c == self.family) {
+        if !out.contains(&self.family) {
             out.insert(0, self.family.clone());
         }
         out
@@ -1665,7 +1665,7 @@ impl Renderer {
         leader(out, lay.scroll_plus.0 + lay.scroll_plus.2, ll, lay.scroll_label_y);
         draw_btn(self, out, lay.scroll_minus, "−");
         draw_btn(self, out, lay.scroll_plus, "+");
-        let sb = if v.scrollback % 1000 == 0 {
+        let sb = if v.scrollback.is_multiple_of(1000) {
             format!("{}k", v.scrollback / 1000)
         } else {
             format!("{}", v.scrollback)
