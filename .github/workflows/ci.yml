@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Windows only, deliberately. Bayan is bound to the platform: ConPTY via
+  # portable-pty, Shell_NotifyIcon toasts, RegisterHotKey, DX12-first wgpu,
+  # and a windows-sys dependency. A Linux job would not compile, so there
+  # isn't one — rather than a matrix full of exclusions.
+  test:
+    name: build + test (stable, windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --all-targets
+      # The 58 tests are pure unit tests — no GPU, no window, no PTY spawn —
+      # so they run headless. Note config.rs's tests read ~/.bayan/config.json
+      # if it exists; a CI runner has none, which is why they are reliable
+      # here and need the file removed when running locally.
+      - name: Test
+        run: cargo test --all-targets
+
+  # Enforces the rust-version declared in Cargo.toml. That floor is set by the
+  # dependency graph (cosmic-text 0.19 wants 1.89), not by our own source, so
+  # without this job the declaration is a comment nobody checks.
+  msrv:
+    name: msrv 1.89
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - name: Check against the declared minimum
+        run: cargo check --all-targets
+
+  # Informational on purpose: no -D warnings. There are known style lints the
+  # project keeps deliberately — most notably bidi.rs's LTR-island scanner,
+  # where clippy wants two if-arms merged and the split is what encodes the
+  # punctuation lookahead. Clippy still fails the job on real errors.
+  clippy:
+    name: clippy
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets
