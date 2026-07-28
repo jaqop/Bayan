@@ -2,6 +2,10 @@
 name = "bayan"
 version = "0.1.0"
 edition = "2021"
+# Set by the dependency graph, not by our own code: cosmic-text 0.19, smol_str
+# and font-types all declare 1.89 (wgpu 30 wants 1.87). Our own floor is lower
+# — is_multiple_of, from a clippy fix, needs 1.87.
+rust-version = "1.89"
 description = "Bayan (بيان) — an Arabic-first, agent-ready terminal emulator"
 license = "MIT"
 
