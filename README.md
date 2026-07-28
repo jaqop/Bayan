@@ -3,7 +3,9 @@
 **An Arabic-first, agent-ready terminal emulator, written in Rust.**
 **طرفية بالعربية أولاً، جاهزة لوكلاء الذكاء الاصطناعي، مكتوبة بلغة Rust.**
 
+[![CI](https://github.com/jaqop/Bayan/actions/workflows/ci.yml/badge.svg)](https://github.com/jaqop/Bayan/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](Cargo.toml)
 
 Bayan is the Rust successor to [EasyTer](https://github.com/jaqop/EasyTer): same mission — a
 terminal where Arabic is a first-class citizen and AI agents (Claude Code)
