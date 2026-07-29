@@ -440,6 +440,34 @@ pub fn parse_posh_config(profile_text: &str) -> Option<String> {
 /// from the PowerShell profile. Lets Bayan skip the profile (-NoProfile is
 /// the single biggest avoidable startup cost — the EasyTer lesson) while
 /// keeping the prompt the user actually uses.
+/// Expand the environment references a hand-written $PROFILE may hold.
+/// Bayan checks the config path on disk before injecting it, and a
+/// portable profile stores "$env:USERPROFILE\\.poshthemes\\..." rather than
+/// an absolute path — checking that literally always fails, which silently
+/// drops the prompt. (Self-inflicted: making the profile portable is what
+/// exposed this.)
+fn expand_env(path: &str) -> String {
+    let mut out = path.to_string();
+    for (needle, var) in [
+        ("$env:USERPROFILE", "USERPROFILE"),
+        ("$env:HOME", "USERPROFILE"),
+        ("$HOME", "USERPROFILE"),
+        ("%USERPROFILE%", "USERPROFILE"),
+        ("$env:LOCALAPPDATA", "LOCALAPPDATA"),
+    ] {
+        if let Some(v) = std::env::var_os(var).and_then(|v| v.into_string().ok()) {
+            out = out.replace(needle, &v);
+        }
+    }
+    // a leading ~ is the other common shorthand
+    if let Some(rest) = out.strip_prefix("~") {
+        if let Some(h) = std::env::var_os("USERPROFILE").and_then(|v| v.into_string().ok()) {
+            out = format!("{h}{rest}");
+        }
+    }
+    out
+}
+
 fn detect_posh_theme() -> Option<String> {
     if let Ok(t) = std::env::var("POSH_THEME") {
         if !t.is_empty() && std::path::Path::new(&t).exists() {
@@ -454,6 +482,7 @@ fn detect_posh_theme() -> Option<String> {
         let p = std::path::Path::new(&home).join(rel);
         if let Ok(text) = std::fs::read_to_string(&p) {
             if let Some(cfg) = parse_posh_config(&text) {
+                let cfg = expand_env(&cfg);
                 if std::path::Path::new(&cfg).exists() {
                     return Some(cfg);
                 }
@@ -762,6 +791,28 @@ mod tests {
         // the no-profile variant is still the PowerShell family: it must keep
         // UTF-8 setup and OSC 133 marks, or command lights die on that entry
         assert!(is_powershell("powershell.exe -NoProfile"));
+    }
+
+    #[test]
+    fn a_portable_profile_path_still_resolves() {
+        // the regression this guards: making $PROFILE portable replaced an
+        // absolute path with "$env:USERPROFILE\\..." — and the existence
+        // check on that literal string always fails, silently dropping the
+        // prompt theme with no error anywhere
+        let home = std::env::var("USERPROFILE").unwrap_or_default();
+        assert!(!home.is_empty(), "test needs USERPROFILE");
+        for form in [
+            "$env:USERPROFILE\\.poshthemes\\kali.omp.json",
+            "%USERPROFILE%\\.poshthemes\\kali.omp.json",
+            "~\\.poshthemes\\kali.omp.json",
+        ] {
+            let out = expand_env(form);
+            assert!(out.starts_with(&home), "{form} did not expand: {out}");
+            assert!(!out.contains("$env:") && !out.contains('%'), "leftover: {out}");
+        }
+        // an already-absolute path passes through untouched
+        let abs = format!("{home}\\.poshthemes\\pure.omp.json");
+        assert_eq!(expand_env(&abs), abs);
     }
 
     #[test]
