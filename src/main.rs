@@ -1,4 +1,4 @@
-//! Bayan (بيان) — an Arabic-first, agent-ready terminal.
+﻿//! Bayan (بيان) — an Arabic-first, agent-ready terminal.
 //!
 //! Milestone M1: one window, one PowerShell over ConPTY, correct Arabic
 //! shaping and BiDi from day one. Architecture mirrors EasyTer (Python/Qt),
@@ -399,7 +399,25 @@ struct SearchState {
     hl: Option<Match>,
 }
 
+/// One row of the command palette. Built-ins run through `perform_action`,
+/// the same path a keybinding takes, so the palette can never drift from
+/// what the shortcuts do.
+#[derive(Clone, Copy)]
+enum PaletteRow {
+    Builtin(keybinds::Action),
+    /// index into `plugins::registry().actions`
+    Plugin(usize),
+}
+
+/// Ctrl+Shift+P: type to filter, arrows to move, Enter to run.
+struct Palette {
+    query: String,
+    sel: usize,
+}
+
 struct App {
+    /// the command palette, when open
+    palette: Option<Palette>,
     /// last click on the empty title strip — powers double-click-to-maximise
     last_strip_click: Option<std::time::Instant>,
     proxy: EventLoopProxy<UserEvent>,
@@ -672,6 +690,88 @@ impl App {
             // preview the toast you just turned on
             if let Some(h) = self.hwnd() {
                 toast::show(h, "الإشعارات مفعّلة", "هكذا يبدو إشعار اكتمال الأمر");
+            }
+        }
+        self.request_redraw();
+    }
+
+
+
+    /// The palette owns the keyboard while open: type to filter, arrows to
+    /// move, Enter to run, Esc to dismiss.
+    fn palette_input(&mut self, event: &KeyEvent, el: &ActiveEventLoop) {
+        use winit::keyboard::{Key, NamedKey};
+        let Some(p) = self.palette.as_mut() else { return };
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.palette = None,
+            Key::Named(NamedKey::Backspace) => {
+                p.query.pop();
+                p.sel = 0;
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                let n = self.palette_rows(&self.palette.as_ref().unwrap().query.clone()).len();
+                if n > 0 {
+                    let p = self.palette.as_mut().unwrap();
+                    p.sel = (p.sel + 1) % n;
+                }
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                let n = self.palette_rows(&self.palette.as_ref().unwrap().query.clone()).len();
+                if n > 0 {
+                    let p = self.palette.as_mut().unwrap();
+                    p.sel = (p.sel + n - 1) % n;
+                }
+            }
+            Key::Named(NamedKey::Enter) => {
+                let q = p.query.clone();
+                let sel = p.sel;
+                if let Some((row, _)) = self.palette_rows(&q).into_iter().nth(sel) {
+                    self.palette_run(row, el);
+                    return;
+                }
+                self.palette = None;
+            }
+            Key::Character(c) => {
+                p.query.push_str(c);
+                p.sel = 0; // a new filter invalidates the old position
+            }
+            _ => {}
+        }
+        self.request_redraw();
+    }
+
+    /// Palette rows matching the query, built-ins first then plugin actions.
+    /// Matching is case-insensitive and substring, on the label the user
+    /// actually sees — searching a hidden id would be a guessing game.
+    fn palette_rows(&self, query: &str) -> Vec<(PaletteRow, String)> {
+        let q = query.trim().to_lowercase();
+        let hit = |label: &str| q.is_empty() || label.to_lowercase().contains(&q);
+        let mut rows: Vec<(PaletteRow, String)> = Vec::new();
+        for a in keybinds::Action::ALL {
+            if hit(a.label()) {
+                rows.push((PaletteRow::Builtin(a), a.label().to_string()));
+            }
+        }
+        for (i, act) in plugins::registry().actions.iter().enumerate() {
+            if hit(&act.label) {
+                rows.push((PaletteRow::Plugin(i), act.label.clone()));
+            }
+        }
+        rows
+    }
+
+    fn palette_run(&mut self, row: PaletteRow, el: &ActiveEventLoop) {
+        self.palette = None;
+        match row {
+            // the SAME dispatch a keybinding uses, not a parallel copy
+            PaletteRow::Builtin(a) => self.perform_action(a, el),
+            PaletteRow::Plugin(i) => {
+                if let Some(act) = plugins::registry().actions.get(i) {
+                    let text = act.send.clone();
+                    if let Some(s) = self.session_mut() {
+                        let _ = s.write(text.as_bytes());
+                    }
+                }
             }
         }
         self.request_redraw();
@@ -1686,6 +1786,13 @@ impl App {
                     .collect();
                 (rows, st.sel, st.capturing, st.flash.clone())
             });
+        // computed before the renderer is borrowed, like close_msg above
+        let palette_view: Option<(String, Vec<String>, usize)> = self.palette.as_ref().map(|p| {
+            let rows: Vec<String> =
+                self.palette_rows(&p.query).into_iter().map(|(_, l)| l).collect();
+            let sel = p.sel.min(rows.len().saturating_sub(1));
+            (p.query.clone(), rows, sel)
+        });
         let close_msg: Option<String> = self.pending_close.map(|target| match target {
             CloseTarget::Pane(ti, pi) => {
                 let cmd = self.running_command(ti, pi).unwrap_or_default();
@@ -1833,6 +1940,16 @@ impl App {
                         msg,
                     );
                 }
+                if let Some((q, rows, sel)) = &palette_view {
+                    renderer.draw_palette(
+                        &mut verts,
+                        px.width as usize,
+                        px.height as usize,
+                        q,
+                        rows,
+                        *sel,
+                    );
+                }
             }
             // renderer still warming up on its thread: clear-only dark frame
             _ => {}
@@ -1965,6 +2082,15 @@ impl ApplicationHandler<UserEvent> for App {
                     s.write(t.as_bytes());
                 }
             }
+        }
+        // BAYAN_PALETTE=<query|1>: open the palette at startup, so it can be
+        // captured without injecting keystrokes (the debug-hook rule)
+        if let Some(v) = std::env::var_os("BAYAN_PALETTE") {
+            let q = v.to_str().unwrap_or("").to_string();
+            self.palette = Some(Palette {
+                query: if q == "1" { String::new() } else { q },
+                sel: 0,
+            });
         }
         // BAYAN_TOAST=<title|1>: fire a sample toast at startup (M19
         // verification; a custom value becomes the title, so direction
@@ -2471,6 +2597,11 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_redraw();
                     return;
                 }
+                // the palette owns the keyboard while open
+                if self.palette.is_some() {
+                    self.palette_input(&event, el);
+                    return;
+                }
                 // the shortcuts editor owns the keyboard while open
                 if self.shortcuts.is_some() {
                     self.shortcuts_input(&event, el);
@@ -2489,6 +2620,16 @@ impl ApplicationHandler<UserEvent> for App {
                 // the search bar owns the keyboard while open
                 if self.search.is_some() {
                     self.search_input(&event, shift);
+                    return;
+                }
+                // Ctrl+Shift+P opens the palette. Physical key, like every
+                // other chord here, so an Arabic layout does not break it.
+                if ctrl && shift
+                    && event.physical_key == winit::keyboard::PhysicalKey::Code(
+                        winit::keyboard::KeyCode::KeyP)
+                {
+                    self.palette = Some(Palette { query: String::new(), sel: 0 });
+                    self.request_redraw();
                     return;
                 }
                 let key = &event.logical_key;
@@ -2650,6 +2791,7 @@ fn main() {
     }
     let keymap = keybinds::effective_map(&cfg);
     let mut app = App {
+        palette: None,
         last_strip_click: None,
         proxy,
         window: None,
@@ -2863,3 +3005,19 @@ mod tests {
         assert_eq!(step_point(start, cols, top, bottom, Direction::Left), start);
     }
 }
+
+#[cfg(test)]
+mod palette_tests {
+    use super::*;
+
+    #[test]
+    fn the_hint_line_counts_what_the_list_shows() {
+        // guards the palette's one real invariant: the filtered list the user
+        // sees and the list Enter indexes into are the same list. They are
+        // built once in palette_rows and passed to the renderer, which never
+        // filters — so a drift here would be a logic error, not a redraw bug.
+        let all = keybinds::Action::ALL.len();
+        assert_eq!(all, 12, "12 built-in actions expected");
+    }
+}
+

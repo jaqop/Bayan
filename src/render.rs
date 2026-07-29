@@ -1948,6 +1948,55 @@ impl Renderer {
 
     /// The close guard (same family as the paste guard): a pane or the
     /// window is about to close while a command still runs — confirm.
+
+    /// The command palette (Ctrl+Shift+P). Query line, filtered rows, hint.
+    /// `rows` is already filtered by the caller — the renderer never decides
+    /// what matches, so the list drawn and the list Enter runs cannot differ.
+    pub fn draw_palette(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
+                        query: &str, rows: &[String], sel: usize) {
+        let whole: Rect = (0, 0, fw as i32, fh as i32);
+        push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 120));
+        const MAX_ROWS: usize = 12;
+        let shown = rows.len().min(MAX_ROWS);
+        let w = ((self.cell_w * 52.0) as i32).min(fw as i32 - 60);
+        let row_h = (self.cell_h + 6.0) as i32;
+        let h = row_h * (shown as i32 + 2) + 22;
+        let x = (fw as i32 - w) / 2;
+        let y = self.tab_bar_h() as i32 + (fh as i32 - h) / 5;
+        push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 250));
+        push_rect(out, whole, x, y, w, 2, c4((0x2e, 0xa0, 0x43), 255));
+
+        // query line — a caret so an empty palette still looks like an input
+        let q = [
+            Seg::plain("⌕ ", (0x8a, 0x94, 0xa3)),
+            Seg { text: format!("{query}_"), fg: self.fg, style: ST_BOLD },
+        ];
+        self.draw_run(&q, true, out, whole, (x + 14) as f32, y + 10, 1.0);
+
+        // scroll the window so the selection stays visible past MAX_ROWS
+        let first = sel.saturating_sub(MAX_ROWS - 1).min(rows.len().saturating_sub(shown));
+        for i in 0..shown {
+            let idx = first + i;
+            let ry = y + 14 + row_h * (i as i32 + 1);
+            let picked = idx == sel;
+            if picked {
+                push_rect(out, whole, x + 6, ry - 3, w - 12, row_h, c4((0x2c, 0x3a, 0x33), 255));
+            }
+            let fg = if picked { self.fg } else { (0x9a, 0xa4, 0xb2) };
+            let seg = [Seg { text: rows[idx].clone(), fg, style: if picked { ST_BOLD } else { 0 } }];
+            self.draw_run(&seg, true, out, whole, (x + 18) as f32, ry, 1.0);
+        }
+
+        let hint = if rows.is_empty() {
+            "لا نتائج · Esc إغلاق".to_string()
+        } else {
+            format!("{} نتيجة · Enter تشغيل · ↑↓ تنقّل · Esc إغلاق", rows.len())
+        };
+        let l = [Seg::plain(hint, (0x6e, 0x78, 0x85))];
+        self.draw_run(&l, true, out, whole, (x + 14) as f32,
+                      y + h - self.cell_h as i32 - 8, 1.0);
+    }
+
     pub fn draw_close_guard(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
                             msg: &str) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
