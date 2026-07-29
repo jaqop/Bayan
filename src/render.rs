@@ -39,6 +39,9 @@ use crate::term::EventProxy;
 pub const BG: (u8, u8, u8) = (0x06, 0x26, 0x26);
 pub const FG: (u8, u8, u8) = (0xc2, 0xb7, 0x96);
 
+/// ESC, spelled out so a raw byte never sits inside a string literal.
+const ESC: char = '\u{1b}';
+
 const PALETTE: [(u8, u8, u8); 16] = [
     (0x06, 0x26, 0x26), // black — MEASURED background
     (0xc0, 0x50, 0x3f), // red — derived; the reference has no red
@@ -2012,6 +2015,115 @@ impl Renderer {
         };
         let l = [Seg::plain(hint, (0x6e, 0x78, 0x85))];
         self.draw_run(&l, true, out, whole, (x + 14) as f32,
+                      y + h - self.cell_h as i32 - 8, 1.0);
+    }
+
+
+    /// Minimal SGR reader for preview text: enough of oh-my-posh's output to
+    /// colour it faithfully (24-bit foreground, reset). Background runs are
+    /// dropped rather than approximated — a preview that invents colours it
+    /// cannot draw is worse than one that shows the shapes honestly.
+    fn ansi_segments(&self, bytes: &[u8], default_fg: (u8, u8, u8)) -> Vec<Seg> {
+        let text = String::from_utf8_lossy(bytes);
+        let mut segs = Vec::new();
+        let mut fg = default_fg;
+        let mut buf = String::new();
+        let mut it = text.chars().peekable();
+        while let Some(c) = it.next() {
+            if c != ESC {
+                if c != '\n' && c != '\r' {
+                    buf.push(c);
+                }
+                continue;
+            }
+            // OSC (ESC ]) carries title and hyperlink payloads, not colour.
+            // Skip to its terminator, or the text leaks into the preview:
+            // the first render showed ']8;;file:C:/...' and ']0; ~\\Bayan'.
+            if it.peek() == Some(&']') {
+                let mut prev = '\0';
+                for c in it.by_ref() {
+                    if c == '\u{7}' || (c == '\\' && prev == ESC) {
+                        break;
+                    }
+                    prev = c;
+                }
+                continue;
+            }
+            if it.peek() != Some(&'[') {
+                continue;
+            }
+            it.next();
+            let mut code = String::new();
+            for c in it.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    if c == 'm' {
+                        if !buf.is_empty() {
+                            segs.push(Seg { text: std::mem::take(&mut buf), fg, style: 0 });
+                        }
+                        let n: Vec<u32> =
+                            code.split(';').filter_map(|p| p.parse().ok()).collect();
+                        match n.as_slice() {
+                            [] | [0] => fg = default_fg,
+                            [38, 2, r, g, b, ..] => fg = (*r as u8, *g as u8, *b as u8),
+                            _ => {}
+                        }
+                    }
+                    break;
+                }
+                code.push(c);
+            }
+        }
+        if !buf.is_empty() {
+            segs.push(Seg { text: buf, fg, style: 0 });
+        }
+        segs
+    }
+
+    /// The prompt picker: each theme's name above its REAL rendered prompt.
+    pub fn draw_posh(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
+                     names: &[String], previews: &[Option<Vec<u8>>], sel: usize) {
+        let whole: Rect = (0, 0, fw as i32, fh as i32);
+        push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 130));
+        const MAX: usize = 9;
+        let shown = names.len().min(MAX);
+        let w = ((self.cell_w * 70.0) as i32).min(fw as i32 - 60);
+        let rh = (self.cell_h * 2.0 + 10.0) as i32;
+        let h = rh * shown as i32 + (self.cell_h * 3.5) as i32 + 20;
+        let x = (fw as i32 - w) / 2;
+        let y = self.tab_bar_h() as i32 + (fh as i32 - h) / 6;
+        push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 250));
+        push_rect(out, whole, x, y, w, 2, c4((0x2e, 0xa0, 0x43), 255));
+
+        let title = [Seg::plain("شكل الموجِّه — معاينة حيّة", self.fg)];
+        self.draw_run(&title, true, out, whole, (x + 14) as f32, y + 8, 1.0);
+
+        let first = sel.saturating_sub(MAX - 1).min(names.len().saturating_sub(shown));
+        for i in 0..shown {
+            let idx = first + i;
+            let ry = y + (self.cell_h * 2.2) as i32 + rh * i as i32;
+            if idx == sel {
+                push_rect(out, whole, x + 6, ry - 4, w - 12, rh, c4((0x2c, 0x3a, 0x33), 255));
+            }
+            let name_fg = if idx == sel { self.fg } else { (0x8a, 0x94, 0xa3) };
+            let n = [Seg { text: names[idx].clone(), fg: name_fg, style: ST_BOLD }];
+            self.draw_run(&n, false, out, whole, (x + 14) as f32, ry, 1.0);
+            match &previews[idx] {
+                Some(bytes) => {
+                    // oh-my-posh's own bytes, through our own renderer: the
+                    // preview and the real prompt cannot disagree
+                    let segs = self.ansi_segments(bytes, self.fg);
+                    self.draw_run(&segs, false, out, whole, (x + 24) as f32,
+                                  ry + self.cell_h as i32, 1.0);
+                }
+                None => {
+                    let m = [Seg::plain("(تعذّر التصيير)", (0x6e, 0x78, 0x85))];
+                    self.draw_run(&m, true, out, whole, (x + 24) as f32,
+                                  ry + self.cell_h as i32, 1.0);
+                }
+            }
+        }
+        let hint = [Seg::plain("Enter تطبيق · ↑↓ تنقّل · Esc إغلاق", (0x6e, 0x78, 0x85))];
+        self.draw_run(&hint, true, out, whole, (x + 14) as f32,
                       y + h - self.cell_h as i32 - 8, 1.0);
     }
 

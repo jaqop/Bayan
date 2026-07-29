@@ -9,6 +9,7 @@
 
 mod bidi;
 mod plugins;
+mod posh;
 mod shells;
 mod config;
 mod gpu;
@@ -415,7 +416,18 @@ struct Palette {
     sel: usize,
 }
 
+/// The prompt picker: theme names with LIVE previews rendered by oh-my-posh
+/// itself, so what you see is the prompt you get.
+struct PoshPicker {
+    names: Vec<String>,
+    /// preview ANSI per name, fetched once on open (a subprocess per row)
+    previews: Vec<Option<Vec<u8>>>,
+    sel: usize,
+}
+
 struct App {
+    /// the prompt picker, when open
+    posh: Option<PoshPicker>,
     /// the command palette, when open
     palette: Option<Palette>,
     /// last click on the empty title strip — powers double-click-to-maximise
@@ -705,6 +717,45 @@ impl App {
     }
 
 
+
+
+    /// Open the prompt picker, rendering every theme once up front. One
+    /// subprocess per theme is fine at ~11 themes and keeps scrolling instant;
+    /// rendering lazily would stutter exactly while the user is browsing.
+    fn open_posh(&mut self) {
+        let names = posh::available();
+        if names.is_empty() {
+            return; // no oh-my-posh themes: nothing to pick from
+        }
+        let previews = names.iter().map(|n| posh::preview(n)).collect();
+        let cur = posh::current();
+        let sel = cur
+            .and_then(|c| names.iter().position(|n| *n == c))
+            .unwrap_or(0);
+        self.posh = Some(PoshPicker { names, previews, sel });
+        self.request_redraw();
+    }
+
+    fn posh_input(&mut self, event: &KeyEvent) {
+        use winit::keyboard::{Key, NamedKey};
+        let Some(p) = self.posh.as_mut() else { return };
+        let n = p.names.len();
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.posh = None,
+            Key::Named(NamedKey::ArrowDown) => p.sel = (p.sel + 1) % n,
+            Key::Named(NamedKey::ArrowUp) => p.sel = (p.sel + n - 1) % n,
+            Key::Named(NamedKey::Enter) => {
+                let name = p.names[p.sel].clone();
+                self.posh = None;
+                match posh::set_theme(&name) {
+                    Ok(()) => eprintln!("bayan: prompt theme set to {name} (new tabs)"),
+                    Err(e) => eprintln!("bayan: prompt theme failed: {e}"),
+                }
+            }
+            _ => {}
+        }
+        self.request_redraw();
+    }
 
     /// The palette owns the keyboard while open: type to filter, arrows to
     /// move, Enter to run, Esc to dismiss.
@@ -1795,6 +1846,8 @@ impl App {
                     .collect();
                 (rows, st.sel, st.capturing, st.flash.clone())
             });
+        let posh_view: Option<(Vec<String>, Vec<Option<Vec<u8>>>, usize)> =
+            self.posh.as_ref().map(|p| (p.names.clone(), p.previews.clone(), p.sel));
         // computed before the renderer is borrowed, like close_msg above
         let palette_view: Option<(String, Vec<String>, usize)> = self.palette.as_ref().map(|p| {
             let rows: Vec<String> =
@@ -1959,6 +2012,16 @@ impl App {
                         *sel,
                     );
                 }
+                if let Some((names, previews, sel)) = &posh_view {
+                    renderer.draw_posh(
+                        &mut verts,
+                        px.width as usize,
+                        px.height as usize,
+                        names,
+                        previews,
+                        *sel,
+                    );
+                }
             }
             // renderer still warming up on its thread: clear-only dark frame
             _ => {}
@@ -2091,6 +2154,10 @@ impl ApplicationHandler<UserEvent> for App {
                     s.write(t.as_bytes());
                 }
             }
+        }
+        // BAYAN_POSH=1: open the prompt picker at startup (capture without keys)
+        if std::env::var_os("BAYAN_POSH").is_some() {
+            self.open_posh();
         }
         // BAYAN_PALETTE=<query|1>: open the palette at startup, so it can be
         // captured without injecting keystrokes (the debug-hook rule)
@@ -2606,6 +2673,11 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_redraw();
                     return;
                 }
+                // the prompt picker owns the keyboard while open
+                if self.posh.is_some() {
+                    self.posh_input(&event);
+                    return;
+                }
                 // the palette owns the keyboard while open
                 if self.palette.is_some() {
                     self.palette_input(&event, el);
@@ -2639,6 +2711,14 @@ impl ApplicationHandler<UserEvent> for App {
                 {
                     self.palette = Some(Palette { query: String::new(), sel: 0 });
                     self.request_redraw();
+                    return;
+                }
+                // Ctrl+Shift+O: the prompt picker (O for oh-my-posh)
+                if ctrl && shift
+                    && event.physical_key == winit::keyboard::PhysicalKey::Code(
+                        winit::keyboard::KeyCode::KeyO)
+                {
+                    self.open_posh();
                     return;
                 }
                 let key = &event.logical_key;
@@ -2800,6 +2880,7 @@ fn main() {
     }
     let keymap = keybinds::effective_map(&cfg);
     let mut app = App {
+        posh: None,
         palette: None,
         last_strip_click: None,
         proxy,
