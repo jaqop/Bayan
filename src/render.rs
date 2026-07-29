@@ -199,6 +199,27 @@ pub const THEMES: &[Theme] = &[
     },
 ];
 
+
+/// Arabic counted-noun agreement for lines (see the note on the caller).
+fn arabic_lines(n: usize) -> String {
+    match n {
+        1 => "سطراً واحداً".to_string(),
+        2 => "سطرين".to_string(),
+        3..=10 => format!("{n} أسطر"),
+        _ => format!("{n} سطراً"),
+    }
+}
+
+/// Same rule, for characters.
+fn arabic_chars(n: usize) -> String {
+    match n {
+        1 => "حرفاً واحداً".to_string(),
+        2 => "حرفين".to_string(),
+        3..=10 => format!("{n} أحرف"),
+        _ => format!("{n} حرفاً"),
+    }
+}
+
 /// Straight-alpha color for the quad batch.
 fn c4((r, g, b): (u8, u8, u8), a: u8) -> [f32; 4] {
     [
@@ -2149,23 +2170,38 @@ impl Renderer {
     pub fn draw_paste_guard(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
                             lines: usize, chars: usize) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
-        push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 110));
-        let w = ((self.cell_w * 56.0) as i32).min(fw as i32 - 60);
-        let h = (self.cell_h * 2.0 + 24.0) as i32;
+        // heavier dim than the close guard: this card lands on top of whatever
+        // the user was reading, and a thin strip over dense text reads as a
+        // rendering glitch rather than a question
+        push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 165));
+        let w = ((self.cell_w * 62.0) as i32).min(fw as i32 - 80);
+        let pad = 18;
+        let h = (self.cell_h * 3.0) as i32 + pad * 2 + 10;
         let x = (fw as i32 - w) / 2;
-        let y = self.tab_bar_h() as i32 + (fh as i32 - h) / 4;
+        let y = self.tab_bar_h() as i32 + (fh as i32 - h) / 3;
+        // a ring of background around the card separates it from the text
+        push_rect(out, whole, x - 3, y - 3, w + 6, h + 6, c4((0x0d, 0x11, 0x14), 235));
         push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 255));
-        push_rect(out, whole, x, y, w, 2, c4((0xf2, 0xcc, 0x60), 255)); // warn accent
-        let l1 = [Seg {
-            text: format!("لصق {lines} سطراً ({chars} حرفاً)؟ اللصق متعدد الأسطر قد ينفّذ أوامر فوراً."),
+        push_rect(out, whole, x, y, w, 3, c4((0xf2, 0xcc, 0x60), 255)); // warn accent
+
+        let title = [Seg {
+            text: format!("لصق {} ({})؟", arabic_lines(lines), arabic_chars(chars)),
             fg: self.fg,
             style: ST_BOLD,
         }];
-        self.draw_run(&l1, true, out, whole, (x + 14) as f32, y + 8, 1.0);
-        let l2 = [Seg::plain("Enter تأكيد   ·   Esc إلغاء", (0x9a, 0xa4, 0xb2))];
-        self.draw_run(&l2, true, out, whole, (x + 14) as f32,
-                      y + 12 + self.cell_h as i32, 1.0);
+        self.draw_run(&title, true, out, whole, (x + pad) as f32, y + pad, 1.0);
+        let why = [Seg::plain(
+            "اللصق متعدّد الأسطر قد ينفّذ أوامر فوراً.",
+            (0xf2, 0xcc, 0x60),
+        )];
+        self.draw_run(&why, true, out, whole, (x + pad) as f32,
+                      y + pad + self.cell_h as i32, 1.0);
+        let keys = [Seg::plain("Enter تأكيد   ·   Esc إلغاء", (0x9a, 0xa4, 0xb2))];
+        self.draw_run(&keys, true, out, whole, (x + pad) as f32,
+                      y + pad + (self.cell_h * 2.0) as i32 + 6, 1.0);
     }
+
+
 
     /// Window-level chrome: tab bar, search bar, Claude badge.
     pub fn draw_chrome(&mut self, out: &mut Vec<Vertex>, width: usize, height: usize,
@@ -2453,6 +2489,22 @@ mod cache_tests {
 
     fn test_renderer() -> Renderer {
         Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0)
+    }
+
+    #[test]
+    fn arabic_counted_nouns_agree() {
+        // "3 سطراً" is wrong Arabic, and an Arabic-first terminal has no
+        // excuse for it: 1 and 2 take their own forms, 3-10 the plural,
+        // 11 and above the accusative singular.
+        assert_eq!(arabic_lines(1), "سطراً واحداً");
+        assert_eq!(arabic_lines(2), "سطرين");
+        assert_eq!(arabic_lines(3), "3 أسطر");
+        assert_eq!(arabic_lines(10), "10 أسطر");
+        assert_eq!(arabic_lines(11), "11 سطراً");
+        assert_eq!(arabic_lines(293), "293 سطراً");
+        assert_eq!(arabic_chars(2), "حرفين");
+        assert_eq!(arabic_chars(7), "7 أحرف");
+        assert_eq!(arabic_chars(293), "293 حرفاً");
     }
 
     #[test]

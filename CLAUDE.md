@@ -126,7 +126,7 @@ principle when adding new ones:
 | `BAYAN_PICK_THEME=<n>` | open settings and apply theme *n*, so a click's live effect is screenshot-verifiable |
 | `BAYAN_SPLIT=1` | start with the first tab pre-split (pane machinery) |
 | `BAYAN_COCKPIT=1` | open the agent cockpit |
-| `BAYAN_GUARD=1` | show the close-guard card |
+| `BAYAN_GUARD=1` | arm the PASTE guard with a 3-line sample (not the close guard — the name misleads) |
 | `BAYAN_TYPE=<text>` | feed text into the first pane's PTY — the hook for ligature and shaping checks |
 | `BAYAN_TOAST=<title\|1>` | fire a sample toast at startup (M19 A/B loops without rebuilding) |
 | `BAYAN_ATLAS_STRESS=1` | shape a large spread of unique glyphs to force page-1 atlas growth |
