@@ -516,8 +516,17 @@ impl App {
 
     /// Apply theme `idx` (copy its colors into the config), live.
     fn apply_theme(&mut self, idx: usize) {
-        if let Some(t) = render::THEMES.get(idx) {
-            self.config.theme = Some(t.name.to_string());
+        // one index into one list: built-ins first, then plugin themes. The
+        // gallery draws from the same order, so tile N and theme N agree.
+        let all = render::gallery();
+        if let Some(t) = all.get(idx) {
+            let builtin = render::THEMES.len();
+            let name = if idx < builtin {
+                render::THEMES[idx].name.to_string()
+            } else {
+                plugins::registry().themes[idx - builtin].name.clone()
+            };
+            self.config.theme = Some(name);
             self.config.bg = Some(hex(t.bg));
             self.config.fg = Some(hex(t.fg));
             self.config.palette = Some(t.palette.iter().map(|&c| hex(c)).collect());

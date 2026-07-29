@@ -72,6 +72,23 @@ const fn rgb(v: u32) -> (u8, u8, u8) {
     ((v >> 16) as u8, (v >> 8) as u8, v as u8)
 }
 
+
+/// Every theme the settings gallery offers: the built-in table, then whatever
+/// plugins contributed. One list, so the tiles drawn, the tile clicked and the
+/// theme applied are always the same index into the same order.
+pub fn gallery() -> Vec<Theme> {
+    let mut v: Vec<Theme> = THEMES
+        .iter()
+        .map(|t| Theme { name: t.name, bg: t.bg, fg: t.fg, palette: t.palette })
+        .collect();
+    for p in &crate::plugins::registry().themes {
+        // the &'static name field cannot hold a runtime string; the gallery
+        // identifies tiles by index and colour, not by name
+        v.push(Theme { name: "", bg: p.bg, fg: p.fg, palette: p.palette });
+    }
+    v
+}
+
 /// A theme by name (used to resolve the config's `theme` field). Built-ins
 /// win; a plugin theme is consulted only if no built-in matches, so a plugin
 /// can add but never silently replace a shipped theme.
@@ -1454,7 +1471,7 @@ impl Renderer {
         let shortcuts_btn = (x + pad, y + 10, sb_w, (self.cell_h + 8.0) as i32);
 
         let theme_y = y + head_h + 6 + (theme_rowh - tile_h) / 2;
-        let theme_tiles: Vec<Rect> = (0..THEMES.len() as i32)
+        let theme_tiles: Vec<Rect> = (0..gallery().len() as i32)
             .map(|i| (x + pad + i * (tile_w + 6), theme_y, tile_w, tile_h))
             .collect();
 
@@ -1643,9 +1660,10 @@ impl Renderer {
         let tl = label(self, out, "المظهر", theme_row_top);
         let last = lay.theme_tiles[lay.theme_tiles.len() - 1];
         leader(out, last.0 + last.2, tl, theme_row_top);
+        let all = gallery();
         for (i, tile) in lay.theme_tiles.iter().enumerate() {
             let (tx, ty, tw2, th) = *tile;
-            let t = &THEMES[i];
+            let Some(t) = all.get(i) else { continue };
             let edge = if i == v.theme { GREEN } else { EDGE };
             bordered(out, (tx, ty, tw2, th), t.bg, edge);
             if i == v.theme {
@@ -2527,7 +2545,15 @@ mod cache_tests {
         let r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
         let (fw, fh) = (1400usize, 900usize);
         let lay = r.settings_layout(fw, fh);
-        assert_eq!(lay.theme_tiles.len(), THEMES.len());
+        // the gallery is built-ins PLUS plugin themes, and the tile count
+        // must follow it — a tile without a theme behind it is a dead click
+        assert_eq!(lay.theme_tiles.len(), gallery().len());
+        assert!(gallery().len() >= THEMES.len(), "plugins add, never remove");
+        // and the built-ins keep their positions, so an index stored in a
+        // config yesterday still means the same theme today
+        for (i, t) in THEMES.iter().enumerate() {
+            assert_eq!(gallery()[i].bg, t.bg, "built-in {i} moved");
+        }
         let (cx, cy, cw, ch) = lay.card;
         // the card is centered and fully on-screen
         assert!(cx > 0 && cy > 0 && cx + cw <= fw as i32 && cy + ch <= fh as i32);
