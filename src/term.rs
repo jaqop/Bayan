@@ -139,6 +139,127 @@ pub(crate) struct ChunkEvents {
     pub cwd: Option<String>,
     /// a LONG command just ended (ok?) — worth a notification if unfocused
     pub finished: Option<bool>,
+    /// the program asked for a desktop notification (title, body): OSC 9,
+    /// OSC 777 or OSC 99 — what Claude Code, ntfy, zellij and friends emit
+    pub notify: Option<(String, String)>,
+    /// OSC 9;4 progress: Some(None) clears, Some(Some(p)) sets
+    pub progress: Option<Option<Progress>>,
+}
+
+/// ConEmu's OSC 9;4 progress report, as Windows Terminal, Ghostty, WezTerm
+/// and Konsole read it — and as Claude Code emits it while it works
+/// (`terminalProgressBarEnabled`). The tab bar and the cockpit draw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Progress {
+    pub state: ProgressState,
+    /// 0..=100; meaningful for Normal, Error and Paused
+    pub percent: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgressState {
+    Normal,
+    Error,
+    Indeterminate,
+    Paused,
+}
+
+/// Parse an OSC 9;4 payload ("st;pr" after the "4;"): st 0 clears, 1 normal
+/// (pr%), 2 error, 3 indeterminate, 4 paused. Unknown states are ignored
+/// rather than drawn as something they are not.
+fn parse_progress(payload: &[u8]) -> Option<Option<Progress>> {
+    let s = std::str::from_utf8(payload).ok()?;
+    let mut it = s.split(';');
+    let st: u8 = it.next()?.trim().parse().ok()?;
+    let pr: u8 = it.next().and_then(|p| p.trim().parse().ok()).unwrap_or(0).min(100);
+    Some(match st {
+        0 => None,
+        1 => Some(Progress { state: ProgressState::Normal, percent: pr }),
+        2 => Some(Progress { state: ProgressState::Error, percent: pr }),
+        3 => Some(Progress { state: ProgressState::Indeterminate, percent: 0 }),
+        4 => Some(Progress { state: ProgressState::Paused, percent: pr }),
+        _ => return None,
+    })
+}
+
+/// The LAST OSC 9;4 in a chunk (a burst of progress updates collapses to
+/// its final value — nobody needs the intermediate ones drawn).
+fn scan_progress(data: &[u8]) -> Option<Option<Progress>> {
+    let payload = last_osc_payload(data, b"\x1b]9;4;")?;
+    parse_progress(payload)
+}
+
+/// Desktop-notification requests, three dialects, last one in the chunk wins:
+/// - OSC 9;<message> — iTerm2 / ConEmu (digit-prefixed ConEmu subcommands
+///   like 9;4; and 9;9; are NOT messages)
+/// - OSC 777;notify;<title>;<body> — rxvt-unicode, what Ghostty and WezTerm speak
+/// - OSC 99;<meta>;<payload> — kitty: `p=title`/`p=body` in the metadata
+fn scan_notify(data: &[u8]) -> Option<(String, String)> {
+    let mut best: Option<(usize, (String, String))> = None;
+    let mut consider = |pos: usize, n: (String, String)| {
+        if best.as_ref().is_none_or(|(p, _)| pos > *p) {
+            best = Some((pos, n));
+        }
+    };
+    let text = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
+    // OSC 9;<message>
+    let mut i = 0;
+    while let Some(rel) = find(&data[i..], b"\x1b]9;") {
+        let s = i + rel + 4;
+        let e = osc_end(data, s);
+        let payload = &data[s..e];
+        // ConEmu subcommand (9;4;progress, 9;9;cwd, 9;12;...): not a message
+        let is_subcommand = payload
+            .iter()
+            .position(|&b| b == b';')
+            .is_some_and(|k| k > 0 && payload[..k].iter().all(u8::is_ascii_digit));
+        if !is_subcommand && !payload.is_empty() {
+            consider(s, ("Bayan".to_string(), text(payload)));
+        }
+        i = e.max(s);
+    }
+    // OSC 777;notify;title;body
+    let mut i = 0;
+    while let Some(rel) = find(&data[i..], b"\x1b]777;notify;") {
+        let s = i + rel + 13;
+        let e = osc_end(data, s);
+        let payload = &data[s..e];
+        let (title, body) = match payload.iter().position(|&b| b == b';') {
+            Some(k) => (text(&payload[..k]), text(&payload[k + 1..])),
+            None => ("Bayan".to_string(), text(payload)),
+        };
+        consider(s, (title, body));
+        i = e.max(s);
+    }
+    // OSC 99;<k=v:k=v>;<payload>
+    let mut i = 0;
+    while let Some(rel) = find(&data[i..], b"\x1b]99;") {
+        let s = i + rel + 5;
+        let e = osc_end(data, s);
+        let payload = &data[s..e];
+        if let Some(k) = payload.iter().position(|&b| b == b';') {
+            let meta = String::from_utf8_lossy(&payload[..k]);
+            let is_title = meta.split(':').any(|kv| kv == "p=title");
+            let body = text(&payload[k + 1..]);
+            if !body.is_empty() {
+                consider(s, if is_title { (body, String::new()) } else { ("Bayan".to_string(), body) });
+            }
+        }
+        i = e.max(s);
+    }
+    best.map(|(_, n)| n)
+}
+
+/// End of an OSC payload that starts at `s`: the BEL / ESC, or the data end.
+fn osc_end(data: &[u8], s: usize) -> usize {
+    data[s..]
+        .iter()
+        .position(|&b| b == 0x07 || b == 0x1b)
+        .map_or(data.len(), |p| s + p)
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Commands shorter than this end silently (EasyTer's threshold).
@@ -374,6 +495,8 @@ pub(crate) fn process_chunk<T: EventListener>(
         meta.cwd = Some(c.clone());
         ev.cwd = Some(c);
     }
+    ev.notify = scan_notify(&buf);
+    ev.progress = scan_progress(&buf);
     let mut pos = 0;
     for (s, e, kind, exit) in find_osc133(&buf) {
         feed_counted(parser, t, meta, &buf[pos..s]);
@@ -564,6 +687,11 @@ impl Session {
         for a in &args {
             cmd.arg(a);
         }
+        // what programs key their terminal features on: Claude Code, ripgrep,
+        // delta and the rest read these before deciding what to emit
+        cmd.env("TERM_PROGRAM", "Bayan");
+        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        cmd.env("COLORTERM", "truecolor");
         // requested dir (a restored tab, or "new tab inherits the cwd"),
         // else the launcher's directory, else home
         let dir = start_cwd
@@ -637,6 +765,12 @@ impl Session {
                         }
                         if let Some(ok) = ev.finished {
                             let _ = proxy.send_event(UserEvent::CommandFinished(id, ok));
+                        }
+                        if let Some((title, body)) = ev.notify {
+                            let _ = proxy.send_event(UserEvent::Notify(id, title, body));
+                        }
+                        if let Some(p) = ev.progress {
+                            let _ = proxy.send_event(UserEvent::Progress(id, p));
                         }
                         if proxy.send_event(UserEvent::Wakeup(id)).is_err() {
                             break; // the event loop is gone
@@ -1005,6 +1139,55 @@ mod tests {
         );
         assert_eq!(ev.cwd.as_deref(), Some(r"C:\Users\Admin\Bayan"));
         assert_eq!(meta.cwd.as_deref(), Some(r"C:\Users\Admin\Bayan"));
+    }
+
+    #[test]
+    fn progress_reports_parse_every_state_and_the_last_one_wins() {
+        assert_eq!(parse_progress(b"1;42"),
+                   Some(Some(Progress { state: ProgressState::Normal, percent: 42 })));
+        assert_eq!(parse_progress(b"2;7"),
+                   Some(Some(Progress { state: ProgressState::Error, percent: 7 })));
+        assert_eq!(parse_progress(b"3"),
+                   Some(Some(Progress { state: ProgressState::Indeterminate, percent: 0 })));
+        assert_eq!(parse_progress(b"4;50"),
+                   Some(Some(Progress { state: ProgressState::Paused, percent: 50 })));
+        assert_eq!(parse_progress(b"0"), Some(None), "state 0 clears");
+        assert_eq!(parse_progress(b"1;250").unwrap().unwrap().percent, 100, "clamped");
+        assert_eq!(parse_progress(b"9;1"), None, "unknown state ignored");
+        assert_eq!(parse_progress(b"x"), None);
+        // a burst collapses to its final value, through the real chunk path
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry,
+                               b"\x1b]9;4;1;10\x07work\x1b]9;4;1;90\x07");
+        assert_eq!(ev.progress.unwrap().unwrap().percent, 90);
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]9;4;0;0\x07");
+        assert_eq!(ev.progress, Some(None));
+        // the cwd report shares the OSC 9 prefix and must not be mistaken
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]9;9;C:\\x\x07");
+        assert_eq!(ev.progress, None);
+        assert_eq!(ev.notify, None);
+    }
+
+    #[test]
+    fn notification_sequences_in_three_dialects() {
+        // iTerm2 / ConEmu message form
+        assert_eq!(scan_notify(b"\x1b]9;Build done\x07"),
+                   Some(("Bayan".into(), "Build done".into())));
+        // ConEmu subcommands are not messages
+        assert_eq!(scan_notify(b"\x1b]9;4;1;50\x07"), None);
+        assert_eq!(scan_notify(b"\x1b]9;9;C:\\Users\x07"), None);
+        // rxvt-unicode form (Ghostty/WezTerm), ESC-backslash terminated
+        assert_eq!(scan_notify(b"\x1b]777;notify;Claude;needs your approval\x1b\\"),
+                   Some(("Claude".into(), "needs your approval".into())));
+        // kitty form: title chunk and body chunk
+        assert_eq!(scan_notify(b"\x1b]99;i=1:p=title;Tests\x07"),
+                   Some(("Tests".into(), String::new())));
+        assert_eq!(scan_notify(b"\x1b]99;i=1:d=1;all green\x07"),
+                   Some(("Bayan".into(), "all green".into())));
+        // several in one read: the LAST one is what the user sees
+        assert_eq!(scan_notify(b"\x1b]9;first\x07 x \x1b]777;notify;T;second\x07"),
+                   Some(("T".into(), "second".into())));
+        assert_eq!(scan_notify(b"plain text"), None);
     }
 
     #[test]

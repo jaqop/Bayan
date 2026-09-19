@@ -275,6 +275,10 @@ pub enum UserEvent {
     Bell(u64),
     /// A command that ran ≥6s in pane `id` just finished (ok?).
     CommandFinished(u64, bool),
+    /// Pane `id`'s program asked for a desktop notification (title, body).
+    Notify(u64, String, String),
+    /// Pane `id` reported OSC 9;4 progress (None clears it).
+    Progress(u64, Option<term::Progress>),
     /// Pane `id`'s shell exited.
     Exit(u64),
 }
@@ -285,6 +289,8 @@ struct Pane {
     session: Session,
     /// when this pane last produced output — feeds the busy dot
     last_output: Option<Instant>,
+    /// the program's OSC 9;4 progress report, until it clears it
+    progress: Option<term::Progress>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -307,6 +313,15 @@ struct Tab {
 }
 
 impl Tab {
+    /// The tab's progress: its focused pane's, else any pane's — a
+    /// background pane's Claude is still this tab's work.
+    fn progress(&self) -> Option<term::Progress> {
+        self.panes
+            .get(self.focused)
+            .and_then(|p| p.progress)
+            .or_else(|| self.panes.iter().find_map(|p| p.progress))
+    }
+
     fn busy(&self, now_active: bool) -> bool {
         !now_active
             && self.panes.iter().any(|p| {
@@ -1241,6 +1256,7 @@ impl App {
                     busy: t.busy(i == self.active),
                     attention: t.attention,
                     active: i == self.active,
+                    progress: t.progress(),
                 }
             })
             .collect()
@@ -1317,7 +1333,7 @@ impl App {
         match Session::spawn(self.size, self.proxy.clone(), id, cwd,
                              self.config.scrollback_lines(),
                              &self.config.shell_program()) {
-            Ok(session) => Some(Pane { id, session, last_output: None }),
+            Ok(session) => Some(Pane { id, session, last_output: None, progress: None }),
             Err(e) => {
                 eprintln!("bayan: spawn failed: {e}");
                 None
@@ -1915,6 +1931,7 @@ impl App {
                 busy: t.busy(i == self.active),
                 attention: t.attention,
                 active: i == self.active,
+                progress: t.progress(),
             })
             .collect();
         let Some(window) = self.window.as_ref() else { return };
@@ -2283,6 +2300,52 @@ impl ApplicationHandler<UserEvent> for App {
                     if mode == config::BellMode::Sound && (background || !self.focused) {
                         beep();
                     }
+                    // the window is unfocused: a dot nobody can see is no
+                    // alert. A toast, like a finished command gets (Claude
+                    // Code with preferredNotifChannel=terminal_bell rings
+                    // exactly this bell when it needs an approval).
+                    if !self.focused && self.config.notifications_on() {
+                        if let Some(h) = self.hwnd() {
+                            let body = self.tabs[ti].title.clone();
+                            toast::show(h, "بيان — تنبيه", &body);
+                        }
+                        if let Some(w) = &self.window {
+                            w.request_user_attention(Some(
+                                winit::window::UserAttentionType::Informational,
+                            ));
+                        }
+                    }
+                }
+            }
+            UserEvent::Notify(id, title, body) => {
+                // an explicit ask (OSC 9 / 777 / 99): the program decided
+                // this deserves attention, so the only question is whether
+                // the user is already looking — same rule as the bell
+                if let Some((ti, _)) = self.find_pane(id) {
+                    let background = ti != self.active;
+                    if background {
+                        self.tabs[ti].attention = true;
+                    }
+                    if (background || !self.focused) && self.config.notifications_on() {
+                        if let Some(h) = self.hwnd() {
+                            let body = if body.is_empty() { self.tabs[ti].title.clone() } else { body };
+                            toast::show(h, &title, &body);
+                        }
+                        if !self.focused {
+                            if let Some(w) = &self.window {
+                                w.request_user_attention(Some(
+                                    winit::window::UserAttentionType::Informational,
+                                ));
+                            }
+                        }
+                    }
+                    self.request_redraw();
+                }
+            }
+            UserEvent::Progress(id, p) => {
+                if let Some((ti, pi)) = self.find_pane(id) {
+                    self.tabs[ti].panes[pi].progress = p;
+                    self.request_redraw(); // the tab bar and cockpit draw it
                 }
             }
             UserEvent::CommandFinished(id, ok) => {

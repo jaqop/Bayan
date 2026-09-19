@@ -499,6 +499,31 @@ pub struct TabInfo {
     /// approval): amber beats the green busy dot
     pub attention: bool,
     pub active: bool,
+    /// OSC 9;4 progress from the tab's focused pane (Claude Code emits it
+    /// while it works): a thin bar along the tab's bottom edge
+    pub progress: Option<crate::term::Progress>,
+}
+
+/// Bar colour for a progress state: green working, red failed, amber paused.
+fn progress_color(p: crate::term::Progress) -> (u8, u8, u8) {
+    use crate::term::ProgressState::*;
+    match p.state {
+        Normal | Indeterminate => (0x2e, 0xa0, 0x43),
+        Error => (0xcf, 0x22, 0x2e),
+        Paused => (0xf2, 0xcc, 0x60),
+    }
+}
+
+/// Short label for the cockpit: "42%", "!" for an error, "…" while
+/// indeterminate, "⏸" paused.
+pub fn progress_label(p: crate::term::Progress) -> String {
+    use crate::term::ProgressState::*;
+    match p.state {
+        Normal => format!("{}%", p.percent),
+        Error => format!("! {}%", p.percent),
+        Indeterminate => "…".to_string(),
+        Paused => format!("⏸ {}%", p.percent),
+    }
 }
 
 /// Fixed tab width in cells — the app's click hit-test relies on this.
@@ -616,6 +641,7 @@ pub struct CockpitEntry {
     pub busy: bool,
     pub attention: bool,
     pub active: bool,
+    pub progress: Option<crate::term::Progress>,
 }
 
 /// One pane's draw parameters.
@@ -1485,9 +1511,14 @@ impl Renderer {
             let mark = if e.active { "● " } else { "" };
             let title: String = e.title.chars().take(22).collect();
             let status: String = e.status.chars().take(48).collect();
+            let (pct, pct_fg) = match e.progress {
+                Some(p) => (format!("{}  ", progress_label(p)), progress_color(p)),
+                None => (String::new(), fg),
+            };
             let segs = [
                 Seg::plain(format!("{mark}{title}"), fg),
                 Seg::plain("   —   ", (0x6e, 0x76, 0x81)),
+                Seg { text: pct, fg: pct_fg, style: ST_BOLD },
                 Seg::plain(status, (0x9a, 0xa4, 0xb2)),
             ];
             self.draw_run(&segs, true, out, whole, (x + 32) as f32, ry + 6, 1.0);
@@ -2352,6 +2383,19 @@ impl Renderer {
                 let d = 6;
                 push_rect(out, whole, tx + tabw - 14, (oy + 3) / 2 - d / 2, d, d, c4(c, 255));
             }
+            // progress: a 3px bar along the bottom edge, its track dimmed and
+            // its fill at the reported percent (full-width dim = indeterminate)
+            if let Some(p) = tab.progress {
+                let (bx, bw, by, bh) = (tx + 6, tabw - 12, oy - 3, 3);
+                let c = progress_color(p);
+                push_rect(out, whole, bx, by, bw, bh, c4(c, 70));
+                let fill = match p.state {
+                    crate::term::ProgressState::Indeterminate => bw,
+                    _ => (bw as f32 * p.percent as f32 / 100.0).round() as i32,
+                };
+                let alpha = if p.state == crate::term::ProgressState::Indeterminate { 140 } else { 255 };
+                push_rect(out, whole, bx, by, fill, bh, c4(c, alpha));
+            }
         }
 
         // window controls, drawn by us because the OS title bar is gone
@@ -2923,6 +2967,41 @@ mod cache_tests {
         let plain = count_rows(&mut r, "\u{645}\u{631}\u{62d}\u{628}\u{627}".as_bytes());
         let underlined = count_rows(&mut r, "\x1b[4m\u{645}\u{631}\u{62d}\u{628}\u{627}\x1b[0m".as_bytes());
         assert!(underlined > plain, "no underline quads on the Arabic row ({underlined} vs {plain})");
+    }
+
+    /// A tab with OSC 9;4 progress draws its bar (track + fill) and the
+    /// fill follows the percent; an error is red, indeterminate is full width.
+    #[test]
+    fn tab_bar_draws_agent_progress() {
+        use crate::term::{Progress, ProgressState};
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let tab = |p: Option<Progress>| TabInfo {
+            title: "claude".into(), busy: false, attention: false, active: true, progress: p,
+        };
+        // the bar's quads: 3px tall, on the tab's bottom edge (track, then fill)
+        let bar_y = r.tab_bar_h().round() - 3.0;
+        let quads = |r: &mut Renderer, p: Option<Progress>| -> Vec<(f32, [f32; 4])> {
+            let mut out = Vec::new();
+            r.draw_chrome(&mut out, 800, 400, &[tab(p)], None, false);
+            out.chunks(6)
+                .filter(|q| q[0].pos[1] == bar_y && q[5].pos[1] - q[0].pos[1] == 3.0)
+                .map(|q| (q[1].pos[0] - q[0].pos[0], q[0].color))
+                .collect()
+        };
+        assert!(quads(&mut r, None).is_empty(), "no bar without progress");
+        let half = quads(&mut r, Some(Progress { state: ProgressState::Normal, percent: 50 }));
+        let full = quads(&mut r, Some(Progress { state: ProgressState::Normal, percent: 100 }));
+        assert_eq!(half.len(), 2, "track + fill");
+        let (w50, _) = half[1];
+        let (w100, c100) = full[1];
+        assert!((w100 - 2.0 * w50).abs() <= 2.0, "50%={w50} 100%={w100}");
+        assert_eq!(w100, full[0].0, "100% fills the track");
+        assert_eq!(c100, c4((0x2e, 0xa0, 0x43), 255), "working = green");
+        let err = quads(&mut r, Some(Progress { state: ProgressState::Error, percent: 30 }));
+        assert_eq!(err[1].1, c4((0xcf, 0x22, 0x2e), 255), "error = red");
+        let ind = quads(&mut r, Some(Progress { state: ProgressState::Indeterminate, percent: 0 }));
+        assert_eq!(ind[1].0, ind[0].0, "indeterminate spans the track");
+        assert_eq!(progress_label(Progress { state: ProgressState::Paused, percent: 5 }), "⏸ 5%");
     }
 
     /// Solid rects always reference page 0 (the white texel lives there).
