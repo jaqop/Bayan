@@ -79,6 +79,11 @@ pub struct UserConfig {
     /// Only NON-default bindings live here (the editor prunes defaults).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keybinds: Option<std::collections::HashMap<String, String>>,
+    /// What Ctrl+Tab does: "recent" (default) jumps to the previously used
+    /// tab and walks further down the history while Ctrl stays held, like a
+    /// browser or IDE; "order" cycles left to right the classic way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_switch: Option<String>,
 }
 
 /// Cursor shape (the trio every terminal offers: block / bar / underline).
@@ -196,6 +201,12 @@ impl UserConfig {
 
     pub fn notifications_on(&self) -> bool {
         self.notifications.unwrap_or(true)
+    }
+
+    /// Ctrl+Tab walks the most-recently-used history unless the config says
+    /// "order" (anything else, including a typo, keeps the default).
+    pub fn tab_switch_recent(&self) -> bool {
+        !self.tab_switch.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("order"))
     }
 }
 
@@ -323,6 +334,15 @@ mod tests {
             serde_json::from_str(r#"{"opacity":0.05,"padding":500}"#).unwrap();
         assert_eq!(wild.opacity_level(), 0.5);
         assert_eq!(wild.padding_px(), 32);
+    }
+
+    #[test]
+    fn tab_switch_defaults_to_recent_and_only_order_opts_out() {
+        assert!(UserConfig::default().tab_switch_recent());
+        let order: UserConfig = serde_json::from_str(r#"{"tab_switch":"order"}"#).unwrap();
+        assert!(!order.tab_switch_recent());
+        let typo: UserConfig = serde_json::from_str(r#"{"tab_switch":"ordr"}"#).unwrap();
+        assert!(typo.tab_switch_recent(), "a typo must not silently change behaviour");
     }
 
     #[test]

@@ -9,6 +9,7 @@
 
 mod bidi;
 mod links;
+mod mru;
 mod plugins;
 mod posh;
 mod shells;
@@ -529,6 +530,8 @@ struct App {
     posh: Option<PoshPicker>,
     /// the link under the pointer while Ctrl is held: (pane, row, c0, c1, target)
     hover_link: Option<(usize, usize, usize, usize, String)>,
+    /// most-recently-used tab history for Ctrl+Tab
+    mru: mru::Mru,
     /// the command palette, when open
     palette: Option<Palette>,
     /// last click on the empty title strip — powers double-click-to-maximise
@@ -1405,6 +1408,7 @@ impl App {
                 attention: false,
             });
             self.active = self.tabs.len() - 1;
+            self.mru.touch(self.active);
             self.relayout_active();
         }
     }
@@ -1543,7 +1547,9 @@ impl App {
                 self.quit(el);
                 return;
             }
+            self.mru.removed(ti);
             self.active = active_after_remove(self.active, ti, self.tabs.len());
+            self.mru.touch(self.active);
         } else if t.focused >= t.panes.len() {
             t.focused = t.panes.len() - 1;
         }
@@ -1553,6 +1559,13 @@ impl App {
     }
 
     fn switch_tab(&mut self, idx: usize) {
+        self.show_tab(idx);
+        self.mru.touch(self.active);
+    }
+
+    /// Show tab `idx` without touching the MRU history — the Ctrl+Tab walk
+    /// passes through tabs; only the one it ends on (Ctrl released) counts.
+    fn show_tab(&mut self, idx: usize) {
         if idx >= self.tabs.len() || idx == self.active {
             return;
         }
@@ -2640,6 +2653,9 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
                 self.refresh_hover_link(); // Ctrl down/up shows/hides link underlines
+                if !self.modifiers.control_key() && self.mru.walking() {
+                    self.mru.release(self.active); // the Ctrl+Tab walk ends here
+                }
             }
             WindowEvent::ScaleFactorChanged { .. } => {
                 // HiDPI: the window moved to a monitor with another scale.
@@ -3025,12 +3041,20 @@ impl ApplicationHandler<UserEvent> for App {
                     // because winit reports Tab+shift with the shift modifier)
                     if matches!(key, Key::Named(NamedKey::Tab)) && !self.tabs.is_empty() {
                         let n = self.tabs.len();
-                        let next = if shift {
-                            (self.active + n - 1) % n
+                        if self.config.tab_switch_recent() {
+                            // stack-like: the previous tab first, deeper while
+                            // Ctrl stays down; ModifiersChanged commits the stop
+                            if let Some(next) = self.mru.step(!shift, n) {
+                                self.show_tab(next);
+                            }
                         } else {
-                            (self.active + 1) % n
-                        };
-                        self.switch_tab(next);
+                            let next = if shift {
+                                (self.active + n - 1) % n
+                            } else {
+                                (self.active + 1) % n
+                            };
+                            self.switch_tab(next);
+                        }
                         return;
                     }
                     // Ctrl+0 resets the font zoom (physical digit key:
@@ -3146,6 +3170,7 @@ fn main() {
     let mut app = App {
         posh: None,
         hover_link: None,
+        mru: mru::Mru::new(),
         palette: None,
         last_strip_click: None,
         proxy,
