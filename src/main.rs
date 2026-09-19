@@ -148,6 +148,43 @@ fn jump_offset(marks: &[usize], hist: usize, off: usize, dir: i32) -> Option<usi
     Some((hist as i64 - target + 1).clamp(0, hist as i64) as usize)
 }
 
+/// The active tab index after tab `removed` leaves a list of `len` tabs.
+/// A background tab whose shell exits sits at a LOWER index than the active
+/// one often enough (the first tab is the one people leave running): the
+/// active index must slide down with it, or focus lands on the wrong tab.
+fn active_after_remove(active: usize, removed: usize, len_after: usize) -> usize {
+    if len_after == 0 {
+        return 0;
+    }
+    let a = if removed < active { active - 1 } else { active };
+    a.min(len_after - 1)
+}
+
+/// Bytes a wheel notch sends to a full-screen program (EasyTer's rule): a
+/// mouse report only when the app enabled mouse tracking — SGR encoded if it
+/// asked for that (DECSET 1006), X10 bytes otherwise — else an arrow key that
+/// honours DECCKM. `n` > 0 is a notch up. Bytes, not a String: X10 packs
+/// each value into ONE byte (32 + v), and past column 95 that byte is >= 0x80,
+/// which a String would UTF-8-encode into two.
+fn wheel_seq(mode: TermMode, n: i32, row: usize, col: usize) -> Vec<u8> {
+    let btn = if n > 0 { 64 } else { 65 };
+    if mode.intersects(TermMode::MOUSE_MODE) {
+        if mode.contains(TermMode::SGR_MOUSE) {
+            format!("\x1b[<{btn};{col};{row}M").into_bytes()
+        } else {
+            let b = |v: usize| (32 + v.min(223)) as u8;
+            vec![0x1b, b'[', b'M', b(btn), b(col), b(row)]
+        }
+    } else {
+        let ch = if n > 0 { b'A' } else { b'B' };
+        if mode.contains(TermMode::APP_CURSOR) {
+            vec![0x1b, b'O', ch]
+        } else {
+            vec![0x1b, b'[', ch]
+        }
+    }
+}
+
 /// One cell step in the search direction, clamped to the buffer (used to
 /// move the search origin past the current hit so Enter advances).
 fn step_point(p: Point, cols: usize, top: i32, bottom: i32, dir: Direction) -> Point {
@@ -416,6 +453,9 @@ struct Palette {
     sel: usize,
 }
 
+/// A frame's snapshot of the picker: (names, previews, selected row).
+type PoshView = (Vec<String>, Vec<Option<Vec<u8>>>, usize);
+
 /// The prompt picker: theme names with LIVE previews rendered by oh-my-posh
 /// itself, so what you see is the prompt you get.
 struct PoshPicker {
@@ -517,13 +557,18 @@ impl App {
 
     // ---- settings panel ----
 
-    /// Index of the active theme (which the panel highlights).
+    /// Index of the active theme in the gallery order (built-ins, then
+    /// plugin themes) — the index the panel highlights and apply_theme takes.
     fn active_theme(&self) -> usize {
-        self.config
-            .theme
-            .as_deref()
-            .and_then(|n| render::THEMES.iter().position(|t| t.name == n))
-            .unwrap_or(0)
+        let Some(name) = self.config.theme.as_deref() else { return 0 };
+        if let Some(i) = render::THEMES.iter().position(|t| t.name == name) {
+            return i;
+        }
+        plugins::registry()
+            .themes
+            .iter()
+            .position(|t| t.name == name)
+            .map_or(0, |i| render::THEMES.len() + i)
     }
 
     /// Apply theme `idx` (copy its colors into the config), live.
@@ -829,7 +874,7 @@ impl App {
                 if let Some(act) = plugins::registry().actions.get(i) {
                     let text = act.send.clone();
                     if let Some(s) = self.session_mut() {
-                        let _ = s.write(text.as_bytes());
+                        s.write(text.as_bytes());
                     }
                 }
             }
@@ -1327,8 +1372,7 @@ impl App {
         }
         let rects = self.pane_rects();
         const GRAB: f64 = 4.0;
-        for i in 0..rects.len() - 1 {
-            let (x, y, w, h) = rects[i];
+        for (i, &(x, y, w, h)) in rects.iter().enumerate().take(rects.len() - 1) {
             let hit = match t.orientation {
                 Orientation::Row => {
                     (pos.x - (x + w) as f64).abs() <= GRAB
@@ -1434,9 +1478,7 @@ impl App {
                 self.quit(el);
                 return;
             }
-            if self.active >= self.tabs.len() {
-                self.active = self.tabs.len() - 1;
-            }
+            self.active = active_after_remove(self.active, ti, self.tabs.len());
         } else if t.focused >= t.panes.len() {
             t.focused = t.panes.len() - 1;
         }
@@ -1582,8 +1624,6 @@ impl App {
         Some((pi, row, col, side))
     }
 
-    /// Tab index under a pixel position, if it's in the tab bar.
-
     /// Which window edge the pointer is on, if any. 6px is the smallest band
     /// that stays grabbable without stealing clicks from the content.
     fn resize_edge_at(&self, pos: PhysicalPosition<f64>) -> Option<ResizeDirection> {
@@ -1642,6 +1682,7 @@ impl App {
         self.tab_at(pos).is_none()
     }
 
+    /// Tab index under a pixel position, if it's in the tab bar.
     fn tab_at(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
         let r = self.renderer.as_ref()?;
         if r.tab_bar_h() == 0.0 || pos.y >= r.tab_bar_h() as f64 {
@@ -1846,7 +1887,7 @@ impl App {
                     .collect();
                 (rows, st.sel, st.capturing, st.flash.clone())
             });
-        let posh_view: Option<(Vec<String>, Vec<Option<Vec<u8>>>, usize)> =
+        let posh_view: Option<PoshView> =
             self.posh.as_ref().map(|p| (p.names.clone(), p.previews.clone(), p.sel));
         // computed before the renderer is borrowed, like close_msg above
         let palette_view: Option<(String, Vec<String>, usize)> = self.palette.as_ref().map(|p| {
@@ -2611,24 +2652,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 let mode = self.term_mode();
                 if mode.contains(TermMode::ALT_SCREEN) {
-                    // a full-screen TUI owns scrolling. EasyTer's rule: SGR
-                    // mouse only if the app asked for mouse reporting, else
-                    // arrow keys (honoring DECCKM) — never injected garbage.
-                    let seq = if mode.intersects(TermMode::MOUSE_MODE) {
-                        let (row, col) = self.pointer_cell_1based();
-                        let btn = if n > 0 { 64 } else { 65 };
-                        format!("\x1b[<{btn};{col};{row}M")
-                    } else {
-                        let ch = if n > 0 { 'A' } else { 'B' };
-                        if mode.contains(TermMode::APP_CURSOR) {
-                            format!("\x1bO{ch}")
-                        } else {
-                            format!("\x1b[{ch}")
-                        }
-                    };
+                    // a full-screen TUI owns scrolling: a mouse report only if
+                    // it asked for one, arrows otherwise — never injected garbage
+                    let (row, col) = self.pointer_cell_1based();
+                    let seq = wheel_seq(mode, n, row, col);
                     let payload = seq.repeat(n.unsigned_abs() as usize);
                     if let Some(s) = self.session_mut() {
-                        s.write(payload.as_bytes());
+                        s.write(&payload);
                     }
                 } else {
                     self.scroll_lines(n);
@@ -2795,9 +2825,13 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
-                // Shift+PageUp/PageDown page through the scrollback
+                // Shift+PageUp/PageDown page through the scrollback, by the
+                // focused pane's REAL height (self.size is only the spawn grid)
                 if shift && !ctrl {
-                    let rows = self.size.rows as i32;
+                    let rows = self
+                        .session()
+                        .map_or(self.size.rows, |s| s.term.lock().unwrap().screen_lines())
+                        as i32;
                     match key {
                         Key::Named(NamedKey::PageUp) => {
                             self.scroll_lines(rows);
@@ -3077,6 +3111,40 @@ mod tests {
         // no hits -> None, and a regex-special query is treated literally
         assert!(find_match(&mut t, "absent", &None, Direction::Left).is_none());
         assert!(find_match(&mut t, "needle (", &None, Direction::Left).is_none());
+    }
+
+    /// A background tab's shell exiting must not move focus to a different
+    /// tab than the one the user was looking at.
+    #[test]
+    fn closing_a_lower_tab_slides_the_active_index_down() {
+        // 4 tabs, looking at #2, tab #0 closes -> the same tab is now #1
+        assert_eq!(active_after_remove(2, 0, 3), 1);
+        // closing a higher tab leaves the index alone
+        assert_eq!(active_after_remove(1, 3, 3), 1);
+        // closing the active tab itself: clamp to the last remaining
+        assert_eq!(active_after_remove(2, 2, 2), 1);
+        assert_eq!(active_after_remove(0, 0, 2), 0);
+        assert_eq!(active_after_remove(5, 0, 0), 0);
+    }
+
+    /// The wheel inside a TUI: arrows unless the app tracks the mouse, and
+    /// then the encoding IT asked for — an SGR report to a program that only
+    /// enabled X10 tracking is as much garbage as one to a program with none.
+    #[test]
+    fn wheel_sends_what_the_tui_asked_for() {
+        let none = TermMode::ALT_SCREEN;
+        assert_eq!(wheel_seq(none, 1, 5, 7), b"\x1b[A");
+        assert_eq!(wheel_seq(none, -1, 5, 7), b"\x1b[B");
+        assert_eq!(wheel_seq(none | TermMode::APP_CURSOR, 1, 5, 7), b"\x1bOA");
+        let x10 = none | TermMode::MOUSE_REPORT_CLICK;
+        assert_eq!(wheel_seq(x10, 1, 5, 7), b"\x1b[M\x60\x27\x25");
+        let sgr = x10 | TermMode::SGR_MOUSE;
+        assert_eq!(wheel_seq(sgr, -1, 5, 7), b"\x1b[<65;7;5M");
+        // X10 is ONE byte per value: column 200 is 0xE8, never a two-byte
+        // UTF-8 pair, and anything past 223 clamps rather than wrapping
+        assert_eq!(wheel_seq(x10, 1, 3, 200), b"\x1b[M\x60\xe8\x23");
+        assert_eq!(wheel_seq(x10, 1, 500, 900).len(), 6);
+        assert_eq!(wheel_seq(x10, 1, 500, 900)[4], 255);
     }
 
     #[test]

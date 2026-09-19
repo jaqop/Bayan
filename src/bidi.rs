@@ -78,12 +78,10 @@ fn unbidi_rtl_line(line: &str) -> String {
             let mut j = i;
             while j < n {
                 let cj = rev[j];
-                if is_ltr_char(cj) {
-                    j += 1;
-                } else if (LTR_PUNCT.contains(&cj) || cj == ' ')
+                let joins_island = (LTR_PUNCT.contains(&cj) || cj == ' ')
                     && j + 1 < n
-                    && is_ltr_char(rev[j + 1])
-                {
+                    && is_ltr_char(rev[j + 1]);
+                if is_ltr_char(cj) || joins_island {
                     j += 1;
                 } else {
                     break;
@@ -239,6 +237,44 @@ mod tests {
             restore_block(block),
             "مرحبا\nplain english\nWhat are you working on مساعدتك؟"
         );
+    }
+
+    /// `tests/fixtures/bidi_cases.json` is published as a language-agnostic
+    /// corpus (shared with other terminals) and was generated FROM this
+    /// module. Nothing re-checked it after that: a change here would leave
+    /// the corpus quietly wrong. Every pair must still round-trip.
+    #[test]
+    fn the_published_fixture_corpus_still_round_trips() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bidi_cases.json");
+        let text = std::fs::read_to_string(path).expect("fixture corpus present");
+        let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        let cases = v["cases"].as_array().expect("cases array");
+        assert!(cases.len() >= 6, "corpus shrank to {} cases", cases.len());
+        for c in cases {
+            let name = c["name"].as_str().unwrap_or("?");
+            let logical = c["logical"].as_str().expect("logical");
+            let visual = c["visual"].as_str().expect("visual");
+            let got = restore_bidi_line(visual).unwrap_or_else(|| visual.to_string());
+            assert_eq!(got, logical, "fixture {name}: visual -> logical drifted");
+            // the codepoint listings must describe the strings they sit beside
+            let cps = |s: &str| {
+                s.chars().map(|ch| format!("{:04X}", ch as u32)).collect::<Vec<_>>().join(" ")
+            };
+            assert_eq!(cps(logical), c["logical_codepoints"].as_str().unwrap_or(""), "{name}");
+            assert_eq!(cps(visual), c["visual_codepoints"].as_str().unwrap_or(""), "{name}");
+        }
+        let ml = &v["multiline_case"];
+        assert_eq!(
+            restore_block(ml["visual_block"].as_str().unwrap()),
+            ml["logical_block"].as_str().unwrap()
+        );
+        let pg = &v["program_gating"];
+        for m in pg["matches"].as_array().unwrap() {
+            assert!(cmd_is_claude(m.as_str().unwrap()), "should match: {m}");
+        }
+        for m in pg["does_not_match"].as_array().unwrap() {
+            assert!(!cmd_is_claude(m.as_str().unwrap()), "should not match: {m}");
+        }
     }
 
     #[test]

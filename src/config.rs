@@ -69,6 +69,7 @@ pub struct UserConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub padding: Option<u32>,
     /// Plugin file-stems to skip loading.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_plugins: Option<Vec<String>>,
     /// Native toast when a long command finishes while Bayan is unfocused
     /// (default on). Windows quiet hours are respected regardless.
@@ -172,7 +173,7 @@ impl UserConfig {
     }
 
     pub fn shell_program(&self) -> String {
-        self.shell.clone().unwrap_or_else(|| "powershell.exe".to_string())
+        self.shell.clone().unwrap_or_else(|| crate::term::DEFAULT_SHELL.to_string())
     }
 
     pub fn hide_single_tab_on(&self) -> bool {
@@ -183,12 +184,12 @@ impl UserConfig {
         self.confirm_close.unwrap_or(true)
     }
 
-    /// Content inset. Default 10: text pressed flat against the window edge
-    /// reads as unfinished, and every modern terminal ships a gutter.
     pub fn disabled_plugins(&self) -> Vec<String> {
         self.disabled_plugins.clone().unwrap_or_default()
     }
 
+    /// Content inset. Default 10: text pressed flat against the window edge
+    /// reads as unfinished, and every modern terminal ships a gutter.
     pub fn padding_px(&self) -> i32 {
         self.padding.unwrap_or(10).min(32) as i32
     }
@@ -322,6 +323,12 @@ mod tests {
             serde_json::from_str(r#"{"opacity":0.05,"padding":500}"#).unwrap();
         assert_eq!(wild.opacity_level(), 0.5);
         assert_eq!(wild.padding_px(), 32);
+    }
+
+    #[test]
+    fn saving_omits_unset_fields() {
+        let json = serde_json::to_string(&UserConfig::default()).unwrap();
+        assert_eq!(json, "{}", "an untouched config serializes to nothing: {json}");
     }
 
     #[test]

@@ -220,6 +220,13 @@ fn arabic_chars(n: usize) -> String {
     }
 }
 
+/// SGR 2 (faint): two thirds of each channel. Widened before the multiply —
+/// `u8 * 2` overflows for any channel above 127, which is most foregrounds.
+fn dim((r, g, b): (u8, u8, u8)) -> (u8, u8, u8) {
+    let f = |c: u8| (c as u16 * 2 / 3) as u8;
+    (f(r), f(g), f(b))
+}
+
 /// Straight-alpha color for the quad batch.
 fn c4((r, g, b): (u8, u8, u8), a: u8) -> [f32; 4] {
     [
@@ -502,6 +509,9 @@ pub const TAB_MIN_CELLS: f32 = 9.0;
 
 /// A rect in frame pixels: (x, y, w, h).
 pub type Rect = (i32, i32, i32, i32);
+
+/// One underline/strikethrough span on a grid row: (col_start, col_end, style, fg).
+type Deco = (usize, usize, u8, (u8, u8, u8));
 
 /// One row of the shortcuts editor.
 pub struct ShortcutRow {
@@ -1104,7 +1114,7 @@ impl Renderer {
         let n = cells.len();
         let mut i = 0;
         // underline/strikethrough decorations: (col_start, col_end, style, fg)
-        let mut decos: Vec<(usize, usize, u8, (u8, u8, u8))> = Vec::new();
+        let mut decos: Vec<Deco> = Vec::new();
         let mut note_deco = |ci: &CellInfo| {
             if ci.style & (ST_UNDERLINE | ST_STRIKE) == 0 {
                 return;
@@ -1253,7 +1263,7 @@ impl Renderer {
                 style |= ST_STRIKE;
             }
             if cell.flags.intersects(Flags::DIM) {
-                fg = (fg.0 * 2 / 3, fg.1 * 2 / 3, fg.2 * 2 / 3);
+                fg = dim(fg);
             }
             let ch = if cell.flags.intersects(Flags::HIDDEN) { ' ' } else { cell.c };
             if bg != self.bg {
@@ -1482,7 +1492,10 @@ impl Renderer {
         // the theme row obeys the same grammar: tiles left, label right,
         // so the strip leaves room for the "المظهر" label
         let label_reserve = (self.cell_w * 6.0) as i32;
-        let tile_w = ((w - pad * 2 - label_reserve - 6 * 6) / 7).max(30);
+        // sized by the ACTUAL tile count (built-ins + plugin themes), or the
+        // strip overruns the label once a theme is added
+        let n_tiles = gallery().len().max(1) as i32;
+        let tile_w = ((w - pad * 2 - label_reserve - 6 * (n_tiles - 1)) / n_tiles).max(30);
         let tile_h = (self.cell_h * 1.6) as i32;
         let theme_rowh = tile_h + 14;
         let h = head_h + 6 + theme_rowh + rowh * 14 + foot_h;
@@ -1893,6 +1906,7 @@ impl Renderer {
     /// The shortcuts editor: the settings ledger grammar again — keycap
     /// chips left ··· action label right. The selected row highlights; a
     /// capturing row swaps its chips for an amber "press the new chord".
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_shortcuts(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
                           rows: &[ShortcutRow], sel: usize, capturing: bool,
                           flash: Option<&str>) {
@@ -1937,14 +1951,13 @@ impl Renderer {
             let label_x = (x + w - pad) as f32 - lw;
             self.draw_run(&lseg, true, out, whole, label_x, ry + tc, 1.0);
 
-            let chips_end;
-            if selected && capturing {
+            let chips_end = if selected && capturing {
                 // amber capture prompt in place of the chips
                 let seg = [Seg { text: "اضغط الاختصار الجديد…".into(),
                                  fg: AMBER, style: ST_BOLD }];
                 let cw = self.measure(&seg, true);
                 self.draw_run(&seg, true, out, whole, (x + pad) as f32, ry + tc, 1.0);
-                chips_end = x + pad + cw as i32;
+                x + pad + cw as i32
             } else {
                 // keycap chips, one per token: Ctrl / Shift / T
                 let ch = lay.rowh - 12;
@@ -1961,8 +1974,8 @@ impl Renderer {
                                   cy + ((ch as f32 - self.cell_h) / 2.0) as i32, 1.0);
                     cx += cw + 6;
                 }
-                chips_end = cx - 6;
-            }
+                cx - 6
+            };
             // the ledger dots tie chips to label
             let dy = ry + lay.rowh / 2 - 1;
             let mut dx = chips_end + 16;
@@ -1987,9 +2000,6 @@ impl Renderer {
         self.draw_run(&seg, true, out, whole, (x + w - pad) as f32 - fw2,
                       y + h - (self.cell_h as i32 + 14), 1.0);
     }
-
-    /// The close guard (same family as the paste guard): a pane or the
-    /// window is about to close while a command still runs — confirm.
 
     /// The command palette (Ctrl+Shift+P). Query line, filtered rows, hint.
     /// `rows` is already filtered by the caller — the renderer never decides
@@ -2148,6 +2158,8 @@ impl Renderer {
                       y + h - self.cell_h as i32 - 8, 1.0);
     }
 
+    /// The close guard (same family as the paste guard): a pane or the
+    /// window is about to close while a command still runs — confirm.
     pub fn draw_close_guard(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
                             msg: &str) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
@@ -2671,8 +2683,7 @@ mod cache_tests {
     /// ligature-capable default doesn't sneak substitutions in later).
     #[test]
     fn ligatures_off_prefers_a_mono_family() {
-        let mut cfg = crate::config::UserConfig::default();
-        cfg.ligatures = Some(false);
+        let cfg = crate::config::UserConfig { ligatures: Some(false), ..Default::default() };
         let r = Renderer::new(1.0, &cfg, 0.0);
         assert!(!r.ligatures);
         // the picked family is the first installed MONO candidate (or a
@@ -2794,6 +2805,40 @@ mod cache_tests {
         assert!(!r.settings_button_hit(w, 20.0, (by + bh / 2) as f64));
         // the button sits at the right edge
         assert!(bx + bw <= w as i32 && bx > w as i32 / 2);
+    }
+
+    /// SGR 2 on a bright foreground used to overflow `u8 * 2` (a debug
+    /// panic on the first faint character, wrapped garbage in release).
+    #[test]
+    fn dim_never_overflows_and_darkens() {
+        assert_eq!(dim((255, 255, 255)), (170, 170, 170));
+        // the measured tan foreground: every channel is above 127
+        assert_eq!(dim(FG), (129, 122, 100));
+        assert_eq!(dim((0, 0, 0)), (0, 0, 0));
+        for c in [128u8, 200, 254] {
+            let d = dim((c, c, c));
+            let want = (c as u16 * 2 / 3) as u8;
+            assert!(d.0 < c && d.0 == want, "dim({c}) = {d:?}, want {want}");
+        }
+    }
+
+    /// The theme strip must fit every tile between the card's left pad and
+    /// the row label, however many themes the gallery holds — the eighth
+    /// built-in was the one that first ran under the label.
+    #[test]
+    fn theme_tiles_stay_clear_of_the_row_label() {
+        let r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let lay = r.settings_layout(1400, 900);
+        let (cx, _, cw, _) = lay.card;
+        let label_reserve = (r.cell_w * 6.0) as i32;
+        let last = lay.theme_tiles[lay.theme_tiles.len() - 1];
+        assert!(gallery().len() >= 8, "this test assumes the eighth theme exists");
+        assert!(
+            last.0 + last.2 <= cx + cw - 24 - label_reserve,
+            "the last tile ends at {} but the label starts at {}",
+            last.0 + last.2,
+            cx + cw - 24 - label_reserve
+        );
     }
 
     /// Solid rects always reference page 0 (the white texel lives there).
