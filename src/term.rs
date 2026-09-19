@@ -664,7 +664,7 @@ impl Session {
     pub fn write(&mut self, bytes: &[u8]) {
         // Enter at a prompt starts a command: read it off the screen now,
         // before the shell reacts (Claude mode auto-enable needs the name)
-        if bytes.contains(&b'\r') {
+        if submits_a_command(bytes) {
             let t = self.term.lock().unwrap();
             let mut m = self.meta.lock().unwrap();
             capture_command_core(&t, &mut m);
@@ -682,6 +682,15 @@ impl Session {
         });
         self.term.lock().unwrap().resize(size);
     }
+}
+
+/// Does this write submit the line at the prompt? A carriage return does —
+/// unless it sits inside a bracketed paste, where the shell treats the whole
+/// payload as typed text and runs nothing: capturing there read whatever was
+/// on the prompt line as a "running command" (a spurious close-guard prompt,
+/// or a stale name feeding Claude-mode detection).
+pub(crate) fn submits_a_command(bytes: &[u8]) -> bool {
+    bytes.contains(&b'\r') && !bytes.starts_with(b"\x1b[200~")
 }
 
 /// Multi-line / huge pastes can execute commands on arrival (EasyTer's paste
@@ -745,6 +754,19 @@ mod tests {
             normalize_paste("safe\x1b[201~evil\n", true),
             "\x1b[200~safeevil\r\x1b[201~"
         );
+    }
+
+    #[test]
+    fn a_bracketed_paste_does_not_count_as_submitting_a_command() {
+        assert!(submits_a_command(b"ls\r"));
+        assert!(submits_a_command(b"\r"));
+        assert!(!submits_a_command(b"abc"));
+        // the wrapped payload of normalize_paste(_, true) carries \r inside
+        let wrapped = normalize_paste("a\nb\n", true);
+        assert!(wrapped.contains('\r'));
+        assert!(!submits_a_command(wrapped.as_bytes()));
+        // an UNbracketed multi-line paste really does run lines: still a submit
+        assert!(submits_a_command(normalize_paste("a\nb\n", false).as_bytes()));
     }
 
     #[test]

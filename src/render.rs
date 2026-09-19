@@ -27,7 +27,6 @@ use cosmic_text::{
 };
 
 use crate::gpu::Vertex;
-use crate::term::EventProxy;
 
 // Bayan's first look is Jonathan Blow's scheme, SAMPLED from two captures of
 // his editor rather than recalled. Five colours are measured medians, not
@@ -512,6 +511,8 @@ pub type Rect = (i32, i32, i32, i32);
 
 /// One underline/strikethrough span on a grid row: (col_start, col_end, style, fg).
 type Deco = (usize, usize, u8, (u8, u8, u8));
+/// The same span resolved to pixels: (x0, x1, style, fg).
+type PxDeco = (i32, i32, u8, (u8, u8, u8));
 
 /// One row of the shortcuts editor.
 pub struct ShortcutRow {
@@ -1051,11 +1052,23 @@ impl Renderer {
         let mut segs: Vec<Seg> = Vec::new();
         let mut cur_bytes: Option<(usize, usize)> = None;
         let mut nbytes = 0usize;
+        // underline/strikethrough spans as BYTE ranges of the shaped text:
+        // on a BiDi row the pixels come from the layout, never from columns
+        let mut decos: Vec<Deco> = Vec::new();
         for ci in &cells[..end] {
             if cursor_col == Some(ci.col) {
                 cur_bytes = Some((nbytes, nbytes + ci.c.len_utf8()));
             }
+            let b0 = nbytes;
             nbytes += ci.text_len();
+            if ci.style & (ST_UNDERLINE | ST_STRIKE) != 0 {
+                match decos.last_mut() {
+                    Some((_, e, st, fg)) if *e == b0 && *st == ci.style && *fg == ci.fg => {
+                        *e = nbytes;
+                    }
+                    _ => decos.push((b0, nbytes, ci.style, ci.fg)),
+                }
+            }
             match segs.last_mut() {
                 Some(s) if s.fg == ci.fg && s.style == ci.style => ci.push_text(&mut s.text),
                 _ => {
@@ -1077,12 +1090,41 @@ impl Renderer {
             if let Some(fixed) = crate::bidi::restore_bidi_line(&full) {
                 segs = vec![Seg::plain(fixed, self.fg)];
                 cur_bytes = None;
+                decos.clear(); // byte ranges no longer map after reordering
             }
         }
         // shape unconstrained (cached), then compress to the pane on overflow
         let natw = self.measure(&segs, true);
         let scale = if natw > pane_w as f32 { pane_w as f32 / natw } else { 1.0 };
         self.draw_run(&segs, true, out, clip, x0 as f32, y, scale);
+        // decorations through the shaped layout: each byte span becomes the
+        // (possibly several, possibly reordered) glyph rects it occupies
+        if !decos.is_empty() {
+            let th = (self.cell_h / 14.0).max(1.0) as i32;
+            let key = self.ensure_shaped(&segs, true);
+            let mut rects: Vec<PxDeco> = Vec::new();
+            for run in self.cache_hot[&key].buffer.layout_runs() {
+                for &(b0, b1, style, fg) in &decos {
+                    let c0 = cosmic_text::Cursor::new(0, b0);
+                    let c1 = cosmic_text::Cursor::new(0, b1);
+                    for (hx, hw) in run.highlight(c0, c1) {
+                        let dx0 = x0 + (hx * scale).round() as i32;
+                        let dx1 = x0 + ((hx + hw) * scale).round() as i32;
+                        rects.push((dx0, dx1, style, fg));
+                    }
+                }
+            }
+            for (dx0, dx1, style, fg) in rects {
+                if style & ST_UNDERLINE != 0 {
+                    let uy = y + self.cell_h.round() as i32 - th - 1;
+                    push_rect(out, clip, dx0, uy, dx1 - dx0, th, c4(fg, 255));
+                }
+                if style & ST_STRIKE != 0 {
+                    let sy = y + (self.cell_h * 0.55).round() as i32;
+                    push_rect(out, clip, dx0, sy, dx1 - dx0, th, c4(fg, 255));
+                }
+            }
+        }
         if let Some((b0, b1)) = cur_bytes {
             let c0 = cosmic_text::Cursor::new(0, b0);
             let c1 = cosmic_text::Cursor::new(0, b1);
@@ -1206,8 +1248,9 @@ impl Renderer {
     }
 
     /// Draw one pane's terminal into its rect.
-    pub fn draw_pane(&mut self, out: &mut Vec<Vertex>,
-                     view: &PaneView, term: &Term<EventProxy>) {
+    pub fn draw_pane<T: alacritty_terminal::event::EventListener>(
+        &mut self, out: &mut Vec<Vertex>, view: &PaneView, term: &Term<T>,
+    ) {
         let (px, py, pw, ph) = view.rect;
         let clip = view.rect;
         let rows = term.screen_lines();
@@ -2839,6 +2882,47 @@ mod cache_tests {
             last.0 + last.2,
             cx + cw - 24 - label_reserve
         );
+    }
+
+    /// Underline on an Arabic row used to vanish: the BiDi path shaped the
+    /// text and drew no decorations at all. It must emit underline rects,
+    /// placed through the layout (so they sit under the RTL glyphs).
+    #[test]
+    fn underline_survives_on_a_bidi_row() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 30, rows: 3 };
+        let count_rows = |r: &mut Renderer, bytes: &[u8]| -> usize {
+            let mut t = Term::new(Config::default(), &size, VoidListener);
+            let mut p: Processor = Processor::new();
+            p.advance(&mut t, bytes);
+            let mut out = Vec::new();
+            let view = PaneView {
+                rect: (0, 0, 600, 90),
+                focused: false,
+                cursor: crate::config::CursorStyle::Block,
+                cursor_on: false,
+                bordered: false,
+                claude: false,
+                search_match: None,
+                marks: &[],
+            };
+            // an underline is a solid quad (page 0, white texel) th px tall
+            let th = (r.cell_h / 14.0).max(1.0) as i32;
+            r.draw_pane(&mut out, &view, &t);
+            out.chunks(6)
+                .filter(|q| {
+                    q[0].layer == 0.0
+                        && q[0].uv == [WHITE_UV, WHITE_UV]
+                        && (q[5].pos[1] - q[0].pos[1]).round() as i32 == th
+                })
+                .count()
+        };
+        let plain = count_rows(&mut r, "\u{645}\u{631}\u{62d}\u{628}\u{627}".as_bytes());
+        let underlined = count_rows(&mut r, "\x1b[4m\u{645}\u{631}\u{62d}\u{628}\u{627}\x1b[0m".as_bytes());
+        assert!(underlined > plain, "no underline quads on the Arabic row ({underlined} vs {plain})");
     }
 
     /// Solid rects always reference page 0 (the white texel lives there).
