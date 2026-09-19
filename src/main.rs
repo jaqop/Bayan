@@ -388,6 +388,48 @@ struct SavedTab {
 struct SavedState {
     tabs: Vec<SavedTab>,
     active: usize,
+    /// where the window was, so it comes back there (WezTerm's most-asked
+    /// small thing). Physical pixels; absent in files from before M32.
+    #[serde(default)]
+    window: Option<WindowGeom>,
+}
+
+/// The window's last NON-maximized rectangle plus whether it was maximized —
+/// so restoring a maximized window also knows where "restore down" goes.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct WindowGeom {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    #[serde(default)]
+    maximized: bool,
+}
+
+/// A saved rectangle is worth restoring only if enough of it lands on a
+/// monitor that is still connected: a window last seen on an unplugged
+/// second screen must not come back off-screen with no way to grab it.
+/// `monitors` are (x, y, w, h) in physical pixels.
+fn geometry_on_screen(g: WindowGeom, monitors: &[(i32, i32, u32, u32)]) -> bool {
+    const NEED: i64 = 120; // px of the window's top strip that must be reachable
+    if g.w < 200 || g.h < 120 {
+        return false;
+    }
+    let (gx0, gy0) = (g.x as i64, g.y as i64);
+    let (gx1, gy1) = (gx0 + g.w as i64, gy0 + 64); // the title strip, where you grab it
+    monitors.iter().any(|&(mx, my, mw, mh)| {
+        let (mx0, my0, mx1, my1) = (mx as i64, my as i64, mx as i64 + mw as i64, my as i64 + mh as i64);
+        let ox = gx1.min(mx1) - gx0.max(mx0);
+        let oy = gy1.min(my1) - gy0.max(my0);
+        ox >= NEED && oy >= 32
+    })
+}
+
+/// Read and parse ~/.bayan/session.json (None when absent or corrupt).
+fn load_saved_state() -> Option<SavedState> {
+    state_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| parse_state(&s))
 }
 
 /// The pre-M9 file format (one cwd per tab) — read it rather than dropping
@@ -415,6 +457,7 @@ fn parse_state(json: &str) -> Option<SavedState> {
             })
             .collect(),
         active: legacy.active,
+        window: None,
     })
 }
 
@@ -545,6 +588,9 @@ struct App {
     font_delta: f32,
     renderer_building: bool,
     inflight_delta: f32,
+    /// the last rectangle the window had while NOT maximized — what a
+    /// maximized window restores down to, and what the session saves
+    normal_geom: Option<WindowGeom>,
 }
 
 impl App {
@@ -1550,6 +1596,10 @@ impl App {
                 })
                 .collect(),
             active: self.active,
+            window: self.normal_geom.map(|g| WindowGeom {
+                maximized: self.window.as_ref().is_some_and(|w| w.is_maximized()),
+                ..g
+            }),
         };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -1559,10 +1609,22 @@ impl App {
         }
     }
 
+    /// Note the window's current rectangle if it is in its normal state
+    /// (moved or resized by the user, not maximized).
+    fn track_geometry(&mut self) {
+        let Some(w) = &self.window else { return };
+        if w.is_maximized() || w.is_minimized().unwrap_or(false) {
+            return;
+        }
+        let (Ok(pos), size) = (w.outer_position(), w.inner_size()) else { return };
+        if size.width > 0 && size.height > 0 {
+            self.normal_geom =
+                Some(WindowGeom { x: pos.x, y: pos.y, w: size.width, h: size.height, maximized: false });
+        }
+    }
+
     fn restore_state(&mut self) {
-        let saved: Option<SavedState> = state_path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| parse_state(&s));
+        let saved = load_saved_state();
         match saved {
             Some(state) if !state.tabs.is_empty() => {
                 for st in state.tabs {
@@ -2223,7 +2285,7 @@ impl ApplicationHandler<UserEvent> for App {
         // and generated from assets/bayan.ico so the two can't drift apart.
         const ICON_RGBA: &[u8] = include_bytes!("../assets/icon_64.rgba");
         let icon = winit::window::Icon::from_rgba(ICON_RGBA.to_vec(), 64, 64).ok();
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             // M24: no OS title bar. The tab strip IS the title bar, so the
             // window carries one row of chrome instead of two. We draw the
             // caption buttons and handle drag/resize ourselves below.
@@ -2232,6 +2294,23 @@ impl ApplicationHandler<UserEvent> for App {
             .with_window_icon(icon)
             .with_visible(visible)
             .with_inner_size(LogicalSize::new(1100.0, 700.0));
+        // yesterday's rectangle, if it is still on a connected monitor
+        let monitors: Vec<(i32, i32, u32, u32)> = el
+            .available_monitors()
+            .map(|m| {
+                let (p, s) = (m.position(), m.size());
+                (p.x, p.y, s.width, s.height)
+            })
+            .collect();
+        if let Some(g) = load_saved_state().and_then(|s| s.window) {
+            if geometry_on_screen(g, &monitors) {
+                attrs = attrs
+                    .with_position(winit::dpi::PhysicalPosition::new(g.x, g.y))
+                    .with_inner_size(winit::dpi::PhysicalSize::new(g.w, g.h))
+                    .with_maximized(g.maximized);
+                self.normal_geom = Some(WindowGeom { maximized: false, ..g });
+            }
+        }
         let window = Arc::new(el.create_window(attrs).expect("create window"));
         crate::prof::mark("window created");
         let px = window.inner_size();
@@ -2568,10 +2647,12 @@ impl ApplicationHandler<UserEvent> for App {
                 // painting until RendererReady swaps it in and re-snaps the grid.
                 self.rebuild_renderer();
             }
+            WindowEvent::Moved(_) => self.track_geometry(),
             WindowEvent::Resized(px) => {
                 if px.width == 0 || px.height == 0 {
                     return;
                 }
+                self.track_geometry();
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.resize(px.width, px.height);
                 }
@@ -3104,6 +3185,7 @@ fn main() {
         font_delta: 0.0,
         renderer_building: false,
         inflight_delta: 0.0,
+        normal_geom: None,
     };
     event_loop.run_app(&mut app).expect("run event loop");
 }
@@ -3175,6 +3257,26 @@ mod tests {
     }
 
     #[test]
+    fn window_geometry_restores_only_onto_a_live_monitor() {
+        let primary = (0, 0, 2560u32, 1440u32);
+        let second = (2560, 0, 1920u32, 1080u32);
+        let g = |x, y| WindowGeom { x, y, w: 1100, h: 700, maximized: false };
+        assert!(geometry_on_screen(g(100, 100), &[primary]));
+        // on the second monitor: fine while it is connected, not after
+        assert!(geometry_on_screen(g(3000, 200), &[primary, second]));
+        assert!(!geometry_on_screen(g(3000, 200), &[primary]));
+        // mostly off the right edge, but 160px of the grab strip still reaches in
+        assert!(geometry_on_screen(g(2400, 100), &[primary]));
+        // only 60px in: not enough to grab — treat as off-screen
+        assert!(!geometry_on_screen(g(2500, 100), &[primary]));
+        // above the top: the title strip is unreachable
+        assert!(!geometry_on_screen(g(100, -400), &[primary]));
+        // a degenerate size is not worth restoring
+        assert!(!geometry_on_screen(WindowGeom { w: 10, h: 10, ..g(0, 0) }, &[primary]));
+        assert!(!geometry_on_screen(g(0, 0), &[]));
+    }
+
+    #[test]
     fn saved_state_round_trips_with_layout() {
         let s = SavedState {
             tabs: vec![SavedTab {
@@ -3184,9 +3286,14 @@ mod tests {
                 focused: 1,
             }],
             active: 0,
+            window: Some(WindowGeom { x: 40, y: 60, w: 1280, h: 800, maximized: true }),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back = parse_state(&json).unwrap();
+        assert_eq!(back.window, s.window, "geometry survives the round trip");
+        // a pre-M32 file has no window field and must still parse
+        let old = r#"{"tabs":[{"cwds":[null]}],"active":0}"#;
+        assert_eq!(parse_state(old).unwrap().window, None);
         assert_eq!(back.tabs[0].cwds.len(), 2);
         assert_eq!(back.tabs[0].weights, vec![3.0, 1.0]);
         assert_eq!(back.tabs[0].orientation, 1);
