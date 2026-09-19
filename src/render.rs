@@ -660,6 +660,9 @@ pub struct PaneView<'a> {
     pub search_match: Option<&'a std::ops::RangeInclusive<alacritty_terminal::index::Point>>,
     /// Command blocks: (absolute prompt line, exit code) — gutter lights.
     pub marks: &'a [(usize, Option<i32>)],
+    /// A Ctrl-hovered link on this pane: (viewport row, col start, col end)
+    /// — drawn as an underline so the target is unmistakable before the click.
+    pub hover_link: Option<(usize, usize, usize)>,
 }
 
 // translucent overlays, EasyTer's colors: selection blue, search amber
@@ -1410,6 +1413,17 @@ impl Renderer {
                     let bh = ((self.cell_h * 0.1).round() as i32).max(2);
                     push_rect(out, clip, x0, y0 + hpx - bh, wpx, bh, c4(self.fg, 230));
                 }
+            }
+        }
+
+        // the Ctrl-hovered link: an accent underline across its cells
+        if let Some((row, c0, c1)) = view.hover_link {
+            if row < rows && c1 > c0 {
+                let th = (self.cell_h / 14.0).max(1.0) as i32;
+                let x0 = px + (c0 as f32 * self.cell_w).round() as i32;
+                let x1 = px + (c1 as f32 * self.cell_w).round() as i32;
+                let uy = py + ((row + 1) as f32 * self.cell_h).round() as i32 - th - 1;
+                push_rect(out, clip, x0, uy, x1 - x0, th, c4(self.palette[4], 255));
             }
         }
 
@@ -2952,6 +2966,7 @@ mod cache_tests {
                 claude: false,
                 search_match: None,
                 marks: &[],
+                hover_link: None,
             };
             // an underline is a solid quad (page 0, white texel) th px tall
             let th = (r.cell_h / 14.0).max(1.0) as i32;

@@ -8,6 +8,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod bidi;
+mod links;
 mod plugins;
 mod posh;
 mod shells;
@@ -483,6 +484,8 @@ struct PoshPicker {
 struct App {
     /// the prompt picker, when open
     posh: Option<PoshPicker>,
+    /// the link under the pointer while Ctrl is held: (pane, row, c0, c1, target)
+    hover_link: Option<(usize, usize, usize, usize, String)>,
     /// the command palette, when open
     palette: Option<Palette>,
     /// last click on the empty title strip — powers double-click-to-maximise
@@ -1723,6 +1726,68 @@ impl App {
             .unwrap_or((1, 1))
     }
 
+    /// The text of viewport row `row` in pane `pi`, one char per grid
+    /// column (a wide char's spacer becomes a space), so a char index IS a
+    /// column and link spans map straight onto cells.
+    fn row_text(&self, pi: usize, row: usize) -> Option<String> {
+        let t = self.tabs.get(self.active)?;
+        let pane = t.panes.get(pi)?;
+        let term = pane.session.term.lock().unwrap();
+        let off = term.grid().display_offset() as i32;
+        let line = Line(row as i32 - off);
+        if line.0 < -(term.grid().history_size() as i32) || line.0 >= term.screen_lines() as i32 {
+            return None;
+        }
+        let cols = term.columns();
+        let grid_row = &term.grid()[line];
+        let mut s = String::with_capacity(cols);
+        for c in 0..cols {
+            let cell = &grid_row[Column(c)];
+            let ch = cell.c;
+            s.push(if ch == '\0' { ' ' } else { ch });
+        }
+        Some(s)
+    }
+
+    /// The link under the pointer, resolved: URLs as written, paths only
+    /// when the file exists (relative ones against the pane's cwd).
+    fn link_under(&self, pos: PhysicalPosition<f64>) -> Option<(usize, usize, usize, usize, String)> {
+        let (pi, row, col, _) = self.pane_cell_at(pos)?;
+        let text = self.row_text(pi, row)?;
+        let (c0, c1, link) = links::link_at(&text, col)?;
+        let target = match link {
+            links::Link::Url(u) => u,
+            links::Link::Path(p) => {
+                let cwd = self.tabs[self.active].panes[pi].session.meta.lock().unwrap().cwd.clone();
+                links::resolve_path(&p, cwd.as_deref())?.to_string_lossy().into_owned()
+            }
+        };
+        Some((pi, row, c0, c1, target))
+    }
+
+    /// Re-evaluate the Ctrl-hover link for the current pointer (called on
+    /// pointer moves and on Ctrl press/release) — redraws when it changes.
+    fn refresh_hover_link(&mut self) {
+        let next = if self.modifiers.control_key() && !self.mouse_left_down {
+            self.link_under(self.cursor_pos)
+        } else {
+            None
+        };
+        let changed = next.as_ref().map(|l| (l.0, l.1, l.2, l.3))
+            != self.hover_link.as_ref().map(|l| (l.0, l.1, l.2, l.3));
+        self.hover_link = next;
+        if changed {
+            if let Some(w) = &self.window {
+                w.set_cursor(if self.hover_link.is_some() {
+                    winit::window::CursorIcon::Pointer
+                } else {
+                    winit::window::CursorIcon::Default
+                });
+            }
+            self.request_redraw();
+        }
+    }
+
     fn has_selection(&self) -> bool {
         self.session().is_some_and(|s| {
             s.term
@@ -1985,6 +2050,11 @@ impl App {
                             None
                         },
                         marks: &marks,
+                        hover_link: self
+                            .hover_link
+                            .as_ref()
+                            .filter(|l| l.0 == pi)
+                            .map(|l| (l.1, l.2, l.3)),
                     };
                     renderer.draw_pane(&mut verts, &view, &t);
                 }
@@ -2488,7 +2558,10 @@ impl ApplicationHandler<UserEvent> for App {
                     s.write(arg.as_bytes());
                 }
             }
-            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            WindowEvent::ModifiersChanged(m) => {
+                self.modifiers = m.state();
+                self.refresh_hover_link(); // Ctrl down/up shows/hides link underlines
+            }
             WindowEvent::ScaleFactorChanged { .. } => {
                 // HiDPI: the window moved to a monitor with another scale.
                 // Rebuild cell metrics off-thread; the current renderer keeps
@@ -2526,6 +2599,9 @@ impl ApplicationHandler<UserEvent> for App {
                             self.request_redraw();
                         }
                     }
+                } else if self.modifiers.control_key() {
+                    // Ctrl held: a link under the pointer gets the hand + underline
+                    self.refresh_hover_link();
                 } else if let Some(w) = &self.window {
                     // hovering a divider shows the resize cursor
                     use winit::window::CursorIcon;
@@ -2624,6 +2700,16 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         self.request_redraw();
                         return;
+                    }
+                    // Ctrl+click on a link opens it (browser / associated app)
+                    // instead of starting a selection
+                    if self.modifiers.control_key() {
+                        if let Some((_, _, _, _, target)) = self.link_under(self.cursor_pos) {
+                            if !links::open_external(&target) {
+                                eprintln!("bayan: could not open {target}");
+                            }
+                            return;
+                        }
                     }
                     // grabbing a divider starts a resize drag
                     if let Some(i) = self.divider_at(self.cursor_pos) {
@@ -2978,6 +3064,7 @@ fn main() {
     let keymap = keybinds::effective_map(&cfg);
     let mut app = App {
         posh: None,
+        hover_link: None,
         palette: None,
         last_strip_click: None,
         proxy,
