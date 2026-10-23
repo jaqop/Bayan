@@ -225,22 +225,33 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       OSC 133 marks and Arabic shaping unchanged. Left honest: the toast path
       (Shell_NotifyIcon, the biggest windows-sys consumer) compiles and the app
       runs, but a balloon was not caught on camera — quiet hours file it to the
-      Action Center —       so that one is built-and-running, not eyeball-verified
+      Action Center — so that one is built-and-running, not eyeball-verified
 - [x] **M30** — mouse reporting. Clicks, drags and motion reach the program
       when it asks: xterm 1000 (press/release), 1002 (drag), 1003 (any
       motion), encoded as SGR 1006 or the legacy X10 byte form when 1006
-      is off. Coordinates are the pane's cells — padding and split gaps
+      is off. X10 stops at coordinate 95: the wire byte is that plus 32,
+      and ConPTY's UTF-8 pipe turns 0x80 and above into U+FFFD. Mode 1005
+      is not encoded (no silent X10 fallback). Buttons numbered 128 and
+      up, and the horizontal wheel, are not reported. Coordinates are the
+      pane's cells — padding and split gaps
       are not cells, and a click in the second pane is that pane's column
       0. On a row Bayan reorders (the whole-line BiDi path), the column is
       the glyph under the pointer, not `x / cell_w`: the left of مرحبا is
       the last logical cell, and ١٧٥ is not mirrored. Claude rows go
       through the same restoration as the painter, then the index map
       points the glyph back at the grid column Claude stored. Shift+drag
-      stays a local selection. Mode 1004 sends CSI I / CSI O when the
-      window or the focused pane changes, including the moment the program
-      turns the mode on. The wheel still scrolls the pane under the
-      pointer; Ctrl+wheel is still font zoom. Proven: 93 unit tests (81
-      before), including the encoder, the padding/split hit-test, and a
+      stays a local selection, and Shift+wheel scrolls that pane's own
+      history even on the alt screen. A focus loss, a tab switch, or a
+      pane close releases a tracked button (or drops the grab if tracking
+      is already off) so Alt+Tab cannot keep dragging. Mode 1004 sends
+      CSI I / CSI O from `Window::has_focus` when the window or the
+      focused pane changes, including the moment the program turns the
+      mode on, and a RIS forgets the last CSI I so the next one is sent
+      again. The wheel still scrolls the pane under the pointer and is
+      not reported at all over the tab bar or the padding; Ctrl+wheel is
+      still font zoom. Proven: 101 unit tests (81
+      before), including the encoder, the padding/split hit-test, the
+      grab/focus/wheel router, and a
       shaped-Amiri hit on مرحبا and ١٧٥. Not proven here: a live htop /
       vim `mouse=a` / lazygit / Claude Code session — this tree doesn't
       run a window on the machine that built it. Windows CI is the build

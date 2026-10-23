@@ -3,13 +3,18 @@
 //! xterm's tracking modes are mutually exclusive in alacritty_terminal
 //! (setting one clears the others): 1000 is clicks, 1002 is clicks plus
 //! motion while a button is held, 1003 is clicks plus every motion.
-//! 1006 selects SGR encoding; without it the bytes are the legacy X10
-//! form, which only fits coordinates 1..=223. 1004 is independent: the
-//! focused pane hears CSI I, the one that lost focus hears CSI O.
+//! 1006 selects SGR encoding. Without it the bytes are the legacy X10
+//! form, which only fits coordinates and button codes 1..=95: the wire
+//! byte is that value plus 32, and ConPTY's UTF-8 pipe turns 0x80 and
+//! above into U+FFFD, so the historical 223 cap lands on the wrong cell.
+//! Mode 1005 (UTF-8 coordinates) is not encoded — silence, never a
+//! fallback to X10. 1004 is independent: the focused pane hears CSI I,
+//! the one that lost focus hears CSI O.
 //!
-//! Shift bypasses all of it. The terminal keeps the gesture for its own
-//! selection (and its own scroll), which is how a mouse-aware TUI stays
-//! copyable.
+//! Shift bypasses all of it, including the wheel on the alt screen: the
+//! terminal keeps the gesture for its own selection and its own
+//! scrollback. Buttons past the three primaries (codes >= 128) and the
+//! horizontal wheel are not reported.
 
 use alacritty_terminal::term::TermMode;
 
@@ -49,8 +54,10 @@ pub struct Proto {
     pub drag: bool,
     /// 1003 SET_ANY_EVENT_MOUSE — motion with no button too.
     pub motion: bool,
-    /// 1006 SGR encoding. Off means X10.
+    /// 1006 SGR encoding.
     pub sgr: bool,
+    /// 1005 UTF-8 coordinates. Not encoded; must not fall through to X10.
+    pub utf8: bool,
     /// 1004 focus in/out.
     pub focus: bool,
 }
@@ -70,7 +77,20 @@ impl Proto {
             drag: mode.contains(TermMode::MOUSE_DRAG),
             motion: mode.contains(TermMode::MOUSE_MOTION),
             sgr: mode.contains(TermMode::SGR_MOUSE),
+            utf8: mode.contains(TermMode::UTF8_MOUSE),
             focus: mode.contains(TermMode::FOCUS_IN_OUT),
+        }
+    }
+
+    /// Which bytes `encode` may emit. SGR wins if both encoding flags are
+    /// set; 1005 is its own case so a caller cannot treat it as X10.
+    pub fn wire(&self) -> Wire {
+        if self.sgr {
+            Wire::Sgr
+        } else if self.utf8 {
+            Wire::Utf8
+        } else {
+            Wire::X10
         }
     }
 
@@ -138,10 +158,41 @@ fn with_mods(code: u16, mods: Mods) -> u16 {
     c
 }
 
+/// How a report is framed. `Utf8` is mode 1005: [`encode_wire`] returns
+/// `None` rather than inventing an X10 report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wire {
+    Sgr,
+    X10,
+    Utf8,
+}
+
+/// Largest X10 coordinate or button code. The wire byte is this plus 32,
+/// which keeps it in 7-bit ASCII. Past that, ConPTY's UTF-8 input turns
+/// the byte into U+FFFD and the program reads a different cell.
+const X10_MAX: u16 = 95;
+
+/// One report for `proto`'s encoding. Mode 1005 yields `None`.
+pub fn encode_wire(
+    wire: Wire,
+    phase: Phase,
+    button: Btn,
+    col: usize,
+    row: usize,
+    mods: Mods,
+) -> Option<Vec<u8>> {
+    match wire {
+        Wire::Sgr => encode(true, phase, button, col, row, mods),
+        Wire::X10 => encode(false, phase, button, col, row, mods),
+        Wire::Utf8 => None,
+    }
+}
+
 /// One report. `col` and `row` are 1-based, matching what the program
 /// counts. `None` when the event has no encoding (a wheel release, or an
-/// X10 coordinate past 223 — a byte can't hold it, and clamping would
-/// land the click on the wrong cell).
+/// X10 value past [`X10_MAX`] — clamping would land the click on the
+/// wrong cell). This is the SGR/X10 encoder; mode 1005 goes through
+/// [`encode_wire`] and does not arrive here.
 pub fn encode(
     sgr: bool,
     phase: Phase,
@@ -164,7 +215,7 @@ pub fn encode(
         } else {
             code
         };
-        if col > 223 || row > 223 || x10 > 223 {
+        if col > X10_MAX as usize || row > X10_MAX as usize || x10 > X10_MAX {
             return None;
         }
         Some(vec![
@@ -259,9 +310,9 @@ pub fn col_for_byte(spans: &[(usize, usize, usize)], byte: usize) -> Option<usiz
         .map(|&(_, _, c)| c)
 }
 
-/// Glyph spans → boxes in pane-local pixels. A glyph that covers two
-/// columns is split at its midpoint; an RTL glyph's left half is the
-/// higher logical column (the end of its byte range).
+/// Glyph spans → boxes in pane-local pixels. A glyph that covers N
+/// columns is split into N equal slices; an RTL glyph's leftmost slice
+/// is the highest logical column (the end of its byte range).
 pub fn boxes_for_glyphs(
     glyphs: &[GlyphSpan],
     scale: f32,
@@ -284,30 +335,19 @@ pub fn boxes_for_glyphs(
             continue;
         };
         let c_end = col_for_byte(g.end.saturating_sub(1)).unwrap_or(c_start);
-        if c_start == c_end {
-            out.push(GlyphBox {
-                x0,
-                x1,
-                col: c_start,
-            });
-            continue;
-        }
-        let (left, right) = if g.rtl {
-            (c_end, c_start)
-        } else {
+        let (lo, hi) = if c_start <= c_end {
             (c_start, c_end)
+        } else {
+            (c_end, c_start)
         };
-        let mid = (x0 + x1) * 0.5;
-        out.push(GlyphBox {
-            x0,
-            x1: mid,
-            col: left,
-        });
-        out.push(GlyphBox {
-            x0: mid,
-            x1,
-            col: right,
-        });
+        let n = hi - lo + 1;
+        let width = x1 - x0;
+        for i in 0..n {
+            let col = if g.rtl { hi - i } else { lo + i };
+            let a = x0 + width * (i as f32) / (n as f32);
+            let b = x0 + width * ((i + 1) as f32) / (n as f32);
+            out.push(GlyphBox { x0: a, x1: b, col });
+        }
     }
     out
 }
@@ -373,6 +413,364 @@ pub fn column_for_click(
         );
     }
     clamp(nearest_col(boxes, x).unwrap_or(fallback))
+}
+
+/// One pane's mouse-relevant mode, for wheel routing.
+#[derive(Clone, Copy, Debug)]
+pub struct View {
+    pub id: u64,
+    pub proto: Proto,
+    pub alt_screen: bool,
+    pub app_cursor: bool,
+}
+
+/// A grid cell the pointer is actually over. Absent means the tab bar,
+/// the padding, or a split gap — not cell 1;1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cell {
+    pub pane: u64,
+    pub row: usize,
+    pub col: usize,
+}
+
+/// Bytes the router wants written to one pane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Out {
+    pub pane: u64,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Grab {
+    pane_id: u64,
+    /// bit 0 left, bit 1 middle, bit 2 right
+    down: u8,
+}
+
+fn button_bit(button: Btn) -> u8 {
+    match button {
+        Btn::Left => 1,
+        Btn::Middle => 2,
+        Btn::Right => 4,
+        _ => 0,
+    }
+}
+
+fn grab_button(down: u8) -> Btn {
+    if down & 1 != 0 {
+        Btn::Left
+    } else if down & 2 != 0 {
+        Btn::Middle
+    } else {
+        Btn::Right
+    }
+}
+
+/// What a button-up did with a grab.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Take {
+    /// This button was not one we reported.
+    Ignore,
+    /// We owned it. `None` when tracking is already off, or the wire
+    /// cannot carry the release (mode 1005, X10 past 95): the grab is
+    /// still dropped, and no release byte is written.
+    Consumed(Option<Out>),
+}
+
+/// Where a wheel notch goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Wheel {
+    Report { pane: u64, bytes: Vec<u8> },
+    Arrows { pane: u64, bytes: Vec<u8> },
+    Scroll { pane: u64, lines: i32 },
+}
+
+/// Grab, motion dedupe, per-pane wheel choice, and which pane was told
+/// it has focus. The window asks this instead of keeping the rules in
+/// the event match, so a focus loss can be tested without a window.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Route {
+    grab: Option<Grab>,
+    last: Option<(u64, usize, usize)>,
+    focus_sent: Option<u64>,
+    /// Local selection drag. Cleared with the grab so Alt+Tab cannot
+    /// keep painting a selection in a pane the pointer has left.
+    pub selecting: bool,
+}
+
+impl Route {
+    pub fn grabbed_pane(&self) -> Option<u64> {
+        self.grab.map(|g| g.pane_id)
+    }
+
+    pub fn focus_sent(&self) -> Option<u64> {
+        self.focus_sent
+    }
+
+    /// A press the program should hear. `Pass`-equivalent is `None`:
+    /// Shift, or tracking off, and nothing is grabbed. `Some(None)` is
+    /// mode 1005: the gesture is ours, but there is no wire form.
+    pub fn press(
+        &mut self,
+        cell: Cell,
+        button: Btn,
+        proto: Proto,
+        mods: Mods,
+    ) -> Option<Option<Out>> {
+        if !proto.wants(What::Click, mods.shift) {
+            return None;
+        }
+        let bit = button_bit(button);
+        if self.grab.as_ref().is_some_and(|g| g.pane_id == cell.pane) {
+            if let Some(g) = self.grab.as_mut() {
+                g.down |= bit;
+            }
+        } else {
+            self.grab = Some(Grab {
+                pane_id: cell.pane,
+                down: bit,
+            });
+        }
+        self.last = Some((cell.pane, cell.row, cell.col));
+        Some(self.report(
+            cell.pane,
+            Phase::Press,
+            button,
+            (cell.row, cell.col),
+            proto,
+            mods,
+        ))
+    }
+
+    /// Button up for a press we reported. Tracking that has since turned
+    /// off consumes the grab and writes nothing.
+    pub fn release(&mut self, button: Btn, cell: Option<Cell>, proto: Proto, mods: Mods) -> Take {
+        let bit = button_bit(button);
+        let Some(grab) = self.grab else {
+            return Take::Ignore;
+        };
+        if bit == 0 || grab.down & bit == 0 {
+            return Take::Ignore;
+        }
+        let pane = grab.pane_id;
+        let down = grab.down & !bit;
+        if down == 0 {
+            self.grab = None;
+            self.last = None;
+        } else if let Some(g) = self.grab.as_mut() {
+            g.down = down;
+        }
+        if !proto.tracking() {
+            return Take::Consumed(None);
+        }
+        let Some(cell) = cell else {
+            return Take::Consumed(None);
+        };
+        Take::Consumed(self.report(
+            pane,
+            Phase::Release,
+            button,
+            (cell.row, cell.col),
+            proto,
+            mods,
+        ))
+    }
+
+    /// Motion while a reported button is held (1002/1003). Same cell
+    /// twice produces one report.
+    pub fn drag(&mut self, cell: Cell, proto: Proto, mods: Mods) -> Option<Out> {
+        let button = grab_button(self.grab?.down);
+        self.moved(cell, button, What::Drag, proto, mods)
+    }
+
+    /// Motion with no button (1003). Same cell twice produces one report.
+    pub fn motion(&mut self, cell: Cell, proto: Proto, mods: Mods) -> Option<Out> {
+        self.moved(cell, Btn::None, What::Motion, proto, mods)
+    }
+
+    fn moved(
+        &mut self,
+        cell: Cell,
+        button: Btn,
+        what: What,
+        proto: Proto,
+        mods: Mods,
+    ) -> Option<Out> {
+        if !proto.wants(what, mods.shift) {
+            return None;
+        }
+        if self.last == Some((cell.pane, cell.row, cell.col)) {
+            return None;
+        }
+        self.last = Some((cell.pane, cell.row, cell.col));
+        self.report(
+            cell.pane,
+            Phase::Move,
+            button,
+            (cell.row, cell.col),
+            proto,
+            mods,
+        )
+    }
+
+    /// Focus loss, tab switch, or pane close. A still-tracking program
+    /// hears a release at the last cell; either way the grab, the last
+    /// cell, and the local selection drag are cleared.
+    pub fn abandon(&mut self, proto: Proto, mods: Mods) -> Vec<Out> {
+        let grab = self.grab.take();
+        let last = self.last.take();
+        self.selecting = false;
+        let Some(grab) = grab else {
+            return Vec::new();
+        };
+        if !proto.tracking() {
+            return Vec::new();
+        }
+        let Some((_, row, col)) = last else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for button in [Btn::Left, Btn::Middle, Btn::Right] {
+            if grab.down & button_bit(button) == 0 {
+                continue;
+            }
+            if let Some(bytes) = self.report(
+                grab.pane_id,
+                Phase::Release,
+                button,
+                (row, col),
+                proto,
+                mods,
+            ) {
+                out.push(bytes);
+            }
+        }
+        out
+    }
+
+    /// RIS forgot the program's idea of focus. The next [`Self::apply_focus`]
+    /// sends the current state again, including CSI I when 1004 comes back
+    /// in the same chunk.
+    pub fn note_ris(&mut self, pane: u64) {
+        if self.focus_sent == Some(pane) {
+            self.focus_sent = None;
+        }
+    }
+
+    /// Test entry. The window calls [`Self::apply_focus`] after it has
+    /// read each pane's mode, so this predicate form stays out of the
+    /// binary.
+    #[cfg(test)]
+    pub fn sync_focus(
+        &mut self,
+        window_focused: bool,
+        focused_pane: Option<u64>,
+        mut wants: impl FnMut(u64) -> bool,
+    ) -> Vec<Out> {
+        let new_reports = focused_pane.is_some_and(&mut wants);
+        let old_reports = self.focus_sent.is_some_and(wants);
+        self.apply_focus(window_focused, focused_pane, new_reports, old_reports)
+    }
+
+    pub fn apply_focus(
+        &mut self,
+        window_focused: bool,
+        focused_pane: Option<u64>,
+        new_reports: bool,
+        old_reports: bool,
+    ) -> Vec<Out> {
+        let want = if window_focused && new_reports {
+            focused_pane
+        } else {
+            None
+        };
+        if want == self.focus_sent {
+            return Vec::new();
+        }
+        let old = self.focus_sent;
+        self.focus_sent = want;
+        let mut out = Vec::new();
+        if let Some(old) = old {
+            if old_reports {
+                out.push(Out {
+                    pane: old,
+                    bytes: focus_seq(false).to_vec(),
+                });
+            }
+        }
+        if let Some(id) = want {
+            out.push(Out {
+                pane: id,
+                bytes: focus_seq(true).to_vec(),
+            });
+        }
+        out
+    }
+
+    /// Wheel notch. `at` is the cell under the pointer; `None` is outside
+    /// every pane grid, and a tracking program does not hear cell 1;1.
+    /// Shift scrolls that pane's history even on the alt screen.
+    /// `view` describes the pane that owns the gesture: the one under the
+    /// pointer when `at` is `Some`, otherwise the focused pane.
+    pub fn wheel(at: Option<Cell>, view: View, n: i32, mods: Mods) -> Option<Wheel> {
+        if n == 0 {
+            return None;
+        }
+        let pane = at.map(|c| c.pane).unwrap_or(view.id);
+        if mods.shift {
+            return Some(Wheel::Scroll { pane, lines: n });
+        }
+        if view.proto.wants(What::Wheel, false) {
+            let cell = at?;
+            let button = if n > 0 { Btn::WheelUp } else { Btn::WheelDown };
+            let report_mods = Mods {
+                shift: false,
+                alt: mods.alt,
+                ctrl: false,
+            };
+            let seq = encode_wire(
+                view.proto.wire(),
+                Phase::Press,
+                button,
+                cell.col + 1,
+                cell.row + 1,
+                report_mods,
+            )?;
+            let mut bytes = Vec::with_capacity(seq.len() * n.unsigned_abs() as usize);
+            for _ in 0..n.unsigned_abs() {
+                bytes.extend_from_slice(&seq);
+            }
+            return Some(Wheel::Report {
+                pane: cell.pane,
+                bytes,
+            });
+        }
+        if view.alt_screen {
+            let ch = if n > 0 { b'A' } else { b'B' };
+            let prefix: &[u8] = if view.app_cursor { b"\x1bO" } else { b"\x1b[" };
+            let mut bytes = Vec::new();
+            for _ in 0..n.unsigned_abs() {
+                bytes.extend_from_slice(prefix);
+                bytes.push(ch);
+            }
+            return Some(Wheel::Arrows { pane, bytes });
+        }
+        Some(Wheel::Scroll { pane, lines: n })
+    }
+
+    fn report(
+        &self,
+        pane: u64,
+        phase: Phase,
+        button: Btn,
+        at: (usize, usize),
+        proto: Proto,
+        mods: Mods,
+    ) -> Option<Out> {
+        let (row, col) = at;
+        encode_wire(proto.wire(), phase, button, col + 1, row + 1, mods)
+            .map(|bytes| Out { pane, bytes })
+    }
 }
 
 #[cfg(test)]
@@ -452,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn x10_is_the_legacy_fallback_and_stops_at_223() {
+    fn x10_is_the_legacy_fallback_and_stops_at_95() {
         let m = Mods::default();
         // Cb/Cx/Cy = value + 32. Column 1 row 1 left press → bytes 32, 33, 33.
         assert_eq!(
@@ -482,10 +880,32 @@ mod tests {
             encode(false, Phase::Move, Btn::None, 1, 1, m).unwrap(),
             vec![0x1b, b'[', b'M', 67, 33, 33]
         );
-        // 223 fits (byte 255); 224 does not, and we refuse rather than lie
-        assert!(encode(false, Phase::Press, Btn::Left, 223, 1, m).is_some());
-        assert!(encode(false, Phase::Press, Btn::Left, 224, 1, m).is_none());
-        assert!(encode(false, Phase::Press, Btn::Left, 1, 224, m).is_none());
+        // 95 is byte 127, the last value ConPTY's UTF-8 pipe will not
+        // replace. 96 would be 0x80 and must be dropped, not clamped.
+        assert!(encode(false, Phase::Press, Btn::Left, 95, 1, m).is_some());
+        assert!(encode(false, Phase::Press, Btn::Left, 96, 1, m).is_none());
+        assert!(encode(false, Phase::Press, Btn::Left, 1, 96, m).is_none());
+        assert!(encode(false, Phase::Press, Btn::Left, 223, 1, m).is_none());
+    }
+
+    #[test]
+    fn utf8_mouse_is_not_silently_x10() {
+        let utf8 = Proto::from_mode(TermMode::UTF8_MOUSE | TermMode::MOUSE_REPORT_CLICK);
+        assert!(utf8.utf8 && !utf8.sgr);
+        assert_eq!(utf8.wire(), Wire::Utf8);
+        assert!(encode_wire(Wire::Utf8, Phase::Press, Btn::Left, 1, 1, Mods::default()).is_none());
+        // a tracking press is still ours, it just has no bytes
+        let mut route = Route::default();
+        let cell = Cell {
+            pane: 1,
+            row: 0,
+            col: 0,
+        };
+        assert_eq!(
+            route.press(cell, Btn::Left, utf8, Mods::default()),
+            Some(None)
+        );
+        assert_eq!(route.grabbed_pane(), Some(1));
     }
 
     #[test]
@@ -663,5 +1083,199 @@ mod tests {
         let boxes = boxes_for_glyphs(&rtl, 1.0, |b| col_for_byte(&spans, b));
         assert_eq!(boxes[0].col, 1);
         assert_eq!(boxes[1].col, 0);
+        // three columns, equal slices, not a pair of halves
+        let wide = [(0usize, 1, 0), (1, 2, 1), (2, 3, 2)];
+        let glyph = [GlyphSpan {
+            x: 0.0,
+            w: 30.0,
+            start: 0,
+            end: 3,
+            rtl: false,
+        }];
+        let boxes = boxes_for_glyphs(&glyph, 1.0, |b| col_for_byte(&wide, b));
+        assert_eq!(
+            boxes,
+            vec![
+                GlyphBox {
+                    x0: 0.0,
+                    x1: 10.0,
+                    col: 0
+                },
+                GlyphBox {
+                    x0: 10.0,
+                    x1: 20.0,
+                    col: 1
+                },
+                GlyphBox {
+                    x0: 20.0,
+                    x1: 30.0,
+                    col: 2
+                },
+            ]
+        );
+    }
+
+    fn click_proto() -> Proto {
+        Proto::from_mode(TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE)
+    }
+
+    #[test]
+    fn focus_loss_releases_a_held_button() {
+        let mut route = Route::default();
+        let cell = Cell {
+            pane: 7,
+            row: 2,
+            col: 3,
+        };
+        let proto = click_proto();
+        let sent = route
+            .press(cell, Btn::Left, proto, Mods::default())
+            .unwrap();
+        assert_eq!(sent.unwrap().bytes, b"\x1b[<0;4;3M");
+        route.selecting = true;
+        let out = route.abandon(proto, Mods::default());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].pane, 7);
+        assert_eq!(out[0].bytes, b"\x1b[<0;4;3m");
+        assert_eq!(route.grabbed_pane(), None);
+        assert!(!route.selecting);
+        // a second loss has nothing left to release
+        assert!(route.abandon(proto, Mods::default()).is_empty());
+    }
+
+    #[test]
+    fn release_after_tracking_off_writes_nothing() {
+        let mut route = Route::default();
+        let cell = Cell {
+            pane: 3,
+            row: 0,
+            col: 1,
+        };
+        let proto = click_proto();
+        assert!(route
+            .press(cell, Btn::Left, proto, Mods::default())
+            .unwrap()
+            .is_some());
+        let off = Proto::default();
+        assert!(!off.tracking());
+        assert_eq!(
+            route.release(Btn::Left, Some(cell), off, Mods::default()),
+            Take::Consumed(None)
+        );
+        assert_eq!(route.grabbed_pane(), None);
+        // the same press, then focus loss after the program left mouse mode
+        assert!(route
+            .press(cell, Btn::Left, proto, Mods::default())
+            .unwrap()
+            .is_some());
+        assert!(route.abandon(off, Mods::default()).is_empty());
+        assert_eq!(route.grabbed_pane(), None);
+    }
+
+    #[test]
+    fn motion_to_the_same_cell_is_reported_once() {
+        let mut route = Route::default();
+        let proto = Proto::from_mode(TermMode::MOUSE_MOTION | TermMode::SGR_MOUSE);
+        let a = Cell {
+            pane: 1,
+            row: 0,
+            col: 0,
+        };
+        let b = Cell {
+            pane: 1,
+            row: 0,
+            col: 2,
+        };
+        assert!(route.motion(a, proto, Mods::default()).is_some());
+        assert!(route.motion(a, proto, Mods::default()).is_none());
+        assert!(route.motion(b, proto, Mods::default()).is_some());
+        // 1002 drag: the second visit to a cell is quiet too
+        let drag = Proto::from_mode(TermMode::MOUSE_DRAG | TermMode::SGR_MOUSE);
+        route.press(a, Btn::Left, drag, Mods::default());
+        assert!(route.drag(b, drag, Mods::default()).is_some());
+        assert!(route.drag(b, drag, Mods::default()).is_none());
+    }
+
+    #[test]
+    fn wheel_outside_the_grid_is_not_a_cell() {
+        let tracking = View {
+            id: 4,
+            proto: click_proto(),
+            alt_screen: true,
+            app_cursor: false,
+        };
+        // tab bar / padding: do not invent column 1 row 1
+        assert!(Route::wheel(None, tracking, 1, Mods::default()).is_none());
+        let under = Cell {
+            pane: 9,
+            row: 3,
+            col: 5,
+        };
+        let hit = View { id: 9, ..tracking };
+        match Route::wheel(Some(under), hit, 2, Mods::default()) {
+            Some(Wheel::Report { pane, bytes }) => {
+                assert_eq!(pane, 9);
+                assert_eq!(bytes, b"\x1b[<64;6;4M\x1b[<64;6;4M");
+            }
+            other => panic!("expected a report to pane 9, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shift_wheel_on_the_alt_screen_scrolls_locally() {
+        let view = View {
+            id: 2,
+            proto: click_proto(),
+            alt_screen: true,
+            app_cursor: true,
+        };
+        let cell = Cell {
+            pane: 2,
+            row: 1,
+            col: 1,
+        };
+        assert_eq!(
+            Route::wheel(
+                Some(cell),
+                view,
+                -3,
+                Mods {
+                    shift: true,
+                    ..Mods::default()
+                }
+            ),
+            Some(Wheel::Scroll { pane: 2, lines: -3 })
+        );
+        // without Shift, and without tracking, the alt screen still gets arrows
+        let plain = View {
+            proto: Proto::from_mode(TermMode::ALT_SCREEN),
+            ..view
+        };
+        match Route::wheel(Some(cell), plain, 1, Mods::default()) {
+            Some(Wheel::Arrows { pane, bytes }) => {
+                assert_eq!(pane, 2);
+                assert_eq!(bytes, b"\x1bOA");
+            }
+            other => panic!("expected arrows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_focus_uses_the_window_and_forgets_ris() {
+        let mut route = Route::default();
+        let wants = |id: u64| id == 1;
+        // an unfocused window (has_focus false, including startup before
+        // the first Focused event) does not announce
+        assert!(route.sync_focus(false, Some(1), wants).is_empty());
+        let on = route.sync_focus(true, Some(1), wants);
+        assert_eq!(on[0].bytes, b"\x1b[I");
+        assert!(route.sync_focus(true, Some(1), wants).is_empty());
+        // RIS clears the memory, so the same focused pane hears CSI I again
+        route.note_ris(1);
+        assert_eq!(route.focus_sent(), None);
+        let again = route.sync_focus(true, Some(1), wants);
+        assert_eq!(again[0].bytes, b"\x1b[I");
+        let off = route.sync_focus(false, Some(1), wants);
+        assert_eq!(off[0].bytes, b"\x1b[O");
     }
 }
