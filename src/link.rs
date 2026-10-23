@@ -18,11 +18,14 @@
 //! `{col}` are substituted after the template is split, so a path with
 //! spaces stays one argument and the string is never handed to a shell.
 //!
-//! Mouse tracking (PR #3) still owns a plain click. Ctrl+click is the
-//! link gesture even while tracking is on. Shift keeps the gesture for
-//! local selection, and it wins over Ctrl. Hit-testing uses the same
-//! visual-to-logical column map as mouse reporting: a link on an Arabic
-//! row is the cell under the glyph, not `x / cell_w`.
+//! Mouse tracking still owns a plain click. Ctrl+click is the link
+//! gesture even while tracking is on. Shift keeps the gesture for local
+//! selection, and it wins over Ctrl. An overlay (the refused-link card,
+//! the paste guard, settings, the cockpit) blocks the click entirely:
+//! the link underneath is not opened. Hit-testing uses the same
+//! visual-to-logical column map as [`crate::mouse::Route`]: a link on an
+//! Arabic row is the cell under the glyph, not `x / cell_w`. The window
+//! asks [`click_owner`] before [`crate::mouse::Route::press`].
 //!
 //! Relative file links resolve through [`cwd_hook`]. That reads the
 //! directory OSC 9;9 already stores on the pane. OSC 7 (PR5) should write
@@ -37,8 +40,8 @@ use alacritty_terminal::term::Term;
 /// Bytes, not characters. A link past this is refused whole.
 pub const MAX_TARGET: usize = 2048;
 
-/// Who handles a left click. Tracking, Shift and Ctrl are the whole policy;
-/// the window loop does not invent a fourth case.
+/// Who handles a left click. Overlay, tracking, Shift and Ctrl are the
+/// whole policy; the window loop does not invent another case.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClickOwner {
     /// Ctrl+click on a link. Not reported, and not a selection.
@@ -48,11 +51,24 @@ pub enum ClickOwner {
     /// Local selection. Shift always lands here, and so does a plain click
     /// when the program is not tracking the mouse.
     Local,
+    /// A card or panel is up. The click opens nothing and starts no drag.
+    Blocked,
 }
 
-/// `shift` wins, then Ctrl+click on a link, then the program, then selection.
-pub fn click_owner(tracking: bool, shift: bool, ctrl: bool, on_link: bool) -> ClickOwner {
-    if shift {
+/// `overlay` wins, then `shift`, then Ctrl+click on a link, then the
+/// program, then selection. `overlay` is the window's
+/// `overlay_blocks_mouse` (settings, cockpit, paste guard, close guard,
+/// refused-link card).
+pub fn click_owner(
+    overlay: bool,
+    tracking: bool,
+    shift: bool,
+    ctrl: bool,
+    on_link: bool,
+) -> ClickOwner {
+    if overlay {
+        ClickOwner::Blocked
+    } else if shift {
         ClickOwner::Local
     } else if ctrl && on_link {
         ClickOwner::Link
@@ -114,8 +130,12 @@ pub enum Action {
 pub enum LinkKind {
     /// OSC 8. `uri` is what the program attached, which may differ from
     /// the cells' text — the hover status shows `uri`.
-    Osc { uri: String },
-    Url { uri: String },
+    Osc {
+        uri: String,
+    },
+    Url {
+        uri: String,
+    },
     File {
         path: String,
         line: u32,
@@ -269,10 +289,7 @@ pub fn cwd_hook(reported: Option<&str>) -> Option<&str> {
 
 fn is_windows_abs(p: &str) -> bool {
     let b = p.as_bytes();
-    if b.len() >= 3
-        && b[0].is_ascii_alphabetic()
-        && b[1] == b':'
-        && (b[2] == b'\\' || b[2] == b'/')
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
     {
         return true;
     }
@@ -618,9 +635,8 @@ pub fn editor_command(argv: &[String]) -> Option<std::process::Command> {
 }
 
 pub fn spawn_editor(argv: &[String]) -> std::io::Result<()> {
-    let mut cmd = editor_command(argv).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "editor")
-    })?;
+    let mut cmd = editor_command(argv)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "editor"))?;
     cmd.spawn()?;
     Ok(())
 }
@@ -695,10 +711,7 @@ fn exe_near_cmd(cmd: &Path) -> Option<std::path::PathBuf> {
 /// Open `target` with the shell association. `target` is `lpFile` alone.
 /// `lpParameters` is null. This is not `cmd /c start`.
 pub fn shell_execute(target: &str) -> bool {
-    if target.is_empty()
-        || target.len() > MAX_TARGET
-        || target.chars().any(is_forbidden)
-    {
+    if target.is_empty() || target.len() > MAX_TARGET || target.chars().any(is_forbidden) {
         return false;
     }
     #[cfg(windows)]
@@ -1022,7 +1035,10 @@ fn is_path_char(c: char) -> bool {
     }
     if c.is_ascii() {
         c.is_ascii_alphanumeric()
-            || matches!(c, '_' | '-' | '.' | '+' | '/' | '\\' | '~' | '@' | '%' | '$')
+            || matches!(
+                c,
+                '_' | '-' | '.' | '+' | '/' | '\\' | '~' | '@' | '%' | '$'
+            )
     } else {
         c.is_alphanumeric()
     }
@@ -1052,9 +1068,7 @@ fn take_path(text: &str, chars: &[(usize, char)], end: usize) -> Option<(usize, 
         if ch == ':' {
             let letter_at = i.checked_sub(2);
             let letter_ok = letter_at.is_some_and(|at| chars[at].1.is_ascii_alphabetic());
-            let sep_ok = chars
-                .get(i)
-                .is_some_and(|c| c.1 == '\\' || c.1 == '/');
+            let sep_ok = chars.get(i).is_some_and(|c| c.1 == '\\' || c.1 == '/');
             let before_ok = match letter_at {
                 Some(0) => true,
                 Some(at) if at > 0 => !is_path_char(chars[at - 1].1),
@@ -1244,7 +1258,7 @@ mod tests {
         use alacritty_terminal::vte::ansi::Processor;
         let size = crate::term::TermSize { cols: 80, rows: 6 };
         let mut term = Term::new(Config::default(), &size, VoidListener);
-        let mut parser = Processor::new();
+        let mut parser: Processor = Processor::new();
         parser.advance(&mut term, bytes);
         links_on_row(&term, 0)
     }
@@ -1346,19 +1360,14 @@ mod tests {
         // No space: Arabic still bounds the URL, it is not a URL character.
         let glued = "انظرhttps://example.com/docsالآن";
         assert_eq!(urls_in(glued), vec!["https://example.com/docs".to_string()]);
-        assert!(!urls_in(glued)[0].chars().any(|c| !c.is_ascii()));
+        assert!(urls_in(glued)[0].is_ascii());
     }
 
     #[test]
     fn file_line_formats_for_rustc_gcc_msvc_and_grep() {
         assert_eq!(
             files_in("src/main.rs:10:5"),
-            vec![(
-                "src/main.rs".into(),
-                10,
-                Some(5),
-                "src/main.rs:10:5".into()
-            )]
+            vec![("src/main.rs".into(), 10, Some(5), "src/main.rs:10:5".into())]
         );
         assert_eq!(
             files_in("src/main.rs:10"),
@@ -1385,12 +1394,7 @@ mod tests {
         );
         assert_eq!(
             files_in(r"src\main.cpp(10): error"),
-            vec![(
-                r"src\main.cpp".into(),
-                10,
-                None,
-                r"src\main.cpp(10)".into()
-            )]
+            vec![(r"src\main.cpp".into(), 10, None, r"src\main.cpp(10)".into())]
         );
         assert_eq!(
             files_in(r"src\main.cpp(10, 5): error"),
@@ -1408,12 +1412,7 @@ mod tests {
         );
         assert_eq!(
             files_in("src/main.rs:10:4:match"),
-            vec![(
-                "src/main.rs".into(),
-                10,
-                Some(4),
-                "src/main.rs:10:4".into()
-            )]
+            vec![("src/main.rs".into(), 10, Some(4), "src/main.rs:10:4".into())]
         );
         assert_eq!(
             files_in("  --> src/lib.rs:20:1"),
@@ -1464,10 +1463,7 @@ mod tests {
                     shown,
                 } => {
                     assert!(!shown.contains('\u{202E}'), "{uri} -> {shown}");
-                    assert!(
-                        !shown.to_ascii_lowercase().contains("cmd /c"),
-                        "{shown}"
-                    );
+                    assert!(!shown.to_ascii_lowercase().contains("cmd /c"), "{shown}");
                 }
                 other => panic!("{uri} -> {other:?}"),
             }
@@ -1601,10 +1597,7 @@ mod tests {
             Some(3),
         )
         .unwrap();
-        assert_eq!(
-            argv[0],
-            r"C:\Program Files\Microsoft VS Code\Code.exe"
-        );
+        assert_eq!(argv[0], r"C:\Program Files\Microsoft VS Code\Code.exe");
         assert_eq!(argv[2], r"C:\src\my file.rs:12:3");
         let cmd = editor_command(&argv).unwrap();
         assert_eq!(
@@ -1614,18 +1607,17 @@ mod tests {
         assert_eq!(cmd.get_args().count(), 2);
 
         // No column: the colon that only introduced {col} is not left behind.
-        let argv = expand_editor(
-            "code -g {file}:{line}:{col}",
-            "a.rs",
-            Some(4),
-            None,
-        )
-        .unwrap();
+        let argv = expand_editor("code -g {file}:{line}:{col}", "a.rs", Some(4), None).unwrap();
         assert_eq!(argv[2], "a.rs:4");
 
         // A shell is not an editor, even written as an argument vector.
-        assert!(editor_command(&["cmd".into(), "/c".into(), "start".into(), "https://x".into()])
-            .is_none());
+        assert!(editor_command(&[
+            "cmd".into(),
+            "/c".into(),
+            "start".into(),
+            "https://x".into()
+        ])
+        .is_none());
         assert!(editor_command(&[
             r"C:\Windows\System32\cmd.exe".into(),
             "/c".into(),
@@ -1652,11 +1644,7 @@ mod tests {
 
         let spans = links_in_row(&row("src/main.rs:10:4"));
         assert_eq!(
-            spans[0].activate(
-                Some(r"C:\work"),
-                Some("code -g {file}:{line}:{col}"),
-                None
-            ),
+            spans[0].activate(Some(r"C:\work"), Some("code -g {file}:{line}:{col}"), None),
             Action::Edit {
                 argv: vec![
                     "code".into(),
@@ -1780,26 +1768,101 @@ mod tests {
     fn ctrl_click_opens_a_link_and_shift_keeps_selection() {
         // Tracking on: a plain click is the program's, even on a link.
         assert_eq!(
-            click_owner(true, false, false, true),
+            click_owner(false, true, false, false, true),
             ClickOwner::Program
         );
         // Ctrl+click is the link, tracking or not.
-        assert_eq!(click_owner(true, false, true, true), ClickOwner::Link);
-        assert_eq!(click_owner(false, false, true, true), ClickOwner::Link);
+        assert_eq!(
+            click_owner(false, true, false, true, true),
+            ClickOwner::Link
+        );
+        assert_eq!(
+            click_owner(false, false, false, true, true),
+            ClickOwner::Link
+        );
         // Shift keeps local selection, and it wins over Ctrl.
-        assert_eq!(click_owner(true, true, false, true), ClickOwner::Local);
-        assert_eq!(click_owner(true, true, true, true), ClickOwner::Local);
-        assert_eq!(click_owner(false, true, true, true), ClickOwner::Local);
+        assert_eq!(
+            click_owner(false, true, true, false, true),
+            ClickOwner::Local
+        );
+        assert_eq!(
+            click_owner(false, true, true, true, true),
+            ClickOwner::Local
+        );
+        assert_eq!(
+            click_owner(false, false, true, true, true),
+            ClickOwner::Local
+        );
         // Ctrl+click on a cell that is not a link still reports.
         assert_eq!(
-            click_owner(true, false, true, false),
+            click_owner(false, true, false, true, false),
             ClickOwner::Program
         );
         // No tracking, no ctrl: selection, link or not.
-        assert_eq!(click_owner(false, false, false, true), ClickOwner::Local);
         assert_eq!(
-            click_owner(false, false, false, false),
+            click_owner(false, false, false, false, true),
             ClickOwner::Local
+        );
+        assert_eq!(
+            click_owner(false, false, false, false, false),
+            ClickOwner::Local
+        );
+    }
+
+    #[test]
+    fn overlay_blocks_a_ctrl_click_on_a_link() {
+        // The refused-link card, the paste guard, settings, the cockpit:
+        // Ctrl+click underneath does not open, and it does not fall
+        // through into a selection or a mouse report.
+        assert_eq!(
+            click_owner(true, true, false, true, true),
+            ClickOwner::Blocked
+        );
+        assert_eq!(
+            click_owner(true, false, false, true, true),
+            ClickOwner::Blocked
+        );
+        assert_eq!(
+            click_owner(true, true, true, true, true),
+            ClickOwner::Blocked
+        );
+        assert_eq!(
+            click_owner(true, false, false, false, false),
+            ClickOwner::Blocked
+        );
+    }
+
+    #[test]
+    fn route_reports_ctrl_as_a_modifier_the_link_decision_is_separate() {
+        // Route does not know about links. Ctrl is a modifier bit on the
+        // report. The window asks click_owner first and only calls press
+        // when the owner is the program — the cell is the same one.
+        let mut route = crate::mouse::Route::default();
+        let proto = crate::mouse::Proto {
+            clicks: true,
+            sgr: true,
+            ..crate::mouse::Proto::default()
+        };
+        let cell = crate::mouse::Cell {
+            pane: 1,
+            row: 0,
+            col: 4,
+        };
+        let out = route.press(
+            cell,
+            crate::mouse::Btn::Left,
+            proto,
+            crate::mouse::Mods {
+                ctrl: true,
+                ..crate::mouse::Mods::default()
+            },
+        );
+        let bytes = out.expect("tracking consumes the press").expect("SGR");
+        assert_eq!(bytes.pane, 1);
+        assert_eq!(bytes.bytes, b"\x1b[<16;5;1M");
+        assert_eq!(
+            click_owner(false, true, false, true, true),
+            ClickOwner::Link
         );
     }
 
@@ -1807,10 +1870,7 @@ mod tests {
     fn editor_config_key_round_trips() {
         let cfg: crate::config::UserConfig =
             serde_json::from_str(r#"{"editor":"code -g {file}:{line}:{col}"}"#).unwrap();
-        assert_eq!(
-            cfg.editor.as_deref(),
-            Some("code -g {file}:{line}:{col}")
-        );
+        assert_eq!(cfg.editor.as_deref(), Some("code -g {file}:{line}:{col}"));
         assert!(crate::config::UserConfig::default().editor.is_none());
     }
 }

@@ -132,6 +132,10 @@ pub struct SessionMeta {
     pub evicted: u64,
     /// when the running command was submitted — feeds the finish notification
     pub cmd_started: Option<std::time::Instant>,
+    /// The chunk contained RIS (ESC c). The UI clears this and forgets
+    /// which pane it had told "you are focused", so a 1004 that comes
+    /// back in the same read still hears CSI I.
+    pub saw_ris: bool,
 }
 
 /// Events one PTY chunk produced, delivered to the UI thread by the reader.
@@ -370,6 +374,11 @@ pub(crate) fn process_chunk<T: EventListener>(
     let mut ev = ChunkEvents::default();
     if buf.is_empty() {
         return ev;
+    }
+    // ESC c is RIS. It can share a read with the 1004 that follows it,
+    // and the UI only sees the final mode — so the flag has to be here.
+    if buf.windows(2).any(|w| w == b"\x1bc") {
+        meta.saw_ris = true;
     }
     ev.clipboard = scan_osc52(&buf);
     if let Some(c) = scan_cwd(&buf) {
@@ -883,6 +892,22 @@ mod tests {
             SessionMeta::default(),
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn ris_is_flagged_even_when_focus_mode_comes_back() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        // RIS, then 1004 in the same read. The final mode has focus
+        // reporting; the router still has to forget the previous CSI I.
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1bc\x1b[?1004h",
+        );
+        assert!(meta.saw_ris);
+        assert!(t.mode().contains(TermMode::FOCUS_IN_OUT));
     }
 
     #[test]

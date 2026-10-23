@@ -261,34 +261,6 @@ struct BlockedLink {
     shown: String,
 }
 
-/// Buttons captured for mouse reporting. A bit per button so a chord
-/// (left held, then right) releases the one that actually came up.
-#[derive(Clone, Copy)]
-struct MouseGrab {
-    pane_id: u64,
-    /// bit 0 left, bit 1 middle, bit 2 right
-    down: u8,
-}
-
-fn button_bit(button: mouse::Btn) -> u8 {
-    match button {
-        mouse::Btn::Left => 1,
-        mouse::Btn::Middle => 2,
-        mouse::Btn::Right => 4,
-        _ => 0,
-    }
-}
-
-fn grab_button(down: u8) -> mouse::Btn {
-    if down & 1 != 0 {
-        mouse::Btn::Left
-    } else if down & 2 != 0 {
-        mouse::Btn::Middle
-    } else {
-        mouse::Btn::Right
-    }
-}
-
 /// One terminal pane (a tab holds one or more).
 struct Pane {
     id: u64,
@@ -494,16 +466,9 @@ struct App {
     /// (a still terminal stops re-rendering; laptop battery thanks you)
     last_frame: Vec<u8>,
     cursor_pos: PhysicalPosition<f64>,
-    mouse_left_down: bool,
-    /// button held for a mouse-report drag (1002/1003). Absent while a
-    /// Shift+drag is a local selection — that gesture stays on
-    /// `mouse_left_down` and never reaches the program.
-    mouse_grab: Option<MouseGrab>,
-    /// last cell we reported, so motion doesn't write a byte per pixel
-    mouse_last: Option<(u64, usize, usize)>,
-    /// pane we last sent focus-in (CSI I) to. None means the program was
-    /// told it is blurred, or it never asked (mode 1004).
-    focus_sent: Option<u64>,
+    /// Grab, motion dedupe, focus-in memory, and the local selection drag.
+    /// A focus loss drops all of them together.
+    mouse: mouse::Route,
     /// the pane a mouse selection started in (drags don't cross panes)
     sel_pane: usize,
     /// divider being dragged (between pane i and i+1)
@@ -1481,6 +1446,8 @@ impl App {
 
     /// Remove one pane; a tab with no panes closes, the last tab closes Bayan.
     fn remove_pane(&mut self, ti: usize, pi: usize, el: &ActiveEventLoop) {
+        // before the pane is gone, so a tracked button can still be released
+        self.abandon_mouse();
         let Some(t) = self.tabs.get_mut(ti) else { return };
         if pi >= t.panes.len() {
             return;
@@ -1512,6 +1479,7 @@ impl App {
         if idx >= self.tabs.len() || idx == self.active {
             return;
         }
+        self.abandon_mouse();
         self.active = idx;
         if let Some(t) = self.tabs.get_mut(idx) {
             t.attention = false; // you're looking at it now
@@ -1660,20 +1628,21 @@ impl App {
         }
     }
 
-    fn send_mouse(
-        &mut self,
-        id: u64,
-        phase: mouse::Phase,
-        button: mouse::Btn,
-        row: usize,
-        col: usize,
-        sgr: bool,
-    ) {
-        // release/move carry the modifiers held NOW. The encoder wants
-        // 1-based coordinates, the hit-test speaks 0-based.
-        if let Some(bytes) = mouse::encode(sgr, phase, button, col + 1, row + 1, self.mods_now()) {
-            self.write_pane(id, &bytes);
+    fn emit_mouse(&mut self, outs: impl IntoIterator<Item = mouse::Out>) {
+        for out in outs {
+            self.write_pane(out.pane, &out.bytes);
         }
+    }
+
+    /// `Window::has_focus`, not the `focused` flag. That flag tracks
+    /// Focused events and, on the security branch, starts false — CSI I
+    /// at startup has to follow the window itself.
+    fn window_focused(&self) -> bool {
+        self.window.as_ref().is_some_and(|w| w.has_focus())
+    }
+
+    fn focus_reporting(&self, id: u64) -> bool {
+        self.mode_of(id).contains(TermMode::FOCUS_IN_OUT)
     }
 
     /// CSI I / CSI O when the focused pane, or the window, changes. A
@@ -1681,27 +1650,37 @@ impl App {
     /// wakeup — xterm sends it as the mode turns on, and the chunk that
     /// carried the mode is what wakes us.
     fn sync_focus(&mut self) {
-        let want = if self.focused {
+        let window_focused = self.window_focused();
+        let focused_pane = if window_focused {
             self.tabs
                 .get(self.active)
                 .and_then(|t| t.panes.get(t.focused).map(|p| p.id))
         } else {
             None
         };
-        let want = want.filter(|&id| self.mode_of(id).contains(TermMode::FOCUS_IN_OUT));
-        if want == self.focus_sent {
-            return;
-        }
-        let old = self.focus_sent;
-        self.focus_sent = want;
-        if let Some(old) = old {
-            if self.mode_of(old).contains(TermMode::FOCUS_IN_OUT) {
-                self.write_pane(old, mouse::focus_seq(false));
-            }
-        }
-        if let Some(id) = want {
-            self.write_pane(id, mouse::focus_seq(true));
-        }
+        let old = self.mouse.focus_sent();
+        let old_reports = old.is_some_and(|id| self.focus_reporting(id));
+        let new_reports = focused_pane.is_some_and(|id| self.focus_reporting(id));
+        let outs = self
+            .mouse
+            .apply_focus(window_focused, focused_pane, new_reports, old_reports);
+        self.emit_mouse(outs);
+    }
+
+    /// Release a reported button if the program is still tracking, then
+    /// drop the grab and the local selection drag. Focus loss, a tab
+    /// switch, and a pane close all go through here — otherwise the
+    /// button stays down in vim after Alt+Tab.
+    fn abandon_mouse(&mut self) {
+        let proto = self
+            .mouse
+            .grabbed_pane()
+            .map(|id| mouse::Proto::from_mode(self.mode_of(id)))
+            .unwrap_or_default();
+        let mods = self.mods_now();
+        let outs = self.mouse.abandon(proto, mods);
+        self.emit_mouse(outs);
+        self.clear_link_hover();
     }
 
     fn focus_pane_at(&mut self, pi: usize) {
@@ -1811,6 +1790,11 @@ impl App {
             || self.cockpit
             || self.palette.is_some()
             || self.posh.is_some()
+            || self.pending_close.is_some()
+            // #2 replaces String with PendingPaste { text, lines, chars, reason }.
+            // is_some() is the hook either way. The refused-link card is the
+            // same kind of overlay: a Ctrl+click under it must not open.
+            || self.pending_paste.is_some()
             || self.blocked_link.is_some()
     }
 
@@ -1927,7 +1911,26 @@ impl App {
             reason: reason.label().to_string(),
             shown: link::preview(shown, 160),
         });
+        self.clear_link_hover();
         self.request_redraw();
+    }
+
+    /// Who owns this left click. The cell is the one [`Self::locate`]
+    /// already mapped through `column_for_click`, which is the same cell
+    /// [`mouse::Route::press`] would report. An overlay short-circuits
+    /// before that: the link under a card is not opened.
+    fn left_click_owner(&mut self) -> link::ClickOwner {
+        let shift = self.modifiers.shift_key();
+        let ctrl = self.modifiers.control_key();
+        if self.overlay_blocks_mouse() {
+            return link::click_owner(true, false, shift, ctrl, false);
+        }
+        let Some((_, id, row, col)) = self.locate(self.cursor_pos) else {
+            return link::click_owner(false, false, shift, ctrl, false);
+        };
+        let tracking = mouse::Proto::from_mode(self.mode_of(id)).tracking();
+        let on_link = self.links_on(id, row).iter().any(|s| s.contains(col));
+        link::click_owner(false, tracking, shift, ctrl, on_link)
     }
 
     /// Press in a tracking mode, and not Shift (Shift keeps the gesture
@@ -1941,24 +1944,15 @@ impl App {
             return false;
         };
         let proto = mouse::Proto::from_mode(self.mode_of(id));
-        if !proto.wants(mouse::What::Click, self.modifiers.shift_key()) {
+        let cell = mouse::Cell { pane: id, row, col };
+        let Some(bytes) = self.mouse.press(cell, button, proto, self.mods_now()) else {
             return false;
-        }
+        };
         self.focus_pane_at(pane);
         self.sync_focus();
-        self.send_mouse(id, mouse::Phase::Press, button, row, col, proto.sgr);
-        let bit = button_bit(button);
-        if self.mouse_grab.as_ref().is_some_and(|g| g.pane_id == id) {
-            if let Some(g) = self.mouse_grab.as_mut() {
-                g.down |= bit;
-            }
-        } else {
-            self.mouse_grab = Some(MouseGrab {
-                pane_id: id,
-                down: bit,
-            });
+        if let Some(out) = bytes {
+            self.write_pane(out.pane, &out.bytes);
         }
-        self.mouse_last = Some((id, row, col));
         if let Some((ti, pi)) = self.find_pane(id) {
             self.tabs[ti].panes[pi]
                 .session
@@ -1971,50 +1965,50 @@ impl App {
     }
 
     /// Release of a button we reported. True when the gesture was ours, so
-    /// the selection path must not also copy.
+    /// the selection path must not also copy. Tracking that turned off
+    /// still consumes the button and writes nothing.
     fn release_mouse_report(&mut self, button: mouse::Btn) -> bool {
-        let bit = button_bit(button);
-        let Some(grab) = self.mouse_grab else {
+        let Some(pane_id) = self.mouse.grabbed_pane() else {
             return false;
         };
-        if bit == 0 || grab.down & bit == 0 {
-            return false;
+        let proto = mouse::Proto::from_mode(self.mode_of(pane_id));
+        let cell = self
+            .cell_in_pane_clamped(pane_id, self.cursor_pos)
+            .map(|(row, col)| mouse::Cell {
+                pane: pane_id,
+                row,
+                col,
+            });
+        match self.mouse.release(button, cell, proto, self.mods_now()) {
+            mouse::Take::Ignore => false,
+            mouse::Take::Consumed(bytes) => {
+                if let Some(out) = bytes {
+                    self.write_pane(out.pane, &out.bytes);
+                }
+                true
+            }
         }
-        let pane_id = grab.pane_id;
-        let down = grab.down & !bit;
-        if down == 0 {
-            self.mouse_grab = None;
-            self.mouse_last = None;
-        } else if let Some(g) = self.mouse_grab.as_mut() {
-            g.down = down;
-        }
-        let sgr = mouse::Proto::from_mode(self.mode_of(pane_id)).sgr;
-        if let Some((row, col)) = self.cell_in_pane_clamped(pane_id, self.cursor_pos) {
-            self.send_mouse(pane_id, mouse::Phase::Release, button, row, col, sgr);
-        }
-        true
     }
 
     fn report_drag(&mut self, pos: PhysicalPosition<f64>) {
         if self.overlay_blocks_mouse() {
             return;
         }
-        let Some(grab) = self.mouse_grab else { return };
-        let pane_id = grab.pane_id;
-        let button = grab_button(grab.down);
-        let proto = mouse::Proto::from_mode(self.mode_of(pane_id));
-        // 1000 hears the press and the release, not the pixels between.
-        if !proto.wants(mouse::What::Drag, false) {
+        let Some(pane_id) = self.mouse.grabbed_pane() else {
             return;
-        }
+        };
+        let proto = mouse::Proto::from_mode(self.mode_of(pane_id));
         let Some((row, col)) = self.cell_in_pane_clamped(pane_id, pos) else {
             return;
         };
-        if self.mouse_last == Some((pane_id, row, col)) {
-            return;
+        let cell = mouse::Cell {
+            pane: pane_id,
+            row,
+            col,
+        };
+        if let Some(out) = self.mouse.drag(cell, proto, self.mods_now()) {
+            self.write_pane(out.pane, &out.bytes);
         }
-        self.mouse_last = Some((pane_id, row, col));
-        self.send_mouse(pane_id, mouse::Phase::Move, button, row, col, proto.sgr);
     }
 
     fn report_motion_at(&mut self, id: u64, row: usize, col: usize) {
@@ -2022,21 +2016,20 @@ impl App {
             return;
         }
         let proto = mouse::Proto::from_mode(self.mode_of(id));
-        if !proto.wants(mouse::What::Motion, false) {
-            return;
+        let cell = mouse::Cell { pane: id, row, col };
+        if let Some(out) = self.mouse.motion(cell, proto, self.mods_now()) {
+            self.write_pane(out.pane, &out.bytes);
         }
-        if self.mouse_last == Some((id, row, col)) {
-            return;
-        }
-        self.mouse_last = Some((id, row, col));
-        self.send_mouse(
+    }
+
+    fn wheel_view(&self, id: u64) -> mouse::View {
+        let mode = self.mode_of(id);
+        mouse::View {
             id,
-            mouse::Phase::Move,
-            mouse::Btn::None,
-            row,
-            col,
-            proto.sgr,
-        );
+            proto: mouse::Proto::from_mode(mode),
+            alt_screen: mode.contains(TermMode::ALT_SCREEN),
+            app_cursor: mode.contains(TermMode::APP_CURSOR),
+        }
     }
 
     /// Which window edge the pointer is on, if any. 6px is the smallest band
@@ -2259,6 +2252,16 @@ impl App {
     }
 
     fn redraw(&mut self) {
+        // A scroll under a still pointer moves the link. Refresh only while
+        // a hover is showing, and never during a drag: that path must not
+        // redraw on every pixel.
+        if self.link_hover.is_some()
+            && !self.mouse.selecting
+            && self.mouse.grabbed_pane().is_none()
+        {
+            let pos = self.cursor_pos;
+            let _ = self.refresh_link_hover(pos);
+        }
         // the bar's visibility is a per-frame fact (tab count × setting)
         let hide = self.config.hide_single_tab_on() && self.tabs.len() <= 1;
         if let Some(r) = self.renderer.as_mut() {
@@ -2363,6 +2366,13 @@ impl App {
                     if focused {
                         focused_claude = claude_pane;
                     }
+                    let (link_hover, link_tip) = match &self.link_hover {
+                        Some(h) if h.pane_id == pane.id => (
+                            Some((h.row, h.start_col, h.end_col)),
+                            Some(h.target.as_str()),
+                        ),
+                        _ => (None, None),
+                    };
                     let view = render::PaneView {
                         rect: *rect,
                         focused,
@@ -2376,6 +2386,8 @@ impl App {
                             None
                         },
                         marks: &marks,
+                        link_hover,
+                        link_tip,
                     };
                     renderer.draw_pane(&mut verts, &view, &t);
                 }
@@ -2431,6 +2443,15 @@ impl App {
                             chars,
                         );
                     }
+                }
+                if let Some(block) = &self.blocked_link {
+                    renderer.draw_link_block(
+                        &mut verts,
+                        px.width as usize,
+                        px.height as usize,
+                        &block.reason,
+                        &block.shown,
+                    );
                 }
                 if let Some((rows, sel, capturing, flash)) = &shortcuts_view {
                     renderer.draw_shortcuts(
@@ -2637,6 +2658,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         crate::prof::mark("session spawned");
+        // the window exists now; if it is already focused and a pane has
+        // 1004, say so. has_focus is the same check a later rebase uses.
+        self.sync_focus();
         // FontSystem::new scans every installed font — the documented
         // cosmic-text startup cost (pop-os/cosmic-text#247): keep it off
         // the UI thread and swap the renderer in when it's ready
@@ -2665,6 +2689,15 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if let Some((ti, pi)) = self.find_pane(id) {
                     self.tabs[ti].panes[pi].last_output = Some(Instant::now());
+                    let ris = {
+                        let mut meta = self.tabs[ti].panes[pi].session.meta.lock().unwrap();
+                        let ris = meta.saw_ris;
+                        meta.saw_ris = false;
+                        ris
+                    };
+                    if ris {
+                        self.mouse.note_ris(id);
+                    }
                 }
                 // the chunk may have enabled focus reporting; tell the
                 // program whether the window is looking at it
@@ -2827,8 +2860,13 @@ impl ApplicationHandler<UserEvent> for App {
                         t.attention = false;
                     }
                     self.request_redraw();
+                } else {
+                    // Alt+Tab with the button down must not keep dragging
+                    self.abandon_mouse();
                 }
-                // mode 1004: CSI I on the way in, CSI O on the way out
+                // mode 1004: CSI I on the way in, CSI O on the way out.
+                // has_focus, so a window that is already focused at startup
+                // still announces when 1004 turns on.
                 self.sync_focus();
             }
             WindowEvent::DroppedFile(path) => {
@@ -2861,10 +2899,11 @@ impl ApplicationHandler<UserEvent> for App {
                     self.drag_divider_to(i, position);
                     return;
                 }
-                if self.mouse_left_down {
+                if self.mouse.selecting {
                     // the drag stays in the pane where it started. Shift+drag
                     // takes this path even while the program is tracking the
                     // mouse — the bypass is the whole point of Shift.
+                    self.clear_link_hover();
                     if let Some((pi, row, col, side)) = self.pane_cell_at(position) {
                         if pi == self.sel_pane {
                             if let Some(s) = self.session() {
@@ -2878,45 +2917,54 @@ impl ApplicationHandler<UserEvent> for App {
                             self.request_redraw();
                         }
                     }
-                } else if self.mouse_grab.is_some() {
+                } else if self.mouse.grabbed_pane().is_some() {
                     // 1002/1003: the program owns the drag. No local selection,
                     // and no redraw — a still frame stays still.
                     self.report_drag(position);
-                } else if let Some(w) = &self.window {
-                    // hovering a divider shows the resize cursor
-                    use winit::window::CursorIcon;
-                    // M24: an undecorated window has to advertise its own
-                    // edges, or the user has no way to learn they can grab.
-                    let icon = if let Some(dir) = self.resize_edge_at(position) {
-                        CursorIcon::from(dir)
-                    } else if self.divider_at(position).is_some() {
-                        match self.tabs.get(self.active).map(|t| t.orientation) {
-                            Some(Orientation::Column) => CursorIcon::NsResize,
-                            _ => CursorIcon::EwResize,
-                        }
-                    } else {
-                        CursorIcon::Default
-                    };
-                    w.set_cursor(icon);
-                    // caption/gear hover feedback
-                    let cap = self.caption_button_at(position);
-                    let pw = w.inner_size().width as usize;
-                    let gear = self.renderer.as_ref()
-                        .is_some_and(|r| r.settings_button_hit(pw, position.x, position.y));
-                    if let Some(r) = self.renderer.as_mut() {
-                        if r.hover_caption != cap || r.hover_gear != gear {
-                            r.hover_caption = cap;
-                            r.hover_gear = gear;
-                            self.request_redraw();
+                    self.clear_link_hover();
+                } else {
+                    // One hit-test: the hover and the 1003 report share the
+                    // logical cell `locate` mapped through column_for_click.
+                    let cell = self.refresh_link_hover(position);
+                    if let Some(w) = &self.window {
+                        // hovering a divider shows the resize cursor
+                        use winit::window::CursorIcon;
+                        // M24: an undecorated window has to advertise its own
+                        // edges, or the user has no way to learn they can grab.
+                        let icon = if let Some(dir) = self.resize_edge_at(position) {
+                            CursorIcon::from(dir)
+                        } else if self.divider_at(position).is_some() {
+                            match self.tabs.get(self.active).map(|t| t.orientation) {
+                                Some(Orientation::Column) => CursorIcon::NsResize,
+                                _ => CursorIcon::EwResize,
+                            }
+                        } else if self.link_hover.is_some() {
+                            CursorIcon::Pointer
+                        } else {
+                            CursorIcon::Default
+                        };
+                        w.set_cursor(icon);
+                        // caption/gear hover feedback
+                        let cap = self.caption_button_at(position);
+                        let pw = w.inner_size().width as usize;
+                        let gear = self.renderer.as_ref()
+                            .is_some_and(|r| r.settings_button_hit(pw, position.x, position.y));
+                        if let Some(r) = self.renderer.as_mut() {
+                            if r.hover_caption != cap || r.hover_gear != gear {
+                                r.hover_caption = cap;
+                                r.hover_gear = gear;
+                                self.request_redraw();
+                            }
                         }
                     }
-                }
-                // 1003: motion with no button. Not inside the window borrow
-                // above — reporting needs the renderer and the pane.
-                if !self.mouse_left_down && self.mouse_grab.is_none() {
-                    self.report_motion(position);
+                    // 1003: motion with no button. Shift and overlays already
+                    // dropped out inside the report.
+                    if let Some((id, row, col)) = cell {
+                        self.report_motion_at(id, row, col);
+                    }
                 }
             }
+            WindowEvent::CursorLeft { .. } => self.clear_link_hover(),
             WindowEvent::MouseInput { state, button, .. } => {
                 let mapped = match button {
                     MouseButton::Left => Some(mouse::Btn::Left),
@@ -3029,10 +3077,21 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             return;
                         }
-                        // mouse tracking owns the click unless Shift is held —
-                        // Shift+drag stays a local selection (the bypass).
-                        if self.try_report_press(mouse::Btn::Left) {
-                            return;
+                        // Link, program, or local selection. Shift wins over
+                        // Ctrl. An overlay (including the refused-link card)
+                        // is neither a link open nor a selection. The cell
+                        // is the one Route::press reports.
+                        match self.left_click_owner() {
+                            link::ClickOwner::Blocked => return,
+                            link::ClickOwner::Link => {
+                                let _ = self.activate_link_at(self.cursor_pos);
+                                return;
+                            }
+                            link::ClickOwner::Program => {
+                                let _ = self.try_report_press(mouse::Btn::Left);
+                                return;
+                            }
+                            link::ClickOwner::Local => {}
                         }
                         if let Some((pi, row, col, side)) = self.pane_cell_at(self.cursor_pos) {
                             // clicking a pane focuses it
@@ -3057,7 +3116,8 @@ impl ApplicationHandler<UserEvent> for App {
                                 let point = Point::new(Line(row as i32 - off), Column(col));
                                 t.selection = Some(Selection::new(ty, point, side));
                             }
-                            self.mouse_left_down = true;
+                            self.mouse.selecting = true;
+                            self.clear_link_hover();
                             if n >= 2 && self.config.copy_on_select_on() {
                                 // word/line selections are complete on click
                                 self.copy_selection(false);
@@ -3077,7 +3137,7 @@ impl ApplicationHandler<UserEvent> for App {
                         if !matches!(button, MouseButton::Left) {
                             return;
                         }
-                        self.mouse_left_down = false;
+                        self.mouse.selecting = false;
                         // EasyTer convention: auto-copy the selection on release
                         // (the settings panel can turn this off; explicit
                         // Ctrl+C / Ctrl+Shift+C always copy)
@@ -3106,77 +3166,41 @@ impl ApplicationHandler<UserEvent> for App {
                     self.rebuild_renderer();
                     return;
                 }
-                // the pane under the pointer, else the focused one. Splits
-                // scroll the pane you're pointing at.
+                // the pane under the pointer, else the focused one. A notch
+                // over the tab bar or the padding is not a cell: tracking
+                // programs do not hear 1;1. Shift scrolls locally, including
+                // on the alt screen.
                 let hit = self.locate(self.cursor_pos);
-                let pane_id = hit.as_ref().map(|h| h.1).or_else(|| {
-                    self.tabs
+                let (at, view_id) = if let Some((_, id, row, col)) = hit {
+                    (Some(mouse::Cell { pane: id, row, col }), Some(id))
+                } else {
+                    let id = self
+                        .tabs
                         .get(self.active)
-                        .and_then(|t| t.panes.get(t.focused).map(|p| p.id))
-                });
-                let mode = pane_id
-                    .map(|id| self.mode_of(id))
-                    .unwrap_or_else(TermMode::empty);
-                let proto = mouse::Proto::from_mode(mode);
-                let (row, col) = hit.map(|h| (h.2, h.3)).unwrap_or((0, 0));
-                if proto.wants(mouse::What::Wheel, self.modifiers.shift_key()) {
-                    // SGR when the program asked (1006), X10 otherwise.
-                    // Shift falls through: the terminal scrolls, the program
-                    // doesn't hear the wheel.
-                    if let Some(id) = pane_id {
-                        let button = if n > 0 {
-                            mouse::Btn::WheelUp
-                        } else {
-                            mouse::Btn::WheelDown
-                        };
-                        let mods = mouse::Mods {
-                            shift: false,
-                            alt: self.modifiers.alt_key(),
-                            ctrl: false,
-                        };
-                        if let Some(seq) = mouse::encode(
-                            proto.sgr,
-                            mouse::Phase::Press,
-                            button,
-                            col + 1,
-                            row + 1,
-                            mods,
-                        ) {
-                            let mut payload =
-                                Vec::with_capacity(seq.len() * n.unsigned_abs() as usize);
-                            for _ in 0..n.unsigned_abs() {
-                                payload.extend_from_slice(&seq);
-                            }
-                            self.write_pane(id, &payload);
+                        .and_then(|t| t.panes.get(t.focused).map(|p| p.id));
+                    (None, id)
+                };
+                let Some(id) = view_id else {
+                    return;
+                };
+                let decided = mouse::Route::wheel(at, self.wheel_view(id), n, self.mods_now());
+                match decided {
+                    Some(mouse::Wheel::Report { pane, bytes })
+                    | Some(mouse::Wheel::Arrows { pane, bytes }) => {
+                        self.write_pane(pane, &bytes);
+                    }
+                    Some(mouse::Wheel::Scroll { pane, lines }) => {
+                        if let Some((ti, pi)) = self.find_pane(pane) {
+                            self.tabs[ti].panes[pi]
+                                .session
+                                .term
+                                .lock()
+                                .unwrap()
+                                .scroll_display(Scroll::Delta(lines));
                         }
+                        self.request_redraw();
                     }
-                } else if mode.contains(TermMode::ALT_SCREEN) {
-                    // a full-screen TUI that didn't ask for the mouse (or
-                    // Shift bypassed it): arrow keys, honoring DECCKM.
-                    let ch = if n > 0 { b'A' } else { b'B' };
-                    let prefix: &[u8] = if mode.contains(TermMode::APP_CURSOR) {
-                        b"\x1bO"
-                    } else {
-                        b"\x1b["
-                    };
-                    let mut payload = Vec::new();
-                    for _ in 0..n.unsigned_abs() {
-                        payload.extend_from_slice(prefix);
-                        payload.push(ch);
-                    }
-                    if let Some(id) = pane_id {
-                        self.write_pane(id, &payload);
-                    }
-                } else if let Some(id) = pane_id {
-                    if let Some((ti, pi)) = self.find_pane(id) {
-                        self.tabs[ti].panes[pi]
-                            .session
-                            .term
-                            .lock()
-                            .unwrap()
-                            .scroll_display(Scroll::Delta(n));
-                    }
-                    self.request_redraw();
+                    None => {}
                 }
             }
             WindowEvent::KeyboardInput { event, .. }
@@ -3216,6 +3240,18 @@ impl ApplicationHandler<UserEvent> for App {
                         _ => {}
                     }
                     self.request_redraw();
+                    return;
+                }
+                // a refused link owns the keyboard. Enter and Esc both
+                // dismiss; neither opens the target, and nothing is typed.
+                if self.blocked_link.is_some() {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Escape) => {
+                            self.blocked_link = None;
+                            self.request_redraw();
+                        }
+                        _ => {}
+                    }
                     return;
                 }
                 // the prompt picker owns the keyboard while open
@@ -3442,10 +3478,7 @@ fn main() {
         first_output: false,
         last_frame: Vec::new(),
         cursor_pos: PhysicalPosition::new(0.0, 0.0),
-        mouse_left_down: false,
-        mouse_grab: None,
-        mouse_last: None,
-        focus_sent: None,
+        mouse: mouse::Route::default(),
         sel_pane: 0,
         drag_divider: None,
         cockpit: false,

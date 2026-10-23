@@ -2819,10 +2819,9 @@ mod tests {
                     });
                 }
             }
-            let boxes = crate::mouse::boxes_for_glyphs(&glyphs, 1.0, |byte| {
+            crate::mouse::boxes_for_glyphs(&glyphs, 1.0, |byte| {
                 crate::mouse::col_for_byte(&spans, byte)
-            });
-            boxes
+            })
         };
         let boxes = shape(&mut fs, "مرحبا");
         assert!(!boxes.is_empty(), "Arabic shaped to no glyphs");

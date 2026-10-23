@@ -225,26 +225,73 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       OSC 133 marks and Arabic shaping unchanged. Left honest: the toast path
       (Shell_NotifyIcon, the biggest windows-sys consumer) compiles and the app
       runs, but a balloon was not caught on camera — quiet hours file it to the
-      Action Center —       so that one is built-and-running, not eyeball-verified
+      Action Center — so that one is built-and-running, not eyeball-verified
 - [x] **M30** — mouse reporting. Clicks, drags and motion reach the program
       when it asks: xterm 1000 (press/release), 1002 (drag), 1003 (any
       motion), encoded as SGR 1006 or the legacy X10 byte form when 1006
-      is off. Coordinates are the pane's cells — padding and split gaps
+      is off. X10 stops at coordinate 95: the wire byte is that plus 32,
+      and ConPTY's UTF-8 pipe turns 0x80 and above into U+FFFD. Mode 1005
+      is not encoded (no silent X10 fallback). Buttons numbered 128 and
+      up, and the horizontal wheel, are not reported. Coordinates are the
+      pane's cells — padding and split gaps
       are not cells, and a click in the second pane is that pane's column
       0. On a row Bayan reorders (the whole-line BiDi path), the column is
       the glyph under the pointer, not `x / cell_w`: the left of مرحبا is
       the last logical cell, and ١٧٥ is not mirrored. Claude rows go
       through the same restoration as the painter, then the index map
       points the glyph back at the grid column Claude stored. Shift+drag
-      stays a local selection. Mode 1004 sends CSI I / CSI O when the
-      window or the focused pane changes, including the moment the program
-      turns the mode on. The wheel still scrolls the pane under the
-      pointer; Ctrl+wheel is still font zoom. Proven: 93 unit tests (81
-      before), including the encoder, the padding/split hit-test, and a
+      stays a local selection, and Shift+wheel scrolls that pane's own
+      history even on the alt screen. A focus loss, a tab switch, or a
+      pane close releases a tracked button (or drops the grab if tracking
+      is already off) so Alt+Tab cannot keep dragging. Mode 1004 sends
+      CSI I / CSI O from `Window::has_focus` when the window or the
+      focused pane changes, including the moment the program turns the
+      mode on, and a RIS forgets the last CSI I so the next one is sent
+      again. The wheel still scrolls the pane under the pointer and is
+      not reported at all over the tab bar or the padding; Ctrl+wheel is
+      still font zoom. Proven: 101 unit tests (81
+      before), including the encoder, the padding/split hit-test, the
+      grab/focus/wheel router, and a
       shaped-Amiri hit on مرحبا and ١٧٥. Not proven here: a live htop /
       vim `mouse=a` / lazygit / Claude Code session — this tree doesn't
       run a window on the machine that built it. Windows CI is the build
       that does.
+- [x] **M31** — hyperlinks. OSC 8 is already on the cell
+      (`Cell::hyperlink`); a run of cells that share one id is a span, and
+      the bytes are not parsed a second time. Cells an OSC link does not
+      cover are scanned for `http`/`https` URLs and for `path:line[:col]` /
+      `path(line,col)` (rustc, gcc, MSVC, grep). Hover underlines the span
+      through the same shaped glyph boxes a click uses, and the pane's
+      bottom strip shows the target — so a label that differs from its URI
+      is visible. The underline is not a shaped-run style bit: baking it
+      into the cache key would reshape the line on every hover change.
+      Ctrl+click opens the link. Shift+click stays a local selection and
+      wins over Ctrl. A plain click while mouse tracking is on still goes
+      to the program, Ctrl modifier bit included; the window asks
+      `link::click_owner` before `mouse::Route::press`, and an overlay
+      (settings, cockpit, paste guard, close guard, the refused-link card)
+      blocks the click so a link under a card does not open. Only `http`,
+      `https`, and `file` are opened, and never through `cmd /c start`:
+      `ShellExecuteW` gets the URI or path as the single `lpFile`.
+      `javascript:`, `ms-*`, `search-ms:`, `data:`, and anything else are
+      refused on a card that Esc and Enter both dismiss. Control characters
+      and bidi overrides are refused too, including after percent-decoding,
+      and a target longer than 2048 bytes is refused. The editor is a
+      `Command` argument vector from `editor` in the config
+      (`code -g {file}:{line}:{col}`); `{file}` `{line}` `{col}` are
+      substituted after the template is split, so a path with spaces is one
+      argument. Absent that key, `code.exe` on PATH (or the `Code.exe`
+      beside VS Code's `code.cmd`) is used; a bare `.cmd` is not spawned.
+      Relative paths resolve through the pane cwd OSC 9;9 already stores
+      (`link::cwd_hook`); OSC 7 should write that same field. Unquoted
+      paths that contain spaces are not detected. Proven: 119 unit tests
+      (101 before), including OSC 8 open/close, URL punctuation and
+      surrounding Arabic, the four file:line shapes, the scheme allowlist,
+      control/bidi rejection, the editor argv (no shell), an RTL hit
+      through `column_for_click`, and the overlay short-circuit in front
+      of `Route::press`. Not proven here: a live hover underline,
+      `ShellExecuteW` actually launching a browser, or a real editor spawn
+      — this tree doesn't run a window on the machine that built it.
 
 ## Settings
 
@@ -260,6 +307,7 @@ key falls back to a sane default:
   "copy_on_select": true, "ligatures": true, "bell": "attention",
   "shell": "pwsh.exe", "padding": 8, "opacity": 0.9,
   "hide_single_tab": true, "confirm_close": true,
+  "editor": "code -g {file}:{line}:{col}",
   "keybinds": { "new-tab": "ctrl+shift+n" }
 }
 ```

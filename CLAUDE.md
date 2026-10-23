@@ -31,8 +31,20 @@ lines so cosmic-text applies UAX#9. Grid fidelity wins for TUIs; correct text
 wins for prose. Unifying the two paths breaks one or the other — this is the
 core design, not an accident.
 
-**On RTL rows, logical column ≠ visual x.** Cursor and selection must resolve
-through the shaped layout, never by multiplying a column index by cell width.
+**On RTL rows, logical column ≠ visual x.** Cursor, selection, and hyperlink
+hit-testing must resolve through the shaped layout, never by multiplying a
+column index by cell width.
+
+**Hyperlinks never go through a shell.** OSC 8 is read off the cell
+(`Cell::hyperlink`), not parsed again. Ctrl+click opens only `http`, `https`,
+and `file`, via `ShellExecuteW` with the target as the single `lpFile`. The
+editor is a `Command` argument vector (`{file}` `{line}` `{col}` substituted
+after the template is split). `javascript:`, `ms-*`, `data:`, control
+characters, and bidi overrides are refused on a card that does not open them.
+The window asks `link::click_owner` before `mouse::Route::press`: Shift keeps
+local selection and wins over Ctrl, a plain click while tracking is on belongs
+to the program, and `overlay_blocks_mouse` (including the refused-link card)
+blocks the click.
 
 **Claude mode is narrow on purpose.** Claude Code (Ink) applies BiDi itself on
 Windows and emits Arabic in reversed visual order, so `bidi.rs` reverses UAX#9

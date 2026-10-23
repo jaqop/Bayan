@@ -65,6 +65,7 @@ fn rev_indexed(chars: &[char], origin: &[usize]) -> (Vec<char>, Vec<usize>) {
     (out_c, out_o)
 }
 
+#[cfg(test)]
 fn rev_clusters(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let origin: Vec<usize> = (0..chars.len()).collect();
@@ -125,6 +126,7 @@ fn unbidi_indexed(chars: &[char]) -> (Vec<char>, Vec<usize>) {
     (out, out_i)
 }
 
+#[cfg(test)]
 fn unbidi_rtl_line(line: &str) -> String {
     let chars: Vec<char> = line.chars().collect();
     unbidi_indexed(&chars).0.into_iter().collect()
