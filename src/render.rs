@@ -28,7 +28,6 @@ use cosmic_text::{
 
 use crate::bidi_ctl::{base_direction_mark, ParagraphDir};
 use crate::gpu::Vertex;
-use crate::term::EventProxy;
 
 // Bayan's first look is Jonathan Blow's scheme, SAMPLED from two captures of
 // his editor rather than recalled. Five colours are measured medians, not
@@ -219,6 +218,13 @@ fn arabic_chars(n: usize) -> String {
         3..=10 => format!("{n} أحرف"),
         _ => format!("{n} حرفاً"),
     }
+}
+
+/// SGR 2 (faint): two thirds of each channel. Widened before the multiply —
+/// `u8 * 2` overflows for any channel above 127, which is most foregrounds.
+fn dim((r, g, b): (u8, u8, u8)) -> (u8, u8, u8) {
+    let f = |c: u8| (c as u16 * 2 / 3) as u8;
+    (f(r), f(g), f(b))
 }
 
 /// Straight-alpha color for the quad batch.
@@ -494,6 +500,31 @@ pub struct TabInfo {
     /// approval): amber beats the green busy dot
     pub attention: bool,
     pub active: bool,
+    /// OSC 9;4 progress from the tab's focused pane (Claude Code emits it
+    /// while it works): a thin bar along the tab's bottom edge
+    pub progress: Option<crate::term::Progress>,
+}
+
+/// Bar colour for a progress state: green working, red failed, amber paused.
+fn progress_color(p: crate::term::Progress) -> (u8, u8, u8) {
+    use crate::term::ProgressState::*;
+    match p.state {
+        Normal | Indeterminate => (0x2e, 0xa0, 0x43),
+        Error => (0xcf, 0x22, 0x2e),
+        Paused => (0xf2, 0xcc, 0x60),
+    }
+}
+
+/// Short label for the cockpit: "42%", "!" for an error, "…" while
+/// indeterminate, "⏸" paused.
+pub fn progress_label(p: crate::term::Progress) -> String {
+    use crate::term::ProgressState::*;
+    match p.state {
+        Normal => format!("{}%", p.percent),
+        Error => format!("! {}%", p.percent),
+        Indeterminate => "…".to_string(),
+        Paused => format!("⏸ {}%", p.percent),
+    }
 }
 
 /// Fixed tab width in cells — the app's click hit-test relies on this.
@@ -503,6 +534,11 @@ pub const TAB_MIN_CELLS: f32 = 9.0;
 
 /// A rect in frame pixels: (x, y, w, h).
 pub type Rect = (i32, i32, i32, i32);
+
+/// One underline/strikethrough span on a grid row: (col_start, col_end, style, fg).
+type Deco = (usize, usize, u8, (u8, u8, u8));
+/// The same span resolved to pixels: (x0, x1, style, fg).
+type PxDeco = (i32, i32, u8, (u8, u8, u8));
 
 /// One row of the shortcuts editor.
 pub struct ShortcutRow {
@@ -606,6 +642,7 @@ pub struct CockpitEntry {
     pub busy: bool,
     pub attention: bool,
     pub active: bool,
+    pub progress: Option<crate::term::Progress>,
 }
 
 /// One pane's draw parameters.
@@ -749,6 +786,28 @@ struct BidiPlan {
     byte_cols: Vec<(usize, usize, usize)>,
     /// First column not part of the shaped run (trailing blanks).
     first_blank: usize,
+}
+
+/// Underline / strikethrough spans of a BiDi row, as BYTE ranges of the
+/// shaped string. The grid path can place these from columns, but on a
+/// row cosmic-text reordered a column is not an x — so the style runs
+/// travel as bytes and the layout says where they landed. `byte_cols`
+/// stays correct through Claude-mode restoration, so these do too.
+fn bidi_decos(cells: &[CellInfo], plan: &BidiPlan) -> Vec<Deco> {
+    let mut out: Vec<Deco> = Vec::new();
+    for ci in cells {
+        if ci.style & (ST_UNDERLINE | ST_STRIKE) == 0 {
+            continue;
+        }
+        let Some(&(b0, b1, _)) = plan.byte_cols.iter().find(|&&(_, _, c)| c == ci.col) else {
+            continue; // a trailing blank, outside the shaped run
+        };
+        match out.last_mut() {
+            Some((_, e, st, fg)) if *e == b0 && *st == ci.style && *fg == ci.fg => *e = b1,
+            _ => out.push((b0, b1, ci.style, ci.fg)),
+        }
+    }
+    out
 }
 
 fn byte_cols_of(text: &str, char_cols: &[usize]) -> Vec<(usize, usize, usize)> {
@@ -1298,7 +1357,7 @@ impl Renderer {
             style |= ST_STRIKE;
         }
         if flags.intersects(Flags::DIM) {
-            fg = (fg.0 * 2 / 3, fg.1 * 2 / 3, fg.2 * 2 / 3);
+            fg = dim(fg);
         }
         (fg, bg, style)
     }
@@ -1329,6 +1388,39 @@ impl Renderer {
             1.0
         };
         self.draw_run(&plan.segs, true, out, clip, x0 as f32, y, scale);
+        // SGR underline and strikethrough, through the same layout. Without
+        // this they are simply absent on any row holding Arabic: the grid
+        // path draws them from columns, and this path has no columns.
+        let decos = bidi_decos(cells, &plan);
+        if !decos.is_empty() {
+            let th = (self.cell_h / 14.0).max(1.0) as i32;
+            let key = self.ensure_shaped(&plan.segs, true);
+            let mut rects: Vec<PxDeco> = Vec::new();
+            for run in self.cache_hot[&key].buffer.layout_runs() {
+                for &(b0, b1, style, fg) in &decos {
+                    let c0 = cosmic_text::Cursor::new(0, b0);
+                    let c1 = cosmic_text::Cursor::new(0, b1);
+                    for (hx, hw) in run.highlight(c0, c1) {
+                        rects.push((
+                            x0 + (hx * scale).round() as i32,
+                            x0 + ((hx + hw) * scale).round() as i32,
+                            style,
+                            fg,
+                        ));
+                    }
+                }
+            }
+            for (dx0, dx1, style, fg) in rects {
+                if style & ST_UNDERLINE != 0 {
+                    let uy = y + self.cell_h.round() as i32 - th - 1;
+                    push_rect(out, clip, dx0, uy, dx1 - dx0, th, c4(fg, 255));
+                }
+                if style & ST_STRIKE != 0 {
+                    let sy = y + (self.cell_h * 0.55).round() as i32;
+                    push_rect(out, clip, dx0, sy, dx1 - dx0, th, c4(fg, 255));
+                }
+            }
+        }
         // Hover underline follows the shaped glyphs. Column * cell_w would
         // land on the wrong side of an RTL row — the same reason the cursor
         // and the click go through this buffer.
@@ -1472,7 +1564,7 @@ impl Renderer {
         let n = cells.len();
         let mut i = 0;
         // underline/strikethrough decorations: (col_start, col_end, style, fg)
-        let mut decos: Vec<(usize, usize, u8, (u8, u8, u8))> = Vec::new();
+        let mut decos: Vec<Deco> = Vec::new();
         let mut note_deco = |ci: &CellInfo| {
             if ci.style & (ST_UNDERLINE | ST_STRIKE) == 0 {
                 return;
@@ -1574,8 +1666,9 @@ impl Renderer {
     }
 
     /// Draw one pane's terminal into its rect.
-    pub fn draw_pane(&mut self, out: &mut Vec<Vertex>,
-                     view: &PaneView, term: &Term<EventProxy>) {
+    pub fn draw_pane<T: alacritty_terminal::event::EventListener>(
+        &mut self, out: &mut Vec<Vertex>, view: &PaneView, term: &Term<T>,
+    ) {
         let (px, py, pw, ph) = view.rect;
         let clip = view.rect;
         let rows = term.screen_lines();
@@ -1861,9 +1954,14 @@ impl Renderer {
             let mark = if e.active { "● " } else { "" };
             let title: String = e.title.chars().take(22).collect();
             let status: String = e.status.chars().take(48).collect();
+            let (pct, pct_fg) = match e.progress {
+                Some(p) => (format!("{}  ", progress_label(p)), progress_color(p)),
+                None => (String::new(), fg),
+            };
             let segs = [
                 Seg::plain(format!("{mark}{title}"), fg),
                 Seg::plain("   —   ", (0x6e, 0x76, 0x81)),
+                Seg { text: pct, fg: pct_fg, style: ST_BOLD },
                 Seg::plain(status, (0x9a, 0xa4, 0xb2)),
             ];
             self.draw_run(&segs, true, out, whole, (x + 32) as f32, ry + 6, 1.0);
@@ -1911,7 +2009,10 @@ impl Renderer {
         // the theme row obeys the same grammar: tiles left, label right,
         // so the strip leaves room for the "المظهر" label
         let label_reserve = (self.cell_w * 6.0) as i32;
-        let tile_w = ((w - pad * 2 - label_reserve - 6 * 6) / 7).max(30);
+        // sized by the ACTUAL tile count (built-ins + plugin themes), or the
+        // strip overruns the label once a theme is added
+        let n_tiles = gallery().len().max(1) as i32;
+        let tile_w = ((w - pad * 2 - label_reserve - 6 * (n_tiles - 1)) / n_tiles).max(30);
         let tile_h = (self.cell_h * 1.6) as i32;
         let theme_rowh = tile_h + 14;
         let h = head_h + 6 + theme_rowh + rowh * 14 + foot_h;
@@ -2322,6 +2423,7 @@ impl Renderer {
     /// The shortcuts editor: the settings ledger grammar again — keycap
     /// chips left ··· action label right. The selected row highlights; a
     /// capturing row swaps its chips for an amber "press the new chord".
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_shortcuts(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
                           rows: &[ShortcutRow], sel: usize, capturing: bool,
                           flash: Option<&str>) {
@@ -2366,14 +2468,13 @@ impl Renderer {
             let label_x = (x + w - pad) as f32 - lw;
             self.draw_run(&lseg, true, out, whole, label_x, ry + tc, 1.0);
 
-            let chips_end;
-            if selected && capturing {
+            let chips_end = if selected && capturing {
                 // amber capture prompt in place of the chips
                 let seg = [Seg { text: "اضغط الاختصار الجديد…".into(),
                                  fg: AMBER, style: ST_BOLD }];
                 let cw = self.measure(&seg, true);
                 self.draw_run(&seg, true, out, whole, (x + pad) as f32, ry + tc, 1.0);
-                chips_end = x + pad + cw as i32;
+                x + pad + cw as i32
             } else {
                 // keycap chips, one per token: Ctrl / Shift / T
                 let ch = lay.rowh - 12;
@@ -2390,8 +2491,8 @@ impl Renderer {
                                   cy + ((ch as f32 - self.cell_h) / 2.0) as i32, 1.0);
                     cx += cw + 6;
                 }
-                chips_end = cx - 6;
-            }
+                cx - 6
+            };
             // the ledger dots tie chips to label
             let dy = ry + lay.rowh / 2 - 1;
             let mut dx = chips_end + 16;
@@ -2416,9 +2517,6 @@ impl Renderer {
         self.draw_run(&seg, true, out, whole, (x + w - pad) as f32 - fw2,
                       y + h - (self.cell_h as i32 + 14), 1.0);
     }
-
-    /// The close guard (same family as the paste guard): a pane or the
-    /// window is about to close while a command still runs — confirm.
 
     /// The command palette (Ctrl+Shift+P). Query line, filtered rows, hint.
     /// `rows` is already filtered by the caller — the renderer never decides
@@ -2573,6 +2671,8 @@ impl Renderer {
                       y + h - self.cell_h as i32 - 8, 1.0);
     }
 
+    /// The close guard (same family as the paste guard): a pane or the
+    /// window is about to close while a command still runs — confirm.
     pub fn draw_close_guard(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
                             msg: &str) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
@@ -2818,6 +2918,19 @@ impl Renderer {
             if let Some(c) = dot {
                 let d = 6;
                 push_rect(out, whole, tx + tabw - 14, (oy + 3) / 2 - d / 2, d, d, c4(c, 255));
+            }
+            // progress: a 3px bar along the bottom edge, its track dimmed and
+            // its fill at the reported percent (full-width dim = indeterminate)
+            if let Some(p) = tab.progress {
+                let (bx, bw, by, bh) = (tx + 6, tabw - 12, oy - 3, 3);
+                let c = progress_color(p);
+                push_rect(out, whole, bx, by, bw, bh, c4(c, 70));
+                let fill = match p.state {
+                    crate::term::ProgressState::Indeterminate => bw,
+                    _ => (bw as f32 * p.percent as f32 / 100.0).round() as i32,
+                };
+                let alpha = if p.state == crate::term::ProgressState::Indeterminate { 140 } else { 255 };
+                push_rect(out, whole, bx, by, fill, bh, c4(c, alpha));
             }
         }
 
@@ -3387,8 +3500,7 @@ mod cache_tests {
     /// ligature-capable default doesn't sneak substitutions in later).
     #[test]
     fn ligatures_off_prefers_a_mono_family() {
-        let mut cfg = crate::config::UserConfig::default();
-        cfg.ligatures = Some(false);
+        let cfg = crate::config::UserConfig { ligatures: Some(false), ..Default::default() };
         let r = Renderer::new(1.0, &cfg, 0.0);
         assert!(!r.ligatures);
         // the picked family is the first installed MONO candidate (or a
@@ -3510,6 +3622,120 @@ mod cache_tests {
         assert!(!r.settings_button_hit(w, 20.0, (by + bh / 2) as f64));
         // the button sits at the right edge
         assert!(bx + bw <= w as i32 && bx > w as i32 / 2);
+    }
+
+    /// SGR 2 on a bright foreground used to overflow `u8 * 2` (a debug
+    /// panic on the first faint character, wrapped garbage in release).
+    #[test]
+    fn dim_never_overflows_and_darkens() {
+        assert_eq!(dim((255, 255, 255)), (170, 170, 170));
+        // the measured tan foreground: every channel is above 127
+        assert_eq!(dim(FG), (129, 122, 100));
+        assert_eq!(dim((0, 0, 0)), (0, 0, 0));
+        for c in [128u8, 200, 254] {
+            let d = dim((c, c, c));
+            let want = (c as u16 * 2 / 3) as u8;
+            assert!(d.0 < c && d.0 == want, "dim({c}) = {d:?}, want {want}");
+        }
+    }
+
+    /// The theme strip must fit every tile between the card's left pad and
+    /// the row label, however many themes the gallery holds — the eighth
+    /// built-in was the one that first ran under the label.
+    #[test]
+    fn theme_tiles_stay_clear_of_the_row_label() {
+        let r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let lay = r.settings_layout(1400, 900);
+        let (cx, _, cw, _) = lay.card;
+        let label_reserve = (r.cell_w * 6.0) as i32;
+        let last = lay.theme_tiles[lay.theme_tiles.len() - 1];
+        assert!(gallery().len() >= 8, "this test assumes the eighth theme exists");
+        assert!(
+            last.0 + last.2 <= cx + cw - 24 - label_reserve,
+            "the last tile ends at {} but the label starts at {}",
+            last.0 + last.2,
+            cx + cw - 24 - label_reserve
+        );
+    }
+
+    /// Underline on an Arabic row used to vanish: the BiDi path shaped the
+    /// text and drew no decorations at all. It must emit underline rects,
+    /// placed through the layout (so they sit under the RTL glyphs).
+    #[test]
+    fn underline_survives_on_a_bidi_row() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 30, rows: 3 };
+        let count_rows = |r: &mut Renderer, bytes: &[u8]| -> usize {
+            let mut t = Term::new(Config::default(), &size, VoidListener);
+            let mut p: Processor = Processor::new();
+            p.advance(&mut t, bytes);
+            let mut out = Vec::new();
+            let view = PaneView {
+                rect: (0, 0, 600, 90),
+                focused: false,
+                cursor: crate::config::CursorStyle::Block,
+                cursor_on: false,
+                bordered: false,
+                claude: false,
+                reorder: true,
+                line_dir: &[],
+                search_match: None,
+                marks: &[],
+                link_hover: None,
+                link_tip: None,
+            };
+            // an underline is a solid quad (page 0, white texel) th px tall
+            let th = (r.cell_h / 14.0).max(1.0) as i32;
+            r.draw_pane(&mut out, &view, &t);
+            out.chunks(6)
+                .filter(|q| {
+                    q[0].layer == 0.0
+                        && q[0].uv == [WHITE_UV, WHITE_UV]
+                        && (q[5].pos[1] - q[0].pos[1]).round() as i32 == th
+                })
+                .count()
+        };
+        let plain = count_rows(&mut r, "\u{645}\u{631}\u{62d}\u{628}\u{627}".as_bytes());
+        let underlined = count_rows(&mut r, "\x1b[4m\u{645}\u{631}\u{62d}\u{628}\u{627}\x1b[0m".as_bytes());
+        assert!(underlined > plain, "no underline quads on the Arabic row ({underlined} vs {plain})");
+    }
+
+    /// A tab with OSC 9;4 progress draws its bar (track + fill) and the
+    /// fill follows the percent; an error is red, indeterminate is full width.
+    #[test]
+    fn tab_bar_draws_agent_progress() {
+        use crate::term::{Progress, ProgressState};
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let tab = |p: Option<Progress>| TabInfo {
+            title: "claude".into(), busy: false, attention: false, active: true, progress: p,
+        };
+        // the bar's quads: 3px tall, on the tab's bottom edge (track, then fill)
+        let bar_y = r.tab_bar_h().round() - 3.0;
+        let quads = |r: &mut Renderer, p: Option<Progress>| -> Vec<(f32, [f32; 4])> {
+            let mut out = Vec::new();
+            r.draw_chrome(&mut out, 800, 400, &[tab(p)], None, false);
+            out.chunks(6)
+                .filter(|q| q[0].pos[1] == bar_y && q[5].pos[1] - q[0].pos[1] == 3.0)
+                .map(|q| (q[1].pos[0] - q[0].pos[0], q[0].color))
+                .collect()
+        };
+        assert!(quads(&mut r, None).is_empty(), "no bar without progress");
+        let half = quads(&mut r, Some(Progress { state: ProgressState::Normal, percent: 50 }));
+        let full = quads(&mut r, Some(Progress { state: ProgressState::Normal, percent: 100 }));
+        assert_eq!(half.len(), 2, "track + fill");
+        let (w50, _) = half[1];
+        let (w100, c100) = full[1];
+        assert!((w100 - 2.0 * w50).abs() <= 2.0, "50%={w50} 100%={w100}");
+        assert_eq!(w100, full[0].0, "100% fills the track");
+        assert_eq!(c100, c4((0x2e, 0xa0, 0x43), 255), "working = green");
+        let err = quads(&mut r, Some(Progress { state: ProgressState::Error, percent: 30 }));
+        assert_eq!(err[1].1, c4((0xcf, 0x22, 0x2e), 255), "error = red");
+        let ind = quads(&mut r, Some(Progress { state: ProgressState::Indeterminate, percent: 0 }));
+        assert_eq!(ind[1].0, ind[0].0, "indeterminate spans the track");
+        assert_eq!(progress_label(Progress { state: ProgressState::Paused, percent: 5 }), "⏸ 5%");
     }
 
     /// Solid rects always reference page 0 (the white texel lives there).

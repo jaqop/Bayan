@@ -427,6 +427,58 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       of `Route::press`. Not proven here: a live hover underline,
       `ShellExecuteW` actually launching a browser, or a real editor spawn
       — this tree doesn't run a window on the machine that built it.
+- [x] **M32** — the agent's own signals, drawn. OSC 9;4 progress (ConEmu's,
+      read by Windows Terminal, Ghostty, WezTerm, Konsole — and emitted by
+      Claude Code under `terminalProgressBarEnabled`) becomes a 3px bar along
+      the tab's bottom edge: green working, red failed, amber paused, dim
+      full-width while indeterminate, with a "42%" lead-in on the cockpit row.
+      Desktop-notification escapes in all three dialects — OSC 9;message
+      (iTerm2/ConEmu), OSC 777;notify (rxvt, what Ghostty and WezTerm speak),
+      OSC 99 (kitty) — raise a native toast when the window is unfocused or the
+      tab is in the background; a BEL from an unfocused window does too, so
+      `preferredNotifChannel: terminal_bell` in Claude Code lands somewhere you
+      can see. The shell gets `TERM_PROGRAM=Bayan`, `TERM_PROGRAM_VERSION` and
+      `COLORTERM=truecolor`. Verified live: a 60% report typed through the real
+      ConPTY path draws the bar under the tab (PrintWindow capture,
+      pixel-sampled). Learned again on the way: `cargo test` does not relink
+      `target/debug/bayan.exe` — the first two captures were of a stale binary
+- [x] **M33** — RETIRED, and kept here because the log is the point.
+      Ctrl+click link opening was built on this branch while M31 was being
+      built on main, and `links.rs` was the smaller, later, worse of the
+      two: 530 lines of plain-text scanning against `link.rs`'s 4700, with
+      no OSC 8, no URI or IDN handling, no editor route, and no confirm
+      card. It was deleted in the merge; M31 is the link feature. Do not
+      reintroduce a second scanner.
+
+      Three things it found outlived it, because main did not have them.
+      SGR underline and strikethrough were simply absent on any row holding
+      Arabic — the grid path draws them from columns and the BiDi path has
+      no columns — so decorations now travel as byte ranges of the shaped
+      string and come back as pixels through `highlight`, correct through
+      Claude restoration because `byte_cols` is. `Flags::DIM` computed
+      `fg.0 * 2 / 3` on a `u8`, which overflows for every channel above
+      127, i.e. most foregrounds: a debug panic on the first faint
+      character. And an untouched config serialized `"keyboard"` out of
+      nothing, so saving one minted settings the user never set.
+
+      Two limits that applied to `links.rs` apply to `link.rs` too and are
+      NOT fixed: a mapped network drive is still stat'd, and a junction or
+      symlink aimed at a UNC share defeats any gate that reads the path as
+      text. Closing that needs resolution off the UI thread, gating on the
+      canonical path.
+- [x] **M34** — the window comes back where you left it: session.json carries
+      the last non-maximized rectangle plus the maximized flag, restored only
+      if enough of the title strip lands on a monitor that is still connected
+      (a window last seen on an unplugged second screen must not return
+      off-screen). Verified live: moved and resized through the OS, closed
+      cleanly, relaunched — same rectangle to the pixel
+- [x] **M35** — Ctrl+Tab returns to the tab you were just on (browser/IDE
+      stack behaviour, a top Ghostty request): holding Ctrl and pressing Tab
+      again walks further down the history, Shift walks back, releasing Ctrl
+      commits the stop. `tab_switch: "order"` restores the classic cycle.
+      Verified live with driven input: three tabs, click the first, Ctrl+Tab —
+      the third (previously used) tab activates, where a plain cycle would
+      have picked the second
 
 ## Settings
 
@@ -442,7 +494,7 @@ key falls back to a sane default:
   "copy_on_select": true, "ligatures": true, "bell": "attention",
   "shell": "pwsh.exe", "padding": 8, "opacity": 0.9,
   "hide_single_tab": true, "confirm_close": true, "osc52": "off",
-  "editor": "code -g {file}:{line}:{col}",
+  "editor": "code -g {file}:{line}:{col}", "tab_switch": "recent",
   "keybinds": { "new-tab": "ctrl+shift+n" },
   "keyboard": { "kitty_protocol": false, "kitty_base_layout_fallback": true }
 }

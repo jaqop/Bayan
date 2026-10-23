@@ -132,6 +132,16 @@ pub fn detect() -> Vec<Shell> {
     v
 }
 
+/// Friendly label for a stored command line, for the settings panel. Falls
+/// back to a trimmed command so a hand-edited config.json still reads sanely.
+pub fn label_for(command: &str) -> String {
+    detect()
+        .into_iter()
+        .find(|s| s.command == command)
+        .map(|s| s.name)
+        .unwrap_or_else(|| command.trim_end_matches(".exe").to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,13 +219,3 @@ mod tests {
     }
 }
 
-
-/// Friendly label for a stored command line, for the settings panel. Falls
-/// back to a trimmed command so a hand-edited config.json still reads sanely.
-pub fn label_for(command: &str) -> String {
-    detect()
-        .into_iter()
-        .find(|s| s.command == command)
-        .map(|s| s.name)
-        .unwrap_or_else(|| command.trim_end_matches(".exe").to_string())
-}
