@@ -1261,11 +1261,43 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_tab_releases_the_grab_on_the_old_pane() {
+        // spawn_tab changes the active tab without switch_tab, and calls
+        // the same abandon the focus-loss path uses.
+        let mut route = Route::default();
+        let old = Cell {
+            pane: 4,
+            row: 1,
+            col: 2,
+        };
+        let proto = click_proto();
+        route.press(old, Btn::Left, proto, Mods::default()).unwrap();
+        route.selecting = true;
+        let out = route.abandon(proto, Mods::default());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].pane, 4);
+        assert_eq!(out[0].bytes, b"\x1b[<0;3;2m");
+        assert_eq!(route.grabbed_pane(), None);
+        assert!(!route.selecting);
+        // the new tab's press is its own grab, not a chord on the old pane
+        let fresh = Cell {
+            pane: 9,
+            row: 0,
+            col: 0,
+        };
+        assert!(route
+            .press(fresh, Btn::Left, proto, Mods::default())
+            .unwrap()
+            .is_some());
+        assert_eq!(route.grabbed_pane(), Some(9));
+    }
+
+    #[test]
     fn sync_focus_uses_the_window_and_forgets_ris() {
         let mut route = Route::default();
         let wants = |id: u64| id == 1;
-        // an unfocused window (has_focus false, including startup before
-        // the first Focused event) does not announce
+        // startup has no Focused event yet: an unfocused window
+        // (has_focus false) does not announce
         assert!(route.sync_focus(false, Some(1), wants).is_empty());
         let on = route.sync_focus(true, Some(1), wants);
         assert_eq!(on[0].bytes, b"\x1b[I");
@@ -1275,7 +1307,10 @@ mod tests {
         assert_eq!(route.focus_sent(), None);
         let again = route.sync_focus(true, Some(1), wants);
         assert_eq!(again[0].bytes, b"\x1b[I");
+        // Focused(false) passes that bit. A lagging has_focus() that is
+        // still true must not be consulted here, or CSI O is lost.
         let off = route.sync_focus(false, Some(1), wants);
         assert_eq!(off[0].bytes, b"\x1b[O");
+        assert_eq!(route.focus_sent(), None);
     }
 }

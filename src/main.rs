@@ -1289,6 +1289,9 @@ impl App {
             .and_then(|c| c.rsplit(['\\', '/']).next().map(str::to_string))
             .unwrap_or_else(|| "بيان".to_string());
         if let Some(pane) = self.spawn_pane(cwd.as_deref()) {
+            // this becomes the active tab without switch_tab, so a button
+            // held on the previous tab has to go up first
+            self.abandon_mouse();
             self.tabs.push(Tab {
                 panes: vec![pane],
                 weights: vec![1.0],
@@ -1299,7 +1302,7 @@ impl App {
             });
             self.active = self.tabs.len() - 1;
             self.relayout_active();
-            self.sync_focus();
+            self.sync_focus(None);
         }
     }
 
@@ -1418,7 +1421,7 @@ impl App {
             t.focused = t.panes.len() - 1;
         }
         self.relayout_active();
-        self.sync_focus();
+        self.sync_focus(None);
         self.request_redraw();
     }
 
@@ -1449,7 +1452,7 @@ impl App {
         }
         self.relayout_active();
         self.update_title();
-        self.sync_focus();
+        self.sync_focus(None);
         self.request_redraw();
     }
 
@@ -1465,7 +1468,7 @@ impl App {
         self.search = None; // the bar belongs to the tab that opened it
         self.relayout_active(); // this tab's layout may differ
         self.update_title();
-        self.sync_focus();
+        self.sync_focus(None);
         self.request_redraw();
     }
 
@@ -1627,8 +1630,15 @@ impl App {
     /// program that just enabled 1004 hears the current state on the next
     /// wakeup — xterm sends it as the mode turns on, and the chunk that
     /// carried the mode is what wakes us.
-    fn sync_focus(&mut self) {
-        let window_focused = self.window_focused();
+    ///
+    /// `focused` is the `Focused` event when one just arrived. Other
+    /// callers pass `None`, and the window's `has_focus` answers, so a
+    /// window that is already focused at startup still sends CSI I.
+    /// The event is not checked again against the window: `has_focus`
+    /// can stay true for a moment after `Focused(false)` and would
+    /// swallow CSI O.
+    fn sync_focus(&mut self, focused: Option<bool>) {
+        let window_focused = focused.unwrap_or_else(|| self.window_focused());
         let focused_pane = if window_focused {
             self.tabs
                 .get(self.active)
@@ -1647,8 +1657,8 @@ impl App {
 
     /// Release a reported button if the program is still tracking, then
     /// drop the grab and the local selection drag. Focus loss, a tab
-    /// switch, and a pane close all go through here — otherwise the
-    /// button stays down in vim after Alt+Tab.
+    /// switch, a new tab, and a pane close all go through here —
+    /// otherwise the button stays down in vim after Alt+Tab.
     fn abandon_mouse(&mut self) {
         let proto = self
             .mouse
@@ -1789,7 +1799,7 @@ impl App {
             return false;
         };
         self.focus_pane_at(pane);
-        self.sync_focus();
+        self.sync_focus(None);
         if let Some(out) = bytes {
             self.write_pane(out.pane, &out.bytes);
         }
@@ -2475,7 +2485,7 @@ impl ApplicationHandler<UserEvent> for App {
         crate::prof::mark("session spawned");
         // the window exists now; if it is already focused and a pane has
         // 1004, say so. has_focus is the same check a later rebase uses.
-        self.sync_focus();
+        self.sync_focus(None);
         // FontSystem::new scans every installed font — the documented
         // cosmic-text startup cost (pop-os/cosmic-text#247): keep it off
         // the UI thread and swap the renderer in when it's ready
@@ -2516,7 +2526,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // the chunk may have enabled focus reporting; tell the
                 // program whether the window is looking at it
-                self.sync_focus();
+                self.sync_focus(None);
                 self.request_redraw();
             }
             UserEvent::PtyWrite(id, text) => {
@@ -2679,10 +2689,9 @@ impl ApplicationHandler<UserEvent> for App {
                     // Alt+Tab with the button down must not keep dragging
                     self.abandon_mouse();
                 }
-                // mode 1004: CSI I on the way in, CSI O on the way out.
-                // has_focus, so a window that is already focused at startup
-                // still announces when 1004 turns on.
-                self.sync_focus();
+                // The event bit, not has_focus: that query can still say
+                // true after Focused(false) and would drop CSI O.
+                self.sync_focus(Some(f));
             }
             WindowEvent::DroppedFile(path) => {
                 // a dropped file lands at the prompt as a shell-ready path
@@ -2895,7 +2904,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     self.update_title();
                                 }
                             }
-                            self.sync_focus();
+                            self.sync_focus(None);
                             self.sel_pane = pi;
                             // 1 click = simple drag anchor, 2 = word, 3 = line
                             let n = self.clicks.click(Instant::now(), (row, col));
@@ -3117,7 +3126,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 t.focused =
                                     ((t.focused as i32 + d + n) % n) as usize;
                                 self.update_title();
-                                self.sync_focus();
+                                self.sync_focus(None);
                                 self.request_redraw();
                                 return;
                             }

@@ -230,7 +230,8 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       when it asks: xterm 1000 (press/release), 1002 (drag), 1003 (any
       motion), encoded as SGR 1006 or the legacy X10 byte form when 1006
       is off. X10 stops at coordinate 95: the wire byte is that plus 32,
-      and ConPTY's UTF-8 pipe turns 0x80 and above into U+FFFD. Mode 1005
+      and ConPTY's UTF-8 pipe turns 0x80 and above into U+FFFD, so a click
+      past column or row 95 is not reported. Mode 1005
       is not encoded (no silent X10 fallback). Buttons numbered 128 and
       up, and the horizontal wheel, are not reported. Coordinates are the
       pane's cells — padding and split gaps
@@ -241,15 +242,18 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       through the same restoration as the painter, then the index map
       points the glyph back at the grid column Claude stored. Shift+drag
       stays a local selection, and Shift+wheel scrolls that pane's own
-      history even on the alt screen. A focus loss, a tab switch, or a
-      pane close releases a tracked button (or drops the grab if tracking
-      is already off) so Alt+Tab cannot keep dragging. Mode 1004 sends
-      CSI I / CSI O from `Window::has_focus` when the window or the
-      focused pane changes, including the moment the program turns the
+      history even on the alt screen. A focus loss, a tab switch, opening
+      a new tab, or a pane close releases a tracked button (or drops the
+      grab if tracking is already off) so Alt+Tab cannot keep dragging.
+      Mode 1004 sends CSI I / CSI O when the window or the focused pane
+      changes. A `Focused` event passes its own bit, because
+      `Window::has_focus` can still read true for a moment after blur
+      and would swallow CSI O; every other path asks `has_focus`, including
+      the moment the program turns the
       mode on, and a RIS forgets the last CSI I so the next one is sent
       again. The wheel still scrolls the pane under the pointer and is
       not reported at all over the tab bar or the padding; Ctrl+wheel is
-      still font zoom. Proven: 101 unit tests (81
+      still font zoom. Proven: 102 unit tests (81
       before), including the encoder, the padding/split hit-test, the
       grab/focus/wheel router, and a
       shaped-Amiri hit on مرحبا and ١٧٥. Not proven here: a live htop /
