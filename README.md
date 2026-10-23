@@ -260,7 +260,9 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       parser never touches its stack — including the forms a digit/semicolon
       scanner misses (`ESC [ > 1 NUL u`, a C0 before the intermediate, a
       `:` sub-parameter). `CSI ? u` is answered by us with `CSI ?0u` (the
-      same probe reply Rio sends when the protocol is off), and the encoder
+      same probe reply Rio sends when the protocol is off), including a
+      query vte still accepts because a C0 inside the CSI does not end it
+      (`ESC [ ? NUL u`). The encoder
       masks the kitty bits out of `TermMode` so a hostile push cannot make
       a key emit CSI u. Set `kitty_protocol` to true to enable the encoder.
       On, the crate is [alacritty commit `542147067dd016fc5f49120ef0ba605a98a4e3a7`](https://github.com/alacritty/alacritty/commit/542147067dd016fc5f49120ef0ba605a98a4e3a7)
@@ -274,6 +276,8 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       patch was then unused. A vendor of 0.26.0 was the fallback if this
       commit did not build against our API; `cargo check --tests` for
       `x86_64-pc-windows-gnu` did build, so the pin is what shipped.
+      TODO: remove `[patch.crates-io]` and go back to the crates.io release
+      once alacritty_terminal 0.26.1 is published.
       With disambiguate on but alternate keys off, a non-ASCII chord is
       reported as its PC-101 key (`keyboard.kitty_base_layout_fallback`,
       default true) — `ؤ` on the C key is `CSI 99;5u`, not `CSI 1572;5u` —
@@ -281,8 +285,9 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       departure from the spec; turn the fallback off to send the Arabic
       codepoint.
       A crashed full-screen program leaks its flags into the shell. The
-      reset pops only the **current** screen's stack (4096 levels, so a
-      bypass deeper than 16 is actually drained) and does not emit `1049`.
+      reset pops only the **current** screen's stack, by the number of
+      levels that were counted, including a level whose mode is 0. Flag
+      bits alone do not make it pop, and it does not emit `1049`.
       Visiting the other screen cleared the selection, clobbered DECSC, and
       wiped the alt grid on the way back in — a prompt turned a TUI blank.
       It is a no-op when the protocol is off or that stack is empty. It runs
@@ -291,8 +296,10 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       `reset-keyboard`: it is taken from the program in the terminal, and
       `keybinds` can move it. RIS (`ESC c`) zeroes both depth counters,
       because the parser clears both stacks and a stale cap would drop the
-      next push. AltGr is text only on the kitty path, and only when `text`
-      differs from `key_without_modifiers` — Ctrl+Alt+1 stays a chord.
+      next push. AltGr is text when `text` is not that key and not its
+      PC-101 shift, compared case-insensitively, so Ctrl+Alt+Shift+A and
+      Ctrl+Alt+Shift+1 stay chords. It types with the protocol off too:
+      AltGr+E is €.
 - [x] **Security (High)** — the four High findings from the audit
       (`docs/SECURITY_AUDIT.md`). OSC 52 no longer writes the OS clipboard
       unless `osc52` is `"copy"`, the window is focused, and the write comes

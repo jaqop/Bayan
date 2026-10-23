@@ -160,11 +160,6 @@ pub struct SessionMeta {
 /// keyboard stack instead of panicking.
 const KITTY_STACK_CAP: u16 = 16;
 
-/// alacritty's keyboard stack never grows past this (`TITLE_STACK_MAX_DEPTH`).
-/// A reset pops this many so a bypass that pushed past [`KITTY_STACK_CAP`]
-/// is actually drained. `<16u` is not enough for that.
-const KEYBOARD_STACK_MAX: u16 = 4096;
-
 /// Events one PTY chunk produced, delivered to the UI thread by the reader.
 #[derive(Default)]
 pub(crate) struct ChunkEvents {
@@ -527,6 +522,41 @@ struct KittySeq {
 
 /// A complete `CSI <intermediate> <params> u` starting at `i`.
 fn kitty_seq_at(data: &[u8], i: usize) -> Option<KittySeq> {
+    if let Some(seq) = kitty_seq_strict(data, i) {
+        return Some(seq);
+    }
+    // vte executes C0 inside a CSI and still completes it. `ESC [ ? NUL u`
+    // is a query. The strict scanner misses the NUL, and with the protocol
+    // off the parser will not answer, so this has to.
+    let end = kitty_query_with_c0(data, i)?;
+    Some(KittySeq { end, kind: KittySeqKind::Query })
+}
+
+/// `0x00..=0x17`, `0x19`, `0x1C..=0x1F`. CAN, SUB and ESC abort the CSI.
+fn c0_inside_csi(b: u8) -> bool {
+    matches!(b, 0x00..=0x17 | 0x19 | 0x1C..=0x1F)
+}
+
+/// A `CSI ? u` query that may contain C0 bytes, the way vte still parses it.
+fn kitty_query_with_c0(data: &[u8], i: usize) -> Option<usize> {
+    if data.get(i) != Some(&0x1b) || data.get(i + 1) != Some(&b'[') {
+        return None;
+    }
+    let mut j = i + 2;
+    while j < data.len() && c0_inside_csi(data[j]) {
+        j += 1;
+    }
+    if data.get(j) != Some(&b'?') {
+        return None;
+    }
+    j += 1;
+    while j < data.len() && (matches!(data[j], b'0'..=b'9' | b';') || c0_inside_csi(data[j])) {
+        j += 1;
+    }
+    (data.get(j) == Some(&b'u')).then_some(j + 1)
+}
+
+fn kitty_seq_strict(data: &[u8], i: usize) -> Option<KittySeq> {
     if data.get(i) != Some(&0x1b) || data.get(i + 1) != Some(&b'[') {
         return None;
     }
@@ -625,26 +655,24 @@ fn repair_keyboard_stack<T: EventListener>(
 /// Drop keyboard-mode levels on the current screen only.
 ///
 /// No-op when the protocol is off (the parser never recorded a stack) or
-/// the current stack is empty. A `1049h`/`1049l` visit of the other screen
+/// the counted depth is 0. A `1049h`/`1049l` visit of the other screen
 /// clears the selection, clobbers DECSC, and wipes the alt grid on the way
 /// back in — a prompt or Ctrl+Shift+K must not do that. The other screen's
 /// stack stays where it is.
 ///
-/// The pop count is the crate's hard maximum, not 16. Bypasses can push
-/// past the sequences we count, and `<16u` leaves those levels in place.
+/// The pop count is the depth, not the flag bits. A stacked layer whose
+/// mode is 0 sets no kitty bits, and skipping it would leave the level
+/// under it in place. Flag bits from a sequence we did not count are not
+/// a stack.
 pub(crate) fn reset_keyboard_modes<T: EventListener>(
     parser: &mut Processor,
     t: &mut Term<T>,
     meta: &mut SessionMeta,
 ) {
-    if !meta.kitty_protocol {
+    if !meta.kitty_protocol || meta.kitty_depth == 0 {
         return;
     }
-    let nonempty = meta.kitty_depth > 0 || t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL);
-    if !nonempty {
-        return;
-    }
-    let pop = format!("\x1b[<{KEYBOARD_STACK_MAX}u");
+    let pop = format!("\x1b[<{}u", meta.kitty_depth);
     parser.advance(t, pop.as_bytes());
     meta.kitty_depth = 0;
 }
@@ -2634,7 +2662,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_drains_bypass_pushes_past_the_counted_cap() {
+    fn reset_pops_zero_value_layers_by_depth() {
         let KittyFixture {
             term: mut t,
             parser: mut p,
@@ -2642,16 +2670,60 @@ mod tests {
             mut carry,
             log,
         } = kitty_term(true);
-        // Not counted by kitty_seq_at, so kitty_depth stays 0, but the real
-        // stack is 20 deep. `<16u` would leave four levels.
+        // Two counted levels. The top mode is 0, so no kitty bits are set.
+        // A flags check would skip the reset and a later pop would reveal 1.
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[>1u\x1b[>0u");
+        assert_eq!(meta.kitty_depth, 2);
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        reset_keyboard_modes(&mut p, &mut t, &mut meta);
+        assert_eq!(meta.kitty_depth, 0);
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
+        // The extra pop must not uncover the buried 1.
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[<u\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+    }
+
+    #[test]
+    fn reset_ignores_flag_bits_when_the_counted_depth_is_zero() {
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log,
+        } = kitty_term(true);
+        // A `:` sub-parameter is not counted, so kitty_depth stays 0 while
+        // the real stack is 20 deep and disambiguate is on. Popping from
+        // the flag bits would drain it. The depth is what we pop.
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, &repeat(b"\x1b[>1:1u", 20));
         assert_eq!(meta.kitty_depth, 0);
         assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
         reset_keyboard_modes(&mut p, &mut t, &mut meta);
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?u!");
-        assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
-        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        assert_eq!(take_writes(&log), vec!["\x1b[?1u".to_string()]);
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
         assert_eq!(cell(&t, 0), '!');
+    }
+
+    #[test]
+    fn protocol_off_answers_a_query_with_a_c0_inside_the_csi() {
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log,
+        } = kitty_term(false);
+        // NUL does not end the CSI. vte would still execute the query.
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?\x00u");
+        assert!(take_writes(&log).is_empty(), "parser must stay silent");
+        assert_eq!(ev.pty_replies, vec!["\x1b[?0u".to_string()]);
+        // C0 before the intermediate is the same sequence.
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[\x00?u");
+        assert!(take_writes(&log).is_empty());
+        assert_eq!(ev.pty_replies, vec!["\x1b[?0u".to_string()]);
     }
 
     #[test]

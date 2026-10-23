@@ -3686,14 +3686,20 @@ mod palette_tests {
 
     #[test]
     fn the_hint_line_counts_what_the_list_shows() {
-        // guards the palette's one real invariant: the filtered list the user
-        // sees and the list Enter indexes into are the same list. They are
-        // built once in palette_rows and passed to the renderer, which never
-        // filters — so a drift here would be a logic error, not a redraw bug.
-        let all = keybinds::Action::ALL.len();
-        // reset-keyboard is the thirteenth built-in. The palette and the
-        // shortcuts editor both walk Action::ALL, so this count is the list.
-        assert_eq!(all, 13, "13 built-in actions expected");
+        // The hint prints the length of the list Enter indexes into. That
+        // list is Action::ALL (plugins add to it at runtime). A literal
+        // count goes stale the moment an action is added.
+        let n = keybinds::Action::ALL.len();
+        assert_eq!(
+            render::palette_hint(n),
+            format!("{n} نتيجة · Enter تشغيل · ↑↓ تنقّل · Esc إغلاق"),
+        );
+        let extra = n + 1;
+        assert_eq!(
+            render::palette_hint(extra),
+            format!("{extra} نتيجة · Enter تشغيل · ↑↓ تنقّل · Esc إغلاق"),
+        );
+        assert_eq!(render::palette_hint(0), "لا نتائج · Esc إغلاق");
     }
 }
 
