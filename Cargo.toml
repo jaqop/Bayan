@@ -36,6 +36,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_UI_Shell", # Shell_NotifyIcon balloons = native toasts, no WinRT
     "Win32_Storage_FileSystem", # GetShortPathNameW: ConPTY chokes on spaces in paths
+    "Win32_System_Com", # CoInitializeEx on the link-open thread, before ShellExecuteW
 ] }
 
 [target."cfg(windows)".build-dependencies]

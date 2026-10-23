@@ -244,8 +244,9 @@ pub enum UserEvent {
     CommandFinished(u64, bool),
     /// Pane `id`'s shell exited.
     Exit(u64),
-    /// A link open (browser, editor, explorer) failed off the UI thread.
-    LinkFailed(String),
+    /// A link open failed, or `settle` refused it, off the UI thread.
+    /// `reason` is already [`link::RefuseReason::label`].
+    LinkFailed { reason: String, shown: String },
 }
 
 /// The link under the pointer. Stable while the pointer stays inside it,
@@ -1941,13 +1942,14 @@ impl App {
         self.focus_pane_at(pane);
         self.sync_focus(None);
         let cwd = self.pane_link_cwd(id);
-        let code = link::find_code_exe();
-        let code_s = code.as_ref().map(|p| p.to_string_lossy().into_owned());
-        match span.activate(cwd.as_deref(), self.config.editor.as_deref(), code_s.as_deref()) {
+        // `exists` and `find_code_exe` run on the link thread. A disconnected
+        // network drive must not stall this handler.
+        match span.activate(cwd.as_deref(), self.config.editor.as_deref(), None) {
             action @ (link::Action::Browse(_)
             | link::Action::OpenPath(_)
             | link::Action::Reveal(_)
-            | link::Action::Edit { .. }) => self.spawn_link_open(action),
+            | link::Action::Edit { .. }
+            | link::Action::EditDefault { .. }) => self.spawn_link_open(action),
             link::Action::Confirm { uri, host } => {
                 self.blocked_link = Some(BlockedLink {
                     reason: link::HOST_CONFIRM.to_string(),
@@ -1972,7 +1974,11 @@ impl App {
             link::Action::Browse(s) | link::Action::OpenPath(s) | link::Action::Reveal(s) => {
                 s.clone()
             }
-            link::Action::Edit { argv } => argv.join(" "),
+            link::Action::Edit { argv, .. } => argv.join(" "),
+            link::Action::EditDefault { path, line, col } => match col {
+                Some(c) => format!("{path}:{line}:{c}"),
+                None => format!("{path}:{line}"),
+            },
             link::Action::Confirm { .. } | link::Action::Refuse { .. } => return,
         };
         let proxy = self.proxy.clone();
@@ -1980,8 +1986,20 @@ impl App {
         let spawned = std::thread::Builder::new()
             .name("bayan-link".into())
             .spawn(move || {
+                link::init_link_thread();
+                let action = link::settle_live(action);
+                if let link::Action::Refuse { reason, shown } = &action {
+                    let _ = proxy.send_event(UserEvent::LinkFailed {
+                        reason: reason.label().to_string(),
+                        shown: shown.clone(),
+                    });
+                    return;
+                }
                 if !link::perform_open(&action) {
-                    let _ = proxy.send_event(UserEvent::LinkFailed(shown_for_fail));
+                    let _ = proxy.send_event(UserEvent::LinkFailed {
+                        reason: link::RefuseReason::Editor.label().to_string(),
+                        shown: shown_for_fail,
+                    });
                 }
             });
         if spawned.is_err() {
@@ -2553,6 +2571,7 @@ impl App {
                         px.height as usize,
                         &block.reason,
                         &block.shown,
+                        block.confirm_uri.is_some(),
                     );
                 }
                 if let Some((rows, sel, capturing, flash)) = &shortcuts_view {
@@ -2786,6 +2805,11 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::Wakeup(id) => {
                 self.link_cache.invalidate_pane(id);
+                // The row that was hovered may have moved. Drop the tooltip
+                // and the click target together, or they can disagree.
+                if self.link_hover.as_ref().is_some_and(|h| h.pane_id == id) {
+                    self.clear_link_hover();
+                }
                 if !self.first_output {
                     self.first_output = true;
                     crate::prof::mark("first pty output");
@@ -2900,8 +2924,14 @@ impl ApplicationHandler<UserEvent> for App {
                     self.remove_pane(ti, pi, el);
                 }
             }
-            UserEvent::LinkFailed(shown) => {
-                self.refuse_link(link::RefuseReason::Editor, &shown);
+            UserEvent::LinkFailed { reason, shown } => {
+                self.blocked_link = Some(BlockedLink {
+                    reason,
+                    shown: link::preview(&shown, 160),
+                    confirm_uri: None,
+                });
+                self.clear_link_hover();
+                self.request_redraw();
             }
         }
     }
@@ -3385,9 +3415,9 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_redraw();
                     return;
                 }
-                // a refused link owns the keyboard. Esc dismisses. Enter
-                // dismisses a refusal and opens only a userinfo confirm.
-                // Nothing is typed into the PTY.
+                // a link card owns the keyboard. Esc dismisses. Enter
+                // dismisses a refusal and opens only a confirm card
+                // (userinfo, or a non-ASCII host). Nothing is typed into the PTY.
                 if self.blocked_link.is_some() {
                     let enter = matches!(&event.logical_key, Key::Named(NamedKey::Enter));
                     let escape = matches!(&event.logical_key, Key::Named(NamedKey::Escape));

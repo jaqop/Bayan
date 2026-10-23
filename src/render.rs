@@ -2487,22 +2487,28 @@ impl Renderer {
                       y + 12 + self.cell_h as i32, 1.0);
     }
 
-    /// A link Ctrl+click was refused. Enter and Esc both dismiss; neither
-    /// opens the target. The second line is the sanitized destination.
+    /// A link card. `may_open` is the confirm card (mint bar, Enter opens).
+    /// A refusal is the red bar, and Enter only dismisses it.
     pub fn draw_link_block(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
-                           reason: &str, target: &str) {
+                           reason: &str, target: &str, may_open: bool) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
         push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 150));
         let w = ((self.cell_w * 62.0) as i32).min(fw as i32 - 80);
         let pad = 18;
-        let h = (self.cell_h * 3.0) as i32 + pad * 2 + 8;
+        let h = (self.cell_h * 4.0) as i32 + pad * 2 + 12;
         let x = (fw as i32 - w) / 2;
         let y = self.tab_bar_h() as i32 + (fh as i32 - h) / 3;
+        let accent = if may_open {
+            (0x58, 0xd1, 0xc0)
+        } else {
+            (0xcf, 0x22, 0x2e)
+        };
         push_rect(out, whole, x - 3, y - 3, w + 6, h + 6, c4((0x0d, 0x11, 0x14), 235));
         push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 255));
-        push_rect(out, whole, x, y, w, 3, c4((0xcf, 0x22, 0x2e), 255));
+        push_rect(out, whole, x, y, w, 3, c4(accent, 255));
+        let prefix = crate::link::card_title_prefix(may_open);
         let title = [Seg {
-            text: format!("رابط مرفوض — {reason}"),
+            text: format!("{prefix} — {reason}"),
             fg: self.fg,
             style: ST_BOLD,
         }];
@@ -2510,9 +2516,13 @@ impl Renderer {
         let dest = [Seg::plain(target.to_string(), (0xf2, 0xcc, 0x60))];
         self.draw_run(&dest, false, out, whole, (x + pad) as f32,
                       y + pad + self.cell_h as i32, 1.0);
-        let keys = [Seg::plain("Esc إغلاق", (0x9a, 0xa4, 0xb2))];
-        self.draw_run(&keys, true, out, whole, (x + pad) as f32,
+        let (ar, en) = crate::link::card_key_lines(may_open);
+        let keys_ar = [Seg::plain(ar.to_string(), (0x9a, 0xa4, 0xb2))];
+        self.draw_run(&keys_ar, true, out, whole, (x + pad) as f32,
                       y + pad + (self.cell_h * 2.0) as i32 + 4, 1.0);
+        let keys_en = [Seg::plain(en.to_string(), (0x6e, 0x78, 0x85))];
+        self.draw_run(&keys_en, true, out, whole, (x + pad) as f32,
+                      y + pad + (self.cell_h * 3.0) as i32 + 6, 1.0);
     }
 
     /// The paste guard (EasyTer's protection): a multi-line/huge paste, or a

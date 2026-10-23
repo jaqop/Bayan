@@ -9,18 +9,21 @@
 //! and grep.
 //!
 //! Opening is deliberately narrow. `http` and `https` go to `ShellExecuteW`
-//! with the URI as the single `lpFile`. A `file` URI opens the same way
-//! only when the path is a local drive path and the extension is not one
-//! Windows would execute. `javascript:`, `ms-*`, `search-ms:`, `data:`, a
-//! custom protocol, a UNC or device path, and those extensions are refused
-//! on a card. A `path:line` location goes to the editor's `Command` argv,
-//! or `explorer.exe /select,<path>` when no editor is configured — never
-//! to the file's own association. Control characters and bidi overrides
-//! are refused too, including when they only appear after percent-decoding,
-//! and nothing longer than [`MAX_TARGET`] bytes is opened. `{file}`
-//! `{line}` `{col}` are substituted once, after the template is split, so
-//! a path with spaces stays one argument and a `{line}` inside the path
-//! is not rewritten. The open itself runs off the UI thread.
+//! with the URI as the single `lpFile`. A `file` URI association-opens only
+//! a local drive path whose extension is on the document/media allowlist
+//! (`.txt`, `.md`, `.pdf`, images, …). Everything else, including no
+//! extension, is revealed in Explorer (`/select`). `javascript:`, `ms-*`,
+//! `search-ms:`, `data:`, a custom protocol, a UNC or device path, an
+//! alternate data stream, and a path that breaks out of `/select,"…"` are
+//! refused on a card. A `path:line` location goes to the editor's
+//! `Command` argv, or to that same reveal when no editor is configured —
+//! never to the file's own association. Control characters and bidi
+//! overrides are refused too, including when they only appear after
+//! percent-decoding, and nothing longer than [`MAX_TARGET`] bytes is
+//! opened. `{file}` `{line}` `{col}` are substituted once, after the
+//! template is split, so a path with spaces stays one argument and a
+//! `{line}` inside the path is not rewritten. Disk checks and the open
+//! itself run off the UI thread.
 //!
 //! Mouse tracking still owns a plain click. Ctrl+click is the link
 //! gesture even while tracking is on. Shift keeps the gesture for local
@@ -95,6 +98,9 @@ pub enum RefuseReason {
     BadFile,
     Editor,
     /// PATHEXT or another extension Windows association-opens as a program.
+    /// Association-open now reveals these instead of constructing this
+    /// variant. The label stays so a card can still name the reason.
+    #[allow(dead_code)]
     Blocked,
     /// The path is local, and it is not on disk.
     Missing,
@@ -126,18 +132,25 @@ pub enum Action {
     /// `ShellExecuteW` lpFile = this URI. http or https only.
     Browse(String),
     /// `ShellExecuteW` lpFile = this filesystem path. One argument.
-    /// Never a PATHEXT (or other association-executed) extension.
+    /// Only an allowlisted document or media extension, after `settle`
+    /// has expanded an 8.3 name and re-checked the long path.
     OpenPath(String),
-    /// `explorer.exe /select,<path>` as a `Command` argument vector.
-    /// This is how a `path:line` link opens when no editor is configured.
+    /// `%WINDIR%\explorer.exe` with `/select,"<path>"` passed via
+    /// `CommandExt::raw_arg`. Not an association open.
     Reveal(String),
     /// `Command::new(argv[0]).args(&argv[1..])`. No association fallback:
     /// a spawn failure is reported, and the file is not opened by its type.
-    Edit {
-        argv: Vec<String>,
+    /// `path` is the file `settle` checks; it is not an association target.
+    Edit { argv: Vec<String>, path: String },
+    /// `path:line` with no editor chosen yet. `settle` looks up `code.exe`
+    /// off the UI thread and either becomes [`Action::Edit`] or [`Action::Reveal`].
+    EditDefault {
+        path: String,
+        line: u32,
+        col: Option<u32>,
     },
-    /// `http(s)` with userinfo (`user@host` or `good.com@evil.com`).
-    /// The card shows `host` first. Enter is what opens `uri`.
+    /// `http(s)` with userinfo, or a non-ASCII host. The card shows `host`
+    /// first (punycode when the host was not ASCII). Enter opens `uri`.
     Confirm {
         uri: String,
         host: String,
@@ -348,6 +361,10 @@ pub fn resolve_against_cwd(path: &str, cwd: Option<&str>) -> Option<String> {
         let cwd = cwd_hook(cwd)?;
         if path.is_empty() {
             cwd
+        } else if cwd.ends_with('\\') {
+            // Drive root already ends in a slash. A second one is `\\`,
+            // which [`crate::term::accept_local_cwd`] rejects.
+            format!("{cwd}{path}")
         } else {
             format!("{cwd}\\{path}")
         }
@@ -506,11 +523,165 @@ fn http_authority(uri: &str) -> Option<(String, bool)> {
     }
 }
 
-/// Tooltip text. When the URI has userinfo the real host is first, so a
-/// label of `good.com` cannot hide `evil.com`.
+/// RFC 3492 punycode of one label, without the `xn--` prefix.
+/// ASCII letters are lowercased first. Overflow yields `None`.
+fn punycode_encode(input: &str) -> Option<String> {
+    const BASE: u32 = 36;
+    const TMIN: u32 = 1;
+    const TMAX: u32 = 26;
+    const SKEW: u32 = 38;
+    const DAMP: u32 = 700;
+    const INITIAL_BIAS: u32 = 72;
+    const INITIAL_N: u32 = 128;
+
+    fn adapt(mut delta: u32, numpoints: u32, first: bool) -> u32 {
+        delta /= if first { DAMP } else { 2 };
+        delta += delta / numpoints;
+        let mut k = 0u32;
+        while delta > ((BASE - TMIN) * TMAX) / 2 {
+            delta /= BASE - TMIN;
+            k += BASE;
+        }
+        k + ((BASE - TMIN + 1) * delta) / (delta + SKEW)
+    }
+
+    fn digit(d: u32) -> char {
+        if d < 26 {
+            char::from(b'a' + d as u8)
+        } else {
+            char::from(b'0' + (d - 26) as u8)
+        }
+    }
+
+    let cps: Vec<u32> = input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_uppercase() {
+                c.to_ascii_lowercase() as u32
+            } else {
+                c as u32
+            }
+        })
+        .collect();
+    let mut out = String::new();
+    let mut basic = 0u32;
+    for &c in &cps {
+        if c < 128 {
+            out.push(char::from_u32(c)?);
+            basic += 1;
+        }
+    }
+    let len = cps.len() as u32;
+    if basic > 0 && basic < len {
+        out.push('-');
+    }
+    let mut n = INITIAL_N;
+    let mut delta = 0u32;
+    let mut bias = INITIAL_BIAS;
+    let mut h = basic;
+    while h < len {
+        let m = cps.iter().copied().filter(|&c| c >= n).min()?;
+        let gap = m.checked_sub(n)?;
+        delta = delta.checked_add(gap.checked_mul(h + 1)?)?;
+        n = m;
+        for &c in &cps {
+            if c < n {
+                delta = delta.checked_add(1)?;
+            } else if c == n {
+                let mut q = delta;
+                let mut k = BASE;
+                loop {
+                    let t = if k <= bias {
+                        TMIN
+                    } else if k >= bias.saturating_add(TMAX) {
+                        TMAX
+                    } else {
+                        k - bias
+                    };
+                    if q < t {
+                        break;
+                    }
+                    let base_t = BASE - t;
+                    out.push(digit(t + (q - t) % base_t));
+                    q = (q - t) / base_t;
+                    k = k.saturating_add(BASE);
+                }
+                out.push(digit(q));
+                bias = adapt(delta, h + 1, h == basic);
+                delta = 0;
+                h += 1;
+            }
+        }
+        delta = delta.checked_add(1)?;
+        n = n.checked_add(1)?;
+    }
+    Some(out)
+}
+
+fn punycode_label(label: &str) -> Option<String> {
+    if label.is_empty() {
+        return None;
+    }
+    if label.is_ascii() {
+        Some(label.to_ascii_lowercase())
+    } else {
+        punycode_encode(label).map(|body| format!("xn--{body}"))
+    }
+}
+
+/// Each dot-label encoded. `None` when a label is empty or the encoder overflows.
+fn punycode_host(host: &str) -> Option<String> {
+    let mut labels = Vec::new();
+    for label in host.split('.') {
+        labels.push(punycode_label(label)?);
+    }
+    Some(labels.join("."))
+}
+
+/// Replace the host of an `http(s)` URI, keeping userinfo, port, path,
+/// query, and fragment.
+fn rewrite_host(uri: &str, ascii_host: &str) -> String {
+    let Some(scheme) = scheme_name(uri) else {
+        return uri.to_string();
+    };
+    let after = &uri[scheme.len()..];
+    let Some(rest) = after.strip_prefix("://") else {
+        return uri.to_string();
+    };
+    let hostport = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let suffix = &rest[hostport.len()..];
+    let (userinfo, host_and_port) = if let Some(at) = hostport.rfind('@') {
+        (&hostport[..=at], &hostport[at + 1..])
+    } else {
+        ("", hostport)
+    };
+    let port = if host_and_port.starts_with('[') {
+        ""
+    } else if let Some(idx) = host_and_port.rfind(':') {
+        &host_and_port[idx..]
+    } else {
+        ""
+    };
+    let mut out = String::new();
+    out.push_str(&uri[..scheme.len()]);
+    out.push_str("://");
+    out.push_str(userinfo);
+    out.push_str(ascii_host);
+    out.push_str(port);
+    out.push_str(suffix);
+    out
+}
+
+/// Tooltip text. Userinfo and a non-ASCII host lead with the host that
+/// will actually be opened (punycode, when a label is not ASCII), so a
+/// label of `good.com` cannot hide `evil.com` and an IDN cannot hide its
+/// ASCII form.
 fn host_tooltip(uri: &str) -> String {
     match http_authority(uri) {
-        Some((host, true)) => preview(&format!("{host} — {uri}"), 200),
+        Some((host, has_userinfo)) if has_userinfo || !host.is_ascii() => {
+            let shown = punycode_host(&host).unwrap_or(host);
+            preview(&format!("{shown} — {uri}"), 200)
+        }
         _ => preview(uri, 200),
     }
 }
@@ -526,11 +697,30 @@ pub fn plan_uri(uri: &str) -> Action {
     };
     if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
         match http_authority(uri) {
-            Some((host, true)) => Action::Confirm {
-                uri: uri.to_string(),
-                host,
-            },
-            Some((_, false)) => Action::Browse(uri.to_string()),
+            Some((host, has_userinfo)) => {
+                let non_ascii = !host.is_ascii();
+                if has_userinfo || non_ascii {
+                    let shown = if non_ascii {
+                        match punycode_host(&host) {
+                            Some(ascii) if ascii.is_ascii() => ascii,
+                            _ => return refuse(RefuseReason::Scheme, uri),
+                        }
+                    } else {
+                        host
+                    };
+                    let opened = if non_ascii {
+                        rewrite_host(uri, &shown)
+                    } else {
+                        uri.to_string()
+                    };
+                    Action::Confirm {
+                        uri: opened,
+                        host: shown,
+                    }
+                } else {
+                    Action::Browse(uri.to_string())
+                }
+            }
             None => refuse(RefuseReason::Scheme, uri),
         }
     } else if scheme.eq_ignore_ascii_case("file") {
@@ -543,20 +733,19 @@ pub fn plan_uri(uri: &str) -> Action {
     }
 }
 
-/// Association-open of a local file URI. Executables and the other
-/// extensions Windows would run are refused before `exists`, and `exists`
-/// is only reached for a path [`file_uri_path`] already accepted.
+/// Association-open of a local file URI, as an intent. `exists` and 8.3
+/// expansion run later in [`settle`], on the link thread. Only the
+/// document/media allowlist may become [`Action::OpenPath`]; every other
+/// extension, including none, is [`Action::Reveal`].
 fn plan_local_open(path: &str) -> Action {
     if crate::term::unc_or_device(path) {
         return refuse(RefuseReason::BadFile, path);
     }
-    if is_blocked_file(path) {
-        return refuse(RefuseReason::Blocked, path);
+    if is_allowlisted(path) {
+        Action::OpenPath(path.to_string())
+    } else {
+        Action::Reveal(path.to_string())
     }
-    if !local_file_exists(path) {
-        return refuse(RefuseReason::Missing, path);
-    }
-    Action::OpenPath(path.to_string())
 }
 
 fn local_file_exists(path: &str) -> bool {
@@ -595,25 +784,17 @@ fn plan_file(
         return refuse(RefuseReason::BadFile, path);
     };
     // `path:line` never association-opens the file. A shell template is
-    // refused even when the file is missing, so the missing-file card
-    // cannot hide `cmd /c`.
+    // refused before any disk check, so a missing file cannot hide `cmd /c`.
+    // Whether the file exists is [`settle`]'s job, on the link thread.
     let configured = editor.map(str::trim).filter(|s| !s.is_empty());
     if let Some(template) = configured {
         match expand_editor(template, &full, Some(line), col) {
-            Some(argv) if !is_shell_program(&argv[0]) => {
-                if !local_file_exists(&full) {
-                    return refuse(RefuseReason::Missing, &full);
-                }
-                Action::Edit { argv }
-            }
+            Some(argv) if !is_shell_program(&argv[0]) => Action::Edit { argv, path: full },
             _ => refuse(RefuseReason::Editor, template),
         }
     } else if let Some(exe) = code_exe.map(str::trim).filter(|s| !s.is_empty()) {
         if is_shell_program(exe) {
             return refuse(RefuseReason::Editor, exe);
-        }
-        if !local_file_exists(&full) {
-            return refuse(RefuseReason::Missing, &full);
         }
         match expand_editor("code -g {file}:{line}:{col}", &full, Some(line), col) {
             Some(mut argv) => {
@@ -621,14 +802,16 @@ fn plan_file(
                 if is_shell_program(&argv[0]) {
                     return refuse(RefuseReason::Editor, exe);
                 }
-                Action::Edit { argv }
+                Action::Edit { argv, path: full }
             }
             None => refuse(RefuseReason::Editor, exe),
         }
-    } else if !local_file_exists(&full) {
-        refuse(RefuseReason::Missing, &full)
     } else {
-        Action::Reveal(full)
+        Action::EditDefault {
+            path: full,
+            line,
+            col,
+        }
     }
 }
 
@@ -649,61 +832,31 @@ fn is_shell_program(prog: &str) -> bool {
             | "wscript"
             | "cscript"
             | "rundll32"
+            | "regsvr32"
+            | "msiexec"
+            | "mmc"
+            | "hh"
     )
 }
 
-/// Extensions association-open must never run. PATHEXT is read at runtime;
-/// the built-in list still applies when that variable is empty or stripped.
-const BLOCKED_EXTS: &[&str] = &[
-    ".com",
-    ".exe",
-    ".bat",
-    ".cmd",
-    ".lnk",
-    ".url",
-    ".hta",
-    ".scr",
-    ".msi",
-    ".ps1",
-    ".vbs",
-    ".vbe",
-    ".js",
-    ".jse",
-    ".wsf",
-    ".wsh",
-    ".cpl",
-    ".appref-ms",
-    ".library-ms",
-    ".search-ms",
-    ".settingcontent-ms",
-    ".application",
-    ".reg",
-    ".pif",
+/// Extensions `ShellExecuteW` `"open"` may receive. Source files are not
+/// here: a `path:line` link goes to the editor, and a bare `file` URI of
+/// a source file is revealed.
+const ALLOWED_EXTS: &[&str] = &[
+    ".txt", ".md", ".log", ".json", ".csv", ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp",
+    ".bmp", ".svg",
 ];
 
-fn normalize_ext(ext: &str) -> Option<String> {
-    let ext = ext.trim().trim_start_matches('*');
-    if ext.is_empty() || ext == "." {
-        return None;
-    }
-    let ext = if ext.starts_with('.') {
-        ext.to_ascii_lowercase()
-    } else {
-        format!(".{}", ext.to_ascii_lowercase())
-    };
-    Some(ext)
-}
-
 /// Filename used for the extension check. Trailing dots and spaces are
-/// ignored the way Windows ignores them, and `name.exe:stream` is judged
-/// as `name.exe`.
+/// ignored the way Windows ignores them. A colon in the leaf is an
+/// alternate data stream (`a.txt:evil.exe`); it matches no allowlisted
+/// extension, and [`crate::term::accept_local_cwd`] rejects the path.
 fn leaf_for_extension(path: &str) -> String {
     let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
     let file = file.trim_end_matches([' ', '.']);
-    let file = match file.rsplit_once(':') {
-        Some((base, stream)) if !stream.is_empty() && base.contains('.') => base,
-        _ => file,
-    };
+    if file.contains(':') {
+        return String::new();
+    }
     file.to_ascii_lowercase()
 }
 
@@ -711,40 +864,265 @@ fn ext_matches(leaf: &str, ext: &str) -> bool {
     leaf.len() > ext.len() && leaf.ends_with(ext)
 }
 
-fn is_blocked_path(path: &str, pathext: &[String]) -> bool {
+fn is_allowlisted(path: &str) -> bool {
     let leaf = leaf_for_extension(path);
-    if BLOCKED_EXTS.iter().any(|ext| ext_matches(&leaf, ext)) {
-        return true;
+    ALLOWED_EXTS.iter().any(|ext| ext_matches(&leaf, ext))
+}
+
+fn has_short_component(path: &str) -> bool {
+    path.split(['\\', '/']).any(|comp| comp.contains('~'))
+}
+
+/// `GetLongPathNameW` returns `\\?\` paths. `\\?\UNC\…` becomes a UNC
+/// (`\\…`), which the local-drive gate then refuses. `\\?\C:\…` drops the prefix.
+fn strip_verbatim(path: &str) -> String {
+    let lower = path.to_ascii_lowercase();
+    if lower.starts_with(r"\\?\unc\") {
+        format!(r"\\{}", &path[r"\\?\UNC\".len()..])
+    } else if lower.starts_with(r"\\?\") {
+        path[r"\\?\".len()..].to_string()
+    } else {
+        path.to_string()
     }
-    pathext
-        .iter()
-        .any(|ext| normalize_ext(ext).is_some_and(|ext| ext_matches(&leaf, &ext)))
 }
 
-fn is_blocked_file(path: &str) -> bool {
-    is_blocked_path(path, &pathexts())
+/// Expand an 8.3 name when the file is already known to exist. `None`
+/// means the name could not be expanded; a `~` component in that case is
+/// revealed rather than association-opened.
+fn win_long_path(path: &str) -> Option<String> {
+    #[cfg(windows)]
+    {
+        use std::ffi::{OsStr, OsString};
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Storage::FileSystem::GetLongPathNameW;
+        let wide: Vec<u16> = OsStr::new(path)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut buf = vec![0u16; 32_768];
+        let n = unsafe { GetLongPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+        if n == 0 || n as usize >= buf.len() {
+            return None;
+        }
+        let os = OsString::from_wide(&buf[..n as usize]);
+        Some(strip_verbatim(&os.to_string_lossy()))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
 }
 
-/// `explorer.exe /select,<path>`. One argument after the program, no shell.
-pub fn reveal_argv(path: &str) -> Vec<String> {
-    vec!["explorer.exe".into(), format!("/select,{path}")]
+enum DiskPath {
+    /// Re-classify by the allowlist (the long path, when expansion worked).
+    Ready(String),
+    /// A `~` component that could not be expanded. Always reveal.
+    ForceReveal(String),
+}
+
+fn prepare_disk<E, L>(path: &str, exists: &E, long_path: &L) -> Result<DiskPath, Action>
+where
+    E: Fn(&str) -> bool,
+    L: Fn(&str) -> Option<String>,
+{
+    let Some(path) = crate::term::accept_local_cwd(path) else {
+        return Err(refuse(RefuseReason::BadFile, path));
+    };
+    if crate::term::unc_or_device(&path) {
+        return Err(refuse(RefuseReason::BadFile, &path));
+    }
+    if !exists(&path) {
+        if has_short_component(&path) {
+            return Ok(DiskPath::ForceReveal(path));
+        }
+        return Err(refuse(RefuseReason::Missing, &path));
+    }
+    match long_path(&path) {
+        Some(long) => {
+            let long = strip_verbatim(&long);
+            let Some(long) = crate::term::accept_local_cwd(&long) else {
+                return Err(refuse(RefuseReason::BadFile, &long));
+            };
+            if crate::term::unc_or_device(&long) {
+                return Err(refuse(RefuseReason::BadFile, &long));
+            }
+            Ok(DiskPath::Ready(long))
+        }
+        None if has_short_component(&path) => Ok(DiskPath::ForceReveal(path)),
+        None => Ok(DiskPath::Ready(path)),
+    }
+}
+
+fn classify_open(path: String) -> Action {
+    if is_allowlisted(&path) {
+        Action::OpenPath(path)
+    } else {
+        Action::Reveal(path)
+    }
+}
+
+fn rewrite_edit_path(argv: Vec<String>, from: &str, to: &str) -> Vec<String> {
+    if from == to {
+        argv
+    } else {
+        argv.into_iter().map(|arg| arg.replace(from, to)).collect()
+    }
+}
+
+fn settle_edit_default<E, L, C>(
+    path: String,
+    line: u32,
+    col: Option<u32>,
+    exists: &E,
+    long_path: &L,
+    code_exe: &C,
+) -> Action
+where
+    E: Fn(&str) -> bool,
+    L: Fn(&str) -> Option<String>,
+    C: Fn() -> Option<String>,
+{
+    let path = match prepare_disk(&path, exists, long_path) {
+        Ok(DiskPath::ForceReveal(path)) => return Action::Reveal(path),
+        Ok(DiskPath::Ready(path)) => path,
+        Err(refusal) => return refusal,
+    };
+    // Still never association-open. No editor means reveal.
+    if let Some(exe) = code_exe() {
+        let exe = exe.trim();
+        if !exe.is_empty() && !is_shell_program(exe) {
+            if let Some(mut argv) =
+                expand_editor("code -g {file}:{line}:{col}", &path, Some(line), col)
+            {
+                argv[0] = exe.to_string();
+                if !is_shell_program(&argv[0]) {
+                    return Action::Edit { argv, path };
+                }
+            }
+        }
+    }
+    Action::Reveal(path)
+}
+
+/// Apply `exists` and 8.3 expansion, then the allowlist, off the UI thread.
+/// `long_path` returns the expanded path (already without a `\\?\` prefix,
+/// or with one — it is stripped). `None` means expansion failed.
+pub fn settle<E, L, C>(action: Action, exists: E, long_path: L, code_exe: C) -> Action
+where
+    E: Fn(&str) -> bool,
+    L: Fn(&str) -> Option<String>,
+    C: Fn() -> Option<String>,
+{
+    match action {
+        Action::OpenPath(path) | Action::Reveal(path) => match prepare_disk(&path, &exists, &long_path)
+        {
+            Ok(DiskPath::ForceReveal(path)) => Action::Reveal(path),
+            Ok(DiskPath::Ready(path)) => classify_open(path),
+            Err(refusal) => refusal,
+        },
+        Action::Edit { argv, path } => match prepare_disk(&path, &exists, &long_path) {
+            Err(refusal) => refusal,
+            Ok(DiskPath::ForceReveal(path)) => Action::Reveal(path),
+            Ok(DiskPath::Ready(full)) => {
+                let argv = rewrite_edit_path(argv, &path, &full);
+                Action::Edit { argv, path: full }
+            }
+        },
+        Action::EditDefault { path, line, col } => {
+            settle_edit_default(path, line, col, &exists, &long_path, &code_exe)
+        }
+        other => other,
+    }
+}
+
+pub fn settle_live(action: Action) -> Action {
+    settle(action, local_file_exists, win_long_path, || {
+        find_code_exe().map(|p| p.to_string_lossy().into_owned())
+    })
+}
+
+/// Apartment COM, before `ShellExecuteW`. Called on the `bayan-link` thread.
+pub fn init_link_thread() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        unsafe {
+            let _hr = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
+        }
+    }
+}
+
+/// Absolute `explorer.exe`. `WINDIR` is used only when it is a local drive
+/// path whose last component is `Windows`. Otherwise `C:\Windows\explorer.exe`.
+pub fn explorer_from_windir(windir: Option<&str>) -> String {
+    const FALLBACK: &str = r"C:\Windows\explorer.exe";
+    let Some(dir) = windir.map(str::trim).filter(|s| !s.is_empty()) else {
+        return FALLBACK.to_string();
+    };
+    let Some(norm) = crate::term::accept_local_cwd(dir) else {
+        return FALLBACK.to_string();
+    };
+    let leaf = norm.rsplit('\\').next().unwrap_or("");
+    if leaf.eq_ignore_ascii_case("Windows") {
+        format!(r"{norm}\explorer.exe")
+    } else {
+        FALLBACK.to_string()
+    }
+}
+
+pub fn explorer_program() -> String {
+    explorer_from_windir(std::env::var("WINDIR").ok().as_deref())
+}
+
+/// One raw argument: `/select,"<path>"`. The path has already rejected
+/// comma and quote, so this cannot break out of the quotes.
+pub fn select_arg(path: &str) -> String {
+    format!(r#"/select,"{path}""#)
+}
+
+pub fn spawn_reveal(path: &str) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new(explorer_program());
+        cmd.raw_arg(select_arg(path));
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        cmd.spawn()?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "explorer",
+        ))
+    }
 }
 
 /// Browse, association-open, editor, and explorer run off the UI thread.
-/// A refusal and a userinfo confirm are decided on it.
+/// A refusal and a confirm card are decided on it. [`Action::EditDefault`]
+/// is included so `exists` and `find_code_exe` run on the link thread.
 pub fn runs_off_ui_thread(action: &Action) -> bool {
     matches!(
         action,
-        Action::Browse(_) | Action::OpenPath(_) | Action::Reveal(_) | Action::Edit { .. }
+        Action::Browse(_)
+            | Action::OpenPath(_)
+            | Action::Reveal(_)
+            | Action::Edit { .. }
+            | Action::EditDefault { .. }
     )
 }
 
 pub fn perform_open(action: &Action) -> bool {
     match action {
         Action::Browse(target) | Action::OpenPath(target) => shell_execute(target),
-        Action::Reveal(path) => spawn_editor(&reveal_argv(path)).is_ok(),
-        Action::Edit { argv } => spawn_editor(argv).is_ok(),
-        Action::Confirm { .. } | Action::Refuse { .. } => false,
+        Action::Reveal(path) => spawn_reveal(path).is_ok(),
+        Action::Edit { argv, .. } => spawn_editor(argv).is_ok(),
+        Action::EditDefault { .. } | Action::Confirm { .. } | Action::Refuse { .. } => false,
     }
 }
 
@@ -766,6 +1144,24 @@ pub fn card_decision(enter: bool, escape: bool, may_open: bool) -> CardDecision 
         CardDecision::Dismiss
     } else {
         CardDecision::Ignore
+    }
+}
+
+/// Title prefix. The confirm card and the refuse card do not share one.
+pub fn card_title_prefix(may_open: bool) -> &'static str {
+    if may_open {
+        "تأكد قبل الفتح"
+    } else {
+        "رابط مرفوض"
+    }
+}
+
+/// Arabic line, then English. Enter opens only on the confirm card.
+pub fn card_key_lines(may_open: bool) -> (&'static str, &'static str) {
+    if may_open {
+        ("Enter يفتح · Esc يغلق", "Enter opens · Esc closes")
+    } else {
+        ("Enter يغلق · Esc يغلق", "Enter closes · Esc closes")
     }
 }
 
@@ -1825,13 +2221,11 @@ mod tests {
             file_uri_path("file://localhost/C:/Program%20Files/a.rs").as_deref(),
             Some(r"C:\Program Files\a.rs")
         );
-        // The path is local and not an executable, and it is not on disk.
+        // A source file is not on the association allowlist. Reveal, and
+        // the exists check is deferred to settle.
         assert!(matches!(
             plan_uri("file:///C:/bayan-qa-missing/no-such.rs"),
-            Action::Refuse {
-                reason: RefuseReason::Missing,
-                ..
-            }
+            Action::Reveal(ref path) if path == r"C:\bayan-qa-missing\no-such.rs"
         ));
         // Remote file host: not a local path, not opened.
         assert!(matches!(
@@ -1989,15 +2383,35 @@ mod tests {
             resolve_against_cwd(r".\src\main.rs", Some(r"C:\work")).as_deref(),
             Some(r"C:\work\src\main.rs")
         );
-        // The file is not on disk: the card, not an editor launch.
+        // Drive root keeps its slash; joining must not produce `\\`.
+        assert_eq!(
+            resolve_against_cwd(r"src\a.rs", Some(r"D:\")).as_deref(),
+            Some(r"D:\src\a.rs")
+        );
+        // The file is not on disk. The intent is still Edit; settle is
+        // what raises the missing-file card, so the UI thread does not stat.
         let spans = links_in_row(&row("src/main.rs:10:4"));
-        assert!(matches!(
-            spans[0].activate(Some(r"C:\work"), Some("code -g {file}:{line}:{col}"), None),
-            Action::Refuse {
-                reason: RefuseReason::Missing,
-                ..
+        match spans[0].activate(Some(r"C:\work"), Some("code -g {file}:{line}:{col}"), None) {
+            Action::Edit { path, .. } => {
+                assert_eq!(path, r"C:\work\src\main.rs");
+                assert!(matches!(
+                    settle(
+                        Action::Edit {
+                            argv: vec!["code".into()],
+                            path: path.clone(),
+                        },
+                        |_| false,
+                        |_| None,
+                        || None,
+                    ),
+                    Action::Refuse {
+                        reason: RefuseReason::Missing,
+                        ..
+                    }
+                ));
             }
-        ));
+            other => panic!("{other:?}"),
+        }
         assert_eq!(
             spans[0].tooltip(Some(r"C:\work")),
             r"C:\work\src\main.rs:10:4"
@@ -2291,8 +2705,10 @@ mod tests {
 
     #[test]
     fn dangerous_extensions_are_not_association_opened() {
-        // PATHEXT's built-in default, plus every extension association-open
-        // must refuse even when PATHEXT does not list it.
+        // The old blocklist, kept as a fixture, plus the extensions that
+        // used to reach ShellExecuteW, plus PATHEXT's built-in default
+        // and a custom PATHEXT-shaped extension. None of them are
+        // association-opened. No extension is not, either.
         let exts = [
             ".com",
             ".exe",
@@ -2318,45 +2734,75 @@ mod tests {
             ".application",
             ".reg",
             ".pif",
+            ".msc",
+            ".chm",
+            ".jar",
+            ".diagcab",
+            ".website",
+            ".wsc",
+            ".sct",
+            ".xbap",
+            ".mht",
+            ".msp",
+            ".msu",
+            ".ppkg",
+            ".msix",
+            ".appx",
+            ".appinstaller",
+            ".rdp",
+            ".theme",
+            ".themepack",
+            ".scf",
+            ".searchConnector-ms",
+            ".iso",
+            ".img",
+            ".vhd",
+            ".vhdx",
+            ".foo",
+            "",
         ];
         for ext in exts {
             let uri = format!("file:///C:/qa/evil{ext}");
             match plan_uri(&uri) {
-                Action::Refuse {
-                    reason: RefuseReason::Blocked,
-                    shown,
-                } => {
-                    assert!(!shown.to_ascii_lowercase().contains("cmd /c"), "{shown}");
-                    assert!(!matches!(plan_uri(&uri), Action::OpenPath(_)));
+                Action::Reveal(path) => {
+                    assert!(!path.to_ascii_lowercase().contains("cmd"), "{path}");
+                    let settled = settle(
+                        Action::Reveal(path),
+                        |_| true,
+                        |_| None,
+                        || panic!("reveal must not search for an editor"),
+                    );
+                    assert!(
+                        matches!(settled, Action::Reveal(_)),
+                        "{ext} settled to {settled:?}"
+                    );
                 }
+                Action::Refuse { .. } => {}
                 other => panic!("{ext} -> {other:?}"),
             }
-            let upper = format!("file:///C:/qa/evil{}", ext.to_ascii_uppercase());
-            assert!(
-                matches!(
-                    plan_uri(&upper),
-                    Action::Refuse {
-                        reason: RefuseReason::Blocked,
-                        ..
-                    }
-                ),
-                "{upper}"
-            );
+            if !ext.is_empty() {
+                let upper = format!("file:///C:/qa/evil{}", ext.to_ascii_uppercase());
+                assert!(
+                    matches!(plan_uri(&upper), Action::Reveal(_) | Action::Refuse { .. }),
+                    "{upper}"
+                );
+                assert!(!matches!(plan_uri(&upper), Action::OpenPath(_)), "{upper}");
+            }
         }
-        // Built-in list, with an empty PATHEXT. A runtime-only extension
-        // blocks only when that list names it.
-        assert!(is_blocked_path(r"C:\a.exe", &[]));
-        assert!(is_blocked_path(r"C:\a.bat", &[]));
-        assert!(is_blocked_path(r"C:\a.cmd", &[]));
-        assert!(is_blocked_path(r"C:\a.com", &[]));
-        assert!(is_blocked_path(r"C:\a.foo", &[String::from(".FOO")]));
-        assert!(!is_blocked_path(r"C:\a.foo", &[]));
-        assert!(!is_blocked_path(r"C:\notes.txt", &[]));
-        assert!(!is_blocked_path(r"C:\evil.exe.txt", &[]));
-        assert!(is_blocked_path(r"C:\evil.txt.exe", &[]));
-        assert!(is_blocked_path(r"C:\evil.exe:stream", &[]));
-        assert!(is_blocked_path(r"C:\evil.exe.", &[]));
-        // Enter on this card does not open. A userinfo card is the one that does.
+        // Final extension wins. A trailing dot is ignored, the way Windows ignores it.
+        assert!(matches!(
+            plan_uri("file:///C:/qa/evil.exe.txt"),
+            Action::OpenPath(ref p) if p.ends_with(r"evil.exe.txt")
+        ));
+        assert!(matches!(
+            plan_uri("file:///C:/qa/evil.txt.exe"),
+            Action::Reveal(_)
+        ));
+        assert!(matches!(
+            plan_uri("file:///C:/qa/evil.exe."),
+            Action::Reveal(_)
+        ));
+        // Enter on a refusal does not open. A confirm card is the one that does.
         assert_eq!(card_decision(true, false, false), CardDecision::Dismiss);
         assert_eq!(card_decision(false, true, false), CardDecision::Dismiss);
     }
@@ -2367,24 +2813,36 @@ mod tests {
         let leaf = bat.rsplit('\\').next().unwrap();
         let spans = links_in_row(&row(&format!("{leaf}:1")));
         assert_eq!(spans.len(), 1, "{spans:?}");
-        // No editor: the folder, via explorer's argv. Not the batch file.
+        // No editor yet: the intent defers exists and code.exe to the link thread.
         match spans[0].activate(Some(&cwd), None, None) {
-            Action::Reveal(path) => {
+            Action::EditDefault { path, line, col } => {
                 assert_eq!(path, bat);
-                let argv = reveal_argv(&path);
-                assert_eq!(
-                    argv,
-                    vec!["explorer.exe".to_string(), format!("/select,{path}")]
+                assert_eq!(line, 1);
+                assert!(col.is_none());
+                let settled = settle(
+                    Action::EditDefault { path, line, col },
+                    |_| true,
+                    |_| None,
+                    || None,
                 );
-                let cmd = editor_command(&argv).unwrap();
-                assert_eq!(cmd.get_program(), std::ffi::OsStr::new("explorer.exe"));
-                assert!(!cmd.get_args().any(|a| a == "/c" || a == "start"));
-                assert!(runs_off_ui_thread(&Action::Reveal(path)));
+                match settled {
+                    Action::Reveal(path) => {
+                        assert_eq!(path, bat);
+                        assert_eq!(select_arg(&path), format!(r#"/select,"{path}""#));
+                        let prog = explorer_from_windir(Some(r"C:\Windows"));
+                        assert_eq!(prog, r"C:\Windows\explorer.exe");
+                        assert!(!prog.to_ascii_lowercase().contains("cmd"));
+                        assert!(!select_arg(&path).contains("/c"));
+                        assert!(runs_off_ui_thread(&Action::Reveal(path)));
+                    }
+                    other => panic!("{other:?}"),
+                }
             }
             other => panic!("{other:?}"),
         }
         match spans[0].activate(Some(&cwd), None, Some(r"C:\Program Files\Code.exe")) {
-            Action::Edit { argv } => {
+            Action::Edit { argv, path } => {
+                assert_eq!(path, bat);
                 assert_eq!(argv[0], r"C:\Program Files\Code.exe");
                 assert_eq!(argv[1], "-g");
                 assert_eq!(argv[2], format!("{bat}:1"));
@@ -2394,7 +2852,8 @@ mod tests {
         }
         // Configured editor, still no association fallback.
         match spans[0].activate(Some(&cwd), Some("code -g {file}:{line}:{col}"), None) {
-            Action::Edit { argv } => {
+            Action::Edit { argv, path } => {
+                assert_eq!(path, bat);
                 assert_eq!(argv[0], "code");
                 assert_eq!(argv[2], format!("{bat}:1"));
             }
@@ -2434,42 +2893,70 @@ mod tests {
 
     #[test]
     fn missing_file_is_refused() {
+        let missing_txt = plan_uri(r"file:///C:/bayan-qa-missing/no-such.txt");
+        assert!(matches!(missing_txt, Action::OpenPath(_)), "{missing_txt:?}");
         assert!(matches!(
-            plan_uri(r"file:///C:/bayan-qa-missing/no-such.txt"),
+            settle(missing_txt, |_| false, |_| None, || None),
             Action::Refuse {
                 reason: RefuseReason::Missing,
                 ..
             }
         ));
         let spans = links_in_row(&row(r"C:\bayan-qa-missing\no-such.rs:3"));
-        assert!(matches!(
-            spans[0].activate(Some(r"D:\other"), Some("code -g {file}:{line}"), None),
-            Action::Refuse {
-                reason: RefuseReason::Missing,
-                ..
+        match spans[0].activate(Some(r"D:\other"), Some("code -g {file}:{line}"), None) {
+            Action::Edit { path, .. } => {
+                assert!(matches!(
+                    settle(
+                        Action::Edit {
+                            argv: vec!["code".into()],
+                            path,
+                        },
+                        |_| false,
+                        |_| None,
+                        || None,
+                    ),
+                    Action::Refuse {
+                        reason: RefuseReason::Missing,
+                        ..
+                    }
+                ));
             }
-        ));
-        assert!(matches!(
-            spans[0].activate(Some(r"D:\other"), None, None),
-            Action::Refuse {
-                reason: RefuseReason::Missing,
-                ..
+            other => panic!("{other:?}"),
+        }
+        match spans[0].activate(Some(r"D:\other"), None, None) {
+            Action::EditDefault { path, line, col } => {
+                assert!(matches!(
+                    settle(
+                        Action::EditDefault { path, line, col },
+                        |_| false,
+                        |_| None,
+                        || None,
+                    ),
+                    Action::Refuse {
+                        reason: RefuseReason::Missing,
+                        ..
+                    }
+                ));
             }
-        ));
-        // A real text file still association-opens. An executable does not,
-        // even when it exists.
+            other => panic!("{other:?}"),
+        }
+        // A real text file is still an association intent. An executable
+        // is revealed, even when it exists.
         let (txt_dir, txt) = scratch("note.txt");
         let uri = format!("file:///{}", txt.replace('\\', "/"));
         assert_eq!(plan_uri(&uri), Action::OpenPath(txt));
         let (exe_dir, exe) = scratch("evil.exe");
         let uri = format!("file:///{}", exe.replace('\\', "/"));
-        assert!(matches!(
-            plan_uri(&uri),
-            Action::Refuse {
-                reason: RefuseReason::Blocked,
-                ..
+        match plan_uri(&uri) {
+            Action::Reveal(path) => {
+                assert_eq!(path, exe);
+                assert!(matches!(
+                    settle(Action::Reveal(path), |_| true, |_| None, || None),
+                    Action::Reveal(_)
+                ));
             }
-        ));
+            other => panic!("{other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&txt_dir);
         let _ = std::fs::remove_dir_all(&exe_dir);
     }
@@ -2503,7 +2990,8 @@ mod tests {
         let (cwd, full) = scratch("-n.rs");
         let spans = links_in_row(&row("-n.rs:2"));
         match spans[0].activate(Some(&cwd), Some("code -g {file}:{line}"), None) {
-            Action::Edit { argv } => {
+            Action::Edit { argv, path } => {
+                assert_eq!(path, full);
                 assert_eq!(argv[0], "code");
                 assert_eq!(argv[1], "-g");
                 assert_eq!(argv[2], format!("{full}:2"));
@@ -2663,6 +3151,15 @@ mod tests {
             "rundll32",
             "rundll32.exe",
             r"C:\Windows\SysWOW64\rundll32.exe",
+            "regsvr32",
+            "regsvr32.exe",
+            "msiexec",
+            "msiexec.exe",
+            "mmc",
+            "mmc.exe",
+            "hh",
+            "hh.exe",
+            r"C:\Windows\hh.exe",
         ] {
             assert!(
                 editor_command(&[name.into(), r"C:\src\a.rs".into()]).is_none(),
@@ -2715,6 +3212,12 @@ mod tests {
         assert!(runs_off_ui_thread(&Action::Reveal(r"C:\a.txt".into())));
         assert!(runs_off_ui_thread(&Action::Edit {
             argv: vec!["code".into()],
+            path: r"C:\a.txt".into(),
+        }));
+        assert!(runs_off_ui_thread(&Action::EditDefault {
+            path: r"C:\a.rs".into(),
+            line: 1,
+            col: None,
         }));
         assert!(!runs_off_ui_thread(&Action::Refuse {
             reason: RefuseReason::Blocked,
@@ -2732,5 +3235,213 @@ mod tests {
             uri: "http://a@b".into(),
             host: "b".into(),
         }));
+        assert!(!perform_open(&Action::EditDefault {
+            path: r"C:\a.rs".into(),
+            line: 1,
+            col: None,
+        }));
+    }
+
+    #[test]
+    fn association_allowlist_opens_only_documents_and_media() {
+        for ext in [
+            ".txt", ".md", ".log", ".json", ".csv", ".pdf", ".png", ".jpg", ".jpeg", ".gif",
+            ".webp", ".bmp", ".svg",
+        ] {
+            let uri = format!("file:///C:/qa/note{ext}");
+            match plan_uri(&uri) {
+                Action::OpenPath(path) => {
+                    assert!(path.to_ascii_lowercase().ends_with(ext), "{path}");
+                    assert!(matches!(
+                        settle(Action::OpenPath(path.clone()), |_| false, |_| None, || None),
+                        Action::Refuse {
+                            reason: RefuseReason::Missing,
+                            ..
+                        }
+                    ));
+                    assert!(matches!(
+                        settle(Action::OpenPath(path), |_| true, |_| None, || None),
+                        Action::OpenPath(_)
+                    ));
+                }
+                other => panic!("{ext} -> {other:?}"),
+            }
+            let upper = format!("file:///C:/qa/note{}", ext.to_ascii_uppercase());
+            assert!(matches!(plan_uri(&upper), Action::OpenPath(_)), "{upper}");
+        }
+    }
+
+    #[test]
+    fn ads_colon_after_the_drive_is_rejected() {
+        assert_eq!(crate::term::accept_local_cwd(r"C:\a.txt:evil.exe"), None);
+        assert_eq!(crate::term::accept_local_cwd(r"C:\evil.exe::$DATA"), None);
+        assert!(leaf_for_extension(r"C:\a.txt:evil.exe").is_empty());
+        assert!(!leaf_for_extension(r"C:\a.txt:evil.exe").ends_with(".txt"));
+        assert!(matches!(
+            plan_uri("file:///C:/a.txt:evil.exe"),
+            Action::Refuse {
+                reason: RefuseReason::BadFile,
+                ..
+            }
+        ));
+        assert!(matches!(
+            plan_uri("file:///C:/a.txt%3Aevil.exe"),
+            Action::Refuse {
+                reason: RefuseReason::BadFile,
+                ..
+            }
+        ));
+        assert!(!matches!(
+            plan_uri("file:///C:/a.txt:evil.exe"),
+            Action::OpenPath(_)
+        ));
+    }
+
+    #[test]
+    fn short_names_are_expanded_before_open() {
+        let open = settle(
+            Action::OpenPath(r"C:\X~1.APP".into()),
+            |_| true,
+            |_| Some(r"C:\notes.txt".into()),
+            || None,
+        );
+        assert_eq!(open, Action::OpenPath(r"C:\notes.txt".into()));
+
+        let exe = settle(
+            Action::Reveal(r"C:\X~1.APP".into()),
+            |_| true,
+            |_| Some(r"C:\evil.exe".into()),
+            || None,
+        );
+        assert!(matches!(exe, Action::Reveal(ref p) if p == r"C:\evil.exe"));
+
+        let unexpanded = settle(
+            Action::OpenPath(r"C:\X~1.TXT".into()),
+            |_| true,
+            |_| None,
+            || None,
+        );
+        assert!(matches!(unexpanded, Action::Reveal(_)), "{unexpanded:?}");
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        let unc = settle(
+            Action::OpenPath(r"C:\X~1.APP".into()),
+            |p| {
+                assert!(!p.starts_with(r"\\"), "must not stat {p}");
+                calls.borrow_mut().push(p.to_string());
+                true
+            },
+            |_| Some(r"\\evil\share\a.txt".into()),
+            || None,
+        );
+        assert!(matches!(
+            unc,
+            Action::Refuse {
+                reason: RefuseReason::BadFile,
+                ..
+            }
+        ));
+        assert_eq!(calls.borrow().as_slice(), [r"C:\X~1.APP".to_string()]);
+
+        let missing = settle(
+            Action::OpenPath(r"C:\NOTEXIST~1.TXT".into()),
+            |_| false,
+            |_| panic!("a missing short name is not expanded"),
+            || None,
+        );
+        assert!(
+            matches!(missing, Action::Reveal(_)),
+            "unexpanded tilde reveals, {missing:?}"
+        );
+    }
+
+    #[test]
+    fn explorer_select_rejects_injection() {
+        for bad in [
+            r"C:\x,/root,\\evil\share",
+            r"C:\foo\\bar",
+            r"C:\foo//bar",
+            "C:\\foo\"bar",
+            r"C:\..\..\evil",
+        ] {
+            assert_eq!(cwd_hook(Some(bad)), None, "{bad}");
+            assert_eq!(crate::term::accept_local_cwd(bad), None, "{bad}");
+        }
+        assert_eq!(
+            crate::term::accept_local_cwd(r"C:\a\..\b").as_deref(),
+            Some(r"C:\b")
+        );
+        assert_eq!(
+            explorer_from_windir(Some(r"C:\Windows")),
+            r"C:\Windows\explorer.exe"
+        );
+        assert_eq!(
+            explorer_from_windir(Some(r"D:\Windows")),
+            r"D:\Windows\explorer.exe"
+        );
+        assert_eq!(
+            explorer_from_windir(Some(r"C:\evil")),
+            r"C:\Windows\explorer.exe"
+        );
+        assert_eq!(
+            explorer_from_windir(Some(r"\\evil\share")),
+            r"C:\Windows\explorer.exe"
+        );
+        assert_eq!(
+            explorer_from_windir(Some(r"C:\Windows\..\evil")),
+            r"C:\Windows\explorer.exe"
+        );
+        assert_eq!(explorer_from_windir(None), r"C:\Windows\explorer.exe");
+        assert_eq!(
+            select_arg(r"C:\qa\note.txt"),
+            r#"/select,"C:\qa\note.txt""#
+        );
+        let prog = explorer_from_windir(Some(r"C:\Windows"));
+        assert!(prog.to_ascii_lowercase().ends_with(r"\explorer.exe"));
+        assert!(!prog.to_ascii_lowercase().contains("cmd"));
+    }
+
+    #[test]
+    fn idn_host_confirms_with_punycode() {
+        assert_eq!(punycode_encode("münchen").as_deref(), Some("mnchen-3ya"));
+        assert_eq!(punycode_encode("bücher").as_deref(), Some("bcher-kva"));
+        match plan_uri("http://münchen.example/a") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "xn--mnchen-3ya.example");
+                assert!(uri.contains("xn--mnchen-3ya.example"), "{uri}");
+                assert!(!uri.contains('ü'), "{uri}");
+                assert_eq!(uri, "http://xn--mnchen-3ya.example/a");
+            }
+            other => panic!("{other:?}"),
+        }
+        match plan_uri("http://user:secret@münchen.example:8080/a?q=1") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "xn--mnchen-3ya.example");
+                assert_eq!(uri, "http://user:secret@xn--mnchen-3ya.example:8080/a?q=1");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            plan_uri("http://xn--mnchen-3ya.example/a"),
+            Action::Browse("http://xn--mnchen-3ya.example/a".into())
+        );
+        let tip = host_tooltip("http://münchen.example/a");
+        assert!(tip.starts_with("xn--mnchen-3ya.example"), "{tip}");
+    }
+
+    #[test]
+    fn card_keys_say_whether_enter_opens() {
+        let (ar, en) = card_key_lines(true);
+        assert!(ar.contains("Enter يفتح"), "{ar}");
+        assert!(en.contains("Enter opens"), "{en}");
+        assert_eq!(card_title_prefix(true), "تأكد قبل الفتح");
+        let (ar, en) = card_key_lines(false);
+        assert!(ar.contains("Enter يغلق"), "{ar}");
+        assert!(en.contains("Enter closes"), "{en}");
+        assert_eq!(card_title_prefix(false), "رابط مرفوض");
+        assert_ne!(card_key_lines(true), card_key_lines(false));
+        assert_eq!(card_decision(true, false, true), CardDecision::Open);
+        assert_eq!(card_decision(true, false, false), CardDecision::Dismiss);
+        assert_eq!(card_decision(false, true, true), CardDecision::Dismiss);
     }
 }

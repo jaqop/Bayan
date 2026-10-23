@@ -37,24 +37,31 @@ column index by cell width.
 
 **Hyperlinks never go through a shell.** OSC 8 is read off the cell
 (`Cell::hyperlink`), not parsed again. Ctrl+click opens `http` and `https`
-via `ShellExecuteW` with the URI as the single `lpFile`. A `file` URI opens
-the same way only for a local drive path whose extension Windows would not
-execute (PATHEXT, read at runtime, plus `.lnk` `.url` `.hta` `.ps1` and the
-rest of the list in `link.rs`). UNC, `\\?\`, `\\.\`, and `\??\` are rejected
-with `term::accept_local_cwd` / `unc_or_device` before any `exists` call.
-`path:line` goes to the editor's `Command` argv, or `explorer.exe
-/select,<path>` when no editor is configured — never to the file's
-association. `{file}` `{line}` `{col}` are substituted once, after the
-template is split, and the path is absolute. A relative path with no pane
-cwd is refused. Userinfo (`good.com@evil.com`) shows the real host and waits
-for the card. `javascript:`, `ms-*`, `data:`, control characters, and bidi
-overrides are refused on a card that does not open them. The open runs off
-the UI thread. The window asks `link::click_owner` before
-`mouse::Route::press`: Shift keeps local selection and wins over Ctrl, a
-plain click while tracking is on belongs to the program, and
-`overlay_blocks_mouse` (including the refused-link card) blocks the click.
-HIDDEN cells are not clickable. Link spans are cached per row and dropped
-on PTY damage, scroll, and relayout.
+via `ShellExecuteW` with the URI as the single `lpFile`. A `file` URI
+association-opens only an allowlisted document or media type (`.txt` `.md`
+`.log` `.json` `.csv` `.pdf` and the image extensions in `link.rs`).
+Everything else, including no extension, is revealed in Explorer. Source
+files reach the editor only as `path:line`. UNC, `\\?\`, `\\.\`, `\??\`,
+a colon after the drive letter, a comma, a quote, and `\\` anywhere are
+rejected with `term::accept_local_cwd` / `unc_or_device` before any
+`exists` call. An existing 8.3 name is expanded with `GetLongPathNameW`
+and both checks run again; a `~` component that cannot be expanded is
+revealed. `path:line` goes to the editor's `Command` argv, or to
+`%WINDIR%\explorer.exe` with raw `/select,"<path>"` when no editor is
+configured — never to the file's association. `{file}` `{line}` `{col}`
+are substituted once, after the template is split, and the path is
+absolute. A relative path with no pane cwd is refused. Userinfo
+(`good.com@evil.com`) and a non-ASCII host show the real host (punycode
+for IDN) and wait for the confirm card (`Enter يفتح`). The refuse card
+says `Enter يغلق` and does not open. `javascript:`, `ms-*`, `data:`,
+control characters, and bidi overrides are refused. `exists` and the open
+run on the `bayan-link` thread, which initializes COM first. The window
+asks `link::click_owner` before `mouse::Route::press`: Shift keeps local
+selection and wins over Ctrl, a plain click while tracking is on belongs
+to the program, and `overlay_blocks_mouse` (including the link card)
+blocks the click. HIDDEN cells are not clickable. Link spans are cached
+per row and dropped on PTY damage, scroll, and relayout; the hover is
+cleared on that wakeup too.
 
 **Claude mode is narrow on purpose.** Claude Code (Ink) applies BiDi itself on
 Windows and emits Arabic in reversed visual order, so `bidi.rs` reverses UAX#9
