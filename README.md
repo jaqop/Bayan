@@ -461,7 +461,7 @@ Two escape sequences from ECMA-48 / the terminal-wg "BiDi in Terminal
 Emulators" recommendation, which `alacritty_terminal` 0.26 does not act on
 (mode 8 is an unknown SM/RM parameter; `CSI Ps SP k` is not in its CSI
 dispatch). Bayan strips them from the PTY stream before the parser, including
-when a sequence is split across reads. The tree has 215 unit tests.
+when a sequence is split across reads. The tree has 224 unit tests.
 
 - **BDSM** — `CSI 8 h` implicit (Bayan applies UAX#9; this is the initial
   state, so a shell that never sends BDSM still gets Arabic), `CSI 8 l`
@@ -504,8 +504,12 @@ a quote, a `\\` or `//` anywhere, `..` that climbs past the drive, DOS
 device names (`CON`, `NUL`, `PRN`, `AUX`, `CONIN$`, `CONOUT$`, `CLOCK$`,
 `COM0`–`COM9`, `LPT0`–`LPT9`, including a superscript digit and a space as
 in `CON .txt`), alternate data streams, and bidi controls are rejected
-there, before any probe. A report is stored only when no command is running
-and the pane is not on the alt screen. The prompt's own OSC 7 still counts:
+there, before any probe. A report is stored only when no command is running, Enter is not still
+pending, and the pane is not on the alt screen. Enter at the prompt sets
+`cmd_pending` even when the cursor never moves past the prompt column
+(paste and Enter in one chunk, Home then Enter, a wrapped command), and
+only a nonce-verified OSC 133 A or D clears it. While it is set, OSC 7
+needs the nonce the same way it does while a command is running.
 PowerShell's wrapper sends OSC 133 D and A with a per-session nonce, and
 only that A arms the report, so a spoofed `133;D` from `cat` cannot. An
 idle OSC 7 (cmd/clink, which has no 133) is still stored. A new tab calls

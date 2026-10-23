@@ -367,6 +367,7 @@ The scratch harness is throwaway. The High-finding assertions now live next to t
 - `bdsm_that_ends_an_osc_does_not_swallow_text` — stripping BDSM or SCP closes the OSC it terminated, and the following text is printed.
 - `kitty_query_reply_survives_merged_chunks` — `merge_chunk` keeps `pty_replies` when the BiDi filter splits a read around BDSM.
 - `spoofed_133_d_does_not_accept_osc7_without_the_nonce` — OSC 7 after a command is stored only once OSC 133 A carries the session nonce. A spoofed `133;D` does not clear `running_cmd` and does not authorize the report. Idle OSC 7 still does.
+- `paste_and_enter_in_one_chunk_still_requires_the_osc7_nonce`, `home_then_enter_still_requires_the_osc7_nonce`, `wrapped_command_still_requires_the_osc7_nonce` — Enter at the prompt sets `cmd_pending` when the command text is not captured. OSC 7 stays nonce-gated until a trusted 133 A or D. A spoofed D does not clear the flag.
 - `local_cwd_rejects_spaced_superscript_and_dollar_devices` — `COM0`, `LPT0`, superscript COM/LPT digits, `CONIN$`, `CONOUT$`, `CLOCK$`, and `CON .txt`.
 
 ## QA review of BDSM/SCP and OSC 7

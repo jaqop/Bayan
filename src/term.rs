@@ -178,6 +178,14 @@ pub struct SessionMeta {
     pub prompt_col: Option<usize>,
     /// the command line currently executing ("" = idle) — feeds cmd_is_claude
     pub running_cmd: String,
+    /// Enter was sent at the prompt, and a trusted OSC 133 A or D has not
+    /// been seen since. Set even when the cursor never moved past the prompt
+    /// column, so `running_cmd` stayed empty: paste and Enter in one chunk,
+    /// Home then Enter, or a command that wrapped onto the next line. While
+    /// this is set, OSC 7 and OSC 9;9 are held to the nonce the same way
+    /// they are while `running_cmd` is set. Cleared only by a nonce-verified
+    /// 133 A or D.
+    pub cmd_pending: bool,
     /// working directory from OSC 7 (`file://`) or OSC 9;9.
     /// File links resolve through `link::cwd_hook` on this field. There is
     /// no second source.
@@ -741,14 +749,17 @@ fn osc133_trusted(payload: &[u8], nonce: &str) -> bool {
 
 /// The last OSC 7 or OSC 9;9 in `data` that is allowed to change the cwd.
 ///
-/// `running` and `alt` are the pane state at the start of the slice. The
-/// prompt wrapper emits OSC 133 D, then A, then 9;9, then 7, in one read.
-/// A trusted A or D clears `running` for reports that follow them in this
-/// slice. With a session nonce, only an A that carries it arms the report:
-/// a spoofed `133;D` leaves the command running and does not authorize the
-/// OSC 7 after it. An empty nonce (tests) arms at the start, so any A/D is
-/// enough. A pane that is already idle stays armed, which is how clink's
-/// OSC 7 — no 133 at all — still updates the directory. A `?1049` / `?47` /
+/// `running` and `alt` are the pane state at the start of the slice.
+/// `running` is also true when Enter was sent at the prompt and no trusted
+/// 133 A/D has cleared `cmd_pending` yet, even if the command text was not
+/// captured. The prompt wrapper emits OSC 133 D, then A, then 9;9, then 7,
+/// in one read. A trusted A or D clears `running` for reports that follow
+/// them in this slice. With a session nonce, only an A that carries it arms
+/// the report: a spoofed `133;D` leaves the command running and does not
+/// authorize the OSC 7 after it. An empty nonce (tests) arms at the start,
+/// so any A/D is enough. A pane that is already idle stays armed, which is
+/// how clink's OSC 7 — no 133 at all — still updates the directory. A
+/// `?1049` / `?47` /
 /// `?1047` updates `alt` for reports after that CSI. RIS (`ESC c`) leaves
 /// the alt screen.
 ///
@@ -829,6 +840,7 @@ fn handle_osc133<T: EventListener>(
                 return;
             }
             meta.running_cmd.clear();
+            meta.cmd_pending = false;
             // a new prompt starts on the cursor's row: record its block
             // GLOBALLY (evicted + history + row — never drifts)
             let abs = meta.evicted
@@ -849,6 +861,7 @@ fn handle_osc133<T: EventListener>(
                 return;
             }
             meta.running_cmd.clear();
+            meta.cmd_pending = false;
             if let Some(m) = meta.marks.last_mut() {
                 m.exit = exit;
             }
@@ -1217,15 +1230,17 @@ fn process_bytes<T: EventListener>(
     }
     ev.clipboard = scan_osc52(&buf);
     // OSC 7 and OSC 9;9 are trusted only at a shell prompt: no command
-    // running, and not the alt screen. A report that sits after OSC 133 A/D
-    // in this same slice is trusted even if the command was still running
-    // when the slice started — that is the prompt wrapper's own report.
-    // The later of the two trusted reports wins. An untrusted or rejected
-    // one does not replace a directory already stored.
+    // running, Enter not still pending, and not the alt screen. A report
+    // that sits after a trusted OSC 133 A in this same slice is trusted
+    // even if the command was still running when the slice started — that
+    // is the prompt wrapper's own report. The later of the two trusted
+    // reports wins. An untrusted or rejected one does not replace a
+    // directory already stored.
     let nonce = meta.prompt_nonce.clone();
+    let command_active = !meta.running_cmd.is_empty() || meta.cmd_pending;
     if let Some(cwd) = trusted_cwd(
         &buf,
-        !meta.running_cmd.is_empty(),
+        command_active,
         t.mode().contains(TermMode::ALT_SCREEN),
         &nonce,
     ) {
@@ -1368,6 +1383,11 @@ pub(crate) fn capture_command_core<T: EventListener>(t: &Term<T>, meta: &mut Ses
     if t.mode().contains(TermMode::ALT_SCREEN) || !meta.at_prompt {
         return;
     }
+    // Every Enter at the prompt, before we know whether the command text
+    // is readable. Paste and Enter in one write, Home then Enter, and a
+    // wrapped line all leave the cursor at or before the prompt column, so
+    // `running_cmd` stays empty. The nonce gate still has to close.
+    meta.cmd_pending = true;
     let Some(pcol) = meta.prompt_col else {
         return;
     };
@@ -3215,6 +3235,100 @@ mod tests {
         let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &prompt);
         assert_eq!(ev.cwd.as_deref(), Some(r"C:\from7"));
         assert!(meta.running_cmd.is_empty());
+    }
+
+    fn osc7_of(url: &str) -> Vec<u8> {
+        let mut v = b"\x1b]7;".to_vec();
+        v.extend_from_slice(url.as_bytes());
+        v.push(0x07);
+        v
+    }
+
+    /// Prompt showing, nonce set, cwd already `C:\work` from an idle OSC 7.
+    fn prompt_ready() -> (Term<VoidListener>, Processor, SessionMeta, Vec<u8>) {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"PS> \x1b]133;B\x07");
+        assert!(meta.at_prompt);
+        assert_eq!(meta.prompt_col, Some(4));
+        meta.prompt_nonce = "n0nce".into();
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &osc7_of("file:///C:/work"));
+        assert_eq!(ev.cwd.as_deref(), Some(r"C:\work"));
+        (t, p, meta, carry)
+    }
+
+    /// Enter already happened and `running_cmd` is empty. OSC 7 from the
+    /// command is refused until a trusted 133 A. A spoofed D does not clear
+    /// `cmd_pending`.
+    fn assert_pending_blocks_osc7(
+        t: &mut Term<VoidListener>,
+        p: &mut Processor,
+        meta: &mut SessionMeta,
+        carry: &mut Vec<u8>,
+    ) {
+        assert!(meta.running_cmd.is_empty(), "the command text was not captured");
+        assert!(meta.cmd_pending, "Enter at the prompt must arm the nonce gate");
+        let ev = process_chunk(p, t, meta, carry, &osc7_of("file:///C:/evil"));
+        assert!(ev.cwd.is_none());
+        assert_eq!(meta.cwd.as_deref(), Some(r"C:\work"));
+
+        let mut spoof = b"\x1b]133;D;0\x07".to_vec();
+        spoof.extend(osc7_of("file:///C:/spoof"));
+        let ev = process_chunk(p, t, meta, carry, &spoof);
+        assert!(ev.cwd.is_none());
+        assert!(meta.cmd_pending, "a spoofed D must not clear the pending command");
+        assert_eq!(meta.cwd.as_deref(), Some(r"C:\work"));
+
+        let mut prompt = b"\x1b]133;D;0;n0nce\x07\x1b]133;A;n0nce\x07".to_vec();
+        prompt.extend(osc7_of("file:///C:/from7"));
+        let ev = process_chunk(p, t, meta, carry, &prompt);
+        assert_eq!(ev.cwd.as_deref(), Some(r"C:\from7"));
+        assert!(!meta.cmd_pending);
+        assert!(meta.running_cmd.is_empty());
+    }
+
+    /// Paste and Enter arrive together. The shell has not echoed the paste,
+    /// so the cursor is still on the prompt column and `running_cmd` stays
+    /// empty.
+    #[test]
+    fn paste_and_enter_in_one_chunk_still_requires_the_osc7_nonce() {
+        let (mut t, mut p, mut meta, mut carry) = prompt_ready();
+        assert_eq!(t.grid().cursor.point.column.0, meta.prompt_col.unwrap());
+        capture_command_core(&t, &mut meta);
+        assert_pending_blocks_osc7(&mut t, &mut p, &mut meta, &mut carry);
+    }
+
+    /// Home, then Enter. The cursor is at column 0, which is not past the
+    /// prompt, so the typed line is not read.
+    #[test]
+    fn home_then_enter_still_requires_the_osc7_nonce() {
+        let (mut t, mut p, mut meta, mut carry) = prompt_ready();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[H");
+        assert_eq!(t.grid().cursor.point.column.0, 0);
+        capture_command_core(&t, &mut meta);
+        assert_pending_blocks_osc7(&mut t, &mut p, &mut meta, &mut carry);
+    }
+
+    /// The command wrapped onto the next line. The cursor column is back
+    /// near 0, so it is not past the prompt column on the row above.
+    #[test]
+    fn wrapped_command_still_requires_the_osc7_nonce() {
+        let (mut t, mut p, mut meta, mut carry) = prompt_ready();
+        let pcol = meta.prompt_col.unwrap();
+        let n = t.grid().columns() - pcol + 1;
+        let line = "x".repeat(n);
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, line.as_bytes());
+        assert!(
+            t.grid().cursor.point.line.0 > 0,
+            "the command should occupy the next row, cursor {:?}",
+            t.grid().cursor.point
+        );
+        assert!(
+            t.grid().cursor.point.column.0 <= pcol,
+            "cursor {:?} should sit at or before the prompt column",
+            t.grid().cursor.point
+        );
+        capture_command_core(&t, &mut meta);
+        assert_pending_blocks_osc7(&mut t, &mut p, &mut meta, &mut carry);
     }
 
     #[test]

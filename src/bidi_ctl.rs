@@ -287,7 +287,7 @@ impl StreamFilter {
                         out.push(b);
                         self.phase = Phase::Ground;
                     }
-                    0x7f | 0x80..=0xff => {}
+                    0x7f..=0xff => {}
                     b'[' => {
                         self.held.push(b);
                         self.phase = Phase::Csi;
