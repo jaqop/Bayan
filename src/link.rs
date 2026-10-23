@@ -141,7 +141,10 @@ pub enum Action {
     /// `Command::new(argv[0]).args(&argv[1..])`. No association fallback:
     /// a spawn failure is reported, and the file is not opened by its type.
     /// `path` is the file `settle` checks; it is not an association target.
-    Edit { argv: Vec<String>, path: String },
+    Edit {
+        argv: Vec<String>,
+        path: String,
+    },
     /// `path:line` with no editor chosen yet. `settle` looks up `code.exe`
     /// off the UI thread and either becomes [`Action::Edit`] or [`Action::Reveal`].
     EditDefault {
@@ -1103,12 +1106,13 @@ where
     C: Fn() -> Option<String>,
 {
     match action {
-        Action::OpenPath(path) | Action::Reveal(path) => match prepare_disk(&path, &exists, &long_path)
-        {
-            Ok(DiskPath::ForceReveal(path)) => Action::Reveal(path),
-            Ok(DiskPath::Ready(path)) => classify_open(path),
-            Err(refusal) => refusal,
-        },
+        Action::OpenPath(path) | Action::Reveal(path) => {
+            match prepare_disk(&path, &exists, &long_path) {
+                Ok(DiskPath::ForceReveal(path)) => Action::Reveal(path),
+                Ok(DiskPath::Ready(path)) => classify_open(path),
+                Err(refusal) => refusal,
+            }
+        }
         Action::Edit { argv, path } => match prepare_disk(&path, &exists, &long_path) {
             Err(refusal) => refusal,
             Ok(DiskPath::ForceReveal(path)) => Action::Reveal(path),
@@ -2984,7 +2988,10 @@ mod tests {
     #[test]
     fn missing_file_is_refused() {
         let missing_txt = plan_uri(r"file:///C:/bayan-qa-missing/no-such.txt");
-        assert!(matches!(missing_txt, Action::OpenPath(_)), "{missing_txt:?}");
+        assert!(
+            matches!(missing_txt, Action::OpenPath(_)),
+            "{missing_txt:?}"
+        );
         assert!(matches!(
             settle(missing_txt, |_| false, |_| None, || None),
             Action::Refuse {
@@ -3495,10 +3502,7 @@ mod tests {
             r"C:\Windows\explorer.exe"
         );
         assert_eq!(explorer_from_windir(None), r"C:\Windows\explorer.exe");
-        assert_eq!(
-            select_arg(r"C:\qa\note.txt"),
-            r#"/select,"C:\qa\note.txt""#
-        );
+        assert_eq!(select_arg(r"C:\qa\note.txt"), r#"/select,"C:\qa\note.txt""#);
         let prog = explorer_from_windir(Some(r"C:\Windows"));
         assert!(prog.to_ascii_lowercase().ends_with(r"\explorer.exe"));
         assert!(!prog.to_ascii_lowercase().contains("cmd"));
@@ -3681,8 +3685,15 @@ mod tests {
                 "evil.example",
                 "https://user:secret@evil.example:8443/a?q=1",
             ),
-            ("https://[%3A%3A1]/", "::1", "https://[::1]/"),
-            ("https://[%3A%3A1]:443/a", "::1", "https://[::1]:443/a"),
+            // The colons were already in the raw host, so this is an IPv6
+            // literal, not a port smuggled by `%3A`. The opened URI keeps
+            // the brackets and the port.
+            ("https://[fe80::%31]/", "fe80::1", "https://[fe80::1]/"),
+            (
+                "https://[fe80::%31]:443/a",
+                "fe80::1",
+                "https://[fe80::1]:443/a",
+            ),
         ];
         for (input, host, opened) in cases {
             match plan_uri(input) {
@@ -3752,6 +3763,9 @@ mod tests {
             "https://evil..example/",
             "https://.evil.example/",
             "https://evil.example./",
+            // A colon that exists only after decoding is a smuggled port.
+            "https://[%3A%3A1]/",
+            "https://evil.example%3A443/",
         ] {
             match plan_uri(uri) {
                 Action::Refuse {
