@@ -3691,7 +3691,9 @@ mod palette_tests {
         // built once in palette_rows and passed to the renderer, which never
         // filters — so a drift here would be a logic error, not a redraw bug.
         let all = keybinds::Action::ALL.len();
-        assert_eq!(all, 12, "12 built-in actions expected");
+        // reset-keyboard is the thirteenth built-in. The palette and the
+        // shortcuts editor both walk Action::ALL, so this count is the list.
+        assert_eq!(all, 13, "13 built-in actions expected");
     }
 }
 
