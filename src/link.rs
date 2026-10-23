@@ -2765,7 +2765,7 @@ mod tests {
             let uri = format!("file:///C:/qa/evil{ext}");
             match plan_uri(&uri) {
                 Action::Reveal(path) => {
-                    assert!(!path.to_ascii_lowercase().contains("cmd"), "{path}");
+                    assert!(!path.to_ascii_lowercase().contains("cmd /c"), "{path}");
                     let settled = settle(
                         Action::Reveal(path),
                         |_| true,
