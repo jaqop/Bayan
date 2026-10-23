@@ -2546,7 +2546,8 @@ mod tests {
                 reason: RefuseReason::ControlOrBidi,
                 shown,
             } => {
-                assert!(shown.contains("<RLO>"), "{shown}");
+                // The card shows the escape, not a live RLO.
+                assert!(shown.contains("%E2%80%AE"), "{shown}");
                 assert!(!shown.contains('\u{202E}'), "{shown}");
             }
             other => panic!("encoded RLO -> {other:?}"),
