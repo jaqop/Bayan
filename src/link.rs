@@ -499,11 +499,12 @@ fn file_uri_path(uri: &str) -> Option<String> {
 
 /// Host of an `http(s)` URI. `raw_host` is the bytes before percent-decoding
 /// (brackets and the port already stripped). `host` is that string decoded
-/// once. The host is the part after the last `@`, so `good.com@evil.com` is
-/// `evil.com`.
+/// once. `port` is empty or `:` plus digits. The host is the part after the
+/// last `@`, so `good.com@evil.com` is `evil.com`.
 struct HttpAuthority {
     raw_host: String,
     host: String,
+    port: String,
     has_userinfo: bool,
 }
 
@@ -527,27 +528,56 @@ fn http_authority(uri: &str) -> Option<HttpAuthority> {
         return None;
     }
     let has_userinfo = hostport.contains('@');
-    let host = hostport.rsplit('@').next().unwrap_or(hostport);
-    let host = if let Some(inner) = host.strip_prefix('[') {
-        inner.split(']').next().unwrap_or("")
-    } else {
-        host.split(':').next().unwrap_or(host)
-    };
-    let raw_host = host.to_string();
-    let host = decode_http_host(&raw_host)?;
+    let authority = hostport.rsplit('@').next().unwrap_or(hostport);
+    let (raw_host, port, ipv6) = split_host_and_port(authority)?;
+    let host = decode_http_host(raw_host, ipv6)?;
     Some(HttpAuthority {
-        raw_host,
+        raw_host: raw_host.to_string(),
         host,
+        port: port.to_string(),
         has_userinfo,
     })
 }
 
+/// Brackets are an IPv6 literal only: the address must contain a `:`, and
+/// the tail is a port or nothing. A name uses the first `:` as its port,
+/// and that port is empty or `:` followed by ASCII digits. `].evil.net`
+/// and `:80:90` are not ports.
+fn split_host_and_port(authority: &str) -> Option<(&str, &str, bool)> {
+    if let Some(inner) = authority.strip_prefix('[') {
+        let (addr, tail) = inner.split_once(']')?;
+        if addr.is_empty() || !addr.contains(':') {
+            return None;
+        }
+        Some((addr, strict_port(tail)?, true))
+    } else {
+        match authority.split_once(':') {
+            Some((host, _)) => Some((host, strict_port(&authority[host.len()..])?, false)),
+            None => Some((authority, "", false)),
+        }
+    }
+}
+
+/// `""` or `:` plus one or more ASCII digits. Anything else is not a port.
+fn strict_port(tail: &str) -> Option<&str> {
+    if tail.is_empty() {
+        return Some(tail);
+    }
+    let digits = tail.strip_prefix(':')?;
+    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        Some(tail)
+    } else {
+        None
+    }
+}
+
 /// One percent-decode. A leftover `%` is rejected. So is a decoded host the
 /// file-host gate would refuse: a UNC-like string, a slash or backslash, a
-/// control or bidi character, whitespace, or an empty DNS label (`a..b`,
-/// `.a`, `a.`). A colon that the decode introduced is a smuggled port; an
-/// IPv6 literal already contained its colons.
-fn decode_http_host(raw: &str) -> Option<String> {
+/// bracket, a control or bidi character, whitespace, or an empty DNS label
+/// (`a..b`, `.a`, `a..`). One trailing dot is an FQDN root and is kept. A
+/// colon belongs only inside a bracketed IPv6 literal; anywhere else it is
+/// a smuggled port.
+fn decode_http_host(raw: &str, ipv6: bool) -> Option<String> {
     let host = percent_decode(raw)?;
     if host.is_empty() || host == "." || host.contains('%') || host_has_empty_label(&host) {
         return None;
@@ -555,25 +585,34 @@ fn decode_http_host(raw: &str) -> Option<String> {
     if host_forbidden_for_file(&host) {
         return None;
     }
-    if host.contains(':') && !raw.contains(':') {
+    if ipv6 {
+        if !host.contains(':') {
+            return None;
+        }
+    } else if host.contains(':') {
         return None;
     }
     Some(host)
 }
 
-/// Empty labels are `a..b`, a leading dot, and a trailing dot.
+/// Empty labels are `a..b` and a leading dot. One trailing dot is the FQDN
+/// root (`example.com.`); a second dot (`example.com..`) is still empty.
 fn host_has_empty_label(host: &str) -> bool {
-    host.split('.').any(|label| label.is_empty())
+    let host = host.strip_suffix('.').unwrap_or(host);
+    host.is_empty() || host.split('.').any(|label| label.is_empty())
 }
 
 /// Separators and controls the `file://` host check refuses, plus
 /// [`crate::term::unc_or_device`]. A decoded `http(s)` host is not a file
-/// path, but `\\server\share`, `//server/share`, and a backslash are not
-/// hostnames either.
+/// path, but `\\server\share`, `//server/share`, a backslash, or a bracket
+/// is not a hostname either. Brackets belong around an IPv6 literal, not
+/// inside the decoded address.
 fn host_forbidden_for_file(host: &str) -> bool {
-    host.chars()
-        .any(|c| c.is_whitespace() || is_forbidden(c) || matches!(c, '/' | '\\' | '@' | '?' | '#'))
-        || crate::term::unc_or_device(host)
+    host.chars().any(|c| {
+        c.is_whitespace()
+            || is_forbidden(c)
+            || matches!(c, '/' | '\\' | '@' | '?' | '#' | '[' | ']')
+    }) || crate::term::unc_or_device(host)
 }
 
 /// A label that starts with `xn--`, in either case. Checked on the raw
@@ -723,15 +762,13 @@ fn punycode_host(host: &str) -> Option<String> {
 }
 
 /// Replace the host of an `http(s)` URI, keeping userinfo, port, path,
-/// query, and fragment.
-fn rewrite_host(uri: &str, ascii_host: &str) -> String {
-    let Some(scheme) = scheme_name(uri) else {
-        return uri.to_string();
-    };
+/// query, and fragment. `None` when the authority is not a host plus a
+/// strict port: a `]` counts only when the authority starts with `[`, and
+/// the port is the first `:` after that host.
+fn rewrite_host(uri: &str, ascii_host: &str) -> Option<String> {
+    let scheme = scheme_name(uri)?;
     let after = &uri[scheme.len()..];
-    let Some(rest) = after.strip_prefix("://") else {
-        return uri.to_string();
-    };
+    let rest = after.strip_prefix("://")?;
     let hostport = rest.split(['/', '?', '#']).next().unwrap_or("");
     let suffix = &rest[hostport.len()..];
     let (userinfo, host_and_port) = if let Some(at) = hostport.rfind('@') {
@@ -739,16 +776,18 @@ fn rewrite_host(uri: &str, ascii_host: &str) -> String {
     } else {
         ("", hostport)
     };
-    // Colons inside `[…]` are the address, not a port. The port, when
-    // there is one, is the `:` after the closing bracket.
-    let port = if let Some(end) = host_and_port.find(']') {
-        &host_and_port[end + 1..]
-    } else if host_and_port.starts_with('[') {
-        ""
-    } else if let Some(idx) = host_and_port.rfind(':') {
-        &host_and_port[idx..]
+    // `]` is the end of an IPv6 literal, and only then. The port is the
+    // first `:` after the host — the tail after `]`, or the first `:` in
+    // a name — and it has to be empty or digits. `:80:90` stays one tail
+    // and is rejected, instead of the last colon winning.
+    let port = if host_and_port.starts_with('[') {
+        let end = host_and_port.find(']')?;
+        strict_port(&host_and_port[end + 1..])?
     } else {
-        ""
+        match host_and_port.find(':') {
+            Some(idx) => strict_port(&host_and_port[idx..])?,
+            None => "",
+        }
     };
     let mut out = String::new();
     out.push_str(&uri[..scheme.len()]);
@@ -763,7 +802,15 @@ fn rewrite_host(uri: &str, ascii_host: &str) -> String {
     }
     out.push_str(port);
     out.push_str(suffix);
-    out
+    Some(out)
+}
+
+/// The opened URI names the same host the card shows, and the same port.
+fn opened_matches_card(opened: &str, shown: &str, port: &str) -> bool {
+    match http_authority(opened) {
+        Some(again) => display_host(&again.host).as_deref() == Some(shown) && again.port == port,
+        None => false,
+    }
 }
 
 /// Tooltip text. Userinfo, a non-ASCII host, a percent-encoded host, and
@@ -792,25 +839,33 @@ pub fn plan_uri(uri: &str) -> Action {
     if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
         match http_authority(uri) {
             Some(auth) => {
-                if host_needs_confirm(&auth) {
-                    let Some(shown) = display_host(&auth.host) else {
+                let Some(shown) = display_host(&auth.host) else {
+                    return refuse(RefuseReason::Scheme, uri);
+                };
+                let confirm = host_needs_confirm(&auth);
+                // A percent-encoded or non-ASCII host is opened as the
+                // decoded name. The raw `%HH` form is never what the
+                // browser receives. Userinfo and a plain `xn--` label
+                // keep the original URI; the card already shows the host.
+                let opened = if confirm && (!auth.host.is_ascii() || auth.raw_host.contains('%')) {
+                    let Some(opened) = rewrite_host(uri, &shown) else {
                         return refuse(RefuseReason::Scheme, uri);
                     };
-                    // A percent-encoded or non-ASCII host is opened as the
-                    // decoded name. The raw `%HH` form is never what the
-                    // browser receives. Userinfo and a plain `xn--` label
-                    // keep the original URI; the card already shows the host.
-                    let opened = if !auth.host.is_ascii() || auth.raw_host.contains('%') {
-                        rewrite_host(uri, &shown)
-                    } else {
-                        uri.to_string()
-                    };
+                    opened
+                } else {
+                    uri.to_string()
+                };
+                // The host on the card is the host the browser will open.
+                if !opened_matches_card(&opened, &shown, &auth.port) {
+                    return refuse(RefuseReason::Scheme, uri);
+                }
+                if confirm {
                     Action::Confirm {
                         uri: opened,
                         host: shown,
                     }
                 } else {
-                    Action::Browse(uri.to_string())
+                    Action::Browse(opened)
                 }
             }
             None => refuse(RefuseReason::Scheme, uri),
@@ -3701,6 +3756,13 @@ mod tests {
                     assert_eq!(got, host, "{input}");
                     assert_eq!(uri, opened, "{input}");
                     assert!(!uri.contains('%'), "{input} opened {uri}");
+                    let opened_host = http_authority(&uri).expect("opened uri");
+                    assert_eq!(
+                        display_host(&opened_host.host).as_deref(),
+                        Some(got.as_str()),
+                        "{input}"
+                    );
+                    assert_eq!(opened_host.port, http_authority(input).expect("input").port);
                     assert!(!runs_off_ui_thread(&Action::Confirm {
                         uri: uri.clone(),
                         host: got.clone(),
@@ -3762,7 +3824,8 @@ mod tests {
             "https://evil%2e%2eexample/",
             "https://evil..example/",
             "https://.evil.example/",
-            "https://evil.example./",
+            "https://example.com../",
+            "https://evil.example../",
             // A colon that exists only after decoding is a smuggled port.
             "https://[%3A%3A1]/",
             "https://evil.example%3A443/",
@@ -3778,6 +3841,59 @@ mod tests {
                 }
                 other => panic!("{uri} -> {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn bracket_junk_does_not_open_a_different_host() {
+        for uri in [
+            "https://[%61pple.com].evil.net/login",
+            "https://%61pple.com:x].evil.net/",
+            "https://a@[%61pple.com].evil.net/p?q#f",
+            "https://user:pw@%61pple.com:x].evil.net/",
+            "https://%67ood.com]evil.net/",
+            "https://%5Bfe80::1%5D/",
+            "https://%65vil.example:80:90/",
+        ] {
+            match plan_uri(uri) {
+                Action::Refuse {
+                    reason: RefuseReason::Scheme,
+                    ..
+                } => {}
+                Action::Browse(opened) => panic!("{uri} opened {opened}"),
+                Action::Confirm { uri: opened, host } => {
+                    panic!("{uri} card {host} opened {opened}")
+                }
+                other => panic!("{uri} -> {other:?}"),
+            }
+            let tip = host_tooltip(uri);
+            assert!(!tip.starts_with("apple.com "), "{uri} tooltip {tip}");
+            assert!(!tip.starts_with("[fe80 "), "{uri} tooltip {tip}");
+        }
+    }
+
+    #[test]
+    fn trailing_dot_and_ipv6_port_still_open() {
+        assert_eq!(
+            plan_uri("https://example.com./"),
+            Action::Browse("https://example.com./".into())
+        );
+        assert_eq!(
+            plan_uri("https://evil.example./path"),
+            Action::Browse("https://evil.example./path".into())
+        );
+        assert_eq!(
+            plan_uri("https://[::1]:8080/"),
+            Action::Browse("https://[::1]:8080/".into())
+        );
+        match plan_uri("https://example.com%2e/") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "example.com.");
+                assert_eq!(uri, "https://example.com./");
+                let opened = http_authority(&uri).expect("opened");
+                assert_eq!(display_host(&opened.host).as_deref(), Some(host.as_str()));
+            }
+            other => panic!("{other:?}"),
         }
     }
 }
