@@ -387,7 +387,9 @@ pub fn accept_local_cwd(raw: &str) -> Option<String> {
 
 /// `\\…` (UNC, `\\?\`, `\\.\`) or `\??\…`. Slashes are normalized first so
 /// `//server/share` and `//?/UNC/…` take the same path as their backslash form.
-fn unc_or_device(s: &str) -> bool {
+/// File links call this on the path they are about to open — the same gate
+/// as [`accept_local_cwd`], not a second copy of the rules.
+pub(crate) fn unc_or_device(s: &str) -> bool {
     let norm: String = s.chars().map(|c| if c == '/' { '\\' } else { c }).collect();
     let lower = norm.to_ascii_lowercase();
     lower.starts_with("\\\\") || lower.starts_with("\\??\\")

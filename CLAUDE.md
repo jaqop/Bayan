@@ -36,15 +36,25 @@ hit-testing must resolve through the shaped layout, never by multiplying a
 column index by cell width.
 
 **Hyperlinks never go through a shell.** OSC 8 is read off the cell
-(`Cell::hyperlink`), not parsed again. Ctrl+click opens only `http`, `https`,
-and `file`, via `ShellExecuteW` with the target as the single `lpFile`. The
-editor is a `Command` argument vector (`{file}` `{line}` `{col}` substituted
-after the template is split). `javascript:`, `ms-*`, `data:`, control
-characters, and bidi overrides are refused on a card that does not open them.
-The window asks `link::click_owner` before `mouse::Route::press`: Shift keeps
-local selection and wins over Ctrl, a plain click while tracking is on belongs
-to the program, and `overlay_blocks_mouse` (including the refused-link card)
-blocks the click.
+(`Cell::hyperlink`), not parsed again. Ctrl+click opens `http` and `https`
+via `ShellExecuteW` with the URI as the single `lpFile`. A `file` URI opens
+the same way only for a local drive path whose extension Windows would not
+execute (PATHEXT, read at runtime, plus `.lnk` `.url` `.hta` `.ps1` and the
+rest of the list in `link.rs`). UNC, `\\?\`, `\\.\`, and `\??\` are rejected
+with `term::accept_local_cwd` / `unc_or_device` before any `exists` call.
+`path:line` goes to the editor's `Command` argv, or `explorer.exe
+/select,<path>` when no editor is configured — never to the file's
+association. `{file}` `{line}` `{col}` are substituted once, after the
+template is split, and the path is absolute. A relative path with no pane
+cwd is refused. Userinfo (`good.com@evil.com`) shows the real host and waits
+for the card. `javascript:`, `ms-*`, `data:`, control characters, and bidi
+overrides are refused on a card that does not open them. The open runs off
+the UI thread. The window asks `link::click_owner` before
+`mouse::Route::press`: Shift keeps local selection and wins over Ctrl, a
+plain click while tracking is on belongs to the program, and
+`overlay_blocks_mouse` (including the refused-link card) blocks the click.
+HIDDEN cells are not clickable. Link spans are cached per row and dropped
+on PTY damage, scroll, and relayout.
 
 **Claude mode is narrow on purpose.** Claude Code (Ink) applies BiDi itself on
 Windows and emits Arabic in reversed visual order, so `bidi.rs` reverses UAX#9

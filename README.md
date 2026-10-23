@@ -295,27 +295,49 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       to the program, Ctrl modifier bit included; the window asks
       `link::click_owner` before `mouse::Route::press`, and an overlay
       (settings, cockpit, paste guard, close guard, the refused-link card)
-      blocks the click so a link under a card does not open. Only `http`,
-      `https`, and `file` are opened, and never through `cmd /c start`:
-      `ShellExecuteW` gets the URI or path as the single `lpFile`.
-      `javascript:`, `ms-*`, `search-ms:`, `data:`, and anything else are
-      refused on a card that Esc and Enter both dismiss. Control characters
-      and bidi overrides are refused too, including after percent-decoding,
-      and a target longer than 2048 bytes is refused. The editor is a
+      blocks the click so a link under a card does not open. Only `http`
+      and `https` are association-opened, and never through `cmd /c start`:
+      `ShellExecuteW` gets the URI as the single `lpFile`. A `file` URI
+      opens the same way only after `accept_local_cwd` has accepted a
+      drive path — UNC, `\\?\`, `\\.\`, and `\??\` are refused before
+      `exists`, because a stat of those opens SMB and can leak NTLM — and
+      only when the extension is not one Windows would execute (PATHEXT,
+      read at runtime, plus `.lnk` `.url` `.hta` `.ps1` `.js` and the rest
+      of the list). `javascript:`, `ms-*`, `search-ms:`, `data:`, and
+      anything else are refused on a card that Esc and Enter both dismiss.
+      A URL with userinfo shows the real host first and waits for that
+      card; Enter is what opens it. Control characters and bidi overrides
+      are refused too, including after percent-decoding (a stray `%` is
+      not one of those), and a target longer than 2048 bytes is refused.
+      `path:line` never association-opens the file. The editor is a
       `Command` argument vector from `editor` in the config
       (`code -g {file}:{line}:{col}`); `{file}` `{line}` `{col}` are
-      substituted after the template is split, so a path with spaces is one
-      argument. Absent that key, `code.exe` on PATH (or the `Code.exe`
-      beside VS Code's `code.cmd`) is used; a bare `.cmd` is not spawned.
-      Relative paths resolve through the pane cwd OSC 9;9 already stores
-      (`link::cwd_hook`); OSC 7 should write that same field. Unquoted
-      paths that contain spaces are not detected. Proven: 136 `#[test]`
-      functions (118 on main before these link tests), including OSC 8
-      open/close, URL punctuation and
+      substituted in one pass after the template is split, so a path with
+      spaces is one argument and a `{line}` inside the filename is left
+      alone. The path is absolute, so a file named `-n.rs` cannot become
+      an option. Absent that key, `code.exe` on PATH (or the `Code.exe`
+      beside VS Code's `code.cmd`) is used; a bare `.cmd` is not spawned,
+      and there is no association fallback if the editor fails to start.
+      With no editor, the folder opens as `explorer.exe /select,<path>`,
+      argv, not a shell. A relative path with no pane cwd is refused
+      rather than resolved against Bayan's own directory. A missing file
+      is the card. Relative paths that do resolve use the pane cwd OSC 9;9
+      already stores (`link::cwd_hook`, the same `accept_local_cwd` gate);
+      OSC 7 should write that same field. Unquoted paths that contain
+      spaces are not detected, including a tail like `y\a.rs` inside
+      `C:\x y\a.rs:12`. HIDDEN cells are not clickable. Spans are cached
+      per row and dropped when the pane's PTY wakes, when it scrolls, and
+      on relayout. The browser, the editor, and explorer are spawned off
+      the UI thread. Proven: 151 `#[test]` functions (118 on main before
+      these link tests), including OSC 8 open/close, URL punctuation and
       surrounding Arabic, the four file:line shapes, the scheme allowlist,
-      control/bidi rejection, the editor argv (no shell), an RTL hit
-      through `column_for_click`, and the overlay short-circuit in front
-      of `Route::press`. Not proven here: a live hover underline,
+      the UNC forms, every blocked extension, explorer `/select`, a missing
+      file, one-pass placeholders, the absolute path, a stray `%`, the
+      extra invisible characters, a spaced path that must not match, hidden
+      cells, the row cache, the script hosts, userinfo, control/bidi
+      rejection, the editor argv (no shell), an RTL hit through
+      `column_for_click`, and the overlay short-circuit in front of
+      `Route::press`. Not proven here: a live hover underline,
       `ShellExecuteW` actually launching a browser, or a real editor spawn
       — this tree doesn't run a window on the machine that built it.
 

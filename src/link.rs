@@ -8,15 +8,19 @@
 //! URLs, and `path:line[:col]` / `path(line,col)` from rustc, gcc, MSVC
 //! and grep.
 //!
-//! Opening is deliberately narrow. `http`, `https` and `file` go to
-//! `ShellExecuteW` with the target as the single `lpFile` argument.
-//! Anything else — `javascript:`, `ms-*`, `search-ms:`, `data:`, a custom
-//! protocol — is refused and shown on a card. Control characters and bidi
-//! overrides are refused too, including when they only appear after
-//! percent-decoding, and nothing longer than [`MAX_TARGET`] bytes is
-//! opened. The editor is a `Command` argument vector; `{file}` `{line}`
-//! `{col}` are substituted after the template is split, so a path with
-//! spaces stays one argument and the string is never handed to a shell.
+//! Opening is deliberately narrow. `http` and `https` go to `ShellExecuteW`
+//! with the URI as the single `lpFile`. A `file` URI opens the same way
+//! only when the path is a local drive path and the extension is not one
+//! Windows would execute. `javascript:`, `ms-*`, `search-ms:`, `data:`, a
+//! custom protocol, a UNC or device path, and those extensions are refused
+//! on a card. A `path:line` location goes to the editor's `Command` argv,
+//! or `explorer.exe /select,<path>` when no editor is configured — never
+//! to the file's own association. Control characters and bidi overrides
+//! are refused too, including when they only appear after percent-decoding,
+//! and nothing longer than [`MAX_TARGET`] bytes is opened. `{file}`
+//! `{line}` `{col}` are substituted once, after the template is split, so
+//! a path with spaces stays one argument and a `{line}` inside the path
+//! is not rewritten. The open itself runs off the UI thread.
 //!
 //! Mouse tracking still owns a plain click. Ctrl+click is the link
 //! gesture even while tracking is on. Shift keeps the gesture for local
@@ -31,6 +35,7 @@
 //! directory OSC 9;9 already stores on the pane. OSC 7 (PR5) should write
 //! the same field; this function is the only reader.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use alacritty_terminal::event::EventListener;
@@ -89,6 +94,10 @@ pub enum RefuseReason {
     Empty,
     BadFile,
     Editor,
+    /// PATHEXT or another extension Windows association-opens as a program.
+    Blocked,
+    /// The path is local, and it is not on disk.
+    Missing,
 }
 
 impl RefuseReason {
@@ -100,9 +109,15 @@ impl RefuseReason {
             RefuseReason::Empty => "رابط فارغ",
             RefuseReason::BadFile => "مسار الملف غير مقبول",
             RefuseReason::Editor => "تعذّر فتح المحرّر",
+            RefuseReason::Blocked => "لن يُفتح هذا النوع من الملفات",
+            RefuseReason::Missing => "الملف غير موجود",
         }
     }
 }
+
+/// Shown on the confirm card when a URL carries userinfo. Enter opens it;
+/// Esc dismisses. A [`RefuseReason`] card does not open on Enter.
+pub const HOST_CONFIRM: &str = "تأكد من المضيف";
 
 /// What a Ctrl+click should do. The window loop performs it; nothing here
 /// builds a `cmd /c` string.
@@ -111,14 +126,21 @@ pub enum Action {
     /// `ShellExecuteW` lpFile = this URI. http or https only.
     Browse(String),
     /// `ShellExecuteW` lpFile = this filesystem path. One argument.
+    /// Never a PATHEXT (or other association-executed) extension.
     OpenPath(String),
-    /// `Command::new(argv[0]).args(&argv[1..])`.
-    /// `fallback_path` is set only for the default `code -g` choice: if
-    /// that process fails to spawn, the file opens by association. A
-    /// configured editor leaves it empty so a failure is reported.
+    /// `explorer.exe /select,<path>` as a `Command` argument vector.
+    /// This is how a `path:line` link opens when no editor is configured.
+    Reveal(String),
+    /// `Command::new(argv[0]).args(&argv[1..])`. No association fallback:
+    /// a spawn failure is reported, and the file is not opened by its type.
     Edit {
         argv: Vec<String>,
-        fallback_path: Option<String>,
+    },
+    /// `http(s)` with userinfo (`user@host` or `good.com@evil.com`).
+    /// The card shows `host` first. Enter is what opens `uri`.
+    Confirm {
+        uri: String,
+        host: String,
     },
     Refuse {
         reason: RefuseReason,
@@ -160,9 +182,9 @@ impl LinkSpan {
     /// the status cannot be reordered by the link it is disclosing.
     pub fn tooltip(&self, cwd: Option<&str>) -> String {
         match &self.kind {
-            LinkKind::Osc { uri } | LinkKind::Url { uri } => preview(uri, 200),
+            LinkKind::Osc { uri } | LinkKind::Url { uri } => host_tooltip(uri),
             LinkKind::File { path, line, col } => {
-                let full = resolve_against_cwd(path, cwd);
+                let full = resolve_against_cwd(path, cwd).unwrap_or_else(|| path.clone());
                 preview(&format_file(&full, *line, *col), 200)
             }
         }
@@ -216,8 +238,13 @@ pub fn is_forbidden(c: char) -> bool {
                 | '\u{2067}'
                 | '\u{2068}'
                 | '\u{2069}'
+                | '\u{00AD}'
+                | '\u{034F}'
                 | '\u{FEFF}'
         )
+        || ('\u{2061}'..='\u{2064}').contains(&c)
+        || ('\u{FFF9}'..='\u{FFFB}').contains(&c)
+        || ('\u{E0000}'..='\u{E007F}').contains(&c)
 }
 
 fn marker(c: char) -> String {
@@ -275,46 +302,61 @@ fn refuse(reason: RefuseReason, raw: &str) -> Action {
 /// Directory a relative `file:line` resolves against.
 ///
 /// `reported` is `SessionMeta::cwd` (OSC 9;9 today). OSC 7 should assign
-/// that same field; callers do not grow a second source. Empty, too long,
-/// or containing a control / bidi character yields `None` — the link then
-/// keeps the relative path instead of joining a poisoned directory.
-pub fn cwd_hook(reported: Option<&str>) -> Option<&str> {
-    let c = reported.map(str::trim).filter(|s| !s.is_empty())?;
-    if c.len() > MAX_TARGET || c.chars().any(is_forbidden) {
+/// that same field; callers do not grow a second source. The value has to
+/// pass [`crate::term::accept_local_cwd`]: a UNC, `\\?\`, `\\.\`, or `\??\`
+/// directory is dropped, and so is anything that is not a drive path.
+/// Bidi and other forbidden characters are dropped here first — the cwd
+/// gate only rejects controls.
+pub fn cwd_hook(reported: Option<&str>) -> Option<String> {
+    let c = reported?;
+    if c.chars().any(is_forbidden) {
+        return None;
+    }
+    crate::term::accept_local_cwd(c)
+}
+
+fn is_drive_abs(p: &str) -> bool {
+    let b = p.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+}
+
+/// Join `path` onto `cwd` when the path is relative.
+///
+/// `None` when the result is not a local drive path: UNC and device paths,
+/// a relative path with no pane cwd (Bayan's own cwd is not a fallback),
+/// or a cwd [`cwd_hook`] already rejected. The returned path has been
+/// through [`crate::term::accept_local_cwd`], so it starts with `X:\`.
+pub fn resolve_against_cwd(path: &str, cwd: Option<&str>) -> Option<String> {
+    if path.is_empty() || path.len() > MAX_TARGET || path.chars().any(is_forbidden) {
+        return None;
+    }
+    let mut path = path.replace('/', "\\");
+    if crate::term::unc_or_device(&path) {
+        return None;
+    }
+    let joined = if is_drive_abs(&path) {
+        path
+    } else {
+        // A single leading slash is the current-drive root. That still
+        // depends on the process cwd, so it is not a path we open.
+        if path.starts_with('\\') {
+            return None;
+        }
+        while let Some(stripped) = path.strip_prefix(".\\") {
+            path = stripped.to_string();
+        }
+        let cwd = cwd_hook(cwd)?;
+        if path.is_empty() {
+            cwd
+        } else {
+            format!("{cwd}\\{path}")
+        }
+    };
+    let full = crate::term::accept_local_cwd(&joined)?;
+    if crate::term::unc_or_device(&full) || full.starts_with('-') {
         None
     } else {
-        Some(c)
-    }
-}
-
-fn is_windows_abs(p: &str) -> bool {
-    let b = p.as_bytes();
-    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
-    {
-        return true;
-    }
-    p.starts_with('\\') || p.starts_with("//")
-}
-
-/// Join `path` onto `cwd` when the path is relative. Slashes become `\`.
-/// An absolute path (drive, UNC, or root-relative) is returned alone.
-pub fn resolve_against_cwd(path: &str, cwd: Option<&str>) -> String {
-    let mut path = path.replace('/', "\\");
-    if is_windows_abs(&path) {
-        return path;
-    }
-    if let Some(stripped) = path.strip_prefix(".\\") {
-        path = stripped.to_string();
-    }
-    let Some(cwd) = cwd_hook(cwd) else {
-        return path;
-    };
-    let cwd = cwd.replace('/', "\\");
-    let cwd = cwd.trim_end_matches('\\');
-    if path.is_empty() {
-        cwd.to_string()
-    } else {
-        format!("{cwd}\\{path}")
+        Some(full)
     }
 }
 
@@ -333,23 +375,24 @@ fn scheme_name(uri: &str) -> Option<&str> {
     Some(scheme)
 }
 
+/// Decode well-formed `%HH` escapes. A stray `%` (`http://a/100%`) or a
+/// `%` that is not followed by two hex digits stays a literal percent
+/// sign — it is not a control character, and it is not a reason to refuse
+/// the URI. Invalid UTF-8 after a real escape still yields `None`.
 fn percent_decode(s: &str) -> Option<String> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' {
-            if i + 2 >= b.len() {
-                return None;
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex_val(b[i + 1]), hex_val(b[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
             }
-            let h = hex_val(b[i + 1])?;
-            let l = hex_val(b[i + 2])?;
-            out.push((h << 4) | l);
-            i += 3;
-        } else {
-            out.push(b[i]);
-            i += 1;
         }
+        out.push(b[i]);
+        i += 1;
     }
     String::from_utf8(out).ok()
 }
@@ -381,8 +424,10 @@ fn uri_shape_bad(uri: &str) -> Option<RefuseReason> {
 }
 
 /// `file:///C:/src/a.rs` and `file://localhost/C:/src/a.rs` become a local
-/// path. A remote host is refused — ShellExecuteW would otherwise treat it
-/// as a network location.
+/// drive path. The host is not the only check: the decoded path goes
+/// through [`crate::term::accept_local_cwd`], so `file://///evil/share`,
+/// a percent-encoded `\\evil\share`, and `\\?\UNC\…` are `None` before
+/// anything stats the path.
 fn file_uri_path(uri: &str) -> Option<String> {
     let scheme = scheme_name(uri)?;
     if !scheme.eq_ignore_ascii_case("file") {
@@ -403,6 +448,9 @@ fn file_uri_path(uri: &str) -> Option<String> {
         path
     };
     let decoded = percent_decode(raw)?;
+    if decoded.chars().any(is_forbidden) {
+        return None;
+    }
     let path = if decoded.len() >= 3
         && decoded.as_bytes()[0] == b'/'
         && decoded.as_bytes()[1].is_ascii_alphabetic()
@@ -412,31 +460,59 @@ fn file_uri_path(uri: &str) -> Option<String> {
     } else {
         decoded
     };
-    if path.is_empty() || path.len() > MAX_TARGET || path.chars().any(is_forbidden) {
+    // A query or fragment is not part of the filesystem path. Leaving it
+    // on would also hide a trailing `.exe`.
+    let path = path.split(['?', '#']).next().unwrap_or(&path);
+    let path = path.replace('/', "\\");
+    if path.is_empty() || path.len() > MAX_TARGET {
         return None;
     }
-    Some(path.replace('/', "\\"))
+    let full = crate::term::accept_local_cwd(&path)?;
+    if crate::term::unc_or_device(&full) {
+        None
+    } else {
+        Some(full)
+    }
 }
 
-fn http_host_ok(uri: &str, scheme: &str) -> bool {
+/// Host of an `http(s)` URI, and whether userinfo (`@`) was present.
+/// The host is the part after the last `@`, so `good.com@evil.com` is
+/// `evil.com`.
+fn http_authority(uri: &str) -> Option<(String, bool)> {
+    let scheme = scheme_name(uri)?;
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
+        return None;
+    }
     let after = &uri[scheme.len()..];
-    let Some(rest) = after.strip_prefix("://") else {
-        return false;
-    };
+    let rest = after.strip_prefix("://")?;
     if uri.contains('\\') || rest.is_empty() {
-        return false;
+        return None;
     }
     let hostport = rest.split(['/', '?', '#']).next().unwrap_or("");
     if hostport.is_empty() {
-        return false;
+        return None;
     }
+    let has_userinfo = hostport.contains('@');
     let host = hostport.rsplit('@').next().unwrap_or(hostport);
     let host = if let Some(inner) = host.strip_prefix('[') {
         inner.split(']').next().unwrap_or("")
     } else {
         host.split(':').next().unwrap_or(host)
     };
-    !host.is_empty() && host != "."
+    if host.is_empty() || host == "." {
+        None
+    } else {
+        Some((host.to_string(), has_userinfo))
+    }
+}
+
+/// Tooltip text. When the URI has userinfo the real host is first, so a
+/// label of `good.com` cannot hide `evil.com`.
+fn host_tooltip(uri: &str) -> String {
+    match http_authority(uri) {
+        Some((host, true)) => preview(&format!("{host} — {uri}"), 200),
+        _ => preview(uri, 200),
+    }
 }
 
 /// Allowlist. The `Ok` string is exactly what `ShellExecuteW` receives:
@@ -449,19 +525,46 @@ pub fn plan_uri(uri: &str) -> Action {
         return refuse(RefuseReason::Scheme, uri);
     };
     if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
-        if http_host_ok(uri, scheme) {
-            Action::Browse(uri.to_string())
-        } else {
-            refuse(RefuseReason::Scheme, uri)
+        match http_authority(uri) {
+            Some((host, true)) => Action::Confirm {
+                uri: uri.to_string(),
+                host,
+            },
+            Some((_, false)) => Action::Browse(uri.to_string()),
+            None => refuse(RefuseReason::Scheme, uri),
         }
     } else if scheme.eq_ignore_ascii_case("file") {
         match file_uri_path(uri) {
-            Some(path) => Action::OpenPath(path),
+            Some(path) => plan_local_open(&path),
             None => refuse(RefuseReason::BadFile, uri),
         }
     } else {
         refuse(RefuseReason::Scheme, uri)
     }
+}
+
+/// Association-open of a local file URI. Executables and the other
+/// extensions Windows would run are refused before `exists`, and `exists`
+/// is only reached for a path [`file_uri_path`] already accepted.
+fn plan_local_open(path: &str) -> Action {
+    if crate::term::unc_or_device(path) {
+        return refuse(RefuseReason::BadFile, path);
+    }
+    if is_blocked_file(path) {
+        return refuse(RefuseReason::Blocked, path);
+    }
+    if !local_file_exists(path) {
+        return refuse(RefuseReason::Missing, path);
+    }
+    Action::OpenPath(path.to_string())
+}
+
+fn local_file_exists(path: &str) -> bool {
+    // A UNC stat opens SMB. Refuse that even if a caller skipped the gate.
+    if crate::term::unc_or_device(path) {
+        return false;
+    }
+    Path::new(path).exists()
 }
 
 fn plan_file(
@@ -488,35 +591,44 @@ fn plan_file(
             return refuse(RefuseReason::Scheme, path);
         }
     }
-    let full = resolve_against_cwd(path, cwd);
-    if full.len() > MAX_TARGET || full.chars().any(is_forbidden) {
-        return refuse(RefuseReason::BadFile, &full);
-    }
+    let Some(full) = resolve_against_cwd(path, cwd) else {
+        return refuse(RefuseReason::BadFile, path);
+    };
+    // `path:line` never association-opens the file. A shell template is
+    // refused even when the file is missing, so the missing-file card
+    // cannot hide `cmd /c`.
     let configured = editor.map(str::trim).filter(|s| !s.is_empty());
     if let Some(template) = configured {
         match expand_editor(template, &full, Some(line), col) {
-            Some(argv) if !is_shell_program(&argv[0]) => Action::Edit {
-                argv,
-                fallback_path: None,
-            },
+            Some(argv) if !is_shell_program(&argv[0]) => {
+                if !local_file_exists(&full) {
+                    return refuse(RefuseReason::Missing, &full);
+                }
+                Action::Edit { argv }
+            }
             _ => refuse(RefuseReason::Editor, template),
         }
     } else if let Some(exe) = code_exe.map(str::trim).filter(|s| !s.is_empty()) {
+        if is_shell_program(exe) {
+            return refuse(RefuseReason::Editor, exe);
+        }
+        if !local_file_exists(&full) {
+            return refuse(RefuseReason::Missing, &full);
+        }
         match expand_editor("code -g {file}:{line}:{col}", &full, Some(line), col) {
             Some(mut argv) => {
                 argv[0] = exe.to_string();
                 if is_shell_program(&argv[0]) {
                     return refuse(RefuseReason::Editor, exe);
                 }
-                Action::Edit {
-                    argv,
-                    fallback_path: Some(full),
-                }
+                Action::Edit { argv }
             }
-            None => Action::OpenPath(full),
+            None => refuse(RefuseReason::Editor, exe),
         }
+    } else if !local_file_exists(&full) {
+        refuse(RefuseReason::Missing, &full)
     } else {
-        Action::OpenPath(full)
+        Action::Reveal(full)
     }
 }
 
@@ -526,8 +638,135 @@ fn is_shell_program(prog: &str) -> bool {
     let base = base.strip_suffix(".exe").unwrap_or(&base);
     matches!(
         base,
-        "cmd" | "powershell" | "pwsh" | "bash" | "sh" | "wsl" | "fish"
+        "cmd"
+            | "powershell"
+            | "pwsh"
+            | "bash"
+            | "sh"
+            | "wsl"
+            | "fish"
+            | "mshta"
+            | "wscript"
+            | "cscript"
+            | "rundll32"
     )
+}
+
+/// Extensions association-open must never run. PATHEXT is read at runtime;
+/// the built-in list still applies when that variable is empty or stripped.
+const BLOCKED_EXTS: &[&str] = &[
+    ".com",
+    ".exe",
+    ".bat",
+    ".cmd",
+    ".lnk",
+    ".url",
+    ".hta",
+    ".scr",
+    ".msi",
+    ".ps1",
+    ".vbs",
+    ".vbe",
+    ".js",
+    ".jse",
+    ".wsf",
+    ".wsh",
+    ".cpl",
+    ".appref-ms",
+    ".library-ms",
+    ".search-ms",
+    ".settingcontent-ms",
+    ".application",
+    ".reg",
+    ".pif",
+];
+
+fn normalize_ext(ext: &str) -> Option<String> {
+    let ext = ext.trim().trim_start_matches('*');
+    if ext.is_empty() || ext == "." {
+        return None;
+    }
+    let ext = if ext.starts_with('.') {
+        ext.to_ascii_lowercase()
+    } else {
+        format!(".{}", ext.to_ascii_lowercase())
+    };
+    Some(ext)
+}
+
+/// Filename used for the extension check. Trailing dots and spaces are
+/// ignored the way Windows ignores them, and `name.exe:stream` is judged
+/// as `name.exe`.
+fn leaf_for_extension(path: &str) -> String {
+    let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    let file = file.trim_end_matches([' ', '.']);
+    let file = match file.rsplit_once(':') {
+        Some((base, stream)) if !stream.is_empty() && base.contains('.') => base,
+        _ => file,
+    };
+    file.to_ascii_lowercase()
+}
+
+fn ext_matches(leaf: &str, ext: &str) -> bool {
+    leaf.len() > ext.len() && leaf.ends_with(ext)
+}
+
+fn is_blocked_path(path: &str, pathext: &[String]) -> bool {
+    let leaf = leaf_for_extension(path);
+    if BLOCKED_EXTS.iter().any(|ext| ext_matches(&leaf, ext)) {
+        return true;
+    }
+    pathext
+        .iter()
+        .any(|ext| normalize_ext(ext).is_some_and(|ext| ext_matches(&leaf, &ext)))
+}
+
+fn is_blocked_file(path: &str) -> bool {
+    is_blocked_path(path, &pathexts())
+}
+
+/// `explorer.exe /select,<path>`. One argument after the program, no shell.
+pub fn reveal_argv(path: &str) -> Vec<String> {
+    vec!["explorer.exe".into(), format!("/select,{path}")]
+}
+
+/// Browse, association-open, editor, and explorer run off the UI thread.
+/// A refusal and a userinfo confirm are decided on it.
+pub fn runs_off_ui_thread(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Browse(_) | Action::OpenPath(_) | Action::Reveal(_) | Action::Edit { .. }
+    )
+}
+
+pub fn perform_open(action: &Action) -> bool {
+    match action {
+        Action::Browse(target) | Action::OpenPath(target) => shell_execute(target),
+        Action::Reveal(path) => spawn_editor(&reveal_argv(path)).is_ok(),
+        Action::Edit { argv } => spawn_editor(argv).is_ok(),
+        Action::Confirm { .. } | Action::Refuse { .. } => false,
+    }
+}
+
+/// Enter on a userinfo card opens. Enter on a refusal dismisses. Esc
+/// always dismisses. Any other key is ignored, so it is not typed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardDecision {
+    Ignore,
+    Dismiss,
+    Open,
+}
+
+pub fn card_decision(enter: bool, escape: bool, may_open: bool) -> CardDecision {
+    if escape {
+        CardDecision::Dismiss
+    } else if enter && may_open {
+        CardDecision::Open
+    } else if enter {
+        CardDecision::Dismiss
+    } else {
+        CardDecision::Ignore
+    }
 }
 
 /// Split `template` on whitespace, honoring double quotes, then substitute
@@ -551,20 +790,9 @@ pub fn expand_editor(
     let col_s = col.map(|n| n.to_string()).unwrap_or_default();
     let mut argv = Vec::with_capacity(tokens.len());
     for tok in tokens {
-        let mut filled = tok
-            .replace("{file}", file)
-            .replace("{line}", &line_s)
-            .replace("{col}", &col_s);
-        if col_s.is_empty() && tok.contains("{col}") {
-            if let Some(stripped) = filled.strip_suffix(':') {
-                filled = stripped.to_string();
-            }
-        }
-        if line_s.is_empty() && tok.contains("{line}") {
-            if let Some(stripped) = filled.strip_suffix(':') {
-                filled = stripped.to_string();
-            }
-        }
+        // One pass. The substituted path is not scanned again, so a
+        // `{line}` that is part of the filename stays literal.
+        let filled = subst_once(&tok, file, &line_s, &col_s);
         if filled.is_empty() {
             continue;
         }
@@ -578,6 +806,44 @@ pub fn expand_editor(
     } else {
         Some(argv)
     }
+}
+
+fn subst_once(tok: &str, file: &str, line: &str, col: &str) -> String {
+    let mut out = String::new();
+    let mut rest = tok;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix("{file}") {
+            out.push_str(file);
+            rest = after;
+            continue;
+        }
+        if line.is_empty() {
+            if let Some(after) = rest.strip_prefix(":{line}") {
+                rest = after;
+                continue;
+            }
+        }
+        if col.is_empty() {
+            if let Some(after) = rest.strip_prefix(":{col}") {
+                rest = after;
+                continue;
+            }
+        }
+        if let Some(after) = rest.strip_prefix("{line}") {
+            out.push_str(line);
+            rest = after;
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("{col}") {
+            out.push_str(col);
+            rest = after;
+            continue;
+        }
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    out
 }
 
 fn tokenize(s: &str) -> Option<Vec<String>> {
@@ -644,7 +910,8 @@ pub fn spawn_editor(argv: &[String]) -> std::io::Result<()> {
 /// `code.exe` on PATH, or the `Code.exe` that sits next to the `code.cmd`
 /// shim VS Code puts on PATH. A `.cmd` is not returned: `Command` would
 /// not start it, and wrapping it in `cmd /c` is the thing this module
-/// does not do. `None` means the caller opens the file by association.
+/// does not do. `None` means a `path:line` link opens its folder with
+/// `explorer.exe /select` instead of an editor.
 pub fn find_code_exe() -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     find_code_exe_in(std::env::split_paths(&path), &pathexts())
@@ -744,12 +1011,15 @@ fn shell_execute_w(target: &str) -> bool {
     (rc as isize) > 32
 }
 
+#[derive(Clone)]
 struct RowCell {
     col: usize,
     width: usize,
     ch: char,
     osc_id: Option<String>,
     osc_uri: Option<String>,
+    /// HIDDEN cells are not part of a clickable span.
+    hidden: bool,
 }
 
 struct CharLoc {
@@ -778,12 +1048,11 @@ pub fn links_on_row<T: EventListener>(term: &Term<T>, viewport_row: usize) -> Ve
         } else {
             1
         };
-        let href = cell.hyperlink();
-        let ch = if cell.flags.intersects(Flags::HIDDEN) {
-            ' '
-        } else {
-            cell.c
-        };
+        let hidden = cell.flags.intersects(Flags::HIDDEN);
+        // A hidden cell keeps no hyperlink. Copying the URI onto a blank
+        // would leave that column clickable.
+        let href = if hidden { None } else { cell.hyperlink() };
+        let ch = if hidden { ' ' } else { cell.c };
         cells.push(RowCell {
             col: cell.point.column.0,
             width,
@@ -793,6 +1062,7 @@ pub fn links_on_row<T: EventListener>(term: &Term<T>, viewport_row: usize) -> Ve
                 .as_ref()
                 .map(|h| h.uri().to_string())
                 .filter(|u| !u.is_empty()),
+            hidden,
         });
     }
     links_in_row(&cells)
@@ -839,6 +1109,10 @@ fn osc_spans(cells: &[RowCell]) -> Vec<LinkSpan> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < cells.len() {
+        if cells[i].hidden {
+            i += 1;
+            continue;
+        }
         let Some(uri) = cells[i].osc_uri.clone() else {
             i += 1;
             continue;
@@ -848,6 +1122,7 @@ fn osc_spans(cells: &[RowCell]) -> Vec<LinkSpan> {
         let mut end = cells[i].col + cells[i].width;
         i += 1;
         while i < cells.len()
+            && !cells[i].hidden
             && cells[i].osc_uri.as_deref() == Some(uri.as_str())
             && cells[i].osc_id == id
             && cells[i].col <= end
@@ -1062,6 +1337,27 @@ fn looks_like_path(p: &str) -> bool {
     has_sep || dotted
 }
 
+fn previous_token_is_path(text: &str, chars: &[(usize, char)], i: usize) -> bool {
+    if i == 0 || !chars[i - 1].1.is_whitespace() {
+        return false;
+    }
+    let mut k = i - 1;
+    while k > 0 && chars[k - 1].1.is_whitespace() {
+        k -= 1;
+    }
+    if k == 0 {
+        return false;
+    }
+    let mut t = k;
+    while t > 0 && !chars[t - 1].1.is_whitespace() {
+        t -= 1;
+    }
+    let prev = &text[chars[t].0..chars[k].0];
+    let drive =
+        prev.len() >= 2 && prev.as_bytes()[0].is_ascii_alphabetic() && prev.as_bytes()[1] == b':';
+    prev.contains('\\') || prev.contains('/') || drive
+}
+
 fn take_path(text: &str, chars: &[(usize, char)], end: usize) -> Option<(usize, usize)> {
     if end == 0 {
         return None;
@@ -1093,6 +1389,12 @@ fn take_path(text: &str, chars: &[(usize, char)], end: usize) -> Option<(usize, 
     }
     // Stopped on a colon we did not consume: the tail of `scheme://…`.
     if i > 0 && chars[i - 1].1 == ':' {
+        return None;
+    }
+    // `C:\x y\a.rs:12` stops at the space and would open `y\a.rs`. If the
+    // token before that space is itself a path, this match is the tail of
+    // a spaced path — drop it. `see src/main.rs:10` stays: `see` is a word.
+    if previous_token_is_path(text, chars, i) {
         return None;
     }
     let start = chars[i].0;
@@ -1209,6 +1511,32 @@ fn try_paren(text: &str, chars: &[(usize, char)], i: usize) -> Option<FileHit> {
     })
 }
 
+/// Spans for one pane, keyed by viewport row. The window invalidates a
+/// pane when its PTY wakes, when that pane scrolls, and on relayout —
+/// hover and click then reuse the row instead of locking the terminal.
+#[derive(Clone, Debug, Default)]
+pub struct SpanCache {
+    panes: HashMap<u64, HashMap<usize, Vec<LinkSpan>>>,
+}
+
+impl SpanCache {
+    pub fn get(&self, pane: u64, row: usize) -> Option<Vec<LinkSpan>> {
+        self.panes.get(&pane)?.get(&row).cloned()
+    }
+
+    pub fn insert(&mut self, pane: u64, row: usize, spans: Vec<LinkSpan>) {
+        self.panes.entry(pane).or_default().insert(row, spans);
+    }
+
+    pub fn invalidate_pane(&mut self, pane: u64) {
+        self.panes.remove(&pane);
+    }
+
+    pub fn clear(&mut self) {
+        self.panes.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1222,6 +1550,7 @@ mod tests {
                 ch,
                 osc_id: None,
                 osc_uri: None,
+                hidden: false,
             })
             .collect()
     }
@@ -1489,13 +1818,21 @@ mod tests {
             }
         ));
         assert_eq!(
-            plan_uri("file:///C:/src/main.rs"),
-            Action::OpenPath(r"C:\src\main.rs".into())
+            file_uri_path("file:///C:/src/main.rs").as_deref(),
+            Some(r"C:\src\main.rs")
         );
         assert_eq!(
-            plan_uri("file://localhost/C:/Program%20Files/a.rs"),
-            Action::OpenPath(r"C:\Program Files\a.rs".into())
+            file_uri_path("file://localhost/C:/Program%20Files/a.rs").as_deref(),
+            Some(r"C:\Program Files\a.rs")
         );
+        // The path is local and not an executable, and it is not on disk.
+        assert!(matches!(
+            plan_uri("file:///C:/bayan-qa-missing/no-such.rs"),
+            Action::Refuse {
+                reason: RefuseReason::Missing,
+                ..
+            }
+        ));
         // Remote file host: not a local path, not opened.
         assert!(matches!(
             plan_uri("file://evil.example/share/secret"),
@@ -1529,8 +1866,6 @@ mod tests {
             // percent-encoded RLO (UTF-8 E2 80 AE) and a NUL
             "https://example.com/%E2%80%AEhidden",
             "https://example.com/%00",
-            "https://example.com/%ZZ",
-            "https://example.com/%E",
         ] {
             match plan_uri(uri) {
                 Action::Refuse {
@@ -1641,51 +1976,28 @@ mod tests {
 
     #[test]
     fn relative_path_resolves_against_cwd_hook() {
-        assert_eq!(cwd_hook(Some(r"  C:\src  ")), Some(r"C:\src"));
+        assert_eq!(cwd_hook(Some(r"  C:\src  ")).as_deref(), Some(r"C:\src"));
         assert_eq!(cwd_hook(Some("")), None);
         assert_eq!(cwd_hook(None), None);
         assert_eq!(cwd_hook(Some("C:\\src\u{202E}")), None);
-
-        let spans = links_in_row(&row("src/main.rs:10:4"));
+        assert_eq!(cwd_hook(Some(r"\\evil\share")), None);
         assert_eq!(
-            spans[0].activate(Some(r"C:\work"), Some("code -g {file}:{line}:{col}"), None),
-            Action::Edit {
-                argv: vec![
-                    "code".into(),
-                    "-g".into(),
-                    r"C:\work\src\main.rs:10:4".into()
-                ],
-                fallback_path: None,
-            }
+            resolve_against_cwd("src/main.rs", Some(r"C:\work")).as_deref(),
+            Some(r"C:\work\src\main.rs")
         );
-        // `./` is the cwd itself, not a literal dot directory.
-        let spans = links_in_row(&row("./src/main.rs:3"));
-        match spans[0].activate(Some(r"C:\work"), None, None) {
-            Action::OpenPath(path) => assert_eq!(path, r"C:\work\src\main.rs"),
-            other => panic!("{other:?}"),
-        }
-        // Absolute wins over the pane cwd. No editor and no code.exe: association.
-        let spans = links_in_row(&row(r"C:\src\main.rs:2:1"));
-        match spans[0].activate(Some(r"D:\other"), None, None) {
-            Action::OpenPath(path) => assert_eq!(path, r"C:\src\main.rs"),
-            other => panic!("{other:?}"),
-        }
-        // Default editor is the resolved exe, one argv element, with the
-        // file as the association fallback if that process fails to spawn.
+        assert_eq!(
+            resolve_against_cwd(r".\src\main.rs", Some(r"C:\work")).as_deref(),
+            Some(r"C:\work\src\main.rs")
+        );
+        // The file is not on disk: the card, not an editor launch.
         let spans = links_in_row(&row("src/main.rs:10:4"));
-        match spans[0].activate(Some(r"C:\work"), None, Some(r"C:\Program Files\Code.exe")) {
-            Action::Edit {
-                argv,
-                fallback_path,
-            } => {
-                assert_eq!(argv[0], r"C:\Program Files\Code.exe");
-                assert_eq!(argv[1], "-g");
-                assert_eq!(argv[2], r"C:\work\src\main.rs:10:4");
-                assert_eq!(fallback_path.as_deref(), Some(r"C:\work\src\main.rs"));
-                assert!(editor_command(&argv).is_some());
+        assert!(matches!(
+            spans[0].activate(Some(r"C:\work"), Some("code -g {file}:{line}:{col}"), None),
+            Action::Refuse {
+                reason: RefuseReason::Missing,
+                ..
             }
-            other => panic!("{other:?}"),
-        }
+        ));
         assert_eq!(
             spans[0].tooltip(Some(r"C:\work")),
             r"C:\work\src\main.rs:10:4"
@@ -1882,5 +2194,542 @@ mod tests {
             serde_json::from_str(r#"{"editor":"code -g {file}:{line}:{col}"}"#).unwrap();
         assert_eq!(cfg.editor.as_deref(), Some("code -g {file}:{line}:{col}"));
         assert!(crate::config::UserConfig::default().editor.is_none());
+    }
+
+    /// A drive path under the temp dir, created for the test. Each call
+    /// gets its own directory so the suite can run in parallel.
+    fn scratch(name: &str) -> (String, String) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("bayan-link-qa-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, b"x").unwrap();
+        let raw = path.display().to_string();
+        let raw = raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string();
+        let full = crate::term::accept_local_cwd(&raw).expect("temp file is a drive path");
+        let cwd = full
+            .rsplit_once('\\')
+            .map(|(d, _)| d.to_string())
+            .expect("parent");
+        (cwd, full)
+    }
+
+    #[test]
+    fn unc_paths_are_not_opened() {
+        for uri in [
+            "file://///evil/share/x.txt",
+            "file:///%5C%5Cevil%5Cshare%5Cx.txt",
+            "file://localhost/%5C%5Cevil%5Cshare%5Cx.txt",
+            "file://localhost/%2F%2Fevil%2Fshare%2Fx.txt",
+            r"file:///\\evil\share\x",
+            r"file:///\\?\UNC\evil\s",
+            r"file:///\\.\UNC\evil\s",
+            r"file:///\??\UNC\evil\s",
+        ] {
+            assert!(
+                file_uri_path(uri).is_none(),
+                "decoded a UNC path from {uri}"
+            );
+            assert!(
+                matches!(
+                    plan_uri(uri),
+                    Action::Refuse {
+                        reason: RefuseReason::BadFile,
+                        ..
+                    }
+                ),
+                "{uri} -> {:?}",
+                plan_uri(uri)
+            );
+        }
+        for path in [
+            r"\\?\UNC\evil\s",
+            r"\\evil\share\a.rs",
+            "//evil/share/a.rs",
+            r"\\.\pipe\bayan",
+            r"\??\C:\Windows\a.rs",
+            r"\\?\C:\Windows\a.rs",
+        ] {
+            assert_eq!(resolve_against_cwd(path, Some(r"C:\work")), None, "{path}");
+            assert!(!local_file_exists(path), "stat of {path}");
+        }
+        assert_eq!(cwd_hook(Some(r"\\evil\share")), None);
+        assert_eq!(cwd_hook(Some(r"//evil/share")), None);
+        assert_eq!(cwd_hook(Some(r"\\?\UNC\evil\s")), None);
+        assert_eq!(cwd_hook(Some(r"\\.\C:\x")), None);
+        assert_eq!(cwd_hook(Some(r"\??\C:\x")), None);
+
+        let spans = links_in_row(&row(r"\\evil\share\a.rs:12"));
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert!(matches!(
+            spans[0].activate(Some(r"C:\work"), Some("code -g {file}:{line}:{col}"), None),
+            Action::Refuse {
+                reason: RefuseReason::BadFile,
+                ..
+            }
+        ));
+        let spans = links_in_row(&row("//evil/share/a.rs:3"));
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert!(matches!(
+            spans[0].activate(None, Some(r"C:\Program Files\Code.exe"), None),
+            Action::Refuse {
+                reason: RefuseReason::BadFile,
+                ..
+            }
+        ));
+        // Not an editor argument and not an association open.
+        assert!(!matches!(
+            spans[0].activate(Some(r"C:\work"), None, Some(r"C:\Code.exe")),
+            Action::OpenPath(_) | Action::Edit { .. } | Action::Reveal(_) | Action::Browse(_)
+        ));
+    }
+
+    #[test]
+    fn dangerous_extensions_are_not_association_opened() {
+        // PATHEXT's built-in default, plus every extension association-open
+        // must refuse even when PATHEXT does not list it.
+        let exts = [
+            ".com",
+            ".exe",
+            ".bat",
+            ".cmd",
+            ".lnk",
+            ".url",
+            ".hta",
+            ".scr",
+            ".msi",
+            ".ps1",
+            ".vbs",
+            ".vbe",
+            ".js",
+            ".jse",
+            ".wsf",
+            ".wsh",
+            ".cpl",
+            ".appref-ms",
+            ".library-ms",
+            ".search-ms",
+            ".settingcontent-ms",
+            ".application",
+            ".reg",
+            ".pif",
+        ];
+        for ext in exts {
+            let uri = format!("file:///C:/qa/evil{ext}");
+            match plan_uri(&uri) {
+                Action::Refuse {
+                    reason: RefuseReason::Blocked,
+                    shown,
+                } => {
+                    assert!(!shown.to_ascii_lowercase().contains("cmd /c"), "{shown}");
+                    assert!(!matches!(plan_uri(&uri), Action::OpenPath(_)));
+                }
+                other => panic!("{ext} -> {other:?}"),
+            }
+            let upper = format!("file:///C:/qa/evil{}", ext.to_ascii_uppercase());
+            assert!(
+                matches!(
+                    plan_uri(&upper),
+                    Action::Refuse {
+                        reason: RefuseReason::Blocked,
+                        ..
+                    }
+                ),
+                "{upper}"
+            );
+        }
+        // Built-in list, with an empty PATHEXT. A runtime-only extension
+        // blocks only when that list names it.
+        assert!(is_blocked_path(r"C:\a.exe", &[]));
+        assert!(is_blocked_path(r"C:\a.bat", &[]));
+        assert!(is_blocked_path(r"C:\a.cmd", &[]));
+        assert!(is_blocked_path(r"C:\a.com", &[]));
+        assert!(is_blocked_path(r"C:\a.foo", &[String::from(".FOO")]));
+        assert!(!is_blocked_path(r"C:\a.foo", &[]));
+        assert!(!is_blocked_path(r"C:\notes.txt", &[]));
+        assert!(!is_blocked_path(r"C:\evil.exe.txt", &[]));
+        assert!(is_blocked_path(r"C:\evil.txt.exe", &[]));
+        assert!(is_blocked_path(r"C:\evil.exe:stream", &[]));
+        assert!(is_blocked_path(r"C:\evil.exe.", &[]));
+        // Enter on this card does not open. A userinfo card is the one that does.
+        assert_eq!(card_decision(true, false, false), CardDecision::Dismiss);
+        assert_eq!(card_decision(false, true, false), CardDecision::Dismiss);
+    }
+
+    #[test]
+    fn file_line_goes_to_the_editor_or_explorer_select() {
+        let (cwd, bat) = scratch("setup.bat");
+        let leaf = bat.rsplit('\\').next().unwrap();
+        let spans = links_in_row(&row(&format!("{leaf}:1")));
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        // No editor: the folder, via explorer's argv. Not the batch file.
+        match spans[0].activate(Some(&cwd), None, None) {
+            Action::Reveal(path) => {
+                assert_eq!(path, bat);
+                let argv = reveal_argv(&path);
+                assert_eq!(
+                    argv,
+                    vec!["explorer.exe".to_string(), format!("/select,{path}")]
+                );
+                let cmd = editor_command(&argv).unwrap();
+                assert_eq!(cmd.get_program(), std::ffi::OsStr::new("explorer.exe"));
+                assert!(!cmd.get_args().any(|a| a == "/c" || a == "start"));
+                assert!(runs_off_ui_thread(&Action::Reveal(path)));
+            }
+            other => panic!("{other:?}"),
+        }
+        match spans[0].activate(Some(&cwd), None, Some(r"C:\Program Files\Code.exe")) {
+            Action::Edit { argv } => {
+                assert_eq!(argv[0], r"C:\Program Files\Code.exe");
+                assert_eq!(argv[1], "-g");
+                assert_eq!(argv[2], format!("{bat}:1"));
+                assert!(editor_command(&argv).is_some());
+            }
+            other => panic!("{other:?}"),
+        }
+        // Configured editor, still no association fallback.
+        match spans[0].activate(Some(&cwd), Some("code -g {file}:{line}:{col}"), None) {
+            Action::Edit { argv } => {
+                assert_eq!(argv[0], "code");
+                assert_eq!(argv[2], format!("{bat}:1"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn relative_path_without_cwd_is_refused() {
+        assert_eq!(resolve_against_cwd("src/main.rs", None), None);
+        assert_eq!(resolve_against_cwd(r".\src\main.rs", None), None);
+        let spans = links_in_row(&row("src/main.rs:10:4"));
+        assert!(matches!(
+            spans[0].activate(None, Some("code -g {file}:{line}:{col}"), None),
+            Action::Refuse {
+                reason: RefuseReason::BadFile,
+                ..
+            }
+        ));
+        assert!(matches!(
+            spans[0].activate(None, None, Some(r"C:\Code.exe")),
+            Action::Refuse {
+                reason: RefuseReason::BadFile,
+                ..
+            }
+        ));
+        // A reported UNC cwd is not a directory to join onto.
+        assert!(matches!(
+            spans[0].activate(Some(r"\\evil\share"), Some("code -g {file}:{line}"), None),
+            Action::Refuse {
+                reason: RefuseReason::BadFile,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn missing_file_is_refused() {
+        assert!(matches!(
+            plan_uri(r"file:///C:/bayan-qa-missing/no-such.txt"),
+            Action::Refuse {
+                reason: RefuseReason::Missing,
+                ..
+            }
+        ));
+        let spans = links_in_row(&row(r"C:\bayan-qa-missing\no-such.rs:3"));
+        assert!(matches!(
+            spans[0].activate(Some(r"D:\other"), Some("code -g {file}:{line}"), None),
+            Action::Refuse {
+                reason: RefuseReason::Missing,
+                ..
+            }
+        ));
+        assert!(matches!(
+            spans[0].activate(Some(r"D:\other"), None, None),
+            Action::Refuse {
+                reason: RefuseReason::Missing,
+                ..
+            }
+        ));
+        // A real text file still association-opens. An executable does not,
+        // even when it exists.
+        let (txt_dir, txt) = scratch("note.txt");
+        let uri = format!("file:///{}", txt.replace('\\', "/"));
+        assert_eq!(plan_uri(&uri), Action::OpenPath(txt));
+        let (exe_dir, exe) = scratch("evil.exe");
+        let uri = format!("file:///{}", exe.replace('\\', "/"));
+        assert!(matches!(
+            plan_uri(&uri),
+            Action::Refuse {
+                reason: RefuseReason::Blocked,
+                ..
+            }
+        ));
+        let _ = std::fs::remove_dir_all(&txt_dir);
+        let _ = std::fs::remove_dir_all(&exe_dir);
+    }
+
+    #[test]
+    fn editor_placeholder_is_substituted_once() {
+        let argv = expand_editor(
+            "code -g {file}:{line}:{col}",
+            r"C:\src\a{line}b.rs",
+            Some(9),
+            Some(2),
+        )
+        .unwrap();
+        assert_eq!(argv[2], r"C:\src\a{line}b.rs:9:2");
+        let argv = expand_editor("code {file}", r"C:\src\a{file}b.rs", None, None).unwrap();
+        assert_eq!(argv[1], r"C:\src\a{file}b.rs");
+        // The colon that only introduced an empty placeholder is still dropped,
+        // and it is the template's colon, not a colon inside the path.
+        let argv = expand_editor(
+            "code -g {file}:{line}:{col}",
+            r"C:\src\a{line}b.rs",
+            Some(4),
+            None,
+        )
+        .unwrap();
+        assert_eq!(argv[2], r"C:\src\a{line}b.rs:4");
+    }
+
+    #[test]
+    fn absolute_path_cannot_become_an_editor_flag() {
+        let (cwd, full) = scratch("-n.rs");
+        let spans = links_in_row(&row("-n.rs:2"));
+        match spans[0].activate(Some(&cwd), Some("code -g {file}:{line}"), None) {
+            Action::Edit { argv } => {
+                assert_eq!(argv[0], "code");
+                assert_eq!(argv[1], "-g");
+                assert_eq!(argv[2], format!("{full}:2"));
+                assert!(argv[2].as_bytes()[1] == b':', "{argv:?}");
+                assert!(!argv[2].starts_with('-'), "{argv:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            resolve_against_cwd("-n.rs", Some(&cwd)).as_deref(),
+            Some(full.as_str())
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn stray_percent_is_not_a_control_character() {
+        assert_eq!(
+            plan_uri("http://a/100%"),
+            Action::Browse("http://a/100%".into())
+        );
+        // Not two hex digits: a literal percent, not "control characters".
+        assert_eq!(
+            plan_uri("https://example.com/%ZZ"),
+            Action::Browse("https://example.com/%ZZ".into())
+        );
+        assert_eq!(
+            plan_uri("https://example.com/%E"),
+            Action::Browse("https://example.com/%E".into())
+        );
+        match plan_uri("https://example.com/%00") {
+            Action::Refuse {
+                reason: RefuseReason::ControlOrBidi,
+                ..
+            } => {}
+            other => panic!("encoded NUL -> {other:?}"),
+        }
+        match plan_uri("https://example.com/%E2%80%AEhidden") {
+            Action::Refuse {
+                reason: RefuseReason::ControlOrBidi,
+                shown,
+            } => {
+                assert!(shown.contains("<RLO>"), "{shown}");
+                assert!(!shown.contains('\u{202E}'), "{shown}");
+            }
+            other => panic!("encoded RLO -> {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extra_invisible_characters_are_forbidden() {
+        let chars = [
+            '\u{00AD}',
+            '\u{034F}',
+            '\u{2061}',
+            '\u{2062}',
+            '\u{2063}',
+            '\u{2064}',
+            '\u{FFF9}',
+            '\u{FFFA}',
+            '\u{FFFB}',
+            '\u{E0000}',
+            '\u{E0001}',
+            '\u{E007F}',
+        ];
+        for c in chars {
+            assert!(is_forbidden(c), "U+{:04X}", c as u32);
+            let uri = format!("https://example.com/{c}x");
+            match plan_uri(&uri) {
+                Action::Refuse {
+                    reason: RefuseReason::ControlOrBidi,
+                    shown,
+                } => assert!(!shown.chars().any(is_forbidden), "{shown}"),
+                other => panic!("U+{:04X} -> {other:?}", c as u32),
+            }
+        }
+        assert!(!is_forbidden('a'));
+        assert!(!is_forbidden('ع'));
+    }
+
+    #[test]
+    fn path_with_a_space_is_not_a_partial_link() {
+        assert!(
+            files_in(r"C:\x y\a.rs:12").is_empty(),
+            "the tail of a spaced path must not be a link"
+        );
+        assert!(files_in(r"C:\x y\a.rs(12, 1)").is_empty());
+        assert_eq!(
+            files_in("see src/main.rs:10"),
+            vec![("src/main.rs".into(), 10, None, "src/main.rs:10".into())]
+        );
+        assert_eq!(
+            files_in(r"error at C:\src\a.rs:10"),
+            vec![(r"C:\src\a.rs".into(), 10, None, r"C:\src\a.rs:10".into())]
+        );
+    }
+
+    #[test]
+    fn hidden_cells_are_not_links() {
+        let mut cells = row("click");
+        for c in &mut cells {
+            c.osc_id = Some("id".into());
+            c.osc_uri = Some("https://example.com/secret".into());
+        }
+        cells[2].hidden = true;
+        let spans = links_in_row(&cells);
+        assert!(spans.iter().all(|s| !s.contains(2)), "{spans:?}");
+        assert!(spans.iter().any(|s| s.contains(0)), "{spans:?}");
+        assert!(spans.iter().any(|s| s.contains(4)), "{spans:?}");
+        let mut all_hidden = cells.clone();
+        for c in &mut all_hidden {
+            c.hidden = true;
+        }
+        assert!(links_in_row(&all_hidden).is_empty());
+    }
+
+    #[test]
+    fn link_row_cache_reuses_spans_until_invalidated() {
+        let mut cache = SpanCache::default();
+        let mut builds = 0u32;
+        let sample = vec![LinkSpan {
+            start_col: 0,
+            end_col: 4,
+            kind: LinkKind::Url {
+                uri: "https://example.com".into(),
+            },
+        }];
+        let first = {
+            builds += 1;
+            cache.insert(7, 0, sample.clone());
+            cache.get(7, 0).unwrap()
+        };
+        assert_eq!(first, sample);
+        assert_eq!(cache.get(7, 0), Some(sample.clone()));
+        assert_eq!(builds, 1, "a hit must not rebuild the row");
+        assert!(cache.get(7, 1).is_none());
+        cache.invalidate_pane(7);
+        assert!(cache.get(7, 0).is_none(), "damage drops the pane");
+        cache.insert(7, 0, sample.clone());
+        cache.insert(8, 0, sample.clone());
+        cache.clear();
+        assert!(cache.get(7, 0).is_none());
+        assert!(cache.get(8, 0).is_none());
+    }
+
+    #[test]
+    fn shell_helpers_include_script_hosts() {
+        for name in [
+            "mshta",
+            "mshta.exe",
+            r"C:\Windows\System32\mshta.exe",
+            "wscript",
+            "wscript.exe",
+            "cscript",
+            "cscript.exe",
+            "rundll32",
+            "rundll32.exe",
+            r"C:\Windows\SysWOW64\rundll32.exe",
+        ] {
+            assert!(
+                editor_command(&[name.into(), r"C:\src\a.rs".into()]).is_none(),
+                "{name} was accepted as an editor"
+            );
+        }
+    }
+
+    #[test]
+    fn userinfo_highlights_the_real_host_and_asks() {
+        let spans = links_in_row(&row("see http://good.com@evil.com/a next"));
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        let tip = spans[0].tooltip(None);
+        assert!(tip.starts_with("evil.com"), "{tip}");
+        assert!(tip.contains("good.com@evil.com"), "{tip}");
+        match spans[0].activate(None, None, None) {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "evil.com");
+                assert_eq!(uri, "http://good.com@evil.com/a");
+                assert!(!runs_off_ui_thread(&Action::Confirm {
+                    uri: uri.clone(),
+                    host: host.clone(),
+                }));
+                assert_eq!(card_decision(true, false, true), CardDecision::Open);
+                assert_eq!(card_decision(false, true, true), CardDecision::Dismiss);
+                assert_eq!(card_decision(false, false, true), CardDecision::Ignore);
+            }
+            other => panic!("{other:?}"),
+        }
+        // No userinfo: open, and the tooltip is the URI itself.
+        assert_eq!(
+            plan_uri("https://evil.com/a"),
+            Action::Browse("https://evil.com/a".into())
+        );
+        let plain = links_in_row(&row("https://evil.com/a"));
+        assert_eq!(plain[0].tooltip(None), "https://evil.com/a");
+        // user:pass@host is the same card. The host is after the last @.
+        match plan_uri("http://user:secret@good.com@evil.com/x") {
+            Action::Confirm { host, .. } => assert_eq!(host, "evil.com"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn opens_leave_the_ui_thread() {
+        assert!(runs_off_ui_thread(&Action::Browse(
+            "https://example.com".into()
+        )));
+        assert!(runs_off_ui_thread(&Action::OpenPath(r"C:\a.txt".into())));
+        assert!(runs_off_ui_thread(&Action::Reveal(r"C:\a.txt".into())));
+        assert!(runs_off_ui_thread(&Action::Edit {
+            argv: vec!["code".into()],
+        }));
+        assert!(!runs_off_ui_thread(&Action::Refuse {
+            reason: RefuseReason::Blocked,
+            shown: String::new(),
+        }));
+        assert!(!runs_off_ui_thread(&Action::Confirm {
+            uri: "http://a@b".into(),
+            host: "b".into(),
+        }));
+        assert!(!perform_open(&Action::Refuse {
+            reason: RefuseReason::Blocked,
+            shown: "x".into(),
+        }));
+        assert!(!perform_open(&Action::Confirm {
+            uri: "http://a@b".into(),
+            host: "b".into(),
+        }));
     }
 }

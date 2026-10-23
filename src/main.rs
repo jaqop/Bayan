@@ -244,6 +244,8 @@ pub enum UserEvent {
     CommandFinished(u64, bool),
     /// Pane `id`'s shell exited.
     Exit(u64),
+    /// A link open (browser, editor, explorer) failed off the UI thread.
+    LinkFailed(String),
 }
 
 /// The link under the pointer. Stable while the pointer stays inside it,
@@ -257,10 +259,13 @@ struct LinkHover {
     target: String,
 }
 
-/// A Ctrl+click that was refused. Esc (and Enter) dismiss; neither opens.
+/// A Ctrl+click that was refused, or a userinfo URL waiting for Enter.
+/// Esc dismisses either. Enter opens only when `confirm_uri` is set;
+/// a refusal leaves it empty so Enter cannot launch the target.
 struct BlockedLink {
     reason: String,
     shown: String,
+    confirm_uri: Option<String>,
 }
 
 /// Text held for the confirm card: the bytes to send, and why the card is up.
@@ -492,8 +497,10 @@ struct App {
     pending_close: Option<CloseTarget>,
     /// link under the pointer: underline + the target in the pane status
     link_hover: Option<LinkHover>,
-    /// a refused link (bad scheme, bidi, too long). Dismissed, never opened.
+    /// a refused link, or a userinfo URL waiting for Enter.
     blocked_link: Option<BlockedLink>,
+    /// Link spans per pane row. Invalidated on PTY damage, scroll, relayout.
+    link_cache: link::SpanCache,
     /// last keystroke sent to a PTY — the cursor blinks for 15s after it,
     /// then parks solid so an idle window stops re-rendering (M14's win)
     last_input: Instant,
@@ -1276,6 +1283,7 @@ impl App {
                 t.scroll_display(Scroll::Delta(new_off as i32 - off as i32));
             }
         }
+        self.invalidate_focused_links();
         self.request_redraw();
     }
 
@@ -1427,6 +1435,8 @@ impl App {
     /// Resize every pane of the ACTIVE tab to its rect (background tabs
     /// re-layout when they become active — the standard terminal tradeoff).
     fn relayout_active(&mut self) {
+        // Pane rows moved. Cached link spans would underline the wrong cells.
+        self.link_cache.clear();
         // resolve "hide the bar with one tab" BEFORE measuring the content
         let hide = self.config.hide_single_tab_on() && self.tabs.len() <= 1;
         if let Some(r) = self.renderer.as_mut() {
@@ -1849,15 +1859,33 @@ impl App {
     fn pane_link_cwd(&self, id: u64) -> Option<String> {
         let (ti, pi) = self.find_pane(id)?;
         let raw = self.tabs[ti].panes[pi].session.meta.lock().unwrap().cwd.clone();
-        link::cwd_hook(raw.as_deref()).map(str::to_string)
+        link::cwd_hook(raw.as_deref())
     }
 
-    fn links_on(&self, id: u64, row: usize) -> Vec<link::LinkSpan> {
+    fn links_on(&mut self, id: u64, row: usize) -> Vec<link::LinkSpan> {
+        if let Some(spans) = self.link_cache.get(id, row) {
+            return spans;
+        }
         let Some((ti, pi)) = self.find_pane(id) else {
             return Vec::new();
         };
-        let term = self.tabs[ti].panes[pi].session.term.lock().unwrap();
-        link::links_on_row(&term, row)
+        let spans = {
+            let term = self.tabs[ti].panes[pi].session.term.lock().unwrap();
+            link::links_on_row(&term, row)
+        };
+        self.link_cache.insert(id, row, spans.clone());
+        spans
+    }
+
+    fn invalidate_focused_links(&mut self) {
+        if let Some(id) = self.focused_pane_id() {
+            self.link_cache.invalidate_pane(id);
+        }
+    }
+
+    fn focused_pane_id(&self) -> Option<u64> {
+        let t = self.tabs.get(self.active)?;
+        Some(t.panes.get(t.focused)?.id)
     }
 
     /// Recompute the hover from `pos`. Returns the logical cell so mouse
@@ -1916,40 +1944,56 @@ impl App {
         let code = link::find_code_exe();
         let code_s = code.as_ref().map(|p| p.to_string_lossy().into_owned());
         match span.activate(cwd.as_deref(), self.config.editor.as_deref(), code_s.as_deref()) {
-            link::Action::Browse(uri) => {
-                if !link::shell_execute(&uri) {
-                    self.refuse_link(link::RefuseReason::Editor, &uri);
-                }
-            }
-            link::Action::OpenPath(path) => {
-                if !link::shell_execute(&path) {
-                    self.refuse_link(link::RefuseReason::Editor, &path);
-                }
-            }
-            link::Action::Edit {
-                argv,
-                fallback_path,
-            } => {
-                if link::spawn_editor(&argv).is_err() {
-                    if let Some(path) = fallback_path {
-                        if !link::shell_execute(&path) {
-                            self.refuse_link(link::RefuseReason::Editor, &path);
-                        }
-                    } else {
-                        let shown = argv.join(" ");
-                        self.refuse_link(link::RefuseReason::Editor, &shown);
-                    }
-                }
+            action @ (link::Action::Browse(_)
+            | link::Action::OpenPath(_)
+            | link::Action::Reveal(_)
+            | link::Action::Edit { .. }) => self.spawn_link_open(action),
+            link::Action::Confirm { uri, host } => {
+                self.blocked_link = Some(BlockedLink {
+                    reason: link::HOST_CONFIRM.to_string(),
+                    shown: link::preview(&format!("{host} — {uri}"), 160),
+                    confirm_uri: Some(uri),
+                });
+                self.clear_link_hover();
+                self.request_redraw();
             }
             link::Action::Refuse { reason, shown } => self.refuse_link(reason, &shown),
         }
         true
     }
 
+    /// Browser, association-open, editor, and explorer. A network path must
+    /// not stall the window, so the call happens on `bayan-link`.
+    fn spawn_link_open(&mut self, action: link::Action) {
+        if !link::runs_off_ui_thread(&action) {
+            return;
+        }
+        let shown = match &action {
+            link::Action::Browse(s) | link::Action::OpenPath(s) | link::Action::Reveal(s) => {
+                s.clone()
+            }
+            link::Action::Edit { argv } => argv.join(" "),
+            link::Action::Confirm { .. } | link::Action::Refuse { .. } => return,
+        };
+        let proxy = self.proxy.clone();
+        let shown_for_fail = shown.clone();
+        let spawned = std::thread::Builder::new()
+            .name("bayan-link".into())
+            .spawn(move || {
+                if !link::perform_open(&action) {
+                    let _ = proxy.send_event(UserEvent::LinkFailed(shown_for_fail));
+                }
+            });
+        if spawned.is_err() {
+            self.refuse_link(link::RefuseReason::Editor, &shown);
+        }
+    }
+
     fn refuse_link(&mut self, reason: link::RefuseReason, shown: &str) {
         self.blocked_link = Some(BlockedLink {
             reason: reason.label().to_string(),
             shown: link::preview(shown, 160),
+            confirm_uri: None,
         });
         self.clear_link_hover();
         self.request_redraw();
@@ -2242,6 +2286,7 @@ impl App {
         if let Some(s) = self.session() {
             s.term.lock().unwrap().scroll_display(Scroll::Delta(n));
         }
+        self.invalidate_focused_links();
         self.request_redraw();
     }
 
@@ -2268,6 +2313,7 @@ impl App {
             }
             m
         };
+        self.invalidate_focused_links();
         if let (Some(st), Some(m)) = (self.search.as_mut(), found) {
             st.hl = Some(m);
         }
@@ -2739,6 +2785,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Wakeup(id) => {
+                self.link_cache.invalidate_pane(id);
                 if !self.first_output {
                     self.first_output = true;
                     crate::prof::mark("first pty output");
@@ -2852,6 +2899,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some((ti, pi)) = self.find_pane(id) {
                     self.remove_pane(ti, pi, el);
                 }
+            }
+            UserEvent::LinkFailed(shown) => {
+                self.refuse_link(link::RefuseReason::Editor, &shown);
             }
         }
     }
@@ -3290,6 +3340,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 .unwrap()
                                 .scroll_display(Scroll::Delta(lines));
                         }
+                        self.link_cache.invalidate_pane(pane);
                         self.request_redraw();
                     }
                     None => {}
@@ -3334,15 +3385,30 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_redraw();
                     return;
                 }
-                // a refused link owns the keyboard. Enter and Esc both
-                // dismiss; neither opens the target, and nothing is typed.
+                // a refused link owns the keyboard. Esc dismisses. Enter
+                // dismisses a refusal and opens only a userinfo confirm.
+                // Nothing is typed into the PTY.
                 if self.blocked_link.is_some() {
-                    match &event.logical_key {
-                        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Escape) => {
+                    let enter = matches!(&event.logical_key, Key::Named(NamedKey::Enter));
+                    let escape = matches!(&event.logical_key, Key::Named(NamedKey::Escape));
+                    let may_open = self
+                        .blocked_link
+                        .as_ref()
+                        .is_some_and(|c| c.confirm_uri.is_some());
+                    match link::card_decision(enter, escape, may_open) {
+                        link::CardDecision::Open => {
+                            if let Some(card) = self.blocked_link.take() {
+                                if let Some(uri) = card.confirm_uri {
+                                    self.spawn_link_open(link::Action::Browse(uri));
+                                }
+                            }
+                            self.request_redraw();
+                        }
+                        link::CardDecision::Dismiss => {
                             self.blocked_link = None;
                             self.request_redraw();
                         }
-                        _ => {}
+                        link::CardDecision::Ignore => {}
                     }
                     return;
                 }
@@ -3506,6 +3572,7 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         s.write(&bytes);
                     }
+                    self.invalidate_focused_links();
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(),
@@ -3579,6 +3646,7 @@ fn main() {
         pending_close: None,
         link_hover: None,
         blocked_link: None,
+        link_cache: link::SpanCache::default(),
         last_input: Instant::now(),
         blink_drawn_on: true,
         settings: None,
