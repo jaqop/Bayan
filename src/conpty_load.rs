@@ -86,17 +86,18 @@ fn search_flag_matches_windows_sys() {
 /// harness and sets the variable; a full-path `LoadLibraryW` in that other
 /// process proves the bait is an image Windows will map, which is what
 /// makes a still-present bare-name load visible in the parent.
+///
+/// Return instead of `process::exit`. Exiting from a libtest worker on
+/// Windows can deadlock the harness stdio lock, and the parent then waits
+/// forever.
 #[test]
 fn probe_loads_fake_conpty_dll() {
     let Some(dll) = std::env::var_os("BAYAN_PROBE_CONPTY") else {
         return;
     };
     let code = load_bait(&dll);
-    if code == 0 {
-        let marker = Path::new(&dll).with_file_name("probe.ok");
-        std::fs::write(&marker, b"ok").expect("probe marker");
-    }
-    std::process::exit(code);
+    let marker = Path::new(&dll).with_file_name(if code == 0 { "probe.ok" } else { "probe.fail" });
+    std::fs::write(&marker, code.to_string()).expect("probe marker");
 }
 
 fn load_bait(dll: &std::ffi::OsStr) -> i32 {
@@ -134,8 +135,17 @@ extern "system" {
     fn SetErrorMode(mode: u32) -> u32;
 }
 
+const PTY_TEST: &str = "conpty_load::pty_under_planted_conpty_dll";
+
 #[test]
 fn planted_conpty_dll_is_not_loaded() {
+    // The re-execed harness sets one of these. Returning keeps a missed
+    // `--exact` filter from spawning another copy of this test.
+    if std::env::var_os("BAYAN_PROBE_CONPTY").is_some()
+        || std::env::var_os("BAYAN_CONPTY_EXERCISE").is_some()
+    {
+        return;
+    }
     for needle in [
         "CreatePseudoConsole",
         "ResizePseudoConsole",
@@ -155,20 +165,237 @@ fn planted_conpty_dll_is_not_loaded() {
         .unwrap()
         .join("conpty.dll");
     std::fs::write(&cwd_dll, BAIT).unwrap();
-    std::fs::write(&exe_dll, BAIT).unwrap();
     let _restore = Restore {
-        prev: std::env::current_dir().unwrap(),
         exe_dll: exe_dll.clone(),
         temp: temp.clone(),
     };
 
+    // Probe before the exe-adjacent plant. A conpty.dll beside this harness
+    // is on the child process's application-directory search path from the
+    // moment it starts.
     assert_bait_loads_in_a_child(&cwd_dll);
+    std::fs::write(&exe_dll, BAIT).unwrap();
+    assert_pty_child_rejects_bait(&temp);
+}
 
-    std::env::set_current_dir(&temp).unwrap();
+/// Child entry for the PTY half. Unset in the normal suite, so this is a
+/// no-op there. The parent sets `BAYAN_CONPTY_EXERCISE` to the temp
+/// directory that holds the bait and has already planted the other copy
+/// next to the test exe. Doing the spawn here lets the parent
+/// `TerminateProcess` this harness if ConPTY or `cmd.exe` does not return.
+#[test]
+fn pty_under_planted_conpty_dll() {
+    let Some(temp) = std::env::var_os("BAYAN_CONPTY_EXERCISE") else {
+        return;
+    };
+    let temp = PathBuf::from(temp);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_planted_pty(&temp);
+    }));
+    let text = match &result {
+        Ok(()) => "ok\n".to_string(),
+        Err(payload) => format!("panic: {}\n", panic_message(payload)),
+    };
+    std::fs::write(temp.join("pty-report.txt"), &text).expect("pty report");
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+fn run_planted_pty(temp: &Path) {
+    note(temp, "start");
+    std::env::set_current_dir(temp).expect("cwd");
+    note(temp, "cwd");
     // Same call main() makes first. CWD is the directory that holds the bait.
     crate::harden_dll_search();
-    exercise_pty();
+    note(temp, "hardened");
+    exercise_pty(temp);
+    note(temp, "pty done");
+    assert_modules_clean(temp);
+    note(temp, "modules ok");
+}
 
+fn assert_bait_loads_in_a_child(dll: &Path) {
+    let marker = dll.with_file_name("probe.ok");
+    let fail = dll.with_file_name("probe.fail");
+    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_file(&fail);
+    let mut child = reexec(PROBE_TEST, "BAYAN_PROBE_CONPTY", dll.as_os_str());
+    let status = wait_for(&mut child.child, std::time::Duration::from_secs(30));
+    let (stdout, stderr) = child.output();
+    let fail_body = std::fs::read_to_string(&fail).unwrap_or_default();
+    assert!(
+        marker.is_file(),
+        "bait conpty.dll did not LoadLibraryW in a child process (status {status:?}, fail {fail_body:?}).\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
+fn assert_pty_child_rejects_bait(temp: &Path) {
+    let report = temp.join("pty-report.txt");
+    let _ = std::fs::remove_file(&report);
+    let mut child = reexec(PTY_TEST, "BAYAN_CONPTY_EXERCISE", temp.as_os_str());
+    let status = wait_for(&mut child.child, std::time::Duration::from_secs(45));
+    let (stdout, stderr) = child.output();
+    let body = std::fs::read_to_string(&report).unwrap_or_default();
+    let trace = std::fs::read_to_string(temp.join("pty-trace.txt")).unwrap_or_default();
+    assert!(
+        status.as_ref().is_some_and(|s| s.success()) && body == "ok\n",
+        "planted conpty.dll was loaded or the pty child did not finish (status {status:?}).\nreport:\n{body}\ntrace:\n{trace}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
+struct Reexec {
+    child: std::process::Child,
+    stdout: std::thread::JoinHandle<Vec<u8>>,
+    stderr: std::thread::JoinHandle<Vec<u8>>,
+}
+
+impl Reexec {
+    fn output(self) -> (Vec<u8>, Vec<u8>) {
+        let stdout = self.stdout.join().unwrap_or_else(|_| Vec::new());
+        let stderr = self.stderr.join().unwrap_or_else(|_| Vec::new());
+        (stdout, stderr)
+    }
+}
+
+fn reexec(test: &str, key: &str, value: &std::ffi::OsStr) -> Reexec {
+    let mut child = Command::new(std::env::current_exe().expect("current_exe"))
+        .arg("--exact")
+        .arg(test)
+        .arg("--test-threads")
+        .arg("1")
+        .env_remove("BAYAN_PROBE_CONPTY")
+        .env_remove("BAYAN_CONPTY_EXERCISE")
+        .env(key, value)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("re-exec the test harness");
+    let stdout = drain(child.stdout.take().expect("stdout"));
+    let stderr = drain(child.stderr.take().expect("stderr"));
+    Reexec {
+        child,
+        stdout,
+        stderr,
+    }
+}
+
+fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        buf
+    })
+}
+
+fn wait_for(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            return Some(status);
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+fn exercise_pty(temp: &Path) {
+    note(temp, "openpty");
+    let pty = native_pty_system();
+    let pair = pty
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    note(temp, "openpty ok");
+    // Absolute path: CommandBuilder still walks PATH for a bare `cmd.exe`,
+    // and a dead PATH entry can block `exists` for a long time.
+    let comspec =
+        std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string());
+    let mut cmd = CommandBuilder::new(comspec);
+    cmd.arg("/c");
+    cmd.arg("exit");
+    let mut reader = pair.master.try_clone_reader().expect("pty reader");
+    let drain = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+    note(temp, "spawn");
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn");
+    drop(pair.slave);
+    // EOF on the ConPTY input. `cmd /c exit` does not read it; a shell that
+    // ignored `/c` would otherwise block in ReadFile.
+    drop(pair.master.take_writer().ok());
+    note(temp, "spawned");
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if start.elapsed() < std::time::Duration::from_secs(20) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                note(temp, "cmd timeout");
+                panic!("cmd.exe did not exit within 20s");
+            }
+            Err(err) => panic!("try_wait: {err}"),
+        }
+    };
+    note(temp, "cmd exited");
+    drop(child);
+    drop(pair.master);
+    drain.join().expect("pty drain");
+    assert!(status.success(), "cmd /c exit -> {status:?}");
+}
+
+fn note(temp: &Path, msg: &str) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(temp.join("pty-trace.txt"))
+        .expect("pty trace");
+    writeln!(file, "{msg}").expect("pty trace");
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(msg) = payload.downcast_ref::<String>() {
+        msg.clone()
+    } else if let Some(msg) = payload.downcast_ref::<&str>() {
+        (*msg).to_string()
+    } else {
+        "unknown panic".into()
+    }
+}
+
+fn assert_modules_clean(temp: &Path) {
+    let exe_dll = std::env::current_exe()
+        .expect("current_exe")
+        .parent()
+        .expect("exe dir")
+        .join("conpty.dll");
+    let cwd_dll = temp.join("conpty.dll");
     let system32 = system32_dir();
     assert!(
         norm(&system32).ends_with("\\system32"),
@@ -199,56 +426,6 @@ fn planted_conpty_dll_is_not_loaded() {
             planted.display()
         );
     }
-}
-
-fn assert_bait_loads_in_a_child(dll: &Path) {
-    let marker = dll.with_file_name("probe.ok");
-    let _ = std::fs::remove_file(&marker);
-    let output = Command::new(std::env::current_exe().unwrap())
-        .arg("--exact")
-        .arg(PROBE_TEST)
-        .env("BAYAN_PROBE_CONPTY", dll)
-        .output()
-        .expect("re-exec the test harness");
-    assert!(
-        marker.is_file(),
-        "bait conpty.dll did not LoadLibraryW in a child process (status {:?}).\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn exercise_pty() {
-    let pty = native_pty_system();
-    let pair = pty
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("openpty");
-    let mut cmd = CommandBuilder::new("cmd.exe");
-    cmd.arg("/c");
-    cmd.arg("exit");
-    let mut reader = pair.master.try_clone_reader().expect("pty reader");
-    let mut child = pair.slave.spawn_command(cmd).expect("spawn");
-    drop(pair.slave);
-    let drain = std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-        }
-    });
-    let status = child.wait().expect("wait for cmd");
-    drop(child);
-    drop(pair.master);
-    drain.join().expect("pty drain");
-    assert!(status.success(), "cmd /c exit -> {status:?}");
 }
 
 fn system32_dir() -> PathBuf {
@@ -319,15 +496,20 @@ fn file_name_is(path: &Path, name: &str) -> bool {
 }
 
 struct Restore {
-    prev: PathBuf,
     exe_dll: PathBuf,
     temp: PathBuf,
 }
 
 impl Drop for Restore {
     fn drop(&mut self) {
-        let _ = std::env::set_current_dir(&self.prev);
-        let _ = std::fs::remove_file(&self.exe_dll);
+        // The pty child may still be releasing the image for a moment after
+        // TerminateProcess. Retry so deps/conpty.dll does not survive the test.
+        for _ in 0..50 {
+            if std::fs::remove_file(&self.exe_dll).is_ok() || !self.exe_dll.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let _ = std::fs::remove_dir_all(&self.temp);
     }
 }
