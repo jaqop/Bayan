@@ -11,7 +11,8 @@
 //! Opening is deliberately narrow. `http` and `https` go to `ShellExecuteW`
 //! with the URI as the single `lpFile`. A `file` URI association-opens only
 //! a local drive path whose extension is on the document/media allowlist
-//! (`.txt`, `.md`, `.pdf`, images, …). Everything else, including no
+//! (`.txt`, `.md`, `.log`, `.json`, `.pdf`, and raster images). `.svg` and
+//! `.csv` are revealed, not association-opened. Everything else, including no
 //! extension, is revealed in Explorer (`/select`). `javascript:`, `ms-*`,
 //! `search-ms:`, `data:`, a custom protocol, a UNC or device path, an
 //! alternate data stream, and a path that breaks out of `/select,"…"` are
@@ -392,7 +393,7 @@ fn scheme_name(uri: &str) -> Option<&str> {
     Some(scheme)
 }
 
-/// Decode well-formed `%HH` escapes. A stray `%` (`http://a/100%`) or a
+/// Decode well-formed `%HH` escapes once. A stray `%` (`http://a/100%`) or a
 /// `%` that is not followed by two hex digits stays a literal percent
 /// sign — it is not a control character, and it is not a reason to refuse
 /// the URI. Invalid UTF-8 after a real escape still yields `None`.
@@ -412,6 +413,24 @@ fn percent_decode(s: &str) -> Option<String> {
         i += 1;
     }
     String::from_utf8(out).ok()
+}
+
+/// Decode `%HH` until a pass changes nothing. `%252F` becomes `/`. A stray
+/// `%` that is not a well-formed escape stays (`100%` is stable). More than
+/// a handful of layers, or invalid UTF-8, is `None`.
+fn percent_decode_until_stable(s: &str) -> Option<String> {
+    let mut cur = s.to_string();
+    for _ in 0..16 {
+        let next = percent_decode(&cur)?;
+        if next.len() > MAX_TARGET {
+            return None;
+        }
+        if next == cur {
+            return Some(cur);
+        }
+        cur = next;
+    }
+    None
 }
 
 fn hex_val(b: u8) -> Option<u8> {
@@ -441,10 +460,11 @@ fn uri_shape_bad(uri: &str) -> Option<RefuseReason> {
 }
 
 /// `file:///C:/src/a.rs` and `file://localhost/C:/src/a.rs` become a local
-/// drive path. The host is not the only check: the decoded path goes
-/// through [`crate::term::accept_local_cwd`], so `file://///evil/share`,
-/// a percent-encoded `\\evil\share`, and `\\?\UNC\…` are `None` before
-/// anything stats the path.
+/// drive path. The path is percent-decoded until stable, `/` is folded to
+/// `\`, and a rooted path is collapsed to a UNC prefix **before** any
+/// gate. `file://///evil/share`, `file:////evil/share`, `file://?/UNC/…`,
+/// a once- or twice-encoded `\\evil\share`, and `\\?\UNC\…` are `None`
+/// before anything stats the path or calls `ShellExecuteW`.
 fn file_uri_path(uri: &str) -> Option<String> {
     let scheme = scheme_name(uri)?;
     if !scheme.eq_ignore_ascii_case("file") {
@@ -459,42 +479,121 @@ fn file_uri_path(uri: &str) -> Option<String> {
         rest
     } else {
         let (host, path) = after.split_once('/')?;
+        let host = percent_decode_until_stable(host)?;
+        if host.chars().any(is_forbidden)
+            || host.contains('%')
+            || host.contains('\\')
+            || host.contains('/')
+        {
+            return None;
+        }
         if !(host.is_empty() || host.eq_ignore_ascii_case("localhost")) {
             return None;
         }
         path
     };
-    let decoded = percent_decode(raw)?;
+    let decoded = percent_decode_until_stable(raw)?;
     if decoded.chars().any(is_forbidden) {
         return None;
     }
-    let path = if decoded.len() >= 3
-        && decoded.as_bytes()[0] == b'/'
-        && decoded.as_bytes()[1].is_ascii_alphabetic()
-        && decoded.as_bytes()[2] == b':'
-    {
-        decoded[1..].to_string()
-    } else {
-        decoded
-    };
+    // `/C:/foo` is a drive path. `//evil/share` and `/evil/share` are not:
+    // the drive strip only matches a single separator in front of `X:`.
+    let path = strip_one_drive_prefix(&decoded);
     // A query or fragment is not part of the filesystem path. Leaving it
     // on would also hide a trailing `.exe`.
     let path = path.split(['?', '#']).next().unwrap_or(&path);
-    let path = path.replace('/', "\\");
     if path.is_empty() || path.len() > MAX_TARGET {
         return None;
     }
+    let path = collapse_leading_separators(path);
+    if path.len() > MAX_TARGET || blocked_fs_path(&path) {
+        return None;
+    }
     let full = crate::term::accept_local_cwd(&path)?;
-    if crate::term::unc_or_device(&full) {
+    if blocked_fs_path(&full) {
         None
     } else {
         Some(full)
     }
 }
 
+/// A single separator before `X:` is the `file:///C:/…` form. Two
+/// separators are a UNC prefix and stay so the network gate can see them.
+fn strip_one_drive_prefix(path: &str) -> String {
+    let b = path.as_bytes();
+    if b.len() >= 3
+        && (b[0] == b'/' || b[0] == b'\\')
+        && b[1].is_ascii_alphabetic()
+        && b[2] == b':'
+    {
+        path[1..].to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+/// Leading `/` or `\` become exactly `\\`. Windows file-URL parsing and
+/// `GetFullPathName` treat `\server\share`, `\\server\share`, and
+/// `\\\server\share` as the same UNC path. A drive path has no leading
+/// separator and is unchanged. Separators after the first component are
+/// left alone, so `C:\\\evil` is not rewritten into the local path `C:\evil`.
+fn collapse_leading_separators(path: &str) -> String {
+    let path = path.replace('/', "\\");
+    let leading = path.chars().take_while(|c| *c == '\\').count();
+    if leading == 0 {
+        return path;
+    }
+    let rest = path.trim_start_matches('\\');
+    format!(r"\\{rest}")
+}
+
+/// UNC, device, NT, or a drive `PathIsNetworkPathW` reports as remote.
+/// Slashes are folded and leading separators collapsed first.
+fn blocked_fs_path(path: &str) -> bool {
+    let norm = collapse_leading_separators(path);
+    // Both, not a short-circuit: the string gate is `accept_local_cwd`'s UNC
+    // rule, and `PathIsNetworkPathW` is the mapped-drive half. Either one
+    // blocks the open.
+    let unc = crate::term::unc_or_device(&norm);
+    let remote = path_is_network_os(&norm);
+    unc || remote
+}
+
+fn path_is_network_os(path: &str) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::PathIsNetworkPathW;
+        // The API is specified for MAX_PATH wide units. A drive check only
+        // needs `X:\`. A longer string is cut to that prefix; UNC is already
+        // decided by `unc_or_device` when the prefix does not fit.
+        const MAX_PATH: usize = 260;
+        let mut wide: Vec<u16> = std::ffi::OsStr::new(path)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        if wide.len() > MAX_PATH {
+            if wide.get(1) == Some(&u16::from(b':')) && wide.get(2) == Some(&u16::from(b'\\')) {
+                wide.truncate(3);
+                wide.push(0);
+            } else {
+                return false;
+            }
+        }
+        // The buffer is null-terminated and not retained by the call.
+        unsafe { PathIsNetworkPathW(wide.as_ptr()) != 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// Host of an `http(s)` URI, and whether userinfo (`@`) was present.
 /// The host is the part after the last `@`, so `good.com@evil.com` is
-/// `evil.com`.
+/// `evil.com`. Percent-decoding runs before that string is returned, so
+/// `https://%D0%B0pple.com/` is the Cyrillic homograph, not an ASCII host.
 fn http_authority(uri: &str) -> Option<(String, bool)> {
     let scheme = scheme_name(uri)?;
     if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
@@ -516,11 +615,33 @@ fn http_authority(uri: &str) -> Option<(String, bool)> {
     } else {
         host.split(':').next().unwrap_or(host)
     };
+    let host = decode_http_host(host)?;
+    Some((host, has_userinfo))
+}
+
+/// Percent-decode a host until stable. A `%` that is still there is not a
+/// hostname. `/`, `\`, `@`, and whitespace are not either. A colon that
+/// decoding introduced is a smuggled port; an IPv6 literal already had its
+/// colons and is left alone.
+fn decode_http_host(raw: &str) -> Option<String> {
+    let host = percent_decode_until_stable(raw)?;
     if host.is_empty() || host == "." {
-        None
-    } else {
-        Some((host.to_string(), has_userinfo))
+        return None;
     }
+    if host.contains('%')
+        || host.contains('/')
+        || host.contains('\\')
+        || host.contains('@')
+        || host.contains('?')
+        || host.contains('#')
+        || host.chars().any(|c| c.is_whitespace() || is_forbidden(c))
+    {
+        return None;
+    }
+    if host != raw && host.contains(':') {
+        return None;
+    }
+    Some(host)
 }
 
 /// RFC 3492 punycode of one label, without the `xn--` prefix.
@@ -738,7 +859,7 @@ pub fn plan_uri(uri: &str) -> Action {
 /// document/media allowlist may become [`Action::OpenPath`]; every other
 /// extension, including none, is [`Action::Reveal`].
 fn plan_local_open(path: &str) -> Action {
-    if crate::term::unc_or_device(path) {
+    if blocked_fs_path(path) {
         return refuse(RefuseReason::BadFile, path);
     }
     if is_allowlisted(path) {
@@ -749,8 +870,9 @@ fn plan_local_open(path: &str) -> Action {
 }
 
 fn local_file_exists(path: &str) -> bool {
-    // A UNC stat opens SMB. Refuse that even if a caller skipped the gate.
-    if crate::term::unc_or_device(path) {
+    // A UNC or mapped-drive stat opens SMB. Refuse that even if a caller
+    // skipped the gate. `PathIsNetworkPathW` does not itself touch the network.
+    if blocked_fs_path(path) {
         return false;
     }
     Path::new(path).exists()
@@ -843,8 +965,7 @@ fn is_shell_program(prog: &str) -> bool {
 /// here: a `path:line` link goes to the editor, and a bare `file` URI of
 /// a source file is revealed.
 const ALLOWED_EXTS: &[&str] = &[
-    ".txt", ".md", ".log", ".json", ".csv", ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp",
-    ".bmp", ".svg",
+    ".txt", ".md", ".log", ".json", ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
 ];
 
 /// Filename used for the extension check. Trailing dots and spaces are
@@ -929,7 +1050,7 @@ where
     let Some(path) = crate::term::accept_local_cwd(path) else {
         return Err(refuse(RefuseReason::BadFile, path));
     };
-    if crate::term::unc_or_device(&path) {
+    if blocked_fs_path(&path) {
         return Err(refuse(RefuseReason::BadFile, &path));
     }
     if !exists(&path) {
@@ -944,7 +1065,7 @@ where
             let Some(long) = crate::term::accept_local_cwd(&long) else {
                 return Err(refuse(RefuseReason::BadFile, &long));
             };
-            if crate::term::unc_or_device(&long) {
+            if blocked_fs_path(&long) {
                 return Err(refuse(RefuseReason::BadFile, &long));
             }
             Ok(DiskPath::Ready(long))
@@ -955,6 +1076,9 @@ where
 }
 
 fn classify_open(path: String) -> Action {
+    if blocked_fs_path(&path) {
+        return refuse(RefuseReason::BadFile, &path);
+    }
     if is_allowlisted(&path) {
         Action::OpenPath(path)
     } else {
@@ -1082,11 +1206,25 @@ pub fn select_arg(path: &str) -> String {
 }
 
 pub fn spawn_reveal(path: &str) -> std::io::Result<()> {
+    // The same drive-path gate as `accept_local_cwd`, then `PathIsNetworkPathW`,
+    // before explorer is started. A UNC or a mapped drive must not be selected.
+    let Some(path) = crate::term::accept_local_cwd(path) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path",
+        ));
+    };
+    if blocked_fs_path(&path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "network",
+        ));
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         let mut cmd = std::process::Command::new(explorer_program());
-        cmd.raw_arg(select_arg(path));
+        cmd.raw_arg(select_arg(&path));
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
@@ -1373,19 +1511,43 @@ fn exe_near_cmd(cmd: &Path) -> Option<std::path::PathBuf> {
 
 /// Open `target` with the shell association. `target` is `lpFile` alone.
 /// `lpParameters` is null. This is not `cmd /c start`.
+///
+/// `http` and `https` are the only URI schemes that reach `ShellExecuteW`.
+/// A `file` URI is not one of them: Windows parses `file://///evil/share`
+/// and `file://localhost/%2F%2Fevil/share` as a UNC path. A filesystem
+/// `lpFile` has to survive `accept_local_cwd` and the network-path check first.
 pub fn shell_execute(target: &str) -> bool {
-    if target.is_empty() || target.len() > MAX_TARGET || target.chars().any(is_forbidden) {
+    let Some(target) = shell_execute_target(target) else {
         return false;
-    }
+    };
     #[cfg(windows)]
     {
-        shell_execute_w(target)
+        shell_execute_w(&target)
     }
     #[cfg(not(windows))]
     {
         let _ = target;
         false
     }
+}
+
+/// `Some` is the string `ShellExecuteW` may receive. `None` means the call
+/// is skipped.
+fn shell_execute_target(target: &str) -> Option<String> {
+    if target.is_empty() || target.len() > MAX_TARGET || target.chars().any(is_forbidden) {
+        return None;
+    }
+    if let Some(scheme) = scheme_name(target) {
+        if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+            return Some(target.to_string());
+        }
+        return None;
+    }
+    let path = crate::term::accept_local_cwd(target)?;
+    if blocked_fs_path(&path) {
+        return None;
+    }
+    Some(path)
 }
 
 #[cfg(windows)]
@@ -2759,6 +2921,8 @@ mod tests {
             ".vhd",
             ".vhdx",
             ".foo",
+            ".csv",
+            ".svg",
             "",
         ];
         for ext in exts {
@@ -3245,8 +3409,8 @@ mod tests {
     #[test]
     fn association_allowlist_opens_only_documents_and_media() {
         for ext in [
-            ".txt", ".md", ".log", ".json", ".csv", ".pdf", ".png", ".jpg", ".jpeg", ".gif",
-            ".webp", ".bmp", ".svg",
+            ".txt", ".md", ".log", ".json", ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp",
+            ".bmp",
         ] {
             let uri = format!("file:///C:/qa/note{ext}");
             match plan_uri(&uri) {
@@ -3268,6 +3432,20 @@ mod tests {
             }
             let upper = format!("file:///C:/qa/note{}", ext.to_ascii_uppercase());
             assert!(matches!(plan_uri(&upper), Action::OpenPath(_)), "{upper}");
+        }
+        // Spreadsheets and script-bearing images are revealed, not opened.
+        for ext in [".csv", ".svg"] {
+            for uri in [
+                format!("file:///C:/qa/note{ext}"),
+                format!("file:///C:/qa/note{}", ext.to_ascii_uppercase()),
+            ] {
+                assert!(
+                    matches!(plan_uri(&uri), Action::Reveal(_)),
+                    "{uri} -> {:?}",
+                    plan_uri(&uri)
+                );
+                assert!(!matches!(plan_uri(&uri), Action::OpenPath(_)), "{uri}");
+            }
         }
     }
 
@@ -3443,5 +3621,183 @@ mod tests {
         assert_eq!(card_decision(true, false, true), CardDecision::Open);
         assert_eq!(card_decision(true, false, false), CardDecision::Dismiss);
         assert_eq!(card_decision(false, true, true), CardDecision::Dismiss);
+    }
+
+    /// Refused: not association-opened, and not revealed when the path is a
+    /// network path. `ShellExecuteW` does not receive the URI either — a
+    /// `file:` scheme is not an allowed `lpFile`.
+    fn assert_file_link_refused(uri: &str) {
+        assert!(
+            file_uri_path(uri).is_none(),
+            "decoded a path from {uri}: {:?}",
+            file_uri_path(uri)
+        );
+        match plan_uri(uri) {
+            Action::Refuse {
+                reason: RefuseReason::BadFile,
+                ..
+            } => {}
+            other => panic!("{uri} -> {other:?}"),
+        }
+        assert!(
+            !matches!(plan_uri(uri), Action::OpenPath(_) | Action::Reveal(_)),
+            "{uri} opened or revealed"
+        );
+        assert!(
+            shell_execute_target(uri).is_none(),
+            "{uri} would reach ShellExecuteW"
+        );
+        assert!(spawn_reveal(uri).is_err(), "{uri} would reach explorer");
+    }
+
+    #[test]
+    fn file_five_slash_unc_is_refused() {
+        assert_file_link_refused("file://///evil.example/share/secret");
+    }
+
+    #[test]
+    fn file_localhost_encoded_slashes_are_refused() {
+        assert_file_link_refused("file://localhost/%2F%2Fevil.example/share/x");
+    }
+
+    #[test]
+    fn file_empty_host_encoded_slashes_are_refused() {
+        assert_file_link_refused("file:///%2F%2Fevil.example/share/x");
+    }
+
+    #[test]
+    fn file_localhost_encoded_backslashes_are_refused() {
+        assert_file_link_refused("file://localhost/%5C%5Cevil.example/share/x");
+    }
+
+    #[test]
+    fn file_unc_encodings_and_extra_slashes_are_refused() {
+        for uri in [
+            // Mixed-case percent escapes.
+            "file://localhost/%2f%2fevil.example/share/x.txt",
+            "file://localhost/%2F%2fevil.example/share/x",
+            "file://localhost/%5c%5cevil.example/share/x.txt",
+            "file:///%2f%5cEvil.example/share/x.txt",
+            "file://localhost/%5C%2Fevil.example/share/x",
+            "file://localhost/%2F%5Cevil.example/share/x.txt",
+            // Double-encoded, including under a drive letter. One decode used
+            // to leave `C:\%2F%2Fevil…`, which is not yet a UNC string.
+            "file://localhost/%252F%252Fevil.example/share/x.txt",
+            "file:///%252F%252Fevil.example/share/x",
+            "file://localhost/%255C%255Cevil.example/share/x.txt",
+            "file:///C:/%252F%252Fevil.example/share/x.txt",
+            "file://localhost/C:/%252F%252Fevil.example/share/x.txt",
+            "file:///C:/foo/%252F%252Fevil.example/share/secret.txt",
+            "file://localhost/%25252F%25252Fevil.example/share/x.txt",
+            // Backslash forms.
+            r"file:///\\evil.example\share\secret",
+            r"file://localhost/\\evil.example\share\x",
+            r"file:///\evil.example\share\x.txt",
+            "file://localhost/%5C%2F%5Cevil.example/share/x.txt",
+            // Four slashes: Windows reads `file:////host/share` as UNC.
+            "file:////evil.example/share/secret",
+            "file:////evil.example/share/secret.txt",
+            "file://////evil.example/share/secret.txt",
+            "file://localhost//evil.example/share/secret.txt",
+            // Device / NT prefixes.
+            "file://?/UNC/evil.example/share/x",
+            "file://?/UNC/evil.example/share/x.txt",
+            r"file:///?/UNC/evil.example/share/x.txt",
+            "file://localhost/?/UNC/evil.example/share/x.txt",
+            r"file:///\\?\UNC\evil.example\share\x.txt",
+            r"file:///\??\UNC\evil\s",
+            // Encoded localhost is still not a remote host, and the path is.
+            "file://%6c%6f%63%61%6c%68%6f%73%74/%2F%2Fevil.example/share/x",
+        ] {
+            assert_file_link_refused(uri);
+        }
+        // A normal drive file, including a literal percent, still resolves.
+        assert_eq!(
+            file_uri_path("file:///C:/100%25done.txt").as_deref(),
+            Some(r"C:\100%done.txt")
+        );
+        assert_eq!(
+            file_uri_path("file://localhost/C:/Program%20Files/a.rs").as_deref(),
+            Some(r"C:\Program Files\a.rs")
+        );
+    }
+
+    #[test]
+    fn shell_and_explorer_reject_unc_before_the_call() {
+        for target in [
+            "file://///evil.example/share/secret",
+            "file://localhost/%2F%2Fevil.example/share/x",
+            "file:///%2F%2Fevil.example/share/x",
+            "file://localhost/%5C%5Cevil.example/share/x",
+            "file:////evil.example/share/secret.txt",
+            "file://?/UNC/evil.example/share/x",
+            r"\\evil.example\share\secret",
+            r"//evil.example/share/secret",
+            r"\evil.example\share\secret",
+            r"\\\evil.example\share\secret",
+            r"\\?\UNC\evil.example\share\x",
+        ] {
+            assert!(
+                shell_execute_target(target).is_none(),
+                "{target} reaches ShellExecuteW"
+            );
+            assert!(!shell_execute(target), "{target} shell_execute");
+            assert!(spawn_reveal(target).is_err(), "{target} explorer");
+        }
+        assert_eq!(
+            shell_execute_target("https://example.com/a").as_deref(),
+            Some("https://example.com/a")
+        );
+        assert_eq!(
+            shell_execute_target(r"C:\notes.txt").as_deref(),
+            Some(r"C:\notes.txt")
+        );
+        assert!(!blocked_fs_path(r"C:\notes.txt"));
+        assert!(blocked_fs_path(r"\\evil.example\share\secret"));
+        assert!(blocked_fs_path("//evil.example/share/x"));
+        assert!(blocked_fs_path(r"\evil.example\share\x"));
+    }
+
+    #[test]
+    fn percent_encoded_host_confirms_with_punycode() {
+        match plan_uri("https://%D0%B0pple.com/") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "xn--pple-43d.com");
+                assert_eq!(uri, "https://xn--pple-43d.com/");
+                assert!(!uri.to_ascii_lowercase().contains("%d0%b0"), "{uri}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let tip = host_tooltip("https://%D0%B0pple.com/");
+        assert!(tip.starts_with("xn--pple-43d.com"), "{tip}");
+        match plan_uri("http://good.com@%D0%B0pple.com/a") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "xn--pple-43d.com");
+                assert_eq!(uri, "http://good.com@xn--pple-43d.com/a");
+            }
+            other => panic!("{other:?}"),
+        }
+        // A second layer of encoding still reaches the homograph.
+        match plan_uri("https://%25D0%25B0pple.com/a") {
+            Action::Confirm { host, .. } => assert_eq!(host, "xn--pple-43d.com"),
+            other => panic!("{other:?}"),
+        }
+        // A leftover percent is not a hostname, so there is no silent browse.
+        assert!(matches!(
+            plan_uri("https://100%.example/"),
+            Action::Refuse {
+                reason: RefuseReason::Scheme,
+                ..
+            }
+        ));
+        // ASCII after decoding does not need the confirm card.
+        assert_eq!(
+            plan_uri("https://apple%2ecom/a"),
+            Action::Browse("https://apple%2ecom/a".into())
+        );
+        assert_eq!(
+            plan_uri("https://[::1]/"),
+            Action::Browse("https://[::1]/".into())
+        );
     }
 }
