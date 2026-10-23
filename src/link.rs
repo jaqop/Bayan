@@ -141,7 +141,10 @@ pub enum Action {
     /// `Command::new(argv[0]).args(&argv[1..])`. No association fallback:
     /// a spawn failure is reported, and the file is not opened by its type.
     /// `path` is the file `settle` checks; it is not an association target.
-    Edit { argv: Vec<String>, path: String },
+    Edit {
+        argv: Vec<String>,
+        path: String,
+    },
     /// `path:line` with no editor chosen yet. `settle` looks up `code.exe`
     /// off the UI thread and either becomes [`Action::Edit`] or [`Action::Reveal`].
     EditDefault {
@@ -149,8 +152,12 @@ pub enum Action {
         line: u32,
         col: Option<u32>,
     },
-    /// `http(s)` with userinfo, or a non-ASCII host. The card shows `host`
-    /// first (punycode when the host was not ASCII). Enter opens `uri`.
+    /// `http(s)` whose host needs a look before it opens: userinfo, a
+    /// non-ASCII host, a raw host that contains `%`, a label that starts
+    /// with `xn--`, a non-canonical IPv4 spelling, or a host longer than
+    /// 64 characters or deeper than four labels. The card shows `host`
+    /// in full (the decoded host, punycode when a label is not ASCII, dotted
+    /// decimal when the host is an IPv4 address). Enter opens `uri`.
     Confirm {
         uri: String,
         host: String,
@@ -186,19 +193,41 @@ pub struct LinkSpan {
     pub kind: LinkKind,
 }
 
+/// The two pieces of a hover line. `host` stays on screen (scheme, host,
+/// port, and IPv6 brackets). `rest` is the path, query, and fragment, and
+/// is the part a narrow pane cuts from the right.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatusParts {
+    pub host: String,
+    pub rest: String,
+}
+
+impl StatusParts {
+    /// Host then path, with no bidi isolates. The status bar adds those
+    /// when it shapes the line.
+    pub fn text(&self) -> String {
+        format!("{}{}", self.host, self.rest)
+    }
+}
+
 impl LinkSpan {
     pub fn contains(&self, col: usize) -> bool {
         col >= self.start_col && col < self.end_col
     }
 
-    /// The string the hover status draws. Bidi controls are replaced, so
-    /// the status cannot be reordered by the link it is disclosing.
-    pub fn tooltip(&self, cwd: Option<&str>) -> String {
+    /// Hover text for the status bar. `host` is the scheme, host, and port.
+    /// `rest` is the path. Bidi controls in either part are markers, not
+    /// controls. An RTL letter is not a control: the status bar forces an
+    /// LTR paragraph and isolates `rest`, so that letter cannot move the host.
+    pub fn tooltip(&self, cwd: Option<&str>) -> StatusParts {
         match &self.kind {
             LinkKind::Osc { uri } | LinkKind::Url { uri } => host_tooltip(uri),
             LinkKind::File { path, line, col } => {
                 let full = resolve_against_cwd(path, cwd).unwrap_or_else(|| path.clone());
-                preview(&format_file(&full, *line, *col), 200)
+                StatusParts {
+                    host: preview(&format_file(&full, *line, *col), 200),
+                    rest: String::new(),
+                }
             }
         }
     }
@@ -492,12 +521,26 @@ fn file_uri_path(uri: &str) -> Option<String> {
     }
 }
 
+/// Host of an `http(s)` URI. `raw_host` is the bytes before percent-decoding
+/// (brackets and the port already stripped). `host` is that string decoded
+/// once, and an IPv4 address is the canonical dotted form. `port` is empty
+/// or `:` plus digits — a bare `:` is an empty port. The host is the part
+/// after the last `@`, so `good.com@evil.com` is `evil.com`.
+struct HttpAuthority {
+    raw_host: String,
+    host: String,
+    port: String,
+    has_userinfo: bool,
+    /// Decimal, hex, octal, or shortened IPv4 whose spelling is not `a.b.c.d`.
+    noncanonical_ipv4: bool,
+}
+
 /// Host of an `http(s)` URI, and whether userinfo (`@`) was present.
-/// The host is the part after the last `@`, so `good.com@evil.com` is
-/// `evil.com`. The host is percent-decoded once before it is returned, so
-/// `https://%D0%B0pple.com/` is the Cyrillic homograph. A `%` that is still
-/// there after that decode is not a hostname.
-fn http_authority(uri: &str) -> Option<(String, bool)> {
+/// The host is percent-decoded once before it is returned, so
+/// `https://%D0%B0pple.com/` is the Cyrillic homograph and
+/// `https://%65vil.example/` is `evil.example`. A `%` that is still there
+/// after that decode is not a hostname.
+fn http_authority(uri: &str) -> Option<HttpAuthority> {
     let scheme = scheme_name(uri)?;
     if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
         return None;
@@ -512,33 +555,324 @@ fn http_authority(uri: &str) -> Option<(String, bool)> {
         return None;
     }
     let has_userinfo = hostport.contains('@');
-    let host = hostport.rsplit('@').next().unwrap_or(hostport);
-    let host = if let Some(inner) = host.strip_prefix('[') {
-        inner.split(']').next().unwrap_or("")
-    } else {
-        host.split(':').next().unwrap_or(host)
-    };
-    let host = decode_http_host(host)?;
-    Some((host, has_userinfo))
+    let authority = hostport.rsplit('@').next().unwrap_or(hostport);
+    let (raw_host, port, ipv6) = split_host_and_port(authority)?;
+    let decoded = decode_http_host(raw_host, ipv6)?;
+    Some(HttpAuthority {
+        raw_host: raw_host.to_string(),
+        host: decoded.host,
+        port: port.to_string(),
+        has_userinfo,
+        noncanonical_ipv4: decoded.noncanonical_ipv4,
+    })
 }
 
-/// One percent-decode, then the non-ASCII check in [`plan_uri`]. A leftover
-/// `%` is rejected. A colon that the decode introduced is a smuggled port;
-/// an IPv6 literal already contained its colons.
-fn decode_http_host(raw: &str) -> Option<String> {
+/// Brackets are an IPv6 literal only: the address must contain a `:`, and
+/// the tail is a port or nothing. A name uses the first `:` as its port,
+/// and that port is empty or `:` followed by ASCII digits. `].evil.net`
+/// and `:80:90` are not ports.
+fn split_host_and_port(authority: &str) -> Option<(&str, &str, bool)> {
+    if let Some(inner) = authority.strip_prefix('[') {
+        let (addr, tail) = inner.split_once(']')?;
+        if addr.is_empty() || !addr.contains(':') {
+            return None;
+        }
+        Some((addr, strict_port(tail)?, true))
+    } else {
+        match authority.split_once(':') {
+            Some((host, _)) => Some((host, strict_port(&authority[host.len()..])?, false)),
+            None => Some((authority, "", false)),
+        }
+    }
+}
+
+/// `""`, a bare `:`, or `:` plus one or more ASCII digits. A bare colon is
+/// the default port (`example.com:/`, `[::1]:/`). Anything else is not a port.
+fn strict_port(tail: &str) -> Option<&str> {
+    if tail.is_empty() || tail == ":" {
+        return Some("");
+    }
+    let digits = tail.strip_prefix(':')?;
+    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        Some(tail)
+    } else {
+        None
+    }
+}
+
+struct DecodedHost {
+    host: String,
+    noncanonical_ipv4: bool,
+}
+
+/// One percent-decode. A leftover `%` is rejected. So is a decoded host the
+/// file-host gate would refuse: a UNC-like string, a slash or backslash, a
+/// bracket, a control or bidi character, whitespace, or an empty DNS label
+/// (`a..b`, `.a`, `a..`). One trailing dot is an FQDN root and is kept. A
+/// colon belongs only inside a bracketed IPv6 literal; anywhere else it is
+/// a smuggled port. A name may only use hostname characters; an IPv6 literal
+/// may only use hex, colon, and dot. A host that ends in a number is an IPv4
+/// address: the canonical `a.b.c.d` form is what the card shows and what is
+/// opened, and a numeric-looking host that does not parse is refused.
+fn decode_http_host(raw: &str, ipv6: bool) -> Option<DecodedHost> {
     let host = percent_decode(raw)?;
-    if host.is_empty() || host == "." || host.contains('%') {
+    if host.is_empty() || host == "." || host.contains('%') || host_has_empty_label(&host) {
         return None;
     }
-    if host.chars().any(|c| {
-        c.is_whitespace() || is_forbidden(c) || matches!(c, '/' | '\\' | '@' | '?' | '#')
-    }) {
+    if host_forbidden_for_file(&host) {
         return None;
     }
-    if host.contains(':') && !raw.contains(':') {
+    if ipv6 {
+        if !host.contains(':') || !ipv6_charset(&host) {
+            return None;
+        }
+        return Some(DecodedHost {
+            host,
+            noncanonical_ipv4: false,
+        });
+    }
+    if host.contains(':') {
         return None;
+    }
+    if ends_in_a_number(&host) {
+        let canon = serialize_ipv4(parse_ipv4(&host)?);
+        let noncanonical_ipv4 = canon != host;
+        return Some(DecodedHost {
+            host: canon,
+            noncanonical_ipv4,
+        });
+    }
+    if !host_name_charset(&host) {
+        return None;
+    }
+    Some(DecodedHost {
+        host,
+        noncanonical_ipv4: false,
+    })
+}
+
+/// WHATWG "ends in a number": the last label is decimal digits, or it parses
+/// as an IPv4 number (`0x` plus hex). One trailing dot is ignored here, the
+/// same way the IPv4 parser drops it.
+fn ends_in_a_number(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    let mut parts: Vec<&str> = host.split('.').collect();
+    if parts.last().copied() == Some("") {
+        parts.pop();
+    }
+    let Some(last) = parts.last().copied() else {
+        return false;
+    };
+    if last.is_empty() {
+        return false;
+    }
+    // Decimal digits, including a `0` octal spelling. A value that does not
+    // fit in `u128` is still a number — the IPv4 parser then refuses it.
+    if last.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    // `0x` / `0X` and hex digits. The `x` means this is not caught above, and
+    // an overflowing `0xffffffff…` must not fall through as a domain name.
+    let bytes = last.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'0' && (bytes[1] == b'x' || bytes[1] == b'X') {
+        return bytes[2..].iter().all(|b| b.is_ascii_hexdigit());
+    }
+    parse_ipv4_number(last).is_some()
+}
+
+/// WHATWG IPv4 number: decimal, or `0x` hex, or a leading `0` meaning octal.
+/// `Some(0)` for a bare `0x` / `0`. `None` when a digit is out of radix or the
+/// value does not fit in `u128`. Overflow is still numeric: [`ends_in_a_number`]
+/// recognises the `0x`/`0` shape, and [`parse_ipv4`] refuses it.
+fn parse_ipv4_number(input: &str) -> Option<(u128, bool)> {
+    if input.is_empty() {
+        return None;
+    }
+    let bytes = input.as_bytes();
+    let (rest, radix, validation) =
+        if bytes.len() >= 2 && bytes[0] == b'0' && (bytes[1] == b'x' || bytes[1] == b'X') {
+            (&input[2..], 16u32, true)
+        } else if bytes.len() >= 2 && bytes[0] == b'0' {
+            (&input[1..], 8u32, true)
+        } else {
+            (input, 10u32, false)
+        };
+    if rest.is_empty() {
+        return Some((0, true));
+    }
+    let mut out = 0u128;
+    for c in rest.chars() {
+        let digit = match c {
+            '0'..='9' => u32::from(c as u8 - b'0'),
+            'a'..='f' if radix == 16 => u32::from(c as u8 - b'a') + 10,
+            'A'..='F' if radix == 16 => u32::from(c as u8 - b'A') + 10,
+            _ => return None,
+        };
+        if digit >= radix {
+            return None;
+        }
+        out = out
+            .checked_mul(u128::from(radix))?
+            .checked_add(u128::from(digit))?;
+    }
+    Some((out, validation))
+}
+
+/// WHATWG IPv4 parser. One trailing dot is dropped. More than four parts,
+/// a non-final part above 255, or a final part that does not fit in the
+/// remaining bytes is failure. The last part fills the remaining octets.
+fn parse_ipv4(host: &str) -> Option<u32> {
+    let mut parts: Vec<&str> = host.split('.').collect();
+    if parts.last().copied() == Some("") && parts.len() > 1 {
+        parts.pop();
+    }
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let mut numbers = Vec::with_capacity(parts.len());
+    for part in &parts {
+        let (n, _) = parse_ipv4_number(part)?;
+        numbers.push(n);
+    }
+    let len = numbers.len();
+    for (i, n) in numbers.iter().enumerate() {
+        if i + 1 != len && *n > 255 {
+            return None;
+        }
+    }
+    let limit = 256u128.checked_pow((5 - len) as u32)?;
+    if numbers[len - 1] >= limit {
+        return None;
+    }
+    let mut ipv4 = numbers[len - 1];
+    for (i, n) in numbers[..len - 1].iter().enumerate() {
+        let factor = 256u128.checked_pow((3 - i) as u32)?;
+        ipv4 = ipv4.checked_add(n.checked_mul(factor)?)?;
+    }
+    u32::try_from(ipv4).ok()
+}
+
+/// WHATWG IPv4 serializer: four decimal octets, no leading zeros.
+fn serialize_ipv4(addr: u32) -> String {
+    format!(
+        "{}.{}.{}.{}",
+        (addr >> 24) & 255,
+        (addr >> 16) & 255,
+        (addr >> 8) & 255,
+        addr & 255
+    )
+}
+
+/// The host a browser will actually use. IPv6 is returned decoded. A host
+/// that ends in a number becomes dotted IPv4, or `None` when that parse fails.
+/// Anything else is the percent-decoded string, so `2130706433` and `127.0.0.1`
+/// compare equal and `apple.com` does not compare equal to `apple.com.evil.net`.
+fn canonical_host(raw: &str, ipv6: bool) -> Option<String> {
+    let host = percent_decode(raw)?;
+    if host.is_empty() || host.contains('%') {
+        return None;
+    }
+    if ipv6 || host.contains(':') {
+        return Some(host);
+    }
+    if ends_in_a_number(&host) {
+        return parse_ipv4(&host).map(serialize_ipv4);
     }
     Some(host)
+}
+
+/// Letters, digits, dot, hyphen, underscore, or a non-ASCII scalar. Quotes,
+/// spaces, and shell metacharacters never reach `ShellExecuteW`.
+fn host_name_charset(host: &str) -> bool {
+    host.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') || !c.is_ascii())
+}
+
+/// Bracketed IPv6: hex, colons, and the dots of an embedded IPv4 tail.
+fn ipv6_charset(host: &str) -> bool {
+    host.chars()
+        .all(|c| c.is_ascii_hexdigit() || matches!(c, ':' | '.'))
+}
+
+/// Empty labels are `a..b` and a leading dot. One trailing dot is the FQDN
+/// root (`example.com.`); a second dot (`example.com..`) is still empty.
+fn host_has_empty_label(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    host.is_empty() || host.split('.').any(|label| label.is_empty())
+}
+
+/// Separators and controls the `file://` host check refuses, plus
+/// [`crate::term::unc_or_device`]. A decoded `http(s)` host is not a file
+/// path, but `\\server\share`, `//server/share`, a backslash, or a bracket
+/// is not a hostname either. Brackets belong around an IPv6 literal, not
+/// inside the decoded address.
+fn host_forbidden_for_file(host: &str) -> bool {
+    host.chars().any(|c| {
+        c.is_whitespace()
+            || is_forbidden(c)
+            || matches!(c, '/' | '\\' | '@' | '?' | '#' | '[' | ']')
+    }) || crate::term::unc_or_device(host)
+}
+
+/// A label that starts with `xn--`, in either case. Checked on the raw
+/// host and again after percent-decoding.
+fn host_has_puny_label(host: &str) -> bool {
+    host.split('.').any(|label| {
+        let bytes = label.as_bytes();
+        bytes.len() >= 4 && bytes[..4].eq_ignore_ascii_case(b"xn--")
+    })
+}
+
+/// One DNS label is at most 63 octets. A host longer than this no longer
+/// fits a status line that keeps the left-hand side, so the registrable
+/// suffix would be the part that disappears.
+const SILENT_HOST_MAX_CHARS: usize = 64;
+/// `www.login.microsoft.com` is four labels. Deeper than that is padding in
+/// front of the real suffix.
+const SILENT_HOST_MAX_LABELS: usize = 4;
+/// Joined hover text (`scheme://host` plus the path) is at most this many
+/// characters. The path itself is cut at 80. Past the budget, the host
+/// loses characters from the left so the registrable suffix stays.
+const TOOLTIP_HOST_CHARS: usize = 200;
+
+/// Userinfo, a non-ASCII host, any `%` in the raw host, an `xn--` label, a
+/// non-canonical IPv4 spelling, or a host too long or too deep to leave
+/// silent. OSC 8 can paint any label over the URL, so with no card the
+/// tooltip is the only place the real host appears.
+fn host_needs_confirm(auth: &HttpAuthority) -> bool {
+    auth.has_userinfo
+        || auth.noncanonical_ipv4
+        || !auth.host.is_ascii()
+        || auth.raw_host.contains('%')
+        || host_has_puny_label(&auth.raw_host)
+        || host_has_puny_label(&auth.host)
+        || host_too_long_for_silent_open(&auth.host)
+}
+
+/// Longer than [`SILENT_HOST_MAX_CHARS`], or more than
+/// [`SILENT_HOST_MAX_LABELS`] labels. One trailing dot is the DNS root and
+/// is not an extra label.
+fn host_too_long_for_silent_open(host: &str) -> bool {
+    if host.chars().count() > SILENT_HOST_MAX_CHARS {
+        return true;
+    }
+    let bare = host.strip_suffix('.').unwrap_or(host);
+    bare.split('.').filter(|label| !label.is_empty()).count() > SILENT_HOST_MAX_LABELS
+}
+
+/// The name the card shows. ASCII stays as decoded. Anything else is
+/// punycode, or `None` when a label cannot be encoded.
+fn display_host(host: &str) -> Option<String> {
+    if host.is_ascii() {
+        Some(host.to_string())
+    } else {
+        match punycode_host(host) {
+            Some(ascii) if ascii.is_ascii() => Some(ascii),
+            _ => None,
+        }
+    }
 }
 
 /// RFC 3492 punycode of one label, without the `xn--` prefix.
@@ -657,15 +991,13 @@ fn punycode_host(host: &str) -> Option<String> {
 }
 
 /// Replace the host of an `http(s)` URI, keeping userinfo, port, path,
-/// query, and fragment.
-fn rewrite_host(uri: &str, ascii_host: &str) -> String {
-    let Some(scheme) = scheme_name(uri) else {
-        return uri.to_string();
-    };
+/// query, and fragment. `None` when the authority is not a host plus a
+/// strict port: a `]` counts only when the authority starts with `[`, and
+/// the port is the first `:` after that host.
+fn rewrite_host(uri: &str, ascii_host: &str) -> Option<String> {
+    let scheme = scheme_name(uri)?;
     let after = &uri[scheme.len()..];
-    let Some(rest) = after.strip_prefix("://") else {
-        return uri.to_string();
-    };
+    let rest = after.strip_prefix("://")?;
     let hostport = rest.split(['/', '?', '#']).next().unwrap_or("");
     let suffix = &rest[hostport.len()..];
     let (userinfo, host_and_port) = if let Some(at) = hostport.rfind('@') {
@@ -673,35 +1005,218 @@ fn rewrite_host(uri: &str, ascii_host: &str) -> String {
     } else {
         ("", hostport)
     };
+    // `]` is the end of an IPv6 literal, and only then. The port is the
+    // first `:` after the host — the tail after `]`, or the first `:` in
+    // a name — and it has to be empty or digits. `:80:90` stays one tail
+    // and is rejected, instead of the last colon winning.
     let port = if host_and_port.starts_with('[') {
-        ""
-    } else if let Some(idx) = host_and_port.rfind(':') {
-        &host_and_port[idx..]
+        let end = host_and_port.find(']')?;
+        strict_port(&host_and_port[end + 1..])?
     } else {
-        ""
+        match host_and_port.find(':') {
+            Some(idx) => strict_port(&host_and_port[idx..])?,
+            None => "",
+        }
     };
     let mut out = String::new();
     out.push_str(&uri[..scheme.len()]);
     out.push_str("://");
     out.push_str(userinfo);
-    out.push_str(ascii_host);
+    if ascii_host.contains(':') {
+        out.push('[');
+        out.push_str(ascii_host);
+        out.push(']');
+    } else {
+        out.push_str(ascii_host);
+    }
     out.push_str(port);
     out.push_str(suffix);
+    Some(out)
+}
+
+/// Scheme, authority split, and the raw host (brackets and port removed).
+fn split_uri_authority(uri: &str) -> Option<(&str, &str, bool)> {
+    let scheme = scheme_name(uri)?;
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
+        return None;
+    }
+    let rest = uri[scheme.len()..].strip_prefix("://")?;
+    if uri.contains('\\') || rest.is_empty() {
+        return None;
+    }
+    let hostport = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if hostport.is_empty() {
+        return None;
+    }
+    let authority = hostport.rsplit('@').next().unwrap_or(hostport);
+    split_host_and_port(authority)
+}
+
+/// The opened URI's canonical host is the card's canonical host, and the
+/// port strings match. Both sides go through the IPv4 parser, so a re-split
+/// of `2130706433` is not treated as equal to a card that says `apple.com`,
+/// and it is treated as equal to a card that says `127.0.0.1`.
+fn opened_matches_card(opened: &str, shown: &str, port: &str) -> bool {
+    let Some((raw_host, opened_port, ipv6)) = split_uri_authority(opened) else {
+        return false;
+    };
+    if opened_port != port {
+        return false;
+    }
+    let Some(opened_canon) = canonical_host(raw_host, ipv6) else {
+        return false;
+    };
+    let Some(shown_canon) = canonical_host(shown, shown.contains(':')) else {
+        return false;
+    };
+    opened_canon == shown_canon
+}
+
+/// Card body for a host confirm. The host is a line of its own and is never
+/// shortened: a long name keeps its registrable suffix. Only the path, query,
+/// and fragment are elided, and from the right.
+pub fn confirm_card_shown(host: &str, uri: &str) -> String {
+    let path = path_query_of(uri);
+    if path.is_empty() {
+        return host.to_string();
+    }
+    let path = preview(&path, 80);
+    format!("{host}\n{path}")
+}
+
+fn path_query_of(uri: &str) -> String {
+    let Some(scheme) = scheme_name(uri) else {
+        return String::new();
+    };
+    let after = &uri[scheme.len()..];
+    let Some(rest) = after.strip_prefix("://") else {
+        return String::new();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    rest[authority.len()..].to_string()
+}
+
+/// The authority's `userinfo@`, or empty when there is none.
+fn userinfo_of(uri: &str) -> String {
+    let Some(scheme) = scheme_name(uri) else {
+        return String::new();
+    };
+    let Some(rest) = uri[scheme.len()..].strip_prefix("://") else {
+        return String::new();
+    };
+    let hostport = rest.split(['/', '?', '#']).next().unwrap_or("");
+    match hostport.rfind('@') {
+        Some(at) => hostport[..=at].to_string(),
+        None => String::new(),
+    }
+}
+
+/// Keep the end of `text`. The leading `…` counts toward `max_chars`.
+fn elide_left_text(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    let keep = max_chars - 1;
+    let tail: String = text.chars().skip(count - keep).collect();
+    format!("…{tail}")
+}
+
+/// Keep the start of `text`. The trailing `…` counts toward `max_chars`.
+fn elide_right_text(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    let keep = max_chars - 1;
+    let head: String = text.chars().take(keep).collect();
+    format!("{head}…")
+}
+
+/// `preview`, then a hard cap. `preview` adds its ellipsis after the budget,
+/// which would make an 80-character path 81 characters.
+fn cut_visible(raw: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let shown = preview(raw, max_chars);
+    if shown.chars().count() <= max_chars {
+        return shown;
+    }
+    let mut out: String = shown.chars().take(max_chars - 1).collect();
+    if !out.ends_with('…') {
+        out.push('…');
+    }
     out
 }
 
-/// Tooltip text. Userinfo and a non-ASCII host lead with the host that
-/// will actually be opened (punycode, when a label is not ASCII), so a
-/// label of `good.com` cannot hide `evil.com` and an IDN cannot hide its
-/// ASCII form.
-fn host_tooltip(uri: &str) -> String {
-    match http_authority(uri) {
-        Some((host, has_userinfo)) if has_userinfo || !host.is_ascii() => {
-            let shown = punycode_host(&host).unwrap_or(host);
-            preview(&format!("{shown} — {uri}"), 200)
-        }
-        _ => preview(uri, 200),
+/// Joined hover text is at most [`TOOLTIP_HOST_CHARS`]. The path is already
+/// at most 80. A host that still does not fit loses characters from the
+/// left, so the registrable suffix stays; the path then yields room.
+fn cap_parts(mut host: String, mut rest: String) -> StatusParts {
+    let rest_n = rest.chars().count();
+    let host_budget = TOOLTIP_HOST_CHARS.saturating_sub(rest_n.min(TOOLTIP_HOST_CHARS));
+    if host.chars().count() > host_budget {
+        host = elide_left_text(&host, host_budget);
     }
+    let room = TOOLTIP_HOST_CHARS.saturating_sub(host.chars().count());
+    if rest.chars().count() > room {
+        rest = elide_right_text(&rest, room);
+    }
+    StatusParts { host, rest }
+}
+
+/// Hover parts for an http(s) URI. `host` is `scheme://host[:port]` (brackets
+/// around an IPv6 literal) using the host that will actually be opened.
+/// `rest` is the path, and a userinfo disclosure after the real host so a
+/// long path cannot cover `good.com@evil.com`.
+pub(crate) fn host_tooltip(uri: &str) -> StatusParts {
+    let Some(auth) = http_authority(uri) else {
+        return cap_parts(String::new(), cut_visible(uri, TOOLTIP_HOST_CHARS));
+    };
+    let shown = display_host(&auth.host).unwrap_or_else(|| auth.host.clone());
+    let scheme = scheme_name(uri).unwrap_or("https");
+    let name = if shown.contains(':') {
+        format!("[{shown}]")
+    } else {
+        shown.clone()
+    };
+    let host = format!("{scheme}://{name}{}", auth.port);
+    let path = cut_visible(&path_query_of(uri), 80);
+    let rest = if auth.has_userinfo {
+        let userinfo = userinfo_of(uri);
+        format!(" — {userinfo}{name}{path}")
+    } else {
+        path
+    };
+    cap_parts(host, rest)
+}
+
+/// Fit a hover line to `columns`. The host is kept whole, and loses
+/// characters from the left only when the host alone is wider than the
+/// pane. The path loses characters from the right.
+pub(crate) fn fit_status_bar(parts: &StatusParts, columns: usize) -> StatusParts {
+    if columns == 0 {
+        return StatusParts {
+            host: String::new(),
+            rest: String::new(),
+        };
+    }
+    let host_n = parts.host.chars().count();
+    let host = if host_n > columns {
+        elide_left_text(&parts.host, columns)
+    } else {
+        parts.host.clone()
+    };
+    let room = columns.saturating_sub(host.chars().count());
+    let rest = elide_right_text(&parts.rest, room);
+    StatusParts { host, rest }
 }
 
 /// Allowlist. The `Ok` string is exactly what `ShellExecuteW` receives:
@@ -715,28 +1230,38 @@ pub fn plan_uri(uri: &str) -> Action {
     };
     if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
         match http_authority(uri) {
-            Some((host, has_userinfo)) => {
-                let non_ascii = !host.is_ascii();
-                if has_userinfo || non_ascii {
-                    let shown = if non_ascii {
-                        match punycode_host(&host) {
-                            Some(ascii) if ascii.is_ascii() => ascii,
-                            _ => return refuse(RefuseReason::Scheme, uri),
-                        }
-                    } else {
-                        host
+            Some(auth) => {
+                let Some(shown) = display_host(&auth.host) else {
+                    return refuse(RefuseReason::Scheme, uri);
+                };
+                let confirm = host_needs_confirm(&auth);
+                // A percent-encoded, non-ASCII, or non-canonical IPv4 host
+                // is opened as the name on the card. The raw `%HH` form and
+                // `2130706433` / `0x7f.1` never reach the browser. Userinfo
+                // and a plain `xn--` label keep the original URI; the card
+                // already shows the host.
+                let opened = if auth.noncanonical_ipv4
+                    || !auth.host.is_ascii()
+                    || auth.raw_host.contains('%')
+                {
+                    let Some(opened) = rewrite_host(uri, &shown) else {
+                        return refuse(RefuseReason::Scheme, uri);
                     };
-                    let opened = if non_ascii {
-                        rewrite_host(uri, &shown)
-                    } else {
-                        uri.to_string()
-                    };
+                    opened
+                } else {
+                    uri.to_string()
+                };
+                // The host on the card is the host the browser will open.
+                if !opened_matches_card(&opened, &shown, &auth.port) {
+                    return refuse(RefuseReason::Scheme, uri);
+                }
+                if confirm {
                     Action::Confirm {
                         uri: opened,
                         host: shown,
                     }
                 } else {
-                    Action::Browse(uri.to_string())
+                    Action::Browse(opened)
                 }
             }
             None => refuse(RefuseReason::Scheme, uri),
@@ -1032,12 +1557,13 @@ where
     C: Fn() -> Option<String>,
 {
     match action {
-        Action::OpenPath(path) | Action::Reveal(path) => match prepare_disk(&path, &exists, &long_path)
-        {
-            Ok(DiskPath::ForceReveal(path)) => Action::Reveal(path),
-            Ok(DiskPath::Ready(path)) => classify_open(path),
-            Err(refusal) => refusal,
-        },
+        Action::OpenPath(path) | Action::Reveal(path) => {
+            match prepare_disk(&path, &exists, &long_path) {
+                Ok(DiskPath::ForceReveal(path)) => Action::Reveal(path),
+                Ok(DiskPath::Ready(path)) => classify_open(path),
+                Err(refusal) => refusal,
+            }
+        }
         Action::Edit { argv, path } => match prepare_disk(&path, &exists, &long_path) {
             Err(refusal) => refusal,
             Ok(DiskPath::ForceReveal(path)) => Action::Reveal(path),
@@ -2045,11 +2571,13 @@ mod tests {
     fn osc8_tooltip_shows_the_uri_not_the_label() {
         let spans = osc_row(b"\x1b]8;;https://evil.example/phish\x07click here\x1b]8;;\x07");
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].tooltip(None), "https://evil.example/phish");
-        assert_ne!(spans[0].tooltip(None), "click here");
+        let tip = spans[0].tooltip(None).text();
+        assert!(tip.starts_with("https://evil.example"), "{tip}");
+        assert!(tip.contains("phish"), "{tip}");
+        assert_ne!(tip, "click here");
         // A bidi override inside the URI is visible as a marker, not as a reorder.
         let spans = osc_row(b"\x1b]8;;https://evil.example/\xE2\x80\xAEhidden\x07x\x1b]8;;\x07");
-        let tip = spans[0].tooltip(None);
+        let tip = spans[0].tooltip(None).text();
         assert!(!tip.contains('\u{202E}'), "{tip}");
         assert!(tip.contains("<RLO>"), "{tip}");
         assert!(matches!(
@@ -2430,7 +2958,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(
-            spans[0].tooltip(Some(r"C:\work")),
+            spans[0].tooltip(Some(r"C:\work")).text(),
             r"C:\work\src\main.rs:10:4"
         );
     }
@@ -2913,7 +3441,10 @@ mod tests {
     #[test]
     fn missing_file_is_refused() {
         let missing_txt = plan_uri(r"file:///C:/bayan-qa-missing/no-such.txt");
-        assert!(matches!(missing_txt, Action::OpenPath(_)), "{missing_txt:?}");
+        assert!(
+            matches!(missing_txt, Action::OpenPath(_)),
+            "{missing_txt:?}"
+        );
         assert!(matches!(
             settle(missing_txt, |_| false, |_| None, || None),
             Action::Refuse {
@@ -3192,8 +3723,8 @@ mod tests {
         let spans = links_in_row(&row("see http://good.com@evil.com/a next"));
         assert_eq!(spans.len(), 1, "{spans:?}");
         let tip = spans[0].tooltip(None);
-        assert!(tip.starts_with("evil.com"), "{tip}");
-        assert!(tip.contains("good.com@evil.com"), "{tip}");
+        assert!(tip.host.starts_with("http://evil.com"), "{}", tip.host);
+        assert!(tip.text().contains("good.com@evil.com"), "{}", tip.text());
         match spans[0].activate(None, None, None) {
             Action::Confirm { uri, host } => {
                 assert_eq!(host, "evil.com");
@@ -3208,13 +3739,15 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        // No userinfo: open, and the tooltip is the URI itself.
+        // No userinfo: open, and the tooltip names the full host.
         assert_eq!(
             plan_uri("https://evil.com/a"),
             Action::Browse("https://evil.com/a".into())
         );
         let plain = links_in_row(&row("https://evil.com/a"));
-        assert_eq!(plain[0].tooltip(None), "https://evil.com/a");
+        let plain_tip = plain[0].tooltip(None).text();
+        assert!(plain_tip.starts_with("https://evil.com"), "{plain_tip}");
+        assert!(plain_tip.ends_with("evil.com/a"), "{plain_tip}");
         // user:pass@host is the same card. The host is after the last @.
         match plan_uri("http://user:secret@good.com@evil.com/x") {
             Action::Confirm { host, .. } => assert_eq!(host, "evil.com"),
@@ -3424,10 +3957,7 @@ mod tests {
             r"C:\Windows\explorer.exe"
         );
         assert_eq!(explorer_from_windir(None), r"C:\Windows\explorer.exe");
-        assert_eq!(
-            select_arg(r"C:\qa\note.txt"),
-            r#"/select,"C:\qa\note.txt""#
-        );
+        assert_eq!(select_arg(r"C:\qa\note.txt"), r#"/select,"C:\qa\note.txt""#);
         let prog = explorer_from_windir(Some(r"C:\Windows"));
         assert!(prog.to_ascii_lowercase().ends_with(r"\explorer.exe"));
         assert!(!prog.to_ascii_lowercase().contains("cmd"));
@@ -3453,12 +3983,19 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        assert_eq!(
-            plan_uri("http://xn--mnchen-3ya.example/a"),
-            Action::Browse("http://xn--mnchen-3ya.example/a".into())
-        );
+        match plan_uri("http://xn--mnchen-3ya.example/a") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "xn--mnchen-3ya.example");
+                assert_eq!(uri, "http://xn--mnchen-3ya.example/a");
+            }
+            other => panic!("{other:?}"),
+        }
         let tip = host_tooltip("http://münchen.example/a");
-        assert!(tip.starts_with("xn--mnchen-3ya.example"), "{tip}");
+        assert!(
+            tip.host.starts_with("http://xn--mnchen-3ya.example"),
+            "{}",
+            tip.host
+        );
     }
 
     #[test]
@@ -3554,7 +4091,11 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let tip = host_tooltip("https://%D0%B0pple.com/");
-        assert!(tip.starts_with("xn--pple-43d.com"), "{tip}");
+        assert!(
+            tip.host.starts_with("https://xn--pple-43d.com"),
+            "{}",
+            tip.host
+        );
         match plan_uri("http://good.com@%D0%B0pple.com/a") {
             Action::Confirm { uri, host } => {
                 assert_eq!(host, "xn--pple-43d.com");
@@ -3569,13 +4110,608 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(
-            plan_uri("https://apple%2ecom/a"),
-            Action::Browse("https://apple%2ecom/a".into())
-        );
+        match plan_uri("https://apple%2ecom/a") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "apple.com");
+                assert_eq!(uri, "https://apple.com/a");
+                assert!(!uri.contains('%'), "{uri}");
+            }
+            other => panic!("{other:?}"),
+        }
         assert_eq!(
             plan_uri("https://[::1]/"),
             Action::Browse("https://[::1]/".into())
         );
+    }
+
+    #[test]
+    fn percent_encoded_ascii_host_confirms_with_decoded_name() {
+        let cases = [
+            (
+                "https://%65vil.example/secret",
+                "evil.example",
+                "https://evil.example/secret",
+            ),
+            (
+                "https://login.microsoft.com%2eevil.example/",
+                "login.microsoft.com.evil.example",
+                "https://login.microsoft.com.evil.example/",
+            ),
+            (
+                "https://login.microsoft.com%2Eevil.example/",
+                "login.microsoft.com.evil.example",
+                "https://login.microsoft.com.evil.example/",
+            ),
+            ("https://%61pple.com/", "apple.com", "https://apple.com/"),
+            (
+                "https://user:secret@%65vil.example:8443/a?q=1",
+                "evil.example",
+                "https://user:secret@evil.example:8443/a?q=1",
+            ),
+            // The colons were already in the raw host, so this is an IPv6
+            // literal, not a port smuggled by `%3A`. The opened URI keeps
+            // the brackets and the port.
+            ("https://[fe80::%31]/", "fe80::1", "https://[fe80::1]/"),
+            (
+                "https://[fe80::%31]:443/a",
+                "fe80::1",
+                "https://[fe80::1]:443/a",
+            ),
+        ];
+        for (input, host, opened) in cases {
+            match plan_uri(input) {
+                Action::Confirm { uri, host: got } => {
+                    assert_eq!(got, host, "{input}");
+                    assert_eq!(uri, opened, "{input}");
+                    assert!(!uri.contains('%'), "{input} opened {uri}");
+                    let opened_host = http_authority(&uri).expect("opened uri");
+                    assert_eq!(
+                        display_host(&opened_host.host).as_deref(),
+                        Some(got.as_str()),
+                        "{input}"
+                    );
+                    assert_eq!(opened_host.port, http_authority(input).expect("input").port);
+                    assert!(!runs_off_ui_thread(&Action::Confirm {
+                        uri: uri.clone(),
+                        host: got.clone(),
+                    }));
+                }
+                other => panic!("{input} -> {other:?}"),
+            }
+            let tip = host_tooltip(input);
+            assert!(
+                tip.host.contains(&format!("://{host}"))
+                    || tip.host.contains(&format!("://[{host}]")),
+                "{input} tooltip {}",
+                tip.host
+            );
+        }
+        // A `%` in the path is not a host. This still opens with no card.
+        assert_eq!(
+            plan_uri("https://example.com/%65vil"),
+            Action::Browse("https://example.com/%65vil".into())
+        );
+        assert_eq!(
+            plan_uri("https://example.com/"),
+            Action::Browse("https://example.com/".into())
+        );
+        let plain = host_tooltip("https://example.com/");
+        assert_eq!(plain.host, "https://example.com");
+        assert_eq!(plain.rest, "/");
+    }
+
+    #[test]
+    fn punycode_label_confirms_before_open() {
+        match plan_uri("https://XN--pple-43d.com/") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "XN--pple-43d.com");
+                assert_eq!(uri, "https://XN--pple-43d.com/");
+            }
+            other => panic!("{other:?}"),
+        }
+        match plan_uri("https://sub.xn--80ak6aa92e.com/") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "sub.xn--80ak6aa92e.com");
+                assert_eq!(uri, "https://sub.xn--80ak6aa92e.com/");
+            }
+            other => panic!("{other:?}"),
+        }
+        // The label is `xn--` only after decoding. The card shows that
+        // name, and the opened URI is rebuilt from it.
+        match plan_uri("https://sub.%78n--80ak6aa92e.com/a") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "sub.xn--80ak6aa92e.com");
+                assert_eq!(uri, "https://sub.xn--80ak6aa92e.com/a");
+            }
+            other => panic!("{other:?}"),
+        }
+        let tip = host_tooltip("https://XN--pple-43d.com/");
+        assert!(
+            tip.host.starts_with("https://XN--pple-43d.com"),
+            "{}",
+            tip.host
+        );
+    }
+
+    #[test]
+    fn encoded_separator_or_empty_label_host_is_refused() {
+        for uri in [
+            "https://evil%5Cshare.example/secret",
+            "https://%5C%5Cevil.example/share",
+            "https://evil%2Fshare.example/secret",
+            "https://%2F%2Fevil.example/share",
+            "https://evil%2e%2eexample/",
+            "https://evil..example/",
+            "https://.evil.example/",
+            "https://example.com../",
+            "https://evil.example../",
+            // A colon that exists only after decoding is a smuggled port.
+            "https://[%3A%3A1]/",
+            "https://evil.example%3A443/",
+        ] {
+            match plan_uri(uri) {
+                Action::Refuse {
+                    reason: RefuseReason::Scheme,
+                    ..
+                } => {}
+                Action::Browse(opened) => panic!("{uri} opened {opened}"),
+                Action::Confirm { uri: opened, host } => {
+                    panic!("{uri} confirmed {host} as {opened}")
+                }
+                other => panic!("{uri} -> {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bracket_junk_does_not_open_a_different_host() {
+        for uri in [
+            "https://[%61pple.com].evil.net/login",
+            "https://%61pple.com:x].evil.net/",
+            "https://a@[%61pple.com].evil.net/p?q#f",
+            "https://user:pw@%61pple.com:x].evil.net/",
+            "https://%67ood.com]evil.net/",
+            "https://%5Bfe80::1%5D/",
+            "https://%65vil.example:80:90/",
+        ] {
+            match plan_uri(uri) {
+                Action::Refuse {
+                    reason: RefuseReason::Scheme,
+                    ..
+                } => {}
+                Action::Browse(opened) => panic!("{uri} opened {opened}"),
+                Action::Confirm { uri: opened, host } => {
+                    panic!("{uri} card {host} opened {opened}")
+                }
+                other => panic!("{uri} -> {other:?}"),
+            }
+            let tip = host_tooltip(uri).text();
+            assert!(!tip.starts_with("apple.com "), "{uri} tooltip {tip}");
+            assert!(!tip.starts_with("[fe80 "), "{uri} tooltip {tip}");
+        }
+    }
+
+    #[test]
+    fn trailing_dot_and_ipv6_port_still_open() {
+        assert_eq!(
+            plan_uri("https://example.com./"),
+            Action::Browse("https://example.com./".into())
+        );
+        assert_eq!(
+            plan_uri("https://evil.example./path"),
+            Action::Browse("https://evil.example./path".into())
+        );
+        assert_eq!(
+            plan_uri("https://[::1]:8080/"),
+            Action::Browse("https://[::1]:8080/".into())
+        );
+        match plan_uri("https://example.com%2e/") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "example.com.");
+                assert_eq!(uri, "https://example.com./");
+                let opened = http_authority(&uri).expect("opened");
+                assert_eq!(display_host(&opened.host).as_deref(), Some(host.as_str()));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn opened_matches_card_compares_canonical_hosts() {
+        assert!(!opened_matches_card(
+            "https://apple.com.evil.net/",
+            "apple.com",
+            ""
+        ));
+        assert!(!opened_matches_card(
+            "https://evil.example:90/",
+            "evil.example",
+            ":80"
+        ));
+        assert!(opened_matches_card(
+            "https://evil.example:80/",
+            "evil.example",
+            ":80"
+        ));
+        // A re-split of the opened URI would say `2130706433` ≠ `127.0.0.1`.
+        // The browser opens the same address, so the canonical forms match.
+        assert!(opened_matches_card("https://2130706433/", "127.0.0.1", ""));
+        assert!(opened_matches_card("https://2130706433/", "2130706433", ""));
+        assert!(!opened_matches_card("https://2130706433/", "apple.com", ""));
+    }
+
+    #[test]
+    fn noncanonical_ipv4_confirms_with_dotted_decimal() {
+        let cases = [
+            (
+                "https://apple.com@2130706433/",
+                "127.0.0.1",
+                "https://apple.com@127.0.0.1/",
+            ),
+            (
+                "https://user:pw@0x7f.0.0.1/a?q=1",
+                "127.0.0.1",
+                "https://user:pw@127.0.0.1/a?q=1",
+            ),
+            ("https://%30x7f.0.0.1/", "127.0.0.1", "https://127.0.0.1/"),
+            (
+                "https://%31%32%37%2e%31/",
+                "127.0.0.1",
+                "https://127.0.0.1/",
+            ),
+            ("https://0177.0.0.1/", "127.0.0.1", "https://127.0.0.1/"),
+            ("https://0x7f.1/", "127.0.0.1", "https://127.0.0.1/"),
+            ("https://127.1/", "127.0.0.1", "https://127.0.0.1/"),
+            ("https://127.0.0.1./", "127.0.0.1", "https://127.0.0.1/"),
+        ];
+        for (input, host, opened) in cases {
+            match plan_uri(input) {
+                Action::Confirm { uri, host: got } => {
+                    assert_eq!(got, host, "{input}");
+                    assert_eq!(uri, opened, "{input}");
+                    assert!(opened_matches_card(&uri, &got, ""), "{input}");
+                    let again = http_authority(&uri).expect("opened");
+                    assert_eq!(again.host, got, "{input}");
+                    assert!(!uri.contains("2130706433"), "{uri}");
+                    assert!(!uri.to_ascii_lowercase().contains("0x7f"), "{uri}");
+                    assert!(!uri.contains("0177"), "{uri}");
+                }
+                other => panic!("{input} -> {other:?}"),
+            }
+            let tip = host_tooltip(input);
+            assert!(
+                tip.host.contains(&format!("://{host}")),
+                "{input} tooltip {}",
+                tip.host
+            );
+        }
+        assert_eq!(
+            plan_uri("https://127.0.0.1/"),
+            Action::Browse("https://127.0.0.1/".into())
+        );
+        assert_eq!(
+            plan_uri("https://127.0.0.1:8080/"),
+            Action::Browse("https://127.0.0.1:8080/".into())
+        );
+        assert_eq!(
+            plan_uri("https://my_host.example/"),
+            Action::Browse("https://my_host.example/".into())
+        );
+        assert_eq!(
+            serialize_ipv4(parse_ipv4("2130706433").unwrap()),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            serialize_ipv4(parse_ipv4("0x7f.0.0.1").unwrap()),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            serialize_ipv4(parse_ipv4("0177.0.0.1").unwrap()),
+            "127.0.0.1"
+        );
+        assert_eq!(serialize_ipv4(parse_ipv4("127.1").unwrap()), "127.0.0.1");
+        assert!(parse_ipv4("1.2.3.4.5").is_none());
+        assert!(parse_ipv4("4294967296").is_none());
+        assert!(parse_ipv4("256.1").is_none());
+        assert!(parse_ipv4("08").is_none());
+    }
+
+    #[test]
+    fn invalid_ipv4_and_host_charset_are_refused() {
+        for uri in [
+            "https://1.2.3.4.5/",
+            "https://256.1/",
+            "https://127.0.0.999/",
+            "https://08/",
+            "https://4294967296/",
+            "https://not-an-ip.1/",
+            "https://example.com.0/",
+            "https://ex'ample.com/",
+            "https://ex*ample.com/",
+            "https://ex,ample.com/",
+            "https://ex;ample.com/",
+            "https://ex%22ample.com/",
+            "https://ex%7Bample.com/",
+            "https://ex%5Cample.com/",
+            "https://ex%20ample.com/",
+            "https://[::1']/",
+            "https://[gggg::1]/",
+        ] {
+            match plan_uri(uri) {
+                Action::Refuse {
+                    reason: RefuseReason::Scheme,
+                    ..
+                } => {}
+                Action::Browse(opened) => panic!("{uri} opened {opened}"),
+                Action::Confirm { uri: opened, host } => {
+                    panic!("{uri} card {host} opened {opened}")
+                }
+                other => panic!("{uri} -> {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bare_colon_is_an_empty_port() {
+        assert_eq!(
+            plan_uri("https://example.com:/"),
+            Action::Browse("https://example.com:/".into())
+        );
+        assert_eq!(
+            plan_uri("https://example.com:/path"),
+            Action::Browse("https://example.com:/path".into())
+        );
+        assert_eq!(
+            plan_uri("https://[::1]:/"),
+            Action::Browse("https://[::1]:/".into())
+        );
+        match plan_uri("https://%65xample.com:/a") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "example.com");
+                assert_eq!(uri, "https://example.com/a");
+                assert!(opened_matches_card(&uri, &host, ""));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirm_card_keeps_the_full_host() {
+        let host = format!("login.microsoft.com.{}.evil.example", "a".repeat(180));
+        let input = format!("https://user@{host}/secret?x=1");
+        match plan_uri(&input) {
+            Action::Confirm { uri, host: got } => {
+                assert_eq!(got, host);
+                assert!(got.ends_with("evil.example"), "{got}");
+                let card = confirm_card_shown(&got, &uri);
+                assert!(card.contains(&host), "{card}");
+                let first = card.lines().next().unwrap();
+                assert_eq!(first, host);
+                assert!(first.ends_with("evil.example"));
+                assert!(!first.contains('…'));
+                let truncated = preview(&format!("{host} — {uri}"), 160);
+                assert!(
+                    !truncated.contains("evil.example"),
+                    "the old 160-char card hid the real suffix: {truncated}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        let long_path = format!("https://example.com/{}", "p".repeat(200));
+        let card = confirm_card_shown("example.com", &long_path);
+        assert!(card.starts_with("example.com\n"));
+        assert!(card.contains('…'));
+        assert!(card.matches('p').count() < 200);
+    }
+
+    #[test]
+    fn long_or_deep_host_confirms_and_tooltip_keeps_the_suffix() {
+        // login.microsoft.com. + three 63-char labels + .evil.example = 224.
+        let host = format!(
+            "login.microsoft.com.{}.{}.{}.evil.example",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+        );
+        assert_eq!(host.chars().count(), 224, "{host}");
+        let input = format!("https://{host}/secret");
+        match plan_uri(&input) {
+            Action::Confirm { uri, host: got } => {
+                assert_eq!(got, host);
+                assert!(got.ends_with("evil.example"), "{got}");
+                assert_eq!(uri, input);
+            }
+            other => panic!("{other:?}"),
+        }
+        let tip = host_tooltip(&input);
+        let text = tip.text();
+        assert!(text.ends_with("evil.example/secret"), "{text}");
+        assert!(text.contains('…'), "{text}");
+        assert!(
+            text.chars().count() <= 200,
+            "tooltip len {}",
+            text.chars().count()
+        );
+        let tail_at = text.rfind("evil.example").expect("suffix");
+        let ellipsis_at = text.find('…').expect("elided");
+        assert!(ellipsis_at < tail_at, "{text}");
+
+        // Lengths are literals on purpose: a test that reads the limit
+        // constant still passes if that constant moves.
+        // `.evil.example` is 13 characters, so these lengths are exact.
+        let tail = ".evil.example";
+        for (n, confirm) in [
+            (12usize, false),
+            (32, false),
+            (64, false),
+            (65, true),
+            (100, true),
+            (180, true),
+        ] {
+            let varied = if n == 12 {
+                "evil.example".to_string()
+            } else {
+                format!("{}{tail}", "d".repeat(n - tail.len()))
+            };
+            assert_eq!(varied.chars().count(), n);
+            let uri = format!("https://{varied}/");
+            let tip = host_tooltip(&uri).text();
+            assert!(tip.ends_with("evil.example/"), "len {n} tooltip {tip}");
+            assert!(tip.chars().count() <= 200, "len {n} tooltip len");
+            if confirm {
+                assert!(
+                    matches!(plan_uri(&uri), Action::Confirm { .. }),
+                    "len {n} should confirm"
+                );
+            } else {
+                assert!(
+                    matches!(plan_uri(&uri), Action::Browse(_)),
+                    "len {n} should open"
+                );
+                assert!(
+                    tip.contains(&varied),
+                    "short tooltip dropped the host: {tip}"
+                );
+            }
+        }
+        // Four labels open. Five labels ask. A trailing dot is the DNS root,
+        // not a fifth label.
+        assert!(matches!(plan_uri("https://a.b.c.d/"), Action::Browse(_)));
+        assert!(matches!(plan_uri("https://a.b.c.d./"), Action::Browse(_)));
+        assert!(matches!(
+            plan_uri("https://a.b.c.d.e/"),
+            Action::Confirm { .. }
+        ));
+        let dotted = host_tooltip("https://a.b.c.d./");
+        assert_eq!(dotted.host, "https://a.b.c.d.");
+        let deep_tip = host_tooltip("https://a.b.c.d.e/x").text();
+        assert!(deep_tip.contains("a.b.c.d.e"), "{deep_tip}");
+        assert!(deep_tip.ends_with("d.e/x"), "{deep_tip}");
+
+        for (uri, host) in [
+            ("https://github.com/", "github.com"),
+            ("https://docs.rs/", "docs.rs"),
+            ("https://github.com/jaqop/Bayan", "github.com"),
+        ] {
+            assert!(
+                matches!(plan_uri(uri), Action::Browse(_)),
+                "{uri} should open with no card"
+            );
+            let tip = host_tooltip(uri);
+            assert!(tip.host.contains(host), "{uri} tooltip {}", tip.host);
+            assert!(!tip.text().contains('…'), "{uri} tooltip {}", tip.text());
+            assert!(tip.text().chars().count() <= 200);
+        }
+
+        let with_port = host_tooltip("https://evil.example:8443/x");
+        assert_eq!(with_port.host, "https://evil.example:8443");
+        assert_eq!(with_port.rest, "/x");
+        let v6 = host_tooltip("https://[2001:DB8::A:b]:8443/");
+        assert_eq!(v6.host, "https://[2001:DB8::A:b]:8443");
+
+        let long_path = format!("https://example.com/{}", "p".repeat(300));
+        let cut = host_tooltip(&long_path);
+        assert!(cut.host.contains("example.com"), "{}", cut.host);
+        assert!(
+            cut.rest.chars().count() <= 80,
+            "path {}",
+            cut.rest.chars().count()
+        );
+        assert!(cut.rest.contains('…'), "{}", cut.rest);
+        assert!(cut.text().chars().count() <= 200);
+        assert!(cut.rest.matches('p').count() < 300);
+    }
+
+    #[test]
+    fn status_bar_keeps_the_full_host_in_a_narrow_pane() {
+        let uri = format!("https://evil.example/{}.github.com/login", "a".repeat(60));
+        let parts = host_tooltip(&uri);
+        assert_eq!(parts.host, "https://evil.example");
+        assert!(matches!(plan_uri(&uri), Action::Browse(_)));
+        for cols in [40usize, 80] {
+            let shown = fit_status_bar(&parts, cols).text();
+            assert!(
+                shown.starts_with("https://evil.example"),
+                "cols {cols}: {shown}"
+            );
+            assert!(
+                !shown.contains("github.com"),
+                "cols {cols} hid the host behind the path: {shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv4_tooltip_keeps_the_host_before_an_rtl_path() {
+        for path in [
+            "/א/github.com/login",
+            "/ا/github.com/login",
+            "/א/ا/github.com/login",
+        ] {
+            let uri = format!("https://1.2.3.4{path}");
+            assert!(
+                matches!(plan_uri(&uri), Action::Browse(_)),
+                "{uri} should open with no card"
+            );
+            let parts = host_tooltip(&uri);
+            assert_eq!(parts.host, "https://1.2.3.4", "{}", parts.host);
+            let text = parts.text();
+            let host_at = text.find("1.2.3.4").expect("host");
+            let tail_at = text.find("github.com").expect("path");
+            assert!(host_at < tail_at, "{text}");
+            assert!(text.starts_with("https://"), "{text}");
+        }
+    }
+
+    #[test]
+    fn ipv4_overflow_is_refused_and_canonical_forms_parse() {
+        assert_eq!(
+            serialize_ipv4(parse_ipv4("0x7f000001").unwrap()),
+            "127.0.0.1"
+        );
+        assert_eq!(serialize_ipv4(parse_ipv4("0X7F.1").unwrap()), "127.0.0.1");
+        assert_eq!(serialize_ipv4(parse_ipv4("0x").unwrap()), "0.0.0.0");
+        match plan_uri("https://0x7f000001/") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(uri, "https://127.0.0.1/");
+            }
+            other => panic!("{other:?}"),
+        }
+        match plan_uri("https://0X7F.1/") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(uri, "https://127.0.0.1/");
+            }
+            other => panic!("{other:?}"),
+        }
+        match plan_uri("https://0x/") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "0.0.0.0");
+                assert_eq!(uri, "https://0.0.0.0/");
+            }
+            other => panic!("{other:?}"),
+        }
+        let overflow_hex = format!("https://0x{}/", "f".repeat(40));
+        let overflow_oct = format!("https://0{}/", "7".repeat(50));
+        for uri in [
+            "https://1.256.1.1/",
+            "https://1.1.1.256/",
+            "https://1.2.3.4.0/",
+            overflow_hex.as_str(),
+            overflow_oct.as_str(),
+        ] {
+            match plan_uri(uri) {
+                Action::Refuse {
+                    reason: RefuseReason::Scheme,
+                    ..
+                } => {}
+                Action::Browse(opened) => panic!("{uri} opened as a name {opened}"),
+                Action::Confirm { uri: opened, host } => {
+                    panic!("{uri} card {host} opened {opened}")
+                }
+                other => panic!("{uri} -> {other:?}"),
+            }
+        }
     }
 }

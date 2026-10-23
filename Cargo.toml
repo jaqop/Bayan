@@ -51,7 +51,13 @@ lto = "thin"
 # alacritty_terminal 0.26.0's push_keyboard_mode evicts from title_stack and
 # panics at depth 4096. This commit fixes that removal to use the keyboard
 # stack (alacritty#9071).
-# TODO: remove [patch.crates-io] and go back to the crates.io release once
+# TODO: remove the alacritty pin and go back to the crates.io release once
 # alacritty_terminal 0.26.1 is published.
+#
+# cosmic-text 0.19.0 always passes None into BidiInfo, so the status bar
+# cannot force a paragraph level. Direction::LeftToRight landed in 5631bfb
+# (fix 4fe1195) and is not in a crates.io release. FontSystem::new is the
+# same call; the on-disk font cache in that range is opt-in.
 [patch.crates-io]
 alacritty_terminal = { git = "https://github.com/alacritty/alacritty", rev = "542147067dd016fc5f49120ef0ba605a98a4e3a7" }
+cosmic-text = { git = "https://github.com/pop-os/cosmic-text", rev = "4fe1195e6451d6aaa3dc383895d6fd366ea9fc7b" }
