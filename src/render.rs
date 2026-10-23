@@ -805,6 +805,15 @@ pub struct Renderer {
     pub cell_h: f32,
 }
 
+/// Copy for the paste-confirm card. Grouped so `draw_paste_guard` stays
+/// under clippy's argument limit.
+pub struct PasteCard<'a> {
+    pub lines: usize,
+    pub chars: usize,
+    pub reason: &'a str,
+    pub preview: &'a str,
+}
+
 impl Renderer {
     /// `extra_pts` is the live Ctrl+wheel zoom delta on top of the
     /// configured base size.
@@ -2170,7 +2179,7 @@ impl Renderer {
     /// `reason` says why (Enter, controls, not at a prompt). `preview` is the
     /// text with controls drawn as visible symbols — the card used to hide it.
     pub fn draw_paste_guard(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
-                            lines: usize, chars: usize, reason: &str, preview: &str) {
+                            card: &PasteCard<'_>) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
         // heavier dim than the close guard: this card lands on top of whatever
         // the user was reading, and a thin strip over dense text reads as a
@@ -2187,15 +2196,15 @@ impl Renderer {
         push_rect(out, whole, x, y, w, 3, c4((0xf2, 0xcc, 0x60), 255)); // warn accent
 
         let title = [Seg {
-            text: format!("لصق {} ({})؟", arabic_lines(lines), arabic_chars(chars)),
+            text: format!("لصق {} ({})؟", arabic_lines(card.lines), arabic_chars(card.chars)),
             fg: self.fg,
             style: ST_BOLD,
         }];
         self.draw_run(&title, true, out, whole, (x + pad) as f32, y + pad, 1.0);
-        let why = [Seg::plain(reason, (0xf2, 0xcc, 0x60))];
+        let why = [Seg::plain(card.reason, (0xf2, 0xcc, 0x60))];
         self.draw_run(&why, true, out, whole, (x + pad) as f32,
                       y + pad + self.cell_h as i32, 1.0);
-        let shown = [Seg::plain(preview, (0xc5, 0xcd, 0xd6))];
+        let shown = [Seg::plain(card.preview, (0xc5, 0xcd, 0xd6))];
         self.draw_run(&shown, true, out, whole, (x + pad) as f32,
                       y + pad + (self.cell_h * 2.0) as i32, 1.0);
         let keys = [Seg::plain("Enter تأكيد   ·   Esc إلغاء", (0x9a, 0xa4, 0xb2))];

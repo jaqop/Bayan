@@ -20,7 +20,7 @@ selection and BiDi paths must do.
 | `config.rs` | `~/.bayan/config.json`, optional and BOM-tolerant |
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 
-93 tests across the tree. `term.rs` (26) and `render.rs` (19) carry the most.
+96 tests across the tree. `term.rs` (28) and `render.rs` (19) carry the most.
 
 ## Invariants — do not "simplify" these
 

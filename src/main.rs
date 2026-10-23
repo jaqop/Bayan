@@ -1271,7 +1271,8 @@ impl App {
         let Some(tab) = self.tabs.get(self.active) else {
             return false;
         };
-        tab.panes.get(tab.focused).is_some_and(|p| p.id == id)
+        let ids: Vec<u64> = tab.panes.iter().map(|p| p.id).collect();
+        crate::osc52_pane_is_focused(&[(tab.focused, ids.as_slice())], 0, id)
     }
 
     /// (tab index, pane index) for a pane id, wherever it lives.
@@ -2021,10 +2022,12 @@ impl App {
                         &mut verts,
                         px.width as usize,
                         px.height as usize,
-                        p.lines,
-                        p.chars,
-                        &p.reason,
-                        &preview,
+                        &render::PasteCard {
+                            lines: p.lines,
+                            chars: p.chars,
+                            reason: &p.reason,
+                            preview: &preview,
+                        },
                     );
                 }
                 if let Some((rows, sel, capturing, flash)) = &shortcuts_view {
@@ -2453,7 +2456,7 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 let (arg, mode, at_prompt) = decision;
                 let alt = mode.contains(TermMode::ALT_SCREEN);
-                if term::drop_needs_confirm(alt, at_prompt) {
+                if term::drop_needs_confirm(alt, at_prompt, &arg) {
                     let why = if alt {
                         term::PasteRisk::AltScreen
                     } else {
@@ -3005,10 +3008,32 @@ fn main() {
     event_loop.run_app(&mut app).expect("run event loop");
 }
 
+/// OSC 52 writes only from the focused pane of the active tab.
+/// `tabs` is `(focused index, pane ids)` per tab. A background tab's pane
+/// is not the focused slot of `active`, so it does not match.
+fn osc52_pane_is_focused(tabs: &[(usize, &[u64])], active: usize, source: u64) -> bool {
+    let Some((focused, panes)) = tabs.get(active) else {
+        return false;
+    };
+    panes.get(*focused) == Some(&source)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn osc52_pane_is_focused() {
+        // active tab's focused pane is index 1 (id 20). Id 10 is the other split.
+        let tabs: [(usize, &[u64]); 2] = [(1, &[10, 20]), (0, &[30])];
+        assert!(super::osc52_pane_is_focused(&tabs, 0, 20));
+        assert!(!super::osc52_pane_is_focused(&tabs, 0, 10), "unfocused split");
+        assert!(!super::osc52_pane_is_focused(&tabs, 0, 30), "background tab");
+        assert!(!super::osc52_pane_is_focused(&tabs, 5, 20), "no such tab");
+        let past_end: [(usize, &[u64]); 1] = [(3, &[1])];
+        assert!(!super::osc52_pane_is_focused(&past_end, 0, 1), "focused index past the end");
+    }
 
     #[test]
     fn split_rects_divide_by_weight() {

@@ -19,7 +19,8 @@ use crate::UserEvent;
 pub const DEFAULT_SHELL: &str = "powershell.exe";
 const MAX_CARRY: usize = 4096;
 /// Bytes one PTY `read` pulls. Named so the OSC 52 transport bound and the
-/// reader share it. See [`osc52_transport_room`].
+/// reader share it. A terminated OSC 52 in one read is about 48 KiB, or
+/// about 51 KiB when the opener is still inside [`MAX_CARRY`].
 const PTY_READ: usize = 64 * 1024;
 
 /// Shells the settings panel offers. Delegates to `shells::detect`, which
@@ -241,15 +242,16 @@ fn find_osc133(data: &[u8]) -> Vec<(usize, usize, u8, Option<i32>)> {
 /// The reader pulls [`PTY_READ`] (64 KiB). [`incomplete_tail_start`] only
 /// carries an OSC whose ESC still sits in the last [`MAX_CARRY`] (4 KiB)
 /// bytes, so a *terminated* sequence has to fit in one scan buffer. For the
-/// shortest opener `\x1b]52;c;` (7) plus a BEL (1), [`osc52_transport_room`]
-/// is 49146 bytes on one read (~48 KiB) and 52218 bytes when that opener is
-/// still inside the carry (~51 KiB). This 64 KiB constant is only the ceiling
-/// `scan_osc52` enforces once the bytes are already in one buffer.
+/// shortest opener `\x1b]52;c;` (7) plus a BEL (1), that is 49146 bytes on
+/// one read (~48 KiB) and 52218 bytes when that opener is still inside the
+/// carry (~51 KiB). This 64 KiB constant is only the ceiling `scan_osc52`
+/// enforces once the bytes are already in one buffer.
 pub(crate) const OSC52_MAX_BYTES: usize = 64 * 1024;
 
 /// Decoded bytes a terminated `OSC 52 ; c ; … BEL` can occupy in a scan of
 /// `scan_len` bytes. The selection field `c` is the shortest one; a longer
-/// field leaves even less room.
+/// field leaves even less room. Test-only: the reader never calls it.
+#[cfg(test)]
 fn osc52_transport_room(scan_len: usize) -> usize {
     const WRAP: usize = 7 + 1; // ESC ] 5 2 ; c ;  + BEL
     (scan_len.saturating_sub(WRAP) / 4) * 3
@@ -928,11 +930,31 @@ fn is_line_break(c: char) -> bool {
 /// Format characters that reorder or hide text. They are not controls, so
 /// `is_control` misses them, and a confirm card that draws them raw can be
 /// made to say the opposite of the bytes that would be sent.
+///
+/// ZWJ (U+200D) and ZWNJ (U+200C) stay: Arabic and Persian need them.
 fn is_paste_spoof(c: char) -> bool {
-    matches!(
-        c,
-        '\u{202E}' | '\u{2066}' | '\u{2067}' | '\u{2068}' | '\u{2069}' | '\u{200B}' | '\u{FEFF}'
-    )
+    paste_spoof_label(c).is_some()
+}
+
+fn paste_spoof_label(c: char) -> Option<&'static str> {
+    Some(match c {
+        '\u{061C}' => "<ALM>",
+        '\u{200B}' => "<ZWSP>",
+        '\u{200E}' => "<LRM>",
+        '\u{200F}' => "<RLM>",
+        '\u{202A}' => "<LRE>",
+        '\u{202B}' => "<RLE>",
+        '\u{202C}' => "<PDF>",
+        '\u{202D}' => "<LRO>",
+        '\u{202E}' => "<RLO>",
+        '\u{2060}' => "<WJ>",
+        '\u{2066}' => "<LRI>",
+        '\u{2067}' => "<RLI>",
+        '\u{2068}' => "<FSI>",
+        '\u{2069}' => "<PDI>",
+        '\u{FEFF}' => "<BOM>",
+        _ => return None,
+    })
 }
 
 /// Which quoting rules a spawned command line needs. Unknown programs follow
@@ -943,6 +965,8 @@ enum ShellFamily {
     Cmd,
     Posix,
     Fish,
+    /// Nushell raw strings. Not PowerShell: `'` is not the quote character.
+    Nu,
 }
 
 fn shell_family(shell: &str) -> ShellFamily {
@@ -957,6 +981,7 @@ fn shell_family(shell: &str) -> ShellFamily {
         "powershell" | "pwsh" => ShellFamily::PowerShell,
         "cmd" => ShellFamily::Cmd,
         "fish" => ShellFamily::Fish,
+        "nu" => ShellFamily::Nu,
         "bash" | "sh" | "zsh" | "wsl" | "dash" => ShellFamily::Posix,
         // `git-bash.exe` is bash. Matching the substring "bash" would also
         // catch `notbash`, so the hyphen is part of the rule.
@@ -986,15 +1011,24 @@ fn powershell_escape_single(s: &str) -> String {
     out
 }
 
-/// Fish single quotes are literal except `\'` and `\\`. The bash `'\''` dance
-/// is a syntax error there. A trailing backslash would escape the closer, so
-/// a drive root becomes `C:\.` (same directory, quote stays closed).
+/// Fish single quotes are literal except `\'` and `\\`. Escape `\` first,
+/// then `'`. The other order turns `C:\d\';calc;#.txt` into
+/// `'C:\d\\';calc;#.txt'`: fish collapses `\\` to one backslash, the quote
+/// closes, and `;calc` runs. A doubled trailing backslash also keeps a drive
+/// root (`C:\`) from escaping the closer, so the path is not rewritten to `C:\.`.
 fn quote_fish(p: &str) -> String {
-    let mut body = p.replace('\'', r"\'");
-    if body.ends_with('\\') {
-        body.push('.');
+    p.replace('\\', r"\\").replace('\'', r"\'")
+}
+
+/// Nushell raw string. The hash run is one longer than any `'#…` already in
+/// the path, so the content cannot close the literal.
+fn quote_nu(p: &str) -> String {
+    let mut n = 1usize;
+    while p.contains(&format!("'{}", "#".repeat(n))) {
+        n += 1;
     }
-    body
+    let h = "#".repeat(n);
+    format!("r{h}'{p}'{h}")
 }
 
 /// A file dropped onto a pane, quoted as a literal for `shell`, plus a trailing
@@ -1005,8 +1039,9 @@ fn quote_fish(p: &str) -> String {
 /// quotes U+2018..=U+201B, which PowerShell treats as `'` too. Each is
 /// doubled. cmd double quotes stop `&` from being a separator, but `%` and
 /// `!` still expand, so a name containing either is refused. Git Bash and
-/// WSL take POSIX single quotes (`'` → `'\''`). fish takes `\'` inside one
-/// pair of single quotes; `git-bash.exe` is bash, not PowerShell.
+/// WSL take POSIX single quotes (`'` → `'\''`). fish doubles `\` and then
+/// escapes `'`. nushell takes a raw string (`r#'…'#`). `git-bash.exe` is
+/// bash, not PowerShell.
 pub fn dropped_path_arg(path: &std::path::Path, shell: &str) -> Option<String> {
     let raw = path.to_string_lossy();
     if raw.chars().any(|c| c.is_control()) {
@@ -1023,6 +1058,7 @@ pub fn dropped_path_arg(path: &std::path::Path, shell: &str) -> Option<String> {
         ShellFamily::PowerShell => format!("'{}'", powershell_escape_single(&p)),
         ShellFamily::Posix => format!("'{}'", p.replace('\'', r"'\''")),
         ShellFamily::Fish => format!("'{}'", quote_fish(&p)),
+        ShellFamily::Nu => quote_nu(&p),
         ShellFamily::Cmd => {
             // `%VAR%` and delayed-expansion `!VAR!` survive double quotes.
             // `"` cannot occur in a Windows filename; if it did, it would
@@ -1086,11 +1122,14 @@ pub fn normalize_paste(text: &str, bracketed: bool) -> String {
     }
 }
 
-/// A drop is typed straight in only at a cooked shell prompt. The alternate
-/// screen (vim, less) and a shell that has not reported OSC 133 B — cmd
-/// inside PowerShell never does — go through the confirm card.
-pub fn drop_needs_confirm(alt_screen: bool, at_prompt: bool) -> bool {
-    alt_screen || !at_prompt
+/// A drop is typed straight in only at a cooked shell prompt whose text does
+/// not itself need the paste guard. The alternate screen (vim, less), a shell
+/// that has not reported OSC 133 B (cmd inside PowerShell never does), and a
+/// name containing a bidi override or a zero-width character go through the
+/// confirm card. Those format characters are not controls, so quoting keeps
+/// them, and `normalize_paste` would otherwise strip them with no card.
+pub fn drop_needs_confirm(alt_screen: bool, at_prompt: bool, text: &str) -> bool {
+    alt_screen || !at_prompt || needs_paste_guard(text).is_some()
 }
 
 /// The confirm card's one-line preview. Controls become the visible pictures
@@ -1113,14 +1152,10 @@ pub fn paste_preview(text: &str, max_chars: usize) -> String {
 }
 
 fn paste_preview_char(c: char) -> String {
+    if let Some(label) = paste_spoof_label(c) {
+        return label.to_string();
+    }
     match c {
-        '\u{202E}' => "<RLO>".to_string(),
-        '\u{2066}' => "<LRI>".to_string(),
-        '\u{2067}' => "<RLI>".to_string(),
-        '\u{2068}' => "<FSI>".to_string(),
-        '\u{2069}' => "<PDI>".to_string(),
-        '\u{200B}' => "<ZWSP>".to_string(),
-        '\u{FEFF}' => "<BOM>".to_string(),
         // C0 control pictures: U+2400 + code. CR is ␍, ESC is ␛, LF is ␊, tab is ␉.
         c if (c as u32) <= 0x1F => char::from_u32(0x2400 + c as u32).unwrap().to_string(),
         '\u{007F}' => "\u{2421}".to_string(),
@@ -1233,23 +1268,38 @@ mod tests {
         assert!(needs_paste_guard(&"x".repeat(2001)).is_some());
     }
 
-    /// U+202E and the isolates reorder the card; ZWSP and BOM hide a character.
-    /// None of them is `is_control`. A confirmed paste must not send them.
+    /// Overrides and zero-width characters are not `is_control`. A confirmed
+    /// paste must not send them. ZWJ and ZWNJ are the exception: shaping needs them.
     #[test]
     fn paste_guard_flags_bidi_overrides_and_zero_width() {
-        for c in ['\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{200B}', '\u{FEFF}'] {
+        for (c, label) in [
+            ('\u{061C}', "<ALM>"),
+            ('\u{200B}', "<ZWSP>"),
+            ('\u{200E}', "<LRM>"),
+            ('\u{200F}', "<RLM>"),
+            ('\u{202A}', "<LRE>"),
+            ('\u{202B}', "<RLE>"),
+            ('\u{202C}', "<PDF>"),
+            ('\u{202D}', "<LRO>"),
+            ('\u{202E}', "<RLO>"),
+            ('\u{2060}', "<WJ>"),
+            ('\u{2066}', "<LRI>"),
+            ('\u{2067}', "<RLI>"),
+            ('\u{2068}', "<FSI>"),
+            ('\u{2069}', "<PDI>"),
+            ('\u{FEFF}', "<BOM>"),
+        ] {
             let text = format!("ab{c}cd");
             assert_eq!(
                 needs_paste_guard(&text).map(|g| g.risk),
                 Some(PasteRisk::Control),
-                "{c:?} must confirm"
+                "{label} must confirm"
             );
             assert_eq!(normalize_paste(&text, false), "abcd");
+            assert_eq!(paste_preview(&text, 48), format!("ab{label}cd"));
         }
-        assert_eq!(paste_preview("ab\u{202E}cd", 48), "ab<RLO>cd");
-        assert_eq!(paste_preview("ab\u{200B}cd", 48), "ab<ZWSP>cd");
-        assert_eq!(paste_preview("ab\u{FEFF}cd", 48), "ab<BOM>cd");
-        assert_eq!(paste_preview("a\u{2066}b\u{2067}c\u{2068}d\u{2069}", 48), "a<LRI>b<RLI>c<FSI>d<PDI>");
+        assert_eq!(needs_paste_guard("a\u{200D}b\u{200C}c"), None, "ZWJ and ZWNJ stay");
+        assert_eq!(normalize_paste("a\u{200D}b\u{200C}c", false), "a\u{200D}b\u{200C}c");
     }
 
     #[test]
@@ -1323,7 +1373,7 @@ mod tests {
         );
         // an unknown program follows PowerShell quoting, not "no quotes"
         assert_eq!(
-            dropped_path_arg(Path::new(r"C:\tmp\$(calc).txt"), "nu.exe").as_deref(),
+            dropped_path_arg(Path::new(r"C:\tmp\$(calc).txt"), "elvish.exe").as_deref(),
             Some(r"'C:\tmp\$(calc).txt' ")
         );
         // CR/LF in a name would be Enter. Refuse for every shell.
@@ -1344,12 +1394,11 @@ mod tests {
             dropped_path_arg(Path::new(name), "powershell.exe").as_deref(),
             Some(doubled)
         );
-        assert_eq!(dropped_path_arg(Path::new(name), "nu.exe").as_deref(), Some(doubled));
         let mixed = format!(
             "C:\\tmp\\{}a{}b{}c{}.txt",
             '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'
         );
-        for shell in ["powershell.exe", "pwsh.exe", "nu.exe"] {
+        for shell in ["powershell.exe", "pwsh.exe", "elvish.exe"] {
             let q = dropped_path_arg(Path::new(&mixed), shell).unwrap();
             for cp in ['\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'] {
                 assert_eq!(
@@ -1382,11 +1431,73 @@ mod tests {
         );
         assert_eq!(
             dropped_path_arg(Path::new(r"C:\o'brien.txt"), "fish.exe").as_deref(),
-            Some(r"'C:\o\'brien.txt' ")
+            Some(r"'C:\\o\'brien.txt' ")
         );
         assert_eq!(
             dropped_path_arg(Path::new(r"C:\"), "fish.exe").as_deref(),
-            Some(r"'C:\.' ")
+            Some(r"'C:\\' ")
+        );
+    }
+
+    /// Fish collapses `\\` inside single quotes. Escaping the apostrophe
+    /// first makes `C:\d\';calc;#.txt` close the quote and run `calc`.
+    #[test]
+    fn fish_doubles_backslash_before_escaping_quote() {
+        use std::path::Path;
+        let attack = "C:\\d\\';calc;#.txt";
+        let quoted = dropped_path_arg(Path::new(attack), "fish.exe").unwrap();
+        assert_eq!(quoted, r"'C:\\d\\\';calc;#.txt' ");
+        assert_eq!(fish_single_quote_value(&quoted), attack);
+        // neighbours: apostrophe with no slash in front of it, a plain path,
+        // and a drive root (the old `C:\.` rewrite is gone)
+        for path in [r"C:\o'brien.txt", r"C:\tmp\file.txt", r"C:\"] {
+            let q = dropped_path_arg(Path::new(path), "fish.exe").unwrap();
+            assert_eq!(fish_single_quote_value(&q), path, "{q}");
+        }
+    }
+
+    /// What fish single quotes mean: `\\` is one backslash, `\'` is one quote,
+    /// and a bare `'` would have closed the literal.
+    fn fish_single_quote_value(typed: &str) -> String {
+        let s = typed.trim();
+        assert!(s.starts_with('\'') && s.ends_with('\''), "{typed}");
+        let body = &s[1..s.len() - 1];
+        let mut out = String::new();
+        let mut it = body.chars();
+        while let Some(c) = it.next() {
+            if c == '\\' {
+                out.push(it.next().expect("dangling fish escape"));
+            } else {
+                assert_ne!(c, '\'', "quote closed early in {typed}");
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// nushell raw strings, with enough `#` that a `'#` in the name cannot close it.
+    #[test]
+    fn nu_quotes_with_a_raw_string() {
+        use std::path::Path;
+        assert_eq!(shell_family("nu.exe"), ShellFamily::Nu);
+        assert_eq!(shell_family(r"C:\Program Files\nu\nu.exe"), ShellFamily::Nu);
+        assert_eq!(
+            dropped_path_arg(Path::new(r"C:\tmp\$(calc).txt"), "nu.exe").as_deref(),
+            Some(r"r#'C:\tmp\$(calc).txt'# ")
+        );
+        let smart = "C:\\tmp\\a\u{2019};calc;\u{2019}.txt";
+        assert_eq!(
+            dropped_path_arg(Path::new(smart), "nu.exe").as_deref(),
+            Some("r#'C:\\tmp\\a\u{2019};calc;\u{2019}.txt'# ")
+        );
+        // one hash would end the literal at `'#`
+        assert_eq!(
+            dropped_path_arg(Path::new(r"C:\a'#calc.txt"), "nu.exe").as_deref(),
+            Some(r"r##'C:\a'#calc.txt'## ")
+        );
+        assert_eq!(
+            dropped_path_arg(Path::new(r"C:\o'brien.txt"), "nu.exe").as_deref(),
+            Some(r"r#'C:\o'brien.txt'# ")
         );
     }
 
@@ -1395,9 +1506,17 @@ mod tests {
     #[test]
     fn drop_off_prompt_confirms_and_bracketed_wraps() {
         use std::path::Path;
-        assert!(drop_needs_confirm(true, true), "alt screen, even at a prompt mark");
-        assert!(drop_needs_confirm(false, false), "no OSC 133 B");
-        assert!(!drop_needs_confirm(false, true), "cooked prompt types immediately");
+        assert!(drop_needs_confirm(true, true, "safe"), "alt screen, even at a prompt mark");
+        assert!(drop_needs_confirm(false, false, "safe"), "no OSC 133 B");
+        assert!(!drop_needs_confirm(false, true, r"'C:\safe.txt' "), "cooked prompt types immediately");
+        // RLO / ZWSP in the name would be stripped on the way to the shell
+        // with no card. A prompt does not make that silent.
+        let rlo = dropped_path_arg(Path::new("C:\\d\\a\u{202E}b.txt"), "powershell.exe").unwrap();
+        assert!(drop_needs_confirm(false, true, &rlo), "RLO at the prompt still confirms");
+        let zwsp = dropped_path_arg(Path::new("C:\\d\\a\u{200B}b.txt"), "cmd.exe").unwrap();
+        assert!(drop_needs_confirm(false, true, &zwsp));
+        let zwj = dropped_path_arg(Path::new("C:\\d\\a\u{200D}b.txt"), "powershell.exe").unwrap();
+        assert!(!drop_needs_confirm(false, true, &zwj), "ZWJ is part of the name");
         let arg = dropped_path_arg(Path::new(r"C:\tmp\a&calc.exe"), "powershell.exe").unwrap();
         let wrapped = normalize_paste(&arg, true);
         assert!(wrapped.starts_with("\x1b[200~"), "{wrapped:?}");

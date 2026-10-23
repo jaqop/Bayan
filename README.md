@@ -241,8 +241,10 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       OSC 9;9 or `session.json` is dropped before `is_dir` can open SMB. A
       dropped file is quoted for the shell that pane was spawned with
       (PowerShell single quotes, including the smart quotes, cmd double
-      quotes, POSIX single quotes for Git Bash and WSL, fish `\'`), and a
-      drop into vim, less, or a shell that is not at its prompt asks first.
+      quotes, POSIX single quotes for Git Bash and WSL, fish with `\`
+      doubled before the apostrophe, a nushell raw string), and a
+      drop into vim, less, a shell that is not at its prompt, or a name
+      with a bidi override asks first.
       Proven by the unit tests named in the audit; not exercised here as a
       live window.
 
