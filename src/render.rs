@@ -979,6 +979,16 @@ pub struct PasteCard<'a> {
     pub preview: &'a str,
 }
 
+/// Hint under the command palette. The number is the filtered list the
+/// caller is about to draw and index, not a fixed action count.
+pub(crate) fn palette_hint(count: usize) -> String {
+    if count == 0 {
+        "لا نتائج · Esc إغلاق".to_string()
+    } else {
+        format!("{count} نتيجة · Enter تشغيل · ↑↓ تنقّل · Esc إغلاق")
+    }
+}
+
 impl Renderer {
     /// `extra_pts` is the live Ctrl+wheel zoom delta on top of the
     /// configured base size.
@@ -2351,11 +2361,7 @@ impl Renderer {
             self.draw_run(&seg, true, out, whole, (x + 18) as f32, ry, 1.0);
         }
 
-        let hint = if rows.is_empty() {
-            "لا نتائج · Esc إغلاق".to_string()
-        } else {
-            format!("{} نتيجة · Enter تشغيل · ↑↓ تنقّل · Esc إغلاق", rows.len())
-        };
+        let hint = palette_hint(rows.len());
         let l = [Seg::plain(hint, (0x6e, 0x78, 0x85))];
         self.draw_run(&l, true, out, whole, (x + 14) as f32,
                       y + h - self.cell_h as i32 - 8, 1.0);

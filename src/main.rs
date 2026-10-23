@@ -15,6 +15,7 @@ mod config;
 mod gpu;
 mod keybinds;
 mod keys;
+mod kitty;
 mod link;
 mod mouse;
 mod toast;
@@ -530,6 +531,12 @@ struct App {
     font_delta: f32,
     renderer_building: bool,
     inflight_delta: f32,
+    /// Physical keys whose press never reached the PTY. The matching release
+    /// must not either: a TUI that asked for key-up events would otherwise
+    /// see a release whose press it never got. Copy clears the selection
+    /// before the key comes up, and a chord can open a panel, so this is
+    /// recorded at press time rather than re-derived when the key is released.
+    keys_held_away: Vec<winit::keyboard::PhysicalKey>,
 }
 
 impl App {
@@ -937,6 +944,11 @@ impl App {
                 }
                 self.request_redraw();
             }
+            ResetKeyboard => {
+                if let Some(s) = self.session_mut() {
+                    s.reset_keyboard();
+                }
+            }
         }
     }
 
@@ -1322,9 +1334,15 @@ impl App {
     fn spawn_pane(&mut self, cwd: Option<&str>) -> Option<Pane> {
         let id = self.next_id;
         self.next_id += 1;
-        match Session::spawn(self.size, self.proxy.clone(), id, cwd,
-                             self.config.scrollback_lines(),
-                             &self.config.shell_program()) {
+        match Session::spawn(
+            self.size,
+            self.proxy.clone(),
+            id,
+            cwd,
+            self.config.scrollback_lines(),
+            &self.config.shell_program(),
+            self.config.kitty_protocol_on(),
+        ) {
             Ok(session) => Some(Pane { id, session, last_output: None }),
             Err(e) => {
                 eprintln!("bayan: spawn failed: {e}");
@@ -1618,6 +1636,51 @@ impl App {
     fn term_mode(&self) -> TermMode {
         self.session()
             .map_or(TermMode::empty(), |s| *s.term.lock().unwrap().mode())
+    }
+
+    fn note_held_away(&mut self, event: &KeyEvent) {
+        let key = event.physical_key;
+        if !self.keys_held_away.contains(&key) {
+            self.keys_held_away.push(key);
+        }
+    }
+
+    /// `true` when this key's press never reached the PTY.
+    fn take_held_away(&mut self, event: &KeyEvent) -> bool {
+        let key = event.physical_key;
+        if let Some(i) = self.keys_held_away.iter().position(|k| *k == key) {
+            self.keys_held_away.swap_remove(i);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn encode_key_event(&self, event: &KeyEvent, released: bool) -> Option<Vec<u8>> {
+        use winit::keyboard::PhysicalKey;
+        use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+        let m = self.modifiers;
+        let unmod = event.key_without_modifiers();
+        let physical = match event.physical_key {
+            PhysicalKey::Code(code) => Some(code),
+            _ => None,
+        };
+        keys::encode_input(&keys::EncodeInput {
+            key: &event.logical_key,
+            unmod: &unmod,
+            physical,
+            location: event.location,
+            text: event.text.as_deref(),
+            shift: m.shift_key(),
+            alt: m.alt_key(),
+            ctrl: m.control_key(),
+            super_key: m.super_key(),
+            repeat: event.repeat,
+            released,
+            mode: keys::mode_for_keys(self.term_mode(), self.config.kitty_protocol_on()),
+            physical_letter: key_letter(event),
+            base_layout_fallback: self.config.kitty_base_layout_fallback_on(),
+        })
     }
 
     /// Claude mode: auto = a full-screen TUI is active AND the command that
@@ -3002,6 +3065,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(f) => {
                 self.focused = f;
+                // A blur drops keys we were holding back. The matching
+                // release may never arrive (the user alt-tabbed mid-chord),
+                // and a later focus must not swallow an unrelated press.
+                blur_forgets_held_keys(f, &mut self.keys_held_away);
                 if f {
                     // you're here now: the active tab's attention is served
                     if let Some(t) = self.tabs.get_mut(self.active) {
@@ -3379,6 +3446,10 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed =>
             {
+                // Assume the press is swallowed until bytes actually go out.
+                // Every early return above the write leaves the key here, so
+                // its release stays out of the PTY too.
+                self.note_held_away(&event);
                 let m = self.modifiers;
                 let (ctrl, shift, alt) = (m.control_key(), m.shift_key(), m.alt_key());
                 crate::prof::mark(&format!(
@@ -3580,20 +3651,18 @@ impl ApplicationHandler<UserEvent> for App {
                         _ => {}
                     }
                 }
-                let text = event.text.as_ref().map(|t| t.as_str());
-                // Ctrl+letter resolves by PHYSICAL key so the control byte is
-                // right on any layout (Arabic: Ctrl+C must interrupt even
-                // though the C key's logical char is "ؤ")
-                let bytes = if ctrl && !alt {
-                    key_letter(&event).map(|l| vec![l as u8 - b'a' + 1])
-                } else {
-                    None
-                }
-                .or_else(|| keys::encode(key, text, shift, alt, ctrl));
+                // Legacy Ctrl+letter still resolves by PHYSICAL key inside
+                // encode_input (Arabic: Ctrl+C interrupts even though the C
+                // key's logical char is "ؤ"). A child that pushed kitty
+                // flags gets CSI u instead, from the same call.
+                let bytes = self.encode_key_event(&event, false);
                 if let Some(bytes) = bytes {
                     // typing snaps to the bottom and clears any selection;
                     // it also restarts the blink window, cursor visible
                     self.last_input = Instant::now();
+                    // The press reached the encoder. Drop it from the
+                    // swallowed set before borrowing the session.
+                    self.take_held_away(&event);
                     if let Some(s) = self.session_mut() {
                         {
                             let mut t = s.term.lock().unwrap();
@@ -3605,9 +3674,34 @@ impl ApplicationHandler<UserEvent> for App {
                     self.invalidate_focused_links();
                 }
             }
+            // Key-up is invisible until the child asks for event types.
+            // Presses still own every shortcut above; a release only
+            // reports, and only when the press itself reached the PTY.
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Released =>
+            {
+                let held_away = self.take_held_away(&event);
+                if held_away || !self.term_mode().contains(TermMode::REPORT_EVENT_TYPES) {
+                    return;
+                }
+                if let Some(bytes) = self.encode_key_event(&event, true) {
+                    if let Some(s) = self.session_mut() {
+                        s.write(&bytes);
+                    }
+                }
+            }
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }
+    }
+}
+
+/// Focus loss forgets presses that never reached the PTY. The release
+/// often goes to whichever window is focused now, so the set would
+/// otherwise keep swallowing that physical key forever.
+fn blur_forgets_held_keys(focused: bool, held: &mut Vec<winit::keyboard::PhysicalKey>) {
+    if !focused {
+        held.clear();
     }
 }
 
@@ -3694,6 +3788,7 @@ fn main() {
         font_delta: 0.0,
         renderer_building: false,
         inflight_delta: 0.0,
+        keys_held_away: Vec::new(),
     };
     event_loop.run_app(&mut app).expect("run event loop");
 }
@@ -3712,6 +3807,18 @@ fn osc52_pane_is_focused(tabs: &[(usize, &[u64])], active: usize, source: u64) -
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn blur_drops_keys_whose_press_was_swallowed() {
+        use winit::keyboard::{KeyCode, PhysicalKey};
+        let key = PhysicalKey::Code(KeyCode::KeyC);
+        let mut held = vec![key];
+        blur_forgets_held_keys(false, &mut held);
+        assert!(held.is_empty());
+        held.push(key);
+        blur_forgets_held_keys(true, &mut held);
+        assert_eq!(held, vec![key]);
+    }
 
     #[test]
     fn osc52_pane_is_focused() {
@@ -3898,12 +4005,20 @@ mod palette_tests {
 
     #[test]
     fn the_hint_line_counts_what_the_list_shows() {
-        // guards the palette's one real invariant: the filtered list the user
-        // sees and the list Enter indexes into are the same list. They are
-        // built once in palette_rows and passed to the renderer, which never
-        // filters — so a drift here would be a logic error, not a redraw bug.
-        let all = keybinds::Action::ALL.len();
-        assert_eq!(all, 12, "12 built-in actions expected");
+        // The hint prints the length of the list Enter indexes into. That
+        // list is Action::ALL (plugins add to it at runtime). A literal
+        // count goes stale the moment an action is added.
+        let n = keybinds::Action::ALL.len();
+        assert_eq!(
+            render::palette_hint(n),
+            format!("{n} نتيجة · Enter تشغيل · ↑↓ تنقّل · Esc إغلاق"),
+        );
+        let extra = n + 1;
+        assert_eq!(
+            render::palette_hint(extra),
+            format!("{extra} نتيجة · Enter تشغيل · ↑↓ تنقّل · Esc إغلاق"),
+        );
+        assert_eq!(render::palette_hint(0), "لا نتائج · Esc إغلاق");
     }
 }
 
