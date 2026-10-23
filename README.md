@@ -247,7 +247,40 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       drop into vim, less, a shell that is not at its prompt, or a name
       with a bidi mark or override asks first.
       Proven by the unit tests named in the audit; not exercised here as a
-      live window.
+      live window
+- [x] **M30** — mouse reporting. Clicks, drags and motion reach the program
+      when it asks: xterm 1000 (press/release), 1002 (drag), 1003 (any
+      motion), encoded as SGR 1006 or the legacy X10 byte form when 1006
+      is off. X10 stops at coordinate 95: the wire byte is that plus 32,
+      and ConPTY's UTF-8 pipe turns 0x80 and above into U+FFFD, so a click
+      past column or row 95 is not reported. Mode 1005
+      is not encoded (no silent X10 fallback). Buttons numbered 128 and
+      up, and the horizontal wheel, are not reported. Coordinates are the
+      pane's cells — padding and split gaps
+      are not cells, and a click in the second pane is that pane's column
+      0. On a row Bayan reorders (the whole-line BiDi path), the column is
+      the glyph under the pointer, not `x / cell_w`: the left of مرحبا is
+      the last logical cell, and ١٧٥ is not mirrored. Claude rows go
+      through the same restoration as the painter, then the index map
+      points the glyph back at the grid column Claude stored. Shift+drag
+      stays a local selection, and Shift+wheel scrolls that pane's own
+      history even on the alt screen. A focus loss, a tab switch, opening
+      a new tab, or a pane close releases a tracked button (or drops the
+      grab if tracking is already off) so Alt+Tab cannot keep dragging.
+      The paste confirm card and the close card block the pointer too.
+      Mode 1004 sends CSI I / CSI O when the window or the focused pane
+      changes. A `Focused` event passes its own bit, because
+      `Window::has_focus` can still read true for a moment after blur
+      and would swallow CSI O; every other path asks `has_focus`, including
+      the moment the program turns the
+      mode on, and a RIS forgets the last CSI I so the next one is sent
+      again. The wheel still scrolls the pane under the pointer and is
+      not reported at all over the tab bar or the padding; Ctrl+wheel is
+      still font zoom. Proven on this branch before the security merge:
+      102 unit tests. Not proven here: a live htop /
+      vim `mouse=a` / lazygit / Claude Code session — this tree doesn't
+      run a window on the machine that built it. Windows CI is the build
+      that does.
 
 ## Settings
 
