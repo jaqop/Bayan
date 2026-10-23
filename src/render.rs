@@ -22,8 +22,8 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::Term;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 use cosmic_text::{
-    Align, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, SwashCache,
-    SwashContent, Weight, Wrap,
+    Align, Attrs, Buffer, Color, Direction, Family, FontSystem, Metrics, Shaping, Style,
+    SwashCache, SwashContent, Weight, Wrap,
 };
 
 use crate::bidi_ctl::{base_direction_mark, ParagraphDir};
@@ -633,9 +633,9 @@ pub struct PaneView<'a> {
     /// underline is drawn through the shaped boxes on an Arabic row, the
     /// same map a click uses.
     pub link_hover: Option<(usize, usize, usize)>,
-    /// Status text for that link (the URI, or the resolved path). Already
-    /// stripped of bidi controls.
-    pub link_tip: Option<&'a str>,
+    /// Status text for that link: scheme and host, then the path. The
+    /// drawer forces an LTR paragraph and isolates the path.
+    pub link_tip: Option<&'a crate::link::StatusParts>,
 }
 
 // translucent overlays, EasyTer's colors: selection blue, search amber
@@ -644,6 +644,22 @@ const SEARCH_RGBA: ((u8, u8, u8), u32) = ((240, 180, 40), 120);
 /// Hover underline for a hyperlink. Mint, so it sits in the palette
 /// instead of introducing a new blue the rest of the chrome doesn't use.
 const LINK_UNDER: (u8, u8, u8) = (0x58, 0xd1, 0xc0);
+
+/// The string the status bar shapes. The host is cut from the left only
+/// when it alone is wider than `columns`. The path is cut from the right,
+/// then wrapped in LRI…PDI so an RTL letter in it cannot pull the host.
+///
+/// Isolates are added here, not in the stored parts. `preview` already
+/// turned attacker-supplied bidi controls into markers; these two are the
+/// terminal's own, and they sit outside the host.
+fn status_line_text(parts: &crate::link::StatusParts, columns: usize) -> String {
+    let fitted = crate::link::fit_status_bar(parts, columns);
+    if fitted.rest.is_empty() {
+        fitted.host
+    } else {
+        format!("{}\u{2066}{}\u{2069}", fitted.host, fitted.rest)
+    }
+}
 
 pub(crate) fn is_arabic(c: char) -> bool {
     matches!(c as u32,
@@ -964,7 +980,7 @@ struct ShapedRun {
 }
 
 /// Cache key: the exact rich-text content (text + color + style) + alignment.
-type RunKey = (Vec<Seg>, bool);
+type RunKey = (Vec<Seg>, bool, bool);
 
 /// Generational cap: on overflow the hot map becomes the cold one and a
 /// fresh hot map starts — the working set survives, stale runs age out
@@ -1160,7 +1176,14 @@ impl Renderer {
     /// the same content nearly every frame, and shaping is the expensive
     /// part of the CPU renderer (the honest 80% of what wgpu would buy).
     fn ensure_shaped(&mut self, segs: &[Seg], align_left: bool) -> RunKey {
-        let key: RunKey = (segs.to_vec(), align_left);
+        self.ensure_shaped_dir(segs, align_left, false)
+    }
+
+    /// `force_ltr` passes [`Direction::LeftToRight`] into cosmic-text, so
+    /// `BidiInfo` gets paragraph level 0 instead of detecting it from the
+    /// first strong character. Terminal rows stay on auto.
+    fn ensure_shaped_dir(&mut self, segs: &[Seg], align_left: bool, force_ltr: bool) -> RunKey {
+        let key: RunKey = (segs.to_vec(), align_left, force_ltr);
         if self.cache_hot.contains_key(&key) {
             return key;
         }
@@ -1186,6 +1209,9 @@ impl Renderer {
         let mut buffer = Buffer::new(&mut self.font_system, self.metrics);
         buffer.set_wrap(Wrap::None);
         buffer.set_size(Some(1_000_000.0), Some(self.cell_h));
+        if force_ltr {
+            buffer.set_direction(Direction::LeftToRight);
+        }
         let align = if align_left { Some(Align::Left) } else { None };
         buffer.set_rich_text(rich, &base, Shaping::Advanced, align);
         buffer.shape_until_scroll(&mut self.font_system, false);
@@ -1726,21 +1752,52 @@ impl Renderer {
     /// moving cursor does not rebuild the quad set on every pixel. The
     /// text is the target (URI or resolved path), which is what makes a
     /// link whose label differs from its destination visible.
-    fn draw_link_status(&mut self, out: &mut Vec<Vertex>, rect: Rect, text: &str) {
+    fn draw_link_status(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        rect: Rect,
+        parts: &crate::link::StatusParts,
+    ) {
         let (px, py, pw, ph) = rect;
-        if pw < 8 || ph < 8 || text.is_empty() {
+        if pw < 8 || ph < 8 || (parts.host.is_empty() && parts.rest.is_empty()) {
             return;
         }
         let th = self.cell_h.round() as i32 + 4;
         let y = py + ph - th;
         push_rect(out, rect, px, y, pw, th, c4((0x0d, 0x11, 0x14), 235));
         push_rect(out, rect, px, y, pw, 1, c4(LINK_UNDER, 255));
-        // The host sits at the end of this string. Wider than the pane:
-        // drop characters from the left so that suffix stays on screen.
+        // Columns, not pixels: the host is kept whole unless it alone is
+        // wider than the pane, and the path is cut from the right. The
+        // line is then shaped LTR with the path isolated.
         let inner = (pw as f32 - 16.0).max(8.0);
-        let shown = self.elide_left(text, inner, LINK_UNDER);
-        let seg = [Seg::plain(shown, LINK_UNDER)];
-        self.draw_run(&seg, false, out, rect, (px + 8) as f32, y + 2, 1.0);
+        let cols = ((inner / self.cell_w).floor() as usize).max(1);
+        let text = status_line_text(parts, cols);
+        if text.is_empty() {
+            return;
+        }
+        let seg = [Seg::plain(text, LINK_UNDER)];
+        let key = self.ensure_shaped_dir(&seg, false, true);
+        let Renderer {
+            cache_hot,
+            font_system,
+            cache,
+            atlas,
+            fg,
+            ..
+        } = self;
+        let run = &cache_hot[&key];
+        push_shaped(
+            out,
+            font_system,
+            cache,
+            atlas,
+            &run.buffer,
+            rect,
+            (px + 8) as f32,
+            y + 2,
+            1.0,
+            *fg,
+        );
     }
 
     /// Cockpit panel geometry (shared with the app's click hit-test).
@@ -2909,6 +2966,57 @@ mod tests {
             first > last,
             "RTL mapping inverted: first logical char at x={first}, last at x={last}"
         );
+    }
+
+    /// A numeric host has no strong LTR character. One Hebrew or Arabic
+    /// letter in the path used to make the whole status line RTL, so
+    /// `github.com` drew on the left. The status line forces paragraph LTR
+    /// and isolates the path, so the host stays first.
+    #[test]
+    fn status_bar_shapes_ipv4_host_before_rtl_path() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let parts = crate::link::host_tooltip("https://1.2.3.4/א/github.com/ا/login");
+        let line = status_line_text(&parts, 80);
+        assert!(line.starts_with("https://1.2.3.4"), "{line}");
+        assert!(line.contains('\u{2066}') && line.contains('\u{2069}'), "{line}");
+        let key = r.ensure_shaped_dir(&[Seg::plain(line.clone(), FG)], false, true);
+        let buffer = &r.cache_hot[&key].buffer;
+        assert_eq!(buffer.is_rtl(0), Some(false));
+        let host_end = "https://1.2.3.4".len();
+        let git = line.find("github.com").expect("path tail");
+        let host_x = min_glyph_x(buffer, 0, host_end);
+        let git_x = min_glyph_x(buffer, git, git + "github.com".len());
+        assert!(
+            host_x < git_x,
+            "host x {host_x} is not left of github x {git_x}: {line}"
+        );
+
+        let raw = "1.2.3.4/א/github.com/ا/login";
+        let raw_key = r.ensure_shaped(&[Seg::plain(raw, FG)], false);
+        assert_eq!(
+            r.cache_hot[&raw_key].buffer.is_rtl(0),
+            Some(true),
+            "auto direction should still flip a numeric host"
+        );
+        // The scheme is a strong LTR letter. This line has none, so only the
+        // forced paragraph level keeps it LTR.
+        let forced = r.ensure_shaped_dir(&[Seg::plain("א/1.2.3.4", FG)], false, true);
+        assert_eq!(r.cache_hot[&forced].buffer.is_rtl(0), Some(false));
+        let auto = r.ensure_shaped(&[Seg::plain("א/1.2.3.4", FG)], false);
+        assert_eq!(r.cache_hot[&auto].buffer.is_rtl(0), Some(true));
+    }
+
+    fn min_glyph_x(buffer: &Buffer, start: usize, end: usize) -> f32 {
+        let mut best = f32::MAX;
+        for run in buffer.layout_runs() {
+            for g in run.glyphs {
+                if g.end > start && g.start < end {
+                    best = best.min(g.x);
+                }
+            }
+        }
+        assert!(best < f32::MAX, "no glyphs in {start}..{end}");
+        best
     }
 
     /// A click on the left of an RTL word is the last logical column, and

@@ -270,7 +270,7 @@ struct LinkHover {
     row: usize,
     start_col: usize,
     end_col: usize,
-    target: String,
+    target: link::StatusParts,
 }
 
 /// A Ctrl+click that was refused, or a userinfo URL waiting for Enter.
@@ -2627,7 +2627,7 @@ impl App {
                     let (link_hover, link_tip) = match &self.link_hover {
                         Some(h) if h.pane_id == pane.id => (
                             Some((h.row, h.start_col, h.end_col)),
-                            Some(h.target.as_str()),
+                            Some(&h.target),
                         ),
                         _ => (None, None),
                     };
