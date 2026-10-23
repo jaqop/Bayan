@@ -1,4 +1,4 @@
-﻿//! Bayan (بيان) — an Arabic-first, agent-ready terminal.
+//! Bayan (بيان) — an Arabic-first, agent-ready terminal.
 //!
 //! Milestone M1: one window, one PowerShell over ConPTY, correct Arabic
 //! shaping and BiDi from day one. Architecture mirrors EasyTer (Python/Qt),
@@ -15,6 +15,7 @@ mod config;
 mod gpu;
 mod keybinds;
 mod keys;
+mod mouse;
 mod toast;
 mod render;
 mod term;
@@ -242,6 +243,34 @@ pub enum UserEvent {
     Exit(u64),
 }
 
+/// Buttons captured for mouse reporting. A bit per button so a chord
+/// (left held, then right) releases the one that actually came up.
+#[derive(Clone, Copy)]
+struct MouseGrab {
+    pane_id: u64,
+    /// bit 0 left, bit 1 middle, bit 2 right
+    down: u8,
+}
+
+fn button_bit(button: mouse::Btn) -> u8 {
+    match button {
+        mouse::Btn::Left => 1,
+        mouse::Btn::Middle => 2,
+        mouse::Btn::Right => 4,
+        _ => 0,
+    }
+}
+
+fn grab_button(down: u8) -> mouse::Btn {
+    if down & 1 != 0 {
+        mouse::Btn::Left
+    } else if down & 2 != 0 {
+        mouse::Btn::Middle
+    } else {
+        mouse::Btn::Right
+    }
+}
+
 /// One terminal pane (a tab holds one or more).
 struct Pane {
     id: u64,
@@ -448,6 +477,15 @@ struct App {
     last_frame: Vec<u8>,
     cursor_pos: PhysicalPosition<f64>,
     mouse_left_down: bool,
+    /// button held for a mouse-report drag (1002/1003). Absent while a
+    /// Shift+drag is a local selection — that gesture stays on
+    /// `mouse_left_down` and never reaches the program.
+    mouse_grab: Option<MouseGrab>,
+    /// last cell we reported, so motion doesn't write a byte per pixel
+    mouse_last: Option<(u64, usize, usize)>,
+    /// pane we last sent focus-in (CSI I) to. None means the program was
+    /// told it is blurred, or it never asked (mode 1004).
+    focus_sent: Option<u64>,
     /// the pane a mouse selection started in (drags don't cross panes)
     sel_pane: usize,
     /// divider being dragged (between pane i and i+1)
@@ -1296,6 +1334,7 @@ impl App {
             });
             self.active = self.tabs.len() - 1;
             self.relayout_active();
+            self.sync_focus();
         }
     }
 
@@ -1414,6 +1453,7 @@ impl App {
             t.focused = t.panes.len() - 1;
         }
         self.relayout_active();
+        self.sync_focus();
         self.request_redraw();
     }
 
@@ -1442,6 +1482,7 @@ impl App {
         }
         self.relayout_active();
         self.update_title();
+        self.sync_focus();
         self.request_redraw();
     }
 
@@ -1456,6 +1497,7 @@ impl App {
         self.search = None; // the bar belongs to the tab that opened it
         self.relayout_active(); // this tab's layout may differ
         self.update_title();
+        self.sync_focus();
         self.request_redraw();
     }
 
@@ -1560,29 +1602,306 @@ impl App {
     }
 
     /// Pixel position -> (pane index, viewport row, col, cell side).
-    /// None inside the tab bar (that region belongs to tab switching).
+    /// None inside the tab bar, the padding, or a divider gap.
     fn pane_cell_at(&self, pos: PhysicalPosition<f64>) -> Option<(usize, usize, usize, Side)> {
         let r = self.renderer.as_ref()?;
-        let rects = self.pane_rects();
-        let (pi, rect) = rects.iter().enumerate().find(|(_, (x, y, w, h))| {
-            pos.x >= *x as f64
-                && pos.x < (*x + *w) as f64
-                && pos.y >= *y as f64
-                && pos.y < (*y + *h) as f64
-        })?;
-        let (rx, ry, rw, rh) = *rect;
-        let lx = pos.x - rx as f64;
-        let ly = pos.y - ry as f64;
-        let max_col = ((rw as f32 / r.cell_w) as usize).max(1) - 1;
-        let max_row = ((rh as f32 / r.cell_h) as usize).max(1) - 1;
-        let colf = lx / r.cell_w as f64;
-        let col = (colf.floor().max(0.0) as usize).min(max_col);
-        let row = ((ly / r.cell_h as f64).floor().max(0.0) as usize).min(max_row);
-        let side = if colf - col as f64 <= 0.5 { Side::Left } else { Side::Right };
-        Some((pi, row, col, side))
+        let hit = mouse::cell_at(
+            pos.x,
+            pos.y,
+            &self.pane_rects(),
+            r.cell_w as f64,
+            r.cell_h as f64,
+        )?;
+        let side = if hit.left { Side::Left } else { Side::Right };
+        Some((hit.pane, hit.row, hit.col, side))
     }
 
-    /// Tab index under a pixel position, if it's in the tab bar.
+    fn mode_of(&self, id: u64) -> TermMode {
+        let Some((ti, pi)) = self.find_pane(id) else {
+            return TermMode::empty();
+        };
+        *self.tabs[ti].panes[pi].session.term.lock().unwrap().mode()
+    }
+
+    fn write_pane(&mut self, id: u64, bytes: &[u8]) {
+        let Some((ti, pi)) = self.find_pane(id) else {
+            return;
+        };
+        self.tabs[ti].panes[pi].session.write(bytes);
+    }
+
+    fn mods_now(&self) -> mouse::Mods {
+        mouse::Mods {
+            shift: self.modifiers.shift_key(),
+            alt: self.modifiers.alt_key(),
+            ctrl: self.modifiers.control_key(),
+        }
+    }
+
+    fn send_mouse(
+        &mut self,
+        id: u64,
+        phase: mouse::Phase,
+        button: mouse::Btn,
+        row: usize,
+        col: usize,
+        sgr: bool,
+    ) {
+        // release/move carry the modifiers held NOW. The encoder wants
+        // 1-based coordinates, the hit-test speaks 0-based.
+        if let Some(bytes) = mouse::encode(sgr, phase, button, col + 1, row + 1, self.mods_now()) {
+            self.write_pane(id, &bytes);
+        }
+    }
+
+    /// CSI I / CSI O when the focused pane, or the window, changes. A
+    /// program that just enabled 1004 hears the current state on the next
+    /// wakeup — xterm sends it as the mode turns on, and the chunk that
+    /// carried the mode is what wakes us.
+    fn sync_focus(&mut self) {
+        let want = if self.focused {
+            self.tabs
+                .get(self.active)
+                .and_then(|t| t.panes.get(t.focused).map(|p| p.id))
+        } else {
+            None
+        };
+        let want = want.filter(|&id| self.mode_of(id).contains(TermMode::FOCUS_IN_OUT));
+        if want == self.focus_sent {
+            return;
+        }
+        let old = self.focus_sent;
+        self.focus_sent = want;
+        if let Some(old) = old {
+            if self.mode_of(old).contains(TermMode::FOCUS_IN_OUT) {
+                self.write_pane(old, mouse::focus_seq(false));
+            }
+        }
+        if let Some(id) = want {
+            self.write_pane(id, mouse::focus_seq(true));
+        }
+    }
+
+    fn focus_pane_at(&mut self, pi: usize) {
+        let Some(t) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if pi < t.panes.len() && t.focused != pi {
+            t.focused = pi;
+            self.update_title();
+            self.request_redraw();
+        }
+    }
+
+    /// Viewport cell under `pos`, with a bidi row's column mapped back to
+    /// the grid cell the program stored. `hit` is the raw grid cell.
+    fn finish_locate(
+        &mut self,
+        hit: mouse::CellHit,
+        pos: PhysicalPosition<f64>,
+        rects: &[render::Rect],
+    ) -> Option<(u64, usize, usize)> {
+        // copy what the locks need, then drop the pane borrow so the term
+        // lock below can re-borrow the tab
+        let (pane_id, running) = {
+            let pane = self.tabs.get(self.active)?.panes.get(hit.pane)?;
+            let running = pane.session.meta.lock().unwrap().running_cmd.clone();
+            (pane.id, running)
+        };
+        let (auto, manual) = (self.auto_follow, self.claude_manual);
+        let (cols, row, cells, claude, vis) = {
+            let t = self.tabs[self.active].panes[hit.pane]
+                .session
+                .term
+                .lock()
+                .unwrap();
+            let cols = t.columns().max(1);
+            let rows = t.screen_lines().max(1);
+            let row = hit.row.min(rows - 1);
+            let claude = if !auto {
+                manual
+            } else {
+                t.mode().contains(TermMode::ALT_SCREEN) && bidi::cmd_is_claude(&running)
+            };
+            let cells = render::snapshot_row(&t, row);
+            (cols, row, cells, claude, hit.col.min(cols - 1))
+        };
+        let col = if cells.iter().any(|c| render::is_arabic(c.c)) {
+            let rect = rects.get(hit.pane).copied().unwrap_or((0, 0, 1, 1));
+            let x = (pos.x - rect.0 as f64) as f32;
+            self.renderer
+                .as_mut()
+                .and_then(|r| r.logical_column_for(&cells, x, rect.2, claude, cols))
+                .unwrap_or(vis)
+        } else {
+            vis
+        };
+        Some((pane_id, row, col.min(cols - 1)))
+    }
+
+    /// The cell under the pointer, or None when it isn't over a pane.
+    fn locate(&mut self, pos: PhysicalPosition<f64>) -> Option<(usize, u64, usize, usize)> {
+        let rects = self.pane_rects();
+        let (cw, ch) = {
+            let r = self.renderer.as_ref()?;
+            (r.cell_w as f64, r.cell_h as f64)
+        };
+        let hit = mouse::cell_at(pos.x, pos.y, &rects, cw, ch)?;
+        let pane = hit.pane;
+        let (id, row, col) = self.finish_locate(hit, pos, &rects)?;
+        Some((pane, id, row, col))
+    }
+
+    /// Same mapping, but clamped into `pane_id`'s rect so a drag that
+    /// leaves the pane still reports a cell of that pane.
+    fn cell_in_pane_clamped(
+        &mut self,
+        pane_id: u64,
+        pos: PhysicalPosition<f64>,
+    ) -> Option<(usize, usize)> {
+        let (ti, pi) = self.find_pane(pane_id)?;
+        if ti != self.active {
+            return None;
+        }
+        let rects = self.pane_rects();
+        let rect = *rects.get(pi)?;
+        let (x, y, w, h) = rect;
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        let (cw, ch) = {
+            let r = self.renderer.as_ref()?;
+            (r.cell_w as f64, r.cell_h as f64)
+        };
+        let cx = pos.x.clamp(x as f64, (x + w - 1) as f64);
+        let cy = pos.y.clamp(y as f64, (y + h - 1) as f64);
+        let hit = mouse::cell_at(cx, cy, &[rect], cw, ch)?;
+        // cell_at's pane index is 0 for the one-rect slice; the real index
+        // is `pi`, which finish_locate uses to read the grid.
+        let hit = mouse::CellHit { pane: pi, ..hit };
+        let (_, row, col) = self.finish_locate(hit, PhysicalPosition::new(cx, cy), &rects)?;
+        Some((row, col))
+    }
+
+    fn overlay_blocks_mouse(&self) -> bool {
+        self.shortcuts.is_some()
+            || self.settings.is_some()
+            || self.cockpit
+            || self.palette.is_some()
+            || self.posh.is_some()
+    }
+
+    /// Press in a tracking mode, and not Shift (Shift keeps the gesture
+    /// for local selection). Focus moves first so the program sees CSI I
+    /// before the click.
+    fn try_report_press(&mut self, button: mouse::Btn) -> bool {
+        if self.overlay_blocks_mouse() {
+            return false;
+        }
+        let Some((pane, id, row, col)) = self.locate(self.cursor_pos) else {
+            return false;
+        };
+        let proto = mouse::Proto::from_mode(self.mode_of(id));
+        if !proto.wants(mouse::What::Click, self.modifiers.shift_key()) {
+            return false;
+        }
+        self.focus_pane_at(pane);
+        self.sync_focus();
+        self.send_mouse(id, mouse::Phase::Press, button, row, col, proto.sgr);
+        let bit = button_bit(button);
+        if self.mouse_grab.as_ref().is_some_and(|g| g.pane_id == id) {
+            if let Some(g) = self.mouse_grab.as_mut() {
+                g.down |= bit;
+            }
+        } else {
+            self.mouse_grab = Some(MouseGrab {
+                pane_id: id,
+                down: bit,
+            });
+        }
+        self.mouse_last = Some((id, row, col));
+        if let Some((ti, pi)) = self.find_pane(id) {
+            self.tabs[ti].panes[pi]
+                .session
+                .term
+                .lock()
+                .unwrap()
+                .selection = None;
+        }
+        true
+    }
+
+    /// Release of a button we reported. True when the gesture was ours, so
+    /// the selection path must not also copy.
+    fn release_mouse_report(&mut self, button: mouse::Btn) -> bool {
+        let bit = button_bit(button);
+        let Some(grab) = self.mouse_grab else {
+            return false;
+        };
+        if bit == 0 || grab.down & bit == 0 {
+            return false;
+        }
+        let pane_id = grab.pane_id;
+        let down = grab.down & !bit;
+        if down == 0 {
+            self.mouse_grab = None;
+            self.mouse_last = None;
+        } else if let Some(g) = self.mouse_grab.as_mut() {
+            g.down = down;
+        }
+        let sgr = mouse::Proto::from_mode(self.mode_of(pane_id)).sgr;
+        if let Some((row, col)) = self.cell_in_pane_clamped(pane_id, self.cursor_pos) {
+            self.send_mouse(pane_id, mouse::Phase::Release, button, row, col, sgr);
+        }
+        true
+    }
+
+    fn report_drag(&mut self, pos: PhysicalPosition<f64>) {
+        if self.overlay_blocks_mouse() {
+            return;
+        }
+        let Some(grab) = self.mouse_grab else { return };
+        let pane_id = grab.pane_id;
+        let button = grab_button(grab.down);
+        let proto = mouse::Proto::from_mode(self.mode_of(pane_id));
+        // 1000 hears the press and the release, not the pixels between.
+        if !proto.wants(mouse::What::Drag, false) {
+            return;
+        }
+        let Some((row, col)) = self.cell_in_pane_clamped(pane_id, pos) else {
+            return;
+        };
+        if self.mouse_last == Some((pane_id, row, col)) {
+            return;
+        }
+        self.mouse_last = Some((pane_id, row, col));
+        self.send_mouse(pane_id, mouse::Phase::Move, button, row, col, proto.sgr);
+    }
+
+    fn report_motion(&mut self, pos: PhysicalPosition<f64>) {
+        if self.overlay_blocks_mouse() || self.modifiers.shift_key() {
+            return;
+        }
+        let Some((_, id, row, col)) = self.locate(pos) else {
+            return;
+        };
+        let proto = mouse::Proto::from_mode(self.mode_of(id));
+        if !proto.wants(mouse::What::Motion, false) {
+            return;
+        }
+        if self.mouse_last == Some((id, row, col)) {
+            return;
+        }
+        self.mouse_last = Some((id, row, col));
+        self.send_mouse(
+            id,
+            mouse::Phase::Move,
+            mouse::Btn::None,
+            row,
+            col,
+            proto.sgr,
+        );
+    }
 
     /// Which window edge the pointer is on, if any. 6px is the smallest band
     /// that stays grabbable without stealing clicks from the content.
@@ -1658,12 +1977,6 @@ impl App {
             x += w;
         }
         None
-    }
-
-    fn pointer_cell_1based(&self) -> (usize, usize) {
-        self.pane_cell_at(self.cursor_pos)
-            .map(|(_, row, col, _)| (row + 1, col + 1))
-            .unwrap_or((1, 1))
     }
 
     fn has_selection(&self) -> bool {
@@ -2217,6 +2530,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some((ti, pi)) = self.find_pane(id) {
                     self.tabs[ti].panes[pi].last_output = Some(Instant::now());
                 }
+                // the chunk may have enabled focus reporting; tell the
+                // program whether the window is looking at it
+                self.sync_focus();
                 self.request_redraw();
             }
             UserEvent::PtyWrite(id, text) => {
@@ -2376,6 +2692,8 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     self.request_redraw();
                 }
+                // mode 1004: CSI I on the way in, CSI O on the way out
+                self.sync_focus();
             }
             WindowEvent::DroppedFile(path) => {
                 // a dropped file lands at the prompt as a shell-ready path
@@ -2408,7 +2726,9 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 if self.mouse_left_down {
-                    // the drag stays in the pane where it started
+                    // the drag stays in the pane where it started. Shift+drag
+                    // takes this path even while the program is tracking the
+                    // mouse — the bypass is the whole point of Shift.
                     if let Some((pi, row, col, side)) = self.pane_cell_at(position) {
                         if pi == self.sel_pane {
                             if let Some(s) = self.session() {
@@ -2422,6 +2742,10 @@ impl ApplicationHandler<UserEvent> for App {
                             self.request_redraw();
                         }
                     }
+                } else if self.mouse_grab.is_some() {
+                    // 1002/1003: the program owns the drag. No local selection,
+                    // and no redraw — a still frame stays still.
+                    self.report_drag(position);
                 } else if let Some(w) = &self.window {
                     // hovering a divider shows the resize cursor
                     use winit::window::CursorIcon;
@@ -2451,145 +2775,182 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
+                // 1003: motion with no button. Not inside the window borrow
+                // above — reporting needs the renderer and the pane.
+                if !self.mouse_left_down && self.mouse_grab.is_none() {
+                    self.report_motion(position);
+                }
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
-                ElementState::Pressed => {
-                    // M24 order matters: edges are outermost, then the caption
-                    // buttons, and only then the panels — otherwise a resize
-                    // grab near the top-right would open settings instead.
-                    if self.shortcuts.is_none() && self.settings.is_none() {
-                        if let Some(dir) = self.resize_edge_at(self.cursor_pos) {
-                            if let Some(w) = self.window.as_ref() {
-                                let _ = w.drag_resize_window(dir);
+            WindowEvent::MouseInput { state, button, .. } => {
+                let mapped = match button {
+                    MouseButton::Left => Some(mouse::Btn::Left),
+                    MouseButton::Middle => Some(mouse::Btn::Middle),
+                    MouseButton::Right => Some(mouse::Btn::Right),
+                    _ => None,
+                };
+                match state {
+                    ElementState::Pressed => {
+                        // middle/right never touch chrome; they only report when
+                        // the program asked. Left still walks the chrome first.
+                        if !matches!(button, MouseButton::Left) {
+                            if let Some(b) = mapped {
+                                let _ = self.try_report_press(b);
                             }
                             return;
                         }
-                        if let Some(i) = self.caption_button_at(self.cursor_pos) {
-                            if let Some(w) = self.window.as_ref() {
-                                match i {
-                                    0 => w.set_minimized(true),
-                                    1 => w.set_maximized(!w.is_maximized()),
-                                    _ => {
-                                        // identical to CloseRequested: the
-                                        // running-command guard must not be
-                                        // bypassed just because the button
-                                        // is ours now
-                                        if self.config.confirm_close_on()
-                                            && self.pending_close.is_none()
-                                            && self.running_count() > 0
-                                        {
-                                            self.pending_close = Some(CloseTarget::Window);
-                                            self.request_redraw();
-                                        } else {
-                                            self.quit(el);
+                        // M24 order matters: edges are outermost, then the caption
+                        // buttons, and only then the panels — otherwise a resize
+                        // grab near the top-right would open settings instead.
+                        if self.shortcuts.is_none() && self.settings.is_none() {
+                            if let Some(dir) = self.resize_edge_at(self.cursor_pos) {
+                                if let Some(w) = self.window.as_ref() {
+                                    let _ = w.drag_resize_window(dir);
+                                }
+                                return;
+                            }
+                            if let Some(i) = self.caption_button_at(self.cursor_pos) {
+                                if let Some(w) = self.window.as_ref() {
+                                    match i {
+                                        0 => w.set_minimized(true),
+                                        1 => w.set_maximized(!w.is_maximized()),
+                                        _ => {
+                                            // identical to CloseRequested: the
+                                            // running-command guard must not be
+                                            // bypassed just because the button
+                                            // is ours now
+                                            if self.config.confirm_close_on()
+                                                && self.pending_close.is_none()
+                                                && self.running_count() > 0
+                                            {
+                                                self.pending_close = Some(CloseTarget::Window);
+                                                self.request_redraw();
+                                            } else {
+                                                self.quit(el);
+                                            }
                                         }
                                     }
+                                }
+                                return;
+                            }
+                        }
+                        // the shortcuts editor swallows clicks: a row starts a
+                        // capture, outside the card closes + saves
+                        if self.shortcuts.is_some() {
+                            self.shortcuts_click(self.cursor_pos.x, self.cursor_pos.y);
+                            return;
+                        }
+                        // the settings panel swallows clicks: apply the control
+                        // hit, or a click outside the card closes + saves
+                        if self.settings.is_some() {
+                            self.settings_click(self.cursor_pos.x, self.cursor_pos.y);
+                            return;
+                        }
+                        // the settings gear button in the tab bar opens settings
+                        // (a click — layout-proof, unlike a comma shortcut)
+                        if let (Some(r), Some(w)) = (self.renderer.as_ref(), self.window.as_ref()) {
+                            let pw = w.inner_size().width as usize;
+                            if r.settings_button_hit(pw, self.cursor_pos.x, self.cursor_pos.y) {
+                                self.settings = Some(0);
+                                self.request_redraw();
+                                return;
+                            }
+                        }
+                        // the cockpit swallows clicks: pick a row or dismiss
+                        if self.cockpit {
+                            let hit = self.cockpit_row_hit(self.cursor_pos);
+                            self.cockpit = false;
+                            if let Some(row) = hit {
+                                self.switch_tab(row);
+                            }
+                            self.request_redraw();
+                            return;
+                        }
+                        // grabbing a divider starts a resize drag
+                        if let Some(i) = self.divider_at(self.cursor_pos) {
+                            self.drag_divider = Some(i);
+                            return;
+                        }
+                        // a click in the tab bar switches tabs
+                        if let Some(idx) = self.tab_at(self.cursor_pos) {
+                            self.switch_tab(idx);
+                            return;
+                        }
+                        // empty title strip: double-click maximises, drag moves —
+                        // the two gestures a real title bar owes the user
+                        if self.in_drag_strip(self.cursor_pos) {
+                            if let Some(w) = self.window.as_ref() {
+                                let now = std::time::Instant::now();
+                                let dbl =
+                                    self.last_strip_click.is_some_and(|t: std::time::Instant| {
+                                        now.duration_since(t).as_millis() < 400
+                                    });
+                                self.last_strip_click = Some(now);
+                                if dbl {
+                                    w.set_maximized(!w.is_maximized());
+                                } else {
+                                    let _ = w.drag_window();
                                 }
                             }
                             return;
                         }
-                    }
-                    // the shortcuts editor swallows clicks: a row starts a
-                    // capture, outside the card closes + saves
-                    if self.shortcuts.is_some() {
-                        self.shortcuts_click(self.cursor_pos.x, self.cursor_pos.y);
-                        return;
-                    }
-                    // the settings panel swallows clicks: apply the control
-                    // hit, or a click outside the card closes + saves
-                    if self.settings.is_some() {
-                        self.settings_click(self.cursor_pos.x, self.cursor_pos.y);
-                        return;
-                    }
-                    // the settings gear button in the tab bar opens settings
-                    // (a click — layout-proof, unlike a comma shortcut)
-                    if let (Some(r), Some(w)) = (self.renderer.as_ref(), self.window.as_ref()) {
-                        let pw = w.inner_size().width as usize;
-                        if r.settings_button_hit(pw, self.cursor_pos.x, self.cursor_pos.y) {
-                            self.settings = Some(0);
-                            self.request_redraw();
+                        // mouse tracking owns the click unless Shift is held —
+                        // Shift+drag stays a local selection (the bypass).
+                        if self.try_report_press(mouse::Btn::Left) {
                             return;
                         }
-                    }
-                    // the cockpit swallows clicks: pick a row or dismiss
-                    if self.cockpit {
-                        let hit = self.cockpit_row_hit(self.cursor_pos);
-                        self.cockpit = false;
-                        if let Some(row) = hit {
-                            self.switch_tab(row);
+                        if let Some((pi, row, col, side)) = self.pane_cell_at(self.cursor_pos) {
+                            // clicking a pane focuses it
+                            if let Some(t) = self.tabs.get_mut(self.active) {
+                                if t.focused != pi {
+                                    t.focused = pi;
+                                    self.update_title();
+                                }
+                            }
+                            self.sync_focus();
+                            self.sel_pane = pi;
+                            // 1 click = simple drag anchor, 2 = word, 3 = line
+                            let n = self.clicks.click(Instant::now(), (row, col));
+                            let ty = match n {
+                                2 => SelectionType::Semantic,
+                                3 => SelectionType::Lines,
+                                _ => SelectionType::Simple,
+                            };
+                            if let Some(s) = self.session() {
+                                let mut t = s.term.lock().unwrap();
+                                let off = t.grid().display_offset() as i32;
+                                let point = Point::new(Line(row as i32 - off), Column(col));
+                                t.selection = Some(Selection::new(ty, point, side));
+                            }
+                            self.mouse_left_down = true;
+                            if n >= 2 && self.config.copy_on_select_on() {
+                                // word/line selections are complete on click
+                                self.copy_selection(false);
+                            }
+                            self.request_redraw();
                         }
-                        self.request_redraw();
-                        return;
                     }
-                    // grabbing a divider starts a resize drag
-                    if let Some(i) = self.divider_at(self.cursor_pos) {
-                        self.drag_divider = Some(i);
-                        return;
-                    }
-                    // a click in the tab bar switches tabs
-                    if let Some(idx) = self.tab_at(self.cursor_pos) {
-                        self.switch_tab(idx);
-                        return;
-                    }
-                    // empty title strip: double-click maximises, drag moves —
-                    // the two gestures a real title bar owes the user
-                    if self.in_drag_strip(self.cursor_pos) {
-                        if let Some(w) = self.window.as_ref() {
-                            let now = std::time::Instant::now();
-                            let dbl = self.last_strip_click
-                                .is_some_and(|t: std::time::Instant| now.duration_since(t).as_millis() < 400);
-                            self.last_strip_click = Some(now);
-                            if dbl {
-                                w.set_maximized(!w.is_maximized());
-                            } else {
-                                let _ = w.drag_window();
+                    ElementState::Released => {
+                        if self.drag_divider.take().is_some() {
+                            return; // a resize drag copies nothing
+                        }
+                        if let Some(b) = mapped {
+                            if self.release_mouse_report(b) {
+                                return;
                             }
                         }
-                        return;
-                    }
-                    if let Some((pi, row, col, side)) = self.pane_cell_at(self.cursor_pos) {
-                        // clicking a pane focuses it
-                        if let Some(t) = self.tabs.get_mut(self.active) {
-                            if t.focused != pi {
-                                t.focused = pi;
-                                self.update_title();
-                            }
+                        if !matches!(button, MouseButton::Left) {
+                            return;
                         }
-                        self.sel_pane = pi;
-                        // 1 click = simple drag anchor, 2 = word, 3 = line
-                        let n = self.clicks.click(Instant::now(), (row, col));
-                        let ty = match n {
-                            2 => SelectionType::Semantic,
-                            3 => SelectionType::Lines,
-                            _ => SelectionType::Simple,
-                        };
-                        if let Some(s) = self.session() {
-                            let mut t = s.term.lock().unwrap();
-                            let off = t.grid().display_offset() as i32;
-                            let point = Point::new(Line(row as i32 - off), Column(col));
-                            t.selection = Some(Selection::new(ty, point, side));
-                        }
-                        self.mouse_left_down = true;
-                        if n >= 2 && self.config.copy_on_select_on() {
-                            // word/line selections are complete on click
+                        self.mouse_left_down = false;
+                        // EasyTer convention: auto-copy the selection on release
+                        // (the settings panel can turn this off; explicit
+                        // Ctrl+C / Ctrl+Shift+C always copy)
+                        if self.config.copy_on_select_on() {
                             self.copy_selection(false);
                         }
-                        self.request_redraw();
                     }
                 }
-                ElementState::Released => {
-                    if self.drag_divider.take().is_some() {
-                        return; // a resize drag copies nothing
-                    }
-                    self.mouse_left_down = false;
-                    // EasyTer convention: auto-copy the selection on release
-                    // (the settings panel can turn this off; explicit
-                    // Ctrl+C / Ctrl+Shift+C always copy)
-                    if self.config.copy_on_select_on() {
-                        self.copy_selection(false);
-                    }
-                }
-            },
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 let cell_h = self.renderer.as_ref().map_or(20.0, |r| r.cell_h);
                 let lines = match delta {
@@ -2609,29 +2970,77 @@ impl ApplicationHandler<UserEvent> for App {
                     self.rebuild_renderer();
                     return;
                 }
-                let mode = self.term_mode();
-                if mode.contains(TermMode::ALT_SCREEN) {
-                    // a full-screen TUI owns scrolling. EasyTer's rule: SGR
-                    // mouse only if the app asked for mouse reporting, else
-                    // arrow keys (honoring DECCKM) — never injected garbage.
-                    let seq = if mode.intersects(TermMode::MOUSE_MODE) {
-                        let (row, col) = self.pointer_cell_1based();
-                        let btn = if n > 0 { 64 } else { 65 };
-                        format!("\x1b[<{btn};{col};{row}M")
-                    } else {
-                        let ch = if n > 0 { 'A' } else { 'B' };
-                        if mode.contains(TermMode::APP_CURSOR) {
-                            format!("\x1bO{ch}")
+                // the pane under the pointer, else the focused one. Splits
+                // scroll the pane you're pointing at.
+                let hit = self.locate(self.cursor_pos);
+                let pane_id = hit.as_ref().map(|h| h.1).or_else(|| {
+                    self.tabs
+                        .get(self.active)
+                        .and_then(|t| t.panes.get(t.focused).map(|p| p.id))
+                });
+                let mode = pane_id
+                    .map(|id| self.mode_of(id))
+                    .unwrap_or_else(TermMode::empty);
+                let proto = mouse::Proto::from_mode(mode);
+                let (row, col) = hit.map(|h| (h.2, h.3)).unwrap_or((0, 0));
+                if proto.wants(mouse::What::Wheel, self.modifiers.shift_key()) {
+                    // SGR when the program asked (1006), X10 otherwise.
+                    // Shift falls through: the terminal scrolls, the program
+                    // doesn't hear the wheel.
+                    if let Some(id) = pane_id {
+                        let button = if n > 0 {
+                            mouse::Btn::WheelUp
                         } else {
-                            format!("\x1b[{ch}")
+                            mouse::Btn::WheelDown
+                        };
+                        let mods = mouse::Mods {
+                            shift: false,
+                            alt: self.modifiers.alt_key(),
+                            ctrl: false,
+                        };
+                        if let Some(seq) = mouse::encode(
+                            proto.sgr,
+                            mouse::Phase::Press,
+                            button,
+                            col + 1,
+                            row + 1,
+                            mods,
+                        ) {
+                            let mut payload =
+                                Vec::with_capacity(seq.len() * n.unsigned_abs() as usize);
+                            for _ in 0..n.unsigned_abs() {
+                                payload.extend_from_slice(&seq);
+                            }
+                            self.write_pane(id, &payload);
                         }
-                    };
-                    let payload = seq.repeat(n.unsigned_abs() as usize);
-                    if let Some(s) = self.session_mut() {
-                        s.write(payload.as_bytes());
                     }
-                } else {
-                    self.scroll_lines(n);
+                } else if mode.contains(TermMode::ALT_SCREEN) {
+                    // a full-screen TUI that didn't ask for the mouse (or
+                    // Shift bypassed it): arrow keys, honoring DECCKM.
+                    let ch = if n > 0 { b'A' } else { b'B' };
+                    let prefix: &[u8] = if mode.contains(TermMode::APP_CURSOR) {
+                        b"\x1bO"
+                    } else {
+                        b"\x1b["
+                    };
+                    let mut payload = Vec::new();
+                    for _ in 0..n.unsigned_abs() {
+                        payload.extend_from_slice(prefix);
+                        payload.push(ch);
+                    }
+                    if let Some(id) = pane_id {
+                        self.write_pane(id, &payload);
+                    }
+                } else if let Some(id) = pane_id {
+                    if let Some((ti, pi)) = self.find_pane(id) {
+                        self.tabs[ti].panes[pi]
+                            .session
+                            .term
+                            .lock()
+                            .unwrap()
+                            .scroll_display(Scroll::Delta(n));
+                    }
+                    self.request_redraw();
                 }
             }
             WindowEvent::KeyboardInput { event, .. }
@@ -2755,6 +3164,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 t.focused =
                                     ((t.focused as i32 + d + n) % n) as usize;
                                 self.update_title();
+                                self.sync_focus();
                                 self.request_redraw();
                                 return;
                             }
@@ -2897,6 +3307,9 @@ fn main() {
         last_frame: Vec::new(),
         cursor_pos: PhysicalPosition::new(0.0, 0.0),
         mouse_left_down: false,
+        mouse_grab: None,
+        mouse_last: None,
+        focus_sent: None,
         sel_pane: 0,
         drag_divider: None,
         cockpit: false,

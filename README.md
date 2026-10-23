@@ -225,7 +225,26 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       OSC 133 marks and Arabic shaping unchanged. Left honest: the toast path
       (Shell_NotifyIcon, the biggest windows-sys consumer) compiles and the app
       runs, but a balloon was not caught on camera — quiet hours file it to the
-      Action Center — so that one is built-and-running, not eyeball-verified
+      Action Center —       so that one is built-and-running, not eyeball-verified
+- [x] **M30** — mouse reporting. Clicks, drags and motion reach the program
+      when it asks: xterm 1000 (press/release), 1002 (drag), 1003 (any
+      motion), encoded as SGR 1006 or the legacy X10 byte form when 1006
+      is off. Coordinates are the pane's cells — padding and split gaps
+      are not cells, and a click in the second pane is that pane's column
+      0. On a row Bayan reorders (the whole-line BiDi path), the column is
+      the glyph under the pointer, not `x / cell_w`: the left of مرحبا is
+      the last logical cell, and ١٧٥ is not mirrored. Claude rows go
+      through the same restoration as the painter, then the index map
+      points the glyph back at the grid column Claude stored. Shift+drag
+      stays a local selection. Mode 1004 sends CSI I / CSI O when the
+      window or the focused pane changes, including the moment the program
+      turns the mode on. The wheel still scrolls the pane under the
+      pointer; Ctrl+wheel is still font zoom. Proven: 93 unit tests (81
+      before), including the encoder, the padding/split hit-test, and a
+      shaped-Amiri hit on مرحبا and ١٧٥. Not proven here: a live htop /
+      vim `mouse=a` / lazygit / Claude Code session — this tree doesn't
+      run a window on the machine that built it. Windows CI is the build
+      that does.
 
 ## Settings
 

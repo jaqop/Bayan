@@ -39,16 +39,36 @@ fn is_combining(c: char) -> bool {
 
 /// Reverse character order keeping each base char glued to its combining
 /// marks — a plain reverse would put marks before their base.
-fn rev_clusters(s: &str) -> String {
-    let mut units: Vec<String> = Vec::new();
-    for ch in s.chars() {
-        match units.last_mut() {
-            Some(last) if is_combining(ch) => last.push(ch),
-            _ => units.push(ch.to_string()),
+/// `origin[i]` is the caller's index of `chars[i]`; it travels with the
+/// char so a later hit-test can point a displayed glyph back at the cell
+/// Claude actually stored.
+fn rev_indexed(chars: &[char], origin: &[usize]) -> (Vec<char>, Vec<usize>) {
+    let mut units: Vec<Vec<usize>> = Vec::new();
+    for (i, ch) in chars.iter().enumerate() {
+        if is_combining(*ch) {
+            if let Some(last) = units.last_mut() {
+                last.push(i);
+                continue;
+            }
         }
+        units.push(vec![i]);
     }
     units.reverse();
-    units.concat()
+    let mut out_c = Vec::with_capacity(chars.len());
+    let mut out_o = Vec::with_capacity(chars.len());
+    for unit in units {
+        for i in unit {
+            out_c.push(chars[i]);
+            out_o.push(origin[i]);
+        }
+    }
+    (out_c, out_o)
+}
+
+fn rev_clusters(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let origin: Vec<usize> = (0..chars.len()).collect();
+    rev_indexed(&chars, &origin).0.into_iter().collect()
 }
 
 /// Is the line predominantly Arabic (so Claude reversed the whole line)?
@@ -68,10 +88,13 @@ pub fn line_is_rtl_visual(text: &str) -> bool {
 /// the LTR islands (Latin words, digits, paths). Punctuation joins an island
 /// only when a Latin char follows, so "config.txt" survives intact but a
 /// trailing "01." doesn't flip to ".01".
-fn unbidi_rtl_line(line: &str) -> String {
-    let rev: Vec<char> = rev_clusters(line).chars().collect();
+/// The second vec is the index of each output char in `chars`.
+fn unbidi_indexed(chars: &[char]) -> (Vec<char>, Vec<usize>) {
+    let origin: Vec<usize> = (0..chars.len()).collect();
+    let (rev, rev_i) = rev_indexed(chars, &origin);
     let n = rev.len();
-    let mut out = String::new();
+    let mut out = Vec::new();
+    let mut out_i = Vec::new();
     let mut i = 0;
     while i < n {
         if is_ltr_char(rev[i]) {
@@ -89,54 +112,75 @@ fn unbidi_rtl_line(line: &str) -> String {
                     break;
                 }
             }
-            let island: String = rev[i..j].iter().collect();
-            out.push_str(&rev_clusters(&island));
+            let (island, island_i) = rev_indexed(&rev[i..j], &rev_i[i..j]);
+            out.extend(island);
+            out_i.extend(island_i);
             i = j;
         } else {
             out.push(rev[i]);
+            out_i.push(rev_i[i]);
             i += 1;
         }
     }
-    out
+    (out, out_i)
+}
+
+fn unbidi_rtl_line(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    unbidi_indexed(&chars).0.into_iter().collect()
 }
 
 /// LTR-base line with Arabic islands (e.g. an English sentence quoting
 /// Arabic): reverse each Arabic run in place, leaving the rest untouched.
-fn reverse_arabic_runs(line: &str) -> String {
-    let ch: Vec<char> = line.chars().collect();
-    let n = ch.len();
-    let mut out = String::new();
+fn reverse_arabic_indexed(chars: &[char]) -> (Vec<char>, Vec<usize>) {
+    let n = chars.len();
+    let mut out = Vec::new();
+    let mut out_i = Vec::new();
     let mut i = 0;
     while i < n {
-        if is_arabic_letter(ch[i]) {
+        if is_arabic_letter(chars[i]) {
             let mut j = i;
             while j < n
-                && (is_arabic_letter(ch[j])
-                    || is_combining(ch[j])
-                    || (ch[j] == ' ' && j + 1 < n && is_arabic_letter(ch[j + 1])))
+                && (is_arabic_letter(chars[j])
+                    || is_combining(chars[j])
+                    || (chars[j] == ' ' && j + 1 < n && is_arabic_letter(chars[j + 1])))
             {
                 j += 1;
             }
-            let run: String = ch[i..j].iter().collect();
-            out.push_str(&rev_clusters(&run));
+            let origin: Vec<usize> = (i..j).collect();
+            let (run, run_i) = rev_indexed(&chars[i..j], &origin);
+            out.extend(run);
+            out_i.extend(run_i);
             i = j;
         } else {
-            out.push(ch[i]);
+            out.push(chars[i]);
+            out_i.push(i);
             i += 1;
         }
     }
-    out
+    (out, out_i)
+}
+
+/// Convert Claude's visual line to logical, and record where each output
+/// char sat in `text`. Mouse hit-testing needs the index: the shaped glyph
+/// is in restored order, the grid cell is still Claude's visual column.
+/// None = leave unchanged.
+pub fn restore_bidi_map(text: &str) -> Option<(String, Vec<usize>)> {
+    let chars: Vec<char> = text.chars().collect();
+    if line_is_rtl_visual(text) {
+        let (out, idx) = unbidi_indexed(&chars);
+        return Some((out.into_iter().collect(), idx));
+    }
+    if chars.iter().copied().any(is_arabic_letter) {
+        let (out, idx) = reverse_arabic_indexed(&chars);
+        return Some((out.into_iter().collect(), idx));
+    }
+    None
 }
 
 /// Convert Claude's visual line to logical. None = leave unchanged.
 pub fn restore_bidi_line(text: &str) -> Option<String> {
-    if line_is_rtl_visual(text) {
-        return Some(unbidi_rtl_line(text));
-    }
-    if text.chars().any(is_arabic_letter) {
-        return Some(reverse_arabic_runs(text));
-    }
-    None
+    restore_bidi_map(text).map(|(s, _)| s)
 }
 
 /// A whole copied block (selection in Claude mode): restore each line, so
@@ -239,6 +283,32 @@ mod tests {
             restore_block(block),
             "مرحبا\nplain english\nWhat are you working on مساعدتك؟"
         );
+    }
+
+    #[test]
+    fn restore_map_points_each_output_char_at_its_source() {
+        // visual "ابحرم" restores to logical "مرحبا"; every output char is
+        // one of the input chars, not a new one, and the map round-trips.
+        let visual = "ابحرم";
+        let (out, idx) = restore_bidi_map(visual).unwrap();
+        assert_eq!(out, "مرحبا");
+        let src: Vec<char> = visual.chars().collect();
+        let rebuilt: String = idx.iter().map(|&i| src[i]).collect();
+        assert_eq!(rebuilt, out);
+        // the displayed-left char after cosmic re-shapes this is ا, which
+        // Claude stored at column 0
+        assert_eq!(idx[idx.len() - 1], 0);
+        // and م, stored at the last visual column, leads the logical line
+        assert_eq!(idx[0], 4);
+
+        // an LTR sentence with an Arabic tail: the English stays put
+        let mixed = "What are you working on ؟كتدعاسم";
+        let (out, idx) = restore_bidi_map(mixed).unwrap();
+        assert_eq!(out, "What are you working on مساعدتك؟");
+        let src: Vec<char> = mixed.chars().collect();
+        let rebuilt: String = idx.iter().map(|&i| src[i]).collect();
+        assert_eq!(rebuilt, out);
+        assert!(idx.len() == src.len());
     }
 
     #[test]
