@@ -256,20 +256,43 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       [microsoft/terminal#19847](https://github.com/microsoft/terminal/issues/19847)),
       which would turn Ctrl+C into the literal text `[99;5u`. Until that is
       verified on a real Windows session, `keyboard.kitty_protocol` defaults
-      to false: push and set are ignored, and `CSI ? u` is answered
-      `CSI ?0u` (the same probe reply Rio sends when the protocol is off).
-      Set it to true to enable the encoder.
-      Two further limits, both tested: alacritty_terminal 0.26's
-      `push_keyboard_mode` evicts from the wrong stack and panics at depth
-      4096, so pushes past 16 are dropped (kitty's own cap). And with
-      disambiguate on but alternate keys off, a non-ASCII chord is reported
-      as its PC-101 key (`keyboard.kitty_base_layout_fallback`, default
-      true) — `ؤ` on the C key is `CSI 99;5u`, not `CSI 1572;5u` — so
-      Claude Code can still be interrupted. That is a deliberate departure
-      from the spec; turn the fallback off to send the Arabic codepoint.
-      A crashed full-screen program leaks its flags into the shell, so
-      `OSC 133;A` (the next prompt), shell exit, and Ctrl+Shift+K
-      (`reset-keyboard`) clear both screens' stacks.
+      to false. Off, `Term::new` is given `kitty_keyboard: false`, so the
+      parser never touches its stack — including the forms a digit/semicolon
+      scanner misses (`ESC [ > 1 NUL u`, a C0 before the intermediate, a
+      `:` sub-parameter). `CSI ? u` is answered by us with `CSI ?0u` (the
+      same probe reply Rio sends when the protocol is off), and the encoder
+      masks the kitty bits out of `TermMode` so a hostile push cannot make
+      a key emit CSI u. Set `kitty_protocol` to true to enable the encoder.
+      On, the crate is [alacritty commit `542147067dd016fc5f49120ef0ba605a98a4e3a7`](https://github.com/alacritty/alacritty/commit/542147067dd016fc5f49120ef0ba605a98a4e3a7)
+      (`0.26.1-dev`, the fix for [alacritty#9071](https://github.com/alacritty/alacritty/issues/9071)).
+      Published 0.26.0's `push_keyboard_mode` evicts from `title_stack` and
+      panics at depth 4096, and that panic survives any scanner because vte
+      completes a CSI on C0 and `:`. The pin changes the eviction to
+      `keyboard_mode_stack`. Recognized pushes still stop at 16, kitty's own
+      cap. The requirement is `0.26.1-dev` rather than `0.26` because Cargo
+      will not select a pre-release for a plain `0.26` requirement, and the
+      patch was then unused. A vendor of 0.26.0 was the fallback if this
+      commit did not build against our API; `cargo check --tests` for
+      `x86_64-pc-windows-gnu` did build, so the pin is what shipped.
+      With disambiguate on but alternate keys off, a non-ASCII chord is
+      reported as its PC-101 key (`keyboard.kitty_base_layout_fallback`,
+      default true) — `ؤ` on the C key is `CSI 99;5u`, not `CSI 1572;5u` —
+      so Claude Code can still be interrupted. That is a deliberate
+      departure from the spec; turn the fallback off to send the Arabic
+      codepoint.
+      A crashed full-screen program leaks its flags into the shell. The
+      reset pops only the **current** screen's stack (4096 levels, so a
+      bypass deeper than 16 is actually drained) and does not emit `1049`.
+      Visiting the other screen cleared the selection, clobbered DECSC, and
+      wiped the alt grid on the way back in — a prompt turned a TUI blank.
+      It is a no-op when the protocol is off or that stack is empty. It runs
+      on `OSC 133;A`, on shell exit through the session's own parser (not a
+      fresh one), and on Ctrl+Shift+K. That chord is the rebindable action
+      `reset-keyboard`: it is taken from the program in the terminal, and
+      `keybinds` can move it. RIS (`ESC c`) zeroes both depth counters,
+      because the parser clears both stacks and a stale cap would drop the
+      next push. AltGr is text only on the kitty path, and only when `text`
+      differs from `key_without_modifiers` — Ctrl+Alt+1 stays a chord.
 - [x] **Security (High)** — the four High findings from the audit
       (`docs/SECURITY_AUDIT.md`). OSC 52 no longer writes the OS clipboard
       unless `osc52` is `"copy"`, the window is focused, and the write comes

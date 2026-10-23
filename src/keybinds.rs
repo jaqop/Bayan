@@ -375,6 +375,27 @@ mod tests {
     }
 
     #[test]
+    fn reset_keyboard_chord_can_be_rebound() {
+        // Ctrl+Shift+K is taken from the program in the terminal. It is a
+        // normal binding, so the user can move it and hand the chord back.
+        let mut cfg = crate::config::UserConfig::default();
+        let mut kb = std::collections::HashMap::new();
+        kb.insert("reset-keyboard".to_string(), "ctrl+shift+f12".to_string());
+        cfg.keybinds = Some(kb);
+        let map = effective_map(&cfg);
+        assert_eq!(lookup(&map, Chord::parse("ctrl+shift+k").unwrap()), None);
+        assert_eq!(
+            lookup(&map, Chord::parse("ctrl+shift+f12").unwrap()),
+            Some(Action::ResetKeyboard)
+        );
+        let defaults = effective_map(&crate::config::UserConfig::default());
+        assert_eq!(
+            lookup(&defaults, Action::ResetKeyboard.default_chord()),
+            Some(Action::ResetKeyboard)
+        );
+    }
+
+    #[test]
     fn tui_passthrough_rule_matches_plain_ctrl_letters_only() {
         assert!(Chord::parse("ctrl+t").unwrap().is_plain_ctrl_letter());
         assert!(!Chord::parse("ctrl+shift+t").unwrap().is_plain_ctrl_letter());

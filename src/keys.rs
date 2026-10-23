@@ -144,21 +144,30 @@ pub fn protocol_bits(mode: TermMode) -> u8 {
     f
 }
 
+/// Config off wins over kitty bits a child managed to set. The encoder
+/// reads `TermMode`; masking here is what keeps a disabled protocol from
+/// emitting CSI u after a hostile push.
+pub fn mode_for_keys(mut mode: TermMode, kitty_protocol: bool) -> TermMode {
+    if !kitty_protocol {
+        mode.remove(TermMode::KITTY_KEYBOARD_PROTOCOL);
+    }
+    mode
+}
+
 /// Encode one event. Kitty bytes win when the child asked for them; every
 /// other press is the legacy sequence, and a release with nothing to say
 /// produces nothing.
 pub fn encode_input(input: &EncodeInput<'_>) -> Option<Vec<u8>> {
-    // Windows reports AltGr as Ctrl+Alt plus the character the layout
-    // produced. That is text, not a CSI u chord. A single ASCII letter is
-    // left as a chord (Ctrl+Alt+C); symbols and non-ASCII are AltGr.
-    if let Some(text) = altgr_text(input) {
-        if input.released {
-            return None;
-        }
-        return Some(text.as_bytes().to_vec());
-    }
     let flags = kitty::Flags(protocol_bits(input.mode));
     if flags.affects_encoding() {
+        // AltGr is a kitty-path concern. Checked first it would turn
+        // Ctrl+Alt+1 into text while the protocol is off.
+        if let Some(text) = altgr_text(input) {
+            if input.released {
+                return None;
+            }
+            return Some(text.as_bytes().to_vec());
+        }
         if let Some(bytes) = encode_kitty(input, flags) {
             return Some(bytes);
         }
@@ -174,20 +183,24 @@ pub fn encode_input(input: &EncodeInput<'_>) -> Option<Vec<u8>> {
     encode(input.key, input.text, input.shift, input.alt, input.ctrl)
 }
 
-/// AltGr text, when this ctrl+alt event is a layout character rather than
-/// a chord. `None` means "encode it as a key".
+/// AltGr text. Windows delivers AltGr as Ctrl+Alt, and winit's `text`
+/// ignores Ctrl, so Ctrl+Alt+1 arrives with text `"1"`. That is a chord.
+/// AltGr only when the composed text differs from `key_without_modifiers`
+/// (AltGr+E: text `€`, unmod `e`).
 fn altgr_text<'a>(input: &EncodeInput<'a>) -> Option<&'a str> {
     if !(input.ctrl && input.alt) {
         return None;
     }
     let text = input.text?;
-    let mut chars = text.chars();
-    let c = chars.next()?;
-    if is_control(c) {
+    if text.is_empty() || text.chars().any(is_control) {
         return None;
     }
-    // Ctrl+Alt+C arrives with text "c" on some paths. That stays a chord.
-    if chars.next().is_none() && c.is_ascii_alphabetic() {
+    let same = match input.unmod {
+        Key::Character(s) => text == s.as_str(),
+        Key::Named(NamedKey::Space) => text == " ",
+        _ => false,
+    };
+    if same {
         return None;
     }
     Some(text)
@@ -714,11 +727,14 @@ mod tests {
 
     #[test]
     fn altgr_prints_text_and_super_is_a_chord() {
+        // AltGr+E: the glyph is not the unshifted key.
         let euro = Key::Character("€".into());
-        let mut altgr = ev(&euro, &euro);
+        let e = Key::Character("e".into());
+        let mut altgr = ev(&euro, &e);
         altgr.ctrl = true;
         altgr.alt = true;
         altgr.text = Some("€");
+        altgr.physical = Some(KeyCode::KeyE);
         altgr.mode = TermMode::DISAMBIGUATE_ESC_CODES;
         assert_eq!(encode_input(&altgr).unwrap(), "€".as_bytes());
 
@@ -739,5 +755,127 @@ mod tests {
         sup.physical_letter = Some('c');
         sup.mode = TermMode::DISAMBIGUATE_ESC_CODES;
         assert_eq!(bytes(&sup), "\u{1b}[99;9u");
+    }
+
+    #[test]
+    fn ctrl_alt_matches_the_unmodified_key_is_not_altgr() {
+        let one = Key::Character("1".into());
+        let mut digit = ev(&one, &one);
+        digit.ctrl = true;
+        digit.alt = true;
+        digit.text = Some("1");
+        digit.physical = Some(KeyCode::Digit1);
+        // Protocol off: the legacy encoder drops Ctrl+non-letter. It must
+        // not start typing "1" just because winit's text ignored Ctrl.
+        assert!(encode_input(&digit).is_none());
+        digit.mode = TermMode::DISAMBIGUATE_ESC_CODES;
+        assert_eq!(bytes(&digit), "\u{1b}[49;7u");
+
+        let waw = Key::Character("ؤ".into());
+        let mut arabic = ev(&waw, &waw);
+        arabic.ctrl = true;
+        arabic.alt = true;
+        arabic.text = Some("ؤ");
+        arabic.physical = Some(KeyCode::KeyC);
+        arabic.physical_letter = Some('c');
+        assert!(encode_input(&arabic).is_none());
+        arabic.mode = TermMode::DISAMBIGUATE_ESC_CODES;
+        // fallback on, no alternate flag: the PC-101 chord, not the letter
+        assert_eq!(bytes(&arabic), "\u{1b}[99;7u");
+
+        // And the euro only exists on the kitty path. Protocol off stays
+        // the old encode, which has no text to send for a ctrl character.
+        let euro = Key::Character("€".into());
+        let e = Key::Character("e".into());
+        let mut altgr = ev(&euro, &e);
+        altgr.ctrl = true;
+        altgr.alt = true;
+        altgr.text = Some("€");
+        assert!(encode_input(&altgr).is_none());
+    }
+
+    fn is_csi_u(bytes: &[u8]) -> bool {
+        bytes.len() >= 3 && bytes[0] == 0x1b && bytes[1] == b'[' && bytes.ends_with(b"u")
+    }
+
+    #[test]
+    fn protocol_off_never_emits_csi_u_even_when_mode_bits_are_set() {
+        let armed = TermMode::KITTY_KEYBOARD_PROTOCOL;
+        let masked = mode_for_keys(armed, false);
+        assert!(masked.is_empty() || !masked.intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+
+        let c = Key::Character("c".into());
+        let one = Key::Character("1".into());
+        let waw = Key::Character("ؤ".into());
+        let euro = Key::Character("€".into());
+        let e = Key::Character("e".into());
+        let enter = Key::Named(NamedKey::Enter);
+        let tab = Key::Named(NamedKey::Tab);
+        let space = Key::Named(NamedKey::Space);
+        let up = Key::Named(NamedKey::ArrowUp);
+        let esc = Key::Named(NamedKey::Escape);
+        let bs = Key::Named(NamedKey::Backspace);
+        let f3 = Key::Named(NamedKey::F3);
+
+        let mut cases: Vec<EncodeInput<'_>> = vec![
+            ev(&c, &c),
+            ev(&one, &one),
+            ev(&waw, &waw),
+            ev(&enter, &enter),
+            ev(&tab, &tab),
+            ev(&space, &space),
+            ev(&up, &up),
+            ev(&esc, &esc),
+            ev(&bs, &bs),
+            ev(&f3, &f3),
+        ];
+        cases[0].ctrl = true;
+        cases[0].physical = Some(KeyCode::KeyC);
+        cases[0].physical_letter = Some('c');
+        cases[1].ctrl = true;
+        cases[1].alt = true;
+        cases[1].text = Some("1");
+        cases[1].physical = Some(KeyCode::Digit1);
+        cases[2].ctrl = true;
+        cases[2].alt = true;
+        cases[2].text = Some("ؤ");
+        cases[2].physical = Some(KeyCode::KeyC);
+        cases[2].physical_letter = Some('c');
+        cases[4].ctrl = true;
+        cases[5].ctrl = true;
+        cases[6].shift = true;
+        cases[7].shift = true;
+
+        for input in &mut cases {
+            input.mode = masked;
+            if let Some(bytes) = encode_input(input) {
+                assert!(!is_csi_u(&bytes), "off produced {}", String::from_utf8_lossy(&bytes));
+            }
+            input.released = true;
+            if let Some(bytes) = encode_input(input) {
+                assert!(!is_csi_u(&bytes));
+            }
+            input.released = false;
+        }
+
+        // The same Ctrl+C with the bits left in place is a kitty sequence,
+        // so the mask is what stopped it.
+        let mut ctrl_c = ev(&c, &c);
+        ctrl_c.ctrl = true;
+        ctrl_c.physical = Some(KeyCode::KeyC);
+        ctrl_c.physical_letter = Some('c');
+        ctrl_c.mode = mode_for_keys(armed, true);
+        let on = encode_input(&ctrl_c).unwrap();
+        assert!(is_csi_u(&on));
+
+        // AltGr still produces the glyph once the protocol is actually on.
+        let mut altgr = ev(&euro, &e);
+        altgr.ctrl = true;
+        altgr.alt = true;
+        altgr.text = Some("€");
+        altgr.mode = mode_for_keys(armed, true);
+        assert_eq!(encode_input(&altgr).unwrap(), "€".as_bytes());
+        altgr.mode = masked;
+        assert!(encode_input(&altgr).is_none());
     }
 }

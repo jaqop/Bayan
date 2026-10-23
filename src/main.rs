@@ -1631,7 +1631,7 @@ impl App {
             super_key: m.super_key(),
             repeat: event.repeat,
             released,
-            mode: self.term_mode(),
+            mode: keys::mode_for_keys(self.term_mode(), self.config.kitty_protocol_on()),
             physical_letter: key_letter(event),
             base_layout_fallback: self.config.kitty_base_layout_fallback_on(),
         })
