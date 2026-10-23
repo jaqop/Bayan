@@ -720,6 +720,15 @@ fn feed_counted<T: EventListener>(
 }
 
 fn merge_chunk(dst: &mut ChunkEvents, src: ChunkEvents) {
+    // TODO(rebase onto main after #4): kitty keyboard adds
+    // `ChunkEvents::pty_replies` (`Vec<String>`). Git will not flag this
+    // function as a conflict — #4 fills that vec inside `process_bytes`,
+    // and this loop is the only place two `Bytes` items become one result.
+    // When the field exists, add:
+    //     dst.pty_replies.extend(src.pty_replies);
+    // Otherwise a kitty `CSI ? u` query answered with `CSI ?0u` is dropped
+    // when the BiDi filter splits that read around other output. Add a test
+    // where the split falls between the `CSI ? u` query and that other output.
     if src.clipboard.is_some() {
         dst.clipboard = src.clipboard;
     }
@@ -794,6 +803,10 @@ fn process_bytes<T: EventListener>(
 ///    prompt is ignored.
 /// 3. `Ris` resets bidi after the `ESC c` bytes, so alacritty's reset and
 ///    ours see the same event. `ESC ESC c` and `ESC <C0> c` are RIS too.
+///
+/// `merge_chunk` is what joins those `Bytes` items. After #4 (kitty) is on
+/// main, that function must `extend` `pty_replies` — see the TODO there.
+/// Git will not report a conflict if the line is missing.
 pub(crate) fn process_chunk<T: EventListener>(
     parser: &mut Processor,
     t: &mut Term<T>,
