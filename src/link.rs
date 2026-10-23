@@ -154,7 +154,8 @@ pub enum Action {
     },
     /// `http(s)` whose host needs a look before it opens: userinfo, a
     /// non-ASCII host, a raw host that contains `%`, a label that starts
-    /// with `xn--`, or a non-canonical IPv4 spelling. The card shows `host`
+    /// with `xn--`, a non-canonical IPv4 spelling, or a host longer than
+    /// 64 characters or deeper than four labels. The card shows `host`
     /// in full (the decoded host, punycode when a label is not ASCII, dotted
     /// decimal when the host is an IPv4 address). Enter opens `uri`.
     Confirm {
@@ -642,15 +643,27 @@ fn ends_in_a_number(host: &str) -> bool {
     let Some(last) = parts.last().copied() else {
         return false;
     };
-    if !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()) {
+    if last.is_empty() {
+        return false;
+    }
+    // Decimal digits, including a `0` octal spelling. A value that does not
+    // fit in `u128` is still a number — the IPv4 parser then refuses it.
+    if last.bytes().all(|b| b.is_ascii_digit()) {
         return true;
+    }
+    // `0x` / `0X` and hex digits. The `x` means this is not caught above, and
+    // an overflowing `0xffffffff…` must not fall through as a domain name.
+    let bytes = last.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'0' && (bytes[1] == b'x' || bytes[1] == b'X') {
+        return bytes[2..].iter().all(|b| b.is_ascii_hexdigit());
     }
     parse_ipv4_number(last).is_some()
 }
 
 /// WHATWG IPv4 number: decimal, or `0x` hex, or a leading `0` meaning octal.
-/// `Some(0)` for a bare `0x` / `0`. Failure when a digit is out of radix or
-/// the value does not fit in `u128`.
+/// `Some(0)` for a bare `0x` / `0`. `None` when a digit is out of radix or the
+/// value does not fit in `u128`. Overflow is still numeric: [`ends_in_a_number`]
+/// recognises the `0x`/`0` shape, and [`parse_ipv4`] refuses it.
 fn parse_ipv4_number(input: &str) -> Option<(u128, bool)> {
     if input.is_empty() {
         return None;
@@ -790,8 +803,22 @@ fn host_has_puny_label(host: &str) -> bool {
     })
 }
 
-/// Userinfo, a non-ASCII host, any `%` in the raw host, an `xn--` label, or
-/// an IPv4 address whose spelling is not the canonical dotted form.
+/// One DNS label is at most 63 octets. A host longer than this no longer
+/// fits a status line that keeps the left-hand side, so the registrable
+/// suffix would be the part that disappears.
+const SILENT_HOST_MAX_CHARS: usize = 64;
+/// `www.login.microsoft.com` is four labels. Deeper than that is padding in
+/// front of the real suffix.
+const SILENT_HOST_MAX_LABELS: usize = 4;
+/// Tooltip budget for the host. Past this, characters drop from the left
+/// (`…`) so the registrable suffix stays in the string. The old tooltip
+/// kept 200 characters from the left and hid that suffix.
+const TOOLTIP_HOST_CHARS: usize = 200;
+
+/// Userinfo, a non-ASCII host, any `%` in the raw host, an `xn--` label, a
+/// non-canonical IPv4 spelling, or a host too long or too deep to leave
+/// silent. OSC 8 can paint any label over the URL, so with no card the
+/// tooltip is the only place the real host appears.
 fn host_needs_confirm(auth: &HttpAuthority) -> bool {
     auth.has_userinfo
         || auth.noncanonical_ipv4
@@ -799,6 +826,18 @@ fn host_needs_confirm(auth: &HttpAuthority) -> bool {
         || auth.raw_host.contains('%')
         || host_has_puny_label(&auth.raw_host)
         || host_has_puny_label(&auth.host)
+        || host_too_long_for_silent_open(&auth.host)
+}
+
+/// Longer than [`SILENT_HOST_MAX_CHARS`], or more than
+/// [`SILENT_HOST_MAX_LABELS`] labels. One trailing dot is the DNS root and
+/// is not an extra label.
+fn host_too_long_for_silent_open(host: &str) -> bool {
+    if host.chars().count() > SILENT_HOST_MAX_CHARS {
+        return true;
+    }
+    let bare = host.strip_suffix('.').unwrap_or(host);
+    bare.split('.').filter(|label| !label.is_empty()).count() > SILENT_HOST_MAX_LABELS
 }
 
 /// The name the card shows. ASCII stays as decoded. Anything else is
@@ -1035,17 +1074,52 @@ fn path_query_of(uri: &str) -> String {
     rest[authority.len()..].to_string()
 }
 
-/// Tooltip text. Userinfo, a non-ASCII host, a percent-encoded host, and
-/// an `xn--` label lead with the host that will actually be opened
-/// (decoded, then punycode when a label is not ASCII), so a label of
-/// `good.com` cannot hide `evil.com` and `%65vil` cannot hide `evil`.
+/// The authority's `userinfo@`, or empty when there is none.
+fn userinfo_of(uri: &str) -> String {
+    let Some(scheme) = scheme_name(uri) else {
+        return String::new();
+    };
+    let Some(rest) = uri[scheme.len()..].strip_prefix("://") else {
+        return String::new();
+    };
+    let hostport = rest.split(['/', '?', '#']).next().unwrap_or("");
+    match hostport.rfind('@') {
+        Some(at) => hostport[..=at].to_string(),
+        None => String::new(),
+    }
+}
+
+/// Keep the end of `text`. The leading `…` counts toward `max_chars`.
+fn elide_left_text(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if max_chars == 0 || count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars - 1;
+    let tail: String = text.chars().skip(count - keep).collect();
+    format!("…{tail}")
+}
+
+/// Tooltip text. Built from the host that will actually be opened (decoded,
+/// punycode when a label is not ASCII, dotted decimal for IPv4), then the
+/// path. The host is never cut from the right: past [`TOOLTIP_HOST_CHARS`]
+/// it loses characters from the left, so the registrable suffix stays.
+/// Only the path, query, and fragment are shortened from the right.
 fn host_tooltip(uri: &str) -> String {
-    match http_authority(uri) {
-        Some(auth) if host_needs_confirm(&auth) => {
-            let shown = display_host(&auth.host).unwrap_or(auth.host);
-            preview(&format!("{shown} — {uri}"), 200)
-        }
-        _ => preview(uri, 200),
+    let Some(auth) = http_authority(uri) else {
+        return preview(uri, 200);
+    };
+    let shown = display_host(&auth.host).unwrap_or(auth.host);
+    let host = elide_left_text(&shown, TOOLTIP_HOST_CHARS);
+    let path = preview(&path_query_of(uri), 80);
+    if auth.has_userinfo && host == shown {
+        let userinfo = userinfo_of(uri);
+        format!("{host} — {userinfo}{host}{path}")
+    } else if auth.has_userinfo {
+        let userinfo = userinfo_of(uri);
+        format!("{host} — {userinfo}{path}")
+    } else {
+        format!("{host}{path}")
     }
 }
 
@@ -2401,8 +2475,10 @@ mod tests {
     fn osc8_tooltip_shows_the_uri_not_the_label() {
         let spans = osc_row(b"\x1b]8;;https://evil.example/phish\x07click here\x1b]8;;\x07");
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].tooltip(None), "https://evil.example/phish");
-        assert_ne!(spans[0].tooltip(None), "click here");
+        let tip = spans[0].tooltip(None);
+        assert!(tip.contains("evil.example"), "{tip}");
+        assert!(tip.contains("phish"), "{tip}");
+        assert_ne!(tip, "click here");
         // A bidi override inside the URI is visible as a marker, not as a reorder.
         let spans = osc_row(b"\x1b]8;;https://evil.example/\xE2\x80\xAEhidden\x07x\x1b]8;;\x07");
         let tip = spans[0].tooltip(None);
@@ -3567,13 +3643,15 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        // No userinfo: open, and the tooltip is the URI itself.
+        // No userinfo: open, and the tooltip names the full host.
         assert_eq!(
             plan_uri("https://evil.com/a"),
             Action::Browse("https://evil.com/a".into())
         );
         let plain = links_in_row(&row("https://evil.com/a"));
-        assert_eq!(plain[0].tooltip(None), "https://evil.com/a");
+        let plain_tip = plain[0].tooltip(None);
+        assert!(plain_tip.contains("evil.com"), "{plain_tip}");
+        assert!(plain_tip.ends_with("evil.com/a"), "{plain_tip}");
         // user:pass@host is the same card. The host is after the last @.
         match plan_uri("http://user:secret@good.com@evil.com/x") {
             Action::Confirm { host, .. } => assert_eq!(host, "evil.com"),
@@ -4008,7 +4086,7 @@ mod tests {
             plan_uri("https://example.com/"),
             Action::Browse("https://example.com/".into())
         );
-        assert_eq!(host_tooltip("https://example.com/"), "https://example.com/");
+        assert_eq!(host_tooltip("https://example.com/"), "example.com/");
     }
 
     #[test]
@@ -4305,5 +4383,144 @@ mod tests {
         assert!(card.starts_with("example.com\n"));
         assert!(card.contains('…'));
         assert!(card.matches('p').count() < 200);
+    }
+
+    #[test]
+    fn long_or_deep_host_confirms_and_tooltip_keeps_the_suffix() {
+        // login.microsoft.com. + three 63-char labels + .evil.example = 224.
+        let host = format!(
+            "login.microsoft.com.{}.{}.{}.evil.example",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+        );
+        assert_eq!(host.chars().count(), 224, "{host}");
+        let input = format!("https://{host}/secret");
+        match plan_uri(&input) {
+            Action::Confirm { uri, host: got } => {
+                assert_eq!(got, host);
+                assert!(got.ends_with("evil.example"), "{got}");
+                assert_eq!(uri, input);
+            }
+            other => panic!("{other:?}"),
+        }
+        let tip = host_tooltip(&input);
+        assert!(tip.ends_with("evil.example/secret"), "{tip}");
+        assert!(tip.contains('…'), "{tip}");
+        let tail_at = tip.rfind("evil.example").expect("suffix");
+        let ellipsis_at = tip.find('…').expect("elided");
+        assert!(ellipsis_at < tail_at, "{tip}");
+
+        // Many lengths. At or under 64 characters and at most four labels
+        // still open with no card. Longer than that asks. The tooltip always
+        // keeps the registrable tail.
+        // `.evil.example` is 13 characters, so these lengths are exact.
+        let tail = ".evil.example";
+        for varied in [
+            "evil.example".to_string(),
+            format!("{}{tail}", "d".repeat(32 - tail.len())),
+            format!("{}{tail}", "d".repeat(SILENT_HOST_MAX_CHARS - tail.len())),
+            format!(
+                "{}{tail}",
+                "d".repeat(SILENT_HOST_MAX_CHARS + 1 - tail.len())
+            ),
+            format!("{}{tail}", "d".repeat(100 - tail.len())),
+            format!("{}{tail}", "d".repeat(180 - tail.len())),
+        ] {
+            let uri = format!("https://{varied}/");
+            let chars = varied.chars().count();
+            let labels = varied.split('.').count();
+            let tip = host_tooltip(&uri);
+            assert!(tip.ends_with("evil.example/"), "len {chars} tooltip {tip}");
+            if chars > SILENT_HOST_MAX_CHARS || labels > SILENT_HOST_MAX_LABELS {
+                assert!(
+                    matches!(plan_uri(&uri), Action::Confirm { .. }),
+                    "len {chars} labels {labels} should confirm"
+                );
+            } else {
+                assert!(
+                    matches!(plan_uri(&uri), Action::Browse(_)),
+                    "len {chars} labels {labels} should open"
+                );
+                assert!(
+                    tip.contains(&varied),
+                    "short tooltip dropped the host: {tip}"
+                );
+            }
+        }
+        assert!(matches!(plan_uri("https://a.b.c.d/"), Action::Browse(_)));
+        assert!(matches!(
+            plan_uri("https://a.b.c.d.e/"),
+            Action::Confirm { .. }
+        ));
+        let deep_tip = host_tooltip("https://a.b.c.d.e/x");
+        assert!(deep_tip.contains("a.b.c.d.e"), "{deep_tip}");
+        assert!(deep_tip.ends_with("d.e/x"), "{deep_tip}");
+
+        for (uri, host) in [
+            ("https://github.com/", "github.com"),
+            ("https://docs.rs/", "docs.rs"),
+            ("https://github.com/jaqop/Bayan", "github.com"),
+        ] {
+            assert!(
+                matches!(plan_uri(uri), Action::Browse(_)),
+                "{uri} should open with no card"
+            );
+            let tip = host_tooltip(uri);
+            assert!(tip.contains(host), "{uri} tooltip {tip}");
+            assert!(!tip.contains('…'), "{uri} tooltip {tip}");
+        }
+    }
+
+    #[test]
+    fn ipv4_overflow_is_refused_and_canonical_forms_parse() {
+        assert_eq!(
+            serialize_ipv4(parse_ipv4("0x7f000001").unwrap()),
+            "127.0.0.1"
+        );
+        assert_eq!(serialize_ipv4(parse_ipv4("0X7F.1").unwrap()), "127.0.0.1");
+        assert_eq!(serialize_ipv4(parse_ipv4("0x").unwrap()), "0.0.0.0");
+        match plan_uri("https://0x7f000001/") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(uri, "https://127.0.0.1/");
+            }
+            other => panic!("{other:?}"),
+        }
+        match plan_uri("https://0X7F.1/") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(uri, "https://127.0.0.1/");
+            }
+            other => panic!("{other:?}"),
+        }
+        match plan_uri("https://0x/") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "0.0.0.0");
+                assert_eq!(uri, "https://0.0.0.0/");
+            }
+            other => panic!("{other:?}"),
+        }
+        let overflow_hex = format!("https://0x{}/", "f".repeat(40));
+        let overflow_oct = format!("https://0{}/", "7".repeat(50));
+        for uri in [
+            "https://1.256.1.1/",
+            "https://1.1.1.256/",
+            "https://1.2.3.4.0/",
+            overflow_hex.as_str(),
+            overflow_oct.as_str(),
+        ] {
+            match plan_uri(uri) {
+                Action::Refuse {
+                    reason: RefuseReason::Scheme,
+                    ..
+                } => {}
+                Action::Browse(opened) => panic!("{uri} opened as a name {opened}"),
+                Action::Confirm { uri: opened, host } => {
+                    panic!("{uri} card {host} opened {opened}")
+                }
+                other => panic!("{uri} -> {other:?}"),
+            }
+        }
     }
 }

@@ -1735,7 +1735,11 @@ impl Renderer {
         let y = py + ph - th;
         push_rect(out, rect, px, y, pw, th, c4((0x0d, 0x11, 0x14), 235));
         push_rect(out, rect, px, y, pw, 1, c4(LINK_UNDER, 255));
-        let seg = [Seg::plain(text.to_string(), LINK_UNDER)];
+        // The host sits at the end of this string. Wider than the pane:
+        // drop characters from the left so that suffix stays on screen.
+        let inner = (pw as f32 - 16.0).max(8.0);
+        let shown = self.elide_left(text, inner, LINK_UNDER);
+        let seg = [Seg::plain(shown, LINK_UNDER)];
         self.draw_run(&seg, false, out, rect, (px + 8) as f32, y + 2, 1.0);
     }
 
