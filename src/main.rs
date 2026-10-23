@@ -8,6 +8,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod bidi;
+mod bidi_ctl;
 mod plugins;
 mod posh;
 mod shells;
@@ -20,12 +21,23 @@ mod link;
 mod mouse;
 mod toast;
 mod render;
+mod osc7;
 mod term;
 
 /// rgb -> "#rrggbb" for the config file.
 fn hex((r, g, b): (u8, u8, u8)) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
 }
+
+/// Meta copied off a pane before the term lock: command marks in grid
+/// space, the running command, the BiDi snapshot, and evicted lines.
+/// The `Arc` is the snapshot. Cloning it does not copy the stamp list.
+type PaneSnap = (
+    Vec<(usize, Option<i32>)>,
+    String,
+    std::sync::Arc<bidi_ctl::BidiState>,
+    u64,
+);
 
 /// The Windows caret rhythm; kitty's idea on top: stop after 15s idle.
 const BLINK_MS: u128 = 530;
@@ -237,7 +249,7 @@ pub enum UserEvent {
     /// `allow_osc52_write` says so — the default is to drop it, and a write
     /// from any pane but the focused one of the active tab is dropped too.
     ClipboardSet(u64, String),
-    /// Pane `id`'s shell reported its working directory (OSC 9;9).
+    /// Pane `id`'s shell reported its working directory (OSC 7 or OSC 9;9).
     Cwd(u64, String),
     /// Pane `id` rang the bell (Claude waiting for an approval).
     Bell(u64),
@@ -892,10 +904,11 @@ impl App {
         use keybinds::Action::*;
         match action {
             NewTab => {
-                // new tab inherits the active tab's directory
+                // new tab inherits the active pane's directory, and only if
+                // that directory exists — a stale OSC 7 must not become the cwd
                 let cwd = self
                     .session()
-                    .and_then(|s| s.meta.lock().unwrap().cwd.clone());
+                    .and_then(|s| s.meta.lock().unwrap().spawn_cwd());
                 self.spawn_tab(cwd);
                 self.update_title();
                 self.request_redraw();
@@ -1483,7 +1496,7 @@ impl App {
         }
         let cwd = self
             .session()
-            .and_then(|s| s.meta.lock().unwrap().cwd.clone());
+            .and_then(|s| s.meta.lock().unwrap().spawn_cwd());
         let Some(pane) = self.spawn_pane(cwd.as_deref()) else { return };
         if let Some(t) = self.tabs.get_mut(self.active) {
             if t.panes.len() == 1 {
@@ -1686,17 +1699,34 @@ impl App {
     /// Claude mode: auto = a full-screen TUI is active AND the command that
     /// started it is Claude itself (vim/less emit logical Arabic — never
     /// reverse those). F2 overrides manually.
+    ///
+    /// Explicit BDSM (`CSI 8 l`), when `bidi.honor_bdsm` is set, wins over
+    /// both: the application already ordered the text, so this pane does
+    /// not reorder.
     fn claude_active(&self) -> bool {
-        if !self.auto_follow {
-            return self.claude_manual;
-        }
         let Some(s) = self.session() else {
             return false;
         };
-        if !self.term_mode().contains(TermMode::ALT_SCREEN) {
+        // term first, then meta — the crate's lock order
+        let alt = s.term.lock().unwrap().mode().contains(TermMode::ALT_SCREEN);
+        let (bidi_state, running) = {
+            let m = s.meta.lock().unwrap();
+            (m.bidi.clone(), m.running_cmd.clone())
+        };
+        // Idle explicit mode (a command that forgot to reset) must not
+        // suppress restoration at the prompt. A live explicit mode still does.
+        let (reorder, _) = bidi_state.for_display(
+            self.config.honor_bdsm(),
+            !running.is_empty(),
+            alt,
+        );
+        if !reorder {
             return false;
         }
-        bidi::cmd_is_claude(&s.meta.lock().unwrap().running_cmd)
+        if !self.auto_follow {
+            return self.claude_manual;
+        }
+        alt && bidi::cmd_is_claude(&running)
     }
 
     /// Pixel position -> (pane index, viewport row, col, cell side).
@@ -1819,13 +1849,19 @@ impl App {
     ) -> Option<(u64, usize, usize)> {
         // copy what the locks need, then drop the pane borrow so the term
         // lock below can re-borrow the tab
-        let (pane_id, running) = {
+        let (pane_id, running, bidi_state, evicted) = {
             let pane = self.tabs.get(self.active)?.panes.get(hit.pane)?;
-            let running = pane.session.meta.lock().unwrap().running_cmd.clone();
-            (pane.id, running)
+            let m = pane.session.meta.lock().unwrap();
+            (
+                pane.id,
+                m.running_cmd.clone(),
+                m.bidi.clone(),
+                m.evicted,
+            )
         };
         let (auto, manual) = (self.auto_follow, self.claude_manual);
-        let (cols, row, cells, claude, vis) = {
+        let honor = self.config.honor_bdsm();
+        let (cols, row, cells, claude, vis, reorder, dir) = {
             let t = self.tabs[self.active].panes[hit.pane]
                 .session
                 .term
@@ -1834,20 +1870,37 @@ impl App {
             let cols = t.columns().max(1);
             let rows = t.screen_lines().max(1);
             let row = hit.row.min(rows - 1);
-            let claude = if !auto {
-                manual
+            // Explicit BDSM draws Arabic on the grid, so the click column
+            // is x / cell_w. Implicit mode uses the same plan as the painter,
+            // SCP mark included. Neither applies once the command has ended
+            // and the pane is back on the primary screen.
+            let alt = t.mode().contains(TermMode::ALT_SCREEN);
+            let (reorder, use_stamps) =
+                bidi_state.for_display(honor, !running.is_empty(), alt);
+            let claude = reorder
+                && if !auto {
+                    manual
+                } else {
+                    alt && bidi::cmd_is_claude(&running)
+                };
+            let history = t.grid().history_size() as u64;
+            let off = t.grid().display_offset() as u64;
+            let dir = if use_stamps {
+                bidi_state.direction_at(bidi_ctl::viewport_line_abs(
+                    evicted, history, off, row as u64,
+                ))
             } else {
-                t.mode().contains(TermMode::ALT_SCREEN) && bidi::cmd_is_claude(&running)
+                bidi_ctl::ParagraphDir::Default
             };
             let cells = render::snapshot_row(&t, row);
-            (cols, row, cells, claude, hit.col.min(cols - 1))
+            (cols, row, cells, claude, hit.col.min(cols - 1), reorder, dir)
         };
-        let col = if cells.iter().any(|c| render::is_arabic(c.c)) {
+        let col = if reorder && cells.iter().any(|c| render::is_arabic(c.c)) {
             let rect = rects.get(hit.pane).copied().unwrap_or((0, 0, 1, 1));
             let x = (pos.x - rect.0 as f64) as f32;
             self.renderer
                 .as_mut()
-                .and_then(|r| r.logical_column_for(&cells, x, rect.2, claude, cols))
+                .and_then(|r| r.logical_column_for(&cells, x, rect.2, claude, dir, cols))
                 .unwrap_or(vis)
         } else {
             vis
@@ -2523,7 +2576,7 @@ impl App {
                     let focused = pi == tab.focused;
                     // meta snapshot BEFORE the term lock (lock order term>meta
                     // only applies when holding both; here they don't overlap)
-                    let (marks, running_cmd): (Vec<(usize, Option<i32>)>, String) = {
+                    let (marks, running_cmd, bidi_state, evicted): PaneSnap = {
                         let m = pane.session.meta.lock().unwrap();
                         (
                             // global -> grid space: subtract the evictions
@@ -2533,19 +2586,44 @@ impl App {
                                 .map(|c| ((c.abs - m.evicted) as usize, c.exit))
                                 .collect(),
                             m.running_cmd.clone(),
+                            m.bidi.clone(),
+                            m.evicted,
                         )
                     };
                     let t = pane.session.term.lock().unwrap();
-                    // Claude mode is a per-PANE fact: this pane's TUI + command
-                    let claude_pane = if !auto_follow {
-                        claude_manual
-                    } else {
-                        t.mode().contains(TermMode::ALT_SCREEN)
-                            && bidi::cmd_is_claude(&running_cmd)
-                    };
+                    // Explicit BDSM suppresses reordering for the whole pane,
+                    // Claude restoration included, and only while the command
+                    // is running or the alt screen is up. honor_bdsm defaults on.
+                    // The Arc is the frame's snapshot: cloning it does not copy
+                    // the stamp list.
+                    let alt = t.mode().contains(TermMode::ALT_SCREEN);
+                    let (reorder, use_stamps) = bidi_state.for_display(
+                        self.config.honor_bdsm(),
+                        !running_cmd.is_empty(),
+                        alt,
+                    );
+                    let claude_pane = reorder
+                        && if !auto_follow {
+                            claude_manual
+                        } else {
+                            alt && bidi::cmd_is_claude(&running_cmd)
+                        };
                     if focused {
                         focused_claude = claude_pane;
                     }
+                    let history = t.grid().history_size() as u64;
+                    let off = t.grid().display_offset() as u64;
+                    let line_dir: Vec<bidi_ctl::ParagraphDir> = if use_stamps {
+                        (0..t.screen_lines())
+                            .map(|li| {
+                                bidi_state.direction_at(bidi_ctl::viewport_line_abs(
+                                    evicted, history, off, li as u64,
+                                ))
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     let (link_hover, link_tip) = match &self.link_hover {
                         Some(h) if h.pane_id == pane.id => (
                             Some((h.row, h.start_col, h.end_col)),
@@ -2560,6 +2638,8 @@ impl App {
                         cursor_on,
                         bordered,
                         claude: claude_pane,
+                        reorder,
+                        line_dir: &line_dir,
                         search_match: if focused {
                             self.search.as_ref().and_then(|s| s.hl.as_ref())
                         } else {

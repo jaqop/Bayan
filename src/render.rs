@@ -26,6 +26,7 @@ use cosmic_text::{
     SwashContent, Weight, Wrap,
 };
 
+use crate::bidi_ctl::{base_direction_mark, ParagraphDir};
 use crate::gpu::Vertex;
 use crate::term::EventProxy;
 
@@ -619,6 +620,11 @@ pub struct PaneView<'a> {
     pub bordered: bool,
     /// Claude mode for THIS pane's content.
     pub claude: bool,
+    /// False when explicit BDSM is honored: cells are already in visual
+    /// order, so Arabic rows take the grid path and are not reordered.
+    pub reorder: bool,
+    /// SCP paragraph direction for each viewport row (index = row).
+    pub line_dir: &'a [ParagraphDir],
     /// The current search hit (focused pane only).
     pub search_match: Option<&'a std::ops::RangeInclusive<alacritty_terminal::index::Point>>,
     /// Command blocks: (absolute prompt line, exit code) — gutter lights.
@@ -749,6 +755,7 @@ fn bidi_plan(
     claude: bool,
     default_fg: (u8, u8, u8),
     cursor_col: Option<usize>,
+    dir: ParagraphDir,
 ) -> Option<BidiPlan> {
     let mut end = cells.len();
     while end > 0 && cells[end - 1].c == ' ' {
@@ -799,7 +806,7 @@ fn bidi_plan(
     // Restore logical so cosmic-text's BiDi shows it right. Per-cell
     // colors can't survive the reordering (EasyTer draws these lines in
     // the default FG too), and the cursor byte-mapping no longer holds.
-    let byte_cols = if claude {
+    let mut byte_cols = if claude {
         if let Some((fixed, idx)) = crate::bidi::restore_bidi_map(&full) {
             segs = vec![Seg::plain(fixed.clone(), default_fg)];
             cur_bytes = None;
@@ -822,6 +829,26 @@ fn bidi_plan(
     } else {
         byte_cols_of(&full, &char_cols)
     };
+    // SCP base direction. Only a non-default direction prepends a mark,
+    // so an ordinary Arabic row keeps the cache key it had before SCP.
+    // The mark is not a cell; it maps to the first real column so a
+    // click on a cluster that absorbed it still hits that cell.
+    if let Some(mark) = base_direction_mark(dir) {
+        let n = mark.len_utf8();
+        let first_col = byte_cols.first().map(|&(_, _, c)| c).unwrap_or(0);
+        if let Some(seg) = segs.first_mut() {
+            seg.text.insert(0, mark);
+        }
+        if let Some((a, b)) = cur_bytes.as_mut() {
+            *a += n;
+            *b += n;
+        }
+        for (start, end, _) in &mut byte_cols {
+            *start += n;
+            *end += n;
+        }
+        byte_cols.insert(0, (0, n, first_col));
+    }
     Some(BidiPlan {
         segs,
         cursor_bytes: cur_bytes,
@@ -1264,9 +1291,10 @@ impl Renderer {
         cells: &[CellInfo],
         claude: bool,
         cursor_col: Option<usize>,
+        dir: ParagraphDir,
         hover: Option<(usize, usize)>,
     ) -> Option<(i32, i32)> {
-        let plan = bidi_plan(cells, claude, self.fg, cursor_col)?;
+        let plan = bidi_plan(cells, claude, self.fg, cursor_col, dir)?;
         // shape unconstrained (cached), then compress to the pane on overflow
         let natw = self.measure(&plan.segs, true);
         let scale = if natw > pane_w as f32 {
@@ -1346,6 +1374,7 @@ impl Renderer {
         x_in_pane: f32,
         pane_w: i32,
         claude: bool,
+        dir: ParagraphDir,
         grid_cols: usize,
     ) -> Option<usize> {
         if !cells.iter().any(|c| is_arabic(c.c)) {
@@ -1369,7 +1398,7 @@ impl Renderer {
                 }
             })
             .collect();
-        let plan = bidi_plan(&infos, claude, self.fg, None)?;
+        let plan = bidi_plan(&infos, claude, self.fg, None, dir)?;
         let natw = self.measure(&plan.segs, true);
         let scale = if natw > pane_w as f32 {
             pane_w as f32 / natw
@@ -1594,11 +1623,18 @@ impl Renderer {
             let hover = view
                 .link_hover
                 .and_then(|(row, a, b)| (row == li).then_some((a, b)));
-            if cells.iter().any(|ci| is_arabic(ci.c)) {
+            // Explicit BDSM: the application sent visual order (and, per the
+            // recommendation, presentation forms). The grid path does not
+            // run UAX#9 and does not reshape. Implicit mode keeps the
+            // whole-line shaper, with SCP's base direction if one was set.
+            let arabic = cells.iter().any(|ci| is_arabic(ci.c));
+            if arabic && view.reorder {
                 let on_row = cursor_vrow >= 0 && cursor_vrow as usize == li;
+                let dir = view.line_dir.get(li).copied().unwrap_or_default();
                 let r = self.draw_line_bidi(out, clip, px, y, pw, cells,
                                             view.claude,
                                             if on_row { Some(ccol) } else { None },
+                                            dir,
                                             hover);
                 if r.is_some() {
                     cursor_rect = r;
@@ -2910,7 +2946,7 @@ mod tests {
                 .collect()
         };
         // non-Claude: the grid IS logical, byte 0 is column 0
-        let logical = bidi_plan(&cells("مرحبا"), false, (1, 1, 1), None).unwrap();
+        let logical = bidi_plan(&cells("مرحبا"), false, (1, 1, 1), None, ParagraphDir::Default).unwrap();
         assert_eq!(logical.byte_cols[0].2, 0);
         assert_eq!(logical.byte_cols.last().unwrap().2, 4);
         assert_eq!(logical.first_blank, 5);
@@ -2919,7 +2955,7 @@ mod tests {
         // Restoration yields مرحبا; its first char (م) is grid column 4
         // and its last char (ا) is grid column 0 — the left of the screen
         // once cosmic-text shapes the restored line.
-        let claude = bidi_plan(&cells("ابحرم"), true, (1, 1, 1), None).unwrap();
+        let claude = bidi_plan(&cells("ابحرم"), true, (1, 1, 1), None, ParagraphDir::Default).unwrap();
         assert_eq!(claude.segs.len(), 1);
         assert_eq!(claude.segs[0].text, "مرحبا");
         assert_eq!(claude.byte_cols[0].2, 4);
@@ -2936,9 +2972,25 @@ mod tests {
             fg: (0, 0, 0),
             style: 0,
         });
-        let plan = bidi_plan(&padded, false, (1, 1, 1), Some(0)).unwrap();
+        let plan = bidi_plan(&padded, false, (1, 1, 1), Some(0), ParagraphDir::Default).unwrap();
         assert_eq!(plan.first_blank, 5);
         assert_eq!(plan.cursor_bytes, Some((0, "م".len())));
+
+        // SCP's RLM sits in front of the line. Cursor bytes and the column
+        // map shift by the mark; the mark itself names the first cell.
+        let rtl = bidi_plan(
+            &cells("مرحبا"),
+            false,
+            (1, 1, 1),
+            Some(0),
+            ParagraphDir::Rtl,
+        )
+        .unwrap();
+        let n = '\u{200F}'.len_utf8();
+        assert!(rtl.segs[0].text.starts_with('\u{200F}'));
+        assert_eq!(rtl.cursor_bytes, Some((n, n + "م".len())));
+        assert_eq!(rtl.byte_cols[0], (0, n, 0));
+        assert_eq!(rtl.byte_cols[1].2, 0);
     }
 
     /// The line classifier: Arabic rows take the BiDi path, others the grid.
