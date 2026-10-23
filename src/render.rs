@@ -2537,7 +2537,13 @@ impl Renderer {
         push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 150));
         let w = ((self.cell_w * 62.0) as i32).min(fw as i32 - 80);
         let pad = 18;
-        let h = (self.cell_h * 4.0) as i32 + pad * 2 + 12;
+        // Host on its own line. A second line is the path/query only.
+        let (host_line, rest_line) = match target.split_once('\n') {
+            Some((host, rest)) => (host, Some(rest)),
+            None => (target, None),
+        };
+        let extra = if rest_line.is_some() { 1.0 } else { 0.0 };
+        let h = (self.cell_h * (4.0 + extra)) as i32 + pad * 2 + 12;
         let x = (fw as i32 - w) / 2;
         let y = self.tab_bar_h() as i32 + (fh as i32 - h) / 3;
         let accent = if may_open {
@@ -2555,16 +2561,67 @@ impl Renderer {
             style: ST_BOLD,
         }];
         self.draw_run(&title, true, out, whole, (x + pad) as f32, y + pad, 1.0);
-        let dest = [Seg::plain(target.to_string(), (0xf2, 0xcc, 0x60))];
+        // Wider than the card: drop characters from the left so the
+        // registrable suffix stays visible. Refuse cards are unchanged.
+        let host_color = (0xf2, 0xcc, 0x60);
+        let inner = (w - pad * 2 - 2).max(8) as f32;
+        let host_draw = if may_open {
+            self.elide_left(host_line, inner, host_color)
+        } else {
+            host_line.to_string()
+        };
+        let dest = [Seg::plain(host_draw, host_color)];
         self.draw_run(&dest, false, out, whole, (x + pad) as f32,
                       y + pad + self.cell_h as i32, 1.0);
+        let keys_at = if let Some(rest) = rest_line {
+            let path = [Seg::plain(rest.to_string(), (0xc5, 0xcd, 0xd6))];
+            self.draw_run(&path, false, out, whole, (x + pad) as f32,
+                          y + pad + (self.cell_h * 2.0) as i32, 1.0);
+            3.0
+        } else {
+            2.0
+        };
         let (ar, en) = crate::link::card_key_lines(may_open);
         let keys_ar = [Seg::plain(ar.to_string(), (0x9a, 0xa4, 0xb2))];
         self.draw_run(&keys_ar, true, out, whole, (x + pad) as f32,
-                      y + pad + (self.cell_h * 2.0) as i32 + 4, 1.0);
+                      y + pad + (self.cell_h * keys_at) as i32 + 4, 1.0);
         let keys_en = [Seg::plain(en.to_string(), (0x6e, 0x78, 0x85))];
         self.draw_run(&keys_en, true, out, whole, (x + pad) as f32,
-                      y + pad + (self.cell_h * 3.0) as i32 + 6, 1.0);
+                      y + pad + (self.cell_h * (keys_at + 1.0)) as i32 + 6, 1.0);
+    }
+
+    /// Keep the end of `text` when it is wider than `max_w`. Stable for a
+    /// given width, so the shaped-run cache hits on the next frame.
+    fn elide_left(&mut self, text: &str, max_w: f32, fg: (u8, u8, u8)) -> String {
+        let fits = |r: &mut Self, s: &str| {
+            let seg = [Seg::plain(s, fg)];
+            r.measure(&seg, false) <= max_w
+        };
+        if text.is_empty() || fits(self, text) {
+            return text.to_string();
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let mut lo = 0usize;
+        let mut hi = chars.len();
+        let mut best = 0usize;
+        while lo <= hi {
+            let mid = (lo + hi) / 2;
+            let suffix: String = chars[chars.len() - mid..].iter().collect();
+            let candidate = format!("…{suffix}");
+            if fits(self, &candidate) {
+                best = mid;
+                if mid == chars.len() {
+                    break;
+                }
+                lo = mid + 1;
+            } else if mid == 0 {
+                break;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let suffix: String = chars[chars.len() - best..].iter().collect();
+        format!("…{suffix}")
     }
 
     /// The paste guard (EasyTer's protection): a multi-line/huge paste, or a
