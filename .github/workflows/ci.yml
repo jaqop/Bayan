@@ -23,7 +23,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --all-targets
-      # The 58 tests are pure unit tests — no GPU, no window, no PTY spawn —
+      # The tests are pure unit tests — no GPU, no window, no PTY spawn —
       # so they run headless. Note config.rs's tests read ~/.bayan/config.json
       # if it exists; a CI runner has none, which is why they are reliable
       # here and need the file removed when running locally.
