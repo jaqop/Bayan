@@ -494,7 +494,9 @@ fn file_uri_path(uri: &str) -> Option<String> {
 
 /// Host of an `http(s)` URI, and whether userinfo (`@`) was present.
 /// The host is the part after the last `@`, so `good.com@evil.com` is
-/// `evil.com`.
+/// `evil.com`. The host is percent-decoded once before it is returned, so
+/// `https://%D0%B0pple.com/` is the Cyrillic homograph. A `%` that is still
+/// there after that decode is not a hostname.
 fn http_authority(uri: &str) -> Option<(String, bool)> {
     let scheme = scheme_name(uri)?;
     if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
@@ -516,11 +518,27 @@ fn http_authority(uri: &str) -> Option<(String, bool)> {
     } else {
         host.split(':').next().unwrap_or(host)
     };
-    if host.is_empty() || host == "." {
-        None
-    } else {
-        Some((host.to_string(), has_userinfo))
+    let host = decode_http_host(host)?;
+    Some((host, has_userinfo))
+}
+
+/// One percent-decode, then the non-ASCII check in [`plan_uri`]. A leftover
+/// `%` is rejected. A colon that the decode introduced is a smuggled port;
+/// an IPv6 literal already contained its colons.
+fn decode_http_host(raw: &str) -> Option<String> {
+    let host = percent_decode(raw)?;
+    if host.is_empty() || host == "." || host.contains('%') {
+        return None;
     }
+    if host.chars().any(|c| {
+        c.is_whitespace() || is_forbidden(c) || matches!(c, '/' | '\\' | '@' | '?' | '#')
+    }) {
+        return None;
+    }
+    if host.contains(':') && !raw.contains(':') {
+        return None;
+    }
+    Some(host)
 }
 
 /// RFC 3492 punycode of one label, without the `xn--` prefix.
@@ -841,10 +859,9 @@ fn is_shell_program(prog: &str) -> bool {
 
 /// Extensions `ShellExecuteW` `"open"` may receive. Source files are not
 /// here: a `path:line` link goes to the editor, and a bare `file` URI of
-/// a source file is revealed.
+/// a source file is revealed. `.svg` and `.csv` are revealed too.
 const ALLOWED_EXTS: &[&str] = &[
-    ".txt", ".md", ".log", ".json", ".csv", ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp",
-    ".bmp", ".svg",
+    ".txt", ".md", ".log", ".json", ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
 ];
 
 /// Filename used for the extension check. Trailing dots and spaces are
@@ -2759,6 +2776,8 @@ mod tests {
             ".vhd",
             ".vhdx",
             ".foo",
+            ".csv",
+            ".svg",
             "",
         ];
         for ext in exts {
@@ -3245,8 +3264,8 @@ mod tests {
     #[test]
     fn association_allowlist_opens_only_documents_and_media() {
         for ext in [
-            ".txt", ".md", ".log", ".json", ".csv", ".pdf", ".png", ".jpg", ".jpeg", ".gif",
-            ".webp", ".bmp", ".svg",
+            ".txt", ".md", ".log", ".json", ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp",
+            ".bmp",
         ] {
             let uri = format!("file:///C:/qa/note{ext}");
             match plan_uri(&uri) {
@@ -3268,6 +3287,19 @@ mod tests {
             }
             let upper = format!("file:///C:/qa/note{}", ext.to_ascii_uppercase());
             assert!(matches!(plan_uri(&upper), Action::OpenPath(_)), "{upper}");
+        }
+        for ext in [".csv", ".svg"] {
+            for uri in [
+                format!("file:///C:/qa/note{ext}"),
+                format!("file:///C:/qa/note{}", ext.to_ascii_uppercase()),
+            ] {
+                assert!(
+                    matches!(plan_uri(&uri), Action::Reveal(_)),
+                    "{uri} -> {:?}",
+                    plan_uri(&uri)
+                );
+                assert!(!matches!(plan_uri(&uri), Action::OpenPath(_)), "{uri}");
+            }
         }
     }
 
@@ -3443,5 +3475,107 @@ mod tests {
         assert_eq!(card_decision(true, false, true), CardDecision::Open);
         assert_eq!(card_decision(true, false, false), CardDecision::Dismiss);
         assert_eq!(card_decision(false, true, true), CardDecision::Dismiss);
+    }
+
+    /// Already rejected by `file_uri_path` before any stat or `ShellExecuteW`.
+    /// No `OpenPath`, and no reveal of a network path.
+    fn assert_file_link_refused(uri: &str) {
+        assert!(
+            file_uri_path(uri).is_none(),
+            "decoded a path from {uri}: {:?}",
+            file_uri_path(uri)
+        );
+        match plan_uri(uri) {
+            Action::Refuse {
+                reason: RefuseReason::BadFile,
+                ..
+            } => {}
+            Action::OpenPath(path) => panic!("{uri} OpenPath {path}"),
+            Action::Reveal(path) => panic!("{uri} revealed {path}"),
+            other => panic!("{uri} -> {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_five_slash_unc_is_refused() {
+        assert_file_link_refused("file://///evil.example/share/secret");
+    }
+
+    #[test]
+    fn file_localhost_encoded_slashes_are_refused() {
+        assert_file_link_refused("file://localhost/%2F%2Fevil.example/share/x");
+    }
+
+    #[test]
+    fn file_empty_host_encoded_slashes_are_refused() {
+        assert_file_link_refused("file:///%2F%2Fevil.example/share/x");
+    }
+
+    #[test]
+    fn file_localhost_encoded_backslashes_are_refused() {
+        assert_file_link_refused("file://localhost/%5C%5Cevil.example/share/x");
+    }
+
+    #[test]
+    fn file_unc_variants_are_refused() {
+        for uri in [
+            "file://localhost/%2f%2fevil.example/share/x.txt",
+            "file://localhost/%2F%2fevil.example/share/x",
+            "file://localhost/%5c%5cevil.example/share/x.txt",
+            "file:///%2f%5cEvil.example/share/x.txt",
+            "file://localhost/%5C%2Fevil.example/share/x",
+            "file://localhost/%252F%252Fevil.example/share/x.txt",
+            "file:///%252F%252Fevil.example/share/x",
+            "file://localhost/%255C%255Cevil.example/share/x.txt",
+            r"file:///\\evil.example\share\secret",
+            r"file://localhost/\\evil.example\share\x",
+            r"file:///\evil.example\share\x.txt",
+            "file:////evil.example/share/secret",
+            "file:////evil.example/share/secret.txt",
+            "file://////evil.example/share/secret.txt",
+            "file://?/UNC/evil.example/share/x",
+            "file://?/UNC/evil.example/share/x.txt",
+            "file:///?/UNC/evil.example/share/x.txt",
+            r"file:///\\?\UNC\evil.example\share\x.txt",
+            r"file:///\??\UNC\evil\s",
+        ] {
+            assert_file_link_refused(uri);
+        }
+    }
+
+    #[test]
+    fn percent_encoded_host_confirms_with_punycode() {
+        match plan_uri("https://%D0%B0pple.com/") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "xn--pple-43d.com");
+                assert_eq!(uri, "https://xn--pple-43d.com/");
+                assert!(!uri.to_ascii_lowercase().contains("%d0%b0"), "{uri}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let tip = host_tooltip("https://%D0%B0pple.com/");
+        assert!(tip.starts_with("xn--pple-43d.com"), "{tip}");
+        match plan_uri("http://good.com@%D0%B0pple.com/a") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "xn--pple-43d.com");
+                assert_eq!(uri, "http://good.com@xn--pple-43d.com/a");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            plan_uri("https://100%.example/"),
+            Action::Refuse {
+                reason: RefuseReason::Scheme,
+                ..
+            }
+        ));
+        assert_eq!(
+            plan_uri("https://apple%2ecom/a"),
+            Action::Browse("https://apple%2ecom/a".into())
+        );
+        assert_eq!(
+            plan_uri("https://[::1]/"),
+            Action::Browse("https://[::1]/".into())
+        );
     }
 }
