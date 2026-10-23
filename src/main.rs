@@ -15,6 +15,7 @@ mod config;
 mod gpu;
 mod keybinds;
 mod keys;
+mod link;
 mod mouse;
 mod toast;
 mod render;
@@ -241,6 +242,23 @@ pub enum UserEvent {
     CommandFinished(u64, bool),
     /// Pane `id`'s shell exited.
     Exit(u64),
+}
+
+/// The link under the pointer. Stable while the pointer stays inside it,
+/// so a hover does not rebuild the frame on every pixel.
+#[derive(PartialEq, Eq)]
+struct LinkHover {
+    pane_id: u64,
+    row: usize,
+    start_col: usize,
+    end_col: usize,
+    target: String,
+}
+
+/// A Ctrl+click that was refused. Esc (and Enter) dismiss; neither opens.
+struct BlockedLink {
+    reason: String,
+    shown: String,
 }
 
 /// Buttons captured for mouse reporting. A bit per button so a chord
@@ -497,6 +515,10 @@ struct App {
     pending_paste: Option<String>,
     /// a close awaiting Enter/Esc (a command is still running)
     pending_close: Option<CloseTarget>,
+    /// link under the pointer: underline + the target in the pane status
+    link_hover: Option<LinkHover>,
+    /// a refused link (bad scheme, bidi, too long). Dismissed, never opened.
+    blocked_link: Option<BlockedLink>,
     /// last keystroke sent to a PTY — the cursor blinks for 15s after it,
     /// then parks solid so an idle window stops re-rendering (M14's win)
     last_input: Instant,
@@ -1789,6 +1811,123 @@ impl App {
             || self.cockpit
             || self.palette.is_some()
             || self.posh.is_some()
+            || self.blocked_link.is_some()
+    }
+
+    fn clear_link_hover(&mut self) {
+        if self.link_hover.take().is_some() {
+            self.request_redraw();
+        }
+    }
+
+    /// Working directory for a relative file link. OSC 9;9 fills it today;
+    /// OSC 7 (PR5) writes the same field and this is the only reader.
+    fn pane_link_cwd(&self, id: u64) -> Option<String> {
+        let (ti, pi) = self.find_pane(id)?;
+        let raw = self.tabs[ti].panes[pi].session.meta.lock().unwrap().cwd.clone();
+        link::cwd_hook(raw.as_deref()).map(str::to_string)
+    }
+
+    fn links_on(&self, id: u64, row: usize) -> Vec<link::LinkSpan> {
+        let Some((ti, pi)) = self.find_pane(id) else {
+            return Vec::new();
+        };
+        let term = self.tabs[ti].panes[pi].session.term.lock().unwrap();
+        link::links_on_row(&term, row)
+    }
+
+    /// Recompute the hover from `pos`. Returns the logical cell so mouse
+    /// motion can be reported without a second hit-test. `None` when the
+    /// pointer is not over a pane.
+    fn refresh_link_hover(
+        &mut self,
+        pos: PhysicalPosition<f64>,
+    ) -> Option<(u64, usize, usize)> {
+        if self.overlay_blocks_mouse() {
+            self.clear_link_hover();
+            return None;
+        }
+        let Some((pane, id, row, col)) = self.locate(pos) else {
+            self.clear_link_hover();
+            return None;
+        };
+        let _ = pane;
+        let spans = self.links_on(id, row);
+        if let Some(span) = spans.into_iter().find(|s| s.contains(col)) {
+            let cwd = self.pane_link_cwd(id);
+            let next = LinkHover {
+                pane_id: id,
+                row,
+                start_col: span.start_col,
+                end_col: span.end_col,
+                target: span.tooltip(cwd.as_deref()),
+            };
+            if self.link_hover.as_ref() != Some(&next) {
+                self.link_hover = Some(next);
+                self.request_redraw();
+            }
+        } else {
+            self.clear_link_hover();
+        }
+        Some((id, row, col))
+    }
+
+    /// Ctrl+click. True when the cell is a link, whether or not it opened:
+    /// the program does not also hear the click, and it does not start a
+    /// selection. A refused target raises the card instead.
+    fn activate_link_at(&mut self, pos: PhysicalPosition<f64>) -> bool {
+        if self.overlay_blocks_mouse() {
+            return false;
+        }
+        let Some((pane, id, row, col)) = self.locate(pos) else {
+            return false;
+        };
+        let spans = self.links_on(id, row);
+        let Some(span) = spans.into_iter().find(|s| s.contains(col)) else {
+            return false;
+        };
+        self.focus_pane_at(pane);
+        self.sync_focus();
+        let cwd = self.pane_link_cwd(id);
+        let code = link::find_code_exe();
+        let code_s = code.as_ref().map(|p| p.to_string_lossy().into_owned());
+        match span.activate(cwd.as_deref(), self.config.editor.as_deref(), code_s.as_deref()) {
+            link::Action::Browse(uri) => {
+                if !link::shell_execute(&uri) {
+                    self.refuse_link(link::RefuseReason::Editor, &uri);
+                }
+            }
+            link::Action::OpenPath(path) => {
+                if !link::shell_execute(&path) {
+                    self.refuse_link(link::RefuseReason::Editor, &path);
+                }
+            }
+            link::Action::Edit {
+                argv,
+                fallback_path,
+            } => {
+                if link::spawn_editor(&argv).is_err() {
+                    if let Some(path) = fallback_path {
+                        if !link::shell_execute(&path) {
+                            self.refuse_link(link::RefuseReason::Editor, &path);
+                        }
+                    } else {
+                        let shown = argv.join(" ");
+                        self.refuse_link(link::RefuseReason::Editor, &shown);
+                    }
+                }
+            }
+            link::Action::Refuse { reason, shown } => self.refuse_link(reason, &shown),
+        }
+        true
+    }
+
+    fn refuse_link(&mut self, reason: link::RefuseReason, shown: &str) {
+        self.blocked_link = Some(BlockedLink {
+            reason: reason.label().to_string(),
+            shown: link::preview(shown, 160),
+        });
+        self.request_redraw();
     }
 
     /// Press in a tracking mode, and not Shift (Shift keeps the gesture
@@ -1878,13 +2017,10 @@ impl App {
         self.send_mouse(pane_id, mouse::Phase::Move, button, row, col, proto.sgr);
     }
 
-    fn report_motion(&mut self, pos: PhysicalPosition<f64>) {
+    fn report_motion_at(&mut self, id: u64, row: usize, col: usize) {
         if self.overlay_blocks_mouse() || self.modifiers.shift_key() {
             return;
         }
-        let Some((_, id, row, col)) = self.locate(pos) else {
-            return;
-        };
         let proto = mouse::Proto::from_mode(self.mode_of(id));
         if !proto.wants(mouse::What::Motion, false) {
             return;
@@ -3316,6 +3452,8 @@ fn main() {
         cockpit_sel: 0,
         pending_paste: None,
         pending_close: None,
+        link_hover: None,
+        blocked_link: None,
         last_input: Instant::now(),
         blink_drawn_on: true,
         settings: None,

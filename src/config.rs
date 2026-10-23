@@ -74,6 +74,13 @@ pub struct UserConfig {
     /// (default on). Windows quiet hours are respected regardless.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notifications: Option<bool>,
+    /// Editor for Ctrl+click on `path:line`. `{file}` `{line}` `{col}` are
+    /// replaced after the template is split into arguments — never a shell
+    /// command. Example: `code -g {file}:{line}:{col}`. Absent: `code -g`
+    /// when `code.exe` is on PATH (or the `Code.exe` next to `code.cmd`),
+    /// otherwise the file opens by shell association.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
     /// Shortcut overrides: action id -> chord ("new-tab": "ctrl+shift+n").
     /// Only NON-default bindings live here (the editor prunes defaults).
     #[serde(skip_serializing_if = "Option::is_none")]

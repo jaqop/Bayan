@@ -121,7 +121,9 @@ pub struct SessionMeta {
     pub prompt_col: Option<usize>,
     /// the command line currently executing ("" = idle) — feeds cmd_is_claude
     pub running_cmd: String,
-    /// working directory from OSC 9;9
+    /// working directory from OSC 9;9.
+    /// File links resolve through `link::cwd_hook` on this field. OSC 7
+    /// (a `file://` cwd, PR5) should write it too — there is no second source.
     pub cwd: Option<String>,
     /// command blocks (OSC 133 A/D): gutter lights + prompt jumping
     pub marks: Vec<CmdMark>,

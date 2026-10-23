@@ -10,6 +10,13 @@
 //! Shift bypasses all of it. The terminal keeps the gesture for its own
 //! selection (and its own scroll), which is how a mouse-aware TUI stays
 //! copyable.
+//!
+//! Ctrl+click is not a report either: it opens a hyperlink
+//! (`link::click_owner`). Shift still keeps local selection when the cell
+//! is a link, and it wins if Ctrl is held too. A plain click while
+//! tracking is on belongs to the program, link or not. The column is the
+//! one `column_for_click` already computed, so a link on an Arabic row is
+//! the glyph under the pointer.
 
 use alacritty_terminal::term::TermMode;
 
