@@ -24,6 +24,12 @@ mod render;
 mod osc7;
 mod term;
 
+#[cfg(test)]
+#[path = "../vendor/portable-pty/src/win/conpty_resolve.rs"]
+mod conpty_resolve;
+#[cfg(test)]
+mod conpty_load;
+
 /// rgb -> "#rrggbb" for the config file.
 fn hex((r, g, b): (u8, u8, u8)) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
@@ -3785,7 +3791,38 @@ fn blur_forgets_held_keys(focused: bool, held: &mut Vec<winit::keyboard::Physica
     }
 }
 
+/// Drop the current directory from the DLL search path before anything else
+/// in this process loads a library by name.
+///
+/// `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR)`
+/// (0x800 | 0x200) is available on Windows 8+ and is intentionally not
+/// called. wgpu-hal loads `d3d12.dll` and `dxgi.dll` by bare name
+/// (`libloading` → `LoadLibraryW`). The inbox `d3d12.dll` then maps
+/// `D3D12Core.dll` from `%SystemRoot%\System32\D3D12`, and the GL fallback
+/// loads an ICD from `DriverStore\FileRepository\...`. Those neighbours are
+/// not System32 itself and not the application directory.
+/// `SetDefaultDllDirectories` replaces the process search path permanently
+/// and does not accept `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` (that flag is
+/// per `LoadLibraryEx`). A missed dependency there is a black window, and
+/// neither CI nor this call can create a device to prove it still works.
+/// `SetDllDirectoryW("")` only removes the CWD, which is what Microsoft
+/// documents for this mitigation, and leaves System32, the application
+/// directory, and PATH in place for DirectX and GL.
+///
+/// ConPTY does not depend on this call. `CreatePseudoConsole`,
+/// `ResizePseudoConsole`, and `ClosePseudoConsole` come from `kernel32.dll`
+/// opened with `LoadLibraryExW(L"kernel32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32)`.
+/// `conpty.dll` is never passed to the loader.
+pub(crate) fn harden_dll_search() {
+    // An empty string removes the CWD. NULL would put it back.
+    let empty = [0u16];
+    unsafe {
+        let _ = windows_sys::Win32::System::LibraryLoader::SetDllDirectoryW(empty.as_ptr());
+    }
+}
+
 fn main() {
+    harden_dll_search();
     prof::init();
     prof::mark("main start");
     use winit::platform::windows::EventLoopBuilderExtWindows;
