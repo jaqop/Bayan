@@ -4,10 +4,10 @@
 //! that directory, and an OSC 8 hyperlink resolver can join a relative
 //! `file:line` target against [`crate::term::SessionMeta::reported_cwd`].
 //!
-//! This validator is deliberately local. PR #2 (`accept_local_cwd` on
-//! `cursor/security-high-fixes-bfda`) gates OSC 9;9 the same way — drive
-//! letter only, no UNC, no `\\?\`. After both land, OSC 7 should call that
-//! helper instead of keeping a second copy of the policy.
+//! The URL is parsed here (scheme, host, percent-decoding). The path that
+//! comes out is then [`crate::term::accept_local_cwd`]: drive letter only,
+//! and UNC, `\\?\`, `\\.\` and `\??\` are rejected before anything probes
+//! the disk.
 
 /// Payload cap, bytes between the semicolon and the terminator. Matches the
 /// length PR #2 uses for OSC 9;9 so the two gates reject the same class of
@@ -252,39 +252,14 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-/// `/C:/x` → `C:\x`. Anything that is not a drive-letter path — UNC,
-/// `\\?\`, `\??\`, a Unix path — is rejected without touching the disk.
+/// `/C:/x` → `C:\x` through [`crate::term::accept_local_cwd`].
+///
+/// A file-URL path starts with `/`. Stripping that one slash leaves a
+/// drive path, or a UNC / device path (`//server/share`, `/\??\…`) which
+/// the shared gate rejects. Nothing here calls `is_dir`.
 fn windows_drive_path(decoded: &str) -> Option<String> {
-    let slashed = decoded.replace('/', "\\");
-    // A file-URL path starts with `/`. Two slashes are UNC (`//server/share`
-    // or `\\?\C:\…`), which we never probe.
-    let rest = slashed.strip_prefix('\\')?;
-    if rest.starts_with('\\') || rest.starts_with('?') {
-        return None;
-    }
-    let mut chars = rest.chars();
-    let drive = chars.next()?;
-    if !drive.is_ascii_alphabetic() || chars.next() != Some(':') {
-        return None;
-    }
-    let tail: String = chars.collect();
-    if tail.is_empty() {
-        return Some(format!("{drive}:\\"));
-    }
-    if !tail.starts_with('\\') {
-        return None;
-    }
-    let path = format!("{drive}:{tail}");
-    let lower = path.to_ascii_lowercase();
-    if lower.contains(r"\\?\") || lower.contains(r"\\.\") || lower.contains(r"\??\") {
-        return None;
-    }
-    // `C:\foo\` → `C:\foo`, but the drive root `C:\` stays.
-    if path.len() > 3 {
-        Some(path.trim_end_matches('\\').to_string())
-    } else {
-        Some(path)
-    }
+    let rest = decoded.strip_prefix('/')?;
+    crate::term::accept_local_cwd(rest)
 }
 
 #[cfg(test)]
@@ -461,7 +436,10 @@ mod tests {
         let dir = std::env::temp_dir();
         let text = dir.to_str().expect("temp dir is unicode");
         meta.cwd = Some(text.to_string());
-        assert_eq!(meta.spawn_cwd().as_deref(), Some(text));
+        // accept_local_cwd drops a trailing slash before the existence check.
+        let expected = crate::term::accept_local_cwd(text).expect("temp is a drive path");
+        assert!(crate::osc7::directory_exists(&expected));
+        assert_eq!(meta.spawn_cwd().as_deref(), Some(expected.as_str()));
     }
 
     #[test]

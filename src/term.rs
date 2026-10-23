@@ -165,12 +165,14 @@ impl SessionMeta {
         self.cwd.as_deref()
     }
 
-    /// Reported directory, if it exists right now. A missing path must not
-    /// become a spawn cwd (the launcher directory is the fallback).
+    /// Reported directory, if it is a local drive path and it exists right
+    /// now. [`accept_local_cwd`] runs before `is_dir`, so a UNC or `\\?\`
+    /// path is never probed. A missing directory falls through to the
+    /// launcher directory.
     pub fn spawn_cwd(&self) -> Option<String> {
         self.reported_cwd()
+            .and_then(accept_local_cwd)
             .filter(|p| crate::osc7::directory_exists(p))
-            .map(str::to_owned)
     }
 }
 

@@ -63,9 +63,8 @@ impl BidiState {
     ///
     /// Explicit BDSM means the application already did the ordering, so
     /// Bayan must not run UAX#9 and must not apply Claude-mode restoration.
-    /// `honor_bdsm` (config, default true) is the gate on that override —
-    /// the owner has not signed off on it. When the flag is false, Bayan's
-    /// own detection keeps reordering anyway.
+    /// `honor_bdsm` (config, default true) is the gate on that override.
+    /// Set it false and Bayan's own detection keeps reordering anyway.
     pub fn reorders(&self, honor_bdsm: bool) -> bool {
         !(honor_bdsm && self.mode == BidiMode::Explicit)
     }

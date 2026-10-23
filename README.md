@@ -315,7 +315,7 @@ Two escape sequences from ECMA-48 / the terminal-wg "BiDi in Terminal
 Emulators" recommendation, which `alacritty_terminal` 0.26 does not act on
 (mode 8 is an unknown SM/RM parameter; `CSI Ps SP k` is not in its CSI
 dispatch). Bayan strips them from the PTY stream before the parser, including
-when a sequence is split across reads.
+when a sequence is split across reads. The tree has 129 unit tests.
 
 - **BDSM** — `CSI 8 h` implicit (Bayan applies UAX#9; this is the initial
   state, so a shell that never sends BDSM still gets Arabic), `CSI 8 l`
@@ -327,8 +327,8 @@ when a sequence is split across reads.
 - Both reset on RIS (`ESC c`) and when switching to or from the alternate screen.
 
 `bidi.honor_bdsm` defaults to **true**, so explicit mode overrides Bayan's
-auto-detection. That override is waiting on the owner; set it false to keep
-today's detection even when an application sends `CSI 8 l`:
+auto-detection. Set it false to keep that detection when an application
+sends `CSI 8 l`:
 
 ```json
 { "bidi": { "honor_bdsm": false } }
@@ -338,15 +338,15 @@ today's detection even when an application sends `CSI 8 l`:
 working directory next to the existing OSC 9;9 report. Only the `file` scheme
 is accepted. The path is percent-decoded, `/C:/x` becomes `C:\x`, and the host
 must be empty, `localhost`, a loopback address, or this machine's name. Remote
-hosts, UNC (`//server/share`, `\\?\`, `\??\`), control characters, bidi
+hosts, UNC (`//server/share`, `\\?\`, `\\.\`, `\??\`), control characters, bidi
 overrides, and payloads over 4096 bytes are rejected and do not replace a
 directory already stored. A new tab or split inherits the directory only when
 it exists. `SessionMeta::reported_cwd` is what an OSC 8 resolver should join a
 relative `file:line` path against.
 
-The path check is local to `src/osc7.rs`. The security fixes on
-`cursor/security-high-fixes-bfda` add `accept_local_cwd` for OSC 9;9; once
-both have merged, OSC 7 should call that helper instead of keeping a second one.
+After percent-decoding, the path goes through `accept_local_cwd` — the same
+gate as OSC 9;9 and `session.json`. UNC, `\\?\`, `\\.\` and `\??\` are
+rejected there, before `is_dir` can open them.
 
 PowerShell gets OSC 7 from the prompt wrapper Bayan already injects (it also
 still emits OSC 9;9). cmd does not, so a clink prompt filter does the same

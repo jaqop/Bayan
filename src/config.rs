@@ -95,9 +95,9 @@ fn default_honor_bdsm() -> bool {
 /// How Bayan treats BDSM from the application.
 ///
 /// `honor_bdsm` defaults to true: an explicit BDSM (`CSI 8 l`) disables
-/// reordering for that pane, including Claude-mode auto-detection. The
-/// owner has not signed off on that override; set it false to keep Bayan's
-/// own detection when an application selects explicit mode.
+/// reordering for that pane, including Claude-mode auto-detection. Set it
+/// false to keep Bayan's own detection when an application selects
+/// explicit mode.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct BidiConfig {
