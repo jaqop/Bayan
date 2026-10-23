@@ -70,15 +70,30 @@ impl BidiState {
     }
 
     pub fn direction_at(&self, abs_line: u64) -> ParagraphDir {
-        let mut dir = ParagraphDir::Default;
-        for &(line, d) in &self.stamps {
-            if line <= abs_line {
-                dir = d;
-            } else {
-                break;
-            }
+        // Stamps are in ascending line order. The last one at or before
+        // this line wins; lines before the first stamp stay at the default.
+        let i = self.stamps.partition_point(|&(line, _)| line <= abs_line);
+        if i == 0 {
+            ParagraphDir::Default
+        } else {
+            self.stamps[i - 1].1
         }
-        dir
+    }
+
+    /// Explicit mode and SCP stamps affect the screen only while a command
+    /// is running or the pane is on the alternate screen. Output from `cat`
+    /// must not leave the prompt in explicit RTL.
+    pub fn for_display(
+        &self,
+        honor_bdsm: bool,
+        command_running: bool,
+        alt_screen: bool,
+    ) -> (bool, bool) {
+        if command_running || alt_screen {
+            (self.reorders(honor_bdsm), true)
+        } else {
+            (true, false)
+        }
     }
 
     /// Record an SCP. Column 0 updates the line the cursor is on; anywhere
@@ -105,6 +120,15 @@ impl BidiState {
     /// finished sequence, not a reason to drop a half-read CSI.
     pub fn reset(&mut self) {
         *self = BidiState::default();
+    }
+
+    /// Drop SCP stamps. A resize reflows rows, so an absolute line no longer
+    /// names the text it was stamped on. The mode stays: a full-screen
+    /// program does not resend BDSM just because the window changed size.
+    /// `Session::resize` is the caller.
+    pub fn on_resize(&mut self) {
+        self.stamps.clear();
+        self.direction = ParagraphDir::Default;
     }
 }
 
@@ -171,6 +195,14 @@ const CSI_CAP: usize = 64;
 
 impl StreamFilter {
     pub fn pull(&mut self, input: &[u8]) -> Vec<StreamItem> {
+        // Most PTY reads are plain text. Skip the state machine when we are
+        // not holding a sequence and the chunk has no ESC.
+        if self.phase == Phase::Ground && !input.contains(&0x1b) {
+            if input.is_empty() {
+                return Vec::new();
+            }
+            return vec![StreamItem::Bytes(input.to_vec())];
+        }
         let mut items = Vec::new();
         let mut out = Vec::new();
         for &b in input {
@@ -194,10 +226,28 @@ impl StreamFilter {
                 }
             }
             Phase::Esc => {
-                self.held.push(b);
+                // vte 0.15 `advance_esc`: a second ESC is ignored and the
+                // state stays Escape, so `ESC ESC c` is RIS. C0 other than
+                // CAN/SUB is executed and does not leave Escape, so
+                // `ESC <C0> c` is RIS too. CAN (0x18) and SUB (0x1A) cancel.
                 match b {
-                    b'[' => self.phase = Phase::Csi,
+                    0x1b => {
+                        self.held.clear();
+                        self.held.push(b);
+                    }
+                    0x00..=0x17 | 0x19 | 0x1c..=0x1f => out.push(b),
+                    0x18 | 0x1a => {
+                        self.held.clear();
+                        out.push(b);
+                        self.phase = Phase::Ground;
+                    }
+                    0x7f => {}
+                    b'[' => {
+                        self.held.push(b);
+                        self.phase = Phase::Csi;
+                    }
                     b'c' => {
+                        self.held.push(b);
                         out.append(&mut self.held);
                         self.phase = Phase::Ground;
                         if !out.is_empty() {
@@ -207,6 +257,7 @@ impl StreamFilter {
                     }
                     _ => {
                         // OSC, ESC D, charset designation, … not ours.
+                        self.held.push(b);
                         out.append(&mut self.held);
                         self.phase = Phase::Ground;
                     }
@@ -228,8 +279,19 @@ impl StreamFilter {
                     self.phase = Phase::Esc;
                     return;
                 }
+                // vte executes other C0 and stays in CSI. DEL and bytes
+                // above 0x7E are ignored and do not leave the sequence, so
+                // `CSI ?1049 <C0> h` is still an alt-screen toggle. The C0
+                // is emitted before the CSI bytes; vte runs it, then the CSI.
+                if b < 0x20 {
+                    out.push(b);
+                    return;
+                }
+                if b == 0x7f || b > 0x7e {
+                    return;
+                }
                 self.held.push(b);
-                if self.held.len() > CSI_CAP || !(0x20..=0x7e).contains(&b) {
+                if self.held.len() > CSI_CAP {
                     out.append(&mut self.held);
                     self.phase = Phase::Ground;
                     return;
@@ -274,7 +336,7 @@ impl StreamFilter {
             }
         }
 
-        if final_byte == b'k' && inter == [b' '] {
+        if final_byte == b'k' && inter == *b" " {
             match parse_scp(params) {
                 Some(dir) => {
                     if !out.is_empty() {
@@ -391,9 +453,16 @@ mod tests {
         t.grid()[line][Column(col)].c
     }
 
+    /// BDSM and SCP are recorded only while a command is running, or on the
+    /// alt screen. Tests that check the sequence itself set this first.
+    fn running(meta: &mut SessionMeta) {
+        meta.running_cmd = "cat".into();
+    }
+
     #[test]
     fn bdsm_scp_split_across_reads_and_mixed_with_other_csi() {
         let (mut t, mut p, mut meta, mut carry) = fresh();
+        running(&mut meta);
 
         // Split BDSM: the 'l' arrives in the next read. The letter on each
         // side is still a cell — the sequence was stripped, not printed.
@@ -446,7 +515,7 @@ mod tests {
         assert_eq!(base_direction_mark(ParagraphDir::Default), None);
 
         let mut meta = meta;
-        meta.bidi.mode = BidiMode::Explicit;
+        meta.bidi_mut().mode = BidiMode::Explicit;
         assert!(
             !meta.bidi.reorders(true),
             "explicit BDSM overrides auto-detection when the flag is on"
@@ -455,9 +524,15 @@ mod tests {
             meta.bidi.reorders(false),
             "bidi.honor_bdsm = false keeps Bayan's own reordering"
         );
+        // A leaked explicit mode does not restyle the prompt. Stamps are
+        // ignored too. While the command is still running, both apply.
+        assert_eq!(meta.bidi.for_display(true, false, false), (true, false));
+        assert_eq!(meta.bidi.for_display(true, true, false), (false, true));
+        assert_eq!(meta.bidi.for_display(true, false, true), (false, true));
 
         // The same answer after a real sequence, not a hand-poked field.
         let (mut t, mut p, mut meta, mut carry) = fresh();
+        running(&mut meta);
         feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[8l");
         assert!(!meta.bidi.reorders(true));
         feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[8h");
@@ -467,6 +542,7 @@ mod tests {
     #[test]
     fn scp_rtl_ltr_and_default() {
         let (mut t, mut p, mut meta, mut carry) = fresh();
+        running(&mut meta);
         // line 0 is written before any SCP, so it stays at the default.
         feed(
             &mut t,
@@ -489,6 +565,7 @@ mod tests {
 
         // Mid-line SCP does not restamp the line already in progress.
         let (mut t, mut p, mut meta, mut carry) = fresh();
+        running(&mut meta);
         feed(&mut t, &mut p, &mut meta, &mut carry, b"ab\x1b[2 k");
         assert_eq!(t.grid().cursor.point.column.0, 2);
         assert_eq!(meta.bidi.direction_at(0), ParagraphDir::Default);
@@ -498,6 +575,7 @@ mod tests {
     #[test]
     fn ris_resets_bidi_state() {
         let (mut t, mut p, mut meta, mut carry) = fresh();
+        running(&mut meta);
         feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[8l\x1b[2 kZ");
         assert_eq!(meta.bidi.mode, BidiMode::Explicit);
         assert_eq!(meta.bidi.direction, ParagraphDir::Rtl);
@@ -516,6 +594,7 @@ mod tests {
     #[test]
     fn alt_screen_switch_resets_bidi_state() {
         let (mut t, mut p, mut meta, mut carry) = fresh();
+        running(&mut meta);
         // Entering the alternate screen clears a mode set on the primary.
         feed(
             &mut t,
@@ -528,7 +607,9 @@ mod tests {
         assert_eq!(meta.bidi.mode, BidiMode::Implicit);
         assert_eq!(meta.bidi.direction, ParagraphDir::Default);
         assert_eq!(meta.bidi.direction_at(1), ParagraphDir::Default);
-        // A BDSM after the switch sticks… until the switch back.
+        // The command name is gone. Alt screen alone still honors BDSM,
+        // until the switch back.
+        meta.running_cmd.clear();
         feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[8l\x1b[1 k");
         assert_eq!(meta.bidi.mode, BidiMode::Explicit);
         assert_eq!(meta.bidi.direction, ParagraphDir::Ltr);
@@ -536,5 +617,199 @@ mod tests {
         assert!(!t.mode().contains(TermMode::ALT_SCREEN));
         assert_eq!(meta.bidi.mode, BidiMode::Implicit);
         assert_eq!(meta.bidi.direction, ParagraphDir::Default);
+    }
+
+    /// `cat` of a file that contains `CSI 8 l` / `CSI 2 SP k` must not leave
+    /// the prompt in explicit RTL. OSC 133 D and A both clear the state, and
+    /// a sequence that arrives with no command running is ignored.
+    #[test]
+    fn osc133_a_and_d_reset_bidi_and_idle_ignores_it() {
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        running(&mut meta);
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            b"\x1b[8l\x1b[2 k\x1b]133;D;0\x07",
+        );
+        assert!(meta.running_cmd.is_empty());
+        assert_eq!(meta.bidi.mode, BidiMode::Implicit);
+        assert_eq!(meta.bidi.direction, ParagraphDir::Default);
+        assert_eq!(meta.bidi.direction_at(1), ParagraphDir::Default);
+        assert_eq!(meta.bidi.for_display(true, false, false), (true, false));
+
+        running(&mut meta);
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            b"\x1b[8l\x1b[2 k\x1b]133;A\x07",
+        );
+        assert!(meta.running_cmd.is_empty());
+        assert_eq!(meta.bidi.mode, BidiMode::Implicit);
+        assert_eq!(meta.bidi.direction_at(0), ParagraphDir::Default);
+
+        // The same bytes at the prompt do nothing.
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[8l\x1b[2 k");
+        assert_eq!(meta.bidi.mode, BidiMode::Implicit);
+        assert_eq!(meta.bidi.direction, ParagraphDir::Default);
+        assert!(meta.bidi.reorders(true));
+    }
+
+    /// vte stays in Escape across a second ESC and across C0 other than
+    /// CAN/SUB, so both of these are RIS. CAN (0x18) cancels, and the `c`
+    /// is then an ordinary character.
+    #[test]
+    fn esc_esc_c_and_esc_c0_c_are_ris() {
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        running(&mut meta);
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[8l\x1b[2 k");
+        assert_eq!(meta.bidi.mode, BidiMode::Explicit);
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b\x1bc");
+        assert_eq!(meta.bidi.mode, BidiMode::Implicit);
+        assert_eq!(meta.bidi.direction, ParagraphDir::Default);
+        assert!(meta.saw_ris);
+
+        running(&mut meta);
+        meta.saw_ris = false;
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[8l\x1b[1 k");
+        assert_eq!(meta.bidi.mode, BidiMode::Explicit);
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b\x00c");
+        assert_eq!(meta.bidi.mode, BidiMode::Implicit);
+        assert_eq!(meta.bidi.direction, ParagraphDir::Default);
+        assert!(meta.saw_ris);
+
+        running(&mut meta);
+        meta.saw_ris = false;
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[8l");
+        assert_eq!(meta.bidi.mode, BidiMode::Explicit);
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b\x18c");
+        assert_eq!(meta.bidi.mode, BidiMode::Explicit);
+        assert!(!meta.saw_ris);
+        assert_eq!(cell(&t, 0), 'c');
+    }
+
+    /// Two alt-screen sequences in one read can leave the mode bit where it
+    /// started. Bidi still resets, because each CSI is seen, not the net.
+    #[test]
+    fn double_alt_screen_toggle_in_one_chunk_resets() {
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        running(&mut meta);
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            b"\x1b[8l\x1b[2 k\x1b[?1049h\x1b[?1049l",
+        );
+        assert!(!t.mode().contains(TermMode::ALT_SCREEN));
+        assert_eq!(meta.bidi.mode, BidiMode::Implicit);
+        assert_eq!(meta.bidi.direction, ParagraphDir::Default);
+        assert_eq!(meta.bidi.direction_at(1), ParagraphDir::Default);
+
+        // 47 and 1047 are the other alt sequences. alacritty ignores them
+        // as unknown private modes; we still reset on the CSI itself.
+        running(&mut meta);
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            b"\x1b[8l\x1b[2 k\x1b[?47h\x1b[?47l\x1b[?1047h\x1b[?1047l",
+        );
+        assert!(!t.mode().contains(TermMode::ALT_SCREEN));
+        assert_eq!(meta.bidi.mode, BidiMode::Implicit);
+        assert_eq!(meta.bidi.direction, ParagraphDir::Default);
+    }
+
+    /// A resize reflows rows. Stamps are dropped; the mode stays, because a
+    /// full-screen program does not resend BDSM just because the window
+    /// changed size. `Session::resize` is the caller.
+    #[test]
+    fn resize_clears_scp_stamps_and_keeps_mode() {
+        let mut state = BidiState {
+            mode: BidiMode::Explicit,
+            direction: ParagraphDir::Default,
+            stamps: Vec::new(),
+        };
+        state.note_scp(ParagraphDir::Rtl, 3, 0);
+        state.note_scp(ParagraphDir::Ltr, 8, 0);
+        assert_eq!(state.direction_at(3), ParagraphDir::Rtl);
+        assert_eq!(state.direction_at(9), ParagraphDir::Ltr);
+        state.on_resize();
+        assert_eq!(state.mode, BidiMode::Explicit);
+        assert_eq!(state.direction, ParagraphDir::Default);
+        assert_eq!(state.direction_at(3), ParagraphDir::Default);
+        assert_eq!(state.direction_at(9), ParagraphDir::Default);
+    }
+
+    /// Random chunks: the filter's RIS count, and the alt-screen CSIs it
+    /// passes through, match a vte parser on the same bytes. BDSM and SCP
+    /// are stripped; they are not RIS and not an alt-screen mode.
+    #[test]
+    fn filter_matches_vte_on_random_streams() {
+        use alacritty_terminal::vte::{Params, Parser, Perform};
+
+        struct Watch {
+            ris: usize,
+            alt: usize,
+        }
+        impl Perform for Watch {
+            fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+                if !ignore && intermediates.is_empty() && byte == b'c' {
+                    self.ris += 1;
+                }
+            }
+            fn csi_dispatch(
+                &mut self,
+                params: &Params,
+                intermediates: &[u8],
+                ignore: bool,
+                action: char,
+            ) {
+                if ignore || intermediates != b"?" || !matches!(action, 'h' | 'l') {
+                    return;
+                }
+                let hit = params.iter().any(|p| {
+                    matches!(p.first().copied(), Some(1049 | 47 | 1047))
+                });
+                if hit {
+                    self.alt += 1;
+                }
+            }
+        }
+
+        let mut rng = 0xC0FFEE_u64;
+        let mut next = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (rng >> 33) as u8
+        };
+
+        for case in 0..32 {
+            let mut filter = StreamFilter::default();
+            let mut vte_raw = Parser::new();
+            let mut raw_w = Watch { ris: 0, alt: 0 };
+            let mut vte_filt = Parser::new();
+            let mut filt_w = Watch { ris: 0, alt: 0 };
+            let mut ris_items = 0usize;
+            let nchunks = 2 + (next() as usize % 3);
+            for _ in 0..nchunks {
+                let len = next() as usize % 40;
+                let chunk: Vec<u8> = (0..len).map(|_| next()).collect();
+                vte_raw.advance(&mut raw_w, &chunk);
+                for item in filter.pull(&chunk) {
+                    match item {
+                        StreamItem::Ris => ris_items += 1,
+                        StreamItem::Bytes(b) => vte_filt.advance(&mut filt_w, &b),
+                        StreamItem::Bdsm(_) | StreamItem::Scp(_) => {}
+                    }
+                }
+            }
+            assert_eq!(ris_items, raw_w.ris, "RIS items, case {case}");
+            assert_eq!(filt_w.ris, raw_w.ris, "RIS bytes passed through, case {case}");
+            assert_eq!(filt_w.alt, raw_w.alt, "alt-screen CSI, case {case}");
+        }
     }
 }

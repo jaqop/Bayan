@@ -88,94 +88,12 @@ pub fn parse_osc7<S: AsRef<str>>(payload: &str, local_names: &[S]) -> Option<Str
     windows_drive_path(&decoded)
 }
 
-/// Last OSC 7 in `data` whose payload [`parse_osc7`] accepts, with the
-/// index of its ESC. Unterminated sequences are ignored — the PTY carry
-/// holds them until the BEL or ST arrives.
-pub fn last_accepted<S: AsRef<str>>(data: &[u8], local_names: &[S]) -> Option<(usize, String)> {
-    let mut found = None;
-    let mut i = 0;
-    while i + 3 < data.len() {
-        if data[i] != 0x1b || data.get(i + 1) != Some(&b']') {
-            i += 1;
-            continue;
-        }
-        let Some((num, after_semi)) = osc_number(data, i + 2) else {
-            i += 1;
-            continue;
-        };
-        let Some((pay_end, next)) = osc_end(data, after_semi) else {
-            break;
-        };
-        if num == b"7" {
-            if let Ok(text) = std::str::from_utf8(&data[after_semi..pay_end]) {
-                if let Some(cwd) = parse_osc7(text, local_names) {
-                    found = Some((i, cwd));
-                }
-            }
-        }
-        i = next;
-    }
-    found
-}
-
-/// Index of the last occurrence of `prefix`, for ordering OSC 7 against
-/// the OSC 9;9 report the shell integration already emits.
-pub fn last_prefix_index(data: &[u8], prefix: &[u8]) -> Option<usize> {
-    let mut found = None;
-    let mut i = 0;
-    while i + prefix.len() <= data.len() {
-        if &data[i..i + prefix.len()] == prefix {
-            found = Some(i);
-            i += prefix.len();
-        } else {
-            i += 1;
-        }
-    }
-    found
-}
-
 /// The spawn gate. Parsing accepts a well-formed drive path that does not
 /// exist (the shell can report a directory we race with); spawning must not.
+/// `Session::spawn` goes further and rejects a remote drive or a reparse
+/// point before this check.
 pub fn directory_exists(path: &str) -> bool {
     !path.is_empty() && std::path::Path::new(path).is_dir()
-}
-
-/// Bytes after `ESC ]`: optional spaces, a decimal number, optional spaces,
-/// a semicolon. Returns `(number, index just past the semicolon)`.
-fn osc_number(data: &[u8], mut j: usize) -> Option<(&[u8], usize)> {
-    while data.get(j) == Some(&b' ') {
-        j += 1;
-    }
-    let start = j;
-    while matches!(data.get(j), Some(b'0'..=b'9')) {
-        j += 1;
-    }
-    if j == start {
-        return None;
-    }
-    let num = &data[start..j];
-    while data.get(j) == Some(&b' ') {
-        j += 1;
-    }
-    if data.get(j) != Some(&b';') {
-        return None;
-    }
-    Some((num, j + 1))
-}
-
-/// `(payload_end, index past the terminator)`. BEL, or ST (`ESC \`).
-fn osc_end(data: &[u8], start: usize) -> Option<(usize, usize)> {
-    let mut k = start;
-    while k < data.len() {
-        if data[k] == 0x07 {
-            return Some((k, k + 1));
-        }
-        if data[k] == 0x1b && data.get(k + 1) == Some(&b'\\') {
-            return Some((k, k + 2));
-        }
-        k += 1;
-    }
-    None
 }
 
 /// `file://host/path` with `rest` starting at `host`. A leading slash is an

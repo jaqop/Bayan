@@ -27,6 +27,16 @@ fn hex((r, g, b): (u8, u8, u8)) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
 }
 
+/// Meta copied off a pane before the term lock: command marks in grid
+/// space, the running command, the BiDi snapshot, and evicted lines.
+/// The `Arc` is the snapshot. Cloning it does not copy the stamp list.
+type PaneSnap = (
+    Vec<(usize, Option<i32>)>,
+    String,
+    std::sync::Arc<bidi_ctl::BidiState>,
+    u64,
+);
+
 /// The Windows caret rhythm; kitty's idea on top: stop after 15s idle.
 const BLINK_MS: u128 = 530;
 const BLINK_STOP: std::time::Duration = std::time::Duration::from_secs(15);
@@ -1603,13 +1613,17 @@ impl App {
         };
         // term first, then meta — the crate's lock order
         let alt = s.term.lock().unwrap().mode().contains(TermMode::ALT_SCREEN);
-        let (reorder, running) = {
+        let (bidi_state, running) = {
             let m = s.meta.lock().unwrap();
-            (
-                m.bidi.reorders(self.config.honor_bdsm()),
-                m.running_cmd.clone(),
-            )
+            (m.bidi.clone(), m.running_cmd.clone())
         };
+        // Idle explicit mode (a command that forgot to reset) must not
+        // suppress restoration at the prompt. A live explicit mode still does.
+        let (reorder, _) = bidi_state.for_display(
+            self.config.honor_bdsm(),
+            !running.is_empty(),
+            alt,
+        );
         if !reorder {
             return false;
         }
@@ -1761,19 +1775,26 @@ impl App {
             let row = hit.row.min(rows - 1);
             // Explicit BDSM draws Arabic on the grid, so the click column
             // is x / cell_w. Implicit mode uses the same plan as the painter,
-            // SCP mark included.
-            let reorder = bidi_state.reorders(honor);
+            // SCP mark included. Neither applies once the command has ended
+            // and the pane is back on the primary screen.
+            let alt = t.mode().contains(TermMode::ALT_SCREEN);
+            let (reorder, use_stamps) =
+                bidi_state.for_display(honor, !running.is_empty(), alt);
             let claude = reorder
                 && if !auto {
                     manual
                 } else {
-                    t.mode().contains(TermMode::ALT_SCREEN) && bidi::cmd_is_claude(&running)
+                    alt && bidi::cmd_is_claude(&running)
                 };
             let history = t.grid().history_size() as u64;
             let off = t.grid().display_offset() as u64;
-            let dir = bidi_state.direction_at(bidi_ctl::viewport_line_abs(
-                evicted, history, off, row as u64,
-            ));
+            let dir = if use_stamps {
+                bidi_state.direction_at(bidi_ctl::viewport_line_abs(
+                    evicted, history, off, row as u64,
+                ))
+            } else {
+                bidi_ctl::ParagraphDir::Default
+            };
             let cells = render::snapshot_row(&t, row);
             (cols, row, cells, claude, hit.col.min(cols - 1), reorder, dir)
         };
@@ -2261,12 +2282,7 @@ impl App {
                     let focused = pi == tab.focused;
                     // meta snapshot BEFORE the term lock (lock order term>meta
                     // only applies when holding both; here they don't overlap)
-                    let (marks, running_cmd, bidi_state, evicted): (
-                        Vec<(usize, Option<i32>)>,
-                        String,
-                        bidi_ctl::BidiState,
-                        u64,
-                    ) = {
+                    let (marks, running_cmd, bidi_state, evicted): PaneSnap = {
                         let m = pane.session.meta.lock().unwrap();
                         (
                             // global -> grid space: subtract the evictions
@@ -2282,27 +2298,38 @@ impl App {
                     };
                     let t = pane.session.term.lock().unwrap();
                     // Explicit BDSM suppresses reordering for the whole pane,
-                    // Claude restoration included. honor_bdsm defaults on.
-                    let reorder = bidi_state.reorders(self.config.honor_bdsm());
+                    // Claude restoration included, and only while the command
+                    // is running or the alt screen is up. honor_bdsm defaults on.
+                    // The Arc is the frame's snapshot: cloning it does not copy
+                    // the stamp list.
+                    let alt = t.mode().contains(TermMode::ALT_SCREEN);
+                    let (reorder, use_stamps) = bidi_state.for_display(
+                        self.config.honor_bdsm(),
+                        !running_cmd.is_empty(),
+                        alt,
+                    );
                     let claude_pane = reorder
                         && if !auto_follow {
                             claude_manual
                         } else {
-                            t.mode().contains(TermMode::ALT_SCREEN)
-                                && bidi::cmd_is_claude(&running_cmd)
+                            alt && bidi::cmd_is_claude(&running_cmd)
                         };
                     if focused {
                         focused_claude = claude_pane;
                     }
                     let history = t.grid().history_size() as u64;
                     let off = t.grid().display_offset() as u64;
-                    let line_dir: Vec<bidi_ctl::ParagraphDir> = (0..t.screen_lines())
-                        .map(|li| {
-                            bidi_state.direction_at(bidi_ctl::viewport_line_abs(
-                                evicted, history, off, li as u64,
-                            ))
-                        })
-                        .collect();
+                    let line_dir: Vec<bidi_ctl::ParagraphDir> = if use_stamps {
+                        (0..t.screen_lines())
+                            .map(|li| {
+                                bidi_state.direction_at(bidi_ctl::viewport_line_abs(
+                                    evicted, history, off, li as u64,
+                                ))
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     let view = render::PaneView {
                         rect: *rect,
                         focused,

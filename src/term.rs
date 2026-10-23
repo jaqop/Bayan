@@ -139,7 +139,10 @@ pub struct SessionMeta {
     /// working directory from OSC 7 (`file://`) or OSC 9;9
     pub cwd: Option<String>,
     /// BDSM (implicit/explicit) and SCP paragraph direction for this pane.
-    pub bidi: crate::bidi_ctl::BidiState,
+    /// An `Arc` so a frame can snapshot it without cloning the stamp list.
+    /// The reader thread uses [`Self::bidi_mut`], which copies only when a
+    /// frame still holds the previous snapshot.
+    pub bidi: std::sync::Arc<crate::bidi_ctl::BidiState>,
     /// Half-parsed BDSM/SCP/RIS held across PTY reads.
     pub(crate) esc_filter: crate::bidi_ctl::StreamFilter,
     /// command blocks (OSC 133 A/D): gutter lights + prompt jumping
@@ -165,14 +168,20 @@ impl SessionMeta {
         self.cwd.as_deref()
     }
 
+    /// Copy-on-write for the reader thread. A frame holding the previous
+    /// `Arc` keeps its snapshot; the next mutation does not rewrite it.
+    pub(crate) fn bidi_mut(&mut self) -> &mut crate::bidi_ctl::BidiState {
+        std::sync::Arc::make_mut(&mut self.bidi)
+    }
+
     /// Reported directory, if it is a local drive path and it exists right
-    /// now. [`accept_local_cwd`] runs before `is_dir`, so a UNC or `\\?\`
-    /// path is never probed. A missing directory falls through to the
-    /// launcher directory.
+    /// now. [`accept_local_cwd`] runs before any probe, and [`usable_spawn_dir`]
+    /// rejects a remote drive or a reparse point before `is_dir`. A missing
+    /// directory falls through to the launcher directory.
     pub fn spawn_cwd(&self) -> Option<String> {
         self.reported_cwd()
             .and_then(accept_local_cwd)
-            .filter(|p| crate::osc7::directory_exists(p))
+            .filter(|p| usable_spawn_dir(p))
     }
 }
 
@@ -381,16 +390,17 @@ const MAX_CWD_CHARS: usize = 4096;
 ///
 /// Returns a normalized drive-letter path (`C:\…`), or `None`. UNC
 /// (`\\server\share`, `//server/share`), device and extended paths
-/// (`\\?\`, `\\.\`, including `\\?\UNC\…`), and the NT prefix `\??\` are
-/// rejected here, **before** any `exists` / `is_dir` / `canonicalize` call —
-/// on Windows those open SMB and can leak NTLM. OSC 7 (`file://…`) should
-/// parse the URL and then call this; do not grow a second checker.
+/// (`\\?\`, `\\.\`, including `\\?\UNC\…`), the NT prefix `\??\`, DOS device
+/// names, alternate data streams, and bidi controls are rejected here,
+/// **before** any `exists` / `is_dir` / `canonicalize` call — on Windows
+/// those open SMB and can leak NTLM. OSC 7 parses the URL and then calls
+/// this; do not grow a second checker.
 pub fn accept_local_cwd(raw: &str) -> Option<String> {
     let s = raw.trim();
     if s.is_empty() || s.chars().count() > MAX_CWD_CHARS {
         return None;
     }
-    if s.chars().any(|c| c.is_control()) {
+    if s.chars().any(|c| c.is_control() || crate::osc7::is_bidi_control(c)) {
         return None;
     }
     if unc_or_device(s) {
@@ -416,7 +426,72 @@ pub fn accept_local_cwd(raw: &str) -> Option<String> {
     if unc_or_device(&norm) {
         return None;
     }
+    // Alternate data streams (`C:\foo:bar`, `C:\foo::$DATA`) and DOS device
+    // names (`CON`, `NUL`, `PRN`, `AUX`, `COM1`–`COM9`, `LPT1`–`LPT9`, with
+    // or without an extension) are not directories.
+    if norm.len() > 2 && norm[2..].contains(':') {
+        return None;
+    }
+    if norm.split('\\').skip(1).any(reserved_dos_name) {
+        return None;
+    }
     Some(norm)
+}
+
+fn reserved_dos_name(component: &str) -> bool {
+    let trimmed = component.trim_end_matches([' ', '.']);
+    if trimmed.is_empty() {
+        return false;
+    }
+    let base = trimmed.split('.').next().unwrap_or(trimmed);
+    let upper = base.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && matches!(upper.as_bytes()[3], b'1'..=b'9'))
+}
+
+/// Spawn-time probe. [`accept_local_cwd`] has already rejected UNC.
+/// `GetDriveTypeW` on the drive root rejects a mapped remote drive before
+/// `is_dir` opens it. A reparse point (symlink, junction, mount point) is
+/// rejected without following it, because the target may be a UNC path.
+/// Both calls are one syscall; nothing here canonicalizes.
+pub(crate) fn usable_spawn_dir(path: &str) -> bool {
+    drive_root_is_local(path) && !is_reparse_point(path) && crate::osc7::directory_exists(path)
+}
+
+fn wide_nul(path: &str) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    std::ffi::OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+fn drive_root_is_local(path: &str) -> bool {
+    let mut chars = path.chars();
+    let drive = match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => c,
+        _ => return false,
+    };
+    if chars.next() != Some(':') {
+        return false;
+    }
+    let root = format!("{drive}:\\");
+    let wide = wide_nul(&root);
+    // DRIVE_REMOTE is 4. The constant lives in Win32_System_WindowsProgramming,
+    // which this crate does not enable; the value is the Win32 one.
+    const DRIVE_REMOTE: u32 = 4;
+    unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(wide.as_ptr()) != DRIVE_REMOTE }
+}
+
+fn is_reparse_point(path: &str) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileAttributesW, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+    let wide = wide_nul(path);
+    let attr = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    attr != u32::MAX && attr & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 /// `\\…` (UNC, `\\?\`, `\\.\`) or `\??\…`. Slashes are normalized first so
@@ -436,6 +511,127 @@ fn scan_cwd(data: &[u8]) -> Option<String> {
     accept_local_cwd(s)
 }
 
+struct OscAt<'a> {
+    number: &'a [u8],
+    payload: &'a [u8],
+    /// Index just past BEL or ST.
+    end: usize,
+}
+
+/// One BEL/ST-terminated OSC that starts at `i` (`ESC ]`).
+///
+/// The payload is only this sequence. A later OSC in the same slice is a
+/// separate call, so an untrusted report cannot be read back through a
+/// "last match in the suffix" scan.
+fn osc_at(data: &[u8], i: usize) -> Option<OscAt<'_>> {
+    if data.get(i + 1) != Some(&b']') {
+        return None;
+    }
+    let mut j = i + 2;
+    while data.get(j) == Some(&b' ') {
+        j += 1;
+    }
+    let num_start = j;
+    while matches!(data.get(j), Some(b'0'..=b'9')) {
+        j += 1;
+    }
+    if j == num_start {
+        return None;
+    }
+    let number = &data[num_start..j];
+    while data.get(j) == Some(&b' ') {
+        j += 1;
+    }
+    if data.get(j) != Some(&b';') {
+        return None;
+    }
+    j += 1;
+    let pay = j;
+    while j < data.len() && data[j] != 0x07 && data[j] != 0x1b {
+        j += 1;
+    }
+    let end = if data.get(j) == Some(&0x07) {
+        j + 1
+    } else if data.get(j) == Some(&0x1b) && data.get(j + 1) == Some(&b'\\') {
+        j + 2
+    } else {
+        return None;
+    };
+    Some(OscAt {
+        number,
+        payload: &data[pay..j],
+        end,
+    })
+}
+
+fn cwd_from_osc7(payload: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(payload).ok()?;
+    crate::osc7::parse_osc7(text, crate::osc7::cached_local_names())
+}
+
+/// The last OSC 7 or OSC 9;9 in `data` that is allowed to change the cwd.
+///
+/// `running` and `alt` are the pane state at the start of the slice. The
+/// prompt wrapper emits OSC 133 D, then A, then 9;9, then 7, in one read.
+/// A and D clear `running` for reports that follow them in this slice, so
+/// the prompt's own report is still trusted when the command was running
+/// at the first byte. A `?1049` / `?47` / `?1047` updates `alt` for reports
+/// after that CSI. RIS (`ESC c`) leaves the alt screen.
+///
+/// An untrusted or rejected report does not replace `best`. The later of
+/// two trusted reports wins.
+fn trusted_cwd(data: &[u8], running: bool, alt: bool) -> Option<String> {
+    let mut running = running;
+    let mut alt = alt;
+    let mut best: Option<String> = None;
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        if data.get(i + 1) == Some(&b'c') {
+            alt = false;
+            i += 2;
+            continue;
+        }
+        if data.get(i + 1) == Some(&b'[') {
+            if let Some((next, is_alt)) = scan_csi_alt(data, i) {
+                if is_alt {
+                    // h enters, l leaves. `scan_csi_alt` only says "this CSI
+                    // is one of the three"; the final byte is the direction.
+                    alt = data.get(next - 1) == Some(&b'h');
+                }
+                i = next;
+                continue;
+            }
+        }
+        if let Some(osc) = osc_at(data, i) {
+            if !running && !alt {
+                let cwd = if osc.number == b"7" {
+                    cwd_from_osc7(osc.payload)
+                } else if osc.number == b"9" {
+                    // The slice is this one sequence, so the "last 9;9" scan
+                    // cannot see a later report.
+                    scan_cwd(&data[i..osc.end])
+                } else {
+                    None
+                };
+                if let Some(cwd) = cwd {
+                    best = Some(cwd);
+                }
+            }
+            if osc.number == b"133" && matches!(osc.payload.first(), Some(b'A' | b'D')) {
+                running = false;
+            }
+            i = osc.end;
+            continue;
+        }
+        i += 1;
+    }
+    best
+}
+
 fn handle_osc133<T: EventListener>(
     t: &Term<T>,
     meta: &mut SessionMeta,
@@ -445,6 +641,9 @@ fn handle_osc133<T: EventListener>(
 ) {
     match kind {
         b'A' => {
+            // Prompt start. A BDSM/SCP from the command that just ended
+            // must not survive onto this line.
+            meta.bidi_mut().reset();
             meta.running_cmd.clear();
             // a new prompt starts on the cursor's row: record its block
             // GLOBALLY (evicted + history + row — never drifts)
@@ -457,6 +656,9 @@ fn handle_osc133<T: EventListener>(
             }
         }
         b'D' => {
+            // Command finished. Same reset as A: `cat` of a file that
+            // contains CSI 8 l must not leave the pane in explicit mode.
+            meta.bidi_mut().reset();
             meta.running_cmd.clear();
             if let Some(m) = meta.marks.last_mut() {
                 m.exit = exit;
@@ -554,20 +756,19 @@ fn process_bytes<T: EventListener>(
         meta.saw_ris = true;
     }
     ev.clipboard = scan_osc52(&buf);
-    if let Some(c) = scan_cwd(&buf) {
-        meta.cwd = Some(c.clone());
-        ev.cwd = Some(c);
-    }
-    // OSC 7 wins only when it sits later in this slice than OSC 9;9. A
-    // rejected file:// must not wipe a directory the other report just set.
-    if let Some((at, cwd)) = crate::osc7::last_accepted(&buf, crate::osc7::cached_local_names()) {
-        let later = crate::osc7::last_prefix_index(&buf, b"\x1b]9;9;")
-            .map(|i| at > i)
-            .unwrap_or(true);
-        if later {
-            meta.cwd = Some(cwd.clone());
-            ev.cwd = Some(cwd);
-        }
+    // OSC 7 and OSC 9;9 are trusted only at a shell prompt: no command
+    // running, and not the alt screen. A report that sits after OSC 133 A/D
+    // in this same slice is trusted even if the command was still running
+    // when the slice started — that is the prompt wrapper's own report.
+    // The later of the two trusted reports wins. An untrusted or rejected
+    // one does not replace a directory already stored.
+    if let Some(cwd) = trusted_cwd(
+        &buf,
+        !meta.running_cmd.is_empty(),
+        t.mode().contains(TermMode::ALT_SCREEN),
+    ) {
+        meta.cwd = Some(cwd.clone());
+        ev.cwd = Some(cwd);
     }
     let mut pos = 0;
     for (s, e, kind, exit) in find_osc133(&buf) {
@@ -579,11 +780,20 @@ fn process_bytes<T: EventListener>(
     ev
 }
 
-/// One PTY read. BDSM (`CSI 8 h` / `CSI 8 l`), SCP (`CSI Ps SP k`) and RIS
-/// (`ESC c`) are peeled off first — alacritty_terminal 0.26 does not act on
-/// the first two — and applied between the byte slices they used to sit in,
-/// so a mode change and the text around it stay in order. An alternate-screen
-/// switch resets BiDi state after the slice that caused it is parsed.
+/// One PTY read.
+///
+/// Order inside the loop is the stream order, and later PRs that touch this
+/// function should keep it that way:
+/// 1. `Bytes` are parsed first. OSC 133 A/D (inside `process_bytes`) reset
+///    bidi. A CSI `?1049` / `?47` / `?1047` in the slice resets bidi even
+///    when a second one in the same slice toggles the mode back, so a
+///    start/end pair in one read is not invisible.
+/// 2. `Bdsm` / `Scp` apply only after the bytes that preceded them, and only
+///    while `running_cmd` is set or the alt screen is up. A sequence emitted
+///    by `cat` therefore dies on OSC 133 D, and one that arrives at the
+///    prompt is ignored.
+/// 3. `Ris` resets bidi after the `ESC c` bytes, so alacritty's reset and
+///    ours see the same event. `ESC ESC c` and `ESC <C0> c` are RIS too.
 pub(crate) fn process_chunk<T: EventListener>(
     parser: &mut Processor,
     t: &mut Term<T>,
@@ -601,20 +811,78 @@ pub(crate) fn process_chunk<T: EventListener>(
                 }
                 let was_alt = t.mode().contains(TermMode::ALT_SCREEN);
                 let part = process_bytes(parser, t, meta, carry, &bytes);
-                if was_alt != t.mode().contains(TermMode::ALT_SCREEN) {
-                    meta.bidi.reset();
+                if was_alt != t.mode().contains(TermMode::ALT_SCREEN)
+                    || contains_alt_screen_csi(&bytes)
+                {
+                    meta.bidi_mut().reset();
                 }
                 merge_chunk(&mut ev, part);
             }
-            crate::bidi_ctl::StreamItem::Bdsm(mode) => meta.bidi.mode = mode,
-            crate::bidi_ctl::StreamItem::Scp(dir) => {
-                let (abs, col) = crate::bidi_ctl::cursor_abs(t, meta.evicted);
-                meta.bidi.note_scp(dir, abs, col);
+            crate::bidi_ctl::StreamItem::Bdsm(mode) => {
+                if bidi_controls_live(t, meta) {
+                    meta.bidi_mut().mode = mode;
+                }
             }
-            crate::bidi_ctl::StreamItem::Ris => meta.bidi.reset(),
+            crate::bidi_ctl::StreamItem::Scp(dir) => {
+                if bidi_controls_live(t, meta) {
+                    let (abs, col) = crate::bidi_ctl::cursor_abs(t, meta.evicted);
+                    meta.bidi_mut().note_scp(dir, abs, col);
+                }
+            }
+            crate::bidi_ctl::StreamItem::Ris => {
+                meta.saw_ris = true;
+                meta.bidi_mut().reset();
+            }
         }
     }
     ev
+}
+
+fn bidi_controls_live<T: EventListener>(t: &Term<T>, meta: &SessionMeta) -> bool {
+    t.mode().contains(TermMode::ALT_SCREEN) || !meta.running_cmd.is_empty()
+}
+
+/// `CSI ?1049` / `?47` / `?1047` h or l anywhere in the slice.
+pub(crate) fn contains_alt_screen_csi(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'[') {
+            if let Some((next, changed)) = scan_csi_alt(bytes, i) {
+                if changed {
+                    return true;
+                }
+                i = next;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// `(index past the CSI, true when this CSI enters or leaves the alt screen)`.
+fn scan_csi_alt(data: &[u8], i: usize) -> Option<(usize, bool)> {
+    let mut j = i + 2;
+    let private = data.get(j) == Some(&b'?');
+    if private {
+        j += 1;
+    }
+    let start = j;
+    while j < data.len() && matches!(data[j], b'0'..=b'9' | b';') {
+        j += 1;
+    }
+    let final_b = *data.get(j)?;
+    if !(0x40..=0x7e).contains(&final_b) {
+        return None;
+    }
+    let next = j + 1;
+    if !private || !matches!(final_b, b'h' | b'l') {
+        return Some((next, false));
+    }
+    let hit = data[start..j]
+        .split(|b| *b == b';')
+        .any(|p| p == b"1049" || p == b"47" || p == b"1047");
+    Some((next, hit))
 }
 
 /// On Enter at a prompt, read the typed command straight off the screen
@@ -802,10 +1070,12 @@ impl Session {
         }
         // requested dir (a restored tab, or "new tab inherits the cwd"),
         // else the launcher's directory, else home.
-        // accept_local_cwd runs BEFORE is_dir: a UNC path must not be probed.
+        // accept_local_cwd runs BEFORE any probe: a UNC path must not be
+        // opened. usable_spawn_dir then rejects a remote drive and a reparse
+        // point, and only then calls is_dir.
         let dir = start_cwd
             .and_then(accept_local_cwd)
-            .filter(|d| std::path::Path::new(d).is_dir())
+            .filter(|d| usable_spawn_dir(d))
             .or_else(launcher_dir)
             .or_else(|| std::env::var("USERPROFILE").ok());
         if let Some(d) = dir {
@@ -923,7 +1193,10 @@ impl Session {
             pixel_width: 0,
             pixel_height: 0,
         });
+        // Drop the term lock before meta. A resize reflows rows, so SCP
+        // stamps no longer name the text they were written on.
         self.term.lock().unwrap().resize(size);
+        self.meta.lock().unwrap().bidi_mut().on_resize();
     }
 }
 
@@ -1988,9 +2261,25 @@ mod tests {
             "",
             "   ",
             "C:\\has\r\nline",
+            r"C:\CON",
+            r"C:\con.txt",
+            r"C:\foo\NUL",
+            r"C:\PRN.",
+            r"C:\AUX ",
+            r"C:\COM1",
+            r"C:\foo\COM1.dat",
+            r"C:\LPT9",
+            r"C:\lpt1.txt",
+            r"C:\foo:bar",
+            r"C:\foo::$DATA",
+            "C:\\a\u{202e}b",
+            "C:\\a\u{200e}",
+            "C:\\a\u{202b}b",
         ] {
             assert_eq!(accept_local_cwd(bad), None, "accepted {bad:?}");
         }
+        assert_eq!(accept_local_cwd(r"C:\COM10").as_deref(), Some(r"C:\COM10"));
+        assert_eq!(accept_local_cwd(r"C:\config").as_deref(), Some(r"C:\config"));
         assert_eq!(
             accept_local_cwd(r"C:\Users\Admin\Bayan\").as_deref(),
             Some(r"C:\Users\Admin\Bayan")
@@ -2013,6 +2302,9 @@ mod tests {
             scan_cwd(&osc(r"C:\Users\Admin\Bayan\")).as_deref(),
             Some(r"C:\Users\Admin\Bayan")
         );
+        assert_eq!(scan_cwd(&osc(r"C:\CON")), None, "DOS device via 9;9");
+        assert_eq!(scan_cwd(&osc(r"C:\foo::$DATA")), None, "ADS via 9;9");
+        assert_eq!(scan_cwd(&osc("C:\\a\u{202e}b")), None, "bidi via 9;9");
 
         // a good report survives a later UNC one: nothing to probe, nothing to store
         let (mut t, mut p, mut meta, mut carry) = test_term();
@@ -2021,6 +2313,78 @@ mod tests {
         let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &osc(r"\\evil\share"));
         assert!(ev.cwd.is_none());
         assert_eq!(meta.cwd.as_deref(), Some(r"C:\work"));
+    }
+
+    /// OSC 7 and OSC 9;9 from a running command, or from the alt screen, do
+    /// not replace the cwd. The prompt wrapper's report follows OSC 133 D
+    /// in the same read and is still trusted.
+    #[test]
+    fn cwd_reports_only_at_the_prompt() {
+        let osc9 = |p: &str| {
+            let mut v = b"\x1b]9;9;".to_vec();
+            v.extend_from_slice(p.as_bytes());
+            v.push(0x07);
+            v
+        };
+        let osc7 = |url: &str| {
+            let mut v = b"\x1b]7;".to_vec();
+            v.extend_from_slice(url.as_bytes());
+            v.push(0x07);
+            v
+        };
+
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &osc9(r"C:\work"));
+        assert_eq!(ev.cwd.as_deref(), Some(r"C:\work"));
+
+        meta.running_cmd = "cat".into();
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &osc9(r"C:\evil"));
+        assert!(ev.cwd.is_none());
+        let ev = process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            &osc7("file:///C:/evil"),
+        );
+        assert!(ev.cwd.is_none());
+        assert_eq!(meta.cwd.as_deref(), Some(r"C:\work"));
+
+        // Prompt order: D, A, 9;9, 7. The command was running at the first
+        // byte. The report after D is the one that sticks, and 7 wins over 9;9.
+        let mut prompt = b"\x1b]133;D;0\x07\x1b]133;A\x07".to_vec();
+        prompt.extend(osc9(r"C:\from9"));
+        prompt.extend(osc7("file:///C:/from7"));
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &prompt);
+        assert_eq!(ev.cwd.as_deref(), Some(r"C:\from7"));
+        assert_eq!(meta.cwd.as_deref(), Some(r"C:\from7"));
+        assert!(meta.running_cmd.is_empty());
+
+        // A report that sits before D in the same slice is not stored when
+        // nothing trusted follows it.
+        meta.running_cmd = "cat".into();
+        let mut early = osc9(r"C:\early");
+        early.extend_from_slice(b"\x1b]133;D;0\x07");
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &early);
+        assert!(ev.cwd.is_none());
+        assert_eq!(meta.cwd.as_deref(), Some(r"C:\from7"));
+
+        // Alt screen rejects both reports. Leaving it in the same slice
+        // trusts a report that comes after the leave.
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?1049h");
+        assert!(t.mode().contains(TermMode::ALT_SCREEN));
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &osc7("file:///C:/alt"));
+        assert!(ev.cwd.is_none());
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &osc9(r"C:\alt"));
+        assert!(ev.cwd.is_none());
+        assert!(meta.cwd.is_none());
+
+        let mut leave = b"\x1b[?1049l".to_vec();
+        leave.extend(osc7("file:///D:/after"));
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &leave);
+        assert!(!t.mode().contains(TermMode::ALT_SCREEN));
+        assert_eq!(ev.cwd.as_deref(), Some(r"D:\after"));
     }
 
     #[test]

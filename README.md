@@ -315,7 +315,7 @@ Two escape sequences from ECMA-48 / the terminal-wg "BiDi in Terminal
 Emulators" recommendation, which `alacritty_terminal` 0.26 does not act on
 (mode 8 is an unknown SM/RM parameter; `CSI Ps SP k` is not in its CSI
 dispatch). Bayan strips them from the PTY stream before the parser, including
-when a sequence is split across reads. The tree has 129 unit tests.
+when a sequence is split across reads. The tree has 135 unit tests.
 
 - **BDSM** — `CSI 8 h` implicit (Bayan applies UAX#9; this is the initial
   state, so a shell that never sends BDSM still gets Arabic), `CSI 8 l`
@@ -324,7 +324,12 @@ when a sequence is split across reads. The tree has 129 unit tests.
 - **SCP** — `CSI 1 SP k` LTR, `CSI 2 SP k` RTL, `CSI 0 SP k` or `CSI SP k`
   back to the default (first strong character). The direction applies to the
   current line when the cursor is in column 0, and to the lines after it.
-- Both reset on RIS (`ESC c`) and when switching to or from the alternate screen.
+- Both apply only while a command is running or the pane is on the alternate
+  screen, so `cat` of a file that contains them cannot restyle the prompt.
+  OSC 133 A and D reset them as well. They also reset on RIS (`ESC c`,
+  including `ESC ESC c` and `ESC` plus a C0 byte then `c`) and when a
+  `?1049` / `?47` / `?1047` CSI is seen, even if a second one in the same
+  read toggles the mode back. A resize drops SCP stamps.
 
 `bidi.honor_bdsm` defaults to **true**, so explicit mode overrides Bayan's
 auto-detection. Set it false to keep that detection when an application
@@ -345,8 +350,14 @@ it exists. `SessionMeta::reported_cwd` is what an OSC 8 resolver should join a
 relative `file:line` path against.
 
 After percent-decoding, the path goes through `accept_local_cwd` — the same
-gate as OSC 9;9 and `session.json`. UNC, `\\?\`, `\\.\` and `\??\` are
-rejected there, before `is_dir` can open them.
+gate as OSC 9;9 and `session.json`. UNC, `\\?\`, `\\.\`, `\??\`, DOS device
+names (`CON`, `NUL`, `PRN`, `AUX`, `COM1`–`COM9`, `LPT1`–`LPT9`), alternate
+data streams, and bidi controls are rejected there, before any probe. A
+report is stored only when no command is running and the pane is not on the
+alt screen; the prompt's own OSC 7 still counts, because it follows OSC 133
+D in the same read. A new tab calls `GetDriveTypeW` on the drive root and
+rejects a remote drive, and it rejects a reparse point without following it,
+before `is_dir`.
 
 PowerShell gets OSC 7 from the prompt wrapper Bayan already injects (it also
 still emits OSC 9;9). cmd does not, so a clink prompt filter does the same

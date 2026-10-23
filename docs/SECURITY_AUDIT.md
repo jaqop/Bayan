@@ -118,7 +118,7 @@ Enter in this codebase is the byte `\r` (`src/keys.rs:47`, and `Session::write` 
 
 ### BAYAN-003 — High — OSC 9;9 becomes the next shell's directory
 
-**Status: Fixed.** `accept_local_cwd` is the reusable gate (OSC 7 should parse `file://` and call this, not grow a second checker). It returns a normalized `X:\…` path or `None`. Rejected, with no filesystem call: `\\server\share`, `//server/share`, `\\?\UNC\…`, `\\?\C:\…`, `\\.\…`, and `\??\…`, plus empty, control characters, non-drive paths, and anything over 4096 characters. `scan_cwd` will not store a rejected path or replace a good cwd with one. `Session::spawn` runs the helper before `Path::is_dir`. `spawn_tab` runs it before the basename becomes the tab title. `save_state` will not write a rejected path into `session.json`. Test: `local_cwd_rejects_unc_and_device_paths`. Not done: `C:\Windows\System32` is a local drive path and is still accepted. `launcher_dir` is unchanged.
+**Status: Fixed.** `accept_local_cwd` is the reusable gate (OSC 7 parses `file://` and calls this). It returns a normalized `X:\…` path or `None`. Rejected, with no filesystem call: `\\server\share`, `//server/share`, `\\?\UNC\…`, `\\?\C:\…`, `\\.\…`, and `\??\…`, DOS device names (`CON`, `NUL`, `PRN`, `AUX`, `COM1`–`COM9`, `LPT1`–`LPT9`, with or without an extension), alternate data streams (`:` after the drive colon, including `::$DATA`), bidi controls, empty strings, other controls, non-drive paths, and anything over 4096 characters. `scan_cwd` will not store a rejected path or replace a good cwd with one. `Session::spawn` and `spawn_cwd` run the helper, then `GetDriveTypeW` on `X:\` (reject `DRIVE_REMOTE`) and `GetFileAttributesW` (reject a reparse point without following it), and only then `is_dir`. `spawn_tab` runs the gate before the basename becomes the tab title. `save_state` will not write a rejected path into `session.json`. Tests: `local_cwd_rejects_unc_and_device_paths`, `cwd_reports_only_at_the_prompt`. Not done: `C:\Windows\System32` is a local drive path and is still accepted. `launcher_dir` is unchanged.
 
 `scan_cwd` (`src/term.rs:265`) keeps the last `ESC ] 9 ; 9 ;` payload, strips quotes and trailing slashes, and stores it on `SessionMeta::cwd`. It does not check that the path is local, absolute, or a reasonable length. `UserEvent::Cwd` (`src/main.rs:2271`) publishes the basename as the tab title.
 
@@ -348,7 +348,21 @@ The scratch harness is throwaway. The High-finding assertions now live next to t
 - `osc52_requires_a_terminator_and_never_reads` — no BEL/ST means `None`, `?` stays `None`, 64 KiB decode backstop, `allow_osc52_write` is off unless copy is enabled, the window is focused, and the pane is the focused one.
 - `osc52_visible_cap_is_the_scan_buffer` — one read holds 49146 decoded bytes (~48 KiB); with the 4 KiB carry, 52218 (~51 KiB).
 - `osc52_copy_is_off_unless_explicitly_enabled` — only the config string `"copy"` opts in. `"paste"` and `"read"` do not.
-- `local_cwd_rejects_unc_and_device_paths` — `scan_cwd` / `accept_local_cwd` return `None` for `\\…`, `//…`, `\\?\…`, and `\??\…`, and a later UNC report does not replace a good cwd.
+- `local_cwd_rejects_unc_and_device_paths` — `scan_cwd` / `accept_local_cwd` return `None` for `\\…`, `//…`, `\\?\…`, `\??\…`, DOS device names, ADS, and bidi controls, and a later UNC report does not replace a good cwd.
+- `cwd_reports_only_at_the_prompt` — OSC 7 and OSC 9;9 are stored only when no command is running and the pane is not on the alt screen. A report that follows OSC 133 D in the same read is still stored.
+- `osc133_a_and_d_reset_bidi_and_idle_ignores_it` — BDSM/SCP from command output do not survive OSC 133 A or D, and the same bytes at the prompt are ignored.
+- `esc_esc_c_and_esc_c0_c_are_ris`, `double_alt_screen_toggle_in_one_chunk_resets`, `filter_matches_vte_on_random_streams` — RIS and alt-screen detection follow vte, including a double toggle in one read.
+- `resize_clears_scp_stamps_and_keeps_mode` — SCP stamps do not survive a resize.
+
+## QA review of BDSM/SCP and OSC 7
+
+These sit on top of the findings above. They are the fixes from the review of `ee36307`.
+
+- **Command output must not stick.** BDSM and SCP are recorded only while `running_cmd` is set or the pane is on the alternate screen. OSC 133 A and OSC 133 D both call `BidiState::reset`. The painter and the hit-test use `for_display`, which ignores explicit mode and SCP stamps once the command has ended and the primary screen is back. `honor_bdsm` stays true.
+- **The filter matches vte 0.15 on ESC.** A second ESC restarts the sequence, and C0 other than CAN/SUB is executed without leaving Escape, so `ESC ESC c` and `ESC <C0> c` are RIS. CAN and SUB still cancel. Inside CSI, other C0 pass through and the sequence continues, and DEL / bytes above 0x7E are ignored, so an alt-screen CSI with a C0 in it is still that CSI.
+- **Alt screen is every CSI, not the net mode.** `?1049`, `?47`, and `?1047` inside one read reset bidi even when a second sequence toggles the mode back to where it started. alacritty only flips `ALT_SCREEN` for 1049; 47 and 1047 still reset bidi.
+- **Cwd reports are prompt-only.** OSC 7 and OSC 9;9 are accepted only when `running_cmd` is empty and the pane is not on the alt screen, judged at each sequence as the slice is scanned. OSC 133 A/D earlier in the same slice clear the running flag, which is why the prompt wrapper (D, then A, then 9;9, then 7) still updates the directory. A rejected report does not replace a stored one. The directory is what `file:line` links resolve against, and cmd searches it before PATH.
+- **Spawn stays off the network.** The string gate does not touch the disk. `usable_spawn_dir` then rejects `DRIVE_REMOTE` via `GetDriveTypeW` on the drive root, and a reparse point via `GetFileAttributesW`, without `canonicalize`.
 - `dropped_paths_are_quoted_for_the_running_shell` — `$(calc)` is a single-quoted literal for PowerShell, Git Bash, and WSL; cmd quotes `&` and refuses `%`.
 
 Still worth adding with the Medium fixes:
