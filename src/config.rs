@@ -46,6 +46,11 @@ pub struct UserConfig {
     /// EasyTer's convention). Explicit Ctrl+C copy always works.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub copy_on_select: Option<bool>,
+    /// OSC 52 clipboard writes from the child. Off unless this is exactly
+    /// `"copy"`. There is no read setting: a query never returns clipboard
+    /// bytes, whatever this says. Writes also require the window to be focused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub osc52: Option<String>,
     /// BEL behavior: "attention" (amber tab dot, default), "sound"
     /// (dot + system beep), "silent" (nothing).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -193,6 +198,12 @@ impl UserConfig {
 
     pub fn copy_on_select_on(&self) -> bool {
         self.copy_on_select.unwrap_or(true)
+    }
+
+    /// True only for an explicit `"copy"`. `"paste"`, `"read"`, `"on"`, and
+    /// a missing key all stay off — a typo must not open the clipboard.
+    pub fn osc52_copy_enabled(&self) -> bool {
+        matches!(self.osc52.as_deref(), Some("copy"))
     }
 
     pub fn cursor_blink_on(&self) -> bool {
@@ -389,5 +400,19 @@ mod tests {
         assert_eq!(parse_hex("#fff"), None);
         assert_eq!(parse_hex("#zzzzzz"), None);
         assert_eq!(parse_hex(""), None);
+    }
+
+    /// BAYAN-001: OSC 52 writes default off, and no value enables a read.
+    #[test]
+    fn osc52_copy_is_off_unless_explicitly_enabled() {
+        assert!(!UserConfig::default().osc52_copy_enabled());
+        let missing: UserConfig = serde_json::from_str("{}").unwrap();
+        assert!(!missing.osc52_copy_enabled());
+        for off in ["off", "paste", "read", "copy-paste", "on", ""] {
+            let cfg: UserConfig = serde_json::from_str(&format!(r#"{{"osc52":"{off}"}}"#)).unwrap();
+            assert!(!cfg.osc52_copy_enabled(), "{off} must not enable a write or a read");
+        }
+        let on: UserConfig = serde_json::from_str(r#"{"osc52":"copy"}"#).unwrap();
+        assert!(on.osc52_copy_enabled());
     }
 }
