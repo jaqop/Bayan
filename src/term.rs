@@ -125,7 +125,9 @@ pub struct SessionMeta {
     pub prompt_col: Option<usize>,
     /// the command line currently executing ("" = idle) — feeds cmd_is_claude
     pub running_cmd: String,
-    /// working directory from OSC 9;9
+    /// working directory from OSC 9;9.
+    /// File links resolve through `link::cwd_hook` on this field. OSC 7
+    /// (a `file://` cwd, PR5) should write it too — there is no second source.
     pub cwd: Option<String>,
     /// command blocks (OSC 133 A/D): gutter lights + prompt jumping
     pub marks: Vec<CmdMark>,
@@ -381,17 +383,12 @@ pub fn accept_local_cwd(raw: &str) -> Option<String> {
     if s.chars().any(|c| c.is_control()) {
         return None;
     }
+    // A comma or a quote breaks out of `explorer /select,"<path>"`.
+    if s.contains(',') || s.contains('"') {
+        return None;
+    }
     if unc_or_device(s) {
         return None;
-    }
-    let mut chars = s.chars();
-    let drive = chars.next()?;
-    if !drive.is_ascii_alphabetic() || chars.next() != Some(':') {
-        return None;
-    }
-    match chars.next() {
-        Some('\\' | '/') => {}
-        _ => return None,
     }
     let mut norm: String = s.chars().map(|c| if c == '/' { '\\' } else { c }).collect();
     // Keep the drive root (`C:\`). A trailing slash on anything longer is
@@ -401,15 +398,60 @@ pub fn accept_local_cwd(raw: &str) -> Option<String> {
             norm.pop();
         }
     }
-    if unc_or_device(&norm) {
+    if unc_or_device(&norm) || norm.contains("\\\\") {
         return None;
     }
-    Some(norm)
+    let mut chars = norm.chars();
+    let drive = chars.next()?;
+    if !drive.is_ascii_alphabetic() || chars.next() != Some(':') {
+        return None;
+    }
+    if chars.next() != Some('\\') {
+        return None;
+    }
+    // The drive letter's colon is the only one allowed. A later colon is
+    // an alternate data stream (`a.txt:evil.exe`, `evil.exe::$DATA`).
+    if norm.len() > 2 && norm[2..].contains(':') {
+        return None;
+    }
+    let rest = if norm.len() <= 3 { "" } else { &norm[3..] };
+    let mut stack: Vec<&str> = Vec::new();
+    if !rest.is_empty() {
+        for comp in rest.split('\\') {
+            if comp.is_empty() {
+                return None;
+            }
+            if comp == "." {
+                continue;
+            }
+            if comp == ".." {
+                if stack.is_empty() {
+                    return None;
+                }
+                stack.pop();
+                continue;
+            }
+            stack.push(comp);
+        }
+    }
+    let mut out = String::new();
+    out.push(drive);
+    out.push(':');
+    out.push('\\');
+    if !stack.is_empty() {
+        out.push_str(&stack.join("\\"));
+    }
+    if out.chars().count() > MAX_CWD_CHARS || unc_or_device(&out) || out.contains("\\\\") {
+        return None;
+    }
+    Some(out)
 }
 
 /// `\\…` (UNC, `\\?\`, `\\.\`) or `\??\…`. Slashes are normalized first so
 /// `//server/share` and `//?/UNC/…` take the same path as their backslash form.
-fn unc_or_device(s: &str) -> bool {
+/// File links call this on the path they are about to open — the same gate
+/// as [`accept_local_cwd`], not a second copy of the rules.
+pub(crate) fn unc_or_device(s: &str) -> bool {
     let norm: String = s.chars().map(|c| if c == '/' { '\\' } else { c }).collect();
     let lower = norm.to_ascii_lowercase();
     lower.starts_with("\\\\") || lower.starts_with("\\??\\")
@@ -2239,6 +2281,31 @@ mod tests {
         let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &osc(r"\\evil\share"));
         assert!(ev.cwd.is_none());
         assert_eq!(meta.cwd.as_deref(), Some(r"C:\work"));
+    }
+
+    /// Comma, quote, a `\\` anywhere, an ADS colon, and `..` that escapes
+    /// the drive are not a cwd and not an `explorer /select` argument.
+    #[test]
+    fn local_cwd_rejects_select_injection_and_ads() {
+        for bad in [
+            r"C:\x,/root,\\evil\share",
+            r"C:\foo\\bar",
+            "C:/foo//bar",
+            "C:\\foo\"bar",
+            r"C:\..\..\evil",
+            r"C:\a.txt:evil.exe",
+            r"C:\evil.exe::$DATA",
+            r"C:\work\..\..\..\Windows",
+        ] {
+            assert_eq!(accept_local_cwd(bad), None, "accepted {bad:?}");
+        }
+        assert_eq!(accept_local_cwd(r"C:\a\..\b").as_deref(), Some(r"C:\b"));
+        assert_eq!(accept_local_cwd(r"C:\a\.\b").as_deref(), Some(r"C:\a\b"));
+        assert_eq!(accept_local_cwd(r"  C:\src  ").as_deref(), Some(r"C:\src"));
+        assert_eq!(
+            accept_local_cwd(r"C:\work\src\..\lib.rs").as_deref(),
+            Some(r"C:\work\lib.rs")
+        );
     }
 
     #[test]
