@@ -101,20 +101,62 @@ pub fn split_command(cmd: &str) -> (String, Vec<String>) {
 /// depend on these marks. `__by_osc7` adds the standard OSC 7 `file://`
 /// report beside 9;9 (empty host, so `file:///C:/…`); cmd/clink has the
 /// matching snippet in the README, because cmd is launched bare.
-const PS_MARKS: &str = "function global:__by_osc7{if($PWD.Provider.Name -ne 'FileSystem'){return ''};\
+const PS_HEAD: &str = "function global:__by_osc7{if($PWD.Provider.Name -ne 'FileSystem'){return ''};\
 $p=$PWD.ProviderPath.Replace('\\','/');if($p -match '^[A-Za-z]:'){$p='/'+$p};$e='';\
 foreach($x in [Text.Encoding]::UTF8.GetBytes($p)){if($x -eq 47 -or ($x -ge 48 -and $x -le 57) -or ($x -ge 65 -and $x -le 90) -or ($x -ge 97 -and $x -le 122) -or $x -eq 45 -or $x -eq 46 -or $x -eq 95 -or $x -eq 126 -or $x -eq 58){$e+=[char]$x}else{$e+=('%{0:X2}' -f $x)}};[char]27+']7;file://'+$e+[char]7};\
 function global:__by_wrap{if(-not $global:__BY_SI){$global:__BY_SI=$true;\
 $global:__BY_OP=$function:prompt;function global:prompt{\
 $c=$global:LASTEXITCODE;if($null -eq $c){if($?){$c=0}else{$c=1}};\
-\"$([char]27)]133;D;$c$([char]7)$([char]27)]133;A$([char]7)\
+\"$([char]27)]133;D;$c;";
+
+const PS_MID: &str = "$([char]7)$([char]27)]133;A;";
+
+const PS_TAIL: &str = "$([char]7)\
 $([char]27)]9;9;$($PWD.ProviderPath)$([char]7)$(__by_osc7)\"\
 +(& $global:__BY_OP)+\"$([char]27)]133;B$([char]7)\"}}}; __by_wrap";
 
-/// The PowerShell prompt wrapper injected at spawn. Tests check that OSC 7
-/// stayed in it; the README quotes the same idea for cmd/clink.
-pub(crate) fn shell_integration_ps() -> &'static str {
-    PS_MARKS
+/// The PowerShell prompt wrapper injected at spawn.
+///
+/// `nonce` is embedded in OSC 133 D and A (`D;<exit>;<nonce>`, `A;<nonce>`).
+/// A report from a running command is stored only after an A that carries
+/// the same nonce, so a spoofed `133;D` cannot authorize the OSC 7 that
+/// follows it. Hex is safe inside the double-quoted prompt string. An empty
+/// nonce keeps the old "any A/D" rule for tests. cmd/clink has no 133 marks;
+/// its OSC 7 is still accepted while the pane is already idle.
+pub(crate) fn shell_integration_ps(nonce: &str) -> String {
+    let mut s = String::with_capacity(PS_HEAD.len() + PS_MID.len() + PS_TAIL.len() + nonce.len() * 2);
+    s.push_str(PS_HEAD);
+    s.push_str(nonce);
+    s.push_str(PS_MID);
+    s.push_str(nonce);
+    s.push_str(PS_TAIL);
+    s
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    /// `SystemFunction036` is `RtlGenRandom`. 32 hex characters from it go
+    /// into OSC 133 so a program cannot mint a prompt-end mark.
+    fn SystemFunction036(randombuffer: *mut core::ffi::c_void, randombufferlength: u32) -> i32;
+}
+
+fn fresh_prompt_nonce() -> String {
+    let mut bytes = [0u8; 16];
+    let ok = unsafe { SystemFunction036(bytes.as_mut_ptr().cast(), bytes.len() as u32) != 0 };
+    if !ok {
+        let tick = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        bytes[..8].copy_from_slice(&tick.to_le_bytes());
+        bytes[8..].copy_from_slice(&(std::process::id() as u64).to_le_bytes());
+    }
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from(b"0123456789abcdef"[(b >> 4) as usize]));
+        s.push(char::from(b"0123456789abcdef"[(b & 0xf) as usize]));
+    }
+    s
 }
 
 /// One command block: where its prompt sits and how the command ended.
@@ -172,6 +214,12 @@ pub struct SessionMeta {
     /// uses this same byte test, inside the feed, because the flag stays
     /// set until the UI reads it.
     pub saw_ris: bool,
+    /// Secret mixed into OSC 133 A and D by the PowerShell prompt wrapper.
+    /// Empty in tests: any A or D is trusted. A live session sets 32 hex
+    /// characters at spawn. While a command is running, OSC 7 / OSC 9;9 are
+    /// stored only after an A that carries this nonce. Clink's OSC 7 has no
+    /// 133 and is still accepted when the pane is already idle.
+    pub prompt_nonce: String,
 }
 
 impl SessionMeta {
@@ -270,9 +318,10 @@ fn osc_opener_before(data: &[u8], esc: usize) -> Option<usize> {
     }
 }
 
-/// OSC 133 markers in a chunk: (start, end, kind, exit code for D marks).
+/// OSC 133 markers in a chunk: (start, end, kind, exit code for D marks,
+/// whether the payload carries the session nonce).
 /// The carry logic above guarantees whole sequences.
-fn find_osc133(data: &[u8]) -> Vec<(usize, usize, u8, Option<i32>)> {
+fn find_osc133(data: &[u8], nonce: &str) -> Vec<(usize, usize, u8, Option<i32>, bool)> {
     const P: &[u8] = b"\x1b]133;";
     let mut out = Vec::new();
     let mut i = 0;
@@ -294,13 +343,16 @@ fn find_osc133(data: &[u8]) -> Vec<(usize, usize, u8, Option<i32>)> {
             }
             match end {
                 Some(e) => {
-                    // "D;<code>" carries the exit status
+                    let payload = &data[i + P.len()..j];
+                    let trusted = osc133_trusted(payload, nonce);
+                    // "D;<code>" carries the exit status. A nonce field after
+                    // the code is not part of the number.
                     let exit = data[i + P.len() + 1..j]
                         .strip_prefix(b";")
                         .and_then(|p| std::str::from_utf8(p).ok())
                         .and_then(|p| p.split(';').next())
                         .and_then(|p| p.parse().ok());
-                    out.push((i, e, kind, exit));
+                    out.push((i, e, kind, exit, trusted));
                     i = e;
                     continue;
                 }
@@ -501,16 +553,50 @@ pub fn accept_local_cwd(raw: &str) -> Option<String> {
 }
 
 fn reserved_dos_name(component: &str) -> bool {
-    let trimmed = component.trim_end_matches([' ', '.']);
+    // Windows strips spaces before the device check, so `CON .txt` is `CON`.
+    let collapsed: String = component.chars().filter(|c| *c != ' ').collect();
+    let trimmed = collapsed.trim_end_matches('.');
     if trimmed.is_empty() {
         return false;
     }
     let base = trimmed.split('.').next().unwrap_or(trimmed);
     let upper = base.to_ascii_uppercase();
-    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (upper.len() == 4
-            && (upper.starts_with("COM") || upper.starts_with("LPT"))
-            && matches!(upper.as_bytes()[3], b'1'..=b'9'))
+    if matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+    ) {
+        return true;
+    }
+    let rest = upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"));
+    let Some(rest) = rest else {
+        return false;
+    };
+    let mut chars = rest.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => dos_device_digit(c),
+        _ => false,
+    }
+}
+
+/// ASCII `0`–`9`, plus the superscript digits Windows folds into that slot
+/// (`⁰¹²³⁴⁵⁶⁷⁸⁹`, with ¹²³ in the Latin-1 block).
+fn dos_device_digit(c: char) -> bool {
+    matches!(
+        c,
+        '0'..='9'
+            | '\u{2070}'
+            | '\u{00B9}'
+            | '\u{00B2}'
+            | '\u{00B3}'
+            | '\u{2074}'
+            | '\u{2075}'
+            | '\u{2076}'
+            | '\u{2077}'
+            | '\u{2078}'
+            | '\u{2079}'
+    )
 }
 
 /// Spawn-time probe. [`accept_local_cwd`] has already rejected UNC.
@@ -633,20 +719,45 @@ fn cwd_from_osc7(payload: &[u8]) -> Option<String> {
     crate::osc7::parse_osc7(text, crate::osc7::cached_local_names())
 }
 
+/// `A` or `D` whose `;`-separated fields contain `nonce`.
+///
+/// An empty nonce trusts every A and D, which is what the unit tests send.
+/// A live nonce is 32 hex characters from [`fresh_prompt_nonce`].
+fn osc133_trusted(payload: &[u8], nonce: &str) -> bool {
+    let Some(&kind) = payload.first() else {
+        return false;
+    };
+    if kind != b'A' && kind != b'D' {
+        return false;
+    }
+    if nonce.is_empty() {
+        return true;
+    }
+    let Ok(text) = std::str::from_utf8(payload) else {
+        return false;
+    };
+    text.split(';').any(|field| field == nonce)
+}
+
 /// The last OSC 7 or OSC 9;9 in `data` that is allowed to change the cwd.
 ///
 /// `running` and `alt` are the pane state at the start of the slice. The
 /// prompt wrapper emits OSC 133 D, then A, then 9;9, then 7, in one read.
-/// A and D clear `running` for reports that follow them in this slice, so
-/// the prompt's own report is still trusted when the command was running
-/// at the first byte. A `?1049` / `?47` / `?1047` updates `alt` for reports
-/// after that CSI. RIS (`ESC c`) leaves the alt screen.
+/// A trusted A or D clears `running` for reports that follow them in this
+/// slice. With a session nonce, only an A that carries it arms the report:
+/// a spoofed `133;D` leaves the command running and does not authorize the
+/// OSC 7 after it. An empty nonce (tests) arms at the start, so any A/D is
+/// enough. A pane that is already idle stays armed, which is how clink's
+/// OSC 7 — no 133 at all — still updates the directory. A `?1049` / `?47` /
+/// `?1047` updates `alt` for reports after that CSI. RIS (`ESC c`) leaves
+/// the alt screen.
 ///
 /// An untrusted or rejected report does not replace `best`. The later of
 /// two trusted reports wins.
-fn trusted_cwd(data: &[u8], running: bool, alt: bool) -> Option<String> {
+fn trusted_cwd(data: &[u8], running: bool, alt: bool, nonce: &str) -> Option<String> {
     let mut running = running;
     let mut alt = alt;
+    let mut armed = nonce.is_empty() || !running;
     let mut best: Option<String> = None;
     let mut i = 0;
     while i < data.len() {
@@ -671,7 +782,7 @@ fn trusted_cwd(data: &[u8], running: bool, alt: bool) -> Option<String> {
             }
         }
         if let Some(osc) = osc_at(data, i) {
-            if !running && !alt {
+            if !running && !alt && armed {
                 let cwd = if osc.number == b"7" {
                     cwd_from_osc7(osc.payload)
                 } else if osc.number == b"9" {
@@ -685,8 +796,11 @@ fn trusted_cwd(data: &[u8], running: bool, alt: bool) -> Option<String> {
                     best = Some(cwd);
                 }
             }
-            if osc.number == b"133" && matches!(osc.payload.first(), Some(b'A' | b'D')) {
+            if osc.number == b"133" && osc133_trusted(osc.payload, nonce) {
                 running = false;
+                if osc.payload.first() == Some(&b'A') {
+                    armed = true;
+                }
             }
             i = osc.end;
             continue;
@@ -701,13 +815,19 @@ fn handle_osc133<T: EventListener>(
     meta: &mut SessionMeta,
     kind: u8,
     exit: Option<i32>,
+    trusted: bool,
     ev: &mut ChunkEvents,
 ) {
     match kind {
         b'A' => {
             // Prompt start. A BDSM/SCP from the command that just ended
-            // must not survive onto this line.
+            // must not survive onto this line, even when the A is spoofed.
+            // Only a trusted A (the session nonce, or any A when the nonce
+            // is empty) clears the command and records a mark.
             meta.bidi_mut().reset();
+            if !trusted {
+                return;
+            }
             meta.running_cmd.clear();
             // a new prompt starts on the cursor's row: record its block
             // GLOBALLY (evicted + history + row — never drifts)
@@ -722,7 +842,12 @@ fn handle_osc133<T: EventListener>(
         b'D' => {
             // Command finished. Same reset as A: `cat` of a file that
             // contains CSI 8 l must not leave the pane in explicit mode.
+            // An untrusted D does not clear `running_cmd`, so the OSC 7
+            // that a spoofed mark tries to authorize stays ignored.
             meta.bidi_mut().reset();
+            if !trusted {
+                return;
+            }
             meta.running_cmd.clear();
             if let Some(m) = meta.marks.last_mut() {
                 m.exit = exit;
@@ -923,8 +1048,35 @@ fn feed_plain<T: EventListener>(
     }
 }
 
+/// RIS the way vte 0.15 sees it from Escape: `c` with no intermediates.
+/// A second ESC restarts the sequence. C0 other than CAN/SUB is executed
+/// and does not leave Escape. DEL and bytes >= 0x80 are ignored and stay,
+/// so `ESC 0x80 c` is RIS.
 fn contains_ris(bytes: &[u8]) -> bool {
-    bytes.windows(2).any(|w| w == b"\x1bc")
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                0x1b => break,
+                0x18 | 0x1a => {
+                    i += 1;
+                    break;
+                }
+                0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f | 0x80..=0xff => i += 1,
+                b'c' => return true,
+                _ => {
+                    i += 1;
+                    break;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// `CSI =` updates `TermMode` and leaves the push/pop stack stale, which is
@@ -1070,22 +1222,25 @@ fn process_bytes<T: EventListener>(
     // when the slice started — that is the prompt wrapper's own report.
     // The later of the two trusted reports wins. An untrusted or rejected
     // one does not replace a directory already stored.
+    let nonce = meta.prompt_nonce.clone();
     if let Some(cwd) = trusted_cwd(
         &buf,
         !meta.running_cmd.is_empty(),
         t.mode().contains(TermMode::ALT_SCREEN),
+        &nonce,
     ) {
         meta.cwd = Some(cwd.clone());
         ev.cwd = Some(cwd);
     }
     let mut pos = 0;
-    for (s, e, kind, exit) in find_osc133(&buf) {
+    for (s, e, kind, exit, trusted) in find_osc133(&buf, &nonce) {
         feed_counted(parser, t, meta, &buf[pos..s], &mut ev.pty_replies);
-        handle_osc133(t, meta, kind, exit, &mut ev);
+        handle_osc133(t, meta, kind, exit, trusted, &mut ev);
         // A new prompt means the previous program is gone. A crashed TUI
         // never pops its keyboard flags; clear the current screen before
-        // the shell types. Off, or an empty stack, this is a no-op.
-        if kind == b'A' {
+        // the shell types. Off, or an empty stack, this is a no-op. A
+        // spoofed A (nonce mismatch) must not pop the stack.
+        if kind == b'A' && trusted {
             reset_keyboard_modes(parser, t, meta);
         }
         pos = e;
@@ -1107,7 +1262,8 @@ fn process_bytes<T: EventListener>(
 ///    by `cat` therefore dies on OSC 133 D, and one that arrives at the
 ///    prompt is ignored.
 /// 3. `Ris` resets bidi after the `ESC c` bytes, so alacritty's reset and
-///    ours see the same event. `ESC ESC c` and `ESC <C0> c` are RIS too.
+///    ours see the same event. `ESC ESC c`, `ESC <C0> c`, and `ESC` plus a
+///    byte >= 0x80 then `c` are RIS too.
 ///
 /// `merge_chunk` joins those `Bytes` items and extends `pty_replies`, so a
 /// kitty `CSI ? u` answer is kept when the filter splits the read.
@@ -1185,7 +1341,9 @@ fn scan_csi_alt(data: &[u8], i: usize) -> Option<(usize, bool)> {
         j += 1;
     }
     let start = j;
-    while j < data.len() && matches!(data[j], b'0'..=b'9' | b';') {
+    // `:` starts a subparameter. The mode number is the first one, so
+    // `?1049:0h` is still 1049.
+    while j < data.len() && matches!(data[j], b'0'..=b'9' | b';' | b':') {
         j += 1;
     }
     let final_b = *data.get(j)?;
@@ -1196,9 +1354,10 @@ fn scan_csi_alt(data: &[u8], i: usize) -> Option<(usize, bool)> {
     if !private || !matches!(final_b, b'h' | b'l') {
         return Some((next, false));
     }
-    let hit = data[start..j]
-        .split(|b| *b == b';')
-        .any(|p| p == b"1049" || p == b"47" || p == b"1047");
+    let hit = data[start..j].split(|b| *b == b';').any(|p| {
+        let head = p.split(|b| *b == b':').next().unwrap_or(p);
+        matches!(head, b"1049" | b"47" | b"1047")
+    });
     Some((next, hit))
 }
 
@@ -1377,6 +1536,7 @@ impl Session {
         shell: &str,
         kitty_protocol: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let prompt_nonce = fresh_prompt_nonce();
         let pty = native_pty_system();
         let pair = pty.openpty(PtySize {
             rows: size.rows as u16,
@@ -1422,7 +1582,7 @@ impl Session {
                 ));
             }
             setup.push(' ');
-            setup.push_str(shell_integration_ps());
+            setup.push_str(&shell_integration_ps(&prompt_nonce));
             cmd.arg(setup);
         } else if shell_family(shell) == ShellFamily::Cmd {
             // UTF-8 code page so Arabic paths survive; no OSC 133 marks
@@ -1451,6 +1611,7 @@ impl Session {
 
         let meta = Arc::new(Mutex::new(SessionMeta {
             kitty_protocol,
+            prompt_nonce,
             ..SessionMeta::default()
         }));
         let parser = Arc::new(Mutex::new(Processor::new()));
@@ -2776,6 +2937,39 @@ mod tests {
         );
     }
 
+    /// COM0/LPT0, superscript digits, the `$` devices, and a space before the
+    /// extension. `COM10` stays a normal directory. A device component is
+    /// rejected even when `..` would have popped it.
+    #[test]
+    fn local_cwd_rejects_spaced_superscript_and_dollar_devices() {
+        let superscripts = [
+            '\u{2070}', '\u{00B9}', '\u{00B2}', '\u{00B3}', '\u{2074}', '\u{2075}', '\u{2076}',
+            '\u{2077}', '\u{2078}', '\u{2079}',
+        ];
+        for (i, digit) in superscripts.iter().enumerate() {
+            let com = format!("C:\\COM{digit}");
+            let lpt = format!("C:\\lpt{digit}.txt");
+            assert_eq!(accept_local_cwd(&com), None, "COM superscript {i} in {com}");
+            assert_eq!(accept_local_cwd(&lpt), None, "LPT superscript {i} in {lpt}");
+        }
+        for bad in [
+            r"C:\COM0",
+            r"C:\LPT0",
+            r"C:\com0.txt",
+            r"C:\CON .txt",
+            r"C:\con .TXT",
+            r"C:\CONIN$",
+            r"C:\CONOUT$",
+            r"C:\CLOCK$",
+            r"C:\foo\CONIN$.txt",
+            r"C:\CON\..\Users",
+        ] {
+            assert_eq!(accept_local_cwd(bad), None, "accepted {bad:?}");
+        }
+        assert_eq!(accept_local_cwd(r"C:\COM10").as_deref(), Some(r"C:\COM10"));
+        assert_eq!(accept_local_cwd(r"C:\LPT10").as_deref(), Some(r"C:\LPT10"));
+    }
+
     #[test]
     fn posh_config_parses_common_profile_lines() {
         assert_eq!(
@@ -2923,6 +3117,104 @@ mod tests {
         let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?u");
         assert_eq!(ev.pty_replies, vec!["\x1b[?0u".to_string()]);
         assert!(take_writes(&log).is_empty());
+    }
+
+    /// The BiDi filter emits one `Bytes` item for the query and another for
+    /// the text after the stripped BDSM. `merge_chunk` has to keep both
+    /// replies, or the `CSI ?0u` answer never reaches the PTY.
+    #[test]
+    fn kitty_query_reply_survives_merged_chunks() {
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log,
+        } = kitty_term(false);
+        let ev = process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[?u\x1b[8lNEXT",
+        );
+        assert_eq!(ev.pty_replies, vec!["\x1b[?0u".to_string()]);
+        assert!(take_writes(&log).is_empty());
+        let row = &t.grid()[alacritty_terminal::index::Line(0)];
+        assert_eq!(row[Column(0)].c, 'N');
+        assert_eq!(row[Column(1)].c, 'E');
+        assert_eq!(row[Column(2)].c, 'X');
+        assert_eq!(row[Column(3)].c, 'T');
+
+        let ev = process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[?u\x1b[8l\x1b[?u",
+        );
+        assert_eq!(
+            ev.pty_replies,
+            vec!["\x1b[?0u".to_string(), "\x1b[?0u".to_string()]
+        );
+    }
+
+    /// A `133;D` that does not carry the session nonce must not authorize
+    /// the OSC 7 after it. The real prompt (D and A, both with the nonce)
+    /// still stores the directory. Idle OSC 7, the clink case, does too.
+    #[test]
+    fn spoofed_133_d_does_not_accept_osc7_without_the_nonce() {
+        let osc7 = |url: &str| {
+            let mut v = b"\x1b]7;".to_vec();
+            v.extend_from_slice(url.as_bytes());
+            v.push(0x07);
+            v
+        };
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.prompt_nonce = "n0nce".into();
+        let ev = process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            &osc7("file:///C:/work"),
+        );
+        assert_eq!(ev.cwd.as_deref(), Some(r"C:\work"), "idle OSC 7 needs no 133");
+
+        meta.running_cmd = "cat".into();
+        meta.bidi_mut().mode = crate::bidi_ctl::BidiMode::Explicit;
+        let mut spoof = b"\x1b]133;D;0\x07".to_vec();
+        spoof.extend(osc7("file:///C:/evil"));
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &spoof);
+        assert!(ev.cwd.is_none());
+        assert_eq!(meta.cwd.as_deref(), Some(r"C:\work"));
+        assert_eq!(meta.running_cmd, "cat", "a spoofed D must not clear the command");
+        assert_eq!(
+            meta.bidi.mode,
+            crate::bidi_ctl::BidiMode::Implicit,
+            "bidi still resets on any D"
+        );
+
+        let mut both = b"\x1b]133;D;0\x07\x1b]133;A\x07".to_vec();
+        both.extend(osc7("file:///C:/evil"));
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &both);
+        assert!(ev.cwd.is_none());
+        assert_eq!(meta.running_cmd, "cat");
+
+        // D with the nonce ends the command but does not arm the report.
+        let mut only_d = b"\x1b]133;D;0;n0nce\x07".to_vec();
+        only_d.extend(osc7("file:///C:/afterd"));
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &only_d);
+        assert!(ev.cwd.is_none());
+        assert!(meta.running_cmd.is_empty());
+        assert_eq!(meta.cwd.as_deref(), Some(r"C:\work"));
+
+        meta.running_cmd = "cat".into();
+        let mut prompt = b"\x1b]133;D;0;n0nce\x07\x1b]133;A;n0nce\x07".to_vec();
+        prompt.extend(osc7("file:///C:/from7"));
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &prompt);
+        assert_eq!(ev.cwd.as_deref(), Some(r"C:\from7"));
+        assert!(meta.running_cmd.is_empty());
     }
 
     #[test]

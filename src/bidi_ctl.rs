@@ -178,16 +178,27 @@ enum Phase {
     Ground,
     Esc,
     Csi,
+    /// OSC payload, passed through. An ESC ends the OSC in vte. If that ESC
+    /// is then stripped (BDSM/SCP), the bytes after it stay inside the OSC
+    /// and the carry swallows them.
+    Osc,
+    /// ESC seen inside an OSC. `\` completes ST. Any other byte starts the
+    /// sequence that ended the OSC.
+    OscEsc,
 }
 
 /// Holds back a CSI (or a bare ESC) that might still turn into BDSM, SCP,
-/// or RIS. Everything else is emitted immediately, so OSC 133 / OSC 7 keep
-/// the carry behaviour they already have.
+/// or RIS. OSC payload is passed through, and an ESC that ends an OSC is
+/// not removed unless ST is emitted in its place. OSC 133 / OSC 7 keep the
+/// carry behaviour they already have.
 #[derive(Default)]
 pub struct StreamFilter {
     phase: Phase,
     /// The sequence under inspection, starting at its ESC.
     held: Vec<u8>,
+    /// `held` starts with an ESC that ended an OSC and has not been emitted.
+    /// Dropping that ESC must emit ST first.
+    osc_open: bool,
 }
 
 /// Longer than any real BDSM/SCP. Past this the bytes cannot be one of ours.
@@ -214,7 +225,33 @@ impl StreamFilter {
         items
     }
 
+    /// Emit `held`. An ESC at the front is the one that ended an OSC, so the
+    /// parser leaves the OSC on its own and no extra ST is needed.
+    fn flush_held(&mut self, out: &mut Vec<u8>) {
+        if self.held.first() == Some(&0x1b) {
+            self.osc_open = false;
+        }
+        out.append(&mut self.held);
+    }
+
+    /// The ESC that ended an OSC was dropped. ST closes the parser's OSC
+    /// without ringing the bell (`ESC \` is a no-op once the string ends).
+    fn seal_osc(&mut self, out: &mut Vec<u8>) {
+        if self.osc_open {
+            out.extend_from_slice(b"\x1b\\");
+            self.osc_open = false;
+        }
+    }
+
+    fn emit_raw(&mut self, raw: &[u8], out: &mut Vec<u8>) {
+        if raw.first() == Some(&0x1b) {
+            self.osc_open = false;
+        }
+        out.extend_from_slice(raw);
+    }
+
     fn step(&mut self, b: u8, items: &mut Vec<StreamItem>, out: &mut Vec<u8>) {
+        let mut again = None;
         match self.phase {
             Phase::Ground => {
                 if b == 0x1b {
@@ -230,25 +267,39 @@ impl StreamFilter {
                 // state stays Escape, so `ESC ESC c` is RIS. C0 other than
                 // CAN/SUB is executed and does not leave Escape, so
                 // `ESC <C0> c` is RIS too. CAN (0x18) and SUB (0x1A) cancel.
+                // Bytes >= 0x80 are ignored and stay in Escape, so
+                // `ESC <0x80> c` is RIS as well. DEL is ignored.
                 match b {
                     0x1b => {
                         self.held.clear();
                         self.held.push(b);
                     }
-                    0x00..=0x17 | 0x19 | 0x1c..=0x1f => out.push(b),
+                    0x00..=0x17 | 0x19 | 0x1c..=0x1f => {
+                        self.seal_osc(out);
+                        out.push(b);
+                    }
                     0x18 | 0x1a => {
                         self.held.clear();
+                        // CAN/SUB ends an OSC on its own. Dropping the ESC
+                        // that moved us here still leaves the parser in
+                        // Ground after this byte.
+                        self.osc_open = false;
                         out.push(b);
                         self.phase = Phase::Ground;
                     }
-                    0x7f => {}
+                    0x7f | 0x80..=0xff => {}
                     b'[' => {
                         self.held.push(b);
                         self.phase = Phase::Csi;
                     }
+                    b']' => {
+                        self.held.push(b);
+                        self.flush_held(out);
+                        self.phase = Phase::Osc;
+                    }
                     b'c' => {
                         self.held.push(b);
-                        out.append(&mut self.held);
+                        self.flush_held(out);
                         self.phase = Phase::Ground;
                         if !out.is_empty() {
                             items.push(StreamItem::Bytes(std::mem::take(out)));
@@ -256,11 +307,38 @@ impl StreamFilter {
                         items.push(StreamItem::Ris);
                     }
                     _ => {
-                        // OSC, ESC D, charset designation, … not ours.
+                        // ESC D, charset designation, … not ours.
                         self.held.push(b);
-                        out.append(&mut self.held);
+                        self.flush_held(out);
                         self.phase = Phase::Ground;
                     }
+                }
+            }
+            Phase::Osc => match b {
+                0x07 => {
+                    out.push(b);
+                    self.phase = Phase::Ground;
+                }
+                0x18 | 0x1a => {
+                    out.push(b);
+                    self.phase = Phase::Ground;
+                }
+                // vte ignores these inside an OSC string.
+                0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1c..=0x1f => {}
+                0x1b => self.phase = Phase::OscEsc,
+                _ => out.push(b),
+            },
+            Phase::OscEsc => {
+                if b == b'\\' {
+                    out.push(0x1b);
+                    out.push(b'\\');
+                    self.phase = Phase::Ground;
+                } else {
+                    self.osc_open = true;
+                    self.held.clear();
+                    self.held.push(0x1b);
+                    self.phase = Phase::Esc;
+                    again = Some(b);
                 }
             }
             Phase::Csi => {
@@ -269,37 +347,36 @@ impl StreamFilter {
                 // what the aborted bytes mean.
                 if b == 0x18 || b == 0x1a {
                     self.held.push(b);
-                    out.append(&mut self.held);
+                    self.flush_held(out);
                     self.phase = Phase::Ground;
-                    return;
-                }
-                if b == 0x1b {
-                    out.append(&mut self.held);
+                } else if b == 0x1b {
+                    self.flush_held(out);
                     self.held.push(b);
                     self.phase = Phase::Esc;
-                    return;
-                }
-                // vte executes other C0 and stays in CSI. DEL and bytes
-                // above 0x7E are ignored and do not leave the sequence, so
-                // `CSI ?1049 <C0> h` is still an alt-screen toggle. The C0
-                // is emitted before the CSI bytes; vte runs it, then the CSI.
-                if b < 0x20 {
+                } else if b < 0x20 {
+                    // vte executes other C0 and stays in CSI. DEL and bytes
+                    // above 0x7E are ignored and do not leave the sequence, so
+                    // `CSI ?1049 <C0> h` is still an alt-screen toggle. The C0
+                    // is emitted before the CSI bytes; vte runs it, then the CSI.
+                    // If the CSI's ESC ended an OSC, close that OSC first so
+                    // the C0 is not ignored as OSC payload.
+                    self.seal_osc(out);
                     out.push(b);
-                    return;
-                }
-                if b == 0x7f || b > 0x7e {
-                    return;
-                }
-                self.held.push(b);
-                if self.held.len() > CSI_CAP {
-                    out.append(&mut self.held);
-                    self.phase = Phase::Ground;
-                    return;
-                }
-                if (0x40..=0x7e).contains(&b) {
-                    self.finish_csi(b, items, out);
+                } else if b == 0x7f || b > 0x7e {
+                    // ignored
+                } else {
+                    self.held.push(b);
+                    if self.held.len() > CSI_CAP {
+                        self.flush_held(out);
+                        self.phase = Phase::Ground;
+                    } else if (0x40..=0x7e).contains(&b) {
+                        self.finish_csi(b, items, out);
+                    }
                 }
             }
+        }
+        if let Some(b) = again {
+            self.step(b, items, out);
         }
     }
 
@@ -317,6 +394,10 @@ impl StreamFilter {
 
         if (final_byte == b'h' || final_byte == b'l') && inter.is_empty() {
             if let Some(rest) = strip_mode_8(params) {
+                // The ESC is not forwarded. If it had ended an OSC, ST has
+                // to, or the rewritten CSI and the text after it stay inside
+                // the string.
+                self.seal_osc(out);
                 if !rest.is_empty() {
                     out.push(0x1b);
                     out.push(b'[');
@@ -339,6 +420,7 @@ impl StreamFilter {
         if final_byte == b'k' && inter == *b" " {
             match parse_scp(params) {
                 Some(dir) => {
+                    self.seal_osc(out);
                     if !out.is_empty() {
                         items.push(StreamItem::Bytes(std::mem::take(out)));
                     }
@@ -346,13 +428,13 @@ impl StreamFilter {
                 }
                 // A numeric parameter we don't know: still SCP-shaped, so it
                 // must not fall through into the grid as text. Direction stays.
-                None if scp_params_are_numeric(params) => {}
-                None => out.extend_from_slice(&raw),
+                None if scp_params_are_numeric(params) => self.seal_osc(out),
+                None => self.emit_raw(&raw, out),
             }
             return;
         }
 
-        out.extend_from_slice(&raw);
+        self.emit_raw(&raw, out);
     }
 }
 
@@ -691,6 +773,91 @@ mod tests {
         assert_eq!(cell(&t, 0), 'c');
     }
 
+    /// vte ignores bytes >= 0x80 in Escape and stays there, so `ESC 0x80 c`
+    /// is RIS. The filter used to emit the high byte and return to ground,
+    /// which made the `c` a printable character.
+    #[test]
+    fn esc_high_byte_then_c_is_ris() {
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        running(&mut meta);
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[8l\x1b[2 k");
+        assert_eq!(meta.bidi.mode, BidiMode::Explicit);
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b\x80c");
+        assert_eq!(meta.bidi.mode, BidiMode::Implicit);
+        assert_eq!(meta.bidi.direction, ParagraphDir::Default);
+        assert!(meta.saw_ris);
+        assert_ne!(cell(&t, 0), 'c', "the c is the RIS final, not a cell");
+
+        running(&mut meta);
+        meta.saw_ris = false;
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[8l");
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b\xffc");
+        assert_eq!(meta.bidi.mode, BidiMode::Implicit);
+        assert!(meta.saw_ris);
+    }
+
+    /// Stripping `CSI 8 l` removes the ESC that vte uses to end an open OSC.
+    /// The text after that ESC must still reach the grid, including when the
+    /// ESC arrives in the next read. A BEL-terminated OSC does not print its
+    /// payload either.
+    #[test]
+    fn bdsm_that_ends_an_osc_does_not_swallow_text() {
+        let row = |t: &Term<VoidListener>| -> String {
+            let line = t.grid().cursor.point.line;
+            let mut s = String::new();
+            for col in 0..12 {
+                let ch = t.grid()[line][Column(col)].c;
+                if ch == ' ' && s.is_empty() {
+                    continue;
+                }
+                s.push(ch);
+            }
+            s.trim_end().to_string()
+        };
+
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        running(&mut meta);
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            b"\x1b]2;prefix\x1b[8lVISIBLE",
+        );
+        assert_eq!(meta.bidi.mode, BidiMode::Explicit);
+        assert_eq!(row(&t), "VISIBLE");
+
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        running(&mut meta);
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b]2;prefix");
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[8lVISIBLE");
+        assert_eq!(meta.bidi.mode, BidiMode::Explicit);
+        assert_eq!(row(&t), "VISIBLE");
+
+        // SCP is stripped the same way.
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        running(&mut meta);
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            b"\x1b]2;prefix\x1b[2 kVISIBLE",
+        );
+        assert_eq!(meta.bidi.direction, ParagraphDir::Rtl);
+        assert_eq!(row(&t), "VISIBLE");
+
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            b"\x1b]0;hello\x07AFTER",
+        );
+        assert_eq!(row(&t), "AFTER");
+    }
+
     /// Two alt-screen sequences in one read can leave the mode bit where it
     /// started. Bidi still resets, because each CSI is seen, not the net.
     #[test]
@@ -722,6 +889,26 @@ mod tests {
         assert!(!t.mode().contains(TermMode::ALT_SCREEN));
         assert_eq!(meta.bidi.mode, BidiMode::Implicit);
         assert_eq!(meta.bidi.direction, ParagraphDir::Default);
+    }
+
+    /// A colon introduces a subparameter. `?1049:0` is still mode 1049, so a
+    /// start/end pair in one read resets bidi even though the mode bit ends
+    /// where it started.
+    #[test]
+    fn colon_subparam_on_alt_screen_resets_bidi() {
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        running(&mut meta);
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            b"\x1b[8l\x1b[2 k\x1b[?1049:0h\x1b[?1049:0l",
+        );
+        assert!(!t.mode().contains(TermMode::ALT_SCREEN));
+        assert_eq!(meta.bidi.mode, BidiMode::Implicit);
+        assert_eq!(meta.bidi.direction, ParagraphDir::Default);
+        assert_eq!(meta.bidi.direction_at(1), ParagraphDir::Default);
     }
 
     /// A resize reflows rows. Stamps are dropped; the mode stays, because a
@@ -786,7 +973,19 @@ mod tests {
             rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
             (rng >> 33) as u8
         };
+        // Chosen bytes, not an empty draw. A seed that never hits ESC makes
+        // the assertions `0 == 0`.
+        let seeds: &[&[u8]] = &[
+            b"\x1b\x1bc",
+            b"\x1b\x80c",
+            b"\x1b[?1049h",
+            b"\x1b[?1049:0h",
+            b"\x1b[?47l",
+            b"\x1b[?1047h\x1b[?1047l",
+        ];
 
+        let mut saw_ris = false;
+        let mut saw_alt = false;
         for case in 0..32 {
             let mut filter = StreamFilter::default();
             let mut vte_raw = Parser::new();
@@ -795,9 +994,18 @@ mod tests {
             let mut filt_w = Watch { ris: 0, alt: 0 };
             let mut ris_items = 0usize;
             let nchunks = 2 + (next() as usize % 3);
-            for _ in 0..nchunks {
+            for chunk_i in 0..nchunks {
                 let len = next() as usize % 40;
-                let chunk: Vec<u8> = (0..len).map(|_| next()).collect();
+                let mut chunk: Vec<u8> = (0..len).map(|_| next()).collect();
+                if chunk_i == 0 {
+                    let seed = seeds[case % seeds.len()];
+                    let at = if chunk.is_empty() {
+                        0
+                    } else {
+                        (next() as usize) % (chunk.len() + 1)
+                    };
+                    chunk.splice(at..at, seed.iter().copied());
+                }
                 vte_raw.advance(&mut raw_w, &chunk);
                 for item in filter.pull(&chunk) {
                     match item {
@@ -810,6 +1018,14 @@ mod tests {
             assert_eq!(ris_items, raw_w.ris, "RIS items, case {case}");
             assert_eq!(filt_w.ris, raw_w.ris, "RIS bytes passed through, case {case}");
             assert_eq!(filt_w.alt, raw_w.alt, "alt-screen CSI, case {case}");
+            if raw_w.ris > 0 {
+                saw_ris = true;
+            }
+            if raw_w.alt > 0 {
+                saw_alt = true;
+            }
         }
+        assert!(saw_ris, "seeded streams contained no RIS");
+        assert!(saw_alt, "seeded streams contained no alt-screen CSI");
     }
 }

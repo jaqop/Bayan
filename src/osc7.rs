@@ -362,11 +362,19 @@ mod tests {
 
     #[test]
     fn powershell_prompt_emits_osc7() {
-        let s = crate::term::shell_integration_ps();
+        let s = crate::term::shell_integration_ps("abc123");
         assert!(
             s.contains("]7;file://"),
             "PowerShell prompt must emit OSC 7"
         );
         assert!(s.contains("]9;9;"), "the ConEmu OSC 9;9 report stays");
+        assert!(
+            s.contains("]133;A;abc123"),
+            "prompt start carries the session nonce"
+        );
+        assert!(
+            s.contains("]133;D;$c;abc123"),
+            "command end carries the exit code and the nonce"
+        );
     }
 }
