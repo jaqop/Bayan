@@ -149,8 +149,10 @@ pub enum Action {
         line: u32,
         col: Option<u32>,
     },
-    /// `http(s)` with userinfo, or a non-ASCII host. The card shows `host`
-    /// first (punycode when the host was not ASCII). Enter opens `uri`.
+    /// `http(s)` whose host needs a look before it opens: userinfo, a
+    /// non-ASCII host, a raw host that contains `%`, or a label that
+    /// starts with `xn--`. The card shows `host` first (the decoded host,
+    /// punycode when a label is not ASCII). Enter opens `uri`.
     Confirm {
         uri: String,
         host: String,
@@ -492,12 +494,22 @@ fn file_uri_path(uri: &str) -> Option<String> {
     }
 }
 
+/// Host of an `http(s)` URI. `raw_host` is the bytes before percent-decoding
+/// (brackets and the port already stripped). `host` is that string decoded
+/// once. The host is the part after the last `@`, so `good.com@evil.com` is
+/// `evil.com`.
+struct HttpAuthority {
+    raw_host: String,
+    host: String,
+    has_userinfo: bool,
+}
+
 /// Host of an `http(s)` URI, and whether userinfo (`@`) was present.
-/// The host is the part after the last `@`, so `good.com@evil.com` is
-/// `evil.com`. The host is percent-decoded once before it is returned, so
-/// `https://%D0%B0pple.com/` is the Cyrillic homograph. A `%` that is still
-/// there after that decode is not a hostname.
-fn http_authority(uri: &str) -> Option<(String, bool)> {
+/// The host is percent-decoded once before it is returned, so
+/// `https://%D0%B0pple.com/` is the Cyrillic homograph and
+/// `https://%65vil.example/` is `evil.example`. A `%` that is still there
+/// after that decode is not a hostname.
+fn http_authority(uri: &str) -> Option<HttpAuthority> {
     let scheme = scheme_name(uri)?;
     if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
         return None;
@@ -518,27 +530,78 @@ fn http_authority(uri: &str) -> Option<(String, bool)> {
     } else {
         host.split(':').next().unwrap_or(host)
     };
-    let host = decode_http_host(host)?;
-    Some((host, has_userinfo))
+    let raw_host = host.to_string();
+    let host = decode_http_host(&raw_host)?;
+    Some(HttpAuthority {
+        raw_host,
+        host,
+        has_userinfo,
+    })
 }
 
-/// One percent-decode, then the non-ASCII check in [`plan_uri`]. A leftover
-/// `%` is rejected. A colon that the decode introduced is a smuggled port;
-/// an IPv6 literal already contained its colons.
+/// One percent-decode. A leftover `%` is rejected. So is a decoded host the
+/// file-host gate would refuse: a UNC-like string, a slash or backslash, a
+/// control or bidi character, whitespace, or an empty DNS label (`a..b`,
+/// `.a`, `a.`). A colon that the decode introduced is a smuggled port; an
+/// IPv6 literal already contained its colons.
 fn decode_http_host(raw: &str) -> Option<String> {
     let host = percent_decode(raw)?;
-    if host.is_empty() || host == "." || host.contains('%') {
+    if host.is_empty() || host == "." || host.contains('%') || host_has_empty_label(&host) {
         return None;
     }
-    if host.chars().any(|c| {
-        c.is_whitespace() || is_forbidden(c) || matches!(c, '/' | '\\' | '@' | '?' | '#')
-    }) {
+    if host_forbidden_for_file(&host) {
         return None;
     }
     if host.contains(':') && !raw.contains(':') {
         return None;
     }
     Some(host)
+}
+
+/// Empty labels are `a..b`, a leading dot, and a trailing dot.
+fn host_has_empty_label(host: &str) -> bool {
+    host.split('.').any(|label| label.is_empty())
+}
+
+/// Separators and controls the `file://` host check refuses, plus
+/// [`crate::term::unc_or_device`]. A decoded `http(s)` host is not a file
+/// path, but `\\server\share`, `//server/share`, and a backslash are not
+/// hostnames either.
+fn host_forbidden_for_file(host: &str) -> bool {
+    host.chars()
+        .any(|c| c.is_whitespace() || is_forbidden(c) || matches!(c, '/' | '\\' | '@' | '?' | '#'))
+        || crate::term::unc_or_device(host)
+}
+
+/// A label that starts with `xn--`, in either case. Checked on the raw
+/// host and again after percent-decoding.
+fn host_has_puny_label(host: &str) -> bool {
+    host.split('.').any(|label| {
+        let bytes = label.as_bytes();
+        bytes.len() >= 4 && bytes[..4].eq_ignore_ascii_case(b"xn--")
+    })
+}
+
+/// Userinfo, a non-ASCII host, any `%` in the raw host, or an `xn--` label.
+fn host_needs_confirm(auth: &HttpAuthority) -> bool {
+    auth.has_userinfo
+        || !auth.host.is_ascii()
+        || auth.raw_host.contains('%')
+        || host_has_puny_label(&auth.raw_host)
+        || host_has_puny_label(&auth.host)
+}
+
+/// The name the card shows. ASCII stays as decoded. Anything else is
+/// punycode, or `None` when a label cannot be encoded.
+fn display_host(host: &str) -> Option<String> {
+    if host.is_ascii() {
+        Some(host.to_string())
+    } else {
+        match punycode_host(host) {
+            Some(ascii) if ascii.is_ascii() => Some(ascii),
+            _ => None,
+        }
+    }
 }
 
 /// RFC 3492 punycode of one label, without the `xn--` prefix.
@@ -673,7 +736,11 @@ fn rewrite_host(uri: &str, ascii_host: &str) -> String {
     } else {
         ("", hostport)
     };
-    let port = if host_and_port.starts_with('[') {
+    // Colons inside `[…]` are the address, not a port. The port, when
+    // there is one, is the `:` after the closing bracket.
+    let port = if let Some(end) = host_and_port.find(']') {
+        &host_and_port[end + 1..]
+    } else if host_and_port.starts_with('[') {
         ""
     } else if let Some(idx) = host_and_port.rfind(':') {
         &host_and_port[idx..]
@@ -684,20 +751,26 @@ fn rewrite_host(uri: &str, ascii_host: &str) -> String {
     out.push_str(&uri[..scheme.len()]);
     out.push_str("://");
     out.push_str(userinfo);
-    out.push_str(ascii_host);
+    if ascii_host.contains(':') {
+        out.push('[');
+        out.push_str(ascii_host);
+        out.push(']');
+    } else {
+        out.push_str(ascii_host);
+    }
     out.push_str(port);
     out.push_str(suffix);
     out
 }
 
-/// Tooltip text. Userinfo and a non-ASCII host lead with the host that
-/// will actually be opened (punycode, when a label is not ASCII), so a
-/// label of `good.com` cannot hide `evil.com` and an IDN cannot hide its
-/// ASCII form.
+/// Tooltip text. Userinfo, a non-ASCII host, a percent-encoded host, and
+/// an `xn--` label lead with the host that will actually be opened
+/// (decoded, then punycode when a label is not ASCII), so a label of
+/// `good.com` cannot hide `evil.com` and `%65vil` cannot hide `evil`.
 fn host_tooltip(uri: &str) -> String {
     match http_authority(uri) {
-        Some((host, has_userinfo)) if has_userinfo || !host.is_ascii() => {
-            let shown = punycode_host(&host).unwrap_or(host);
+        Some(auth) if host_needs_confirm(&auth) => {
+            let shown = display_host(&auth.host).unwrap_or(auth.host);
             preview(&format!("{shown} — {uri}"), 200)
         }
         _ => preview(uri, 200),
@@ -715,18 +788,16 @@ pub fn plan_uri(uri: &str) -> Action {
     };
     if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
         match http_authority(uri) {
-            Some((host, has_userinfo)) => {
-                let non_ascii = !host.is_ascii();
-                if has_userinfo || non_ascii {
-                    let shown = if non_ascii {
-                        match punycode_host(&host) {
-                            Some(ascii) if ascii.is_ascii() => ascii,
-                            _ => return refuse(RefuseReason::Scheme, uri),
-                        }
-                    } else {
-                        host
+            Some(auth) => {
+                if host_needs_confirm(&auth) {
+                    let Some(shown) = display_host(&auth.host) else {
+                        return refuse(RefuseReason::Scheme, uri);
                     };
-                    let opened = if non_ascii {
+                    // A percent-encoded or non-ASCII host is opened as the
+                    // decoded name. The raw `%HH` form is never what the
+                    // browser receives. Userinfo and a plain `xn--` label
+                    // keep the original URI; the card already shows the host.
+                    let opened = if !auth.host.is_ascii() || auth.raw_host.contains('%') {
                         rewrite_host(uri, &shown)
                     } else {
                         uri.to_string()
@@ -3453,10 +3524,13 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        assert_eq!(
-            plan_uri("http://xn--mnchen-3ya.example/a"),
-            Action::Browse("http://xn--mnchen-3ya.example/a".into())
-        );
+        match plan_uri("http://xn--mnchen-3ya.example/a") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "xn--mnchen-3ya.example");
+                assert_eq!(uri, "http://xn--mnchen-3ya.example/a");
+            }
+            other => panic!("{other:?}"),
+        }
         let tip = host_tooltip("http://münchen.example/a");
         assert!(tip.starts_with("xn--mnchen-3ya.example"), "{tip}");
     }
@@ -3569,13 +3643,127 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(
-            plan_uri("https://apple%2ecom/a"),
-            Action::Browse("https://apple%2ecom/a".into())
-        );
+        match plan_uri("https://apple%2ecom/a") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "apple.com");
+                assert_eq!(uri, "https://apple.com/a");
+                assert!(!uri.contains('%'), "{uri}");
+            }
+            other => panic!("{other:?}"),
+        }
         assert_eq!(
             plan_uri("https://[::1]/"),
             Action::Browse("https://[::1]/".into())
         );
+    }
+
+    #[test]
+    fn percent_encoded_ascii_host_confirms_with_decoded_name() {
+        let cases = [
+            (
+                "https://%65vil.example/secret",
+                "evil.example",
+                "https://evil.example/secret",
+            ),
+            (
+                "https://login.microsoft.com%2eevil.example/",
+                "login.microsoft.com.evil.example",
+                "https://login.microsoft.com.evil.example/",
+            ),
+            (
+                "https://login.microsoft.com%2Eevil.example/",
+                "login.microsoft.com.evil.example",
+                "https://login.microsoft.com.evil.example/",
+            ),
+            ("https://%61pple.com/", "apple.com", "https://apple.com/"),
+            (
+                "https://user:secret@%65vil.example:8443/a?q=1",
+                "evil.example",
+                "https://user:secret@evil.example:8443/a?q=1",
+            ),
+            ("https://[%3A%3A1]/", "::1", "https://[::1]/"),
+            ("https://[%3A%3A1]:443/a", "::1", "https://[::1]:443/a"),
+        ];
+        for (input, host, opened) in cases {
+            match plan_uri(input) {
+                Action::Confirm { uri, host: got } => {
+                    assert_eq!(got, host, "{input}");
+                    assert_eq!(uri, opened, "{input}");
+                    assert!(!uri.contains('%'), "{input} opened {uri}");
+                    assert!(!runs_off_ui_thread(&Action::Confirm {
+                        uri: uri.clone(),
+                        host: got.clone(),
+                    }));
+                }
+                other => panic!("{input} -> {other:?}"),
+            }
+            let tip = host_tooltip(input);
+            assert!(tip.starts_with(host), "{input} tooltip {tip}");
+        }
+        // A `%` in the path is not a host. This still opens with no card.
+        assert_eq!(
+            plan_uri("https://example.com/%65vil"),
+            Action::Browse("https://example.com/%65vil".into())
+        );
+        assert_eq!(
+            plan_uri("https://example.com/"),
+            Action::Browse("https://example.com/".into())
+        );
+        assert_eq!(host_tooltip("https://example.com/"), "https://example.com/");
+    }
+
+    #[test]
+    fn punycode_label_confirms_before_open() {
+        match plan_uri("https://XN--pple-43d.com/") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "XN--pple-43d.com");
+                assert_eq!(uri, "https://XN--pple-43d.com/");
+            }
+            other => panic!("{other:?}"),
+        }
+        match plan_uri("https://sub.xn--80ak6aa92e.com/") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "sub.xn--80ak6aa92e.com");
+                assert_eq!(uri, "https://sub.xn--80ak6aa92e.com/");
+            }
+            other => panic!("{other:?}"),
+        }
+        // The label is `xn--` only after decoding. The card shows that
+        // name, and the opened URI is rebuilt from it.
+        match plan_uri("https://sub.%78n--80ak6aa92e.com/a") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(host, "sub.xn--80ak6aa92e.com");
+                assert_eq!(uri, "https://sub.xn--80ak6aa92e.com/a");
+            }
+            other => panic!("{other:?}"),
+        }
+        let tip = host_tooltip("https://XN--pple-43d.com/");
+        assert!(tip.starts_with("XN--pple-43d.com"), "{tip}");
+    }
+
+    #[test]
+    fn encoded_separator_or_empty_label_host_is_refused() {
+        for uri in [
+            "https://evil%5Cshare.example/secret",
+            "https://%5C%5Cevil.example/share",
+            "https://evil%2Fshare.example/secret",
+            "https://%2F%2Fevil.example/share",
+            "https://evil%2e%2eexample/",
+            "https://evil..example/",
+            "https://.evil.example/",
+            "https://evil.example./",
+        ] {
+            match plan_uri(uri) {
+                Action::Refuse {
+                    reason: RefuseReason::Scheme,
+                    ..
+                } => {}
+                Action::Browse(opened) => panic!("{uri} opened {opened}"),
+                Action::Confirm { uri: opened, host } => {
+                    panic!("{uri} confirmed {host} as {opened}")
+                }
+                other => panic!("{uri} -> {other:?}"),
+            }
+        }
     }
 }
