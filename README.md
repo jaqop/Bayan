@@ -226,6 +226,19 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       (Shell_NotifyIcon, the biggest windows-sys consumer) compiles and the app
       runs, but a balloon was not caught on camera — quiet hours file it to the
       Action Center — so that one is built-and-running, not eyeball-verified
+- [x] **Security (High)** — the four High findings from the audit
+      (`docs/SECURITY_AUDIT.md`). OSC 52 no longer writes the OS clipboard
+      unless `osc52` is `"copy"` and the window is focused; the sequence must
+      end in BEL or ST, a `?` query is never answered, and the decoded text
+      is capped at 64 KiB. The paste guard treats CR (Enter on ConPTY), the
+      other line breaks, and other control characters as confirm-first, and
+      counts characters rather than UTF-8 bytes. `accept_local_cwd` is the
+      shared gate for a working directory — drive-letter paths only, so a
+      UNC or `\\?\` path from OSC 9;9 or `session.json` is dropped before
+      `is_dir` can open SMB. A dropped file is quoted for the shell that
+      pane was spawned with (PowerShell single quotes, cmd double quotes,
+      POSIX single quotes for Git Bash and WSL). Proven by the new unit
+      tests named in the audit; not exercised here as a live window.
 
 ## Settings
 
@@ -240,13 +253,16 @@ key falls back to a sane default:
   "cursor_style": "bar", "cursor_blink": true, "scrollback": 20000,
   "copy_on_select": true, "ligatures": true, "bell": "attention",
   "shell": "pwsh.exe", "padding": 8, "opacity": 0.9,
-  "hide_single_tab": true, "confirm_close": true,
+  "hide_single_tab": true, "confirm_close": true, "osc52": "off",
   "keybinds": { "new-tab": "ctrl+shift+n" }
 }
 ```
 
 Shell and scrollback apply to new tabs (no terminal restarts a live
-session); everything else applies immediately.
+session); everything else applies immediately. `osc52` is config-file
+only (there is no settings-panel row). Leave it out or set `"off"`.
+`"copy"` lets a focused window accept OSC 52 clipboard writes from the
+child; no value enables a clipboard read.
 
 ## Build
 

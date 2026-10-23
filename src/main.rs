@@ -230,7 +230,8 @@ pub enum UserEvent {
     PtyWrite(u64, String),
     /// The font system finished loading on its background thread.
     RendererReady(Box<render::Renderer>),
-    /// A program set the clipboard via OSC 52 (yank over SSH ...).
+    /// A program asked to set the clipboard via OSC 52. Applied only when
+    /// `allow_osc52_write` says so — the default is to drop it.
     ClipboardSet(String),
     /// Pane `id`'s shell reported its working directory (OSC 9;9).
     Cwd(u64, String),
@@ -1281,6 +1282,9 @@ impl App {
     }
 
     fn spawn_tab(&mut self, cwd: Option<String>) {
+        // Same gate as spawn: a restored UNC path must not become the tab
+        // title either. accept_local_cwd does not touch the filesystem.
+        let cwd = cwd.and_then(|c| term::accept_local_cwd(&c));
         let title = cwd
             .as_deref()
             .and_then(|c| c.rsplit(['\\', '/']).next().map(str::to_string))
@@ -1478,7 +1482,16 @@ impl App {
                     cwds: t
                         .panes
                         .iter()
-                        .map(|p| p.session.meta.lock().unwrap().cwd.clone())
+                        .map(|p| {
+                            // don't persist a path we would refuse to start in
+                            p.session
+                                .meta
+                                .lock()
+                                .unwrap()
+                                .cwd
+                                .as_deref()
+                                .and_then(term::accept_local_cwd)
+                        })
                         .collect(),
                     weights: t.weights.clone(),
                     orientation: match t.orientation {
@@ -2224,7 +2237,11 @@ impl ApplicationHandler<UserEvent> for App {
                     self.tabs[ti].panes[pi].session.write(text.as_bytes());
                 }
             }
-            UserEvent::ClipboardSet(text) => self.set_clipboard(text),
+            UserEvent::ClipboardSet(text) => {
+                if term::allow_osc52_write(self.config.osc52_copy_enabled(), self.focused) {
+                    self.set_clipboard(text);
+                }
+            }
             UserEvent::Bell(id) => {
                 // the cockpit signal: a pane you're NOT looking at wants you
                 let mode = self.config.bell_mode();
@@ -2378,10 +2395,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::DroppedFile(path) => {
-                // a dropped file lands at the prompt as a shell-ready path
-                let arg = term::dropped_path_arg(&path);
-                if let Some(s) = self.session_mut() {
-                    s.write(arg.as_bytes());
+                // Quote for the shell this pane was spawned with. A name like
+                // $(calc) must arrive as a literal; a control character is
+                // not typed at all.
+                let quoted = self.session().and_then(|s| term::dropped_path_arg(&path, s.shell()));
+                if let Some(arg) = quoted {
+                    if let Some(s) = self.session_mut() {
+                        s.write(arg.as_bytes());
+                    }
                 }
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
