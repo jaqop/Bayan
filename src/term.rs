@@ -141,10 +141,17 @@ pub struct SessionMeta {
     pub kitty_protocol: bool,
     /// How many keyboard-mode levels we have actually pushed on this screen
     /// for sequences we recognized. Kitty's own cap is [`KITTY_STACK_CAP`].
-    /// RIS (`ESC c`) zeroes this and [`kitty_alt_depth`].
+    /// RIS (`ESC c`, the same bytes as [`SessionMeta::saw_ris`]) zeroes this
+    /// and [`kitty_alt_depth`].
     pub kitty_depth: u16,
     /// The other screen's depth. 1049h/l swaps the stacks, so this swaps too.
     pub kitty_alt_depth: u16,
+    /// The chunk contained RIS (ESC c). The UI clears this and forgets
+    /// which pane it had told "you are focused", so a 1004 that comes
+    /// back in the same read still hears CSI I. The keyboard-depth reset
+    /// uses this same byte test, inside the feed, because the flag stays
+    /// set until the UI reads it.
+    pub saw_ris: bool,
 }
 
 /// kitty itself refuses to grow the keyboard-mode stack past 16. Recognized
@@ -578,10 +585,14 @@ fn feed_plain<T: EventListener>(
     let before_alt = t.mode().contains(TermMode::ALT_SCREEN);
     parser.advance(t, bytes);
     note_screen_swap(before_alt, t, meta);
-    // RIS clears both keyboard stacks inside the parser. The counter has to
-    // follow, or the next push is dropped because we still think we are at
-    // the cap. `ESC c` is RIS even mid-sequence: ESC aborts the CSI.
+    // Same `ESC c` that [`process_chunk`] records in `saw_ris`. The parser
+    // has just cleared both keyboard stacks. The counter has to follow, or
+    // the next push is dropped because we still think we are at the cap.
+    // It cannot watch the flag: that stays set until the UI reads it, and a
+    // push in a later chunk must still count. `ESC c` is RIS even
+    // mid-sequence: ESC aborts the CSI.
     if contains_ris(bytes) {
+        meta.saw_ris = true;
         meta.kitty_depth = 0;
         meta.kitty_alt_depth = 0;
     }
@@ -722,6 +733,11 @@ pub(crate) fn process_chunk<T: EventListener>(
     let mut ev = ChunkEvents::default();
     if buf.is_empty() {
         return ev;
+    }
+    // ESC c is RIS. It can share a read with the 1004 that follows it,
+    // and the UI only sees the final mode — so the flag has to be here.
+    if contains_ris(&buf) {
+        meta.saw_ris = true;
     }
     ev.clipboard = scan_osc52(&buf);
     if let Some(c) = scan_cwd(&buf) {
@@ -1962,6 +1978,22 @@ mod tests {
     }
 
     #[test]
+    fn ris_is_flagged_even_when_focus_mode_comes_back() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        // RIS, then 1004 in the same read. The final mode has focus
+        // reporting; the router still has to forget the previous CSI I.
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1bc\x1b[?1004h",
+        );
+        assert!(meta.saw_ris);
+        assert!(t.mode().contains(TermMode::FOCUS_IN_OUT));
+    }
+
+    #[test]
     fn carry_holds_back_split_sequences() {
         // split CSI
         assert_eq!(incomplete_tail_start(b"abc\x1b[1;5"), 3);
@@ -2478,6 +2510,7 @@ mod tests {
         assert_eq!(meta.kitty_depth, 1);
         assert_eq!(meta.kitty_alt_depth, 16);
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1bc");
+        assert!(meta.saw_ris, "the focus-tracking flag is the RIS signal");
         assert_eq!(meta.kitty_depth, 0, "RIS clears the counter, not only the parser");
         assert_eq!(meta.kitty_alt_depth, 0);
         assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));

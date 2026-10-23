@@ -629,7 +629,7 @@ pub struct PaneView<'a> {
 const SELECTION_RGBA: ((u8, u8, u8), u32) = ((80, 140, 255), 90);
 const SEARCH_RGBA: ((u8, u8, u8), u32) = ((240, 180, 40), 120);
 
-fn is_arabic(c: char) -> bool {
+pub(crate) fn is_arabic(c: char) -> bool {
     matches!(c as u32,
         0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF
         | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF)
@@ -654,15 +654,170 @@ impl CellInfo {
             s.extend(z.iter());
         }
     }
+}
 
-    /// UTF-8 length this cell contributes to the shaped text.
-    fn text_len(&self) -> usize {
-        self.c.len_utf8()
-            + self
-                .zw
-                .as_ref()
-                .map_or(0, |z| z.iter().map(|c| c.len_utf8()).sum())
+/// One visible cell, owned, so a mouse hit-test can drop the term lock
+/// before shaping. Fields match what `draw_pane` feeds `CellInfo`.
+pub struct SnapCell {
+    pub col: usize,
+    pub w: usize,
+    pub c: char,
+    pub zw: Vec<char>,
+    pub fg: AnsiColor,
+    pub bg: AnsiColor,
+    pub flags: Flags,
+}
+
+/// Cells of one viewport row, in grid order, wide spacers skipped.
+pub fn snapshot_row<T: alacritty_terminal::event::EventListener>(
+    term: &Term<T>,
+    viewport_row: usize,
+) -> Vec<SnapCell> {
+    let content = term.renderable_content();
+    let off = content.display_offset as i32;
+    let mut cells = Vec::new();
+    for cell in content.display_iter {
+        let vrow = cell.point.line.0 + off;
+        if vrow != viewport_row as i32 {
+            continue;
+        }
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        let w = if cell.flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else {
+            1
+        };
+        cells.push(SnapCell {
+            col: cell.point.column.0,
+            w,
+            c: if cell.flags.intersects(Flags::HIDDEN) {
+                ' '
+            } else {
+                cell.c
+            },
+            zw: cell.zerowidth().map(|z| z.to_vec()).unwrap_or_default(),
+            fg: cell.fg,
+            bg: cell.bg,
+            flags: cell.flags,
+        });
     }
+    cells
+}
+
+/// The shaped form of a bidi row: the segments `draw_line_bidi` draws,
+/// plus the byte→column map a click needs to invert that shaping.
+struct BidiPlan {
+    segs: Vec<Seg>,
+    /// Base-char bytes of the cursor, in the shaped string. Cleared when
+    /// Claude restoration rewrites the line (the old mapping doesn't hold).
+    cursor_bytes: Option<(usize, usize)>,
+    /// `(start, end, grid column)` in the shaped string.
+    byte_cols: Vec<(usize, usize, usize)>,
+    /// First column not part of the shaped run (trailing blanks).
+    first_blank: usize,
+}
+
+fn byte_cols_of(text: &str, char_cols: &[usize]) -> Vec<(usize, usize, usize)> {
+    let mut out = Vec::new();
+    let mut b = 0usize;
+    for (i, ch) in text.chars().enumerate() {
+        let len = ch.len_utf8();
+        let col = char_cols.get(i).copied().unwrap_or(0);
+        out.push((b, b + len, col));
+        b += len;
+    }
+    out
+}
+
+/// Trim trailing spaces and build the rich-text run. Claude's visual order
+/// is restored before shaping, and the byte map follows that permutation
+/// back to the grid column the program stored.
+fn bidi_plan(
+    cells: &[CellInfo],
+    claude: bool,
+    default_fg: (u8, u8, u8),
+    cursor_col: Option<usize>,
+) -> Option<BidiPlan> {
+    let mut end = cells.len();
+    while end > 0 && cells[end - 1].c == ' ' {
+        end -= 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    let first_blank = if end < cells.len() {
+        cells[end].col
+    } else {
+        let last = &cells[end - 1];
+        last.col + last.w
+    };
+
+    let mut segs: Vec<Seg> = Vec::new();
+    let mut cur_bytes: Option<(usize, usize)> = None;
+    let mut nbytes = 0usize;
+    let mut char_cols: Vec<usize> = Vec::new();
+    let mut full = String::new();
+    for ci in &cells[..end] {
+        // the cursor covers the base char only; combining marks sit on it
+        // but aren't part of the highlight range (same as before)
+        if cursor_col == Some(ci.col) {
+            cur_bytes = Some((nbytes, nbytes + ci.c.len_utf8()));
+        }
+        let mut piece = String::new();
+        ci.push_text(&mut piece);
+        for _ in piece.chars() {
+            char_cols.push(ci.col);
+        }
+        nbytes += piece.len();
+        full.push_str(&piece);
+        match segs.last_mut() {
+            Some(s) if s.fg == ci.fg && s.style == ci.style => s.text.push_str(&piece),
+            _ => segs.push(Seg {
+                text: piece,
+                fg: ci.fg,
+                style: ci.style,
+            }),
+        }
+    }
+    if segs.is_empty() {
+        return None;
+    }
+
+    // Claude mode: the cells hold Claude's pre-reversed VISUAL order.
+    // Restore logical so cosmic-text's BiDi shows it right. Per-cell
+    // colors can't survive the reordering (EasyTer draws these lines in
+    // the default FG too), and the cursor byte-mapping no longer holds.
+    let byte_cols = if claude {
+        if let Some((fixed, idx)) = crate::bidi::restore_bidi_map(&full) {
+            segs = vec![Seg::plain(fixed.clone(), default_fg)];
+            cur_bytes = None;
+            let mut out = Vec::new();
+            let mut b = 0usize;
+            for (i, ch) in fixed.chars().enumerate() {
+                let len = ch.len_utf8();
+                let col = idx
+                    .get(i)
+                    .and_then(|&o| char_cols.get(o))
+                    .copied()
+                    .unwrap_or(0);
+                out.push((b, b + len, col));
+                b += len;
+            }
+            out
+        } else {
+            byte_cols_of(&full, &char_cols)
+        }
+    } else {
+        byte_cols_of(&full, &char_cols)
+    };
+    Some(BidiPlan {
+        segs,
+        cursor_bytes: cur_bytes,
+        byte_cols,
+        first_blank,
+    })
 }
 
 const FONT_SIZE: f32 = 15.0;
@@ -1036,56 +1191,73 @@ impl Renderer {
         run.natw
     }
 
+    /// Foreground, background, style bits for one cell. Shared with the
+    /// mouse hit-test: both have to shape the identical run or a click
+    /// resolves against a different layout than the one on screen.
+    fn cell_paint(
+        &self,
+        fg: AnsiColor,
+        bg: AnsiColor,
+        flags: Flags,
+    ) -> ((u8, u8, u8), (u8, u8, u8), u8) {
+        let mut fg = self.ansi_rgb(fg);
+        let mut bg = self.ansi_rgb(bg);
+        if flags.contains(Flags::INVERSE) {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        let mut style = 0u8;
+        if flags.intersects(Flags::BOLD) {
+            style |= ST_BOLD;
+        }
+        if flags.intersects(Flags::ITALIC) {
+            style |= ST_ITALIC;
+        }
+        if flags.intersects(
+            Flags::UNDERLINE
+                | Flags::DOUBLE_UNDERLINE
+                | Flags::UNDERCURL
+                | Flags::DOTTED_UNDERLINE
+                | Flags::DASHED_UNDERLINE,
+        ) {
+            style |= ST_UNDERLINE;
+        }
+        if flags.intersects(Flags::STRIKEOUT) {
+            style |= ST_STRIKE;
+        }
+        if flags.intersects(Flags::DIM) {
+            fg = (fg.0 * 2 / 3, fg.1 * 2 / 3, fg.2 * 2 / 3);
+        }
+        (fg, bg, style)
+    }
+
     /// A row containing Arabic: shape the WHOLE line so cosmic-text applies
     /// UAX#9 BiDi (mixed directions, LTR islands). Compressed to the pane
     /// when overflowing; the cursor resolves THROUGH the shaped layout.
     #[allow(clippy::too_many_arguments)]
-    fn draw_line_bidi(&mut self, out: &mut Vec<Vertex>, clip: Rect,
-                      x0: i32, y: i32, pane_w: i32, cells: &[CellInfo], claude: bool,
-                      cursor_col: Option<usize>) -> Option<(i32, i32)> {
-        let mut end = cells.len();
-        while end > 0 && cells[end - 1].c == ' ' {
-            end -= 1;
-        }
-        let mut segs: Vec<Seg> = Vec::new();
-        let mut cur_bytes: Option<(usize, usize)> = None;
-        let mut nbytes = 0usize;
-        for ci in &cells[..end] {
-            if cursor_col == Some(ci.col) {
-                cur_bytes = Some((nbytes, nbytes + ci.c.len_utf8()));
-            }
-            nbytes += ci.text_len();
-            match segs.last_mut() {
-                Some(s) if s.fg == ci.fg && s.style == ci.style => ci.push_text(&mut s.text),
-                _ => {
-                    let mut s = String::new();
-                    ci.push_text(&mut s);
-                    segs.push(Seg { text: s, fg: ci.fg, style: ci.style });
-                }
-            }
-        }
-        if segs.is_empty() {
-            return None;
-        }
-        // Claude mode: the cells hold Claude's pre-reversed VISUAL order.
-        // Restore logical so cosmic-text's BiDi shows it right. Per-cell
-        // colors can't survive the reordering (EasyTer draws these lines in
-        // the default FG too), and the cursor byte-mapping no longer holds.
-        if claude {
-            let full: String = segs.iter().map(|s| s.text.as_str()).collect();
-            if let Some(fixed) = crate::bidi::restore_bidi_line(&full) {
-                segs = vec![Seg::plain(fixed, self.fg)];
-                cur_bytes = None;
-            }
-        }
+    fn draw_line_bidi(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        clip: Rect,
+        x0: i32,
+        y: i32,
+        pane_w: i32,
+        cells: &[CellInfo],
+        claude: bool,
+        cursor_col: Option<usize>,
+    ) -> Option<(i32, i32)> {
+        let plan = bidi_plan(cells, claude, self.fg, cursor_col)?;
         // shape unconstrained (cached), then compress to the pane on overflow
-        let natw = self.measure(&segs, true);
-        let scale = if natw > pane_w as f32 { pane_w as f32 / natw } else { 1.0 };
-        self.draw_run(&segs, true, out, clip, x0 as f32, y, scale);
-        if let Some((b0, b1)) = cur_bytes {
+        let natw = self.measure(&plan.segs, true);
+        let scale = if natw > pane_w as f32 {
+            pane_w as f32 / natw
+        } else {
+            1.0
+        };
+        self.draw_run(&plan.segs, true, out, clip, x0 as f32, y, scale);
+        if let Some((b0, b1)) = plan.cursor_bytes {
             let c0 = cosmic_text::Cursor::new(0, b0);
             let c1 = cosmic_text::Cursor::new(0, b1);
-            let key = self.ensure_shaped(&segs, true);
+            let key = self.ensure_shaped(&plan.segs, true);
             for run in self.cache_hot[&key].buffer.layout_runs() {
                 // 0.19: highlight yields per-segment rects — merge to one
                 let merged = run.highlight(c0, c1).fold(None, |acc, (x, w)| {
@@ -1103,6 +1275,82 @@ impl Renderer {
             }
         }
         None
+    }
+
+    /// Logical grid column under a pane-local pixel, for a row that takes
+    /// the bidi path. `None` when the row has no Arabic — the caller's
+    /// `x / cell_w` column is already the cell the program stored.
+    ///
+    /// The shaped run is the one `draw_line_bidi` just cached, so the glyph
+    /// under the pointer and the glyph on screen are the same box. Claude
+    /// rows go through `restore_bidi_map` first: the display is restored
+    /// logical order, the column we report is still Claude's grid column.
+    pub fn logical_column_for(
+        &mut self,
+        cells: &[SnapCell],
+        x_in_pane: f32,
+        pane_w: i32,
+        claude: bool,
+        grid_cols: usize,
+    ) -> Option<usize> {
+        if !cells.iter().any(|c| is_arabic(c.c)) {
+            return None;
+        }
+        let infos: Vec<CellInfo> = cells
+            .iter()
+            .map(|c| {
+                let (fg, _bg, style) = self.cell_paint(c.fg, c.bg, c.flags);
+                CellInfo {
+                    col: c.col,
+                    w: c.w,
+                    c: c.c,
+                    zw: if c.zw.is_empty() {
+                        None
+                    } else {
+                        Some(c.zw.clone())
+                    },
+                    fg,
+                    style,
+                }
+            })
+            .collect();
+        let plan = bidi_plan(&infos, claude, self.fg, None)?;
+        let natw = self.measure(&plan.segs, true);
+        let scale = if natw > pane_w as f32 {
+            pane_w as f32 / natw
+        } else {
+            1.0
+        };
+        let key = self.ensure_shaped(&plan.segs, true);
+        let glyphs = {
+            let buffer = &self.cache_hot[&key].buffer;
+            let mut glyphs = Vec::new();
+            for run in buffer.layout_runs() {
+                for g in run.glyphs.iter() {
+                    glyphs.push(crate::mouse::GlyphSpan {
+                        x: g.x,
+                        w: g.w,
+                        start: g.start,
+                        end: g.end,
+                        rtl: g.level.is_rtl(),
+                    });
+                }
+            }
+            glyphs
+        };
+        let boxes = crate::mouse::boxes_for_glyphs(&glyphs, scale, |byte| {
+            crate::mouse::col_for_byte(&plan.byte_cols, byte)
+        });
+        let last = grid_cols.saturating_sub(1);
+        let fallback = cells.first().map(|c| c.col).unwrap_or(0).min(last);
+        Some(crate::mouse::column_for_click(
+            x_in_pane,
+            &boxes,
+            self.cell_w,
+            plan.first_blank,
+            last,
+            fallback,
+        ))
     }
 
     /// A row without Arabic (prompts, code, TUIs): strict grid placement.
@@ -1234,37 +1482,21 @@ impl Renderer {
                 continue;
             }
             let col = cell.point.column.0;
-            let w = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
-            let mut fg = self.ansi_rgb(cell.fg);
-            let mut bg = self.ansi_rgb(cell.bg);
-            if cell.flags.contains(Flags::INVERSE) {
-                std::mem::swap(&mut fg, &mut bg);
-            }
+            let w = if cell.flags.contains(Flags::WIDE_CHAR) {
+                2
+            } else {
+                1
+            };
             // text attributes -> style bits (weight/slant shape into the run;
-            // under/strike draw as rects; DIM fades the color; HIDDEN blanks)
-            let mut style = 0u8;
-            if cell.flags.intersects(Flags::BOLD) {
-                style |= ST_BOLD;
-            }
-            if cell.flags.intersects(Flags::ITALIC) {
-                style |= ST_ITALIC;
-            }
-            if cell.flags.intersects(
-                Flags::UNDERLINE
-                    | Flags::DOUBLE_UNDERLINE
-                    | Flags::UNDERCURL
-                    | Flags::DOTTED_UNDERLINE
-                    | Flags::DASHED_UNDERLINE,
-            ) {
-                style |= ST_UNDERLINE;
-            }
-            if cell.flags.intersects(Flags::STRIKEOUT) {
-                style |= ST_STRIKE;
-            }
-            if cell.flags.intersects(Flags::DIM) {
-                fg = (fg.0 * 2 / 3, fg.1 * 2 / 3, fg.2 * 2 / 3);
-            }
-            let ch = if cell.flags.intersects(Flags::HIDDEN) { ' ' } else { cell.c };
+            // under/strike draw as rects; DIM fades the color; HIDDEN blanks).
+            // cell_paint is shared with the mouse hit-test so a click resolves
+            // through the same shaped run this frame drew.
+            let (fg, bg, style) = self.cell_paint(cell.fg, cell.bg, cell.flags);
+            let ch = if cell.flags.intersects(Flags::HIDDEN) {
+                ' '
+            } else {
+                cell.c
+            };
             if bg != self.bg {
                 let x0 = px + (col as f32 * self.cell_w).round() as i32;
                 let x1 = px + ((col + w) as f32 * self.cell_w).round() as i32;
@@ -2455,6 +2687,133 @@ mod tests {
             first > last,
             "RTL mapping inverted: first logical char at x={first}, last at x={last}"
         );
+    }
+
+    /// A click on the left of an RTL word is the last logical column, and
+    /// Arabic-Indic digits stay left-to-right. This is the inverse of the
+    /// cursor mapping above: the pointer has to land on the glyph it sees.
+    #[test]
+    fn shaped_rtl_pointer_maps_to_the_logical_column() {
+        let mut fs = FontSystem::new();
+        fs.db_mut().load_font_data(AMIRI.to_vec());
+        let shape = |fs: &mut FontSystem, text: &str| {
+            let mut b = Buffer::new(fs, Metrics::new(15.0, 21.0));
+            b.set_wrap(Wrap::None);
+            b.set_size(Some(1_000_000.0), Some(21.0));
+            b.set_text(text, &base_attrs(), Shaping::Advanced, Some(Align::Left));
+            b.shape_until_scroll(fs, false);
+            let mut spans = Vec::new();
+            let mut bstart = 0usize;
+            for (i, ch) in text.chars().enumerate() {
+                let len = ch.len_utf8();
+                spans.push((bstart, bstart + len, i));
+                bstart += len;
+            }
+            let mut glyphs = Vec::new();
+            for run in b.layout_runs() {
+                for g in run.glyphs.iter() {
+                    glyphs.push(crate::mouse::GlyphSpan {
+                        x: g.x,
+                        w: g.w,
+                        start: g.start,
+                        end: g.end,
+                        rtl: g.level.is_rtl(),
+                    });
+                }
+            }
+            crate::mouse::boxes_for_glyphs(&glyphs, 1.0, |byte| {
+                crate::mouse::col_for_byte(&spans, byte)
+            })
+        };
+        let boxes = shape(&mut fs, "مرحبا");
+        assert!(!boxes.is_empty(), "Arabic shaped to no glyphs");
+        let left = boxes
+            .iter()
+            .min_by(|a, c| a.x0.partial_cmp(&c.x0).unwrap())
+            .unwrap();
+        let right = boxes
+            .iter()
+            .max_by(|a, c| a.x1.partial_cmp(&c.x1).unwrap())
+            .unwrap();
+        assert_eq!(
+            left.col, 4,
+            "leftmost glyph should be the last logical char"
+        );
+        assert_eq!(
+            right.col, 0,
+            "rightmost glyph should be the first logical char"
+        );
+        assert_eq!(
+            crate::mouse::column_for_click(left.x0 + 0.1, &boxes, 10.0, 5, 80, 0),
+            4
+        );
+        assert_eq!(
+            crate::mouse::column_for_click(right.x0 + 0.1, &boxes, 10.0, 5, 80, 0),
+            0
+        );
+
+        // ١٧٥ is a weak LTR run. Mirroring it would hand the program ٥.
+        let digits = shape(&mut fs, "١٧٥");
+        assert!(!digits.is_empty());
+        let dleft = digits
+            .iter()
+            .min_by(|a, c| a.x0.partial_cmp(&c.x0).unwrap())
+            .unwrap();
+        let dright = digits
+            .iter()
+            .max_by(|a, c| a.x1.partial_cmp(&c.x1).unwrap())
+            .unwrap();
+        assert_eq!(dleft.col, 0, "digit ١ stays on the left");
+        assert_eq!(dright.col, 2, "digit ٥ stays on the right");
+    }
+
+    /// Claude stores visual order. After restoration the shaped string is
+    /// logical, but each byte still names the grid column Claude wrote.
+    #[test]
+    fn claude_plan_maps_shaped_bytes_back_to_grid_columns() {
+        let cells = |s: &str| -> Vec<CellInfo> {
+            s.chars()
+                .enumerate()
+                .map(|(col, c)| CellInfo {
+                    col,
+                    w: 1,
+                    c,
+                    zw: None,
+                    fg: (0, 0, 0),
+                    style: 0,
+                })
+                .collect()
+        };
+        // non-Claude: the grid IS logical, byte 0 is column 0
+        let logical = bidi_plan(&cells("مرحبا"), false, (1, 1, 1), None).unwrap();
+        assert_eq!(logical.byte_cols[0].2, 0);
+        assert_eq!(logical.byte_cols.last().unwrap().2, 4);
+        assert_eq!(logical.first_blank, 5);
+
+        // Claude wrote the visual order of مرحبا, which is ابحرم.
+        // Restoration yields مرحبا; its first char (م) is grid column 4
+        // and its last char (ا) is grid column 0 — the left of the screen
+        // once cosmic-text shapes the restored line.
+        let claude = bidi_plan(&cells("ابحرم"), true, (1, 1, 1), None).unwrap();
+        assert_eq!(claude.segs.len(), 1);
+        assert_eq!(claude.segs[0].text, "مرحبا");
+        assert_eq!(claude.byte_cols[0].2, 4);
+        assert_eq!(claude.byte_cols.last().unwrap().2, 0);
+        assert!(claude.cursor_bytes.is_none());
+
+        // trailing blanks are not part of the shaped run
+        let mut padded = cells("مرحبا");
+        padded.push(CellInfo {
+            col: 5,
+            w: 1,
+            c: ' ',
+            zw: None,
+            fg: (0, 0, 0),
+            style: 0,
+        });
+        let plan = bidi_plan(&padded, false, (1, 1, 1), Some(0)).unwrap();
+        assert_eq!(plan.first_blank, 5);
+        assert_eq!(plan.cursor_bytes, Some((0, "م".len())));
     }
 
     /// The line classifier: Arabic rows take the BiDi path, others the grid.
