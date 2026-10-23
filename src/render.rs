@@ -623,11 +623,21 @@ pub struct PaneView<'a> {
     pub search_match: Option<&'a std::ops::RangeInclusive<alacritty_terminal::index::Point>>,
     /// Command blocks: (absolute prompt line, exit code) — gutter lights.
     pub marks: &'a [(usize, Option<i32>)],
+    /// Hovered link: viewport row and an exclusive column range. The
+    /// underline is drawn through the shaped boxes on an Arabic row, the
+    /// same map a click uses.
+    pub link_hover: Option<(usize, usize, usize)>,
+    /// Status text for that link (the URI, or the resolved path). Already
+    /// stripped of bidi controls.
+    pub link_tip: Option<&'a str>,
 }
 
 // translucent overlays, EasyTer's colors: selection blue, search amber
 const SELECTION_RGBA: ((u8, u8, u8), u32) = ((80, 140, 255), 90);
 const SEARCH_RGBA: ((u8, u8, u8), u32) = ((240, 180, 40), 120);
+/// Hover underline for a hyperlink. Mint, so it sits in the palette
+/// instead of introducing a new blue the rest of the chrome doesn't use.
+const LINK_UNDER: (u8, u8, u8) = (0x58, 0xd1, 0xc0);
 
 pub(crate) fn is_arabic(c: char) -> bool {
     matches!(c as u32,
@@ -1244,6 +1254,7 @@ impl Renderer {
         cells: &[CellInfo],
         claude: bool,
         cursor_col: Option<usize>,
+        hover: Option<(usize, usize)>,
     ) -> Option<(i32, i32)> {
         let plan = bidi_plan(cells, claude, self.fg, cursor_col)?;
         // shape unconstrained (cached), then compress to the pane on overflow
@@ -1254,6 +1265,40 @@ impl Renderer {
             1.0
         };
         self.draw_run(&plan.segs, true, out, clip, x0 as f32, y, scale);
+        // Hover underline follows the shaped glyphs. Column * cell_w would
+        // land on the wrong side of an RTL row — the same reason the cursor
+        // and the click go through this buffer.
+        if let Some((h0, h1)) = hover {
+            let key = self.ensure_shaped(&plan.segs, true);
+            let glyphs = {
+                let buffer = &self.cache_hot[&key].buffer;
+                let mut glyphs = Vec::new();
+                for run in buffer.layout_runs() {
+                    for g in run.glyphs.iter() {
+                        glyphs.push(crate::mouse::GlyphSpan {
+                            x: g.x,
+                            w: g.w,
+                            start: g.start,
+                            end: g.end,
+                            rtl: g.level.is_rtl(),
+                        });
+                    }
+                }
+                glyphs
+            };
+            let boxes = crate::mouse::boxes_for_glyphs(&glyphs, scale, |byte| {
+                crate::mouse::col_for_byte(&plan.byte_cols, byte)
+            });
+            let th = (self.cell_h / 14.0).max(1.0) as i32;
+            let uy = y + self.cell_h.round() as i32 - th - 1;
+            for b in boxes {
+                if b.col >= h0 && b.col < h1 && b.x1 > b.x0 {
+                    let x = x0 + b.x0.round() as i32;
+                    let w = (b.x1 - b.x0).round().max(1.0) as i32;
+                    push_rect(out, clip, x, uy, w, th, c4(LINK_UNDER, 255));
+                }
+            }
+        }
         if let Some((b0, b1)) = plan.cursor_bytes {
             let c0 = cosmic_text::Cursor::new(0, b0);
             let c1 = cosmic_text::Cursor::new(0, b1);
@@ -1357,7 +1402,8 @@ impl Renderer {
     /// ASCII batches into runs pinned at col*cell_w; every other glyph draws
     /// per cell, compressed into its box when wider.
     fn draw_line_grid(&mut self, out: &mut Vec<Vertex>, clip: Rect,
-                      x0: i32, y: i32, cells: &[CellInfo]) {
+                      x0: i32, y: i32, cells: &[CellInfo],
+                      hover: Option<(usize, usize)>) {
         let n = cells.len();
         let mut i = 0;
         // underline/strikethrough decorations: (col_start, col_end, style, fg)
@@ -1450,6 +1496,16 @@ impl Renderer {
                 push_rect(out, clip, dx0, sy, dx1 - dx0, th, c4(fg, 255));
             }
         }
+        // Grid rows are column-exact, so the hover underline is too.
+        if let Some((h0, h1)) = hover {
+            if h1 > h0 {
+                let dx0 = x0 + (h0 as f32 * self.cell_w).round() as i32;
+                let dx1 = x0 + (h1 as f32 * self.cell_w).round() as i32;
+                let th = (self.cell_h / 14.0).max(1.0) as i32;
+                let uy = y + self.cell_h.round() as i32 - th - 1;
+                push_rect(out, clip, dx0, uy, (dx1 - dx0).max(1), th, c4(LINK_UNDER, 255));
+            }
+        }
     }
 
     /// Draw one pane's terminal into its rect.
@@ -1525,16 +1581,20 @@ impl Renderer {
                 continue;
             }
             let y = py + (li as f32 * self.cell_h).round() as i32;
+            let hover = view
+                .link_hover
+                .and_then(|(row, a, b)| (row == li).then_some((a, b)));
             if cells.iter().any(|ci| is_arabic(ci.c)) {
                 let on_row = cursor_vrow >= 0 && cursor_vrow as usize == li;
                 let r = self.draw_line_bidi(out, clip, px, y, pw, cells,
                                             view.claude,
-                                            if on_row { Some(ccol) } else { None });
+                                            if on_row { Some(ccol) } else { None },
+                                            hover);
                 if r.is_some() {
                     cursor_rect = r;
                 }
             } else {
-                self.draw_line_grid(out, clip, px, y, cells);
+                self.draw_line_grid(out, clip, px, y, cells, hover);
             }
         }
 
@@ -1610,6 +1670,27 @@ impl Renderer {
             push_rect(out, clip, px, py, 1, ph, c);
             push_rect(out, clip, px + pw - 1, py, 1, ph, c);
         }
+
+        if let Some(tip) = view.link_tip {
+            self.draw_link_status(out, clip, tip);
+        }
+    }
+
+    /// The link under the pointer, pinned to the bottom of the pane so a
+    /// moving cursor does not rebuild the quad set on every pixel. The
+    /// text is the target (URI or resolved path), which is what makes a
+    /// link whose label differs from its destination visible.
+    fn draw_link_status(&mut self, out: &mut Vec<Vertex>, rect: Rect, text: &str) {
+        let (px, py, pw, ph) = rect;
+        if pw < 8 || ph < 8 || text.is_empty() {
+            return;
+        }
+        let th = self.cell_h.round() as i32 + 4;
+        let y = py + ph - th;
+        push_rect(out, rect, px, y, pw, th, c4((0x0d, 0x11, 0x14), 235));
+        push_rect(out, rect, px, y, pw, 1, c4(LINK_UNDER, 255));
+        let seg = [Seg::plain(text.to_string(), LINK_UNDER)];
+        self.draw_run(&seg, false, out, rect, (px + 8) as f32, y + 2, 1.0);
     }
 
     /// Cockpit panel geometry (shared with the app's click hit-test).
@@ -2404,6 +2485,44 @@ impl Renderer {
         let l2 = [Seg::plain("Enter إغلاق   ·   Esc إبقاء", (0x9a, 0xa4, 0xb2))];
         self.draw_run(&l2, true, out, whole, (x + 14) as f32,
                       y + 12 + self.cell_h as i32, 1.0);
+    }
+
+    /// A link card. `may_open` is the confirm card (mint bar, Enter opens).
+    /// A refusal is the red bar, and Enter only dismisses it.
+    pub fn draw_link_block(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
+                           reason: &str, target: &str, may_open: bool) {
+        let whole: Rect = (0, 0, fw as i32, fh as i32);
+        push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 150));
+        let w = ((self.cell_w * 62.0) as i32).min(fw as i32 - 80);
+        let pad = 18;
+        let h = (self.cell_h * 4.0) as i32 + pad * 2 + 12;
+        let x = (fw as i32 - w) / 2;
+        let y = self.tab_bar_h() as i32 + (fh as i32 - h) / 3;
+        let accent = if may_open {
+            (0x58, 0xd1, 0xc0)
+        } else {
+            (0xcf, 0x22, 0x2e)
+        };
+        push_rect(out, whole, x - 3, y - 3, w + 6, h + 6, c4((0x0d, 0x11, 0x14), 235));
+        push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 255));
+        push_rect(out, whole, x, y, w, 3, c4(accent, 255));
+        let prefix = crate::link::card_title_prefix(may_open);
+        let title = [Seg {
+            text: format!("{prefix} — {reason}"),
+            fg: self.fg,
+            style: ST_BOLD,
+        }];
+        self.draw_run(&title, true, out, whole, (x + pad) as f32, y + pad, 1.0);
+        let dest = [Seg::plain(target.to_string(), (0xf2, 0xcc, 0x60))];
+        self.draw_run(&dest, false, out, whole, (x + pad) as f32,
+                      y + pad + self.cell_h as i32, 1.0);
+        let (ar, en) = crate::link::card_key_lines(may_open);
+        let keys_ar = [Seg::plain(ar.to_string(), (0x9a, 0xa4, 0xb2))];
+        self.draw_run(&keys_ar, true, out, whole, (x + pad) as f32,
+                      y + pad + (self.cell_h * 2.0) as i32 + 4, 1.0);
+        let keys_en = [Seg::plain(en.to_string(), (0x6e, 0x78, 0x85))];
+        self.draw_run(&keys_en, true, out, whole, (x + pad) as f32,
+                      y + pad + (self.cell_h * 3.0) as i32 + 6, 1.0);
     }
 
     /// The paste guard (EasyTer's protection): a multi-line/huge paste, or a

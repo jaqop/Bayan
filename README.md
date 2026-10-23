@@ -276,11 +276,81 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       mode on, and a RIS forgets the last CSI I so the next one is sent
       again. The wheel still scrolls the pane under the pointer and is
       not reported at all over the tab bar or the padding; Ctrl+wheel is
-      still font zoom. Proven on this branch before the security merge:
-      102 unit tests. Not proven here: a live htop /
+      still font zoom. The suite size after this merged with main is
+      under M31. Not proven here: a live htop /
       vim `mouse=a` / lazygit / Claude Code session — this tree doesn't
       run a window on the machine that built it. Windows CI is the build
       that does.
+- [x] **M31** — hyperlinks. OSC 8 is already on the cell
+      (`Cell::hyperlink`); a run of cells that share one id is a span, and
+      the bytes are not parsed a second time. Cells an OSC link does not
+      cover are scanned for `http`/`https` URLs and for `path:line[:col]` /
+      `path(line,col)` (rustc, gcc, MSVC, grep). Hover underlines the span
+      through the same shaped glyph boxes a click uses, and the pane's
+      bottom strip shows the target — so a label that differs from its URI
+      is visible. The underline is not a shaped-run style bit: baking it
+      into the cache key would reshape the line on every hover change.
+      Ctrl+click opens the link. Shift+click stays a local selection and
+      wins over Ctrl. A plain click while mouse tracking is on still goes
+      to the program, Ctrl modifier bit included; the window asks
+      `link::click_owner` before `mouse::Route::press`, and an overlay
+      (settings, cockpit, paste guard, close guard, the refused-link card)
+      blocks the click so a link under a card does not open.       Only `http`
+      and `https` are association-opened, and never through `cmd /c start`:
+      `ShellExecuteW` gets the URI as the single `lpFile`. A `file` URI
+      association-opens only after `accept_local_cwd` has accepted a drive
+      path — UNC, `\\?\`, `\\.\`, `\??\`, a colon after the drive letter,
+      a comma, a quote, and `\\` anywhere are refused before `exists`,
+      because a stat of a UNC path opens SMB and can leak NTLM — and only
+      when the extension is on the document/media allowlist (`.txt` `.md`
+      `.log` `.json` `.csv` `.pdf` `.png` `.jpg` `.jpeg` `.gif` `.webp`
+      `.bmp` `.svg`). Everything else, including no extension, is revealed.
+      An existing 8.3 name is expanded with `GetLongPathNameW` and both
+      the UNC gate and the allowlist run again on the long path; a `~`
+      component that cannot be expanded is revealed. `javascript:`,
+      `ms-*`, `search-ms:`, `data:`, and anything else are refused on a
+      red card whose keys say Enter closes. A URL with userinfo, and any
+      non-ASCII host, shows the real host first (punycode for IDN) and
+      waits for a different card; Enter is what opens it. Control
+      characters and bidi overrides are refused too, including after
+      percent-decoding (a stray `%` is not one of those), and a target
+      longer than 2048 bytes is refused. `path:line` never
+      association-opens the file. The editor is a `Command` argument
+      vector from `editor` in the config (`code -g {file}:{line}:{col}`);
+      `{file}` `{line}` `{col}` are substituted in one pass after the
+      template is split, so a path with spaces is one argument and a
+      `{line}` inside the filename is left alone. The path is absolute, so
+      a file named `-n.rs` cannot become an option. Absent that key,
+      `code.exe` on PATH (or the `Code.exe` beside VS Code's `code.cmd`)
+      is used; a bare `.cmd` is not spawned, and there is no association
+      fallback if the editor fails to start. With no editor, the folder
+      opens as `%WINDIR%\explorer.exe` with raw `/select,"<path>"`, not a
+      shell. A relative path with no pane cwd is refused rather than
+      resolved against Bayan's own directory. A missing file is the card,
+      unless the path has a `~` component that could not be expanded, in
+      which case it is revealed. Relative paths that do resolve use the
+      pane cwd OSC 9;9 already stores (`link::cwd_hook`, the same
+      `accept_local_cwd` gate); OSC 7 should write that same field.
+      Unquoted paths that contain spaces are not detected, including a
+      tail like `y\a.rs` inside `C:\x y\a.rs:12`. HIDDEN cells are not
+      clickable. Spans are cached per row and dropped when the pane's PTY
+      wakes, when it scrolls, and on relayout; that wakeup also clears the
+      hover. `exists`, the editor lookup, and the browser, the editor, and
+      explorer are spawned off the UI thread, and that thread initializes
+      COM before `ShellExecuteW`. Proven: 158 `#[test]` functions (118 on
+      main before these link tests), including OSC 8 open/close, URL
+      punctuation and surrounding Arabic, the four file:line shapes, the
+      scheme allowlist, the UNC forms, the association allowlist, every
+      old blocked extension plus PATHEXT, ADS colons, injected 8.3
+      expansion, explorer `/select`, a missing file, one-pass
+      placeholders, the absolute path, a stray `%`, the extra invisible
+      characters, a spaced path that must not match, hidden cells, the
+      row cache, the script hosts, userinfo, an IDN punycode card,
+      control/bidi rejection, the editor argv (no shell), an RTL hit
+      through `column_for_click`, and the overlay short-circuit in front
+      of `Route::press`. Not proven here: a live hover underline,
+      `ShellExecuteW` actually launching a browser, or a real editor spawn
+      — this tree doesn't run a window on the machine that built it.
 
 ## Settings
 
@@ -296,6 +366,7 @@ key falls back to a sane default:
   "copy_on_select": true, "ligatures": true, "bell": "attention",
   "shell": "pwsh.exe", "padding": 8, "opacity": 0.9,
   "hide_single_tab": true, "confirm_close": true, "osc52": "off",
+  "editor": "code -g {file}:{line}:{col}",
   "keybinds": { "new-tab": "ctrl+shift+n" }
 }
 ```

@@ -15,6 +15,16 @@
 //! terminal keeps the gesture for its own selection and its own
 //! scrollback. Buttons past the three primaries (codes >= 128) and the
 //! horizontal wheel are not reported.
+//!
+//! Ctrl+click is not a report either: it opens a hyperlink
+//! (`link::click_owner`). Shift still keeps local selection when the cell
+//! is a link, and it wins if Ctrl is held too. A plain click while
+//! tracking is on belongs to the program, link or not. An overlay
+//! (settings, a guard card, the cockpit) blocks the link as well as the
+//! report — the window asks [`Route::press`] only when `click_owner` says
+//! the program owns the gesture. The column is the one `column_for_click`
+//! already computed, so a link on an Arabic row is the glyph under the
+//! pointer.
 
 use alacritty_terminal::term::TermMode;
 
