@@ -52,7 +52,9 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       alternate screen belongs to a `claude` command (F2 = manual toggle,
       green badge); OSC 133 prompt marks injected into PowerShell power the
       command detection; OSC 52 sets the clipboard; OSC 9;9 tracks the cwd
-      into the window title — all scanned split-safe with carry
+      into the window title — all scanned split-safe with carry. OSC 7
+      (`file://`) reports the same directory; see "BiDi controls and the
+      current directory" below
 - [x] **M5** — tabs (Ctrl+T inherits the cwd, Ctrl+Tab cycles,
       Ctrl+Shift+W closes, click to switch; renderer-drawn bar), session
       persistence (~/.bayan/session.json restores every tab in its
@@ -247,6 +249,74 @@ key falls back to a sane default:
 
 Shell and scrollback apply to new tabs (no terminal restarts a live
 session); everything else applies immediately.
+
+## BiDi controls and the current directory
+
+Two escape sequences from ECMA-48 / the terminal-wg "BiDi in Terminal
+Emulators" recommendation, which `alacritty_terminal` 0.26 does not act on
+(mode 8 is an unknown SM/RM parameter; `CSI Ps SP k` is not in its CSI
+dispatch). Bayan strips them from the PTY stream before the parser, including
+when a sequence is split across reads.
+
+- **BDSM** — `CSI 8 h` implicit (Bayan applies UAX#9; this is the initial
+  state, so a shell that never sends BDSM still gets Arabic), `CSI 8 l`
+  explicit (the application already ordered the text, so that pane is not
+  reordered and Claude-mode restoration stays off).
+- **SCP** — `CSI 1 SP k` LTR, `CSI 2 SP k` RTL, `CSI 0 SP k` or `CSI SP k`
+  back to the default (first strong character). The direction applies to the
+  current line when the cursor is in column 0, and to the lines after it.
+- Both reset on RIS (`ESC c`) and when switching to or from the alternate screen.
+
+`bidi.honor_bdsm` defaults to **true**, so explicit mode overrides Bayan's
+auto-detection. That override is waiting on the owner; set it false to keep
+today's detection even when an application sends `CSI 8 l`:
+
+```json
+{ "bidi": { "honor_bdsm": false } }
+```
+
+**OSC 7** (`ESC ] 7 ; file://host/path ST`, BEL or `ESC \`) stores the pane's
+working directory next to the existing OSC 9;9 report. Only the `file` scheme
+is accepted. The path is percent-decoded, `/C:/x` becomes `C:\x`, and the host
+must be empty, `localhost`, a loopback address, or this machine's name. Remote
+hosts, UNC (`//server/share`, `\\?\`, `\??\`), control characters, bidi
+overrides, and payloads over 4096 bytes are rejected and do not replace a
+directory already stored. A new tab or split inherits the directory only when
+it exists. `SessionMeta::reported_cwd` is what an OSC 8 resolver should join a
+relative `file:line` path against.
+
+The path check is local to `src/osc7.rs`. The security fixes on
+`cursor/security-high-fixes-bfda` add `accept_local_cwd` for OSC 9;9; once
+both have merged, OSC 7 should call that helper instead of keeping a second one.
+
+PowerShell gets OSC 7 from the prompt wrapper Bayan already injects (it also
+still emits OSC 9;9). cmd does not, so a clink prompt filter does the same
+report. Both use an empty host (`file:///C:/…`):
+
+```lua
+-- %LOCALAPPDATA%\clink\bayan_osc7.lua
+local osc7 = clink.promptfilter(100)
+
+local function encode(path)
+  local out = {}
+  for i = 1, #path do
+    local b = path:byte(i)
+    local plain = b == 47 or b == 58
+      or (b >= 48 and b <= 57)
+      or (b >= 65 and b <= 90)
+      or (b >= 97 and b <= 122)
+      or b == 45 or b == 46 or b == 95 or b == 126
+    out[#out + 1] = plain and string.char(b) or string.format("%%%02X", b)
+  end
+  return table.concat(out)
+end
+
+function osc7:filter(prompt)
+  local cwd = (clink.get_cwd and clink.get_cwd() or os.getcwd()):gsub("\\", "/")
+  if cwd:match("^%a:") then cwd = "/" .. cwd end
+  return "\027]7;file://" .. encode(cwd) .. "\007" .. prompt
+end
+```
 
 ## Build
 

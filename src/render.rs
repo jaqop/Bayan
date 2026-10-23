@@ -26,6 +26,7 @@ use cosmic_text::{
     SwashContent, Weight, Wrap,
 };
 
+use crate::bidi_ctl::{base_direction_mark, ParagraphDir};
 use crate::gpu::Vertex;
 use crate::term::EventProxy;
 
@@ -619,6 +620,11 @@ pub struct PaneView<'a> {
     pub bordered: bool,
     /// Claude mode for THIS pane's content.
     pub claude: bool,
+    /// False when explicit BDSM is honored: cells are already in visual
+    /// order, so Arabic rows take the grid path and are not reordered.
+    pub reorder: bool,
+    /// SCP paragraph direction for each viewport row (index = row).
+    pub line_dir: &'a [ParagraphDir],
     /// The current search hit (focused pane only).
     pub search_match: Option<&'a std::ops::RangeInclusive<alacritty_terminal::index::Point>>,
     /// Command blocks: (absolute prompt line, exit code) — gutter lights.
@@ -1033,7 +1039,7 @@ impl Renderer {
     #[allow(clippy::too_many_arguments)]
     fn draw_line_bidi(&mut self, out: &mut Vec<Vertex>, clip: Rect,
                       x0: i32, y: i32, pane_w: i32, cells: &[CellInfo], claude: bool,
-                      cursor_col: Option<usize>) -> Option<(i32, i32)> {
+                      cursor_col: Option<usize>, dir: ParagraphDir) -> Option<(i32, i32)> {
         let mut end = cells.len();
         while end > 0 && cells[end - 1].c == ' ' {
             end -= 1;
@@ -1067,6 +1073,18 @@ impl Renderer {
             if let Some(fixed) = crate::bidi::restore_bidi_line(&full) {
                 segs = vec![Seg::plain(fixed, self.fg)];
                 cur_bytes = None;
+            }
+        }
+        // SCP base direction. Only a non-default direction prepends a mark,
+        // so an ordinary Arabic row keeps the cache key it had before SCP.
+        if let Some(mark) = base_direction_mark(dir) {
+            if let Some(seg) = segs.first_mut() {
+                seg.text.insert(0, mark);
+            }
+            let n = mark.len_utf8();
+            if let Some((a, b)) = cur_bytes.as_mut() {
+                *a += n;
+                *b += n;
             }
         }
         // shape unconstrained (cached), then compress to the pane on overflow
@@ -1284,11 +1302,18 @@ impl Renderer {
                 continue;
             }
             let y = py + (li as f32 * self.cell_h).round() as i32;
-            if cells.iter().any(|ci| is_arabic(ci.c)) {
+            // Explicit BDSM: the application sent visual order (and, per the
+            // recommendation, presentation forms). The grid path does not
+            // run UAX#9 and does not reshape. Implicit mode keeps the
+            // whole-line shaper, with SCP's base direction if one was set.
+            let arabic = cells.iter().any(|ci| is_arabic(ci.c));
+            if arabic && view.reorder {
                 let on_row = cursor_vrow >= 0 && cursor_vrow as usize == li;
+                let dir = view.line_dir.get(li).copied().unwrap_or_default();
                 let r = self.draw_line_bidi(out, clip, px, y, pw, cells,
                                             view.claude,
-                                            if on_row { Some(ccol) } else { None });
+                                            if on_row { Some(ccol) } else { None },
+                                            dir);
                 if r.is_some() {
                     cursor_rect = r;
                 }

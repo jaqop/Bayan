@@ -78,6 +78,35 @@ pub struct UserConfig {
     /// Only NON-default bindings live here (the editor prunes defaults).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keybinds: Option<std::collections::HashMap<String, String>>,
+    /// BiDi escape-sequence policy. Absent means [`BidiConfig`]'s defaults.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bidi: Option<BidiConfig>,
+}
+
+fn default_honor_bdsm() -> bool {
+    true
+}
+
+/// How Bayan treats BDSM from the application.
+///
+/// `honor_bdsm` defaults to true: an explicit BDSM (`CSI 8 l`) disables
+/// reordering for that pane, including Claude-mode auto-detection. The
+/// owner has not signed off on that override; set it false to keep Bayan's
+/// own detection when an application selects explicit mode.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct BidiConfig {
+    /// Serde fills a missing field from the field type's `Default`, and
+    /// `bool` defaults to false. The function keeps an empty `{"bidi":{}}`
+    /// on the same side as [`Default`].
+    #[serde(default = "default_honor_bdsm")]
+    pub honor_bdsm: bool,
+}
+
+impl Default for BidiConfig {
+    fn default() -> Self {
+        Self { honor_bdsm: true }
+    }
 }
 
 /// Cursor shape (the trio every terminal offers: block / bar / underline).
@@ -195,6 +224,11 @@ impl UserConfig {
 
     pub fn notifications_on(&self) -> bool {
         self.notifications.unwrap_or(true)
+    }
+
+    /// Explicit BDSM overrides Claude-mode auto-detection. Default true.
+    pub fn honor_bdsm(&self) -> bool {
+        self.bidi.as_ref().map(|b| b.honor_bdsm).unwrap_or(true)
     }
 }
 
@@ -322,6 +356,17 @@ mod tests {
             serde_json::from_str(r#"{"opacity":0.05,"padding":500}"#).unwrap();
         assert_eq!(wild.opacity_level(), 0.5);
         assert_eq!(wild.padding_px(), 32);
+    }
+
+    #[test]
+    fn honor_bdsm_defaults_to_true() {
+        let d = UserConfig::default();
+        assert!(d.honor_bdsm());
+        let off: UserConfig = serde_json::from_str(r#"{"bidi":{"honor_bdsm":false}}"#).unwrap();
+        assert!(!off.honor_bdsm());
+        // an empty object still gets the field default
+        let empty: UserConfig = serde_json::from_str(r#"{"bidi":{}}"#).unwrap();
+        assert!(empty.honor_bdsm());
     }
 
     #[test]

@@ -94,13 +94,24 @@ pub fn split_command(cmd: &str) -> (String, Vec<String>) {
 /// OSC 133 prompt wrapper injected into PowerShell (EasyTer's __et_wrap,
 /// ported): D=command end (exit code), A=prompt start, 9;9=cwd report,
 /// B=input begins. Command detection — and Claude mode's auto-enable —
-/// depend on these marks.
-const PS_MARKS: &str = "function global:__by_wrap{if(-not $global:__BY_SI){$global:__BY_SI=$true;\
+/// depend on these marks. `__by_osc7` adds the standard OSC 7 `file://`
+/// report beside 9;9 (empty host, so `file:///C:/…`); cmd/clink has the
+/// matching snippet in the README, because cmd is launched bare.
+const PS_MARKS: &str = "function global:__by_osc7{if($PWD.Provider.Name -ne 'FileSystem'){return ''};\
+$p=$PWD.ProviderPath.Replace('\\','/');if($p -match '^[A-Za-z]:'){$p='/'+$p};$e='';\
+foreach($x in [Text.Encoding]::UTF8.GetBytes($p)){if($x -eq 47 -or ($x -ge 48 -and $x -le 57) -or ($x -ge 65 -and $x -le 90) -or ($x -ge 97 -and $x -le 122) -or $x -eq 45 -or $x -eq 46 -or $x -eq 95 -or $x -eq 126 -or $x -eq 58){$e+=[char]$x}else{$e+=('%{0:X2}' -f $x)}};[char]27+']7;file://'+$e+[char]7};\
+function global:__by_wrap{if(-not $global:__BY_SI){$global:__BY_SI=$true;\
 $global:__BY_OP=$function:prompt;function global:prompt{\
 $c=$global:LASTEXITCODE;if($null -eq $c){if($?){$c=0}else{$c=1}};\
 \"$([char]27)]133;D;$c$([char]7)$([char]27)]133;A$([char]7)\
-$([char]27)]9;9;$($PWD.ProviderPath)$([char]7)\"\
+$([char]27)]9;9;$($PWD.ProviderPath)$([char]7)$(__by_osc7)\"\
 +(& $global:__BY_OP)+\"$([char]27)]133;B$([char]7)\"}}}; __by_wrap";
+
+/// The PowerShell prompt wrapper injected at spawn. Tests check that OSC 7
+/// stayed in it; the README quotes the same idea for cmd/clink.
+pub(crate) fn shell_integration_ps() -> &'static str {
+    PS_MARKS
+}
 
 /// One command block: where its prompt sits and how the command ended.
 /// `abs` is GLOBAL: evicted lines + history size + cursor row at mark time —
@@ -121,8 +132,12 @@ pub struct SessionMeta {
     pub prompt_col: Option<usize>,
     /// the command line currently executing ("" = idle) — feeds cmd_is_claude
     pub running_cmd: String,
-    /// working directory from OSC 9;9
+    /// working directory from OSC 7 (`file://`) or OSC 9;9
     pub cwd: Option<String>,
+    /// BDSM (implicit/explicit) and SCP paragraph direction for this pane.
+    pub bidi: crate::bidi_ctl::BidiState,
+    /// Half-parsed BDSM/SCP/RIS held across PTY reads.
+    pub(crate) esc_filter: crate::bidi_ctl::StreamFilter,
     /// command blocks (OSC 133 A/D): gutter lights + prompt jumping
     pub marks: Vec<CmdMark>,
     /// history lines evicted past the scrollback cap (+ ED3-cleared lines):
@@ -130,6 +145,25 @@ pub struct SessionMeta {
     pub evicted: u64,
     /// when the running command was submitted — feeds the finish notification
     pub cmd_started: Option<std::time::Instant>,
+}
+
+impl SessionMeta {
+    /// Directory last reported by OSC 7 or OSC 9;9.
+    ///
+    /// OSC 8 hyperlink resolution joins a relative `file:line` target against
+    /// this. It is the report as accepted, not a promise the directory still
+    /// exists — [`Self::spawn_cwd`] is what a new tab or split uses.
+    pub fn reported_cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+
+    /// Reported directory, if it exists right now. A missing path must not
+    /// become a spawn cwd (the launcher directory is the fallback).
+    pub fn spawn_cwd(&self) -> Option<String> {
+        self.reported_cwd()
+            .filter(|p| crate::osc7::directory_exists(p))
+            .map(str::to_owned)
+    }
 }
 
 /// Events one PTY chunk produced, delivered to the UI thread by the reader.
@@ -351,10 +385,23 @@ fn feed_counted<T: EventListener>(
     }
 }
 
-/// Carry-merge, scan, split-feed one PTY read. The markers themselves are
-/// consumed here (alacritty would discard them anyway); segments between
-/// them feed the emulator, with the cursor read exactly at each mark.
-pub(crate) fn process_chunk<T: EventListener>(
+fn merge_chunk(dst: &mut ChunkEvents, src: ChunkEvents) {
+    if src.clipboard.is_some() {
+        dst.clipboard = src.clipboard;
+    }
+    if src.cwd.is_some() {
+        dst.cwd = src.cwd;
+    }
+    if src.finished.is_some() {
+        dst.finished = src.finished;
+    }
+}
+
+/// Carry-merge, scan, split-feed one slice the BiDi filter has already
+/// decided the parser should see. OSC 133 markers are consumed here
+/// (alacritty would discard them anyway); segments between them feed the
+/// emulator, with the cursor read exactly at each mark.
+fn process_bytes<T: EventListener>(
     parser: &mut Processor,
     t: &mut Term<T>,
     meta: &mut SessionMeta,
@@ -374,6 +421,17 @@ pub(crate) fn process_chunk<T: EventListener>(
         meta.cwd = Some(c.clone());
         ev.cwd = Some(c);
     }
+    // OSC 7 wins only when it sits later in this slice than OSC 9;9. A
+    // rejected file:// must not wipe a directory the other report just set.
+    if let Some((at, cwd)) = crate::osc7::last_accepted(&buf, crate::osc7::cached_local_names()) {
+        let later = crate::osc7::last_prefix_index(&buf, b"\x1b]9;9;")
+            .map(|i| at > i)
+            .unwrap_or(true);
+        if later {
+            meta.cwd = Some(cwd.clone());
+            ev.cwd = Some(cwd);
+        }
+    }
     let mut pos = 0;
     for (s, e, kind, exit) in find_osc133(&buf) {
         feed_counted(parser, t, meta, &buf[pos..s]);
@@ -381,6 +439,44 @@ pub(crate) fn process_chunk<T: EventListener>(
         pos = e;
     }
     feed_counted(parser, t, meta, &buf[pos..]);
+    ev
+}
+
+/// One PTY read. BDSM (`CSI 8 h` / `CSI 8 l`), SCP (`CSI Ps SP k`) and RIS
+/// (`ESC c`) are peeled off first — alacritty_terminal 0.26 does not act on
+/// the first two — and applied between the byte slices they used to sit in,
+/// so a mode change and the text around it stay in order. An alternate-screen
+/// switch resets BiDi state after the slice that caused it is parsed.
+pub(crate) fn process_chunk<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    meta: &mut SessionMeta,
+    carry: &mut Vec<u8>,
+    data: &[u8],
+) -> ChunkEvents {
+    let items = meta.esc_filter.pull(data);
+    let mut ev = ChunkEvents::default();
+    for item in items {
+        match item {
+            crate::bidi_ctl::StreamItem::Bytes(bytes) => {
+                if bytes.is_empty() {
+                    continue;
+                }
+                let was_alt = t.mode().contains(TermMode::ALT_SCREEN);
+                let part = process_bytes(parser, t, meta, carry, &bytes);
+                if was_alt != t.mode().contains(TermMode::ALT_SCREEN) {
+                    meta.bidi.reset();
+                }
+                merge_chunk(&mut ev, part);
+            }
+            crate::bidi_ctl::StreamItem::Bdsm(mode) => meta.bidi.mode = mode,
+            crate::bidi_ctl::StreamItem::Scp(dir) => {
+                let (abs, col) = crate::bidi_ctl::cursor_abs(t, meta.evicted);
+                meta.bidi.note_scp(dir, abs, col);
+            }
+            crate::bidi_ctl::StreamItem::Ris => meta.bidi.reset(),
+        }
+    }
     ev
 }
 
@@ -592,7 +688,7 @@ impl Session {
                 ));
             }
             setup.push(' ');
-            setup.push_str(PS_MARKS);
+            setup.push_str(shell_integration_ps());
             cmd.arg(setup);
         } else if shell.eq_ignore_ascii_case("cmd.exe") {
             // UTF-8 code page so Arabic paths survive; no OSC 133 marks
