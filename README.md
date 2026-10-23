@@ -226,7 +226,7 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       (Shell_NotifyIcon, the biggest windows-sys consumer) compiles and the app
       runs, but a balloon was not caught on camera — quiet hours file it to the
       Action Center — so that one is built-and-running, not eyeball-verified
-- [x] **M30** — the agent's own signals, drawn. OSC 9;4 progress (ConEmu's,
+- [x] **M32** — the agent's own signals, drawn. OSC 9;4 progress (ConEmu's,
       read by Windows Terminal, Ghostty, WezTerm, Konsole — and emitted by
       Claude Code under `terminalProgressBarEnabled`) becomes a 3px bar along
       the tab's bottom edge: green working, red failed, amber paused, dim
@@ -241,7 +241,7 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       ConPTY path draws the bar under the tab (PrintWindow capture,
       pixel-sampled). Learned again on the way: `cargo test` does not relink
       `target/debug/bayan.exe` — the first two captures were of a stale binary
-- [x] **M31** — Ctrl+click opens URLs and file paths, underlined in the accent
+- [x] **M33** — Ctrl+click opens URLs and file paths, underlined in the accent
       colour while Ctrl is held (the essential half of the "hints" mode users
       ask every terminal for, in EasyTer's gesture). `links.rs` is pure text →
       spans, unit-tested: a URL starts at its scheme even glued to `url=` or
@@ -251,14 +251,31 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       relative paths resolve against the pane's cwd — and nothing is offered
       unless the file exists. Opens through ShellExecuteW (no console flash).
       Verified live with a driven pointer: the underline covers exactly
-      `https://example.com/path` and neither neighbouring word
-- [x] **M32** — the window comes back where you left it: session.json carries
+      `https://example.com/path` and neither neighbouring word.
+
+      Hardened after review, because terminal output is not trusted input.
+      ShellExecuteW "open" RUNS an executable, so association-open is an
+      allowlist of documents and images; everything else that exists is
+      revealed in Explorer instead. Resolution refuses UNC and device paths
+      BEFORE the existence check — stat'ing `\\host\share` sends the user's
+      credentials to a host named by program output — and refuses quote,
+      comma and the BiDi overrides that dress `payload.exe` up as
+      `payload.txt`. The existence check is injected, so a test proves a
+      refused path is never stat'd at all, and each gate was removed in turn
+      to confirm only its own tests go red. Known limits, both real: a
+      MAPPED network drive is still stat'd (the user mounted it), and a
+      junction or symlink aimed at a UNC share defeats the text-based gate
+      entirely — closing that needs resolution off the UI thread, gating on
+      the canonical path. Pointer-to-column and the hover underline both
+      resolve through the shaped layout, so on an Arabic row the link picked
+      is the one under the pointer and the underline sits beneath its glyphs
+- [x] **M34** — the window comes back where you left it: session.json carries
       the last non-maximized rectangle plus the maximized flag, restored only
       if enough of the title strip lands on a monitor that is still connected
       (a window last seen on an unplugged second screen must not return
       off-screen). Verified live: moved and resized through the OS, closed
       cleanly, relaunched — same rectangle to the pixel
-- [x] **M33** — Ctrl+Tab returns to the tab you were just on (browser/IDE
+- [x] **M35** — Ctrl+Tab returns to the tab you were just on (browser/IDE
       stack behaviour, a top Ghostty request): holding Ctrl and pressing Tab
       again walks further down the history, Shift walks back, releasing Ctrl
       commits the stop. `tab_switch: "order"` restores the classic cycle.

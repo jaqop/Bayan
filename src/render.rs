@@ -1073,7 +1073,8 @@ impl Renderer {
     #[allow(clippy::too_many_arguments)]
     fn draw_line_bidi(&mut self, out: &mut Vec<Vertex>, clip: Rect,
                       x0: i32, y: i32, pane_w: i32, cells: &[CellInfo], claude: bool,
-                      cursor_col: Option<usize>) -> Option<(i32, i32)> {
+                      cursor_col: Option<usize>,
+                      link_cols: Option<(usize, usize)>) -> Option<(i32, i32)> {
         let mut end = cells.len();
         while end > 0 && cells[end - 1].c == ' ' {
             end -= 1;
@@ -1084,12 +1085,20 @@ impl Renderer {
         // underline/strikethrough spans as BYTE ranges of the shaped text:
         // on a BiDi row the pixels come from the layout, never from columns
         let mut decos: Vec<Deco> = Vec::new();
+        // the hovered link's columns, as the same kind of byte range
+        let mut link_bytes: Option<(usize, usize)> = None;
         for ci in &cells[..end] {
             if cursor_col == Some(ci.col) {
                 cur_bytes = Some((nbytes, nbytes + ci.c.len_utf8()));
             }
             let b0 = nbytes;
             nbytes += ci.text_len();
+            if link_cols.is_some_and(|(lc0, lc1)| ci.col >= lc0 && ci.col < lc1) {
+                link_bytes = Some(match link_bytes {
+                    None => (b0, nbytes),
+                    Some((s, _)) => (s, nbytes),
+                });
+            }
             if ci.style & (ST_UNDERLINE | ST_STRIKE) != 0 {
                 match decos.last_mut() {
                     Some((_, e, st, fg)) if *e == b0 && *st == ci.style && *fg == ci.fg => {
@@ -1106,6 +1115,14 @@ impl Renderer {
                     segs.push(Seg { text: s, fg: ci.fg, style: ci.style });
                 }
             }
+        }
+        // The Ctrl-hovered link is just another decoration: it rides the
+        // same byte-range → layout mapping, so the accent line lands under
+        // the glyphs wherever UAX#9 put them. Pushed BEFORE the Claude-mode
+        // rebuild so decos.clear() drops it too — after that reordering a
+        // byte range means nothing, and a wrong underline is worse than none.
+        if let Some((b0, b1)) = link_bytes {
+            decos.push((b0, b1, ST_UNDERLINE, self.palette[4]));
         }
         if segs.is_empty() {
             return None;
@@ -1177,11 +1194,36 @@ impl Renderer {
         None
     }
 
+    /// Logical column at pixel offset `dx` from a row's left edge — the
+    /// inverse of where that column's glyphs were drawn. A grid row
+    /// divides by cell width; a row with Arabic MUST resolve through the
+    /// shaped layout, because on it the glyph at a given x is not the one
+    /// at dx/cell_w. Same reason the cursor and the decorations go through
+    /// the layout, aimed the other way. `line` is one char per column, as
+    /// `row_text` produces it.
+    pub fn col_at(&mut self, line: &str, dx: f32, pane_w: i32) -> usize {
+        let fallback = (dx / self.cell_w).max(0.0) as usize;
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() || !trimmed.chars().any(is_arabic) {
+            return fallback;
+        }
+        let segs = vec![Seg::plain(trimmed.to_string(), self.fg)];
+        let natw = self.measure(&segs, true);
+        let scale = if natw > pane_w as f32 { pane_w as f32 / natw } else { 1.0 };
+        let key = self.ensure_shaped(&segs, true);
+        match self.cache_hot[&key].buffer.hit(dx / scale, self.cell_h * 0.5) {
+            // byte index back to a char index, which IS the column
+            Some(c) => trimmed.char_indices().take_while(|(i, _)| *i < c.index).count(),
+            None => fallback,
+        }
+    }
+
     /// A row without Arabic (prompts, code, TUIs): strict grid placement.
     /// ASCII batches into runs pinned at col*cell_w; every other glyph draws
     /// per cell, compressed into its box when wider.
     fn draw_line_grid(&mut self, out: &mut Vec<Vertex>, clip: Rect,
-                      x0: i32, y: i32, cells: &[CellInfo]) {
+                      x0: i32, y: i32, cells: &[CellInfo],
+                      link_cols: Option<(usize, usize)>) {
         let n = cells.len();
         let mut i = 0;
         // underline/strikethrough decorations: (col_start, col_end, style, fg)
@@ -1259,6 +1301,12 @@ impl Renderer {
                 }
                 i += 1;
             }
+        }
+        // a grid row IS column-exact, so the hovered link maps straight
+        // onto its cells — the same accent line the BiDi path reaches
+        // through the shaped layout
+        if let Some((c0, c1)) = link_cols {
+            decos.push((c0, c1, ST_UNDERLINE, self.palette[4]));
         }
         // decoration lines over the text (underline hugs the cell bottom)
         let th = (self.cell_h / 14.0).max(1.0) as i32;
@@ -1366,16 +1414,23 @@ impl Renderer {
                 continue;
             }
             let y = py + (li as f32 * self.cell_h).round() as i32;
+            // the Ctrl-hovered link, if it is on this row: each path draws
+            // it the way that path places anything else
+            let link = view
+                .hover_link
+                .filter(|&(row, c0, c1)| row == li && c1 > c0)
+                .map(|(_, c0, c1)| (c0, c1));
             if cells.iter().any(|ci| is_arabic(ci.c)) {
                 let on_row = cursor_vrow >= 0 && cursor_vrow as usize == li;
                 let r = self.draw_line_bidi(out, clip, px, y, pw, cells,
                                             view.claude,
-                                            if on_row { Some(ccol) } else { None });
+                                            if on_row { Some(ccol) } else { None },
+                                            link);
                 if r.is_some() {
                     cursor_rect = r;
                 }
             } else {
-                self.draw_line_grid(out, clip, px, y, cells);
+                self.draw_line_grid(out, clip, px, y, cells, link);
             }
         }
 
@@ -1413,17 +1468,6 @@ impl Renderer {
                     let bh = ((self.cell_h * 0.1).round() as i32).max(2);
                     push_rect(out, clip, x0, y0 + hpx - bh, wpx, bh, c4(self.fg, 230));
                 }
-            }
-        }
-
-        // the Ctrl-hovered link: an accent underline across its cells
-        if let Some((row, c0, c1)) = view.hover_link {
-            if row < rows && c1 > c0 {
-                let th = (self.cell_h / 14.0).max(1.0) as i32;
-                let x0 = px + (c0 as f32 * self.cell_w).round() as i32;
-                let x1 = px + (c1 as f32 * self.cell_w).round() as i32;
-                let uy = py + ((row + 1) as f32 * self.cell_h).round() as i32 - th - 1;
-                push_rect(out, clip, x0, uy, x1 - x0, th, c4(self.palette[4], 255));
             }
         }
 
@@ -2982,6 +3026,92 @@ mod cache_tests {
         let plain = count_rows(&mut r, "\u{645}\u{631}\u{62d}\u{628}\u{627}".as_bytes());
         let underlined = count_rows(&mut r, "\x1b[4m\u{645}\u{631}\u{62d}\u{628}\u{627}\x1b[0m".as_bytes());
         assert!(underlined > plain, "no underline quads on the Arabic row ({underlined} vs {plain})");
+    }
+
+    /// The pointer-to-column map has to go through the shaped layout too,
+    /// or the link that gets picked is not the one under the pointer. On
+    /// an RTL row the LEFTMOST pixels hold the LAST logical columns.
+    #[test]
+    fn col_at_mirrors_on_an_rtl_row() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let arabic = "\u{645}\u{631}\u{62d}\u{628}\u{627}"; // five cells, pure RTL
+        let pane_w = 600;
+        let natw = r.measure(&[Seg::plain(arabic.to_string(), r.fg)], true);
+        let left = r.col_at(arabic, natw * 0.1, pane_w);
+        let right = r.col_at(arabic, natw * 0.9, pane_w);
+        assert!(
+            left > right,
+            "a pointer on the LEFT of an RTL row is a LATER column: {left} vs {right}"
+        );
+        // a grid row keeps the exact column arithmetic it always had
+        assert_eq!(r.col_at("abcde", r.cell_w * 0.5, pane_w), 0);
+        assert_eq!(r.col_at("abcde", r.cell_w * 3.5, pane_w), 3);
+        // a blank row has nothing to shape and must not panic
+        assert_eq!(r.col_at("", r.cell_w * 2.5, pane_w), 2);
+    }
+
+    /// The Ctrl-hover underline must resolve through the shaped layout,
+    /// the way the SGR decorations and the cursor already do. On an RTL
+    /// row logical columns 0..2 are the RIGHTMOST glyphs, so their
+    /// underline sits to the right of the one for columns 3..5 —
+    /// something col * cell_w can never produce.
+    #[test]
+    fn the_hover_underline_follows_rtl_glyph_order() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 30, rows: 3 };
+        // the accent underline the hover draws, as (leftmost x, rightmost x)
+        let hover_x = |r: &mut Renderer, text: &str, span: (usize, usize)| -> (i32, i32) {
+            let mut t = Term::new(Config::default(), &size, VoidListener);
+            let mut p: Processor = Processor::new();
+            p.advance(&mut t, text.as_bytes());
+            let view = PaneView {
+                rect: (0, 0, 600, 90),
+                focused: false,
+                cursor: crate::config::CursorStyle::Block,
+                cursor_on: false,
+                bordered: false,
+                claude: false,
+                search_match: None,
+                marks: &[],
+                hover_link: Some((0, span.0, span.1)),
+            };
+            let th = (r.cell_h / 14.0).max(1.0) as i32;
+            let accent = c4(r.palette[4], 255);
+            let mut out = Vec::new();
+            r.draw_pane(&mut out, &view, &t);
+            let xs: Vec<(i32, i32)> = out
+                .chunks(6)
+                .filter(|q| {
+                    q[0].layer == 0.0
+                        && q[0].uv == [WHITE_UV, WHITE_UV]
+                        && q[0].color == accent
+                        && (q[5].pos[1] - q[0].pos[1]).round() as i32 == th
+                })
+                .map(|q| (q[0].pos[0] as i32, q[1].pos[0] as i32))
+                .collect();
+            assert!(!xs.is_empty(), "no hover underline drawn for columns {span:?}");
+            (
+                xs.iter().map(|x| x.0).min().unwrap(),
+                xs.iter().map(|x| x.1).max().unwrap(),
+            )
+        };
+        let arabic = "\u{645}\u{631}\u{62d}\u{628}\u{627}"; // five cells, pure RTL
+        let head = hover_x(&mut r, arabic, (0, 2));
+        let tail = hover_x(&mut r, arabic, (3, 5));
+        assert!(
+            head.0 > tail.0,
+            "logical columns 0..2 must underline RIGHT of 3..5 on an RTL row: {head:?} vs {tail:?}"
+        );
+        // and the grid path is untouched: ASCII still reads left to right
+        let head = hover_x(&mut r, "abcde", (0, 2));
+        let tail = hover_x(&mut r, "abcde", (3, 5));
+        assert!(
+            head.0 < tail.0,
+            "ASCII must stay left to right: {head:?} vs {tail:?}"
+        );
     }
 
     /// A tab with OSC 9;4 progress draws its bar (track + fill) and the

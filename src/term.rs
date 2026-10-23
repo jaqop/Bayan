@@ -401,6 +401,13 @@ fn handle_osc133<T: EventListener>(
     match kind {
         b'A' => {
             meta.running_cmd.clear();
+            // Back at a prompt, so nothing is running and any OSC 9;4 bar
+            // still showing is stale — a program killed with Ctrl+C never
+            // gets to send its own 9;4;0. An explicit report in this same
+            // chunk wins, so a prompt followed by fresh progress is kept.
+            if ev.progress.is_none() {
+                ev.progress = Some(None);
+            }
             // a new prompt starts on the cursor's row: record its block
             // GLOBALLY (evicted + history + row — never drifts)
             let abs = meta.evicted
@@ -413,6 +420,10 @@ fn handle_osc133<T: EventListener>(
         }
         b'D' => {
             meta.running_cmd.clear();
+            // the command is over: its progress bar goes with it
+            if ev.progress.is_none() {
+                ev.progress = Some(None);
+            }
             if let Some(m) = meta.marks.last_mut() {
                 m.exit = exit;
             }
@@ -1166,6 +1177,29 @@ mod tests {
         let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]9;9;C:\\x\x07");
         assert_eq!(ev.progress, None);
         assert_eq!(ev.notify, None);
+    }
+
+    /// A program killed mid-report never sends its own 9;4;0, so the bar
+    /// would sit on the tab for the rest of the session. Coming back to a
+    /// prompt means nothing is running, which is the same information.
+    #[test]
+    fn a_returning_prompt_clears_a_stale_progress_bar() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]9;4;1;40\x07");
+        assert_eq!(ev.progress.unwrap().unwrap().percent, 40);
+        // Ctrl+C: the shell prints a fresh prompt, the program said nothing
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;A\x07PS> ");
+        assert_eq!(ev.progress, Some(None), "a returning prompt must clear it");
+        // a finished command does the same
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;D;0\x07");
+        assert_eq!(ev.progress, Some(None));
+        // but a report in the SAME chunk is live, not stale: it wins
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry,
+                               b"\x1b]133;A\x07\x1b]9;4;1;70\x07");
+        assert_eq!(ev.progress.unwrap().unwrap().percent, 70);
+        // and an ordinary chunk still reports nothing either way
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"just output\r\n");
+        assert_eq!(ev.progress, None);
     }
 
     #[test]

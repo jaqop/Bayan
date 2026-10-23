@@ -161,10 +161,11 @@ fn run_with_timeout(
     // drain stdout on its own thread so a chatty child never blocks on a
     // full pipe while we wait on it
     let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout.read_to_end(&mut buf);
-        buf
+        let _ = tx.send(buf);
     });
     let t0 = std::time::Instant::now();
     let status = loop {
@@ -178,7 +179,16 @@ fn run_with_timeout(
             }
         }
     };
-    let stdout = reader.join().ok()?;
+    // The child is gone, but read_to_end returns only when EVERY write end
+    // of the pipe closes — and oh-my-posh shells out, so a grandchild can
+    // still be holding the one it inherited. Joining that thread outright
+    // would hang the UI thread for as long as the grandchild lives, which
+    // is the exact freeze the deadline above exists to prevent. Bound this
+    // wait too; a preview we cannot collect in time is a preview we skip.
+    let left = limit
+        .saturating_sub(t0.elapsed())
+        .max(std::time::Duration::from_millis(250));
+    let stdout = rx.recv_timeout(left).ok()?;
     Some(std::process::Output { status, stdout, stderr: Vec::new() })
 }
 
@@ -253,6 +263,24 @@ mod tests {
         let out = run_with_timeout(quick, std::time::Duration::from_secs(5)).expect("output");
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+    }
+
+    /// The deadline must cover the DRAIN too. oh-my-posh shells out, so a
+    /// grandchild can outlive it still holding the inherited stdout pipe —
+    /// and read_to_end waits for every writer. Joining that unconditionally
+    /// hung the UI thread for as long as the grandchild lived.
+    #[test]
+    fn a_grandchild_holding_the_pipe_cannot_outlast_the_deadline() {
+        // cmd exits at once; the detached ping inherits stdout and holds it
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/c", "start /b ping -n 20 127.0.0.1"]);
+        let t0 = std::time::Instant::now();
+        let _ = run_with_timeout(cmd, std::time::Duration::from_millis(300));
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "drain outlived the deadline: {:?}",
+            t0.elapsed()
+        );
     }
 
     #[test]
