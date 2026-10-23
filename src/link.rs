@@ -935,8 +935,12 @@ fn is_url_char(c: char) -> bool {
 }
 
 fn url_scheme_len(rest: &str) -> Option<usize> {
-    for scheme in ["https://", "http://"] {
-        if rest.len() >= scheme.len() && rest[..scheme.len()].eq_ignore_ascii_case(scheme) {
+    // Byte compare. Slicing the `&str` at `scheme.len()` panics when the
+    // next bytes are inside an Arabic letter (those are two bytes, and
+    // "http://" is 7).
+    let bytes = rest.as_bytes();
+    for scheme in [b"https://".as_slice(), b"http://".as_slice()] {
+        if bytes.len() >= scheme.len() && bytes[..scheme.len()].eq_ignore_ascii_case(scheme) {
             return Some(scheme.len());
         }
     }
@@ -1702,12 +1706,18 @@ mod tests {
         let found = find_code_exe_in(std::iter::once(&bin), &[".EXE".into(), ".CMD".into()]);
         let found = found.expect("sibling Code.exe");
         assert_eq!(found.file_name().and_then(|s| s.to_str()), Some("Code.exe"));
-        // A cmd shim with no real exe is not an editor we can spawn.
-        let only = root.join("only");
-        std::fs::create_dir_all(&only).unwrap();
-        std::fs::write(only.join("code.cmd"), b"@echo off\r\n").unwrap();
-        assert!(find_code_exe_in(std::iter::once(&only), &[".CMD".into()]).is_none());
         let _ = std::fs::remove_dir_all(&root);
+        // A cmd shim with no real exe is not an editor we can spawn.
+        // Its parent must not be the directory that holds Code.exe above:
+        // `..\Code.exe` is how the shim case resolves, and Windows will
+        // see that file.
+        let alone_root = std::env::temp_dir().join(format!("bayan-link-nocode-{n}"));
+        let alone = alone_root.join("bin");
+        let _ = std::fs::remove_dir_all(&alone_root);
+        std::fs::create_dir_all(&alone).unwrap();
+        std::fs::write(alone.join("code.cmd"), b"@echo off\r\n").unwrap();
+        assert!(find_code_exe_in(std::iter::once(&alone), &[".CMD".into()]).is_none());
+        let _ = std::fs::remove_dir_all(&alone_root);
     }
 
     #[test]
