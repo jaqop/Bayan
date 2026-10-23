@@ -226,6 +226,28 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       (Shell_NotifyIcon, the biggest windows-sys consumer) compiles and the app
       runs, but a balloon was not caught on camera — quiet hours file it to the
       Action Center — so that one is built-and-running, not eyeball-verified
+- [x] **Security (High)** — the four High findings from the audit
+      (`docs/SECURITY_AUDIT.md`). OSC 52 no longer writes the OS clipboard
+      unless `osc52` is `"copy"`, the window is focused, and the write comes
+      from the focused pane of the active tab; the sequence must end in BEL
+      or ST, a `?` query is never answered, and the decode backstop is 64 KiB.
+      One scan can only see about 48 KiB (a single 64 KiB read) or about
+      51 KiB (that read plus the 4 KiB carry). The paste guard treats CR
+      (Enter on ConPTY), the other line breaks, other control characters,
+      and strong bidi / zero-width spoofs as confirm-first (LRM, RLM, and
+      ALM in a paste do not), shows the reason and a
+      preview on the card, and strips ESC and the other C0/C1 bytes before
+      the text is sent. `accept_local_cwd` is the shared gate for a working
+      directory — drive-letter paths only, so a UNC or `\\?\` path from
+      OSC 9;9 or `session.json` is dropped before `is_dir` can open SMB. A
+      dropped file is quoted for the shell that pane was spawned with
+      (PowerShell single quotes, including the smart quotes, cmd double
+      quotes, POSIX single quotes for Git Bash and WSL, fish with `\`
+      doubled before the apostrophe, a nushell raw string), and a
+      drop into vim, less, a shell that is not at its prompt, or a name
+      with a bidi mark or override asks first.
+      Proven by the unit tests named in the audit; not exercised here as a
+      live window
 - [x] **M30** — mouse reporting. Clicks, drags and motion reach the program
       when it asks: xterm 1000 (press/release), 1002 (drag), 1003 (any
       motion), encoded as SGR 1006 or the legacy X10 byte form when 1006
@@ -245,6 +267,7 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       history even on the alt screen. A focus loss, a tab switch, opening
       a new tab, or a pane close releases a tracked button (or drops the
       grab if tracking is already off) so Alt+Tab cannot keep dragging.
+      The paste confirm card and the close card block the pointer too.
       Mode 1004 sends CSI I / CSI O when the window or the focused pane
       changes. A `Focused` event passes its own bit, because
       `Window::has_focus` can still read true for a moment after blur
@@ -253,10 +276,8 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       mode on, and a RIS forgets the last CSI I so the next one is sent
       again. The wheel still scrolls the pane under the pointer and is
       not reported at all over the tab bar or the padding; Ctrl+wheel is
-      still font zoom. Proven: 102 unit tests (81
-      before), including the encoder, the padding/split hit-test, the
-      grab/focus/wheel router, and a
-      shaped-Amiri hit on مرحبا and ١٧٥. Not proven here: a live htop /
+      still font zoom. Proven on this branch before the security merge:
+      102 unit tests. Not proven here: a live htop /
       vim `mouse=a` / lazygit / Claude Code session — this tree doesn't
       run a window on the machine that built it. Windows CI is the build
       that does.
@@ -274,13 +295,17 @@ key falls back to a sane default:
   "cursor_style": "bar", "cursor_blink": true, "scrollback": 20000,
   "copy_on_select": true, "ligatures": true, "bell": "attention",
   "shell": "pwsh.exe", "padding": 8, "opacity": 0.9,
-  "hide_single_tab": true, "confirm_close": true,
+  "hide_single_tab": true, "confirm_close": true, "osc52": "off",
   "keybinds": { "new-tab": "ctrl+shift+n" }
 }
 ```
 
 Shell and scrollback apply to new tabs (no terminal restarts a live
-session); everything else applies immediately.
+session); everything else applies immediately. `osc52` is config-file
+only (there is no settings-panel row). Leave it out or set `"off"`.
+`"copy"` lets a focused window accept OSC 52 clipboard writes from the
+focused pane; no value enables a clipboard read. The decode backstop is
+64 KiB, and one scan sees about 48–51 KiB.
 
 ## Build
 
