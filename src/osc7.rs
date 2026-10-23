@@ -57,7 +57,15 @@ pub fn parse_osc7<S: AsRef<str>>(payload: &str, local_names: &[S]) -> Option<Str
     // whitespace, and every control or bidi character, rejects the report
     // before we look at the scheme.
     let payload = payload.trim_matches(' ');
-    if payload.is_empty() || payload.chars().any(forbidden_char) || payload.contains(['\t', '\\']) {
+    // A raw space belongs in the path as `%20`. Anything else that is
+    // whitespace, a control, a bidi override, or a backslash is rejected
+    // before the scheme is even read.
+    if payload.is_empty()
+        || payload
+            .chars()
+            .any(|c| forbidden_char(c) || c.is_whitespace())
+        || payload.contains('\\')
+    {
         return None;
     }
     let rest = payload
