@@ -48,10 +48,10 @@ dependencies = [
 
 [[package]]
 name = "alacritty_terminal"
-version = "0.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bda177466b9524d59f1b12f0dd30b68696788e9992a7e959021c4a0ed96fcf59"
+version = "0.26.1-dev"
+source = "git+https://github.com/alacritty/alacritty?rev=542147067dd016fc5f49120ef0ba605a98a4e3a7#542147067dd016fc5f49120ef0ba605a98a4e3a7"
 dependencies = [
+ "arrayvec",
  "base64 0.22.1",
  "bitflags 2.13.1",
  "home",
@@ -148,6 +148,9 @@ name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "as-raw-xcb-connection"

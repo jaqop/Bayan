@@ -11,7 +11,9 @@ license = "MIT"
 
 [dependencies]
 # VT emulation: Alacritty's battle-tested core, published as a library
-alacritty_terminal = "0.26"
+# 0.26.1-dev is the pre-release at the pinned commit below. A plain "0.26"
+# requirement will not select a pre-release, so the patch would be ignored.
+alacritty_terminal = "0.26.1-dev"
 # ConPTY (Windows) / openpty (unix), extracted from WezTerm
 portable-pty = "0.9"
 # windowing + GPU present + text shaping (HarfBuzz-class, BiDi, fallback)
@@ -36,6 +38,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_UI_Shell", # Shell_NotifyIcon balloons = native toasts, no WinRT
     "Win32_Storage_FileSystem", # GetShortPathNameW: ConPTY chokes on spaces in paths
+    "Win32_System_Com", # CoInitializeEx on the link-open thread, before ShellExecuteW
 ] }
 
 [target."cfg(windows)".build-dependencies]
@@ -44,3 +47,11 @@ winresource = "0.1"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# alacritty_terminal 0.26.0's push_keyboard_mode evicts from title_stack and
+# panics at depth 4096. This commit fixes that removal to use the keyboard
+# stack (alacritty#9071).
+# TODO: remove [patch.crates-io] and go back to the crates.io release once
+# alacritty_terminal 0.26.1 is published.
+[patch.crates-io]
+alacritty_terminal = { git = "https://github.com/alacritty/alacritty", rev = "542147067dd016fc5f49120ef0ba605a98a4e3a7" }

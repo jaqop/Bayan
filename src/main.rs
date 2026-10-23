@@ -16,6 +16,8 @@ mod config;
 mod gpu;
 mod keybinds;
 mod keys;
+mod kitty;
+mod link;
 mod mouse;
 mod toast;
 mod render;
@@ -255,6 +257,29 @@ pub enum UserEvent {
     CommandFinished(u64, bool),
     /// Pane `id`'s shell exited.
     Exit(u64),
+    /// A link open failed, or `settle` refused it, off the UI thread.
+    /// `reason` is already [`link::RefuseReason::label`].
+    LinkFailed { reason: String, shown: String },
+}
+
+/// The link under the pointer. Stable while the pointer stays inside it,
+/// so a hover does not rebuild the frame on every pixel.
+#[derive(PartialEq, Eq)]
+struct LinkHover {
+    pane_id: u64,
+    row: usize,
+    start_col: usize,
+    end_col: usize,
+    target: String,
+}
+
+/// A Ctrl+click that was refused, or a userinfo URL waiting for Enter.
+/// Esc dismisses either. Enter opens only when `confirm_uri` is set;
+/// a refusal leaves it empty so Enter cannot launch the target.
+struct BlockedLink {
+    reason: String,
+    shown: String,
+    confirm_uri: Option<String>,
 }
 
 /// Text held for the confirm card: the bytes to send, and why the card is up.
@@ -484,6 +509,12 @@ struct App {
     pending_paste: Option<PendingPaste>,
     /// a close awaiting Enter/Esc (a command is still running)
     pending_close: Option<CloseTarget>,
+    /// link under the pointer: underline + the target in the pane status
+    link_hover: Option<LinkHover>,
+    /// a refused link, or a userinfo URL waiting for Enter.
+    blocked_link: Option<BlockedLink>,
+    /// Link spans per pane row. Invalidated on PTY damage, scroll, relayout.
+    link_cache: link::SpanCache,
     /// last keystroke sent to a PTY — the cursor blinks for 15s after it,
     /// then parks solid so an idle window stops re-rendering (M14's win)
     last_input: Instant,
@@ -512,6 +543,12 @@ struct App {
     font_delta: f32,
     renderer_building: bool,
     inflight_delta: f32,
+    /// Physical keys whose press never reached the PTY. The matching release
+    /// must not either: a TUI that asked for key-up events would otherwise
+    /// see a release whose press it never got. Copy clears the selection
+    /// before the key comes up, and a chord can open a panel, so this is
+    /// recorded at press time rather than re-derived when the key is released.
+    keys_held_away: Vec<winit::keyboard::PhysicalKey>,
 }
 
 impl App {
@@ -920,6 +957,11 @@ impl App {
                 }
                 self.request_redraw();
             }
+            ResetKeyboard => {
+                if let Some(s) = self.session_mut() {
+                    s.reset_keyboard();
+                }
+            }
         }
     }
 
@@ -1267,6 +1309,7 @@ impl App {
                 t.scroll_display(Scroll::Delta(new_off as i32 - off as i32));
             }
         }
+        self.invalidate_focused_links();
         self.request_redraw();
     }
 
@@ -1304,9 +1347,15 @@ impl App {
     fn spawn_pane(&mut self, cwd: Option<&str>) -> Option<Pane> {
         let id = self.next_id;
         self.next_id += 1;
-        match Session::spawn(self.size, self.proxy.clone(), id, cwd,
-                             self.config.scrollback_lines(),
-                             &self.config.shell_program()) {
+        match Session::spawn(
+            self.size,
+            self.proxy.clone(),
+            id,
+            cwd,
+            self.config.scrollback_lines(),
+            &self.config.shell_program(),
+            self.config.kitty_protocol_on(),
+        ) {
             Ok(session) => Some(Pane { id, session, last_output: None }),
             Err(e) => {
                 eprintln!("bayan: spawn failed: {e}");
@@ -1418,6 +1467,8 @@ impl App {
     /// Resize every pane of the ACTIVE tab to its rect (background tabs
     /// re-layout when they become active — the standard terminal tradeoff).
     fn relayout_active(&mut self) {
+        // Pane rows moved. Cached link spans would underline the wrong cells.
+        self.link_cache.clear();
         // resolve "hide the bar with one tab" BEFORE measuring the content
         let hide = self.config.hide_single_tab_on() && self.tabs.len() <= 1;
         if let Some(r) = self.renderer.as_mut() {
@@ -1600,6 +1651,51 @@ impl App {
             .map_or(TermMode::empty(), |s| *s.term.lock().unwrap().mode())
     }
 
+    fn note_held_away(&mut self, event: &KeyEvent) {
+        let key = event.physical_key;
+        if !self.keys_held_away.contains(&key) {
+            self.keys_held_away.push(key);
+        }
+    }
+
+    /// `true` when this key's press never reached the PTY.
+    fn take_held_away(&mut self, event: &KeyEvent) -> bool {
+        let key = event.physical_key;
+        if let Some(i) = self.keys_held_away.iter().position(|k| *k == key) {
+            self.keys_held_away.swap_remove(i);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn encode_key_event(&self, event: &KeyEvent, released: bool) -> Option<Vec<u8>> {
+        use winit::keyboard::PhysicalKey;
+        use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+        let m = self.modifiers;
+        let unmod = event.key_without_modifiers();
+        let physical = match event.physical_key {
+            PhysicalKey::Code(code) => Some(code),
+            _ => None,
+        };
+        keys::encode_input(&keys::EncodeInput {
+            key: &event.logical_key,
+            unmod: &unmod,
+            physical,
+            location: event.location,
+            text: event.text.as_deref(),
+            shift: m.shift_key(),
+            alt: m.alt_key(),
+            ctrl: m.control_key(),
+            super_key: m.super_key(),
+            repeat: event.repeat,
+            released,
+            mode: keys::mode_for_keys(self.term_mode(), self.config.kitty_protocol_on()),
+            physical_letter: key_letter(event),
+            base_layout_fallback: self.config.kitty_base_layout_fallback_on(),
+        })
+    }
+
     /// Claude mode: auto = a full-screen TUI is active AND the command that
     /// started it is Claude itself (vim/less emit logical Arabic — never
     /// reverse those). F2 overrides manually.
@@ -1729,6 +1825,7 @@ impl App {
         let mods = self.mods_now();
         let outs = self.mouse.abandon(proto, mods);
         self.emit_mouse(outs);
+        self.clear_link_hover();
     }
 
     fn focus_pane_at(&mut self, pi: usize) {
@@ -1862,8 +1959,196 @@ impl App {
             || self.palette.is_some()
             || self.posh.is_some()
             || self.pending_close.is_some()
-            // PendingPaste is the confirm card (drawn as PasteCard).
+            // PendingPaste is the confirm card. The refused-link card is the
+            // same kind of overlay: a Ctrl+click under either must not open.
             || self.pending_paste.is_some()
+            || self.blocked_link.is_some()
+    }
+
+    fn clear_link_hover(&mut self) {
+        if self.link_hover.take().is_some() {
+            self.request_redraw();
+        }
+    }
+
+    /// Working directory for a relative file link. OSC 9;9 fills it today;
+    /// OSC 7 (PR5) writes the same field and this is the only reader.
+    fn pane_link_cwd(&self, id: u64) -> Option<String> {
+        let (ti, pi) = self.find_pane(id)?;
+        let raw = self.tabs[ti].panes[pi].session.meta.lock().unwrap().cwd.clone();
+        link::cwd_hook(raw.as_deref())
+    }
+
+    fn links_on(&mut self, id: u64, row: usize) -> Vec<link::LinkSpan> {
+        if let Some(spans) = self.link_cache.get(id, row) {
+            return spans;
+        }
+        let Some((ti, pi)) = self.find_pane(id) else {
+            return Vec::new();
+        };
+        let spans = {
+            let term = self.tabs[ti].panes[pi].session.term.lock().unwrap();
+            link::links_on_row(&term, row)
+        };
+        self.link_cache.insert(id, row, spans.clone());
+        spans
+    }
+
+    fn invalidate_focused_links(&mut self) {
+        if let Some(id) = self.focused_pane_id() {
+            self.link_cache.invalidate_pane(id);
+        }
+    }
+
+    fn focused_pane_id(&self) -> Option<u64> {
+        let t = self.tabs.get(self.active)?;
+        Some(t.panes.get(t.focused)?.id)
+    }
+
+    /// Recompute the hover from `pos`. Returns the logical cell so mouse
+    /// motion can be reported without a second hit-test. `None` when the
+    /// pointer is not over a pane.
+    fn refresh_link_hover(
+        &mut self,
+        pos: PhysicalPosition<f64>,
+    ) -> Option<(u64, usize, usize)> {
+        if self.overlay_blocks_mouse() {
+            self.clear_link_hover();
+            return None;
+        }
+        let Some((pane, id, row, col)) = self.locate(pos) else {
+            self.clear_link_hover();
+            return None;
+        };
+        let _ = pane;
+        let spans = self.links_on(id, row);
+        if let Some(span) = spans.into_iter().find(|s| s.contains(col)) {
+            let cwd = self.pane_link_cwd(id);
+            let next = LinkHover {
+                pane_id: id,
+                row,
+                start_col: span.start_col,
+                end_col: span.end_col,
+                target: span.tooltip(cwd.as_deref()),
+            };
+            if self.link_hover.as_ref() != Some(&next) {
+                self.link_hover = Some(next);
+                self.request_redraw();
+            }
+        } else {
+            self.clear_link_hover();
+        }
+        Some((id, row, col))
+    }
+
+    /// Ctrl+click. True when the cell is a link, whether or not it opened:
+    /// the program does not also hear the click, and it does not start a
+    /// selection. A refused target raises the card instead.
+    fn activate_link_at(&mut self, pos: PhysicalPosition<f64>) -> bool {
+        if self.overlay_blocks_mouse() {
+            return false;
+        }
+        let Some((pane, id, row, col)) = self.locate(pos) else {
+            return false;
+        };
+        let spans = self.links_on(id, row);
+        let Some(span) = spans.into_iter().find(|s| s.contains(col)) else {
+            return false;
+        };
+        self.focus_pane_at(pane);
+        self.sync_focus(None);
+        let cwd = self.pane_link_cwd(id);
+        // `exists` and `find_code_exe` run on the link thread. A disconnected
+        // network drive must not stall this handler.
+        match span.activate(cwd.as_deref(), self.config.editor.as_deref(), None) {
+            action @ (link::Action::Browse(_)
+            | link::Action::OpenPath(_)
+            | link::Action::Reveal(_)
+            | link::Action::Edit { .. }
+            | link::Action::EditDefault { .. }) => self.spawn_link_open(action),
+            link::Action::Confirm { uri, host } => {
+                self.blocked_link = Some(BlockedLink {
+                    reason: link::HOST_CONFIRM.to_string(),
+                    shown: link::preview(&format!("{host} — {uri}"), 160),
+                    confirm_uri: Some(uri),
+                });
+                self.clear_link_hover();
+                self.request_redraw();
+            }
+            link::Action::Refuse { reason, shown } => self.refuse_link(reason, &shown),
+        }
+        true
+    }
+
+    /// Browser, association-open, editor, and explorer. A network path must
+    /// not stall the window, so the call happens on `bayan-link`.
+    fn spawn_link_open(&mut self, action: link::Action) {
+        if !link::runs_off_ui_thread(&action) {
+            return;
+        }
+        let shown = match &action {
+            link::Action::Browse(s) | link::Action::OpenPath(s) | link::Action::Reveal(s) => {
+                s.clone()
+            }
+            link::Action::Edit { argv, .. } => argv.join(" "),
+            link::Action::EditDefault { path, line, col } => match col {
+                Some(c) => format!("{path}:{line}:{c}"),
+                None => format!("{path}:{line}"),
+            },
+            link::Action::Confirm { .. } | link::Action::Refuse { .. } => return,
+        };
+        let proxy = self.proxy.clone();
+        let shown_for_fail = shown.clone();
+        let spawned = std::thread::Builder::new()
+            .name("bayan-link".into())
+            .spawn(move || {
+                link::init_link_thread();
+                let action = link::settle_live(action);
+                if let link::Action::Refuse { reason, shown } = &action {
+                    let _ = proxy.send_event(UserEvent::LinkFailed {
+                        reason: reason.label().to_string(),
+                        shown: shown.clone(),
+                    });
+                    return;
+                }
+                if !link::perform_open(&action) {
+                    let _ = proxy.send_event(UserEvent::LinkFailed {
+                        reason: link::RefuseReason::Editor.label().to_string(),
+                        shown: shown_for_fail,
+                    });
+                }
+            });
+        if spawned.is_err() {
+            self.refuse_link(link::RefuseReason::Editor, &shown);
+        }
+    }
+
+    fn refuse_link(&mut self, reason: link::RefuseReason, shown: &str) {
+        self.blocked_link = Some(BlockedLink {
+            reason: reason.label().to_string(),
+            shown: link::preview(shown, 160),
+            confirm_uri: None,
+        });
+        self.clear_link_hover();
+        self.request_redraw();
+    }
+
+    /// Who owns this left click. The cell is the one [`Self::locate`]
+    /// already mapped through `column_for_click`, which is the same cell
+    /// [`mouse::Route::press`] would report. An overlay short-circuits
+    /// before that: the link under a card is not opened.
+    fn left_click_owner(&mut self) -> link::ClickOwner {
+        let shift = self.modifiers.shift_key();
+        let ctrl = self.modifiers.control_key();
+        if self.overlay_blocks_mouse() {
+            return link::click_owner(true, false, shift, ctrl, false);
+        }
+        let Some((_, id, row, col)) = self.locate(self.cursor_pos) else {
+            return link::click_owner(false, false, shift, ctrl, false);
+        };
+        let tracking = mouse::Proto::from_mode(self.mode_of(id)).tracking();
+        let on_link = self.links_on(id, row).iter().any(|s| s.contains(col));
+        link::click_owner(false, tracking, shift, ctrl, on_link)
     }
 
     /// Press in a tracking mode, and not Shift (Shift keeps the gesture
@@ -1944,13 +2229,10 @@ impl App {
         }
     }
 
-    fn report_motion(&mut self, pos: PhysicalPosition<f64>) {
+    fn report_motion_at(&mut self, id: u64, row: usize, col: usize) {
         if self.overlay_blocks_mouse() || self.modifiers.shift_key() {
             return;
         }
-        let Some((_, id, row, col)) = self.locate(pos) else {
-            return;
-        };
         let proto = mouse::Proto::from_mode(self.mode_of(id));
         let cell = mouse::Cell { pane: id, row, col };
         if let Some(out) = self.mouse.motion(cell, proto, self.mods_now()) {
@@ -2138,6 +2420,7 @@ impl App {
         if let Some(s) = self.session() {
             s.term.lock().unwrap().scroll_display(Scroll::Delta(n));
         }
+        self.invalidate_focused_links();
         self.request_redraw();
     }
 
@@ -2164,6 +2447,7 @@ impl App {
             }
             m
         };
+        self.invalidate_focused_links();
         if let (Some(st), Some(m)) = (self.search.as_mut(), found) {
             st.hl = Some(m);
         }
@@ -2201,6 +2485,16 @@ impl App {
     }
 
     fn redraw(&mut self) {
+        // A scroll under a still pointer moves the link. Refresh only while
+        // a hover is showing, and never during a drag: that path must not
+        // redraw on every pixel.
+        if self.link_hover.is_some()
+            && !self.mouse.selecting
+            && self.mouse.grabbed_pane().is_none()
+        {
+            let pos = self.cursor_pos;
+            let _ = self.refresh_link_hover(pos);
+        }
         // the bar's visibility is a per-frame fact (tab count × setting)
         let hide = self.config.hide_single_tab_on() && self.tabs.len() <= 1;
         if let Some(r) = self.renderer.as_mut() {
@@ -2330,6 +2624,13 @@ impl App {
                     } else {
                         Vec::new()
                     };
+                    let (link_hover, link_tip) = match &self.link_hover {
+                        Some(h) if h.pane_id == pane.id => (
+                            Some((h.row, h.start_col, h.end_col)),
+                            Some(h.target.as_str()),
+                        ),
+                        _ => (None, None),
+                    };
                     let view = render::PaneView {
                         rect: *rect,
                         focused,
@@ -2345,6 +2646,8 @@ impl App {
                             None
                         },
                         marks: &marks,
+                        link_hover,
+                        link_tip,
                     };
                     renderer.draw_pane(&mut verts, &view, &t);
                 }
@@ -2402,6 +2705,16 @@ impl App {
                             reason: &p.reason,
                             preview: &preview,
                         },
+                    );
+                }
+                if let Some(block) = &self.blocked_link {
+                    renderer.draw_link_block(
+                        &mut verts,
+                        px.width as usize,
+                        px.height as usize,
+                        &block.reason,
+                        &block.shown,
+                        block.confirm_uri.is_some(),
                     );
                 }
                 if let Some((rows, sel, capturing, flash)) = &shortcuts_view {
@@ -2634,6 +2947,12 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Wakeup(id) => {
+                self.link_cache.invalidate_pane(id);
+                // The row that was hovered may have moved. Drop the tooltip
+                // and the click target together, or they can disagree.
+                if self.link_hover.as_ref().is_some_and(|h| h.pane_id == id) {
+                    self.clear_link_hover();
+                }
                 if !self.first_output {
                     self.first_output = true;
                     crate::prof::mark("first pty output");
@@ -2748,6 +3067,15 @@ impl ApplicationHandler<UserEvent> for App {
                     self.remove_pane(ti, pi, el);
                 }
             }
+            UserEvent::LinkFailed { reason, shown } => {
+                self.blocked_link = Some(BlockedLink {
+                    reason,
+                    shown: link::preview(&shown, 160),
+                    confirm_uri: None,
+                });
+                self.clear_link_hover();
+                self.request_redraw();
+            }
         }
     }
 
@@ -2817,6 +3145,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(f) => {
                 self.focused = f;
+                // A blur drops keys we were holding back. The matching
+                // release may never arrive (the user alt-tabbed mid-chord),
+                // and a later focus must not swallow an unrelated press.
+                blur_forgets_held_keys(f, &mut self.keys_held_away);
                 if f {
                     // you're here now: the active tab's attention is served
                     if let Some(t) = self.tabs.get_mut(self.active) {
@@ -2890,6 +3222,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // the drag stays in the pane where it started. Shift+drag
                     // takes this path even while the program is tracking the
                     // mouse — the bypass is the whole point of Shift.
+                    self.clear_link_hover();
                     if let Some((pi, row, col, side)) = self.pane_cell_at(position) {
                         if pi == self.sel_pane {
                             if let Some(s) = self.session() {
@@ -2907,41 +3240,50 @@ impl ApplicationHandler<UserEvent> for App {
                     // 1002/1003: the program owns the drag. No local selection,
                     // and no redraw — a still frame stays still.
                     self.report_drag(position);
-                } else if let Some(w) = &self.window {
-                    // hovering a divider shows the resize cursor
-                    use winit::window::CursorIcon;
-                    // M24: an undecorated window has to advertise its own
-                    // edges, or the user has no way to learn they can grab.
-                    let icon = if let Some(dir) = self.resize_edge_at(position) {
-                        CursorIcon::from(dir)
-                    } else if self.divider_at(position).is_some() {
-                        match self.tabs.get(self.active).map(|t| t.orientation) {
-                            Some(Orientation::Column) => CursorIcon::NsResize,
-                            _ => CursorIcon::EwResize,
-                        }
-                    } else {
-                        CursorIcon::Default
-                    };
-                    w.set_cursor(icon);
-                    // caption/gear hover feedback
-                    let cap = self.caption_button_at(position);
-                    let pw = w.inner_size().width as usize;
-                    let gear = self.renderer.as_ref()
-                        .is_some_and(|r| r.settings_button_hit(pw, position.x, position.y));
-                    if let Some(r) = self.renderer.as_mut() {
-                        if r.hover_caption != cap || r.hover_gear != gear {
-                            r.hover_caption = cap;
-                            r.hover_gear = gear;
-                            self.request_redraw();
+                    self.clear_link_hover();
+                } else {
+                    // One hit-test: the hover and the 1003 report share the
+                    // logical cell `locate` mapped through column_for_click.
+                    let cell = self.refresh_link_hover(position);
+                    if let Some(w) = &self.window {
+                        // hovering a divider shows the resize cursor
+                        use winit::window::CursorIcon;
+                        // M24: an undecorated window has to advertise its own
+                        // edges, or the user has no way to learn they can grab.
+                        let icon = if let Some(dir) = self.resize_edge_at(position) {
+                            CursorIcon::from(dir)
+                        } else if self.divider_at(position).is_some() {
+                            match self.tabs.get(self.active).map(|t| t.orientation) {
+                                Some(Orientation::Column) => CursorIcon::NsResize,
+                                _ => CursorIcon::EwResize,
+                            }
+                        } else if self.link_hover.is_some() {
+                            CursorIcon::Pointer
+                        } else {
+                            CursorIcon::Default
+                        };
+                        w.set_cursor(icon);
+                        // caption/gear hover feedback
+                        let cap = self.caption_button_at(position);
+                        let pw = w.inner_size().width as usize;
+                        let gear = self.renderer.as_ref()
+                            .is_some_and(|r| r.settings_button_hit(pw, position.x, position.y));
+                        if let Some(r) = self.renderer.as_mut() {
+                            if r.hover_caption != cap || r.hover_gear != gear {
+                                r.hover_caption = cap;
+                                r.hover_gear = gear;
+                                self.request_redraw();
+                            }
                         }
                     }
-                }
-                // 1003: motion with no button. Not inside the window borrow
-                // above — reporting needs the renderer and the pane.
-                if !self.mouse.selecting && self.mouse.grabbed_pane().is_none() {
-                    self.report_motion(position);
+                    // 1003: motion with no button. Shift and overlays already
+                    // dropped out inside the report.
+                    if let Some((id, row, col)) = cell {
+                        self.report_motion_at(id, row, col);
+                    }
                 }
             }
+            WindowEvent::CursorLeft { .. } => self.clear_link_hover(),
             WindowEvent::MouseInput { state, button, .. } => {
                 let mapped = match button {
                     MouseButton::Left => Some(mouse::Btn::Left),
@@ -3054,10 +3396,21 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             return;
                         }
-                        // mouse tracking owns the click unless Shift is held —
-                        // Shift+drag stays a local selection (the bypass).
-                        if self.try_report_press(mouse::Btn::Left) {
-                            return;
+                        // Link, program, or local selection. Shift wins over
+                        // Ctrl. An overlay (including the refused-link card)
+                        // is neither a link open nor a selection. The cell
+                        // is the one Route::press reports.
+                        match self.left_click_owner() {
+                            link::ClickOwner::Blocked => return,
+                            link::ClickOwner::Link => {
+                                let _ = self.activate_link_at(self.cursor_pos);
+                                return;
+                            }
+                            link::ClickOwner::Program => {
+                                let _ = self.try_report_press(mouse::Btn::Left);
+                                return;
+                            }
+                            link::ClickOwner::Local => {}
                         }
                         if let Some((pi, row, col, side)) = self.pane_cell_at(self.cursor_pos) {
                             // clicking a pane focuses it
@@ -3083,6 +3436,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 t.selection = Some(Selection::new(ty, point, side));
                             }
                             self.mouse.selecting = true;
+                            self.clear_link_hover();
                             if n >= 2 && self.config.copy_on_select_on() {
                                 // word/line selections are complete on click
                                 self.copy_selection(false);
@@ -3163,6 +3517,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 .unwrap()
                                 .scroll_display(Scroll::Delta(lines));
                         }
+                        self.link_cache.invalidate_pane(pane);
                         self.request_redraw();
                     }
                     None => {}
@@ -3171,6 +3526,10 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed =>
             {
+                // Assume the press is swallowed until bytes actually go out.
+                // Every early return above the write leaves the key here, so
+                // its release stays out of the PTY too.
+                self.note_held_away(&event);
                 let m = self.modifiers;
                 let (ctrl, shift, alt) = (m.control_key(), m.shift_key(), m.alt_key());
                 crate::prof::mark(&format!(
@@ -3205,6 +3564,33 @@ impl ApplicationHandler<UserEvent> for App {
                         _ => {}
                     }
                     self.request_redraw();
+                    return;
+                }
+                // a link card owns the keyboard. Esc dismisses. Enter
+                // dismisses a refusal and opens only a confirm card
+                // (userinfo, or a non-ASCII host). Nothing is typed into the PTY.
+                if self.blocked_link.is_some() {
+                    let enter = matches!(&event.logical_key, Key::Named(NamedKey::Enter));
+                    let escape = matches!(&event.logical_key, Key::Named(NamedKey::Escape));
+                    let may_open = self
+                        .blocked_link
+                        .as_ref()
+                        .is_some_and(|c| c.confirm_uri.is_some());
+                    match link::card_decision(enter, escape, may_open) {
+                        link::CardDecision::Open => {
+                            if let Some(card) = self.blocked_link.take() {
+                                if let Some(uri) = card.confirm_uri {
+                                    self.spawn_link_open(link::Action::Browse(uri));
+                                }
+                            }
+                            self.request_redraw();
+                        }
+                        link::CardDecision::Dismiss => {
+                            self.blocked_link = None;
+                            self.request_redraw();
+                        }
+                        link::CardDecision::Ignore => {}
+                    }
                     return;
                 }
                 // the prompt picker owns the keyboard while open
@@ -3345,20 +3731,18 @@ impl ApplicationHandler<UserEvent> for App {
                         _ => {}
                     }
                 }
-                let text = event.text.as_ref().map(|t| t.as_str());
-                // Ctrl+letter resolves by PHYSICAL key so the control byte is
-                // right on any layout (Arabic: Ctrl+C must interrupt even
-                // though the C key's logical char is "ؤ")
-                let bytes = if ctrl && !alt {
-                    key_letter(&event).map(|l| vec![l as u8 - b'a' + 1])
-                } else {
-                    None
-                }
-                .or_else(|| keys::encode(key, text, shift, alt, ctrl));
+                // Legacy Ctrl+letter still resolves by PHYSICAL key inside
+                // encode_input (Arabic: Ctrl+C interrupts even though the C
+                // key's logical char is "ؤ"). A child that pushed kitty
+                // flags gets CSI u instead, from the same call.
+                let bytes = self.encode_key_event(&event, false);
                 if let Some(bytes) = bytes {
                     // typing snaps to the bottom and clears any selection;
                     // it also restarts the blink window, cursor visible
                     self.last_input = Instant::now();
+                    // The press reached the encoder. Drop it from the
+                    // swallowed set before borrowing the session.
+                    self.take_held_away(&event);
                     if let Some(s) = self.session_mut() {
                         {
                             let mut t = s.term.lock().unwrap();
@@ -3367,11 +3751,37 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         s.write(&bytes);
                     }
+                    self.invalidate_focused_links();
+                }
+            }
+            // Key-up is invisible until the child asks for event types.
+            // Presses still own every shortcut above; a release only
+            // reports, and only when the press itself reached the PTY.
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Released =>
+            {
+                let held_away = self.take_held_away(&event);
+                if held_away || !self.term_mode().contains(TermMode::REPORT_EVENT_TYPES) {
+                    return;
+                }
+                if let Some(bytes) = self.encode_key_event(&event, true) {
+                    if let Some(s) = self.session_mut() {
+                        s.write(&bytes);
+                    }
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }
+    }
+}
+
+/// Focus loss forgets presses that never reached the PTY. The release
+/// often goes to whichever window is focused now, so the set would
+/// otherwise keep swallowing that physical key forever.
+fn blur_forgets_held_keys(focused: bool, held: &mut Vec<winit::keyboard::PhysicalKey>) {
+    if !focused {
+        held.clear();
     }
 }
 
@@ -3438,6 +3848,9 @@ fn main() {
         cockpit_sel: 0,
         pending_paste: None,
         pending_close: None,
+        link_hover: None,
+        blocked_link: None,
+        link_cache: link::SpanCache::default(),
         last_input: Instant::now(),
         blink_drawn_on: true,
         settings: None,
@@ -3455,6 +3868,7 @@ fn main() {
         font_delta: 0.0,
         renderer_building: false,
         inflight_delta: 0.0,
+        keys_held_away: Vec::new(),
     };
     event_loop.run_app(&mut app).expect("run event loop");
 }
@@ -3473,6 +3887,18 @@ fn osc52_pane_is_focused(tabs: &[(usize, &[u64])], active: usize, source: u64) -
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn blur_drops_keys_whose_press_was_swallowed() {
+        use winit::keyboard::{KeyCode, PhysicalKey};
+        let key = PhysicalKey::Code(KeyCode::KeyC);
+        let mut held = vec![key];
+        blur_forgets_held_keys(false, &mut held);
+        assert!(held.is_empty());
+        held.push(key);
+        blur_forgets_held_keys(true, &mut held);
+        assert_eq!(held, vec![key]);
+    }
 
     #[test]
     fn osc52_pane_is_focused() {
@@ -3659,12 +4085,20 @@ mod palette_tests {
 
     #[test]
     fn the_hint_line_counts_what_the_list_shows() {
-        // guards the palette's one real invariant: the filtered list the user
-        // sees and the list Enter indexes into are the same list. They are
-        // built once in palette_rows and passed to the renderer, which never
-        // filters — so a drift here would be a logic error, not a redraw bug.
-        let all = keybinds::Action::ALL.len();
-        assert_eq!(all, 12, "12 built-in actions expected");
+        // The hint prints the length of the list Enter indexes into. That
+        // list is Action::ALL (plugins add to it at runtime). A literal
+        // count goes stale the moment an action is added.
+        let n = keybinds::Action::ALL.len();
+        assert_eq!(
+            render::palette_hint(n),
+            format!("{n} نتيجة · Enter تشغيل · ↑↓ تنقّل · Esc إغلاق"),
+        );
+        let extra = n + 1;
+        assert_eq!(
+            render::palette_hint(extra),
+            format!("{extra} نتيجة · Enter تشغيل · ↑↓ تنقّل · Esc إغلاق"),
+        );
+        assert_eq!(render::palette_hint(0), "لا نتائج · Esc إغلاق");
     }
 }
 

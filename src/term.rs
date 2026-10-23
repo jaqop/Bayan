@@ -136,7 +136,9 @@ pub struct SessionMeta {
     pub prompt_col: Option<usize>,
     /// the command line currently executing ("" = idle) — feeds cmd_is_claude
     pub running_cmd: String,
-    /// working directory from OSC 7 (`file://`) or OSC 9;9
+    /// working directory from OSC 7 (`file://`) or OSC 9;9.
+    /// File links resolve through `link::cwd_hook` on this field. There is
+    /// no second source.
     pub cwd: Option<String>,
     /// BDSM (implicit/explicit) and SCP paragraph direction for this pane.
     /// An `Arc` so a frame can snapshot it without cloning the stamp list.
@@ -152,9 +154,23 @@ pub struct SessionMeta {
     pub evicted: u64,
     /// when the running command was submitted — feeds the finish notification
     pub cmd_started: Option<std::time::Instant>,
+    /// User opted in (`keyboard.kitty_protocol`). Off: the parser is built
+    /// with `kitty_keyboard: false`, so its stack is never touched, and a
+    /// query is answered `CSI ?0u` by us. ConPTY may swallow the ESC of a
+    /// CSI u sequence and turn Ctrl+C into literal text.
+    pub kitty_protocol: bool,
+    /// How many keyboard-mode levels we have actually pushed on this screen
+    /// for sequences we recognized. Kitty's own cap is [`KITTY_STACK_CAP`].
+    /// RIS (`ESC c`, the same bytes as [`SessionMeta::saw_ris`]) zeroes this
+    /// and [`kitty_alt_depth`].
+    pub kitty_depth: u16,
+    /// The other screen's depth. 1049h/l swaps the stacks, so this swaps too.
+    pub kitty_alt_depth: u16,
     /// The chunk contained RIS (ESC c). The UI clears this and forgets
     /// which pane it had told "you are focused", so a 1004 that comes
-    /// back in the same read still hears CSI I.
+    /// back in the same read still hears CSI I. The keyboard-depth reset
+    /// uses this same byte test, inside the feed, because the flag stays
+    /// set until the UI reads it.
     pub saw_ris: bool,
 }
 
@@ -185,6 +201,12 @@ impl SessionMeta {
     }
 }
 
+/// kitty itself refuses to grow the keyboard-mode stack past 16. Recognized
+/// pushes past this are dropped. Sequences the scanner does not recognize
+/// still reach the parser; the crate patch makes those evict from the
+/// keyboard stack instead of panicking.
+const KITTY_STACK_CAP: u16 = 16;
+
 /// Events one PTY chunk produced, delivered to the UI thread by the reader.
 #[derive(Default)]
 pub(crate) struct ChunkEvents {
@@ -192,6 +214,10 @@ pub(crate) struct ChunkEvents {
     pub cwd: Option<String>,
     /// a LONG command just ended (ok?) — worth a notification if unfocused
     pub finished: Option<bool>,
+    /// Replies alacritty did not emit. With the kitty protocol off the
+    /// parser's `kitty_keyboard` flag is false, so `CSI ? u` is answered
+    /// here with `CSI ?0u` and the reader writes it to the PTY.
+    pub pty_replies: Vec<String>,
 }
 
 /// Commands shorter than this end silently (EasyTer's threshold).
@@ -390,11 +416,13 @@ const MAX_CWD_CHARS: usize = 4096;
 ///
 /// Returns a normalized drive-letter path (`C:\…`), or `None`. UNC
 /// (`\\server\share`, `//server/share`), device and extended paths
-/// (`\\?\`, `\\.\`, including `\\?\UNC\…`), the NT prefix `\??\`, DOS device
-/// names, alternate data streams, and bidi controls are rejected here,
-/// **before** any `exists` / `is_dir` / `canonicalize` call — on Windows
-/// those open SMB and can leak NTLM. OSC 7 parses the URL and then calls
-/// this; do not grow a second checker.
+/// (`\\?\`, `\\.\`, including `\\?\UNC\…`), the NT prefix `\??\`, a comma
+/// or a quote, a `\\` or `//` anywhere, `..` that climbs past the drive,
+/// DOS device names, alternate data streams, and bidi controls are rejected
+/// here, **before** any `exists` / `is_dir` / `canonicalize` call — on
+/// Windows those open SMB and can leak NTLM. `.` and a `..` that stays on
+/// the drive are collapsed (`C:\a\..\b` becomes `C:\b`). OSC 7 parses the
+/// URL and then calls this; do not grow a second checker.
 pub fn accept_local_cwd(raw: &str) -> Option<String> {
     let s = raw.trim();
     if s.is_empty() || s.chars().count() > MAX_CWD_CHARS {
@@ -403,17 +431,12 @@ pub fn accept_local_cwd(raw: &str) -> Option<String> {
     if s.chars().any(|c| c.is_control() || crate::osc7::is_bidi_control(c)) {
         return None;
     }
+    // A comma or a quote breaks out of `explorer /select,"<path>"`.
+    if s.contains(',') || s.contains('"') {
+        return None;
+    }
     if unc_or_device(s) {
         return None;
-    }
-    let mut chars = s.chars();
-    let drive = chars.next()?;
-    if !drive.is_ascii_alphabetic() || chars.next() != Some(':') {
-        return None;
-    }
-    match chars.next() {
-        Some('\\' | '/') => {}
-        _ => return None,
     }
     let mut norm: String = s.chars().map(|c| if c == '/' { '\\' } else { c }).collect();
     // Keep the drive root (`C:\`). A trailing slash on anything longer is
@@ -423,19 +446,58 @@ pub fn accept_local_cwd(raw: &str) -> Option<String> {
             norm.pop();
         }
     }
-    if unc_or_device(&norm) {
+    if unc_or_device(&norm) || norm.contains("\\\\") {
         return None;
     }
-    // Alternate data streams (`C:\foo:bar`, `C:\foo::$DATA`) and DOS device
-    // names (`CON`, `NUL`, `PRN`, `AUX`, `COM1`–`COM9`, `LPT1`–`LPT9`, with
-    // or without an extension) are not directories.
+    let mut chars = norm.chars();
+    let drive = chars.next()?;
+    if !drive.is_ascii_alphabetic() || chars.next() != Some(':') {
+        return None;
+    }
+    if chars.next() != Some('\\') {
+        return None;
+    }
+    // The drive letter's colon is the only one allowed. A later colon is
+    // an alternate data stream (`a.txt:evil.exe`, `evil.exe::$DATA`).
     if norm.len() > 2 && norm[2..].contains(':') {
         return None;
     }
-    if norm.split('\\').skip(1).any(reserved_dos_name) {
+    let rest = if norm.len() <= 3 { "" } else { &norm[3..] };
+    let mut stack: Vec<&str> = Vec::new();
+    if !rest.is_empty() {
+        for comp in rest.split('\\') {
+            if comp.is_empty() {
+                return None;
+            }
+            // A device component is rejected even when a later `..` would
+            // have popped it (`C:\CON\..\Users`).
+            if reserved_dos_name(comp) {
+                return None;
+            }
+            if comp == "." {
+                continue;
+            }
+            if comp == ".." {
+                if stack.is_empty() {
+                    return None;
+                }
+                stack.pop();
+                continue;
+            }
+            stack.push(comp);
+        }
+    }
+    let mut out = String::new();
+    out.push(drive);
+    out.push(':');
+    out.push('\\');
+    if !stack.is_empty() {
+        out.push_str(&stack.join("\\"));
+    }
+    if out.chars().count() > MAX_CWD_CHARS || unc_or_device(&out) || out.contains("\\\\") {
         return None;
     }
-    Some(norm)
+    Some(out)
 }
 
 fn reserved_dos_name(component: &str) -> bool {
@@ -496,7 +558,9 @@ fn is_reparse_point(path: &str) -> bool {
 
 /// `\\…` (UNC, `\\?\`, `\\.\`) or `\??\…`. Slashes are normalized first so
 /// `//server/share` and `//?/UNC/…` take the same path as their backslash form.
-fn unc_or_device(s: &str) -> bool {
+/// File links call this on the path they are about to open — the same gate
+/// as [`accept_local_cwd`], not a second copy of the rules.
+pub(crate) fn unc_or_device(s: &str) -> bool {
     let norm: String = s.chars().map(|c| if c == '/' { '\\' } else { c }).collect();
     let lower = norm.to_ascii_lowercase();
     lower.starts_with("\\\\") || lower.starts_with("\\??\\")
@@ -689,6 +753,7 @@ fn feed_counted<T: EventListener>(
     t: &mut Term<T>,
     meta: &mut SessionMeta,
     bytes: &[u8],
+    replies: &mut Vec<String>,
 ) {
     if bytes.is_empty() {
         return;
@@ -702,8 +767,10 @@ fn feed_counted<T: EventListener>(
     }
     // vte 0.15 takes the whole slice (it batches internally) instead of one
     // byte per call. The counter brackets the entire feed, so this is a
-    // straight speedup, not a change in what gets measured.
-    parser.advance(t, bytes);
+    // straight speedup, not a change in what gets measured. Queries are
+    // split out so each one is answered from the mode the bytes before it
+    // just established.
+    advance_with_kitty_queries(parser, t, meta, bytes, replies);
     let off_after = t.grid().display_offset();
     let hist_after = t.grid().history_size();
     let base = if parked { 1 } else { off_before };
@@ -720,15 +787,6 @@ fn feed_counted<T: EventListener>(
 }
 
 fn merge_chunk(dst: &mut ChunkEvents, src: ChunkEvents) {
-    // TODO(rebase onto main after #4): kitty keyboard adds
-    // `ChunkEvents::pty_replies` (`Vec<String>`). Git will not flag this
-    // function as a conflict — #4 fills that vec inside `process_bytes`,
-    // and this loop is the only place two `Bytes` items become one result.
-    // When the field exists, add:
-    //     dst.pty_replies.extend(src.pty_replies);
-    // Otherwise a kitty `CSI ? u` query answered with `CSI ?0u` is dropped
-    // when the BiDi filter splits that read around other output. Add a test
-    // where the split falls between the `CSI ? u` query and that other output.
     if src.clipboard.is_some() {
         dst.clipboard = src.clipboard;
     }
@@ -737,6 +795,247 @@ fn merge_chunk(dst: &mut ChunkEvents, src: ChunkEvents) {
     }
     if src.finished.is_some() {
         dst.finished = src.finished;
+    }
+    // The BiDi filter splits one PTY read into several `Bytes` items. A
+    // kitty `CSI ? u` answered in an earlier item must not be dropped when
+    // a later item (the text after a stripped BDSM, for example) is merged
+    // on top of it.
+    dst.pty_replies.extend(src.pty_replies);
+}
+
+enum KittySeqKind {
+    Push,
+    Pop(u16),
+    Set,
+    Query,
+}
+
+struct KittySeq {
+    end: usize,
+    kind: KittySeqKind,
+}
+
+/// A complete `CSI <intermediate> <params> u` starting at `i`.
+fn kitty_seq_at(data: &[u8], i: usize) -> Option<KittySeq> {
+    if let Some(seq) = kitty_seq_strict(data, i) {
+        return Some(seq);
+    }
+    // vte executes C0 inside a CSI and still completes it. `ESC [ ? NUL u`
+    // is a query. The strict scanner misses the NUL, and with the protocol
+    // off the parser will not answer, so this has to.
+    let end = kitty_query_with_c0(data, i)?;
+    Some(KittySeq { end, kind: KittySeqKind::Query })
+}
+
+/// `0x00..=0x17`, `0x19`, `0x1C..=0x1F`. CAN, SUB and ESC abort the CSI.
+fn c0_inside_csi(b: u8) -> bool {
+    matches!(b, 0x00..=0x17 | 0x19 | 0x1C..=0x1F)
+}
+
+/// A `CSI ? u` query that may contain C0 bytes, the way vte still parses it.
+fn kitty_query_with_c0(data: &[u8], i: usize) -> Option<usize> {
+    if data.get(i) != Some(&0x1b) || data.get(i + 1) != Some(&b'[') {
+        return None;
+    }
+    let mut j = i + 2;
+    while j < data.len() && c0_inside_csi(data[j]) {
+        j += 1;
+    }
+    if data.get(j) != Some(&b'?') {
+        return None;
+    }
+    j += 1;
+    while j < data.len() && (matches!(data[j], b'0'..=b'9' | b';') || c0_inside_csi(data[j])) {
+        j += 1;
+    }
+    (data.get(j) == Some(&b'u')).then_some(j + 1)
+}
+
+fn kitty_seq_strict(data: &[u8], i: usize) -> Option<KittySeq> {
+    if data.get(i) != Some(&0x1b) || data.get(i + 1) != Some(&b'[') {
+        return None;
+    }
+    let inter = *data.get(i + 2)?;
+    if !matches!(inter, b'<' | b'>' | b'=' | b'?') {
+        return None;
+    }
+    let mut j = i + 3;
+    let param_at = j;
+    while j < data.len() && matches!(data[j], b'0'..=b'9' | b';') {
+        j += 1;
+    }
+    if data.get(j) != Some(&b'u') {
+        return None;
+    }
+    let params = &data[param_at..j];
+    let kind = match inter {
+        b'>' => KittySeqKind::Push,
+        b'<' => KittySeqKind::Pop(kitty_pop_count(params)),
+        b'=' => KittySeqKind::Set,
+        _ => KittySeqKind::Query,
+    };
+    Some(KittySeq { end: j + 1, kind })
+}
+
+/// vte treats a missing or zero parameter as the default, which for pop is 1.
+fn kitty_pop_count(params: &[u8]) -> u16 {
+    let end = params.iter().position(|&b| b == b';').unwrap_or(params.len());
+    if end == 0 {
+        return 1;
+    }
+    match std::str::from_utf8(&params[..end])
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+    {
+        Some(0) | None => 1,
+        Some(n) => n,
+    }
+}
+
+fn note_screen_swap<T: EventListener>(before_alt: bool, t: &Term<T>, meta: &mut SessionMeta) {
+    if before_alt != t.mode().contains(TermMode::ALT_SCREEN) {
+        std::mem::swap(&mut meta.kitty_depth, &mut meta.kitty_alt_depth);
+    }
+}
+
+fn feed_plain<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    meta: &mut SessionMeta,
+    bytes: &[u8],
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    let before_alt = t.mode().contains(TermMode::ALT_SCREEN);
+    parser.advance(t, bytes);
+    note_screen_swap(before_alt, t, meta);
+    // Same `ESC c` that [`process_chunk`] records in `saw_ris`. The parser
+    // has just cleared both keyboard stacks. The counter has to follow, or
+    // the next push is dropped because we still think we are at the cap.
+    // It cannot watch the flag: that stays set until the UI reads it, and a
+    // push in a later chunk must still count. `ESC c` is RIS even
+    // mid-sequence: ESC aborts the CSI.
+    if contains_ris(bytes) {
+        meta.saw_ris = true;
+        meta.kitty_depth = 0;
+        meta.kitty_alt_depth = 0;
+    }
+}
+
+fn contains_ris(bytes: &[u8]) -> bool {
+    bytes.windows(2).any(|w| w == b"\x1bc")
+}
+
+/// `CSI =` updates `TermMode` and leaves the push/pop stack stale, which is
+/// also what a later alt-screen swap restores. Pop the stale top and push
+/// the mode bits now, so both stacks agree with the encoder before the next
+/// `1049h`/`1049l`. A zero mode does not push onto an empty stack.
+fn repair_keyboard_stack<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    depth: &mut u16,
+) {
+    let flags = crate::keys::protocol_bits(*t.mode());
+    parser.advance(t, b"\x1b[<u");
+    *depth = depth.saturating_sub(1);
+    let revealed = crate::keys::protocol_bits(*t.mode());
+    if (flags != 0 || revealed != 0) && *depth < KITTY_STACK_CAP {
+        let repair = format!("\x1b[>{flags}u");
+        parser.advance(t, repair.as_bytes());
+        *depth = depth.saturating_add(1);
+    }
+}
+
+/// Drop keyboard-mode levels on the current screen only.
+///
+/// No-op when the protocol is off (the parser never recorded a stack) or
+/// the counted depth is 0. A `1049h`/`1049l` visit of the other screen
+/// clears the selection, clobbers DECSC, and wipes the alt grid on the way
+/// back in — a prompt or Ctrl+Shift+K must not do that. The other screen's
+/// stack stays where it is.
+///
+/// The pop count is the depth, not the flag bits. A stacked layer whose
+/// mode is 0 sets no kitty bits, and skipping it would leave the level
+/// under it in place. Flag bits from a sequence we did not count are not
+/// a stack.
+pub(crate) fn reset_keyboard_modes<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    meta: &mut SessionMeta,
+) {
+    if !meta.kitty_protocol || meta.kitty_depth == 0 {
+        return;
+    }
+    let pop = format!("\x1b[<{}u", meta.kitty_depth);
+    parser.advance(t, pop.as_bytes());
+    meta.kitty_depth = 0;
+}
+
+fn apply_kitty_seq<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    meta: &mut SessionMeta,
+    seq: &[u8],
+    kind: KittySeqKind,
+    replies: &mut Vec<String>,
+) {
+    if !meta.kitty_protocol {
+        // The parser was built with kitty_keyboard false, so it would not
+        // answer. The probe still gets the empty mode Rio reports.
+        if matches!(kind, KittySeqKind::Query) {
+            replies.push("\x1b[?0u".to_string());
+        }
+        return;
+    }
+    match kind {
+        KittySeqKind::Push => {
+            if meta.kitty_depth >= KITTY_STACK_CAP {
+                return;
+            }
+            parser.advance(t, seq);
+            meta.kitty_depth = meta.kitty_depth.saturating_add(1);
+        }
+        KittySeqKind::Pop(n) => {
+            parser.advance(t, seq);
+            meta.kitty_depth = meta.kitty_depth.saturating_sub(n);
+        }
+        KittySeqKind::Set => {
+            parser.advance(t, seq);
+            repair_keyboard_stack(parser, t, &mut meta.kitty_depth);
+        }
+        KittySeqKind::Query => {
+            repair_keyboard_stack(parser, t, &mut meta.kitty_depth);
+            parser.advance(t, seq);
+        }
+    }
+}
+
+/// Feed `bytes`, keeping the kitty stack in sync with what we actually let
+/// the parser see.
+fn advance_with_kitty_queries<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    meta: &mut SessionMeta,
+    bytes: &[u8],
+    replies: &mut Vec<String>,
+) {
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(seq) = kitty_seq_at(bytes, i) {
+            apply_kitty_seq(parser, t, meta, &bytes[i..seq.end], seq.kind, replies);
+            i = seq.end;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < bytes.len() {
+            if bytes[j] == 0x1b && kitty_seq_at(bytes, j).is_some() {
+                break;
+            }
+            j += 1;
+        }
+        feed_plain(parser, t, meta, &bytes[i..j]);
+        i = j;
     }
 }
 
@@ -761,7 +1060,7 @@ fn process_bytes<T: EventListener>(
     }
     // ESC c is RIS. It can share a read with the 1004 that follows it,
     // and the UI only sees the final mode — so the flag has to be here.
-    if buf.windows(2).any(|w| w == b"\x1bc") {
+    if contains_ris(&buf) {
         meta.saw_ris = true;
     }
     ev.clipboard = scan_osc52(&buf);
@@ -781,11 +1080,17 @@ fn process_bytes<T: EventListener>(
     }
     let mut pos = 0;
     for (s, e, kind, exit) in find_osc133(&buf) {
-        feed_counted(parser, t, meta, &buf[pos..s]);
+        feed_counted(parser, t, meta, &buf[pos..s], &mut ev.pty_replies);
         handle_osc133(t, meta, kind, exit, &mut ev);
+        // A new prompt means the previous program is gone. A crashed TUI
+        // never pops its keyboard flags; clear the current screen before
+        // the shell types. Off, or an empty stack, this is a no-op.
+        if kind == b'A' {
+            reset_keyboard_modes(parser, t, meta);
+        }
         pos = e;
     }
-    feed_counted(parser, t, meta, &buf[pos..]);
+    feed_counted(parser, t, meta, &buf[pos..], &mut ev.pty_replies);
     ev
 }
 
@@ -804,9 +1109,8 @@ fn process_bytes<T: EventListener>(
 /// 3. `Ris` resets bidi after the `ESC c` bytes, so alacritty's reset and
 ///    ours see the same event. `ESC ESC c` and `ESC <C0> c` are RIS too.
 ///
-/// `merge_chunk` is what joins those `Bytes` items. After #4 (kitty) is on
-/// main, that function must `extend` `pty_replies` — see the TODO there.
-/// Git will not report a conflict if the line is missing.
+/// `merge_chunk` joins those `Bytes` items and extends `pty_replies`, so a
+/// kitty `CSI ? u` answer is kept when the filter splits the read.
 pub(crate) fn process_chunk<T: EventListener>(
     parser: &mut Processor,
     t: &mut Term<T>,
@@ -1056,6 +1360,11 @@ pub struct Session {
     /// Command line this pane was spawned with. Drag-drop quoting follows it,
     /// not whatever the settings say now — the live shell is the one reading.
     shell: String,
+    /// The reader thread's VTE parser. Shell exit resets keyboard modes
+    /// through this one, so a sequence the child already started is the
+    /// machine that sees the pop. A fresh `Processor` would leave this one
+    /// mid-CSI and the next byte would not be text.
+    parser: Arc<Mutex<Processor>>,
 }
 
 impl Session {
@@ -1066,6 +1375,7 @@ impl Session {
         start_cwd: Option<&str>,
         scrollback: usize,
         shell: &str,
+        kitty_protocol: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let pty = native_pty_system();
         let pair = pty.openpty(PtySize {
@@ -1125,6 +1435,12 @@ impl Session {
 
         let config = Config {
             scrolling_history: scrollback,
+            // Off unless the user opted in. The flag gates every stack
+            // mutation inside alacritty, including forms our scanner does
+            // not recognize (`CSI > 1 NUL u`, a C0 before the intermediate,
+            // a `:` sub-parameter). Queries while off are answered by
+            // `process_chunk`, not by the parser.
+            kitty_keyboard: kitty_protocol,
             ..Config::default()
         };
         let term = Arc::new(Mutex::new(Term::new(
@@ -1133,11 +1449,15 @@ impl Session {
             EventProxy(proxy.clone(), id),
         )));
 
-        let meta = Arc::new(Mutex::new(SessionMeta::default()));
+        let meta = Arc::new(Mutex::new(SessionMeta {
+            kitty_protocol,
+            ..SessionMeta::default()
+        }));
+        let parser = Arc::new(Mutex::new(Processor::new()));
         let term2 = Arc::clone(&term);
         let meta2 = Arc::clone(&meta);
+        let parser2 = Arc::clone(&parser);
         std::thread::spawn(move || {
-            let mut parser: Processor = Processor::new();
             let mut carry: Vec<u8> = Vec::new();
             let mut buf = [0u8; PTY_READ];
             loop {
@@ -1145,9 +1465,12 @@ impl Session {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         let ev = {
+                            // term, then meta, then parser. reset_keyboard
+                            // on the UI thread takes the same order.
                             let mut t = term2.lock().unwrap();
                             let mut m = meta2.lock().unwrap();
-                            process_chunk(&mut parser, &mut t, &mut m, &mut carry, &buf[..n])
+                            let mut p = parser2.lock().unwrap();
+                            process_chunk(&mut p, &mut t, &mut m, &mut carry, &buf[..n])
                         };
                         if let Some(txt) = ev.clipboard {
                             let _ = proxy.send_event(UserEvent::ClipboardSet(id, txt));
@@ -1158,11 +1481,28 @@ impl Session {
                         if let Some(ok) = ev.finished {
                             let _ = proxy.send_event(UserEvent::CommandFinished(id, ok));
                         }
-                        if proxy.send_event(UserEvent::Wakeup(id)).is_err() {
-                            break; // the event loop is gone
+                        let mut loop_gone = false;
+                        for reply in ev.pty_replies {
+                            if proxy.send_event(UserEvent::PtyWrite(id, reply)).is_err() {
+                                loop_gone = true;
+                                break;
+                            }
+                        }
+                        if loop_gone || proxy.send_event(UserEvent::Wakeup(id)).is_err() {
+                            break; // the event loop is gone; still reset below
                         }
                     }
                 }
+            }
+            // The shell is gone. Drop leaked kitty flags before the pane
+            // closes, so a key event racing the exit cannot encode CSI u.
+            // This is the session parser, not a new one: a CSI the child
+            // already started has to be the machine that sees the pop.
+            {
+                let mut t = term2.lock().unwrap();
+                let mut m = meta2.lock().unwrap();
+                let mut p = parser2.lock().unwrap();
+                reset_keyboard_modes(&mut p, &mut t, &mut m);
             }
             let _ = proxy.send_event(UserEvent::Exit(id));
         });
@@ -1174,6 +1514,7 @@ impl Session {
             master: pair.master,
             child,
             shell: shell.to_string(),
+            parser,
         })
     }
 
@@ -1185,6 +1526,16 @@ impl Session {
     /// Terminate the shell (closing a tab must not leave orphans).
     pub fn kill(&mut self) {
         let _ = self.child.kill();
+    }
+
+    /// Clear the current screen's keyboard-mode stack (Ctrl+Shift+K, a
+    /// rebindable chord). Shell exit and `OSC 133;A` call
+    /// [`reset_keyboard_modes`] on the reader thread, with this same parser.
+    pub fn reset_keyboard(&mut self) {
+        let mut t = self.term.lock().unwrap();
+        let mut m = self.meta.lock().unwrap();
+        let mut parser = self.parser.lock().unwrap();
+        reset_keyboard_modes(&mut parser, &mut t, &mut m);
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
@@ -2400,6 +2751,31 @@ mod tests {
         assert_eq!(ev.cwd.as_deref(), Some(r"D:\after"));
     }
 
+    /// Comma, quote, a `\\` anywhere, an ADS colon, and `..` that escapes
+    /// the drive are not a cwd and not an `explorer /select` argument.
+    #[test]
+    fn local_cwd_rejects_select_injection_and_ads() {
+        for bad in [
+            r"C:\x,/root,\\evil\share",
+            r"C:\foo\\bar",
+            "C:/foo//bar",
+            "C:\\foo\"bar",
+            r"C:\..\..\evil",
+            r"C:\a.txt:evil.exe",
+            r"C:\evil.exe::$DATA",
+            r"C:\work\..\..\..\Windows",
+        ] {
+            assert_eq!(accept_local_cwd(bad), None, "accepted {bad:?}");
+        }
+        assert_eq!(accept_local_cwd(r"C:\a\..\b").as_deref(), Some(r"C:\b"));
+        assert_eq!(accept_local_cwd(r"C:\a\.\b").as_deref(), Some(r"C:\a\b"));
+        assert_eq!(accept_local_cwd(r"  C:\src  ").as_deref(), Some(r"C:\src"));
+        assert_eq!(
+            accept_local_cwd(r"C:\work\src\..\lib.rs").as_deref(),
+            Some(r"C:\work\lib.rs")
+        );
+    }
+
     #[test]
     fn posh_config_parses_common_profile_lines() {
         assert_eq!(
@@ -2421,5 +2797,488 @@ mod tests {
             parse_posh_config("# oh-my-posh init pwsh --config x.json\nSet-Alias g git"),
             None
         );
+    }
+
+    struct PtyLog(Arc<Mutex<Vec<String>>>);
+
+    impl EventListener for PtyLog {
+        fn send_event(&self, event: Event) {
+            if let Event::PtyWrite(text) = event {
+                self.0.lock().unwrap().push(text);
+            }
+        }
+    }
+
+    struct KittyFixture {
+        term: Term<PtyLog>,
+        parser: Processor,
+        meta: SessionMeta,
+        carry: Vec<u8>,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn kitty_term(protocol: bool) -> KittyFixture {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let size = TermSize { cols: 40, rows: 6 };
+        // Off means the parser never touches its keyboard stack. The probe
+        // reply is synthesized by process_chunk, not by alacritty.
+        let config = Config { kitty_keyboard: protocol, ..Config::default() };
+        KittyFixture {
+            term: Term::new(config, &size, PtyLog(Arc::clone(&log))),
+            parser: Processor::new(),
+            meta: SessionMeta { kitty_protocol: protocol, ..SessionMeta::default() },
+            carry: Vec::new(),
+            log,
+        }
+    }
+
+    fn take_writes(log: &Mutex<Vec<String>>) -> Vec<String> {
+        std::mem::take(&mut *log.lock().unwrap())
+    }
+
+    #[test]
+    fn kitty_push_pop_set_and_query() {
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log,
+        } = kitty_term(true);
+        let kitty = TermMode::KITTY_KEYBOARD_PROTOCOL;
+
+        // a probe before any push reports 0 and must not invent a stack level
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
+        assert!(!t.mode().intersects(kitty));
+
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[>1u");
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        let other_flags = kitty.difference(TermMode::DISAMBIGUATE_ESC_CODES);
+        assert!(!t.mode().intersects(other_flags));
+
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[>31u\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?31u".to_string()]);
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert!(t.mode().contains(TermMode::REPORT_ASSOCIATED_TEXT));
+
+        // pop restores the pushed 1, not zero — and not a phantom from the probe
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[<u\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?1u".to_string()]);
+
+        // CSI = updates flags in place: union alternate (4) onto 1, then
+        // clear disambiguate (bit 1) with mode 3. The query must report the
+        // mode bits, which stock 0.26 would not — it answers from the stack.
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[=4;2u\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?5u".to_string()]);
+        assert!(t.mode().contains(TermMode::REPORT_ALTERNATE_KEYS));
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[=1;3u\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?4u".to_string()]);
+        assert!(!t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+
+        // clearing the last bit with CSI = must answer 0, not the stale push
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[=0u\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
+        assert!(!t.mode().intersects(kitty));
+
+        // rebuild a primary level, then check the alternate screen's own stack
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[>4u");
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?1049h\x1b[?u");
+        assert!(t.mode().contains(TermMode::ALT_SCREEN));
+        assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
+        assert!(!t.mode().intersects(kitty));
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[>8u\x1b[?1049l\x1b[?u",
+        );
+        assert!(!t.mode().contains(TermMode::ALT_SCREEN));
+        assert!(t.mode().contains(TermMode::REPORT_ALTERNATE_KEYS));
+        assert_eq!(take_writes(&log), vec!["\x1b[?4u".to_string()]);
+    }
+
+    #[test]
+    fn kitty_protocol_off_ignores_push_and_answers_zero() {
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log,
+        } = kitty_term(false);
+        let ev = process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[>31u\x1b[=1u\x1b[<u\x1b[?u",
+        );
+        // We answer. The parser's kitty_keyboard flag is false, so it does not.
+        assert!(take_writes(&log).is_empty());
+        assert_eq!(ev.pty_replies, vec!["\x1b[?0u".to_string()]);
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        // a second probe is still zero — nothing stuck from the dropped push
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?u");
+        assert_eq!(ev.pty_replies, vec!["\x1b[?0u".to_string()]);
+        assert!(take_writes(&log).is_empty());
+    }
+
+    #[test]
+    fn kitty_stack_cap_survives_five_thousand_pushes() {
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log,
+        } = kitty_term(true);
+        let mut burst = Vec::with_capacity(5000 * 6);
+        for _ in 0..5000 {
+            burst.extend_from_slice(b"\x1b[>1u");
+        }
+        // Past the cap, a different flag must not land — those pushes are
+        // dropped, not applied, and must not panic the parser.
+        burst.extend_from_slice(b"\x1b[>31u");
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, &burst);
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert!(!t.mode().contains(TermMode::REPORT_ALL_KEYS_AS_ESC));
+        assert_eq!(meta.kitty_depth, 16);
+
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?uHi");
+        assert_eq!(take_writes(&log), vec!["\x1b[?1u".to_string()]);
+        {
+            let row = &t.grid()[alacritty_terminal::index::Line(0)];
+            assert_eq!(row[Column(0)].c, 'H');
+            assert_eq!(row[Column(1)].c, 'i');
+        }
+        // still a terminal: a pop under the cap answers, and more text lands
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[<16u\x1b[?u!");
+        assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        let row = &t.grid()[alacritty_terminal::index::Line(0)];
+        assert_eq!(row[Column(2)].c, '!');
+    }
+
+    #[test]
+    fn kitty_set_survives_alt_screen_without_a_query() {
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log,
+        } = kitty_term(true);
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[>1u\x1b[=4;2u");
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert!(t.mode().contains(TermMode::REPORT_ALTERNATE_KEYS));
+        // No query in between. Leaving the alt screen reloads the stack;
+        // the set must already be on that stack or the flags revert to 1.
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?1049h");
+        assert!(t.mode().contains(TermMode::ALT_SCREEN));
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?1049l\x1b[?u");
+        assert!(!t.mode().contains(TermMode::ALT_SCREEN));
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert!(t.mode().contains(TermMode::REPORT_ALTERNATE_KEYS));
+        assert_eq!(take_writes(&log), vec!["\x1b[?5u".to_string()]);
+    }
+
+    #[test]
+    fn osc133_prompt_resets_keyboard_mode() {
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log,
+        } = kitty_term(true);
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[>31uHi");
+        assert!(t.mode().contains(TermMode::REPORT_ASSOCIATED_TEXT));
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;A\x07\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        assert_eq!(meta.kitty_depth, 0);
+        let row = &t.grid()[alacritty_terminal::index::Line(0)];
+        assert_eq!(row[Column(0)].c, 'H', "reset must not wipe the prompt line");
+        assert_eq!(row[Column(1)].c, 'i');
+        assert!(!meta.marks.is_empty(), "the prompt mark is still recorded");
+    }
+
+    fn cell(t: &Term<PtyLog>, col: usize) -> char {
+        t.grid()[alacritty_terminal::index::Line(0)][Column(col)].c
+    }
+
+    fn repeat(seq: &[u8], n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(seq.len() * n);
+        for _ in 0..n {
+            out.extend_from_slice(seq);
+        }
+        out
+    }
+
+    /// Forms vte still accepts as `CSI > u` that `kitty_seq_at` does not:
+    /// a C0 inside the parameter, a C0 before the intermediate, a `:`.
+    #[test]
+    fn kitty_bypass_pushes_do_not_panic_on_or_off() {
+        let variants: &[&[u8]] = &[b"\x1b[>1\x00u", b"\x1b[\x0b>1u", b"\x1b[>1:1u"];
+        for protocol in [false, true] {
+            for seq in variants {
+                let KittyFixture {
+                    term: mut t,
+                    parser: mut p,
+                    mut meta,
+                    mut carry,
+                    log,
+                } = kitty_term(protocol);
+                process_chunk(&mut p, &mut t, &mut meta, &mut carry, &repeat(seq, 5000));
+                // VT inside `ESC [ VT > 1 u` is a real linefeed, so the proof
+                // that the terminal is still usable is the cursor cell, not row 0.
+                let at = t.grid().cursor.point;
+                process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"Z");
+                assert_eq!(
+                    t.grid()[at.line][at.column].c,
+                    'Z',
+                    "protocol={protocol} seq={seq:?}"
+                );
+                let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?u");
+                if protocol {
+                    assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+                    assert_eq!(take_writes(&log), vec!["\x1b[?1u".to_string()]);
+                    assert!(ev.pty_replies.is_empty());
+                } else {
+                    assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+                    assert!(take_writes(&log).is_empty(), "parser must stay silent");
+                    assert_eq!(ev.pty_replies, vec!["\x1b[?0u".to_string()]);
+                    assert_eq!(meta.kitty_depth, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ris_zeroes_keyboard_depth_on_both_screens() {
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log,
+        } = kitty_term(true);
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, &repeat(b"\x1b[>1u", 16));
+        assert_eq!(meta.kitty_depth, 16);
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?1049h\x1b[>4u");
+        assert!(t.mode().contains(TermMode::ALT_SCREEN));
+        assert_eq!(meta.kitty_depth, 1);
+        assert_eq!(meta.kitty_alt_depth, 16);
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1bc");
+        assert!(meta.saw_ris, "the focus-tracking flag is the RIS signal");
+        assert_eq!(meta.kitty_depth, 0, "RIS clears the counter, not only the parser");
+        assert_eq!(meta.kitty_alt_depth, 0);
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        // the cap is not stuck at 16: a push after RIS is accepted
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[>1u\x1b[?uZ");
+        assert_eq!(take_writes(&log), vec!["\x1b[?1u".to_string()]);
+        assert_eq!(meta.kitty_depth, 1);
+        assert_eq!(cell(&t, 0), 'Z');
+    }
+
+    #[test]
+    fn prompt_keeps_the_selection_and_only_resets_the_current_stack() {
+        use alacritty_terminal::index::{Point, Side};
+        use alacritty_terminal::selection::{Selection, SelectionType};
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log: _,
+        } = kitty_term(true);
+        let point = Point::new(alacritty_terminal::index::Line(0), Column(0));
+        // Empty stack: a prompt must not feed anything, so DECSC survives.
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"Hi\x1b7\x1b[2;4H");
+        let saved = t.grid().saved_cursor.point;
+        t.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;A\x07");
+        assert!(t.selection.is_some(), "empty stack is a no-op");
+        assert_eq!(t.grid().saved_cursor.point, saved);
+        assert_eq!(cell(&t, 0), 'H');
+
+        // A real level still must not visit the other screen.
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[>1u");
+        assert_eq!(meta.kitty_depth, 1);
+        t.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;A\x07\x1b[?u");
+        assert!(t.selection.is_some(), "prompt reset must not clear the selection");
+        assert_eq!(t.grid().saved_cursor.point, saved, "DECSC must survive the prompt");
+        assert!(!t.mode().contains(TermMode::ALT_SCREEN));
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        assert_eq!(meta.kitty_depth, 0);
+        assert_eq!(cell(&t, 0), 'H');
+        assert_eq!(cell(&t, 1), 'i');
+    }
+
+    #[test]
+    fn alt_screen_reset_keeps_the_tui_and_the_other_stack() {
+        use alacritty_terminal::index::{Point, Side};
+        use alacritty_terminal::selection::{Selection, SelectionType};
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log,
+        } = kitty_term(true);
+        // Primary keeps disambiguate. Alt has report-all and the word TUI.
+        // Ctrl+Shift+K (and shell exit) call the same helper.
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[>1u\x1b[?1049hTUI\x1b[>8u",
+        );
+        assert!(t.mode().contains(TermMode::ALT_SCREEN));
+        assert!(t.mode().contains(TermMode::REPORT_ALL_KEYS_AS_ESC));
+        assert_eq!(meta.kitty_alt_depth, 1, "primary level is parked");
+        let point = Point::new(alacritty_terminal::index::Line(0), Column(0));
+        t.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+        reset_keyboard_modes(&mut p, &mut t, &mut meta);
+        assert!(t.mode().contains(TermMode::ALT_SCREEN), "reset must not leave the alt screen");
+        assert_eq!(cell(&t, 0), 'T');
+        assert_eq!(cell(&t, 1), 'U');
+        assert_eq!(cell(&t, 2), 'I');
+        assert!(t.selection.is_some());
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        assert_eq!(meta.kitty_depth, 0);
+        assert_eq!(meta.kitty_alt_depth, 1, "only the current screen's stack");
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?1049l\x1b[?u");
+        assert!(!t.mode().contains(TermMode::ALT_SCREEN));
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert_eq!(take_writes(&log), vec!["\x1b[?1u".to_string()]);
+    }
+
+    #[test]
+    fn reset_is_a_noop_when_the_protocol_is_off() {
+        use alacritty_terminal::index::{Point, Side};
+        use alacritty_terminal::selection::{Selection, SelectionType};
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log,
+        } = kitty_term(false);
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"Hi\x1b7\x1b[2;4H");
+        let saved = t.grid().saved_cursor.point;
+        let cursor = t.grid().cursor.point;
+        let point = Point::new(alacritty_terminal::index::Line(0), Column(0));
+        t.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            &repeat(b"\x1b[>1\x00u", 5000),
+        );
+        reset_keyboard_modes(&mut p, &mut t, &mut meta);
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;A\x07\x1b[?u");
+        assert!(t.selection.is_some());
+        assert_eq!(t.grid().saved_cursor.point, saved);
+        assert_eq!(t.grid().cursor.point, cursor, "the prompt must not move the cursor");
+        assert_eq!(cell(&t, 0), 'H');
+        assert!(!t.mode().contains(TermMode::ALT_SCREEN));
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        assert!(take_writes(&log).is_empty());
+        assert_eq!(ev.pty_replies, vec!["\x1b[?0u".to_string()]);
+    }
+
+    #[test]
+    fn reset_pops_zero_value_layers_by_depth() {
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log,
+        } = kitty_term(true);
+        // Two counted levels. The top mode is 0, so no kitty bits are set.
+        // A flags check would skip the reset and a later pop would reveal 1.
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[>1u\x1b[>0u");
+        assert_eq!(meta.kitty_depth, 2);
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        reset_keyboard_modes(&mut p, &mut t, &mut meta);
+        assert_eq!(meta.kitty_depth, 0);
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
+        // The extra pop must not uncover the buried 1.
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[<u\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+    }
+
+    #[test]
+    fn reset_ignores_flag_bits_when_the_counted_depth_is_zero() {
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log,
+        } = kitty_term(true);
+        // A `:` sub-parameter is not counted, so kitty_depth stays 0 while
+        // the real stack is 20 deep and disambiguate is on. Popping from
+        // the flag bits would drain it. The depth is what we pop.
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, &repeat(b"\x1b[>1:1u", 20));
+        assert_eq!(meta.kitty_depth, 0);
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        reset_keyboard_modes(&mut p, &mut t, &mut meta);
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?u!");
+        assert_eq!(take_writes(&log), vec!["\x1b[?1u".to_string()]);
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert_eq!(cell(&t, 0), '!');
+    }
+
+    #[test]
+    fn protocol_off_answers_a_query_with_a_c0_inside_the_csi() {
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log,
+        } = kitty_term(false);
+        // NUL does not end the CSI. vte would still execute the query.
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?\x00u");
+        assert!(take_writes(&log).is_empty(), "parser must stay silent");
+        assert_eq!(ev.pty_replies, vec!["\x1b[?0u".to_string()]);
+        // C0 before the intermediate is the same sequence.
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[\x00?u");
+        assert!(take_writes(&log).is_empty());
+        assert_eq!(ev.pty_replies, vec!["\x1b[?0u".to_string()]);
+    }
+
+    #[test]
+    fn exit_reset_returns_the_live_parser_to_ground() {
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log: _,
+        } = kitty_term(true);
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[>1u");
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        // A read that ended on ESC [ leaves the session parser in CSI.
+        // Shell exit feeds the pop through that parser. A fresh one would
+        // leave this machine inside the CSI, and 'Z' would not be text.
+        p.advance(&mut t, b"\x1b[");
+        reset_keyboard_modes(&mut p, &mut t, &mut meta);
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        p.advance(&mut t, b"Z");
+        assert_eq!(cell(&t, 0), 'Z');
     }
 }

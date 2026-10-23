@@ -79,6 +79,13 @@ pub struct UserConfig {
     /// (default on). Windows quiet hours are respected regardless.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notifications: Option<bool>,
+    /// Editor for Ctrl+click on `path:line`. `{file}` `{line}` `{col}` are
+    /// replaced after the template is split into arguments — never a shell
+    /// command. Example: `code -g {file}:{line}:{col}`. Absent: `code -g`
+    /// when `code.exe` is on PATH (or the `Code.exe` next to `code.cmd`),
+    /// otherwise the file opens by shell association.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
     /// Shortcut overrides: action id -> chord ("new-tab": "ctrl+shift+n").
     /// Only NON-default bindings live here (the editor prunes defaults).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -86,9 +93,17 @@ pub struct UserConfig {
     /// BiDi escape-sequence policy. Absent means [`BidiConfig`]'s defaults.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bidi: Option<BidiConfig>,
+    /// Kitty keyboard protocol. Off unless the user opts in — see
+    /// [`KeyboardConfig`].
+    #[serde(default)]
+    pub keyboard: KeyboardConfig,
 }
 
 fn default_honor_bdsm() -> bool {
+    true
+}
+
+fn default_true() -> bool {
     true
 }
 
@@ -111,6 +126,31 @@ pub struct BidiConfig {
 impl Default for BidiConfig {
     fn default() -> Self {
         Self { honor_bdsm: true }
+    }
+}
+
+/// Kitty keyboard protocol switches. Both live under `"keyboard"` in
+/// config.json so the opt-in is obvious next to the fallback that keeps
+/// Ctrl+C working on an Arabic layout.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct KeyboardConfig {
+    /// Answer `CSI ? u` with `CSI ?0u` and ignore push/set until this is
+    /// true. ConPTY (the system conhost portable-pty uses) has been reported
+    /// to swallow the ESC of `CSI u`, which would deliver `[99;5u` as text
+    /// and break Ctrl+C. Default off until that is verified on real Windows.
+    pub kitty_protocol: bool,
+    /// When disambiguate is on but "report alternates" is not, a non-ASCII
+    /// chord is reported as its PC-101 base key (`ؤ` on the C key →
+    /// `CSI 99;5u` instead of `CSI 1572;5u`). Deliberate departure from the
+    /// kitty spec so Claude Code can still be interrupted. Default on.
+    #[serde(default = "default_true")]
+    pub kitty_base_layout_fallback: bool,
+}
+
+impl Default for KeyboardConfig {
+    fn default() -> Self {
+        Self { kitty_protocol: false, kitty_base_layout_fallback: true }
     }
 }
 
@@ -240,6 +280,14 @@ impl UserConfig {
     /// Explicit BDSM overrides Claude-mode auto-detection. Default true.
     pub fn honor_bdsm(&self) -> bool {
         self.bidi.as_ref().map(|b| b.honor_bdsm).unwrap_or(true)
+    }
+
+    pub fn kitty_protocol_on(&self) -> bool {
+        self.keyboard.kitty_protocol
+    }
+
+    pub fn kitty_base_layout_fallback_on(&self) -> bool {
+        self.keyboard.kitty_base_layout_fallback
     }
 }
 
@@ -378,6 +426,23 @@ mod tests {
         // an empty object still gets the field default
         let empty: UserConfig = serde_json::from_str(r#"{"bidi":{}}"#).unwrap();
         assert!(empty.honor_bdsm());
+    }
+
+    #[test]
+    fn kitty_keyboard_config_defaults_off_and_fallback_on() {
+        let d = UserConfig::default();
+        assert!(!d.kitty_protocol_on());
+        assert!(d.kitty_base_layout_fallback_on());
+        // a config that never mentions keyboard keeps those defaults
+        let absent: UserConfig = serde_json::from_str("{}").unwrap();
+        assert!(!absent.kitty_protocol_on());
+        assert!(absent.kitty_base_layout_fallback_on());
+        let c: UserConfig = serde_json::from_str(
+            r#"{"keyboard":{"kitty_protocol":true,"kitty_base_layout_fallback":false}}"#,
+        )
+        .unwrap();
+        assert!(c.kitty_protocol_on());
+        assert!(!c.kitty_base_layout_fallback_on());
     }
 
     #[test]
