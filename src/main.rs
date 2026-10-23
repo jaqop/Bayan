@@ -230,9 +230,10 @@ pub enum UserEvent {
     PtyWrite(u64, String),
     /// The font system finished loading on its background thread.
     RendererReady(Box<render::Renderer>),
-    /// A program asked to set the clipboard via OSC 52. Applied only when
-    /// `allow_osc52_write` says so — the default is to drop it.
-    ClipboardSet(String),
+    /// Pane `id` asked to set the clipboard via OSC 52. Applied only when
+    /// `allow_osc52_write` says so — the default is to drop it, and a write
+    /// from any pane but the focused one of the active tab is dropped too.
+    ClipboardSet(u64, String),
     /// Pane `id`'s shell reported its working directory (OSC 9;9).
     Cwd(u64, String),
     /// Pane `id` rang the bell (Claude waiting for an approval).
@@ -241,6 +242,14 @@ pub enum UserEvent {
     CommandFinished(u64, bool),
     /// Pane `id`'s shell exited.
     Exit(u64),
+}
+
+/// Text held for the confirm card: the bytes to send, and why the card is up.
+struct PendingPaste {
+    text: String,
+    lines: usize,
+    chars: usize,
+    reason: String,
 }
 
 /// One terminal pane (a tab holds one or more).
@@ -456,8 +465,8 @@ struct App {
     /// the agent cockpit overlay (Ctrl+Shift+D): one glance at every tab
     cockpit: bool,
     cockpit_sel: usize,
-    /// a big paste awaiting Enter/Esc (EasyTer's paste guard)
-    pending_paste: Option<String>,
+    /// a paste or a drop awaiting Enter/Esc (EasyTer's paste guard)
+    pending_paste: Option<PendingPaste>,
     /// a close awaiting Enter/Esc (a command is still running)
     pending_close: Option<CloseTarget>,
     /// last keystroke sent to a PTY — the cursor blinks for 15s after it,
@@ -1257,6 +1266,14 @@ impl App {
         t.panes.get_mut(f).map(|p| &mut p.session)
     }
 
+    /// OSC 52 may write only from the focused pane of the active tab.
+    fn osc52_pane_is_focused(&self, id: u64) -> bool {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return false;
+        };
+        tab.panes.get(tab.focused).is_some_and(|p| p.id == id)
+    }
+
     /// (tab index, pane index) for a pane id, wherever it lives.
     fn find_pane(&self, id: u64) -> Option<(usize, usize)> {
         for (ti, t) in self.tabs.iter().enumerate() {
@@ -1738,13 +1755,26 @@ impl App {
         if txt.is_empty() {
             return;
         }
-        // EasyTer's paste guard: confirm before a multi-line/huge paste
-        if term::needs_paste_guard(&txt).is_some() {
-            self.pending_paste = Some(txt);
-            self.request_redraw();
+        // EasyTer's paste guard: confirm before a multi-line/huge paste.
+        // `None` means the text is safe to type.
+        self.arm_pending_paste(txt, None);
+    }
+
+    /// Hold `txt` for the confirm card. `fallback` is the reason when the
+    /// guard itself is quiet — a quoted drop onto vim, or onto a shell that
+    /// is not at its prompt. The card draws whenever this is set, including
+    /// when the text has no control characters.
+    fn arm_pending_paste(&mut self, txt: String, fallback: Option<term::PasteRisk>) {
+        let (lines, chars, reason) = if let Some(g) = term::needs_paste_guard(&txt) {
+            (g.lines, g.chars, g.risk.label().to_string())
+        } else if let Some(risk) = fallback {
+            (1, txt.chars().count(), risk.label().to_string())
+        } else {
+            self.send_paste(&txt);
             return;
-        }
-        self.send_paste(&txt);
+        };
+        self.pending_paste = Some(PendingPaste { text: txt, lines, chars, reason });
+        self.request_redraw();
     }
 
     fn send_paste(&mut self, txt: &str) {
@@ -1986,15 +2016,16 @@ impl App {
                     );
                 }
                 if let Some(p) = &self.pending_paste {
-                    if let Some((lines, chars)) = term::needs_paste_guard(p) {
-                        renderer.draw_paste_guard(
-                            &mut verts,
-                            px.width as usize,
-                            px.height as usize,
-                            lines,
-                            chars,
-                        );
-                    }
+                    let preview = term::paste_preview(&p.text, 48);
+                    renderer.draw_paste_guard(
+                        &mut verts,
+                        px.width as usize,
+                        px.height as usize,
+                        p.lines,
+                        p.chars,
+                        &p.reason,
+                        &preview,
+                    );
                 }
                 if let Some((rows, sel, capturing, flash)) = &shortcuts_view {
                     renderer.draw_shortcuts(
@@ -2150,7 +2181,7 @@ impl ApplicationHandler<UserEvent> for App {
             self.cockpit_sel = self.active;
         }
         if std::env::var_os("BAYAN_GUARD").is_some() {
-            self.pending_paste = Some("echo one\necho two\necho three\n".into());
+            self.arm_pending_paste("echo one\necho two\necho three\n".into(), None);
         }
         if std::env::var_os("BAYAN_SETTINGS").is_some() {
             self.settings = Some(0);
@@ -2237,8 +2268,16 @@ impl ApplicationHandler<UserEvent> for App {
                     self.tabs[ti].panes[pi].session.write(text.as_bytes());
                 }
             }
-            UserEvent::ClipboardSet(text) => {
-                if term::allow_osc52_write(self.config.osc52_copy_enabled(), self.focused) {
+            UserEvent::ClipboardSet(id, text) => {
+                // has_focus, not the startup value of self.focused: that flag
+                // begins false and only tracks Focused events, which can lag
+                // the real window state (and used to begin as true).
+                let window_focused = self.window.as_ref().is_some_and(|w| w.has_focus());
+                if term::allow_osc52_write(
+                    self.config.osc52_copy_enabled(),
+                    window_focused,
+                    self.osc52_pane_is_focused(id),
+                ) {
                     self.set_clipboard(text);
                 }
             }
@@ -2397,12 +2436,33 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::DroppedFile(path) => {
                 // Quote for the shell this pane was spawned with. A name like
                 // $(calc) must arrive as a literal; a control character is
-                // not typed at all.
-                let quoted = self.session().and_then(|s| term::dropped_path_arg(&path, s.shell()));
-                if let Some(arg) = quoted {
-                    if let Some(s) = self.session_mut() {
-                        s.write(arg.as_bytes());
-                    }
+                // not typed at all. vim, less, and a shell that is not at its
+                // prompt (cmd inside PowerShell never emits OSC 133 B) confirm
+                // first. A program that asked for bracketed paste gets the wrap.
+                let decision = {
+                    let Some(session) = self.session() else {
+                        return;
+                    };
+                    let Some(arg) = term::dropped_path_arg(&path, session.shell()) else {
+                        return;
+                    };
+                    // term, then meta — the lock order the reader uses too.
+                    let mode = *session.term.lock().unwrap().mode();
+                    let at_prompt = session.meta.lock().unwrap().at_prompt;
+                    (arg, mode, at_prompt)
+                };
+                let (arg, mode, at_prompt) = decision;
+                let alt = mode.contains(TermMode::ALT_SCREEN);
+                if term::drop_needs_confirm(alt, at_prompt) {
+                    let why = if alt {
+                        term::PasteRisk::AltScreen
+                    } else {
+                        term::PasteRisk::NotAtPrompt
+                    };
+                    self.arm_pending_paste(arg, Some(why));
+                } else if let Some(s) = self.session_mut() {
+                    let body = term::normalize_paste(&arg, mode.contains(TermMode::BRACKETED_PASTE));
+                    s.write(body.as_bytes());
                 }
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
@@ -2684,8 +2744,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.pending_paste.is_some() {
                     match &event.logical_key {
                         Key::Named(NamedKey::Enter) => {
-                            if let Some(txt) = self.pending_paste.take() {
-                                self.send_paste(&txt);
+                            if let Some(pending) = self.pending_paste.take() {
+                                self.send_paste(&pending.text);
                             }
                         }
                         Key::Named(NamedKey::Escape) => self.pending_paste = None,
@@ -2927,7 +2987,7 @@ fn main() {
         last_input: Instant::now(),
         blink_drawn_on: true,
         settings: None,
-        focused: true,
+        focused: false,
         clicks: ClickTracker::new(),
         wheel_accum: 0.0,
         search: None,

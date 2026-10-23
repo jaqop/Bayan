@@ -18,6 +18,9 @@ use crate::UserEvent;
 
 pub const DEFAULT_SHELL: &str = "powershell.exe";
 const MAX_CARRY: usize = 4096;
+/// Bytes one PTY `read` pulls. Named so the OSC 52 transport bound and the
+/// reader share it. See [`osc52_transport_room`].
+const PTY_READ: usize = 64 * 1024;
 
 /// Shells the settings panel offers. Delegates to `shells::detect`, which
 /// finds what is actually installed — PowerShell with and without $PROFILE,
@@ -233,9 +236,24 @@ fn find_osc133(data: &[u8]) -> Vec<(usize, usize, u8, Option<i32>)> {
     out
 }
 
-/// Decoded OSC 52 payload cap. One PTY read is 64 KiB; anything larger is
-/// not a yank, it is a clipboard bomb. Checked before the base64 decode.
+/// Decoded OSC 52 backstop. One scan cannot actually deliver this much.
+///
+/// The reader pulls [`PTY_READ`] (64 KiB). [`incomplete_tail_start`] only
+/// carries an OSC whose ESC still sits in the last [`MAX_CARRY`] (4 KiB)
+/// bytes, so a *terminated* sequence has to fit in one scan buffer. For the
+/// shortest opener `\x1b]52;c;` (7) plus a BEL (1), [`osc52_transport_room`]
+/// is 49146 bytes on one read (~48 KiB) and 52218 bytes when that opener is
+/// still inside the carry (~51 KiB). This 64 KiB constant is only the ceiling
+/// `scan_osc52` enforces once the bytes are already in one buffer.
 pub(crate) const OSC52_MAX_BYTES: usize = 64 * 1024;
+
+/// Decoded bytes a terminated `OSC 52 ; c ; … BEL` can occupy in a scan of
+/// `scan_len` bytes. The selection field `c` is the shortest one; a longer
+/// field leaves even less room.
+fn osc52_transport_room(scan_len: usize) -> usize {
+    const WRAP: usize = 7 + 1; // ESC ] 5 2 ; c ;  + BEL
+    (scan_len.saturating_sub(WRAP) / 4) * 3
+}
 
 /// Payload of the LAST *terminated* occurrence of an OSC prefix.
 ///
@@ -301,11 +319,16 @@ fn scan_osc52(data: &[u8]) -> Option<String> {
 
 /// Whether an OSC 52 payload may replace the OS clipboard.
 ///
-/// Both must hold: the user set `osc52` to `"copy"`, and the window is
-/// focused. Unfocused writes are how a background session pastejacks the
-/// desktop. There is no flag here that allows a read.
-pub fn allow_osc52_write(copy_enabled: bool, focused: bool) -> bool {
-    copy_enabled && focused
+/// All three must hold: the user set `osc52` to `"copy"`, the window is
+/// focused, and the sequence came from the focused pane of the active tab.
+/// A background tab or an unfocused split must not win the clipboard.
+/// There is no flag here that allows a read.
+pub fn allow_osc52_write(
+    copy_enabled: bool,
+    window_focused: bool,
+    from_focused_pane: bool,
+) -> bool {
+    copy_enabled && window_focused && from_focused_pane
 }
 
 /// Longest cwd we will store or start a process in. Real Windows paths fit;
@@ -693,13 +716,13 @@ impl Session {
                     " $ErrorActionPreference='SilentlyContinue'; \
                      & {{oh-my-posh init powershell --config '{}' | Invoke-Expression}} 2>$null; \
                      $ErrorActionPreference='Continue';",
-                    theme.replace('\'', "''")
+                    powershell_escape_single(&theme)
                 ));
             }
             setup.push(' ');
             setup.push_str(PS_MARKS);
             cmd.arg(setup);
-        } else if shell.eq_ignore_ascii_case("cmd.exe") {
+        } else if shell_family(shell) == ShellFamily::Cmd {
             // UTF-8 code page so Arabic paths survive; no OSC 133 marks
             cmd.args(["/K", "chcp 65001>nul"]);
         }
@@ -724,7 +747,7 @@ impl Session {
         std::thread::spawn(move || {
             let mut parser: Processor = Processor::new();
             let mut carry: Vec<u8> = Vec::new();
-            let mut buf = [0u8; 65536];
+            let mut buf = [0u8; PTY_READ];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -735,7 +758,7 @@ impl Session {
                             process_chunk(&mut parser, &mut t, &mut m, &mut carry, &buf[..n])
                         };
                         if let Some(txt) = ev.clipboard {
-                            let _ = proxy.send_event(UserEvent::ClipboardSet(txt));
+                            let _ = proxy.send_event(UserEvent::ClipboardSet(id, txt));
                         }
                         if let Some(cwd) = ev.cwd {
                             let _ = proxy.send_event(UserEvent::Cwd(id, cwd));
@@ -795,23 +818,65 @@ impl Session {
     }
 }
 
+/// Why a paste or a drop is held for the confirm card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasteRisk {
+    /// CR, LF, CRLF, NEL, U+2028, or U+2029.
+    Enter,
+    /// A control, a C1 byte, or a bidi / zero-width spoof.
+    Control,
+    EnterAndControl,
+    /// More than 2000 characters.
+    TooLong,
+    /// The shell has not reported OSC 133 B. Used by drag-drop, not by the guard.
+    NotAtPrompt,
+    /// The focused program is on the alternate screen (vim, less).
+    AltScreen,
+}
+
+impl PasteRisk {
+    /// Card copy. Arabic, matching the rest of the confirm UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            PasteRisk::Enter => "يحتوي على Enter",
+            PasteRisk::Control => "يحتوي على أحرف تحكم",
+            PasteRisk::EnterAndControl => "يحتوي على Enter وأحرف تحكم",
+            PasteRisk::TooLong => "النص أطول من الحد",
+            PasteRisk::NotAtPrompt => "ليس في موجّه الأوامر",
+            PasteRisk::AltScreen => "البرنامج في وضع الشاشة الكاملة",
+        }
+    }
+}
+
+/// Counts and the reason, when confirmation is due.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PasteGuard {
+    pub lines: usize,
+    pub chars: usize,
+    pub risk: PasteRisk,
+}
+
 /// Multi-line / huge pastes can execute commands on arrival (EasyTer's paste
-/// protection). Some((lines, chars)) when confirmation is due.
+/// protection). `Some` when confirmation is due.
 ///
 /// CR is Enter on ConPTY, and the default PowerShell is started `-NoProfile`
 /// so PSReadLine never turns bracketed paste on. LF-only detection let a
 /// clipboard of `command\r` run on paste. Line breaks are CR, LF, CRLF, NEL,
 /// U+2028 and U+2029. Any other control except a tab takes the same confirm
-/// path (ESC would otherwise smuggle a sequence). The size cap counts
-/// characters: a line of Arabic is not "huge" because UTF-8 uses two bytes.
+/// path (ESC would otherwise smuggle a sequence), and so do the bidi
+/// overrides U+202E and U+2066..=U+2069 plus the zero-width characters
+/// U+200B and U+FEFF — none of those are `is_control`, and a raw RLO in the
+/// card would spoof the preview. The size cap counts characters: a line of
+/// Arabic is not "huge" because UTF-8 uses two bytes.
 ///
 /// Bracketed paste is intentionally not forced from our side. The guard runs
 /// first either way; injecting `\x1b[?2004h` into a host that does not
 /// understand the wrappers would type the wrappers into the prompt.
-pub fn needs_paste_guard(text: &str) -> Option<(usize, usize)> {
+pub fn needs_paste_guard(text: &str) -> Option<PasteGuard> {
     let mut breaks = 0usize;
     let mut ends_with_break = false;
-    let mut dangerous = false;
+    let mut saw_break = false;
+    let mut saw_control = false;
     let mut chars = 0usize;
     let mut iter = text.chars().peekable();
     while let Some(c) = iter.next() {
@@ -819,38 +884,65 @@ pub fn needs_paste_guard(text: &str) -> Option<(usize, usize)> {
         if c == '\r' {
             breaks += 1;
             ends_with_break = true;
-            dangerous = true;
+            saw_break = true;
             if iter.peek() == Some(&'\n') {
                 iter.next();
                 chars += 1;
             }
             continue;
         }
-        if matches!(c, '\n' | '\u{0085}' | '\u{2028}' | '\u{2029}') {
+        if is_line_break(c) {
             breaks += 1;
             ends_with_break = true;
-            dangerous = true;
+            saw_break = true;
             continue;
         }
         ends_with_break = false;
-        if c != '\t' && c.is_control() {
-            dangerous = true;
+        if c != '\t' && (c.is_control() || is_paste_spoof(c)) {
+            saw_control = true;
         }
     }
-    if dangerous || chars > 2000 {
+    if saw_break || saw_control || chars > 2000 {
         let lines = breaks + usize::from(!ends_with_break);
-        Some((lines, chars))
+        let risk = if saw_break && saw_control {
+            PasteRisk::EnterAndControl
+        } else if saw_break {
+            PasteRisk::Enter
+        } else if saw_control {
+            PasteRisk::Control
+        } else {
+            PasteRisk::TooLong
+        };
+        Some(PasteGuard { lines, chars, risk })
     } else {
         None
     }
 }
 
+/// LF, NEL, line separator, paragraph separator. CR is handled by the caller
+/// so a following LF can be swallowed as one CRLF.
+fn is_line_break(c: char) -> bool {
+    matches!(c, '\n' | '\u{0085}' | '\u{2028}' | '\u{2029}')
+}
+
+/// Format characters that reorder or hide text. They are not controls, so
+/// `is_control` misses them, and a confirm card that draws them raw can be
+/// made to say the opposite of the bytes that would be sent.
+fn is_paste_spoof(c: char) -> bool {
+    matches!(
+        c,
+        '\u{202E}' | '\u{2066}' | '\u{2067}' | '\u{2068}' | '\u{2069}' | '\u{200B}' | '\u{FEFF}'
+    )
+}
+
 /// Which quoting rules a spawned command line needs. Unknown programs follow
 /// PowerShell, because that is the shell Bayan starts when nothing else matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShellFamily {
     PowerShell,
     Cmd,
     Posix,
+    Fish,
 }
 
 fn shell_family(shell: &str) -> ShellFamily {
@@ -864,19 +956,57 @@ fn shell_family(shell: &str) -> ShellFamily {
     match name.as_str() {
         "powershell" | "pwsh" => ShellFamily::PowerShell,
         "cmd" => ShellFamily::Cmd,
-        "bash" | "sh" | "zsh" | "fish" | "wsl" | "dash" => ShellFamily::Posix,
+        "fish" => ShellFamily::Fish,
+        "bash" | "sh" | "zsh" | "wsl" | "dash" => ShellFamily::Posix,
+        // `git-bash.exe` is bash. Matching the substring "bash" would also
+        // catch `notbash`, so the hyphen is part of the rule.
+        n if n.ends_with("-bash") => ShellFamily::Posix,
         _ => ShellFamily::PowerShell,
     }
+}
+
+/// PowerShell single-quote characters. U+2018..=U+201B are quotes too: a
+/// dropped file named `a’;calc;’.txt` otherwise runs `calc`.
+fn is_powershell_single_quote(c: char) -> bool {
+    matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}')
+}
+
+/// Double every PowerShell single quote, ASCII and smart. Shared by drop
+/// quoting and the oh-my-posh `--config '…'` argument, which is the same literal.
+fn powershell_escape_single(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if is_powershell_single_quote(c) {
+            out.push(c);
+            out.push(c);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Fish single quotes are literal except `\'` and `\\`. The bash `'\''` dance
+/// is a syntax error there. A trailing backslash would escape the closer, so
+/// a drive root becomes `C:\.` (same directory, quote stays closed).
+fn quote_fish(p: &str) -> String {
+    let mut body = p.replace('\'', r"\'");
+    if body.ends_with('\\') {
+        body.push('.');
+    }
+    body
 }
 
 /// A file dropped onto a pane, quoted as a literal for `shell`, plus a trailing
 /// space. `None` when the path contains a control character (or, for cmd, a
 /// character that expands inside quotes) — those are not typed at all.
 ///
-/// PowerShell single quotes are literal except for `'` doubled. cmd double
-/// quotes stop `&` from being a separator, but `%` and `!` still expand, so a
-/// name containing either is refused. Git Bash and WSL take POSIX single
-/// quotes (`'` → `'\''`).
+/// PowerShell single quotes are literal except for `'` — and the smart
+/// quotes U+2018..=U+201B, which PowerShell treats as `'` too. Each is
+/// doubled. cmd double quotes stop `&` from being a separator, but `%` and
+/// `!` still expand, so a name containing either is refused. Git Bash and
+/// WSL take POSIX single quotes (`'` → `'\''`). fish takes `\'` inside one
+/// pair of single quotes; `git-bash.exe` is bash, not PowerShell.
 pub fn dropped_path_arg(path: &std::path::Path, shell: &str) -> Option<String> {
     let raw = path.to_string_lossy();
     if raw.chars().any(|c| c.is_control()) {
@@ -890,8 +1020,9 @@ pub fn dropped_path_arg(path: &std::path::Path, shell: &str) -> Option<String> {
         p.pop();
     }
     let quoted = match shell_family(shell) {
-        ShellFamily::PowerShell => format!("'{}'", p.replace('\'', "''")),
+        ShellFamily::PowerShell => format!("'{}'", powershell_escape_single(&p)),
         ShellFamily::Posix => format!("'{}'", p.replace('\'', r"'\''")),
+        ShellFamily::Fish => format!("'{}'", quote_fish(&p)),
         ShellFamily::Cmd => {
             // `%VAR%` and delayed-expansion `!VAR!` survive double quotes.
             // `"` cannot occur in a Windows filename; if it did, it would
@@ -912,16 +1043,89 @@ pub fn dropped_path_arg(path: &std::path::Path, shell: &str) -> Option<String> {
     Some(format!("{quoted} "))
 }
 
-/// Prepare clipboard text for the PTY: newlines become carriage returns, and
-/// under bracketed paste the payload is wrapped — with any embedded end
-/// marker stripped so pasted content can't terminate paste mode early and
-/// smuggle the remainder in as executed input (EasyTer's paste-injection fix).
+/// Prepare clipboard text for the PTY.
+///
+/// Line breaks become one carriage return (CRLF is one Enter). Tab stays.
+/// Every other C0 (including every ESC), DEL, and every C1 byte is removed,
+/// and so are the bidi overrides and zero-width characters the confirm card
+/// flags. A single `.replace("\x1b[201~")` is not enough: `\x1b[20\x1b[201~1~`
+/// still contains an ESC after that pass, and the wrapped paste ends early.
+/// Stripping the controls leaves `[20[201~1~`, which cannot close the bracket.
+///
+/// Bracketed paste then wraps the stripped body. The guard still runs first;
+/// this function is what a confirmed paste, and a drop into a program that
+/// asked for bracketed paste, actually writes.
 pub fn normalize_paste(text: &str, bracketed: bool) -> String {
-    let body = text.replace("\r\n", "\r").replace('\n', "\r");
+    let mut body = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            body.push('\r');
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            continue;
+        }
+        if is_line_break(c) {
+            body.push('\r');
+            continue;
+        }
+        if c == '\t' {
+            body.push('\t');
+            continue;
+        }
+        if c.is_control() || is_paste_spoof(c) {
+            continue;
+        }
+        body.push(c);
+    }
     if bracketed {
-        format!("\x1b[200~{}\x1b[201~", body.replace("\x1b[201~", ""))
+        format!("\x1b[200~{body}\x1b[201~")
     } else {
         body
+    }
+}
+
+/// A drop is typed straight in only at a cooked shell prompt. The alternate
+/// screen (vim, less) and a shell that has not reported OSC 133 B — cmd
+/// inside PowerShell never does — go through the confirm card.
+pub fn drop_needs_confirm(alt_screen: bool, at_prompt: bool) -> bool {
+    alt_screen || !at_prompt
+}
+
+/// The confirm card's one-line preview. Controls become the visible pictures
+/// (␍ ␛ ␊ ␉); bidi overrides and zero-width characters become ASCII markers
+/// so the card cannot be reordered by the text it is asking about.
+pub fn paste_preview(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut n = 0usize;
+    for c in text.chars() {
+        let rep = paste_preview_char(c);
+        let extra = rep.chars().count();
+        if n + extra > max_chars {
+            out.push('…');
+            break;
+        }
+        out.push_str(&rep);
+        n += extra;
+    }
+    out
+}
+
+fn paste_preview_char(c: char) -> String {
+    match c {
+        '\u{202E}' => "<RLO>".to_string(),
+        '\u{2066}' => "<LRI>".to_string(),
+        '\u{2067}' => "<RLI>".to_string(),
+        '\u{2068}' => "<FSI>".to_string(),
+        '\u{2069}' => "<PDI>".to_string(),
+        '\u{200B}' => "<ZWSP>".to_string(),
+        '\u{FEFF}' => "<BOM>".to_string(),
+        // C0 control pictures: U+2400 + code. CR is ␍, ESC is ␛, LF is ␊, tab is ␉.
+        c if (c as u32) <= 0x1F => char::from_u32(0x2400 + c as u32).unwrap().to_string(),
+        '\u{007F}' => "\u{2421}".to_string(),
+        c if c.is_control() => format!("<U+{:04X}>", c as u32),
+        c => c.to_string(),
     }
 }
 
@@ -945,36 +1149,79 @@ mod tests {
     #[test]
     fn paste_normalizes_newlines_and_blocks_injection() {
         assert_eq!(normalize_paste("a\r\nb\nc", false), "a\rb\rc");
-        // bracketed: wrapped, and an embedded end marker cannot break out
+        // bracketed: wrapped. The ESC is gone; the leftover "[201~" cannot
+        // close the bracket the way the whole end-marker used to.
         assert_eq!(
             normalize_paste("safe\x1b[201~evil\n", true),
-            "\x1b[200~safeevil\r\x1b[201~"
+            "\x1b[200~safe[201~evil\r\x1b[201~"
+        );
+    }
+
+    /// A single `.replace("\x1b[201~")` turns `\x1b[20\x1b[201~1~` back into
+    /// `\x1b[201~`. Every ESC has to go, and the card has to show the bytes.
+    #[test]
+    fn paste_strips_nested_bracket_end() {
+        let out = normalize_paste("\x1b[20\x1b[201~1~", true);
+        let body = out
+            .strip_prefix("\x1b[200~")
+            .and_then(|s| s.strip_suffix("\x1b[201~"))
+            .expect("wrapped");
+        assert_eq!(body, "[20[201~1~");
+        assert!(!body.chars().any(|c| c == '\u{1b}'));
+        // other C0 (BEL) and C1 (U+009B, the 8-bit CSI) do not survive; a tab does
+        assert_eq!(normalize_paste("a\u{7}b\u{9b}c\t", false), "abc\t");
+        assert_eq!(paste_preview("echo\r\x1b[2J", 48), "echo␍␛[2J");
+        assert_eq!(
+            needs_paste_guard("echo\r\x1b[2J").map(|g| g.risk),
+            Some(PasteRisk::EnterAndControl)
         );
     }
 
     #[test]
     fn paste_guard_triggers_on_danger_only() {
         assert_eq!(needs_paste_guard("ls -la"), None);
-        assert_eq!(needs_paste_guard("line1\nline2"), Some((2, 11)));
+        assert_eq!(
+            needs_paste_guard("line1\nline2").map(|g| (g.lines, g.chars)),
+            Some((2, 11))
+        );
         // a single trailing newline still counts as multi-line intent
-        assert_eq!(needs_paste_guard("rm -rf x\n").map(|g| g.0), Some(1));
+        assert_eq!(needs_paste_guard("rm -rf x\n").map(|g| g.lines), Some(1));
         let huge = "x".repeat(3000);
-        assert_eq!(needs_paste_guard(&huge).map(|g| g.0), Some(1));
+        assert_eq!(needs_paste_guard(&huge).map(|g| g.lines), Some(1));
+        assert_eq!(needs_paste_guard(&huge).map(|g| g.risk), Some(PasteRisk::TooLong));
     }
 
     /// BAYAN-002: CR is Enter. A short CR-separated paste must ask, and so
     /// must other controls. The size cap is in characters, not UTF-8 bytes.
     #[test]
     fn paste_guard_treats_cr_and_controls_as_dangerous() {
-        assert_eq!(needs_paste_guard("echo hi\recho pwned\r"), Some((2, 19)));
-        assert_eq!(needs_paste_guard("whoami\r"), Some((1, 7)));
+        assert_eq!(
+            needs_paste_guard("echo hi\recho pwned\r").map(|g| (g.lines, g.chars)),
+            Some((2, 19))
+        );
+        assert_eq!(
+            needs_paste_guard("whoami\r").map(|g| (g.lines, g.chars)),
+            Some((1, 7))
+        );
         // under the old 2000-byte cap, and still a submit
         assert!(needs_paste_guard(&"whoami\r".repeat(200)).is_some());
         // CRLF is one break, not two
-        assert_eq!(needs_paste_guard("a\r\nb"), Some((2, 4)));
-        assert_eq!(needs_paste_guard("a\u{2028}b"), Some((2, 3)));
-        assert_eq!(needs_paste_guard("a\u{2029}b"), Some((2, 3)));
-        assert_eq!(needs_paste_guard("a\u{0085}b"), Some((2, 3)));
+        assert_eq!(
+            needs_paste_guard("a\r\nb").map(|g| (g.lines, g.chars)),
+            Some((2, 4))
+        );
+        assert_eq!(
+            needs_paste_guard("a\u{2028}b").map(|g| (g.lines, g.chars)),
+            Some((2, 3))
+        );
+        assert_eq!(
+            needs_paste_guard("a\u{2029}b").map(|g| (g.lines, g.chars)),
+            Some((2, 3))
+        );
+        assert_eq!(
+            needs_paste_guard("a\u{0085}b").map(|g| (g.lines, g.chars)),
+            Some((2, 3))
+        );
         assert!(needs_paste_guard("echo \u{1b}[2J").is_some());
         assert!(needs_paste_guard("del\u{7f}").is_some());
         // a tab is indentation, not a command
@@ -984,6 +1231,25 @@ mod tests {
         assert_eq!(needs_paste_guard(&arabic), None);
         assert_eq!(needs_paste_guard(&"x".repeat(2000)), None);
         assert!(needs_paste_guard(&"x".repeat(2001)).is_some());
+    }
+
+    /// U+202E and the isolates reorder the card; ZWSP and BOM hide a character.
+    /// None of them is `is_control`. A confirmed paste must not send them.
+    #[test]
+    fn paste_guard_flags_bidi_overrides_and_zero_width() {
+        for c in ['\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{200B}', '\u{FEFF}'] {
+            let text = format!("ab{c}cd");
+            assert_eq!(
+                needs_paste_guard(&text).map(|g| g.risk),
+                Some(PasteRisk::Control),
+                "{c:?} must confirm"
+            );
+            assert_eq!(normalize_paste(&text, false), "abcd");
+        }
+        assert_eq!(paste_preview("ab\u{202E}cd", 48), "ab<RLO>cd");
+        assert_eq!(paste_preview("ab\u{200B}cd", 48), "ab<ZWSP>cd");
+        assert_eq!(paste_preview("ab\u{FEFF}cd", 48), "ab<BOM>cd");
+        assert_eq!(paste_preview("a\u{2066}b\u{2067}c\u{2068}d\u{2069}", 48), "a<LRI>b<RLI>c<FSI>d<PDI>");
     }
 
     #[test]
@@ -1064,6 +1330,80 @@ mod tests {
         assert_eq!(dropped_path_arg(Path::new("C:\\tmp\\a\nb.txt"), "powershell.exe"), None);
         assert_eq!(dropped_path_arg(Path::new("C:\\tmp\\a\rb.txt"), "cmd.exe"), None);
         assert_eq!(dropped_path_arg(Path::new("C:\\tmp\\a\rb.txt"), "wsl.exe -d Ubuntu"), None);
+    }
+
+    /// PowerShell treats U+2018..=U+201B as `'`. Doubling them is the same
+    /// rule as the ASCII quote, including the unknown-shell fallback and the
+    /// oh-my-posh theme argument (both call `powershell_escape_single`).
+    #[test]
+    fn powershell_doubles_smart_single_quotes() {
+        use std::path::Path;
+        let name = "C:\\tmp\\a\u{2019};calc;\u{2019}.txt";
+        let doubled = "'C:\\tmp\\a\u{2019}\u{2019};calc;\u{2019}\u{2019}.txt' ";
+        assert_eq!(
+            dropped_path_arg(Path::new(name), "powershell.exe").as_deref(),
+            Some(doubled)
+        );
+        assert_eq!(dropped_path_arg(Path::new(name), "nu.exe").as_deref(), Some(doubled));
+        let mixed = format!(
+            "C:\\tmp\\{}a{}b{}c{}.txt",
+            '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'
+        );
+        for shell in ["powershell.exe", "pwsh.exe", "nu.exe"] {
+            let q = dropped_path_arg(Path::new(&mixed), shell).unwrap();
+            for cp in ['\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'] {
+                assert_eq!(
+                    q.chars().filter(|c| *c == cp).count(),
+                    2,
+                    "{shell} left {cp:?} single in {q}"
+                );
+            }
+        }
+        // the theme path interpolates this into `--config '…'`
+        assert_eq!(
+            powershell_escape_single("D:\\themes\\o'night\u{2019}.omp.json"),
+            "D:\\themes\\o''night\u{2019}\u{2019}.omp.json"
+        );
+    }
+
+    /// `git-bash.exe` is bash. fish rejects `'\\''`. A full path to cmd.exe
+    /// is cmd, same as the bare name `shell_family` uses for the spawn branch.
+    #[test]
+    fn shell_family_quotes_git_bash_fish_and_cmd() {
+        use std::path::Path;
+        assert_eq!(shell_family(r"C:\Program Files\Git\git-bash.exe"), ShellFamily::Posix);
+        assert_eq!(shell_family("notbash.exe"), ShellFamily::PowerShell);
+        assert_eq!(shell_family(r"C:\Windows\System32\cmd.exe"), ShellFamily::Cmd);
+        assert_eq!(shell_family("cmd.exe /K chcp 65001"), ShellFamily::Cmd);
+        assert_eq!(shell_family("fish.exe"), ShellFamily::Fish);
+        assert_eq!(
+            dropped_path_arg(Path::new(r"C:\o'brien.txt"), "git-bash.exe").as_deref(),
+            Some("'C:\\o'\\''brien.txt' ")
+        );
+        assert_eq!(
+            dropped_path_arg(Path::new(r"C:\o'brien.txt"), "fish.exe").as_deref(),
+            Some(r"'C:\o\'brien.txt' ")
+        );
+        assert_eq!(
+            dropped_path_arg(Path::new(r"C:\"), "fish.exe").as_deref(),
+            Some(r"'C:\.' ")
+        );
+    }
+
+    /// Alt-screen and a shell that is not at its prompt must confirm. A drop
+    /// into a program that asked for bracketed paste is wrapped after quoting.
+    #[test]
+    fn drop_off_prompt_confirms_and_bracketed_wraps() {
+        use std::path::Path;
+        assert!(drop_needs_confirm(true, true), "alt screen, even at a prompt mark");
+        assert!(drop_needs_confirm(false, false), "no OSC 133 B");
+        assert!(!drop_needs_confirm(false, true), "cooked prompt types immediately");
+        let arg = dropped_path_arg(Path::new(r"C:\tmp\a&calc.exe"), "powershell.exe").unwrap();
+        let wrapped = normalize_paste(&arg, true);
+        assert!(wrapped.starts_with("\x1b[200~"), "{wrapped:?}");
+        assert!(wrapped.ends_with("\x1b[201~"), "{wrapped:?}");
+        assert!(wrapped.contains(r"'C:\tmp\a&calc.exe'"), "{wrapped:?}");
+        assert_eq!(normalize_paste(&arg, false), arg);
     }
 
     #[test]
@@ -1315,13 +1655,32 @@ mod tests {
         assert_eq!(scan_osc52(&at_cap).map(|s| s.len()), Some(OSC52_MAX_BYTES));
         // longer than the carry window, still unterminated: not a write
         let mut carried = b"\x1b]52;c;".to_vec();
-        carried.extend(std::iter::repeat(b'A').take(5000));
+        carried.extend(std::iter::repeat_n(b'A', 5000));
         assert_eq!(scan_osc52(&carried), None);
 
-        assert!(!allow_osc52_write(false, true), "default is off");
-        assert!(!allow_osc52_write(false, false));
-        assert!(!allow_osc52_write(true, false), "unfocused opt-in still does not write");
-        assert!(allow_osc52_write(true, true));
+        assert!(!allow_osc52_write(false, true, true), "default is off");
+        assert!(!allow_osc52_write(false, false, true));
+        assert!(!allow_osc52_write(true, false, true), "unfocused opt-in still does not write");
+        assert!(allow_osc52_write(true, true, true));
+    }
+
+    /// A background tab or an unfocused split must not set the clipboard,
+    /// even when copy is enabled and the window itself is focused.
+    #[test]
+    fn osc52_write_only_from_the_focused_pane() {
+        assert!(!allow_osc52_write(true, true, false));
+        assert!(!allow_osc52_write(true, false, false));
+        assert!(allow_osc52_write(true, true, true));
+    }
+
+    /// The 64 KiB constant is a decode backstop. One scan sees ~48 KiB, or
+    /// ~51 KiB when the opener is still in the 4 KiB carry.
+    #[test]
+    fn osc52_visible_cap_is_the_scan_buffer() {
+        assert_eq!(osc52_transport_room(PTY_READ), 49_146);
+        assert_eq!(osc52_transport_room(PTY_READ + MAX_CARRY), 52_218);
+        assert!(OSC52_MAX_BYTES > osc52_transport_room(PTY_READ + MAX_CARRY));
+        assert_eq!(PTY_READ, 64 * 1024);
     }
 
     /// BAYAN-003: UNC and device paths are not directories we will probe.

@@ -228,17 +228,23 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       Action Center — so that one is built-and-running, not eyeball-verified
 - [x] **Security (High)** — the four High findings from the audit
       (`docs/SECURITY_AUDIT.md`). OSC 52 no longer writes the OS clipboard
-      unless `osc52` is `"copy"` and the window is focused; the sequence must
-      end in BEL or ST, a `?` query is never answered, and the decoded text
-      is capped at 64 KiB. The paste guard treats CR (Enter on ConPTY), the
-      other line breaks, and other control characters as confirm-first, and
-      counts characters rather than UTF-8 bytes. `accept_local_cwd` is the
-      shared gate for a working directory — drive-letter paths only, so a
-      UNC or `\\?\` path from OSC 9;9 or `session.json` is dropped before
-      `is_dir` can open SMB. A dropped file is quoted for the shell that
-      pane was spawned with (PowerShell single quotes, cmd double quotes,
-      POSIX single quotes for Git Bash and WSL). Proven by the new unit
-      tests named in the audit; not exercised here as a live window.
+      unless `osc52` is `"copy"`, the window is focused, and the write comes
+      from the focused pane of the active tab; the sequence must end in BEL
+      or ST, a `?` query is never answered, and the decode backstop is 64 KiB.
+      One scan can only see about 48 KiB (a single 64 KiB read) or about
+      51 KiB (that read plus the 4 KiB carry). The paste guard treats CR
+      (Enter on ConPTY), the other line breaks, other control characters,
+      and bidi / zero-width spoofs as confirm-first, shows the reason and a
+      preview on the card, and strips ESC and the other C0/C1 bytes before
+      the text is sent. `accept_local_cwd` is the shared gate for a working
+      directory — drive-letter paths only, so a UNC or `\\?\` path from
+      OSC 9;9 or `session.json` is dropped before `is_dir` can open SMB. A
+      dropped file is quoted for the shell that pane was spawned with
+      (PowerShell single quotes, including the smart quotes, cmd double
+      quotes, POSIX single quotes for Git Bash and WSL, fish `\'`), and a
+      drop into vim, less, or a shell that is not at its prompt asks first.
+      Proven by the unit tests named in the audit; not exercised here as a
+      live window.
 
 ## Settings
 
@@ -262,7 +268,8 @@ Shell and scrollback apply to new tabs (no terminal restarts a live
 session); everything else applies immediately. `osc52` is config-file
 only (there is no settings-panel row). Leave it out or set `"off"`.
 `"copy"` lets a focused window accept OSC 52 clipboard writes from the
-child; no value enables a clipboard read.
+focused pane; no value enables a clipboard read. The decode backstop is
+64 KiB, and one scan sees about 48–51 KiB.
 
 ## Build
 
