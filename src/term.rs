@@ -866,9 +866,11 @@ pub struct PasteGuard {
 /// clipboard of `command\r` run on paste. Line breaks are CR, LF, CRLF, NEL,
 /// U+2028 and U+2029. Any other control except a tab takes the same confirm
 /// path (ESC would otherwise smuggle a sequence), and so do the bidi
-/// overrides U+202E and U+2066..=U+2069 plus the zero-width characters
-/// U+200B and U+FEFF — none of those are `is_control`, and a raw RLO in the
-/// card would spoof the preview. The size cap counts characters: a line of
+/// overrides U+202A..=U+202E and the isolates U+2066..=U+2069, plus the
+/// zero-width characters U+200B, U+FEFF, and U+2060 — none of those are
+/// `is_control`, and a raw RLO in the card would spoof the preview. LRM
+/// (U+200E), RLM (U+200F), and ALM (U+061C) do not confirm: Arabic copied
+/// from the web is full of them. The size cap counts characters: a line of
 /// Arabic is not "huge" because UTF-8 uses two bytes.
 ///
 /// Bracketed paste is intentionally not forced from our side. The guard runs
@@ -931,9 +933,19 @@ fn is_line_break(c: char) -> bool {
 /// `is_control` misses them, and a confirm card that draws them raw can be
 /// made to say the opposite of the bytes that would be sent.
 ///
-/// ZWJ (U+200D) and ZWNJ (U+200C) stay: Arabic and Persian need them.
+/// LRM, RLM, and ALM are not in this set: a paste of ordinary Arabic should
+/// not stop for them. A dropped filename still confirms on those marks; see
+/// [`drop_needs_confirm`]. ZWJ (U+200D) and ZWNJ (U+200C) stay allowed either
+/// way: Arabic and Persian need them.
 fn is_paste_spoof(c: char) -> bool {
-    paste_spoof_label(c).is_some()
+    paste_spoof_label(c).is_some() && !is_bidi_mark(c)
+}
+
+/// Marks that Arabic text from the web carries constantly. Not a paste
+/// trigger. Still a confirm on a dropped filename, where one mark can hide
+/// the rest of the name.
+fn is_bidi_mark(c: char) -> bool {
+    matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}')
 }
 
 fn paste_spoof_label(c: char) -> Option<&'static str> {
@@ -1125,11 +1137,12 @@ pub fn normalize_paste(text: &str, bracketed: bool) -> String {
 /// A drop is typed straight in only at a cooked shell prompt whose text does
 /// not itself need the paste guard. The alternate screen (vim, less), a shell
 /// that has not reported OSC 133 B (cmd inside PowerShell never does), and a
-/// name containing a bidi override or a zero-width character go through the
-/// confirm card. Those format characters are not controls, so quoting keeps
-/// them, and `normalize_paste` would otherwise strip them with no card.
+/// name containing a bidi override, a zero-width character, or a directional
+/// mark (LRM, RLM, ALM) go through the confirm card. Those marks do not
+/// raise the card for a paste. In a filename they still do: quoting keeps
+/// them, and they can hide the rest of the name.
 pub fn drop_needs_confirm(alt_screen: bool, at_prompt: bool, text: &str) -> bool {
-    alt_screen || !at_prompt || needs_paste_guard(text).is_some()
+    alt_screen || !at_prompt || needs_paste_guard(text).is_some() || text.chars().any(is_bidi_mark)
 }
 
 /// The confirm card's one-line preview. Controls become the visible pictures
@@ -1269,14 +1282,12 @@ mod tests {
     }
 
     /// Overrides and zero-width characters are not `is_control`. A confirmed
-    /// paste must not send them. ZWJ and ZWNJ are the exception: shaping needs them.
+    /// paste must not send them. LRM, RLM, and ALM are not in this set.
+    /// ZWJ and ZWNJ stay: shaping needs them.
     #[test]
     fn paste_guard_flags_bidi_overrides_and_zero_width() {
         for (c, label) in [
-            ('\u{061C}', "<ALM>"),
             ('\u{200B}', "<ZWSP>"),
-            ('\u{200E}', "<LRM>"),
-            ('\u{200F}', "<RLM>"),
             ('\u{202A}', "<LRE>"),
             ('\u{202B}', "<RLE>"),
             ('\u{202C}', "<PDF>"),
@@ -1300,6 +1311,28 @@ mod tests {
         }
         assert_eq!(needs_paste_guard("a\u{200D}b\u{200C}c"), None, "ZWJ and ZWNJ stay");
         assert_eq!(normalize_paste("a\u{200D}b\u{200C}c", false), "a\u{200D}b\u{200C}c");
+    }
+
+    /// Arabic copied from the web is full of LRM, RLM, and ALM. Those marks
+    /// paste straight through. An override still stops for the card.
+    #[test]
+    fn arabic_with_lrm_and_rlm_pastes_without_a_card() {
+        let text = "السلام\u{200E} عليكم\u{200F} و\u{061C}رحمة";
+        assert_eq!(needs_paste_guard(text), None);
+        assert_eq!(normalize_paste(text, false), text);
+        for (c, label) in [('\u{200E}', "<LRM>"), ('\u{200F}', "<RLM>"), ('\u{061C}', "<ALM>")] {
+            let marked = format!("مرحبا{c}بك");
+            assert_eq!(needs_paste_guard(&marked), None, "{label}");
+            assert_eq!(normalize_paste(&marked, false), marked);
+            // the card still draws the mark as text, so a mixed paste cannot
+            // be reordered by a mark that did not itself open the card
+            assert_eq!(paste_preview(&marked, 48), format!("مرحبا{label}بك"));
+        }
+        assert_eq!(
+            needs_paste_guard("السلام\u{202E}عليكم").map(|g| g.risk),
+            Some(PasteRisk::Control)
+        );
+        assert_eq!(normalize_paste("السلام\u{202E}عليكم", false), "السلامعليكم");
     }
 
     #[test]
@@ -1517,6 +1550,15 @@ mod tests {
         assert!(drop_needs_confirm(false, true, &zwsp));
         let zwj = dropped_path_arg(Path::new("C:\\d\\a\u{200D}b.txt"), "powershell.exe").unwrap();
         assert!(!drop_needs_confirm(false, true, &zwj), "ZWJ is part of the name");
+        // LRM / RLM / ALM do not confirm a paste. In a filename they still do.
+        for mark in ['\u{200E}', '\u{200F}', '\u{061C}'] {
+            let raw = format!("C:\\d\\a{mark}b.txt");
+            let quoted = dropped_path_arg(Path::new(&raw), "powershell.exe").unwrap();
+            assert!(
+                drop_needs_confirm(false, true, &quoted),
+                "{mark:?} in a dropped name still confirms"
+            );
+        }
         let arg = dropped_path_arg(Path::new(r"C:\tmp\a&calc.exe"), "powershell.exe").unwrap();
         let wrapped = normalize_paste(&arg, true);
         assert!(wrapped.starts_with("\x1b[200~"), "{wrapped:?}");

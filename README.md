@@ -234,7 +234,8 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       One scan can only see about 48 KiB (a single 64 KiB read) or about
       51 KiB (that read plus the 4 KiB carry). The paste guard treats CR
       (Enter on ConPTY), the other line breaks, other control characters,
-      and bidi / zero-width spoofs as confirm-first, shows the reason and a
+      and strong bidi / zero-width spoofs as confirm-first (LRM, RLM, and
+      ALM in a paste do not), shows the reason and a
       preview on the card, and strips ESC and the other C0/C1 bytes before
       the text is sent. `accept_local_cwd` is the shared gate for a working
       directory — drive-letter paths only, so a UNC or `\\?\` path from
@@ -244,7 +245,7 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       quotes, POSIX single quotes for Git Bash and WSL, fish with `\`
       doubled before the apostrophe, a nushell raw string), and a
       drop into vim, less, a shell that is not at its prompt, or a name
-      with a bidi override asks first.
+      with a bidi mark or override asks first.
       Proven by the unit tests named in the audit; not exercised here as a
       live window.
 
