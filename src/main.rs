@@ -529,7 +529,12 @@ struct App {
     /// the prompt picker, when open
     posh: Option<PoshPicker>,
     /// the link under the pointer while Ctrl is held: (pane, row, c0, c1, target)
-    hover_link: Option<(usize, usize, usize, usize, String)>,
+    hover_link: Option<(usize, usize, usize, usize, links::Target)>,
+    /// the span the hover was last computed for, resolved or not — so a
+    /// pointer moving inside one token never hits the disk twice. The link
+    /// text is part of the key: the same columns can hold a different
+    /// token after a scroll, and that must re-resolve.
+    hover_span: Option<(usize, usize, usize, usize, links::Link)>,
     /// most-recently-used tab history for Ctrl+Tab
     mru: mru::Mru,
     /// the command palette, when open
@@ -1824,43 +1829,65 @@ impl App {
         Some(s)
     }
 
-    /// The link under the pointer, resolved: URLs as written, paths only
-    /// when the file exists (relative ones against the pane's cwd).
-    fn link_under(&self, pos: PhysicalPosition<f64>) -> Option<(usize, usize, usize, usize, String)> {
+    /// The link SPAN under the pointer. Pure text — no disk access — so
+    /// it is safe to run on every pointer move.
+    fn link_span_under(
+        &self,
+        pos: PhysicalPosition<f64>,
+    ) -> Option<(usize, usize, usize, usize, links::Link)> {
         let (pi, row, col, _) = self.pane_cell_at(pos)?;
         let text = self.row_text(pi, row)?;
         let (c0, c1, link) = links::link_at(&text, col)?;
-        let target = match link {
-            links::Link::Url(u) => u,
-            links::Link::Path(p) => {
-                let cwd = self.tabs[self.active].panes[pi].session.meta.lock().unwrap().cwd.clone();
-                links::resolve_path(&p, cwd.as_deref())?.to_string_lossy().into_owned()
-            }
+        Some((pi, row, c0, c1, link))
+    }
+
+    /// Resolve a span into something activatable. THIS is the step that
+    /// touches the disk (and the one that refuses UNC before it does), so
+    /// callers run it only when the span under the pointer changed.
+    fn resolve_link(&self, pi: usize, link: &links::Link) -> Option<links::Target> {
+        let cwd = match link {
+            links::Link::Url(_) => None,
+            links::Link::Path(_) => self
+                .tabs
+                .get(self.active)?
+                .panes
+                .get(pi)?
+                .session
+                .meta
+                .lock()
+                .unwrap()
+                .cwd
+                .clone(),
         };
-        Some((pi, row, c0, c1, target))
+        links::resolve(link, cwd.as_deref())
     }
 
     /// Re-evaluate the Ctrl-hover link for the current pointer (called on
     /// pointer moves and on Ctrl press/release) — redraws when it changes.
+    /// Finding the span is free; resolving it is not, so a pointer moving
+    /// inside one token resolves nothing and redraws nothing.
     fn refresh_hover_link(&mut self) {
-        let next = if self.modifiers.control_key() && !self.mouse_left_down {
-            self.link_under(self.cursor_pos)
+        let span = if self.modifiers.control_key() && !self.mouse_left_down {
+            self.link_span_under(self.cursor_pos)
         } else {
             None
         };
-        let changed = next.as_ref().map(|l| (l.0, l.1, l.2, l.3))
-            != self.hover_link.as_ref().map(|l| (l.0, l.1, l.2, l.3));
-        self.hover_link = next;
-        if changed {
-            if let Some(w) = &self.window {
-                w.set_cursor(if self.hover_link.is_some() {
-                    winit::window::CursorIcon::Pointer
-                } else {
-                    winit::window::CursorIcon::Default
-                });
-            }
-            self.request_redraw();
+        if span == self.hover_span {
+            return;
         }
+        self.hover_span = span.clone();
+        let resolved = span.and_then(|(pi, row, c0, c1, link)| {
+            self.resolve_link(pi, &link).map(|t| (pi, row, c0, c1, t))
+        });
+        self.hover_link = resolved;
+        if let Some(w) = &self.window {
+            w.set_cursor(if self.hover_link.is_some() {
+                winit::window::CursorIcon::Pointer
+            } else {
+                winit::window::CursorIcon::Default
+            });
+        }
+        self.request_redraw();
     }
 
     fn has_selection(&self) -> bool {
@@ -2798,11 +2825,13 @@ impl ApplicationHandler<UserEvent> for App {
                         self.request_redraw();
                         return;
                     }
-                    // Ctrl+click on a link opens it (browser / associated app)
+                    // Ctrl+click acts on the link (browser, associated app,
+                    // or Explorer for anything that is not a document)
                     // instead of starting a selection
                     if self.modifiers.control_key() {
-                        if let Some((_, _, _, _, target)) = self.link_under(self.cursor_pos) {
-                            if !links::open_external(&target) {
+                        self.refresh_hover_link(); // cheap: the span has not moved
+                        if let Some((.., target)) = self.hover_link.clone() {
+                            if !links::activate(&target) {
                                 eprintln!("bayan: could not open {target}");
                             }
                             return;
@@ -3170,6 +3199,7 @@ fn main() {
     let mut app = App {
         posh: None,
         hover_link: None,
+        hover_span: None,
         mru: mru::Mru::new(),
         palette: None,
         last_strip_click: None,
