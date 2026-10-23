@@ -226,6 +226,30 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       (Shell_NotifyIcon, the biggest windows-sys consumer) compiles and the app
       runs, but a balloon was not caught on camera — quiet hours file it to the
       Action Center — so that one is built-and-running, not eyeball-verified
+- [x] **M24** — kitty keyboard protocol. alacritty_terminal 0.26 already
+      parsed `CSI > u` / `CSI < u` / `CSI = u` / `CSI ? u` into a per-screen
+      flag stack, and the stack was inert because `Term::new` left
+      `kitty_keyboard` at its default of false. Turning it on is the whole
+      of the mode tracking. One real bug in that crate came with it:
+      `CSI =` updates `TermMode` but the query reply reads the push/pop
+      stack, so a set-then-query probe (how an app checks that the flags
+      stuck) answered 0. The feed path pops the stale top and pushes the
+      mode bits back in front of each query, so the reply matches the flags
+      the encoder uses. A zero mode does not push onto an empty stack: a
+      startup `CSI ? u` must not invent a level.
+      The encoder is EasyTer's `kitty_encode_key` for the disambiguate
+      flag — Esc, shift+Enter, ctrl+space, ctrl/alt letters become CSI u;
+      plain text and unmodified Enter/Tab/Backspace/arrows stay legacy —
+      extended to the other four flags. Alternate keys are layout-aware:
+      the primary code is the active layout's unshifted character, the
+      shifted alternate is the glyph the layout actually produced (Arabic
+      kasra, not `to_uppercase` of ش), and the base-layout alternate is the
+      PC-101 key in that physical position (`ش` on the A key reports `97`).
+      Protocol off is the old encoder, including Ctrl+C by physical key on
+      an Arabic layout. Proven by the encoder tests and a headless term
+      test of push/pop/set/query plus the alt-screen stack swap. Not proven
+      live: `kitten show-key`, Neovim, and Claude Code need a Windows
+      session this tree was not run in
 
 ## Settings
 

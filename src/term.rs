@@ -334,8 +334,10 @@ fn feed_counted<T: EventListener>(
     }
     // vte 0.15 takes the whole slice (it batches internally) instead of one
     // byte per call. The counter brackets the entire feed, so this is a
-    // straight speedup, not a change in what gets measured.
-    parser.advance(t, bytes);
+    // straight speedup, not a change in what gets measured. Queries are
+    // split out so each one is answered from the mode the bytes before it
+    // just established.
+    advance_with_kitty_queries(parser, t, bytes);
     let off_after = t.grid().display_offset();
     let hist_after = t.grid().history_size();
     let base = if parked { 1 } else { off_before };
@@ -348,6 +350,62 @@ fn feed_counted<T: EventListener>(
     let evict = scrolled - growth;
     if evict > 0 {
         meta.evicted += evict as u64;
+    }
+}
+
+/// First `CSI ? … u` in `data`, as `(start, end)`.
+fn find_kitty_query(data: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        if data[i] == 0x1b && data.get(i + 1) == Some(&b'[') && data.get(i + 2) == Some(&b'?') {
+            let mut j = i + 3;
+            while j < data.len() && matches!(data[j], b'0'..=b'9' | b';') {
+                j += 1;
+            }
+            if data.get(j) == Some(&b'u') {
+                return Some((i, j + 1));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Feed `bytes`, answering each kitty query from the mode bits.
+///
+/// alacritty_terminal 0.26 updates `TermMode` for `CSI = flags ; mode u` but
+/// the query reply reads the push/pop stack, which `=` does not touch. A
+/// program that sets flags and then queries (the protocol's own feature
+/// probe) would be told the flags are still 0. Pop the stale top, then push
+/// the mode bits so the stack top matches the mode the encoder uses, and
+/// only then run the original query.
+///
+/// A zero mode does not push onto an empty stack. `CSI >0u` is a real stack
+/// entry of "no flags", and a startup probe (`CSI ? u` before any push)
+/// must not invent one — a later pop would then uncover that phantom
+/// instead of the level the program actually pushed.
+fn advance_with_kitty_queries<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    bytes: &[u8],
+) {
+    let mut rest = bytes;
+    while let Some((start, end)) = find_kitty_query(rest) {
+        if start > 0 {
+            parser.advance(t, &rest[..start]);
+        }
+        let flags = crate::keys::protocol_bits(*t.mode());
+        parser.advance(t, b"\x1b[<u");
+        let revealed = crate::keys::protocol_bits(*t.mode());
+        if flags != 0 || revealed != 0 {
+            let repair = format!("\x1b[>{flags}u");
+            parser.advance(t, repair.as_bytes());
+        }
+        parser.advance(t, &rest[start..end]);
+        rest = &rest[end..];
+    }
+    if !rest.is_empty() {
+        parser.advance(t, rest);
     }
 }
 
@@ -605,6 +663,10 @@ impl Session {
 
         let config = Config {
             scrolling_history: scrollback,
+            // alacritty_terminal already parses CSI >/=/</? u into the
+            // keyboard-mode stack and TermMode. The flag defaults off, which
+            // is why a TUI's push was a no-op and keys.rs never saw the mode.
+            kitty_keyboard: true,
             ..Config::default()
         };
         let term = Arc::new(Mutex::new(Term::new(
@@ -1006,5 +1068,123 @@ mod tests {
             parse_posh_config("# oh-my-posh init pwsh --config x.json\nSet-Alias g git"),
             None
         );
+    }
+
+    struct PtyLog(Arc<Mutex<Vec<String>>>);
+
+    impl EventListener for PtyLog {
+        fn send_event(&self, event: Event) {
+            if let Event::PtyWrite(text) = event {
+                self.0.lock().unwrap().push(text);
+            }
+        }
+    }
+
+    struct KittyFixture {
+        term: Term<PtyLog>,
+        parser: Processor,
+        meta: SessionMeta,
+        carry: Vec<u8>,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn kitty_term(enabled: bool) -> KittyFixture {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let size = TermSize { cols: 40, rows: 6 };
+        let config = Config { kitty_keyboard: enabled, ..Config::default() };
+        KittyFixture {
+            term: Term::new(config, &size, PtyLog(Arc::clone(&log))),
+            parser: Processor::new(),
+            meta: SessionMeta::default(),
+            carry: Vec::new(),
+            log,
+        }
+    }
+
+    fn take_writes(log: &Mutex<Vec<String>>) -> Vec<String> {
+        std::mem::take(&mut *log.lock().unwrap())
+    }
+
+    #[test]
+    fn kitty_push_pop_set_and_query() {
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log,
+        } = kitty_term(true);
+        let kitty = TermMode::KITTY_KEYBOARD_PROTOCOL;
+
+        // a probe before any push reports 0 and must not invent a stack level
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
+        assert!(!t.mode().intersects(kitty));
+
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[>1u");
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        let other_flags = kitty.difference(TermMode::DISAMBIGUATE_ESC_CODES);
+        assert!(!t.mode().intersects(other_flags));
+
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[>31u\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?31u".to_string()]);
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert!(t.mode().contains(TermMode::REPORT_ASSOCIATED_TEXT));
+
+        // pop restores the pushed 1, not zero — and not a phantom from the probe
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[<u\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?1u".to_string()]);
+
+        // CSI = updates flags in place: union alternate (4) onto 1, then
+        // clear disambiguate (bit 1) with mode 3. The query must report the
+        // mode bits, which stock 0.26 would not — it answers from the stack.
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[=4;2u\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?5u".to_string()]);
+        assert!(t.mode().contains(TermMode::REPORT_ALTERNATE_KEYS));
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[=1;3u\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?4u".to_string()]);
+        assert!(!t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+
+        // clearing the last bit with CSI = must answer 0, not the stale push
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[=0u\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
+        assert!(!t.mode().intersects(kitty));
+
+        // rebuild a primary level, then check the alternate screen's own stack
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[>4u");
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?1049h\x1b[?u");
+        assert!(t.mode().contains(TermMode::ALT_SCREEN));
+        assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
+        assert!(!t.mode().intersects(kitty));
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[>8u\x1b[?1049l\x1b[?u",
+        );
+        assert!(!t.mode().contains(TermMode::ALT_SCREEN));
+        assert!(t.mode().contains(TermMode::REPORT_ALTERNATE_KEYS));
+        assert_eq!(take_writes(&log), vec!["\x1b[?4u".to_string()]);
+    }
+
+    #[test]
+    fn kitty_disabled_ignores_push_and_query() {
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log,
+        } = kitty_term(false);
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[>31u\x1b[=1u\x1b[?u",
+        );
+        assert!(take_writes(&log).is_empty());
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
     }
 }
