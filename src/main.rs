@@ -232,8 +232,10 @@ pub enum UserEvent {
     PtyWrite(u64, String),
     /// The font system finished loading on its background thread.
     RendererReady(Box<render::Renderer>),
-    /// A program set the clipboard via OSC 52 (yank over SSH ...).
-    ClipboardSet(String),
+    /// Pane `id` asked to set the clipboard via OSC 52. Applied only when
+    /// `allow_osc52_write` says so — the default is to drop it, and a write
+    /// from any pane but the focused one of the active tab is dropped too.
+    ClipboardSet(u64, String),
     /// Pane `id`'s shell reported its working directory (OSC 9;9).
     Cwd(u64, String),
     /// Pane `id` rang the bell (Claude waiting for an approval).
@@ -259,6 +261,14 @@ struct LinkHover {
 struct BlockedLink {
     reason: String,
     shown: String,
+}
+
+/// Text held for the confirm card: the bytes to send, and why the card is up.
+struct PendingPaste {
+    text: String,
+    lines: usize,
+    chars: usize,
+    reason: String,
 }
 
 /// One terminal pane (a tab holds one or more).
@@ -476,8 +486,8 @@ struct App {
     /// the agent cockpit overlay (Ctrl+Shift+D): one glance at every tab
     cockpit: bool,
     cockpit_sel: usize,
-    /// a big paste awaiting Enter/Esc (EasyTer's paste guard)
-    pending_paste: Option<String>,
+    /// a paste or a drop awaiting Enter/Esc (EasyTer's paste guard)
+    pending_paste: Option<PendingPaste>,
     /// a close awaiting Enter/Esc (a command is still running)
     pending_close: Option<CloseTarget>,
     /// link under the pointer: underline + the target in the pane status
@@ -1281,6 +1291,15 @@ impl App {
         t.panes.get_mut(f).map(|p| &mut p.session)
     }
 
+    /// OSC 52 may write only from the focused pane of the active tab.
+    fn osc52_pane_is_focused(&self, id: u64) -> bool {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return false;
+        };
+        let ids: Vec<u64> = tab.panes.iter().map(|p| p.id).collect();
+        crate::osc52_pane_is_focused(&[(tab.focused, ids.as_slice())], 0, id)
+    }
+
     /// (tab index, pane index) for a pane id, wherever it lives.
     fn find_pane(&self, id: u64) -> Option<(usize, usize)> {
         for (ti, t) in self.tabs.iter().enumerate() {
@@ -1306,11 +1325,17 @@ impl App {
     }
 
     fn spawn_tab(&mut self, cwd: Option<String>) {
+        // Same gate as spawn: a restored UNC path must not become the tab
+        // title either. accept_local_cwd does not touch the filesystem.
+        let cwd = cwd.and_then(|c| term::accept_local_cwd(&c));
         let title = cwd
             .as_deref()
             .and_then(|c| c.rsplit(['\\', '/']).next().map(str::to_string))
             .unwrap_or_else(|| "بيان".to_string());
         if let Some(pane) = self.spawn_pane(cwd.as_deref()) {
+            // this becomes the active tab without switch_tab, so a button
+            // held on the previous tab has to go up first
+            self.abandon_mouse();
             self.tabs.push(Tab {
                 panes: vec![pane],
                 weights: vec![1.0],
@@ -1321,7 +1346,7 @@ impl App {
             });
             self.active = self.tabs.len() - 1;
             self.relayout_active();
-            self.sync_focus();
+            self.sync_focus(None);
         }
     }
 
@@ -1440,7 +1465,7 @@ impl App {
             t.focused = t.panes.len() - 1;
         }
         self.relayout_active();
-        self.sync_focus();
+        self.sync_focus(None);
         self.request_redraw();
     }
 
@@ -1471,7 +1496,7 @@ impl App {
         }
         self.relayout_active();
         self.update_title();
-        self.sync_focus();
+        self.sync_focus(None);
         self.request_redraw();
     }
 
@@ -1487,7 +1512,7 @@ impl App {
         self.search = None; // the bar belongs to the tab that opened it
         self.relayout_active(); // this tab's layout may differ
         self.update_title();
-        self.sync_focus();
+        self.sync_focus(None);
         self.request_redraw();
     }
 
@@ -1510,7 +1535,16 @@ impl App {
                     cwds: t
                         .panes
                         .iter()
-                        .map(|p| p.session.meta.lock().unwrap().cwd.clone())
+                        .map(|p| {
+                            // don't persist a path we would refuse to start in
+                            p.session
+                                .meta
+                                .lock()
+                                .unwrap()
+                                .cwd
+                                .as_deref()
+                                .and_then(term::accept_local_cwd)
+                        })
                         .collect(),
                     weights: t.weights.clone(),
                     orientation: match t.orientation {
@@ -1649,8 +1683,15 @@ impl App {
     /// program that just enabled 1004 hears the current state on the next
     /// wakeup — xterm sends it as the mode turns on, and the chunk that
     /// carried the mode is what wakes us.
-    fn sync_focus(&mut self) {
-        let window_focused = self.window_focused();
+    ///
+    /// `focused` is the `Focused` event when one just arrived. Other
+    /// callers pass `None`, and the window's `has_focus` answers, so a
+    /// window that is already focused at startup still sends CSI I.
+    /// The event is not checked again against the window: `has_focus`
+    /// can stay true for a moment after `Focused(false)` and would
+    /// swallow CSI O.
+    fn sync_focus(&mut self, focused: Option<bool>) {
+        let window_focused = focused.unwrap_or_else(|| self.window_focused());
         let focused_pane = if window_focused {
             self.tabs
                 .get(self.active)
@@ -1669,8 +1710,8 @@ impl App {
 
     /// Release a reported button if the program is still tracking, then
     /// drop the grab and the local selection drag. Focus loss, a tab
-    /// switch, and a pane close all go through here — otherwise the
-    /// button stays down in vim after Alt+Tab.
+    /// switch, a new tab, and a pane close all go through here —
+    /// otherwise the button stays down in vim after Alt+Tab.
     fn abandon_mouse(&mut self) {
         let proto = self
             .mouse
@@ -1791,9 +1832,8 @@ impl App {
             || self.palette.is_some()
             || self.posh.is_some()
             || self.pending_close.is_some()
-            // #2 replaces String with PendingPaste { text, lines, chars, reason }.
-            // is_some() is the hook either way. The refused-link card is the
-            // same kind of overlay: a Ctrl+click under it must not open.
+            // PendingPaste is the confirm card. The refused-link card is the
+            // same kind of overlay: a Ctrl+click under either must not open.
             || self.pending_paste.is_some()
             || self.blocked_link.is_some()
     }
@@ -1871,7 +1911,7 @@ impl App {
             return false;
         };
         self.focus_pane_at(pane);
-        self.sync_focus();
+        self.sync_focus(None);
         let cwd = self.pane_link_cwd(id);
         let code = link::find_code_exe();
         let code_s = code.as_ref().map(|p| p.to_string_lossy().into_owned());
@@ -1949,7 +1989,7 @@ impl App {
             return false;
         };
         self.focus_pane_at(pane);
-        self.sync_focus();
+        self.sync_focus(None);
         if let Some(out) = bytes {
             self.write_pane(out.pane, &out.bytes);
         }
@@ -2167,13 +2207,26 @@ impl App {
         if txt.is_empty() {
             return;
         }
-        // EasyTer's paste guard: confirm before a multi-line/huge paste
-        if term::needs_paste_guard(&txt).is_some() {
-            self.pending_paste = Some(txt);
-            self.request_redraw();
+        // EasyTer's paste guard: confirm before a multi-line/huge paste.
+        // `None` means the text is safe to type.
+        self.arm_pending_paste(txt, None);
+    }
+
+    /// Hold `txt` for the confirm card. `fallback` is the reason when the
+    /// guard itself is quiet — a quoted drop onto vim, or onto a shell that
+    /// is not at its prompt. The card draws whenever this is set, including
+    /// when the text has no control characters.
+    fn arm_pending_paste(&mut self, txt: String, fallback: Option<term::PasteRisk>) {
+        let (lines, chars, reason) = if let Some(g) = term::needs_paste_guard(&txt) {
+            (g.lines, g.chars, g.risk.label().to_string())
+        } else if let Some(risk) = fallback {
+            (1, txt.chars().count(), risk.label().to_string())
+        } else {
+            self.send_paste(&txt);
             return;
-        }
-        self.send_paste(&txt);
+        };
+        self.pending_paste = Some(PendingPaste { text: txt, lines, chars, reason });
+        self.request_redraw();
     }
 
     fn send_paste(&mut self, txt: &str) {
@@ -2434,15 +2487,18 @@ impl App {
                     );
                 }
                 if let Some(p) = &self.pending_paste {
-                    if let Some((lines, chars)) = term::needs_paste_guard(p) {
-                        renderer.draw_paste_guard(
-                            &mut verts,
-                            px.width as usize,
-                            px.height as usize,
-                            lines,
-                            chars,
-                        );
-                    }
+                    let preview = term::paste_preview(&p.text, 48);
+                    renderer.draw_paste_guard(
+                        &mut verts,
+                        px.width as usize,
+                        px.height as usize,
+                        &render::PasteCard {
+                            lines: p.lines,
+                            chars: p.chars,
+                            reason: &p.reason,
+                            preview: &preview,
+                        },
+                    );
                 }
                 if let Some(block) = &self.blocked_link {
                     renderer.draw_link_block(
@@ -2607,7 +2663,7 @@ impl ApplicationHandler<UserEvent> for App {
             self.cockpit_sel = self.active;
         }
         if std::env::var_os("BAYAN_GUARD").is_some() {
-            self.pending_paste = Some("echo one\necho two\necho three\n".into());
+            self.arm_pending_paste("echo one\necho two\necho three\n".into(), None);
         }
         if std::env::var_os("BAYAN_SETTINGS").is_some() {
             self.settings = Some(0);
@@ -2660,7 +2716,7 @@ impl ApplicationHandler<UserEvent> for App {
         crate::prof::mark("session spawned");
         // the window exists now; if it is already focused and a pane has
         // 1004, say so. has_focus is the same check a later rebase uses.
-        self.sync_focus();
+        self.sync_focus(None);
         // FontSystem::new scans every installed font — the documented
         // cosmic-text startup cost (pop-os/cosmic-text#247): keep it off
         // the UI thread and swap the renderer in when it's ready
@@ -2701,7 +2757,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // the chunk may have enabled focus reporting; tell the
                 // program whether the window is looking at it
-                self.sync_focus();
+                self.sync_focus(None);
                 self.request_redraw();
             }
             UserEvent::PtyWrite(id, text) => {
@@ -2709,7 +2765,19 @@ impl ApplicationHandler<UserEvent> for App {
                     self.tabs[ti].panes[pi].session.write(text.as_bytes());
                 }
             }
-            UserEvent::ClipboardSet(text) => self.set_clipboard(text),
+            UserEvent::ClipboardSet(id, text) => {
+                // has_focus, not the startup value of self.focused: that flag
+                // begins false and only tracks Focused events, which can lag
+                // the real window state (and used to begin as true).
+                let window_focused = self.window.as_ref().is_some_and(|w| w.has_focus());
+                if term::allow_osc52_write(
+                    self.config.osc52_copy_enabled(),
+                    window_focused,
+                    self.osc52_pane_is_focused(id),
+                ) {
+                    self.set_clipboard(text);
+                }
+            }
             UserEvent::Bell(id) => {
                 // the cockpit signal: a pane you're NOT looking at wants you
                 let mode = self.config.bell_mode();
@@ -2864,16 +2932,40 @@ impl ApplicationHandler<UserEvent> for App {
                     // Alt+Tab with the button down must not keep dragging
                     self.abandon_mouse();
                 }
-                // mode 1004: CSI I on the way in, CSI O on the way out.
-                // has_focus, so a window that is already focused at startup
-                // still announces when 1004 turns on.
-                self.sync_focus();
+                // The event bit, not has_focus: that query can still say
+                // true after Focused(false) and would drop CSI O.
+                self.sync_focus(Some(f));
             }
             WindowEvent::DroppedFile(path) => {
-                // a dropped file lands at the prompt as a shell-ready path
-                let arg = term::dropped_path_arg(&path);
-                if let Some(s) = self.session_mut() {
-                    s.write(arg.as_bytes());
+                // Quote for the shell this pane was spawned with. A name like
+                // $(calc) must arrive as a literal; a control character is
+                // not typed at all. vim, less, and a shell that is not at its
+                // prompt (cmd inside PowerShell never emits OSC 133 B) confirm
+                // first. A program that asked for bracketed paste gets the wrap.
+                let decision = {
+                    let Some(session) = self.session() else {
+                        return;
+                    };
+                    let Some(arg) = term::dropped_path_arg(&path, session.shell()) else {
+                        return;
+                    };
+                    // term, then meta — the lock order the reader uses too.
+                    let mode = *session.term.lock().unwrap().mode();
+                    let at_prompt = session.meta.lock().unwrap().at_prompt;
+                    (arg, mode, at_prompt)
+                };
+                let (arg, mode, at_prompt) = decision;
+                let alt = mode.contains(TermMode::ALT_SCREEN);
+                if term::drop_needs_confirm(alt, at_prompt, &arg) {
+                    let why = if alt {
+                        term::PasteRisk::AltScreen
+                    } else {
+                        term::PasteRisk::NotAtPrompt
+                    };
+                    self.arm_pending_paste(arg, Some(why));
+                } else if let Some(s) = self.session_mut() {
+                    let body = term::normalize_paste(&arg, mode.contains(TermMode::BRACKETED_PASTE));
+                    s.write(body.as_bytes());
                 }
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
@@ -3101,7 +3193,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     self.update_title();
                                 }
                             }
-                            self.sync_focus();
+                            self.sync_focus(None);
                             self.sel_pane = pi;
                             // 1 click = simple drag anchor, 2 = word, 3 = line
                             let n = self.clicks.click(Instant::now(), (row, col));
@@ -3232,8 +3324,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.pending_paste.is_some() {
                     match &event.logical_key {
                         Key::Named(NamedKey::Enter) => {
-                            if let Some(txt) = self.pending_paste.take() {
-                                self.send_paste(&txt);
+                            if let Some(pending) = self.pending_paste.take() {
+                                self.send_paste(&pending.text);
                             }
                         }
                         Key::Named(NamedKey::Escape) => self.pending_paste = None,
@@ -3336,7 +3428,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 t.focused =
                                     ((t.focused as i32 + d + n) % n) as usize;
                                 self.update_title();
-                                self.sync_focus();
+                                self.sync_focus(None);
                                 self.request_redraw();
                                 return;
                             }
@@ -3490,7 +3582,7 @@ fn main() {
         last_input: Instant::now(),
         blink_drawn_on: true,
         settings: None,
-        focused: true,
+        focused: false,
         clicks: ClickTracker::new(),
         wheel_accum: 0.0,
         search: None,
@@ -3508,10 +3600,32 @@ fn main() {
     event_loop.run_app(&mut app).expect("run event loop");
 }
 
+/// OSC 52 writes only from the focused pane of the active tab.
+/// `tabs` is `(focused index, pane ids)` per tab. A background tab's pane
+/// is not the focused slot of `active`, so it does not match.
+fn osc52_pane_is_focused(tabs: &[(usize, &[u64])], active: usize, source: u64) -> bool {
+    let Some((focused, panes)) = tabs.get(active) else {
+        return false;
+    };
+    panes.get(*focused) == Some(&source)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn osc52_pane_is_focused() {
+        // active tab's focused pane is index 1 (id 20). Id 10 is the other split.
+        let tabs: [(usize, &[u64]); 2] = [(1, &[10, 20]), (0, &[30])];
+        assert!(super::osc52_pane_is_focused(&tabs, 0, 20));
+        assert!(!super::osc52_pane_is_focused(&tabs, 0, 10), "unfocused split");
+        assert!(!super::osc52_pane_is_focused(&tabs, 0, 30), "background tab");
+        assert!(!super::osc52_pane_is_focused(&tabs, 5, 20), "no such tab");
+        let past_end: [(usize, &[u64]); 1] = [(3, &[1])];
+        assert!(!super::osc52_pane_is_focused(&past_end, 0, 1), "focused index past the end");
+    }
 
     #[test]
     fn split_rects_divide_by_weight() {
