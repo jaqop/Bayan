@@ -249,7 +249,27 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       an Arabic layout. Proven by the encoder tests and a headless term
       test of push/pop/set/query plus the alt-screen stack swap. Not proven
       live: `kitten show-key`, Neovim, and Claude Code need a Windows
-      session this tree was not run in
+      session this tree was not run in.
+      The follow-up made the protocol **opt-in**. ConPTY (the system conhost
+      behind portable-pty) has been reported to swallow the ESC of `CSI u`
+      ([rio#1607](https://github.com/raphamorim/rio/issues/1607),
+      [microsoft/terminal#19847](https://github.com/microsoft/terminal/issues/19847)),
+      which would turn Ctrl+C into the literal text `[99;5u`. Until that is
+      verified on a real Windows session, `keyboard.kitty_protocol` defaults
+      to false: push and set are ignored, and `CSI ? u` is answered
+      `CSI ?0u` (the same probe reply Rio sends when the protocol is off).
+      Set it to true to enable the encoder.
+      Two further limits, both tested: alacritty_terminal 0.26's
+      `push_keyboard_mode` evicts from the wrong stack and panics at depth
+      4096, so pushes past 16 are dropped (kitty's own cap). And with
+      disambiguate on but alternate keys off, a non-ASCII chord is reported
+      as its PC-101 key (`keyboard.kitty_base_layout_fallback`, default
+      true) — `ؤ` on the C key is `CSI 99;5u`, not `CSI 1572;5u` — so
+      Claude Code can still be interrupted. That is a deliberate departure
+      from the spec; turn the fallback off to send the Arabic codepoint.
+      A crashed full-screen program leaks its flags into the shell, so
+      `OSC 133;A` (the next prompt), shell exit, and Ctrl+Shift+K
+      (`reset-keyboard`) clear both screens' stacks.
 
 ## Settings
 
@@ -265,7 +285,8 @@ key falls back to a sane default:
   "copy_on_select": true, "ligatures": true, "bell": "attention",
   "shell": "pwsh.exe", "padding": 8, "opacity": 0.9,
   "hide_single_tab": true, "confirm_close": true,
-  "keybinds": { "new-tab": "ctrl+shift+n" }
+  "keybinds": { "new-tab": "ctrl+shift+n" },
+  "keyboard": { "kitty_protocol": false, "kitty_base_layout_fallback": true }
 }
 ```
 

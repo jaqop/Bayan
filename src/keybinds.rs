@@ -24,10 +24,11 @@ pub enum Action {
     PromptPrev,
     PromptNext,
     ClaudeToggle,
+    ResetKeyboard,
 }
 
 impl Action {
-    pub const ALL: [Action; 12] = [
+    pub const ALL: [Action; 13] = [
         Action::NewTab,
         Action::ClosePane,
         Action::Search,
@@ -40,6 +41,7 @@ impl Action {
         Action::PromptPrev,
         Action::PromptNext,
         Action::ClaudeToggle,
+        Action::ResetKeyboard,
     ];
 
     /// The config.json key.
@@ -57,6 +59,7 @@ impl Action {
             Action::PromptPrev => "prompt-prev",
             Action::PromptNext => "prompt-next",
             Action::ClaudeToggle => "claude-toggle",
+            Action::ResetKeyboard => "reset-keyboard",
         }
     }
 
@@ -75,6 +78,7 @@ impl Action {
             Action::PromptPrev => "الأمر السابق",
             Action::PromptNext => "الأمر التالي",
             Action::ClaudeToggle => "وضع كلود",
+            Action::ResetKeyboard => "إعادة ضبط لوحة المفاتيح",
         }
     }
 
@@ -94,6 +98,9 @@ impl Action {
             Action::PromptPrev => c(true, true, Up),
             Action::PromptNext => c(true, true, Down),
             Action::ClaudeToggle => c(false, false, F(2)),
+            // Ctrl+Shift+K: the leaked-flags escape hatch. Physical K, so an
+            // Arabic layout still reaches it.
+            Action::ResetKeyboard => c(true, true, Letter('k')),
         }
     }
 }

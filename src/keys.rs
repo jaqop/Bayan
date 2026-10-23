@@ -117,6 +117,10 @@ pub struct EncodeInput<'a> {
     /// A–Z from the physical key. Legacy Ctrl+C uses this so an Arabic
     /// layout still sends `\x03`.
     pub physical_letter: Option<char>,
+    /// `keyboard.kitty_base_layout_fallback`. When disambiguate is on and
+    /// alternate keys are not, a non-ASCII chord is reported as its PC-101
+    /// key so Ctrl+C still interrupts.
+    pub base_layout_fallback: bool,
 }
 
 /// Protocol bits stored in [`TermMode`], packed back into the kitty flag byte.
@@ -144,6 +148,15 @@ pub fn protocol_bits(mode: TermMode) -> u8 {
 /// other press is the legacy sequence, and a release with nothing to say
 /// produces nothing.
 pub fn encode_input(input: &EncodeInput<'_>) -> Option<Vec<u8>> {
+    // Windows reports AltGr as Ctrl+Alt plus the character the layout
+    // produced. That is text, not a CSI u chord. A single ASCII letter is
+    // left as a chord (Ctrl+Alt+C); symbols and non-ASCII are AltGr.
+    if let Some(text) = altgr_text(input) {
+        if input.released {
+            return None;
+        }
+        return Some(text.as_bytes().to_vec());
+    }
     let flags = kitty::Flags(protocol_bits(input.mode));
     if flags.affects_encoding() {
         if let Some(bytes) = encode_kitty(input, flags) {
@@ -161,9 +174,44 @@ pub fn encode_input(input: &EncodeInput<'_>) -> Option<Vec<u8>> {
     encode(input.key, input.text, input.shift, input.alt, input.ctrl)
 }
 
+/// AltGr text, when this ctrl+alt event is a layout character rather than
+/// a chord. `None` means "encode it as a key".
+fn altgr_text<'a>(input: &EncodeInput<'a>) -> Option<&'a str> {
+    if !(input.ctrl && input.alt) {
+        return None;
+    }
+    let text = input.text?;
+    let mut chars = text.chars();
+    let c = chars.next()?;
+    if is_control(c) {
+        return None;
+    }
+    // Ctrl+Alt+C arrives with text "c" on some paths. That stays a chord.
+    if chars.next().is_none() && c.is_ascii_alphabetic() {
+        return None;
+    }
+    Some(text)
+}
+
 fn encode_kitty(input: &EncodeInput<'_>, flags: kitty::Flags) -> Option<Vec<u8>> {
     let dis = flags.contains(kitty::DISAMBIGUATE) || flags.contains(kitty::ALL_KEYS);
-    let code = kitty_code(input, dis, flags.contains(kitty::ALL_KEYS))?;
+    let mut code = kitty_code(input, dis, flags.contains(kitty::ALL_KEYS))?;
+    // Spec would send the Arabic letter. With alternates off, an app that
+    // only knows the PC-101 code (Claude Code, Ctrl+C) never sees an
+    // interrupt. Fallback is on unless the user turns it off, and it steps
+    // aside when the program asked for alternate keys.
+    if input.base_layout_fallback
+        && !flags.contains(kitty::ALTERNATE)
+        && (input.ctrl || input.alt || input.super_key)
+    {
+        if let kitty::Code::Char(c) = code {
+            if !c.is_ascii() {
+                if let Some(base) = input.physical.and_then(pc101_unshifted) {
+                    code = kitty::Code::Char(base);
+                }
+            }
+        }
+    }
     let base = input.physical.and_then(pc101_unshifted);
     let unshifted = match code {
         kitty::Code::Char(c) => Some(c),
@@ -530,6 +578,7 @@ mod tests {
             released: false,
             mode: TermMode::empty(),
             physical_letter: None,
+            base_layout_fallback: true,
         }
     }
 
@@ -641,5 +690,54 @@ mod tests {
             0,
             "unrelated modes are not kitty flags"
         );
+    }
+
+    #[test]
+    fn arabic_ctrl_c_falls_back_to_base_layout_without_alternates() {
+        let waw = Key::Character("ؤ".into());
+        let mut ctrl = ev(&waw, &waw);
+        ctrl.ctrl = true;
+        ctrl.physical = Some(KeyCode::KeyC);
+        ctrl.physical_letter = Some('c');
+        ctrl.mode = TermMode::DISAMBIGUATE_ESC_CODES;
+        // default: the PC-101 key, so the program sees Ctrl+C
+        assert!(ctrl.base_layout_fallback);
+        assert_eq!(bytes(&ctrl), "\u{1b}[99;5u");
+        // opted out of the deviation: the spec's Arabic codepoint
+        ctrl.base_layout_fallback = false;
+        assert_eq!(bytes(&ctrl), "\u{1b}[1572;5u");
+        // alternates requested: primary stays ؤ, base layout rides along
+        ctrl.base_layout_fallback = true;
+        ctrl.mode |= TermMode::REPORT_ALTERNATE_KEYS;
+        assert_eq!(bytes(&ctrl), "\u{1b}[1572::99;5u");
+    }
+
+    #[test]
+    fn altgr_prints_text_and_super_is_a_chord() {
+        let euro = Key::Character("€".into());
+        let mut altgr = ev(&euro, &euro);
+        altgr.ctrl = true;
+        altgr.alt = true;
+        altgr.text = Some("€");
+        altgr.mode = TermMode::DISAMBIGUATE_ESC_CODES;
+        assert_eq!(encode_input(&altgr).unwrap(), "€".as_bytes());
+
+        // a real Ctrl+Alt+C (no symbol) is still the chord, mods 1+alt+ctrl
+        let c = Key::Character("c".into());
+        let mut chord = ev(&c, &c);
+        chord.ctrl = true;
+        chord.alt = true;
+        chord.text = Some("c");
+        chord.physical = Some(KeyCode::KeyC);
+        chord.physical_letter = Some('c');
+        chord.mode = TermMode::DISAMBIGUATE_ESC_CODES;
+        assert_eq!(bytes(&chord), "\u{1b}[99;7u");
+
+        let mut sup = ev(&c, &c);
+        sup.super_key = true;
+        sup.physical = Some(KeyCode::KeyC);
+        sup.physical_letter = Some('c');
+        sup.mode = TermMode::DISAMBIGUATE_ESC_CODES;
+        assert_eq!(bytes(&sup), "\u{1b}[99;9u");
     }
 }

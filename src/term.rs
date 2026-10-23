@@ -130,7 +130,24 @@ pub struct SessionMeta {
     pub evicted: u64,
     /// when the running command was submitted — feeds the finish notification
     pub cmd_started: Option<std::time::Instant>,
+    /// User opted in (`keyboard.kitty_protocol`). Off: push/set/pop are
+    /// dropped and a query is answered `CSI ?0u`, because ConPTY may swallow
+    /// the ESC of a CSI u sequence and turn Ctrl+C into literal text.
+    pub kitty_protocol: bool,
+    /// How many keyboard-mode levels we have actually pushed on this screen.
+    /// alacritty_terminal 0.26 panics at depth 4096; we stop at
+    /// [`KITTY_STACK_CAP`].
+    pub kitty_depth: u16,
+    /// The other screen's depth. 1049h/l swaps the stacks, so this swaps too.
+    pub kitty_alt_depth: u16,
 }
+
+/// kitty itself refuses to grow the keyboard-mode stack past 16. Matching
+/// that cap is what keeps `CSI > u` away from alacritty_terminal 0.26's
+/// `push_keyboard_mode`, which evicts from `title_stack` and panics once
+/// that vec is empty (4096). The reader holds the term mutex across the
+/// feed, so the panic would poison every tab.
+const KITTY_STACK_CAP: u16 = 16;
 
 /// Events one PTY chunk produced, delivered to the UI thread by the reader.
 #[derive(Default)]
@@ -337,7 +354,7 @@ fn feed_counted<T: EventListener>(
     // straight speedup, not a change in what gets measured. Queries are
     // split out so each one is answered from the mode the bytes before it
     // just established.
-    advance_with_kitty_queries(parser, t, bytes);
+    advance_with_kitty_queries(parser, t, meta, bytes);
     let off_after = t.grid().display_offset();
     let hist_after = t.grid().history_size();
     let base = if parked { 1 } else { off_before };
@@ -353,59 +370,190 @@ fn feed_counted<T: EventListener>(
     }
 }
 
-/// First `CSI ? … u` in `data`, as `(start, end)`.
-fn find_kitty_query(data: &[u8]) -> Option<(usize, usize)> {
-    let mut i = 0;
-    while i + 3 <= data.len() {
-        if data[i] == 0x1b && data.get(i + 1) == Some(&b'[') && data.get(i + 2) == Some(&b'?') {
-            let mut j = i + 3;
-            while j < data.len() && matches!(data[j], b'0'..=b'9' | b';') {
-                j += 1;
-            }
-            if data.get(j) == Some(&b'u') {
-                return Some((i, j + 1));
-            }
-        }
-        i += 1;
-    }
-    None
+enum KittySeqKind {
+    Push,
+    Pop(u16),
+    Set,
+    Query,
 }
 
-/// Feed `bytes`, answering each kitty query from the mode bits.
-///
-/// alacritty_terminal 0.26 updates `TermMode` for `CSI = flags ; mode u` but
-/// the query reply reads the push/pop stack, which `=` does not touch. A
-/// program that sets flags and then queries (the protocol's own feature
-/// probe) would be told the flags are still 0. Pop the stale top, then push
-/// the mode bits so the stack top matches the mode the encoder uses, and
-/// only then run the original query.
-///
-/// A zero mode does not push onto an empty stack. `CSI >0u` is a real stack
-/// entry of "no flags", and a startup probe (`CSI ? u` before any push)
-/// must not invent one — a later pop would then uncover that phantom
-/// instead of the level the program actually pushed.
+struct KittySeq {
+    end: usize,
+    kind: KittySeqKind,
+}
+
+/// A complete `CSI <intermediate> <params> u` starting at `i`.
+fn kitty_seq_at(data: &[u8], i: usize) -> Option<KittySeq> {
+    if data.get(i) != Some(&0x1b) || data.get(i + 1) != Some(&b'[') {
+        return None;
+    }
+    let inter = *data.get(i + 2)?;
+    if !matches!(inter, b'<' | b'>' | b'=' | b'?') {
+        return None;
+    }
+    let mut j = i + 3;
+    let param_at = j;
+    while j < data.len() && matches!(data[j], b'0'..=b'9' | b';') {
+        j += 1;
+    }
+    if data.get(j) != Some(&b'u') {
+        return None;
+    }
+    let params = &data[param_at..j];
+    let kind = match inter {
+        b'>' => KittySeqKind::Push,
+        b'<' => KittySeqKind::Pop(kitty_pop_count(params)),
+        b'=' => KittySeqKind::Set,
+        _ => KittySeqKind::Query,
+    };
+    Some(KittySeq { end: j + 1, kind })
+}
+
+/// vte treats a missing or zero parameter as the default, which for pop is 1.
+fn kitty_pop_count(params: &[u8]) -> u16 {
+    let end = params.iter().position(|&b| b == b';').unwrap_or(params.len());
+    if end == 0 {
+        return 1;
+    }
+    match std::str::from_utf8(&params[..end])
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+    {
+        Some(0) | None => 1,
+        Some(n) => n,
+    }
+}
+
+fn note_screen_swap<T: EventListener>(before_alt: bool, t: &Term<T>, meta: &mut SessionMeta) {
+    if before_alt != t.mode().contains(TermMode::ALT_SCREEN) {
+        std::mem::swap(&mut meta.kitty_depth, &mut meta.kitty_alt_depth);
+    }
+}
+
+fn feed_plain<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    meta: &mut SessionMeta,
+    bytes: &[u8],
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    let before_alt = t.mode().contains(TermMode::ALT_SCREEN);
+    parser.advance(t, bytes);
+    note_screen_swap(before_alt, t, meta);
+}
+
+/// `CSI =` updates `TermMode` and leaves the push/pop stack stale, which is
+/// also what a later alt-screen swap restores. Pop the stale top and push
+/// the mode bits now, so both stacks agree with the encoder before the next
+/// `1049h`/`1049l`. A zero mode does not push onto an empty stack.
+fn repair_keyboard_stack<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    depth: &mut u16,
+) {
+    let flags = crate::keys::protocol_bits(*t.mode());
+    parser.advance(t, b"\x1b[<u");
+    *depth = depth.saturating_sub(1);
+    let revealed = crate::keys::protocol_bits(*t.mode());
+    if (flags != 0 || revealed != 0) && *depth < KITTY_STACK_CAP {
+        let repair = format!("\x1b[>{flags}u");
+        parser.advance(t, repair.as_bytes());
+        *depth = depth.saturating_add(1);
+    }
+}
+
+/// Drop every keyboard-mode level on both screens and clear `TermMode`'s
+/// kitty bits. Used when a prompt starts (the previous full-screen program
+/// may have crashed without a pop), when the shell itself exits, and from
+/// the reset-keyboard binding.
+pub(crate) fn reset_keyboard_modes<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    meta: &mut SessionMeta,
+) {
+    let was_alt = t.mode().contains(TermMode::ALT_SCREEN);
+    parser.advance(t, b"\x1b[<16u");
+    // The other screen has its own stack. Visit it, pop that too, come back.
+    // Entering the alt screen resets the inactive grid, which is the alt
+    // grid only when we are on the primary — the visible primary is swapped
+    // out and back, so a prompt's text stays put.
+    if was_alt {
+        parser.advance(t, b"\x1b[?1049l");
+        parser.advance(t, b"\x1b[<16u");
+        parser.advance(t, b"\x1b[?1049h");
+    } else {
+        parser.advance(t, b"\x1b[?1049h");
+        parser.advance(t, b"\x1b[<16u");
+        parser.advance(t, b"\x1b[?1049l");
+    }
+    meta.kitty_depth = 0;
+    meta.kitty_alt_depth = 0;
+}
+
+fn apply_kitty_seq<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    meta: &mut SessionMeta,
+    seq: &[u8],
+    kind: KittySeqKind,
+) {
+    if !meta.kitty_protocol {
+        // Opt-out still answers the probe. Push and set never reach the
+        // stack, so the answer is the empty mode Rio reports.
+        if matches!(kind, KittySeqKind::Query) {
+            parser.advance(t, seq);
+        }
+        return;
+    }
+    match kind {
+        KittySeqKind::Push => {
+            if meta.kitty_depth >= KITTY_STACK_CAP {
+                return;
+            }
+            parser.advance(t, seq);
+            meta.kitty_depth = meta.kitty_depth.saturating_add(1);
+        }
+        KittySeqKind::Pop(n) => {
+            parser.advance(t, seq);
+            meta.kitty_depth = meta.kitty_depth.saturating_sub(n);
+        }
+        KittySeqKind::Set => {
+            parser.advance(t, seq);
+            repair_keyboard_stack(parser, t, &mut meta.kitty_depth);
+        }
+        KittySeqKind::Query => {
+            repair_keyboard_stack(parser, t, &mut meta.kitty_depth);
+            parser.advance(t, seq);
+        }
+    }
+}
+
+/// Feed `bytes`, keeping the kitty stack in sync with what we actually let
+/// the parser see.
 fn advance_with_kitty_queries<T: EventListener>(
     parser: &mut Processor,
     t: &mut Term<T>,
+    meta: &mut SessionMeta,
     bytes: &[u8],
 ) {
-    let mut rest = bytes;
-    while let Some((start, end)) = find_kitty_query(rest) {
-        if start > 0 {
-            parser.advance(t, &rest[..start]);
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(seq) = kitty_seq_at(bytes, i) {
+            apply_kitty_seq(parser, t, meta, &bytes[i..seq.end], seq.kind);
+            i = seq.end;
+            continue;
         }
-        let flags = crate::keys::protocol_bits(*t.mode());
-        parser.advance(t, b"\x1b[<u");
-        let revealed = crate::keys::protocol_bits(*t.mode());
-        if flags != 0 || revealed != 0 {
-            let repair = format!("\x1b[>{flags}u");
-            parser.advance(t, repair.as_bytes());
+        let mut j = i + 1;
+        while j < bytes.len() {
+            if bytes[j] == 0x1b && kitty_seq_at(bytes, j).is_some() {
+                break;
+            }
+            j += 1;
         }
-        parser.advance(t, &rest[start..end]);
-        rest = &rest[end..];
-    }
-    if !rest.is_empty() {
-        parser.advance(t, rest);
+        feed_plain(parser, t, meta, &bytes[i..j]);
+        i = j;
     }
 }
 
@@ -436,6 +584,11 @@ pub(crate) fn process_chunk<T: EventListener>(
     for (s, e, kind, exit) in find_osc133(&buf) {
         feed_counted(parser, t, meta, &buf[pos..s]);
         handle_osc133(t, meta, kind, exit, &mut ev);
+        // A new prompt means the previous program is gone. A crashed TUI
+        // never pops its keyboard flags; clear them before the shell types.
+        if kind == b'A' {
+            reset_keyboard_modes(parser, t, meta);
+        }
         pos = e;
     }
     feed_counted(parser, t, meta, &buf[pos..]);
@@ -607,6 +760,7 @@ impl Session {
         start_cwd: Option<&str>,
         scrollback: usize,
         shell: &str,
+        kitty_protocol: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let pty = native_pty_system();
         let pair = pty.openpty(PtySize {
@@ -663,9 +817,11 @@ impl Session {
 
         let config = Config {
             scrolling_history: scrollback,
-            // alacritty_terminal already parses CSI >/=/</? u into the
-            // keyboard-mode stack and TermMode. The flag defaults off, which
-            // is why a TUI's push was a no-op and keys.rs never saw the mode.
+            // Always parsed, so an opt-out probe still gets `CSI ?0u`.
+            // Whether a push is allowed to change the mode is
+            // `SessionMeta::kitty_protocol` (config `keyboard.kitty_protocol`,
+            // default off). The parser's own flag defaults to false, which
+            // would swallow the query reply entirely.
             kitty_keyboard: true,
             ..Config::default()
         };
@@ -675,7 +831,10 @@ impl Session {
             EventProxy(proxy.clone(), id),
         )));
 
-        let meta = Arc::new(Mutex::new(SessionMeta::default()));
+        let meta = Arc::new(Mutex::new(SessionMeta {
+            kitty_protocol,
+            ..SessionMeta::default()
+        }));
         let term2 = Arc::clone(&term);
         let meta2 = Arc::clone(&meta);
         std::thread::spawn(move || {
@@ -706,6 +865,13 @@ impl Session {
                     }
                 }
             }
+            // The shell is gone. Drop leaked kitty flags before the pane
+            // closes, so a key event racing the exit cannot encode CSI u.
+            {
+                let mut t = term2.lock().unwrap();
+                let mut m = meta2.lock().unwrap();
+                reset_keyboard_modes(&mut parser, &mut t, &mut m);
+            }
             let _ = proxy.send_event(UserEvent::Exit(id));
         });
 
@@ -721,6 +887,15 @@ impl Session {
     /// Terminate the shell (closing a tab must not leave orphans).
     pub fn kill(&mut self) {
         let _ = self.child.kill();
+    }
+
+    /// Clear both keyboard-mode stacks (Ctrl+Shift+K). Shell exit and
+    /// `OSC 133;A` call [`reset_keyboard_modes`] on the reader thread.
+    pub fn reset_keyboard(&mut self) {
+        let mut t = self.term.lock().unwrap();
+        let mut m = self.meta.lock().unwrap();
+        let mut parser = Processor::new();
+        reset_keyboard_modes(&mut parser, &mut t, &mut m);
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
@@ -1088,14 +1263,16 @@ mod tests {
         log: Arc<Mutex<Vec<String>>>,
     }
 
-    fn kitty_term(enabled: bool) -> KittyFixture {
+    fn kitty_term(protocol: bool) -> KittyFixture {
         let log = Arc::new(Mutex::new(Vec::new()));
         let size = TermSize { cols: 40, rows: 6 };
-        let config = Config { kitty_keyboard: enabled, ..Config::default() };
+        // The parser flag stays on either way, so a disabled probe can still
+        // answer. `kitty_protocol` is what lets a push change the mode.
+        let config = Config { kitty_keyboard: true, ..Config::default() };
         KittyFixture {
             term: Term::new(config, &size, PtyLog(Arc::clone(&log))),
             parser: Processor::new(),
-            meta: SessionMeta::default(),
+            meta: SessionMeta { kitty_protocol: protocol, ..SessionMeta::default() },
             carry: Vec::new(),
             log,
         }
@@ -1169,7 +1346,7 @@ mod tests {
     }
 
     #[test]
-    fn kitty_disabled_ignores_push_and_query() {
+    fn kitty_protocol_off_ignores_push_and_answers_zero() {
         let KittyFixture {
             term: mut t,
             parser: mut p,
@@ -1182,9 +1359,118 @@ mod tests {
             &mut t,
             &mut meta,
             &mut carry,
-            b"\x1b[>31u\x1b[=1u\x1b[?u",
+            b"\x1b[>31u\x1b[=1u\x1b[<u\x1b[?u",
         );
-        assert!(take_writes(&log).is_empty());
+        assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
         assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        // a second probe is still zero — nothing stuck from the dropped push
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
+    }
+
+    #[test]
+    fn kitty_stack_cap_survives_five_thousand_pushes() {
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log,
+        } = kitty_term(true);
+        let mut burst = Vec::with_capacity(5000 * 6);
+        for _ in 0..5000 {
+            burst.extend_from_slice(b"\x1b[>1u");
+        }
+        // Past the cap, a different flag must not land — those pushes are
+        // dropped, not applied, and must not panic the parser.
+        burst.extend_from_slice(b"\x1b[>31u");
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, &burst);
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert!(!t.mode().contains(TermMode::REPORT_ALL_KEYS_AS_ESC));
+        assert_eq!(meta.kitty_depth, 16);
+
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?uHi");
+        assert_eq!(take_writes(&log), vec!["\x1b[?1u".to_string()]);
+        {
+            let row = &t.grid()[alacritty_terminal::index::Line(0)];
+            assert_eq!(row[Column(0)].c, 'H');
+            assert_eq!(row[Column(1)].c, 'i');
+        }
+        // still a terminal: a pop under the cap answers, and more text lands
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[<16u\x1b[?u!");
+        assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        let row = &t.grid()[alacritty_terminal::index::Line(0)];
+        assert_eq!(row[Column(2)].c, '!');
+    }
+
+    #[test]
+    fn kitty_set_survives_alt_screen_without_a_query() {
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log,
+        } = kitty_term(true);
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[>1u\x1b[=4;2u");
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert!(t.mode().contains(TermMode::REPORT_ALTERNATE_KEYS));
+        // No query in between. Leaving the alt screen reloads the stack;
+        // the set must already be on that stack or the flags revert to 1.
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?1049h");
+        assert!(t.mode().contains(TermMode::ALT_SCREEN));
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?1049l\x1b[?u");
+        assert!(!t.mode().contains(TermMode::ALT_SCREEN));
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert!(t.mode().contains(TermMode::REPORT_ALTERNATE_KEYS));
+        assert_eq!(take_writes(&log), vec!["\x1b[?5u".to_string()]);
+    }
+
+    #[test]
+    fn osc133_prompt_resets_keyboard_mode() {
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log,
+        } = kitty_term(true);
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[>31uHi");
+        assert!(t.mode().contains(TermMode::REPORT_ASSOCIATED_TEXT));
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;A\x07\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        assert_eq!(meta.kitty_depth, 0);
+        let row = &t.grid()[alacritty_terminal::index::Line(0)];
+        assert_eq!(row[Column(0)].c, 'H', "reset must not wipe the prompt line");
+        assert_eq!(row[Column(1)].c, 'i');
+        assert!(!meta.marks.is_empty(), "the prompt mark is still recorded");
+    }
+
+    #[test]
+    fn reset_keyboard_modes_clears_both_screens() {
+        let KittyFixture {
+            term: mut t,
+            parser: mut p,
+            mut meta,
+            mut carry,
+            log,
+        } = kitty_term(true);
+        // Primary has disambiguate; the alt screen has report-all. A crash
+        // that skips the pop leaves both. Child exit and the binding call
+        // the same helper the prompt mark uses.
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[>1u\x1b[?1049h\x1b[>8u\x1b[?1049l");
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        reset_keyboard_modes(&mut p, &mut t, &mut meta);
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?u");
+        assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?1049h\x1b[?u\x1b[?1049l");
+        assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
+        assert!(!t.mode().contains(TermMode::ALT_SCREEN));
+        assert_eq!(meta.kitty_depth, 0);
+        assert_eq!(meta.kitty_alt_depth, 0);
     }
 }

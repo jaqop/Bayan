@@ -259,9 +259,9 @@ fn char_key(
     mods: u8,
     text: &[u32],
 ) -> Option<Vec<u8>> {
-    // ctrl/alt (and therefore ctrl+alt and shift+alt). Shift alone stays
-    // text: the letter is the text.
-    let modified = input.ctrl || input.alt;
+    // ctrl/alt/super (and the combinations). Shift alone stays text.
+    // Super is a modifier in the protocol, so disambiguate reports it.
+    let modified = input.ctrl || input.alt || input.super_key;
     let emit = all || (dis && modified) || (event != 0 && modified);
     emit.then(|| {
         let alt = alternates(input, c);
@@ -671,10 +671,11 @@ mod tests {
     }
 
     #[test]
-    fn super_is_a_modifier_bit_not_a_disambiguator() {
+    fn super_letter_is_a_disambiguated_chord() {
         let mut c = press(Code::Char('c'), DISAMBIGUATE);
         c.super_key = true;
-        assert_eq!(seq(&c), None, "super+letter stays text until report-all");
+        // 1 + super(8) = 9. Disambiguate is enough; report-all is not required.
+        assert_eq!(seq(&c).as_deref(), Some("\u{1b}[99;9u"));
         c.ctrl = true;
         assert_eq!(seq(&c).as_deref(), Some("\u{1b}[99;13u"));
     }

@@ -901,6 +901,11 @@ impl App {
                 }
                 self.request_redraw();
             }
+            ResetKeyboard => {
+                if let Some(s) = self.session_mut() {
+                    s.reset_keyboard();
+                }
+            }
         }
     }
 
@@ -1276,9 +1281,15 @@ impl App {
     fn spawn_pane(&mut self, cwd: Option<&str>) -> Option<Pane> {
         let id = self.next_id;
         self.next_id += 1;
-        match Session::spawn(self.size, self.proxy.clone(), id, cwd,
-                             self.config.scrollback_lines(),
-                             &self.config.shell_program()) {
+        match Session::spawn(
+            self.size,
+            self.proxy.clone(),
+            id,
+            cwd,
+            self.config.scrollback_lines(),
+            &self.config.shell_program(),
+            self.config.kitty_protocol_on(),
+        ) {
             Ok(session) => Some(Pane { id, session, last_output: None }),
             Err(e) => {
                 eprintln!("bayan: spawn failed: {e}");
@@ -1591,6 +1602,7 @@ impl App {
             released,
             mode: self.term_mode(),
             physical_letter: key_letter(event),
+            base_layout_fallback: self.config.kitty_base_layout_fallback_on(),
         })
     }
 
@@ -2420,6 +2432,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(f) => {
                 self.focused = f;
+                // A blur drops keys we were holding back. The matching
+                // release may never arrive (the user alt-tabbed mid-chord),
+                // and a later focus must not swallow an unrelated press.
+                blur_forgets_held_keys(f, &mut self.keys_held_away);
                 if f {
                     // you're here now: the active tab's attention is served
                     if let Some(t) = self.tabs.get_mut(self.active) {
@@ -2909,6 +2925,15 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
+/// Focus loss forgets presses that never reached the PTY. The release
+/// often goes to whichever window is focused now, so the set would
+/// otherwise keep swallowing that physical key forever.
+fn blur_forgets_held_keys(focused: bool, held: &mut Vec<winit::keyboard::PhysicalKey>) {
+    if !focused {
+        held.clear();
+    }
+}
+
 fn main() {
     prof::init();
     prof::mark("main start");
@@ -2998,6 +3023,18 @@ fn main() {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn blur_drops_keys_whose_press_was_swallowed() {
+        use winit::keyboard::{KeyCode, PhysicalKey};
+        let key = PhysicalKey::Code(KeyCode::KeyC);
+        let mut held = vec![key];
+        blur_forgets_held_keys(false, &mut held);
+        assert!(held.is_empty());
+        held.push(key);
+        blur_forgets_held_keys(true, &mut held);
+        assert_eq!(held, vec![key]);
+    }
 
     #[test]
     fn split_rects_divide_by_weight() {

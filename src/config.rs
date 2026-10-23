@@ -78,6 +78,39 @@ pub struct UserConfig {
     /// Only NON-default bindings live here (the editor prunes defaults).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keybinds: Option<std::collections::HashMap<String, String>>,
+    /// Kitty keyboard protocol. Off unless the user opts in — see
+    /// [`KeyboardConfig`].
+    #[serde(default)]
+    pub keyboard: KeyboardConfig,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Kitty keyboard protocol switches. Both live under `"keyboard"` in
+/// config.json so the opt-in is obvious next to the fallback that keeps
+/// Ctrl+C working on an Arabic layout.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct KeyboardConfig {
+    /// Answer `CSI ? u` with `CSI ?0u` and ignore push/set until this is
+    /// true. ConPTY (the system conhost portable-pty uses) has been reported
+    /// to swallow the ESC of `CSI u`, which would deliver `[99;5u` as text
+    /// and break Ctrl+C. Default off until that is verified on real Windows.
+    pub kitty_protocol: bool,
+    /// When disambiguate is on but "report alternates" is not, a non-ASCII
+    /// chord is reported as its PC-101 base key (`ؤ` on the C key →
+    /// `CSI 99;5u` instead of `CSI 1572;5u`). Deliberate departure from the
+    /// kitty spec so Claude Code can still be interrupted. Default on.
+    #[serde(default = "default_true")]
+    pub kitty_base_layout_fallback: bool,
+}
+
+impl Default for KeyboardConfig {
+    fn default() -> Self {
+        Self { kitty_protocol: false, kitty_base_layout_fallback: true }
+    }
 }
 
 /// Cursor shape (the trio every terminal offers: block / bar / underline).
@@ -195,6 +228,14 @@ impl UserConfig {
 
     pub fn notifications_on(&self) -> bool {
         self.notifications.unwrap_or(true)
+    }
+
+    pub fn kitty_protocol_on(&self) -> bool {
+        self.keyboard.kitty_protocol
+    }
+
+    pub fn kitty_base_layout_fallback_on(&self) -> bool {
+        self.keyboard.kitty_base_layout_fallback
     }
 }
 
@@ -322,6 +363,23 @@ mod tests {
             serde_json::from_str(r#"{"opacity":0.05,"padding":500}"#).unwrap();
         assert_eq!(wild.opacity_level(), 0.5);
         assert_eq!(wild.padding_px(), 32);
+    }
+
+    #[test]
+    fn kitty_keyboard_config_defaults_off_and_fallback_on() {
+        let d = UserConfig::default();
+        assert!(!d.kitty_protocol_on());
+        assert!(d.kitty_base_layout_fallback_on());
+        // a config that never mentions keyboard keeps those defaults
+        let absent: UserConfig = serde_json::from_str("{}").unwrap();
+        assert!(!absent.kitty_protocol_on());
+        assert!(absent.kitty_base_layout_fallback_on());
+        let c: UserConfig = serde_json::from_str(
+            r#"{"keyboard":{"kitty_protocol":true,"kitty_base_layout_fallback":false}}"#,
+        )
+        .unwrap();
+        assert!(c.kitty_protocol_on());
+        assert!(!c.kitty_base_layout_fallback_on());
     }
 
     #[test]
