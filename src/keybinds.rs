@@ -140,7 +140,7 @@ impl Chord {
     }
 
     /// Config form: "ctrl+shift+t", "f2", "ctrl+,".
-    pub fn to_config(&self) -> String {
+    pub fn to_config(self) -> String {
         let mut parts: Vec<String> = Vec::new();
         if self.ctrl {
             parts.push("ctrl".into());
@@ -199,7 +199,7 @@ impl Chord {
     }
 
     /// Display form for the editor's keycaps: "Ctrl+Shift+T".
-    pub fn display(&self) -> String {
+    pub fn display(self) -> String {
         let mut parts: Vec<&str> = Vec::new();
         if self.ctrl {
             parts.push("Ctrl");

@@ -28,7 +28,6 @@ use cosmic_text::{
 
 use crate::bidi_ctl::{base_direction_mark, ParagraphDir};
 use crate::gpu::Vertex;
-use crate::term::EventProxy;
 
 // Bayan's first look is Jonathan Blow's scheme, SAMPLED from two captures of
 // his editor rather than recalled. Five colours are measured medians, not
@@ -219,6 +218,13 @@ fn arabic_chars(n: usize) -> String {
         3..=10 => format!("{n} أحرف"),
         _ => format!("{n} حرفاً"),
     }
+}
+
+/// SGR 2 (faint): two thirds of each channel. Widened before the multiply —
+/// `u8 * 2` overflows for any channel above 127, which is most foregrounds.
+fn dim((r, g, b): (u8, u8, u8)) -> (u8, u8, u8) {
+    let f = |c: u8| (c as u16 * 2 / 3) as u8;
+    (f(r), f(g), f(b))
 }
 
 /// Straight-alpha color for the quad batch.
@@ -494,6 +500,31 @@ pub struct TabInfo {
     /// approval): amber beats the green busy dot
     pub attention: bool,
     pub active: bool,
+    /// OSC 9;4 progress from the tab's focused pane (Claude Code emits it
+    /// while it works): a thin bar along the tab's bottom edge
+    pub progress: Option<crate::term::Progress>,
+}
+
+/// Bar colour for a progress state: green working, red failed, amber paused.
+fn progress_color(p: crate::term::Progress) -> (u8, u8, u8) {
+    use crate::term::ProgressState::*;
+    match p.state {
+        Normal | Indeterminate => (0x2e, 0xa0, 0x43),
+        Error => (0xcf, 0x22, 0x2e),
+        Paused => (0xf2, 0xcc, 0x60),
+    }
+}
+
+/// Short label for the cockpit: "42%", "!" for an error, "…" while
+/// indeterminate, "⏸" paused.
+pub fn progress_label(p: crate::term::Progress) -> String {
+    use crate::term::ProgressState::*;
+    match p.state {
+        Normal => format!("{}%", p.percent),
+        Error => format!("! {}%", p.percent),
+        Indeterminate => "…".to_string(),
+        Paused => format!("⏸ {}%", p.percent),
+    }
 }
 
 /// Fixed tab width in cells — the app's click hit-test relies on this.
@@ -504,6 +535,8 @@ pub const TAB_MIN_CELLS: f32 = 9.0;
 /// A rect in frame pixels: (x, y, w, h).
 pub type Rect = (i32, i32, i32, i32);
 
+/// One underline/strikethrough span on a grid row: (col_start, col_end, style, fg).
+type Deco = (usize, usize, u8, (u8, u8, u8));
 /// One row of the shortcuts editor.
 pub struct ShortcutRow {
     pub label: String,
@@ -606,6 +639,7 @@ pub struct CockpitEntry {
     pub busy: bool,
     pub attention: bool,
     pub active: bool,
+    pub progress: Option<crate::term::Progress>,
 }
 
 /// One pane's draw parameters.
@@ -874,6 +908,13 @@ fn bidi_plan(
 }
 
 const FONT_SIZE: f32 = 15.0;
+
+/// The settings and shortcuts panels are chrome, not terminal content, so
+/// they are laid out and drawn at this fixed point size (DPI-scaled only).
+/// Zooming the terminal font moves the text UNDER a panel; the panel itself
+/// holds still, which is what keeps the ledger readable at 8pt and on
+/// screen at 30pt.
+const UI_FONT_SIZE: f32 = 15.0;
 // bundled so connected Arabic works from a fresh clone (same fonts EasyTer
 // ships) — bold included, so Arabic bold is a real weight, not a fake
 const AMIRI: &[u8] = include_bytes!("../fonts/Amiri-Regular.ttf");
@@ -980,12 +1021,36 @@ struct ShapedRun {
 }
 
 /// Cache key: the exact rich-text content (text + color + style) + alignment.
-type RunKey = (Vec<Seg>, bool, bool);
+/// segs, align_left, the forced direction, and WHICH metrics shaped it —
+/// a run cached at the terminal size must never be handed back for a
+/// chrome draw, and an LTR-forced run is not the auto-direction one.
+type RunKey = (Vec<Seg>, bool, bool, bool);
 
 /// Generational cap: on overflow the hot map becomes the cold one and a
 /// fresh hot map starts — the working set survives, stale runs age out
 /// without a clear-everything stall (EasyTer's LRU lesson, generational).
 const CACHE_CAP: usize = 4096;
+
+/// Advance width of one ASCII cell for `metrics` in `family` — the probe
+/// both grids (terminal and chrome) are built on.
+fn probe_cell_w(fs: &mut FontSystem, metrics: Metrics, family: &str) -> f32 {
+    let mut probe = Buffer::new(fs, metrics);
+    probe.set_wrap(Wrap::None);
+    probe.set_size(Some(1000.0), Some(metrics.line_height));
+    probe.set_text(
+        "M",
+        &Attrs::new().family(Family::Name(family)),
+        Shaping::Advanced,
+        None,
+    );
+    probe.shape_until_scroll(fs, false);
+    probe
+        .layout_runs()
+        .next()
+        .map(|r| r.line_w)
+        .filter(|w| *w > 1.0)
+        .unwrap_or(metrics.font_size * 0.6)
+}
 
 pub struct Renderer {
     /// which caption button the pointer is over (0..2) — hover feedback
@@ -1011,6 +1076,11 @@ pub struct Renderer {
     bar_hidden: bool,
     pub cell_w: f32,
     pub cell_h: f32,
+    /// chrome metrics: fixed at UI_FONT_SIZE * dpi, independent of the
+    /// terminal font size and of the live Ctrl+wheel zoom
+    ui_metrics: Metrics,
+    pub ui_cell_w: f32,
+    pub ui_cell_h: f32,
 }
 
 /// Copy for the paste-confirm card. Grouped so `draw_paste_guard` stays
@@ -1044,22 +1114,11 @@ impl Renderer {
         let size = (cfg.font_size.unwrap_or(FONT_SIZE) + extra_pts).clamp(8.0, 40.0) * scale;
         let metrics = Metrics::new(size, (size * 1.4).ceil());
         // cell width = the primary monospace font's advance for an ASCII probe
-        let mut probe = Buffer::new(&mut font_system, metrics);
-        probe.set_wrap(Wrap::None);
-        probe.set_size(Some(1000.0), Some(metrics.line_height));
-        probe.set_text(
-            "M",
-            &Attrs::new().family(Family::Name(&family)),
-            Shaping::Advanced,
-            None,
-        );
-        probe.shape_until_scroll(&mut font_system, false);
-        let cell_w = probe
-            .layout_runs()
-            .next()
-            .map(|r| r.line_w)
-            .filter(|w| *w > 1.0)
-            .unwrap_or(size * 0.6);
+        let cell_w = probe_cell_w(&mut font_system, metrics, &family);
+        // the chrome grid, probed the same way but at the fixed UI size
+        let ui_size = UI_FONT_SIZE * scale;
+        let ui_metrics = Metrics::new(ui_size, (ui_size * 1.4).ceil());
+        let ui_cell_w = probe_cell_w(&mut font_system, ui_metrics, &family);
         // start from a named theme (if any), then let explicit config
         // bg/fg/palette override individual colors on top of it
         let theme = cfg.theme.as_deref().and_then(theme_by_name);
@@ -1097,6 +1156,9 @@ impl Renderer {
             bar_hidden: false,
             cell_w,
             cell_h: metrics.line_height,
+            ui_metrics,
+            ui_cell_w,
+            ui_cell_h: ui_metrics.line_height,
         }
     }
 
@@ -1183,7 +1245,15 @@ impl Renderer {
     /// `BidiInfo` gets paragraph level 0 instead of detecting it from the
     /// first strong character. Terminal rows stay on auto.
     fn ensure_shaped_dir(&mut self, segs: &[Seg], align_left: bool, force_ltr: bool) -> RunKey {
-        let key: RunKey = (segs.to_vec(), align_left, force_ltr);
+        self.ensure_shaped_at(segs, align_left, force_ltr, false)
+    }
+
+    /// `ui` shapes at the fixed chrome metrics instead of the terminal's,
+    /// so a panel holds its size while the terminal font zooms.
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_shaped_at(&mut self, segs: &[Seg], align_left: bool, force_ltr: bool,
+                        ui: bool) -> RunKey {
+        let key: RunKey = (segs.to_vec(), align_left, force_ltr, ui);
         if self.cache_hot.contains_key(&key) {
             return key;
         }
@@ -1206,9 +1276,14 @@ impl Renderer {
                 (s.text.as_str(), a)
             })
             .collect();
-        let mut buffer = Buffer::new(&mut self.font_system, self.metrics);
+        let (metrics, line_h) = if ui {
+            (self.ui_metrics, self.ui_cell_h)
+        } else {
+            (self.metrics, self.cell_h)
+        };
+        let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_wrap(Wrap::None);
-        buffer.set_size(Some(1_000_000.0), Some(self.cell_h));
+        buffer.set_size(Some(1_000_000.0), Some(line_h));
         if force_ltr {
             buffer.set_direction(Direction::LeftToRight);
         }
@@ -1245,9 +1320,19 @@ impl Renderer {
         }
     }
 
-    /// Natural width of a run (shaping it into the cache if new).
+    /// Natural width of a run at the terminal font size (shaping it into
+    /// the cache if new).
     fn measure(&mut self, segs: &[Seg], align_left: bool) -> f32 {
-        let key = self.ensure_shaped(segs, align_left);
+        self.measure_at(segs, align_left, false)
+    }
+
+    /// The same, at the fixed chrome size — what the panels measure with.
+    fn ui_measure(&mut self, segs: &[Seg], align_left: bool) -> f32 {
+        self.measure_at(segs, align_left, true)
+    }
+
+    fn measure_at(&mut self, segs: &[Seg], align_left: bool, ui: bool) -> f32 {
+        let key = self.ensure_shaped_at(segs, align_left, false, ui);
         self.cache_hot[&key].natw
     }
 
@@ -1257,7 +1342,22 @@ impl Renderer {
     fn draw_run(&mut self, segs: &[Seg], align_left: bool,
                 out: &mut Vec<Vertex>, clip: Rect,
                 x: f32, y: i32, scale: f32) -> f32 {
-        let key = self.ensure_shaped(segs, align_left);
+        self.draw_run_at(segs, align_left, out, clip, x, y, scale, false)
+    }
+
+    /// The same, at the fixed chrome size — what the panels draw with.
+    #[allow(clippy::too_many_arguments)]
+    fn ui_draw_run(&mut self, segs: &[Seg], align_left: bool,
+                   out: &mut Vec<Vertex>, clip: Rect,
+                   x: f32, y: i32, scale: f32) -> f32 {
+        self.draw_run_at(segs, align_left, out, clip, x, y, scale, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_run_at(&mut self, segs: &[Seg], align_left: bool,
+                   out: &mut Vec<Vertex>, clip: Rect,
+                   x: f32, y: i32, scale: f32, ui: bool) -> f32 {
+        let key = self.ensure_shaped_at(segs, align_left, false, ui);
         let Renderer { cache_hot, font_system, cache, atlas, fg, .. } = self;
         let run = &cache_hot[&key];
         push_shaped(out, font_system, cache, atlas, &run.buffer, clip, x, y, scale, *fg);
@@ -1298,9 +1398,40 @@ impl Renderer {
             style |= ST_STRIKE;
         }
         if flags.intersects(Flags::DIM) {
-            fg = (fg.0 * 2 / 3, fg.1 * 2 / 3, fg.2 * 2 / 3);
+            // through dim(): `fg.0 * 2` overflows u8 for any channel above
+            // 127 — a debug panic on the first faint character, wrapped
+            // garbage in release. dim() widens to u16 first.
+            fg = dim(fg);
         }
         (fg, bg, style)
+    }
+
+    /// The shaped run's glyph boxes, each tagged with the grid column it
+    /// came from — the one map the hover underline, the decorations and the
+    /// click all read, so none of them can disagree about where a column
+    /// landed on an RTL row.
+    fn shaped_boxes(&mut self, segs: &[Seg], byte_cols: &[(usize, usize, usize)],
+                    scale: f32) -> Vec<crate::mouse::GlyphBox> {
+        let key = self.ensure_shaped(segs, true);
+        let glyphs = {
+            let buffer = &self.cache_hot[&key].buffer;
+            let mut glyphs = Vec::new();
+            for run in buffer.layout_runs() {
+                for g in run.glyphs.iter() {
+                    glyphs.push(crate::mouse::GlyphSpan {
+                        x: g.x,
+                        w: g.w,
+                        start: g.start,
+                        end: g.end,
+                        rtl: g.level.is_rtl(),
+                    });
+                }
+            }
+            glyphs
+        };
+        crate::mouse::boxes_for_glyphs(&glyphs, scale, |byte| {
+            crate::mouse::col_for_byte(byte_cols, byte)
+        })
     }
 
     /// A row containing Arabic: shape the WHOLE line so cosmic-text applies
@@ -1333,26 +1464,7 @@ impl Renderer {
         // land on the wrong side of an RTL row — the same reason the cursor
         // and the click go through this buffer.
         if let Some((h0, h1)) = hover {
-            let key = self.ensure_shaped(&plan.segs, true);
-            let glyphs = {
-                let buffer = &self.cache_hot[&key].buffer;
-                let mut glyphs = Vec::new();
-                for run in buffer.layout_runs() {
-                    for g in run.glyphs.iter() {
-                        glyphs.push(crate::mouse::GlyphSpan {
-                            x: g.x,
-                            w: g.w,
-                            start: g.start,
-                            end: g.end,
-                            rtl: g.level.is_rtl(),
-                        });
-                    }
-                }
-                glyphs
-            };
-            let boxes = crate::mouse::boxes_for_glyphs(&glyphs, scale, |byte| {
-                crate::mouse::col_for_byte(&plan.byte_cols, byte)
-            });
+            let boxes = self.shaped_boxes(&plan.segs, &plan.byte_cols, scale);
             let th = (self.cell_h / 14.0).max(1.0) as i32;
             let uy = y + self.cell_h.round() as i32 - th - 1;
             for b in boxes {
@@ -1360,6 +1472,31 @@ impl Renderer {
                     let x = x0 + b.x0.round() as i32;
                     let w = (b.x1 - b.x0).round().max(1.0) as i32;
                     push_rect(out, clip, x, uy, w, th, c4(LINK_UNDER, 255));
+                }
+            }
+        }
+        // Underline and strikethrough on an Arabic row: through the same
+        // boxes, because a decoration drawn at column * cell_w lands on the
+        // wrong side of an RTL run. main's bidi rewrite drew none at all.
+        if cells.iter().any(|ci| ci.style & (ST_UNDERLINE | ST_STRIKE) != 0) {
+            let boxes = self.shaped_boxes(&plan.segs, &plan.byte_cols, scale);
+            let th = (self.cell_h / 14.0).max(1.0) as i32;
+            for b in boxes {
+                if b.x1 <= b.x0 {
+                    continue;
+                }
+                let Some(ci) = cells.iter().find(|c| c.col == b.col) else {
+                    continue;
+                };
+                let x = x0 + b.x0.round() as i32;
+                let w = (b.x1 - b.x0).round().max(1.0) as i32;
+                if ci.style & ST_UNDERLINE != 0 {
+                    let uy = y + self.cell_h.round() as i32 - th - 1;
+                    push_rect(out, clip, x, uy, w, th, c4(ci.fg, 255));
+                }
+                if ci.style & ST_STRIKE != 0 {
+                    let sy = y + (self.cell_h * 0.55).round() as i32;
+                    push_rect(out, clip, x, sy, w, th, c4(ci.fg, 255));
                 }
             }
         }
@@ -1472,7 +1609,7 @@ impl Renderer {
         let n = cells.len();
         let mut i = 0;
         // underline/strikethrough decorations: (col_start, col_end, style, fg)
-        let mut decos: Vec<(usize, usize, u8, (u8, u8, u8))> = Vec::new();
+        let mut decos: Vec<Deco> = Vec::new();
         let mut note_deco = |ci: &CellInfo| {
             if ci.style & (ST_UNDERLINE | ST_STRIKE) == 0 {
                 return;
@@ -1574,8 +1711,9 @@ impl Renderer {
     }
 
     /// Draw one pane's terminal into its rect.
-    pub fn draw_pane(&mut self, out: &mut Vec<Vertex>,
-                     view: &PaneView, term: &Term<EventProxy>) {
+    pub fn draw_pane<T: alacritty_terminal::event::EventListener>(
+        &mut self, out: &mut Vec<Vertex>, view: &PaneView, term: &Term<T>,
+    ) {
         let (px, py, pw, ph) = view.rect;
         let clip = view.rect;
         let rows = term.screen_lines();
@@ -1861,9 +1999,14 @@ impl Renderer {
             let mark = if e.active { "● " } else { "" };
             let title: String = e.title.chars().take(22).collect();
             let status: String = e.status.chars().take(48).collect();
+            let (pct, pct_fg) = match e.progress {
+                Some(p) => (format!("{}  ", progress_label(p)), progress_color(p)),
+                None => (String::new(), fg),
+            };
             let segs = [
                 Seg::plain(format!("{mark}{title}"), fg),
                 Seg::plain("   —   ", (0x6e, 0x76, 0x81)),
+                Seg { text: pct, fg: pct_fg, style: ST_BOLD },
                 Seg::plain(status, (0x9a, 0xa4, 0xb2)),
             ];
             self.draw_run(&segs, true, out, whole, (x + 32) as f32, ry + 6, 1.0);
@@ -1903,16 +2046,19 @@ impl Renderer {
         // The ledger grammar: every row is [control]···dotted leader···[label],
         // controls left, labels right (RTL), one shared control height.
         let pad = 24;
-        let w = ((self.cell_w * 52.0) as i32).clamp(430, fw as i32 - 60);
-        let rowh = (self.cell_h + 20.0) as i32; // 12 rows now — keep them tight
+        let w = ((self.ui_cell_w * 52.0) as i32).clamp(430, fw as i32 - 60);
+        let rowh = (self.ui_cell_h + 20.0) as i32; // 12 rows now — keep them tight
         let ctl = rowh - 10; // every square control is this tall
-        let head_h = (self.cell_h + 30.0) as i32;
-        let foot_h = (self.cell_h + 30.0) as i32;
+        let head_h = (self.ui_cell_h + 30.0) as i32;
+        let foot_h = (self.ui_cell_h + 30.0) as i32;
         // the theme row obeys the same grammar: tiles left, label right,
         // so the strip leaves room for the "المظهر" label
-        let label_reserve = (self.cell_w * 6.0) as i32;
-        let tile_w = ((w - pad * 2 - label_reserve - 6 * 6) / 7).max(30);
-        let tile_h = (self.cell_h * 1.6) as i32;
+        let label_reserve = (self.ui_cell_w * 6.0) as i32;
+        // sized by the ACTUAL tile count (built-ins + plugin themes), or the
+        // strip overruns the label once a theme is added
+        let n_tiles = gallery().len().max(1) as i32;
+        let tile_w = ((w - pad * 2 - label_reserve - 6 * (n_tiles - 1)) / n_tiles).max(30);
+        let tile_h = (self.ui_cell_h * 1.6) as i32;
         let theme_rowh = tile_h + 14;
         let h = head_h + 6 + theme_rowh + rowh * 14 + foot_h;
         let x = (fw as i32 - w) / 2;
@@ -1920,8 +2066,8 @@ impl Renderer {
             .max(self.tab_bar_h() as i32 + 12);
 
         // the shortcuts-editor button lives in the header, left side
-        let sb_w = (self.cell_w * 12.0) as i32;
-        let shortcuts_btn = (x + pad, y + 10, sb_w, (self.cell_h + 8.0) as i32);
+        let sb_w = (self.ui_cell_w * 12.0) as i32;
+        let shortcuts_btn = (x + pad, y + 10, sb_w, (self.ui_cell_h + 8.0) as i32);
 
         let theme_y = y + head_h + 6 + (theme_rowh - tile_h) / 2;
         let theme_tiles: Vec<Rect> = (0..gallery().len() as i32)
@@ -1934,13 +2080,13 @@ impl Renderer {
 
         // font family: [‹] name [›]
         let font_y = row_y(0);
-        let name_w = (self.cell_w * 17.0) as i32;
+        let name_w = (self.ui_cell_w * 17.0) as i32;
         let font_prev = (x + pad, cy(font_y), ctl, ctl);
         let font_next = (x + pad + ctl + name_w, cy(font_y), ctl, ctl);
 
         // font size: [−  15  +]
         let size_y = row_y(1);
-        let size_slot = (self.cell_w * 4.0) as i32;
+        let size_slot = (self.ui_cell_w * 4.0) as i32;
         let size_minus = (x + pad, cy(size_y), ctl, ctl);
         let size_plus = (x + pad + ctl + size_slot, cy(size_y), ctl, ctl);
 
@@ -1949,7 +2095,7 @@ impl Renderer {
         let cursor_btns = [0, 1, 2].map(|i| (x + pad + i * (ctl + 8), cy(cursor_y), ctl, ctl));
 
         // toggle pills (wide and shallow, so the track reads as a switch)
-        let pill_w = (self.cell_w * 4.2) as i32;
+        let pill_w = (self.ui_cell_w * 4.2) as i32;
         let pill_h = ctl - 8;
         let pcy = |ry: i32| ry + (rowh - pill_h) / 2;
         let blink_y = row_y(3);
@@ -1957,17 +2103,17 @@ impl Renderer {
 
         // scrollback: [−  10k  +]
         let scroll_y = row_y(4);
-        let scroll_slot = (self.cell_w * 5.0) as i32;
+        let scroll_slot = (self.ui_cell_w * 5.0) as i32;
         let scroll_minus = (x + pad, cy(scroll_y), ctl, ctl);
         let scroll_plus = (x + pad + ctl + scroll_slot, cy(scroll_y), ctl, ctl);
 
         // padding / opacity: the same stepper shape
         let pad_y = row_y(5);
-        let pad_slot = (self.cell_w * 4.0) as i32;
+        let pad_slot = (self.ui_cell_w * 4.0) as i32;
         let pad_minus = (x + pad, cy(pad_y), ctl, ctl);
         let pad_plus = (x + pad + ctl + pad_slot, cy(pad_y), ctl, ctl);
         let opacity_y = row_y(6);
-        let op_slot = (self.cell_w * 5.0) as i32;
+        let op_slot = (self.ui_cell_w * 5.0) as i32;
         let opacity_minus = (x + pad, cy(opacity_y), ctl, ctl);
         let opacity_plus = (x + pad + ctl + op_slot, cy(opacity_y), ctl, ctl);
 
@@ -1978,7 +2124,7 @@ impl Renderer {
 
         // bell: a three-segment control (all options visible, one active)
         let bell_y = row_y(9);
-        let seg_w = (self.cell_w * 4.6) as i32;
+        let seg_w = (self.ui_cell_w * 4.6) as i32;
         let bell_btns = [0, 1, 2].map(|i| (x + pad + i * (seg_w + 6), cy(bell_y), seg_w, ctl));
 
         // native-toast toggle (M19)
@@ -1987,7 +2133,7 @@ impl Renderer {
 
         // shell cycler (new tabs only) — same shape as the font cycler
         let shell_y = row_y(11);
-        let shell_w = (self.cell_w * 12.0) as i32;
+        let shell_w = (self.ui_cell_w * 12.0) as i32;
         let shell_prev = (x + pad, cy(shell_y), ctl, ctl);
         let shell_next = (x + pad + ctl + shell_w, cy(shell_y), ctl, ctl);
 
@@ -2060,7 +2206,7 @@ impl Renderer {
         let (x, y, w, h) = lay.card;
         let pad = 24;
         // label baseline offset: text vertically centered in its row
-        let tc = (lay.rowh as f32 - self.cell_h) as i32 / 2;
+        let tc = (lay.rowh as f32 - self.ui_cell_h) as i32 / 2;
 
         push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 140));
         push_rect(out, whole, x - 1, y - 1, w + 2, h + 2, c4(EDGE, 255)); // border
@@ -2069,8 +2215,8 @@ impl Renderer {
 
         // title + hairline under it
         let head = [Seg { text: "الإعدادات".into(), fg: self.fg, style: ST_BOLD }];
-        let hw = self.measure(&head, true);
-        self.draw_run(&head, true, out, whole, (x + w - pad) as f32 - hw, y + 14, 1.0);
+        let hw = self.ui_measure(&head, true);
+        self.ui_draw_run(&head, true, out, whole, (x + w - pad) as f32 - hw, y + 14, 1.0);
         push_rect(out, whole, x + pad, y + lay.head_h, w - pad * 2, 1, c4(EDGE, 255));
 
         // the shortcuts-editor button (header, left)
@@ -2079,17 +2225,17 @@ impl Renderer {
             push_rect(out, whole, bx - 1, by - 1, bw + 2, bh + 2, c4(EDGE, 255));
             push_rect(out, whole, bx, by, bw, bh, c4(CTL_BG, 255));
             let seg = [Seg::plain("الاختصارات ‹", MUTED)];
-            let lw = self.measure(&seg, true);
-            self.draw_run(&seg, true, out, whole,
+            let lw = self.ui_measure(&seg, true);
+            self.ui_draw_run(&seg, true, out, whole,
                           bx as f32 + (bw as f32 - lw) / 2.0, by + 3, 1.0);
         }
 
         // right-aligned row label; returns where the leader dots must stop
         let label = |r: &mut Self, out: &mut Vec<Vertex>, text: &str, row_top: i32| -> i32 {
             let seg = [Seg::plain(text, MUTED)];
-            let lw = r.measure(&seg, true);
+            let lw = r.ui_measure(&seg, true);
             let lx = (x + w - pad) as f32 - lw;
-            r.draw_run(&seg, true, out, whole, lx, row_top + tc, 1.0);
+            r.ui_draw_run(&seg, true, out, whole, lx, row_top + tc, 1.0);
             lx as i32
         };
         // the ledger dots: from a control's right edge to its label
@@ -2139,9 +2285,9 @@ impl Renderer {
             bordered(out, rect, CTL_BG, EDGE);
             let (bx, by, bw, bh) = rect;
             let seg = [Seg { text: glyph.into(), fg: r.fg, style: ST_BOLD }];
-            let lw = r.measure(&seg, false);
-            let gy = by + ((bh as f32 - r.cell_h) / 2.0) as i32;
-            r.draw_run(&seg, false, out, whole,
+            let lw = r.ui_measure(&seg, false);
+            let gy = by + ((bh as f32 - r.ui_cell_h) / 2.0) as i32;
+            r.ui_draw_run(&seg, false, out, whole,
                        bx as f32 + (bw as f32 - lw) / 2.0, gy, 1.0);
         };
         let draw_val = |r: &mut Self, out: &mut Vec<Vertex>, text: String,
@@ -2155,10 +2301,10 @@ impl Renderer {
             let mut text = text;
             loop {
                 let seg = [Seg { text: text.clone(), fg: VALUE, style: ST_BOLD }];
-                let vw = r.measure(&seg, false);
+                let vw = r.ui_measure(&seg, false);
                 if vw as i32 <= gap || text.chars().count() <= 2 {
                     let mid = (left.0 + left.2 + right.0) / 2;
-                    r.draw_run(&seg, false, out, whole, mid as f32 - vw / 2.0, row_top + tc, 1.0);
+                    r.ui_draw_run(&seg, false, out, whole, mid as f32 - vw / 2.0, row_top + tc, 1.0);
                     return;
                 }
                 // drop a char and re-measure: cell width is not a reliable
@@ -2265,9 +2411,9 @@ impl Renderer {
                      if active { GREEN } else { EDGE });
             let fg = if active { (0xff, 0xff, 0xff) } else { MUTED };
             let seg = [Seg { text: names[i].into(), fg, style: if active { ST_BOLD } else { 0 } }];
-            let lw = self.measure(&seg, true);
-            let gy = by + ((bh as f32 - self.cell_h) / 2.0) as i32;
-            self.draw_run(&seg, true, out, whole,
+            let lw = self.ui_measure(&seg, true);
+            let gy = by + ((bh as f32 - self.ui_cell_h) / 2.0) as i32;
+            self.ui_draw_run(&seg, true, out, whole,
                           bx as f32 + (bw as f32 - lw) / 2.0, gy, 1.0);
         }
 
@@ -2293,21 +2439,21 @@ impl Renderer {
         draw_toggle(out, lay.close_toggle, v.confirm_close);
 
         // footer: hairline + hint
-        push_rect(out, whole, x + pad, y + h - (self.cell_h as i32 + 24), w - pad * 2, 1,
+        push_rect(out, whole, x + pad, y + h - (self.ui_cell_h as i32 + 24), w - pad * 2, 1,
                   c4(EDGE, 255));
         let hint = [Seg::plain("انقر للتغيير · Esc للإغلاق والحفظ", (0x6e, 0x78, 0x85))];
-        let fw2 = self.measure(&hint, true);
-        self.draw_run(&hint, true, out, whole, (x + w - pad) as f32 - fw2,
-                      y + h - (self.cell_h as i32 + 14), 1.0);
+        let fw2 = self.ui_measure(&hint, true);
+        self.ui_draw_run(&hint, true, out, whole, (x + w - pad) as f32 - fw2,
+                      y + h - (self.ui_cell_h as i32 + 14), 1.0);
     }
 
     /// Geometry of the shortcuts editor: one full-width clickable strip per
     /// action row (draw + hit-test agree, like the settings panel).
     pub fn shortcuts_layout(&self, fw: usize, fh: usize, n: usize) -> ShortcutsLayout {
-        let w = ((self.cell_w * 44.0) as i32).clamp(380, fw as i32 - 60);
-        let rowh = (self.cell_h + 18.0) as i32;
-        let head_h = (self.cell_h + 30.0) as i32;
-        let foot_h = (self.cell_h + 30.0) as i32;
+        let w = ((self.ui_cell_w * 44.0) as i32).clamp(380, fw as i32 - 60);
+        let rowh = (self.ui_cell_h + 18.0) as i32;
+        let head_h = (self.ui_cell_h + 30.0) as i32;
+        let foot_h = (self.ui_cell_h + 30.0) as i32;
         let h = head_h + 6 + rowh * n as i32 + foot_h;
         let x = (fw as i32 - w) / 2;
         let y = (self.tab_bar_h() as i32 + (fh as i32 - h) / 3)
@@ -2322,6 +2468,7 @@ impl Renderer {
     /// The shortcuts editor: the settings ledger grammar again — keycap
     /// chips left ··· action label right. The selected row highlights; a
     /// capturing row swaps its chips for an amber "press the new chord".
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_shortcuts(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
                           rows: &[ShortcutRow], sel: usize, capturing: bool,
                           flash: Option<&str>) {
@@ -2338,7 +2485,7 @@ impl Renderer {
         let lay = self.shortcuts_layout(fw, fh, rows.len());
         let (x, y, w, h) = lay.card;
         let pad = 24;
-        let tc = (lay.rowh as f32 - self.cell_h) as i32 / 2;
+        let tc = (lay.rowh as f32 - self.ui_cell_h) as i32 / 2;
 
         push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 140));
         push_rect(out, whole, x - 1, y - 1, w + 2, h + 2, c4(EDGE, 255));
@@ -2346,9 +2493,9 @@ impl Renderer {
         push_rect(out, whole, x, y, w, 3, c4(GREEN, 255));
 
         let head = [Seg { text: "الاختصارات".into(), fg: self.fg, style: ST_BOLD }];
-        let hw = self.measure(&head, true);
-        self.draw_run(&head, true, out, whole, (x + w - pad) as f32 - hw, y + 14, 1.0);
-        push_rect(out, whole, x + pad, y + (self.cell_h + 30.0) as i32, w - pad * 2, 1,
+        let hw = self.ui_measure(&head, true);
+        self.ui_draw_run(&head, true, out, whole, (x + w - pad) as f32 - hw, y + 14, 1.0);
+        push_rect(out, whole, x + pad, y + (self.ui_cell_h + 30.0) as i32, w - pad * 2, 1,
                   c4(EDGE, 255));
 
         for (i, row) in rows.iter().enumerate() {
@@ -2362,18 +2509,17 @@ impl Renderer {
             // label, right-aligned
             let lseg = [Seg::plain(row.label.clone(),
                                    if selected { self.fg } else { MUTED })];
-            let lw = self.measure(&lseg, true);
+            let lw = self.ui_measure(&lseg, true);
             let label_x = (x + w - pad) as f32 - lw;
-            self.draw_run(&lseg, true, out, whole, label_x, ry + tc, 1.0);
+            self.ui_draw_run(&lseg, true, out, whole, label_x, ry + tc, 1.0);
 
-            let chips_end;
-            if selected && capturing {
+            let chips_end = if selected && capturing {
                 // amber capture prompt in place of the chips
                 let seg = [Seg { text: "اضغط الاختصار الجديد…".into(),
                                  fg: AMBER, style: ST_BOLD }];
-                let cw = self.measure(&seg, true);
-                self.draw_run(&seg, true, out, whole, (x + pad) as f32, ry + tc, 1.0);
-                chips_end = x + pad + cw as i32;
+                let cw = self.ui_measure(&seg, true);
+                self.ui_draw_run(&seg, true, out, whole, (x + pad) as f32, ry + tc, 1.0);
+                x + pad + cw as i32
             } else {
                 // keycap chips, one per token: Ctrl / Shift / T
                 let ch = lay.rowh - 12;
@@ -2382,16 +2528,16 @@ impl Renderer {
                 for token in row.chord.split('+') {
                     let fg = if row.custom { VALUE } else { self.fg };
                     let seg = [Seg { text: token.to_string(), fg, style: 0 }];
-                    let tw = self.measure(&seg, false);
+                    let tw = self.ui_measure(&seg, false);
                     let cw = tw as i32 + 14;
                     push_rect(out, whole, cx - 1, cy - 1, cw + 2, ch + 2, c4(EDGE, 255));
                     push_rect(out, whole, cx, cy, cw, ch, c4(CTL_BG, 255));
-                    self.draw_run(&seg, false, out, whole, (cx + 7) as f32,
-                                  cy + ((ch as f32 - self.cell_h) / 2.0) as i32, 1.0);
+                    self.ui_draw_run(&seg, false, out, whole, (cx + 7) as f32,
+                                  cy + ((ch as f32 - self.ui_cell_h) / 2.0) as i32, 1.0);
                     cx += cw + 6;
                 }
-                chips_end = cx - 6;
-            }
+                cx - 6
+            };
             // the ledger dots tie chips to label
             let dy = ry + lay.rowh / 2 - 1;
             let mut dx = chips_end + 16;
@@ -2402,7 +2548,7 @@ impl Renderer {
         }
 
         // footer: hairline + flash (amber, right) or the hint
-        push_rect(out, whole, x + pad, y + h - (self.cell_h as i32 + 24), w - pad * 2, 1,
+        push_rect(out, whole, x + pad, y + h - (self.ui_cell_h as i32 + 24), w - pad * 2, 1,
                   c4(EDGE, 255));
         let (text, color) = match flash {
             Some(f) => (f.to_string(), AMBER),
@@ -2412,13 +2558,10 @@ impl Renderer {
             ),
         };
         let seg = [Seg::plain(text, color)];
-        let fw2 = self.measure(&seg, true);
-        self.draw_run(&seg, true, out, whole, (x + w - pad) as f32 - fw2,
-                      y + h - (self.cell_h as i32 + 14), 1.0);
+        let fw2 = self.ui_measure(&seg, true);
+        self.ui_draw_run(&seg, true, out, whole, (x + w - pad) as f32 - fw2,
+                      y + h - (self.ui_cell_h as i32 + 14), 1.0);
     }
-
-    /// The close guard (same family as the paste guard): a pane or the
-    /// window is about to close while a command still runs — confirm.
 
     /// The command palette (Ctrl+Shift+P). Query line, filtered rows, hint.
     /// `rows` is already filtered by the caller — the renderer never decides
@@ -2573,6 +2716,8 @@ impl Renderer {
                       y + h - self.cell_h as i32 - 8, 1.0);
     }
 
+    /// The close guard (same family as the paste guard): a pane or the
+    /// window is about to close while a command still runs — confirm.
     pub fn draw_close_guard(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
                             msg: &str) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
@@ -2818,6 +2963,19 @@ impl Renderer {
             if let Some(c) = dot {
                 let d = 6;
                 push_rect(out, whole, tx + tabw - 14, (oy + 3) / 2 - d / 2, d, d, c4(c, 255));
+            }
+            // progress: a 3px bar along the bottom edge, its track dimmed and
+            // its fill at the reported percent (full-width dim = indeterminate)
+            if let Some(p) = tab.progress {
+                let (bx, bw, by, bh) = (tx + 6, tabw - 12, oy - 3, 3);
+                let c = progress_color(p);
+                push_rect(out, whole, bx, by, bw, bh, c4(c, 70));
+                let fill = match p.state {
+                    crate::term::ProgressState::Indeterminate => bw,
+                    _ => (bw as f32 * p.percent as f32 / 100.0).round() as i32,
+                };
+                let alpha = if p.state == crate::term::ProgressState::Indeterminate { 140 } else { 255 };
+                push_rect(out, whole, bx, by, fill, bh, c4(c, alpha));
             }
         }
 
@@ -3387,8 +3545,7 @@ mod cache_tests {
     /// ligature-capable default doesn't sneak substitutions in later).
     #[test]
     fn ligatures_off_prefers_a_mono_family() {
-        let mut cfg = crate::config::UserConfig::default();
-        cfg.ligatures = Some(false);
+        let cfg = crate::config::UserConfig { ligatures: Some(false), ..Default::default() };
         let r = Renderer::new(1.0, &cfg, 0.0);
         assert!(!r.ligatures);
         // the picked family is the first installed MONO candidate (or a
@@ -3473,6 +3630,42 @@ mod cache_tests {
         assert!(!rect_hit(lay.size_plus, (t0x + 2) as f64, (t0y + 2) as f64));
     }
 
+    /// The settings and shortcuts panels are chrome, not content: zooming
+    /// the terminal font must move the text UNDER them, never inflate the
+    /// panels themselves. Ctrl+wheel used to carry the whole card with it
+    /// until the ledger ran off the bottom of the window.
+    #[test]
+    fn panels_ignore_the_terminal_font_size() {
+        let cfg = crate::config::UserConfig::default();
+        let small = Renderer::new(1.0, &cfg, 0.0);
+        let big = Renderer::new(1.0, &cfg, 14.0);
+        assert!(big.cell_h > small.cell_h, "the terminal font did grow");
+        assert_eq!(small.ui_cell_h, big.ui_cell_h, "chrome metrics are fixed");
+
+        let (fw, fh) = (1400usize, 900usize);
+        let a = small.settings_layout(fw, fh);
+        let b = big.settings_layout(fw, fh);
+        assert_eq!((a.card.2, a.card.3), (b.card.2, b.card.3), "card size moved");
+        assert_eq!((a.rowh, a.head_h), (b.rowh, b.head_h), "row height moved");
+        for (ta, tb) in a.theme_tiles.iter().zip(&b.theme_tiles) {
+            assert_eq!((ta.2, ta.3), (tb.2, tb.3), "theme tile size moved");
+            assert_eq!(ta.0 - a.card.0, tb.0 - b.card.0, "tile offset moved");
+        }
+        assert_eq!(a.size_plus.2, b.size_plus.2, "stepper size moved");
+        assert_eq!(a.bell_btns[2].0 - a.card.0, b.bell_btns[2].0 - b.card.0);
+        // the card still clears the tab bar, which DOES follow the font
+        assert!(a.card.1 >= small.tab_bar_h() as i32);
+        assert!(b.card.1 >= big.tab_bar_h() as i32);
+
+        let n = crate::keybinds::Action::ALL.len();
+        let sa = small.shortcuts_layout(fw, fh, n);
+        let sb = big.shortcuts_layout(fw, fh, n);
+        assert_eq!((sa.card.2, sa.card.3), (sb.card.2, sb.card.3));
+        assert_eq!(sa.rowh, sb.rowh);
+        // and the whole shortcuts ledger still fits on screen at 29pt
+        assert!(sb.card.1 + sb.card.3 <= fh as i32, "the editor runs off-screen");
+    }
+
     /// The shortcuts editor layout: one clickable strip per action, all
     /// inside the card, none overlapping, in row order top to bottom.
     #[test]
@@ -3510,6 +3703,120 @@ mod cache_tests {
         assert!(!r.settings_button_hit(w, 20.0, (by + bh / 2) as f64));
         // the button sits at the right edge
         assert!(bx + bw <= w as i32 && bx > w as i32 / 2);
+    }
+
+    /// SGR 2 on a bright foreground used to overflow `u8 * 2` (a debug
+    /// panic on the first faint character, wrapped garbage in release).
+    #[test]
+    fn dim_never_overflows_and_darkens() {
+        assert_eq!(dim((255, 255, 255)), (170, 170, 170));
+        // the measured tan foreground: every channel is above 127
+        assert_eq!(dim(FG), (129, 122, 100));
+        assert_eq!(dim((0, 0, 0)), (0, 0, 0));
+        for c in [128u8, 200, 254] {
+            let d = dim((c, c, c));
+            let want = (c as u16 * 2 / 3) as u8;
+            assert!(d.0 < c && d.0 == want, "dim({c}) = {d:?}, want {want}");
+        }
+    }
+
+    /// The theme strip must fit every tile between the card's left pad and
+    /// the row label, however many themes the gallery holds — the eighth
+    /// built-in was the one that first ran under the label.
+    #[test]
+    fn theme_tiles_stay_clear_of_the_row_label() {
+        let r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let lay = r.settings_layout(1400, 900);
+        let (cx, _, cw, _) = lay.card;
+        let label_reserve = (r.ui_cell_w * 6.0) as i32;
+        let last = lay.theme_tiles[lay.theme_tiles.len() - 1];
+        assert!(gallery().len() >= 8, "this test assumes the eighth theme exists");
+        assert!(
+            last.0 + last.2 <= cx + cw - 24 - label_reserve,
+            "the last tile ends at {} but the label starts at {}",
+            last.0 + last.2,
+            cx + cw - 24 - label_reserve
+        );
+    }
+
+    /// Underline on an Arabic row used to vanish: the BiDi path shaped the
+    /// text and drew no decorations at all. It must emit underline rects,
+    /// placed through the layout (so they sit under the RTL glyphs).
+    #[test]
+    fn underline_survives_on_a_bidi_row() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 30, rows: 3 };
+        let count_rows = |r: &mut Renderer, bytes: &[u8]| -> usize {
+            let mut t = Term::new(Config::default(), &size, VoidListener);
+            let mut p: Processor = Processor::new();
+            p.advance(&mut t, bytes);
+            let mut out = Vec::new();
+            let view = PaneView {
+                rect: (0, 0, 600, 90),
+                focused: false,
+                cursor: crate::config::CursorStyle::Block,
+                cursor_on: false,
+                bordered: false,
+                claude: false,
+                search_match: None,
+                marks: &[],
+                reorder: true,
+                line_dir: &[],
+                link_hover: None,
+                link_tip: None,
+            };
+            // an underline is a solid quad (page 0, white texel) th px tall
+            let th = (r.cell_h / 14.0).max(1.0) as i32;
+            r.draw_pane(&mut out, &view, &t);
+            out.chunks(6)
+                .filter(|q| {
+                    q[0].layer == 0.0
+                        && q[0].uv == [WHITE_UV, WHITE_UV]
+                        && (q[5].pos[1] - q[0].pos[1]).round() as i32 == th
+                })
+                .count()
+        };
+        let plain = count_rows(&mut r, "\u{645}\u{631}\u{62d}\u{628}\u{627}".as_bytes());
+        let underlined = count_rows(&mut r, "\x1b[4m\u{645}\u{631}\u{62d}\u{628}\u{627}\x1b[0m".as_bytes());
+        assert!(underlined > plain, "no underline quads on the Arabic row ({underlined} vs {plain})");
+    }
+
+    /// A tab with OSC 9;4 progress draws its bar (track + fill) and the
+    /// fill follows the percent; an error is red, indeterminate is full width.
+    #[test]
+    fn tab_bar_draws_agent_progress() {
+        use crate::term::{Progress, ProgressState};
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let tab = |p: Option<Progress>| TabInfo {
+            title: "claude".into(), busy: false, attention: false, active: true, progress: p,
+        };
+        // the bar's quads: 3px tall, on the tab's bottom edge (track, then fill)
+        let bar_y = r.tab_bar_h().round() - 3.0;
+        let quads = |r: &mut Renderer, p: Option<Progress>| -> Vec<(f32, [f32; 4])> {
+            let mut out = Vec::new();
+            r.draw_chrome(&mut out, 800, 400, &[tab(p)], None, false);
+            out.chunks(6)
+                .filter(|q| q[0].pos[1] == bar_y && q[5].pos[1] - q[0].pos[1] == 3.0)
+                .map(|q| (q[1].pos[0] - q[0].pos[0], q[0].color))
+                .collect()
+        };
+        assert!(quads(&mut r, None).is_empty(), "no bar without progress");
+        let half = quads(&mut r, Some(Progress { state: ProgressState::Normal, percent: 50 }));
+        let full = quads(&mut r, Some(Progress { state: ProgressState::Normal, percent: 100 }));
+        assert_eq!(half.len(), 2, "track + fill");
+        let (w50, _) = half[1];
+        let (w100, c100) = full[1];
+        assert!((w100 - 2.0 * w50).abs() <= 2.0, "50%={w50} 100%={w100}");
+        assert_eq!(w100, full[0].0, "100% fills the track");
+        assert_eq!(c100, c4((0x2e, 0xa0, 0x43), 255), "working = green");
+        let err = quads(&mut r, Some(Progress { state: ProgressState::Error, percent: 30 }));
+        assert_eq!(err[1].1, c4((0xcf, 0x22, 0x2e), 255), "error = red");
+        let ind = quads(&mut r, Some(Progress { state: ProgressState::Indeterminate, percent: 0 }));
+        assert_eq!(ind[1].0, ind[0].0, "indeterminate spans the track");
+        assert_eq!(progress_label(Progress { state: ProgressState::Paused, percent: 5 }), "⏸ 5%");
     }
 
     /// Solid rects always reference page 0 (the white texel lives there).

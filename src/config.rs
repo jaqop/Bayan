@@ -74,6 +74,7 @@ pub struct UserConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub padding: Option<u32>,
     /// Plugin file-stems to skip loading.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_plugins: Option<Vec<String>>,
     /// Native toast when a long command finishes while Bayan is unfocused
     /// (default on). Windows quiet hours are respected regardless.
@@ -90,13 +91,24 @@ pub struct UserConfig {
     /// Only NON-default bindings live here (the editor prunes defaults).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keybinds: Option<std::collections::HashMap<String, String>>,
+    /// What Ctrl+Tab does: "recent" (default) jumps to the previously used
+    /// tab and walks further down the history while Ctrl stays held, like a
+    /// browser or IDE; "order" cycles left to right the classic way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_switch: Option<String>,
     /// BiDi escape-sequence policy. Absent means [`BidiConfig`]'s defaults.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bidi: Option<BidiConfig>,
     /// Kitty keyboard protocol. Off unless the user opts in — see
     /// [`KeyboardConfig`].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "keyboard_is_default")]
     pub keyboard: KeyboardConfig,
+}
+
+/// Every other field is skipped when unset, so an untouched config still
+/// saves as `{}` rather than growing a keyboard block nobody asked for.
+fn keyboard_is_default(k: &KeyboardConfig) -> bool {
+    *k == KeyboardConfig::default()
 }
 
 fn default_honor_bdsm() -> bool {
@@ -252,7 +264,7 @@ impl UserConfig {
     }
 
     pub fn shell_program(&self) -> String {
-        self.shell.clone().unwrap_or_else(|| "powershell.exe".to_string())
+        self.shell.clone().unwrap_or_else(|| crate::term::DEFAULT_SHELL.to_string())
     }
 
     pub fn hide_single_tab_on(&self) -> bool {
@@ -263,18 +275,24 @@ impl UserConfig {
         self.confirm_close.unwrap_or(true)
     }
 
-    /// Content inset. Default 10: text pressed flat against the window edge
-    /// reads as unfinished, and every modern terminal ships a gutter.
     pub fn disabled_plugins(&self) -> Vec<String> {
         self.disabled_plugins.clone().unwrap_or_default()
     }
 
+    /// Content inset. Default 10: text pressed flat against the window edge
+    /// reads as unfinished, and every modern terminal ships a gutter.
     pub fn padding_px(&self) -> i32 {
         self.padding.unwrap_or(10).min(32) as i32
     }
 
     pub fn notifications_on(&self) -> bool {
         self.notifications.unwrap_or(true)
+    }
+
+    /// Ctrl+Tab walks the most-recently-used history unless the config says
+    /// "order" (anything else, including a typo, keeps the default).
+    pub fn tab_switch_recent(&self) -> bool {
+        !self.tab_switch.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("order"))
     }
 
     /// Explicit BDSM overrides Claude-mode auto-detection. Default true.
@@ -418,7 +436,22 @@ mod tests {
     }
 
     #[test]
-    fn honor_bdsm_defaults_to_true() {
+    fn tab_switch_defaults_to_recent_and_only_order_opts_out() {
+        assert!(UserConfig::default().tab_switch_recent());
+        let order: UserConfig = serde_json::from_str(r#"{"tab_switch":"order"}"#).unwrap();
+        assert!(!order.tab_switch_recent());
+        let typo: UserConfig = serde_json::from_str(r#"{"tab_switch":"ordr"}"#).unwrap();
+        assert!(typo.tab_switch_recent(), "a typo must not silently change behaviour");
+    }
+
+    #[test]
+    fn saving_omits_unset_fields() {
+        let json = serde_json::to_string(&UserConfig::default()).unwrap();
+        assert_eq!(json, "{}", "an untouched config serializes to nothing: {json}");
+    }
+
+    #[test]
+        fn honor_bdsm_defaults_to_true() {
         let d = UserConfig::default();
         assert!(d.honor_bdsm());
         let off: UserConfig = serde_json::from_str(r#"{"bidi":{"honor_bdsm":false}}"#).unwrap();

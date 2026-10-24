@@ -89,6 +89,17 @@ pub fn encode(
                 }
             }
         }
+        // Alt+<char> is the meta key: ESC then the char, the way every
+        // terminal emulator does it (readline's Alt+B/F word motion, and
+        // emacs-style bindings in TUIs). Not when Ctrl is also down — that is
+        // AltGr on many layouts, and the composed text is the real input.
+        Key::Character(_) if alt && !ctrl => {
+            let t = text?;
+            let mut v = Vec::with_capacity(t.len() + 1);
+            v.push(0x1b);
+            v.extend_from_slice(t.as_bytes());
+            v
+        }
         _ => text?.as_bytes().to_vec(),
     };
     if seq.is_empty() {
@@ -588,6 +599,24 @@ mod tests {
         // Windows hands over the pre-composed control char with Ctrl held
         let raw = Key::Character("\u{6}".into());
         assert_eq!(encode(&raw, None, false, false, true).unwrap(), vec![0x06]);
+    }
+
+    #[test]
+    fn alt_letter_is_meta_prefixed_but_altgr_is_not() {
+        let b = Key::Character("b".into());
+        assert_eq!(encode(&b, Some("b"), false, true, false).unwrap(), b"b".to_vec());
+        // plain typing is untouched
+        assert_eq!(encode(&b, Some("b"), false, false, false).unwrap(), b"b".to_vec());
+        // AltGr arrives as Ctrl+Alt, and the decision is encode_input's:
+        // the composed character is not the key, so it types instead of
+        // falling into the Ctrl+letter branch and vanishing.
+        let at = Key::Character("@".into());
+        let q = Key::Character("q".into());
+        let mut altgr = ev(&at, &q);
+        altgr.ctrl = true;
+        altgr.alt = true;
+        altgr.text = Some("@");
+        assert_eq!(encode_input(&altgr).unwrap(), b"@".to_vec());
     }
 
     #[test]

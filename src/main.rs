@@ -9,6 +9,7 @@
 
 mod bidi;
 mod bidi_ctl;
+mod mru;
 mod plugins;
 mod posh;
 mod shells;
@@ -163,6 +164,18 @@ fn jump_offset(marks: &[usize], hist: usize, off: usize, dir: i32) -> Option<usi
     Some((hist as i64 - target + 1).clamp(0, hist as i64) as usize)
 }
 
+/// The active tab index after tab `removed` leaves a list of `len` tabs.
+/// A background tab whose shell exits sits at a LOWER index than the active
+/// one often enough (the first tab is the one people leave running): the
+/// active index must slide down with it, or focus lands on the wrong tab.
+fn active_after_remove(active: usize, removed: usize, len_after: usize) -> usize {
+    if len_after == 0 {
+        return 0;
+    }
+    let a = if removed < active { active - 1 } else { active };
+    a.min(len_after - 1)
+}
+
 /// One cell step in the search direction, clamped to the buffer (used to
 /// move the search origin past the current hit so Enter advances).
 fn step_point(p: Point, cols: usize, top: i32, bottom: i32, dir: Direction) -> Point {
@@ -255,6 +268,10 @@ pub enum UserEvent {
     Bell(u64),
     /// A command that ran ≥6s in pane `id` just finished (ok?).
     CommandFinished(u64, bool),
+    /// Pane `id`'s program asked for a desktop notification (title, body).
+    Notify(u64, String, String),
+    /// Pane `id` reported OSC 9;4 progress (None clears it).
+    Progress(u64, Option<term::Progress>),
     /// Pane `id`'s shell exited.
     Exit(u64),
     /// A link open failed, or `settle` refused it, off the UI thread.
@@ -296,6 +313,8 @@ struct Pane {
     session: Session,
     /// when this pane last produced output — feeds the busy dot
     last_output: Option<Instant>,
+    /// the program's OSC 9;4 progress report, until it clears it
+    progress: Option<term::Progress>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -318,6 +337,15 @@ struct Tab {
 }
 
 impl Tab {
+    /// The tab's progress: its focused pane's, else any pane's — a
+    /// background pane's Claude is still this tab's work.
+    fn progress(&self) -> Option<term::Progress> {
+        self.panes
+            .get(self.focused)
+            .and_then(|p| p.progress)
+            .or_else(|| self.panes.iter().find_map(|p| p.progress))
+    }
+
     fn busy(&self, now_active: bool) -> bool {
         !now_active
             && self.panes.iter().any(|p| {
@@ -383,6 +411,48 @@ struct SavedTab {
 struct SavedState {
     tabs: Vec<SavedTab>,
     active: usize,
+    /// where the window was, so it comes back there (WezTerm's most-asked
+    /// small thing). Physical pixels; absent in files from before M32.
+    #[serde(default)]
+    window: Option<WindowGeom>,
+}
+
+/// The window's last NON-maximized rectangle plus whether it was maximized —
+/// so restoring a maximized window also knows where "restore down" goes.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct WindowGeom {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    #[serde(default)]
+    maximized: bool,
+}
+
+/// A saved rectangle is worth restoring only if enough of it lands on a
+/// monitor that is still connected: a window last seen on an unplugged
+/// second screen must not come back off-screen with no way to grab it.
+/// `monitors` are (x, y, w, h) in physical pixels.
+fn geometry_on_screen(g: WindowGeom, monitors: &[(i32, i32, u32, u32)]) -> bool {
+    const NEED: i64 = 120; // px of the window's top strip that must be reachable
+    if g.w < 200 || g.h < 120 {
+        return false;
+    }
+    let (gx0, gy0) = (g.x as i64, g.y as i64);
+    let (gx1, gy1) = (gx0 + g.w as i64, gy0 + 64); // the title strip, where you grab it
+    monitors.iter().any(|&(mx, my, mw, mh)| {
+        let (mx0, my0, mx1, my1) = (mx as i64, my as i64, mx as i64 + mw as i64, my as i64 + mh as i64);
+        let ox = gx1.min(mx1) - gx0.max(mx0);
+        let oy = gy1.min(my1) - gy0.max(my0);
+        ox >= NEED && oy >= 32
+    })
+}
+
+/// Read and parse ~/.bayan/session.json (None when absent or corrupt).
+fn load_saved_state() -> Option<SavedState> {
+    state_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| parse_state(&s))
 }
 
 /// The pre-M9 file format (one cwd per tab) — read it rather than dropping
@@ -410,6 +480,7 @@ fn parse_state(json: &str) -> Option<SavedState> {
             })
             .collect(),
         active: legacy.active,
+        window: None,
     })
 }
 
@@ -464,6 +535,9 @@ struct Palette {
     sel: usize,
 }
 
+/// A frame's snapshot of the picker: (names, previews, selected row).
+type PoshView = (Vec<String>, Vec<Option<Vec<u8>>>, usize);
+
 /// The prompt picker: theme names with LIVE previews rendered by oh-my-posh
 /// itself, so what you see is the prompt you get.
 struct PoshPicker {
@@ -476,6 +550,8 @@ struct PoshPicker {
 struct App {
     /// the prompt picker, when open
     posh: Option<PoshPicker>,
+    /// most-recently-used tab history for Ctrl+Tab
+    mru: mru::Mru,
     /// the command palette, when open
     palette: Option<Palette>,
     /// last click on the empty title strip — powers double-click-to-maximise
@@ -543,6 +619,9 @@ struct App {
     font_delta: f32,
     renderer_building: bool,
     inflight_delta: f32,
+    /// the last rectangle the window had while NOT maximized — what a
+    /// maximized window restores down to, and what the session saves
+    normal_geom: Option<WindowGeom>,
     /// Physical keys whose press never reached the PTY. The matching release
     /// must not either: a TUI that asked for key-up events would otherwise
     /// see a release whose press it never got. Copy clears the selection
@@ -579,13 +658,18 @@ impl App {
 
     // ---- settings panel ----
 
-    /// Index of the active theme (which the panel highlights).
+    /// Index of the active theme in the gallery order (built-ins, then
+    /// plugin themes) — the index the panel highlights and apply_theme takes.
     fn active_theme(&self) -> usize {
-        self.config
-            .theme
-            .as_deref()
-            .and_then(|n| render::THEMES.iter().position(|t| t.name == n))
-            .unwrap_or(0)
+        let Some(name) = self.config.theme.as_deref() else { return 0 };
+        if let Some(i) = render::THEMES.iter().position(|t| t.name == name) {
+            return i;
+        }
+        plugins::registry()
+            .themes
+            .iter()
+            .position(|t| t.name == name)
+            .map_or(0, |i| render::THEMES.len() + i)
     }
 
     /// Apply theme `idx` (copy its colors into the config), live.
@@ -891,7 +975,7 @@ impl App {
                 if let Some(act) = plugins::registry().actions.get(i) {
                     let text = act.send.clone();
                     if let Some(s) = self.session_mut() {
-                        let _ = s.write(text.as_bytes());
+                        s.write(text.as_bytes());
                     }
                 }
             }
@@ -1264,6 +1348,7 @@ impl App {
                     busy: t.busy(i == self.active),
                     attention: t.attention,
                     active: i == self.active,
+                    progress: t.progress(),
                 }
             })
             .collect()
@@ -1356,7 +1441,7 @@ impl App {
             &self.config.shell_program(),
             self.config.kitty_protocol_on(),
         ) {
-            Ok(session) => Some(Pane { id, session, last_output: None }),
+            Ok(session) => Some(Pane { id, session, last_output: None, progress: None }),
             Err(e) => {
                 eprintln!("bayan: spawn failed: {e}");
                 None
@@ -1385,6 +1470,7 @@ impl App {
                 attention: false,
             });
             self.active = self.tabs.len() - 1;
+            self.mru.touch(self.active);
             self.relayout_active();
             self.sync_focus(None);
         }
@@ -1418,8 +1504,7 @@ impl App {
         }
         let rects = self.pane_rects();
         const GRAB: f64 = 4.0;
-        for i in 0..rects.len() - 1 {
-            let (x, y, w, h) = rects[i];
+        for (i, &(x, y, w, h)) in rects.iter().enumerate().take(rects.len() - 1) {
             let hit = match t.orientation {
                 Orientation::Row => {
                     (pos.x - (x + w) as f64).abs() <= GRAB
@@ -1530,9 +1615,9 @@ impl App {
                 self.quit(el);
                 return;
             }
-            if self.active >= self.tabs.len() {
-                self.active = self.tabs.len() - 1;
-            }
+            self.mru.removed(ti);
+            self.active = active_after_remove(self.active, ti, self.tabs.len());
+            self.mru.touch(self.active);
         } else if t.focused >= t.panes.len() {
             t.focused = t.panes.len() - 1;
         }
@@ -1543,6 +1628,13 @@ impl App {
     }
 
     fn switch_tab(&mut self, idx: usize) {
+        self.show_tab(idx);
+        self.mru.touch(self.active);
+    }
+
+    /// Show tab `idx` without touching the MRU history — the Ctrl+Tab walk
+    /// passes through tabs; only the one it ends on (Ctrl released) counts.
+    fn show_tab(&mut self, idx: usize) {
         if idx >= self.tabs.len() || idx == self.active {
             return;
         }
@@ -1597,6 +1689,10 @@ impl App {
                 })
                 .collect(),
             active: self.active,
+            window: self.normal_geom.map(|g| WindowGeom {
+                maximized: self.window.as_ref().is_some_and(|w| w.is_maximized()),
+                ..g
+            }),
         };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -1606,10 +1702,22 @@ impl App {
         }
     }
 
+    /// Note the window's current rectangle if it is in its normal state
+    /// (moved or resized by the user, not maximized).
+    fn track_geometry(&mut self) {
+        let Some(w) = &self.window else { return };
+        if w.is_maximized() || w.is_minimized().unwrap_or(false) {
+            return;
+        }
+        let (Ok(pos), size) = (w.outer_position(), w.inner_size()) else { return };
+        if size.width > 0 && size.height > 0 {
+            self.normal_geom =
+                Some(WindowGeom { x: pos.x, y: pos.y, w: size.width, h: size.height, maximized: false });
+        }
+    }
+
     fn restore_state(&mut self) {
-        let saved: Option<SavedState> = state_path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| parse_state(&s));
+        let saved = load_saved_state();
         match saved {
             Some(state) if !state.tabs.is_empty() => {
                 for st in state.tabs {
@@ -2308,6 +2416,7 @@ impl App {
         self.tab_at(pos).is_none()
     }
 
+    /// Tab index under a pixel position, if it's in the tab bar.
     fn tab_at(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
         let r = self.renderer.as_ref()?;
         if r.tab_bar_h() == 0.0 || pos.y >= r.tab_bar_h() as f64 {
@@ -2531,7 +2640,7 @@ impl App {
                     .collect();
                 (rows, st.sel, st.capturing, st.flash.clone())
             });
-        let posh_view: Option<(Vec<String>, Vec<Option<Vec<u8>>>, usize)> =
+        let posh_view: Option<PoshView> =
             self.posh.as_ref().map(|p| (p.names.clone(), p.previews.clone(), p.sel));
         // computed before the renderer is borrowed, like close_msg above
         let palette_view: Option<(String, Vec<String>, usize)> = self.palette.as_ref().map(|p| {
@@ -2559,6 +2668,7 @@ impl App {
                 busy: t.busy(i == self.active),
                 attention: t.attention,
                 active: i == self.active,
+                progress: t.progress(),
             })
             .collect();
         let Some(window) = self.window.as_ref() else { return };
@@ -2829,7 +2939,7 @@ impl ApplicationHandler<UserEvent> for App {
         // and generated from assets/bayan.ico so the two can't drift apart.
         const ICON_RGBA: &[u8] = include_bytes!("../assets/icon_64.rgba");
         let icon = winit::window::Icon::from_rgba(ICON_RGBA.to_vec(), 64, 64).ok();
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             // M24: no OS title bar. The tab strip IS the title bar, so the
             // window carries one row of chrome instead of two. We draw the
             // caption buttons and handle drag/resize ourselves below.
@@ -2838,6 +2948,23 @@ impl ApplicationHandler<UserEvent> for App {
             .with_window_icon(icon)
             .with_visible(visible)
             .with_inner_size(LogicalSize::new(1100.0, 700.0));
+        // yesterday's rectangle, if it is still on a connected monitor
+        let monitors: Vec<(i32, i32, u32, u32)> = el
+            .available_monitors()
+            .map(|m| {
+                let (p, s) = (m.position(), m.size());
+                (p.x, p.y, s.width, s.height)
+            })
+            .collect();
+        if let Some(g) = load_saved_state().and_then(|s| s.window) {
+            if geometry_on_screen(g, &monitors) {
+                attrs = attrs
+                    .with_position(winit::dpi::PhysicalPosition::new(g.x, g.y))
+                    .with_inner_size(winit::dpi::PhysicalSize::new(g.w, g.h))
+                    .with_maximized(g.maximized);
+                self.normal_geom = Some(WindowGeom { maximized: false, ..g });
+            }
+        }
         let window = Arc::new(el.create_window(attrs).expect("create window"));
         crate::prof::mark("window created");
         let px = window.inner_size();
@@ -3009,6 +3136,52 @@ impl ApplicationHandler<UserEvent> for App {
                     if mode == config::BellMode::Sound && (background || !self.focused) {
                         beep();
                     }
+                    // the window is unfocused: a dot nobody can see is no
+                    // alert. A toast, like a finished command gets (Claude
+                    // Code with preferredNotifChannel=terminal_bell rings
+                    // exactly this bell when it needs an approval).
+                    if !self.focused && self.config.notifications_on() {
+                        if let Some(h) = self.hwnd() {
+                            let body = self.tabs[ti].title.clone();
+                            toast::show(h, "بيان — تنبيه", &body);
+                        }
+                        if let Some(w) = &self.window {
+                            w.request_user_attention(Some(
+                                winit::window::UserAttentionType::Informational,
+                            ));
+                        }
+                    }
+                }
+            }
+            UserEvent::Notify(id, title, body) => {
+                // an explicit ask (OSC 9 / 777 / 99): the program decided
+                // this deserves attention, so the only question is whether
+                // the user is already looking — same rule as the bell
+                if let Some((ti, _)) = self.find_pane(id) {
+                    let background = ti != self.active;
+                    if background {
+                        self.tabs[ti].attention = true;
+                    }
+                    if (background || !self.focused) && self.config.notifications_on() {
+                        if let Some(h) = self.hwnd() {
+                            let body = if body.is_empty() { self.tabs[ti].title.clone() } else { body };
+                            toast::show(h, &title, &body);
+                        }
+                        if !self.focused {
+                            if let Some(w) = &self.window {
+                                w.request_user_attention(Some(
+                                    winit::window::UserAttentionType::Informational,
+                                ));
+                            }
+                        }
+                    }
+                    self.request_redraw();
+                }
+            }
+            UserEvent::Progress(id, p) => {
+                if let Some((ti, pi)) = self.find_pane(id) {
+                    self.tabs[ti].panes[pi].progress = p;
+                    self.request_redraw(); // the tab bar and cockpit draw it
                 }
             }
             UserEvent::CommandFinished(id, ok) => {
@@ -3195,17 +3368,24 @@ impl ApplicationHandler<UserEvent> for App {
                     s.write(body.as_bytes());
                 }
             }
-            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            WindowEvent::ModifiersChanged(m) => {
+                self.modifiers = m.state();
+                if !self.modifiers.control_key() && self.mru.walking() {
+                    self.mru.release(self.active); // the Ctrl+Tab walk ends here
+                }
+            }
             WindowEvent::ScaleFactorChanged { .. } => {
                 // HiDPI: the window moved to a monitor with another scale.
                 // Rebuild cell metrics off-thread; the current renderer keeps
                 // painting until RendererReady swaps it in and re-snaps the grid.
                 self.rebuild_renderer();
             }
+            WindowEvent::Moved(_) => self.track_geometry(),
             WindowEvent::Resized(px) => {
                 if px.width == 0 || px.height == 0 {
                     return;
                 }
+                self.track_geometry();
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.resize(px.width, px.height);
                 }
@@ -3686,12 +3866,20 @@ impl ApplicationHandler<UserEvent> for App {
                     // because winit reports Tab+shift with the shift modifier)
                     if matches!(key, Key::Named(NamedKey::Tab)) && !self.tabs.is_empty() {
                         let n = self.tabs.len();
-                        let next = if shift {
-                            (self.active + n - 1) % n
+                        if self.config.tab_switch_recent() {
+                            // stack-like: the previous tab first, deeper while
+                            // Ctrl stays down; ModifiersChanged commits the stop
+                            if let Some(next) = self.mru.step(!shift, n) {
+                                self.show_tab(next);
+                            }
                         } else {
-                            (self.active + 1) % n
-                        };
-                        self.switch_tab(next);
+                            let next = if shift {
+                                (self.active + n - 1) % n
+                            } else {
+                                (self.active + 1) % n
+                            };
+                            self.switch_tab(next);
+                        }
                         return;
                     }
                     // Ctrl+0 resets the font zoom (physical digit key:
@@ -3716,9 +3904,13 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
-                // Shift+PageUp/PageDown page through the scrollback
+                // Shift+PageUp/PageDown page through the scrollback, by the
+                // focused pane's REAL height (self.size is only the spawn grid)
                 if shift && !ctrl {
-                    let rows = self.size.rows as i32;
+                    let rows = self
+                        .session()
+                        .map_or(self.size.rows, |s| s.term.lock().unwrap().screen_lines())
+                        as i32;
                     match key {
                         Key::Named(NamedKey::PageUp) => {
                             self.scroll_lines(rows);
@@ -3826,6 +4018,7 @@ fn main() {
     let keymap = keybinds::effective_map(&cfg);
     let mut app = App {
         posh: None,
+        mru: mru::Mru::new(),
         palette: None,
         last_strip_click: None,
         proxy,
@@ -3868,6 +4061,7 @@ fn main() {
         font_delta: 0.0,
         renderer_building: false,
         inflight_delta: 0.0,
+        normal_geom: None,
         keys_held_away: Vec::new(),
     };
     event_loop.run_app(&mut app).expect("run event loop");
@@ -3974,6 +4168,26 @@ mod tests {
     }
 
     #[test]
+    fn window_geometry_restores_only_onto_a_live_monitor() {
+        let primary = (0, 0, 2560u32, 1440u32);
+        let second = (2560, 0, 1920u32, 1080u32);
+        let g = |x, y| WindowGeom { x, y, w: 1100, h: 700, maximized: false };
+        assert!(geometry_on_screen(g(100, 100), &[primary]));
+        // on the second monitor: fine while it is connected, not after
+        assert!(geometry_on_screen(g(3000, 200), &[primary, second]));
+        assert!(!geometry_on_screen(g(3000, 200), &[primary]));
+        // mostly off the right edge, but 160px of the grab strip still reaches in
+        assert!(geometry_on_screen(g(2400, 100), &[primary]));
+        // only 60px in: not enough to grab — treat as off-screen
+        assert!(!geometry_on_screen(g(2500, 100), &[primary]));
+        // above the top: the title strip is unreachable
+        assert!(!geometry_on_screen(g(100, -400), &[primary]));
+        // a degenerate size is not worth restoring
+        assert!(!geometry_on_screen(WindowGeom { w: 10, h: 10, ..g(0, 0) }, &[primary]));
+        assert!(!geometry_on_screen(g(0, 0), &[]));
+    }
+
+    #[test]
     fn saved_state_round_trips_with_layout() {
         let s = SavedState {
             tabs: vec![SavedTab {
@@ -3983,9 +4197,14 @@ mod tests {
                 focused: 1,
             }],
             active: 0,
+            window: Some(WindowGeom { x: 40, y: 60, w: 1280, h: 800, maximized: true }),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back = parse_state(&json).unwrap();
+        assert_eq!(back.window, s.window, "geometry survives the round trip");
+        // a pre-M32 file has no window field and must still parse
+        let old = r#"{"tabs":[{"cwds":[null]}],"active":0}"#;
+        assert_eq!(parse_state(old).unwrap().window, None);
         assert_eq!(back.tabs[0].cwds.len(), 2);
         assert_eq!(back.tabs[0].weights, vec![3.0, 1.0]);
         assert_eq!(back.tabs[0].orientation, 1);
@@ -4060,6 +4279,20 @@ mod tests {
         // no hits -> None, and a regex-special query is treated literally
         assert!(find_match(&mut t, "absent", &None, Direction::Left).is_none());
         assert!(find_match(&mut t, "needle (", &None, Direction::Left).is_none());
+    }
+
+    /// A background tab's shell exiting must not move focus to a different
+    /// tab than the one the user was looking at.
+    #[test]
+    fn closing_a_lower_tab_slides_the_active_index_down() {
+        // 4 tabs, looking at #2, tab #0 closes -> the same tab is now #1
+        assert_eq!(active_after_remove(2, 0, 3), 1);
+        // closing a higher tab leaves the index alone
+        assert_eq!(active_after_remove(1, 3, 3), 1);
+        // closing the active tab itself: clamp to the last remaining
+        assert_eq!(active_after_remove(2, 2, 2), 1);
+        assert_eq!(active_after_remove(0, 0, 2), 0);
+        assert_eq!(active_after_remove(5, 0, 0), 0);
     }
 
     #[test]
