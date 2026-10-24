@@ -52,7 +52,9 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       alternate screen belongs to a `claude` command (F2 = manual toggle,
       green badge); OSC 133 prompt marks injected into PowerShell power the
       command detection; OSC 52 sets the clipboard; OSC 9;9 tracks the cwd
-      into the window title — all scanned split-safe with carry
+      into the window title — all scanned split-safe with carry. OSC 7
+      (`file://`) reports the same directory; see "BiDi controls and the
+      current directory" below
 - [x] **M5** — tabs (Ctrl+T inherits the cwd, Ctrl+Tab cycles,
       Ctrl+Shift+W closes, click to switch; renderer-drawn bar), session
       persistence (~/.bayan/session.json restores every tab in its
@@ -226,6 +228,205 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       (Shell_NotifyIcon, the biggest windows-sys consumer) compiles and the app
       runs, but a balloon was not caught on camera — quiet hours file it to the
       Action Center — so that one is built-and-running, not eyeball-verified
+- [x] **M24** — kitty keyboard protocol. alacritty_terminal 0.26 already
+      parsed `CSI > u` / `CSI < u` / `CSI = u` / `CSI ? u` into a per-screen
+      flag stack, and the stack was inert because `Term::new` left
+      `kitty_keyboard` at its default of false. Turning it on is the whole
+      of the mode tracking. One real bug in that crate came with it:
+      `CSI =` updates `TermMode` but the query reply reads the push/pop
+      stack, so a set-then-query probe (how an app checks that the flags
+      stuck) answered 0. The feed path pops the stale top and pushes the
+      mode bits back in front of each query, so the reply matches the flags
+      the encoder uses. A zero mode does not push onto an empty stack: a
+      startup `CSI ? u` must not invent a level.
+      The encoder is EasyTer's `kitty_encode_key` for the disambiguate
+      flag — Esc, shift+Enter, ctrl+space, ctrl/alt letters become CSI u;
+      plain text and unmodified Enter/Tab/Backspace/arrows stay legacy —
+      extended to the other four flags. Alternate keys are layout-aware:
+      the primary code is the active layout's unshifted character, the
+      shifted alternate is the glyph the layout actually produced (Arabic
+      kasra, not `to_uppercase` of ش), and the base-layout alternate is the
+      PC-101 key in that physical position (`ش` on the A key reports `97`).
+      Protocol off is the old encoder, including Ctrl+C by physical key on
+      an Arabic layout. Proven by the encoder tests and a headless term
+      test of push/pop/set/query plus the alt-screen stack swap. Not proven
+      live: `kitten show-key`, Neovim, and Claude Code need a Windows
+      session this tree was not run in.
+      The follow-up made the protocol **opt-in**. ConPTY (the system conhost
+      behind portable-pty) has been reported to swallow the ESC of `CSI u`
+      ([rio#1607](https://github.com/raphamorim/rio/issues/1607),
+      [microsoft/terminal#19847](https://github.com/microsoft/terminal/issues/19847)),
+      which would turn Ctrl+C into the literal text `[99;5u`. Until that is
+      verified on a real Windows session, `keyboard.kitty_protocol` defaults
+      to false. Off, `Term::new` is given `kitty_keyboard: false`, so the
+      parser never touches its stack — including the forms a digit/semicolon
+      scanner misses (`ESC [ > 1 NUL u`, a C0 before the intermediate, a
+      `:` sub-parameter). `CSI ? u` is answered by us with `CSI ?0u` (the
+      same probe reply Rio sends when the protocol is off), including a
+      query vte still accepts because a C0 inside the CSI does not end it
+      (`ESC [ ? NUL u`). The encoder
+      masks the kitty bits out of `TermMode` so a hostile push cannot make
+      a key emit CSI u. Set `kitty_protocol` to true to enable the encoder.
+      On, the crate is [alacritty commit `542147067dd016fc5f49120ef0ba605a98a4e3a7`](https://github.com/alacritty/alacritty/commit/542147067dd016fc5f49120ef0ba605a98a4e3a7)
+      (`0.26.1-dev`, the fix for [alacritty#9071](https://github.com/alacritty/alacritty/issues/9071)).
+      Published 0.26.0's `push_keyboard_mode` evicts from `title_stack` and
+      panics at depth 4096, and that panic survives any scanner because vte
+      completes a CSI on C0 and `:`. The pin changes the eviction to
+      `keyboard_mode_stack`. Recognized pushes still stop at 16, kitty's own
+      cap. The requirement is `0.26.1-dev` rather than `0.26` because Cargo
+      will not select a pre-release for a plain `0.26` requirement, and the
+      patch was then unused. A vendor of 0.26.0 was the fallback if this
+      commit did not build against our API; `cargo check --tests` for
+      `x86_64-pc-windows-gnu` did build, so the pin is what shipped.
+      TODO: remove `[patch.crates-io]` and go back to the crates.io release
+      once alacritty_terminal 0.26.1 is published.
+      With disambiguate on but alternate keys off, a non-ASCII chord is
+      reported as its PC-101 key (`keyboard.kitty_base_layout_fallback`,
+      default true) — `ؤ` on the C key is `CSI 99;5u`, not `CSI 1572;5u` —
+      so Claude Code can still be interrupted. That is a deliberate
+      departure from the spec; turn the fallback off to send the Arabic
+      codepoint.
+      A crashed full-screen program leaks its flags into the shell. The
+      reset pops only the **current** screen's stack, by the number of
+      levels that were counted, including a level whose mode is 0. Flag
+      bits alone do not make it pop, and it does not emit `1049`.
+      Visiting the other screen cleared the selection, clobbered DECSC, and
+      wiped the alt grid on the way back in — a prompt turned a TUI blank.
+      It is a no-op when the protocol is off or that stack is empty. It runs
+      on `OSC 133;A`, on shell exit through the session's own parser (not a
+      fresh one), and on Ctrl+Shift+K. That chord is the rebindable action
+      `reset-keyboard`: it is taken from the program in the terminal, and
+      `keybinds` can move it. RIS (`ESC c`) zeroes both depth counters,
+      because the parser clears both stacks and a stale cap would drop the
+      next push. AltGr is text when `text` is not that key and not its
+      PC-101 shift, compared case-insensitively, so Ctrl+Alt+Shift+A and
+      Ctrl+Alt+Shift+1 stay chords. It types with the protocol off too:
+      AltGr+E is €.
+- [x] **Security (High)** — the four High findings from the audit
+      (`docs/SECURITY_AUDIT.md`). OSC 52 no longer writes the OS clipboard
+      unless `osc52` is `"copy"`, the window is focused, and the write comes
+      from the focused pane of the active tab; the sequence must end in BEL
+      or ST, a `?` query is never answered, and the decode backstop is 64 KiB.
+      One scan can only see about 48 KiB (a single 64 KiB read) or about
+      51 KiB (that read plus the 4 KiB carry). The paste guard treats CR
+      (Enter on ConPTY), the other line breaks, other control characters,
+      and strong bidi / zero-width spoofs as confirm-first (LRM, RLM, and
+      ALM in a paste do not), shows the reason and a
+      preview on the card, and strips ESC and the other C0/C1 bytes before
+      the text is sent. `accept_local_cwd` is the shared gate for a working
+      directory — drive-letter paths only, so a UNC or `\\?\` path from
+      OSC 9;9 or `session.json` is dropped before `is_dir` can open SMB. A
+      dropped file is quoted for the shell that pane was spawned with
+      (PowerShell single quotes, including the smart quotes, cmd double
+      quotes, POSIX single quotes for Git Bash and WSL, fish with `\`
+      doubled before the apostrophe, a nushell raw string), and a
+      drop into vim, less, a shell that is not at its prompt, or a name
+      with a bidi mark or override asks first.
+      Proven by the unit tests named in the audit; not exercised here as a
+      live window
+- [x] **M30** — mouse reporting. Clicks, drags and motion reach the program
+      when it asks: xterm 1000 (press/release), 1002 (drag), 1003 (any
+      motion), encoded as SGR 1006 or the legacy X10 byte form when 1006
+      is off. X10 stops at coordinate 95: the wire byte is that plus 32,
+      and ConPTY's UTF-8 pipe turns 0x80 and above into U+FFFD, so a click
+      past column or row 95 is not reported. Mode 1005
+      is not encoded (no silent X10 fallback). Buttons numbered 128 and
+      up, and the horizontal wheel, are not reported. Coordinates are the
+      pane's cells — padding and split gaps
+      are not cells, and a click in the second pane is that pane's column
+      0. On a row Bayan reorders (the whole-line BiDi path), the column is
+      the glyph under the pointer, not `x / cell_w`: the left of مرحبا is
+      the last logical cell, and ١٧٥ is not mirrored. Claude rows go
+      through the same restoration as the painter, then the index map
+      points the glyph back at the grid column Claude stored. Shift+drag
+      stays a local selection, and Shift+wheel scrolls that pane's own
+      history even on the alt screen. A focus loss, a tab switch, opening
+      a new tab, or a pane close releases a tracked button (or drops the
+      grab if tracking is already off) so Alt+Tab cannot keep dragging.
+      The paste confirm card and the close card block the pointer too.
+      Mode 1004 sends CSI I / CSI O when the window or the focused pane
+      changes. A `Focused` event passes its own bit, because
+      `Window::has_focus` can still read true for a moment after blur
+      and would swallow CSI O; every other path asks `has_focus`, including
+      the moment the program turns the
+      mode on, and a RIS forgets the last CSI I so the next one is sent
+      again. The wheel still scrolls the pane under the pointer and is
+      not reported at all over the tab bar or the padding; Ctrl+wheel is
+      still font zoom. The suite size after this merged with main is
+      under M31. Not proven here: a live htop /
+      vim `mouse=a` / lazygit / Claude Code session — this tree doesn't
+      run a window on the machine that built it. Windows CI is the build
+      that does.
+- [x] **M31** — hyperlinks. OSC 8 is already on the cell
+      (`Cell::hyperlink`); a run of cells that share one id is a span, and
+      the bytes are not parsed a second time. Cells an OSC link does not
+      cover are scanned for `http`/`https` URLs and for `path:line[:col]` /
+      `path(line,col)` (rustc, gcc, MSVC, grep). Hover underlines the span
+      through the same shaped glyph boxes a click uses, and the pane's
+      bottom strip shows the target — so a label that differs from its URI
+      is visible. The underline is not a shaped-run style bit: baking it
+      into the cache key would reshape the line on every hover change.
+      Ctrl+click opens the link. Shift+click stays a local selection and
+      wins over Ctrl. A plain click while mouse tracking is on still goes
+      to the program, Ctrl modifier bit included; the window asks
+      `link::click_owner` before `mouse::Route::press`, and an overlay
+      (settings, cockpit, paste guard, close guard, the refused-link card)
+      blocks the click so a link under a card does not open.       Only `http`
+      and `https` are association-opened, and never through `cmd /c start`:
+      `ShellExecuteW` gets the URI as the single `lpFile`. A `file` URI
+      association-opens only after `accept_local_cwd` has accepted a drive
+      path — UNC, `\\?\`, `\\.\`, `\??\`, a colon after the drive letter,
+      a comma, a quote, and `\\` anywhere are refused before `exists`,
+      because a stat of a UNC path opens SMB and can leak NTLM — and only
+      when the extension is on the document/media allowlist (`.txt` `.md`
+      `.log` `.json` `.csv` `.pdf` `.png` `.jpg` `.jpeg` `.gif` `.webp`
+      `.bmp` `.svg`). Everything else, including no extension, is revealed.
+      An existing 8.3 name is expanded with `GetLongPathNameW` and both
+      the UNC gate and the allowlist run again on the long path; a `~`
+      component that cannot be expanded is revealed. `javascript:`,
+      `ms-*`, `search-ms:`, `data:`, and anything else are refused on a
+      red card whose keys say Enter closes. A URL with userinfo, and any
+      non-ASCII host, shows the real host first (punycode for IDN) and
+      waits for a different card; Enter is what opens it. Control
+      characters and bidi overrides are refused too, including after
+      percent-decoding (a stray `%` is not one of those), and a target
+      longer than 2048 bytes is refused. `path:line` never
+      association-opens the file. The editor is a `Command` argument
+      vector from `editor` in the config (`code -g {file}:{line}:{col}`);
+      `{file}` `{line}` `{col}` are substituted in one pass after the
+      template is split, so a path with spaces is one argument and a
+      `{line}` inside the filename is left alone. The path is absolute, so
+      a file named `-n.rs` cannot become an option. Absent that key,
+      `code.exe` on PATH (or the `Code.exe` beside VS Code's `code.cmd`)
+      is used; a bare `.cmd` is not spawned, and there is no association
+      fallback if the editor fails to start. With no editor, the folder
+      opens as `%WINDIR%\explorer.exe` with raw `/select,"<path>"`, not a
+      shell. A relative path with no pane cwd is refused rather than
+      resolved against Bayan's own directory. A missing file is the card,
+      unless the path has a `~` component that could not be expanded, in
+      which case it is revealed. Relative paths that do resolve use the
+      pane cwd OSC 9;9 already stores (`link::cwd_hook`, the same
+      `accept_local_cwd` gate); OSC 7 should write that same field.
+      Unquoted paths that contain spaces are not detected, including a
+      tail like `y\a.rs` inside `C:\x y\a.rs:12`. HIDDEN cells are not
+      clickable. Spans are cached per row and dropped when the pane's PTY
+      wakes, when it scrolls, and on relayout; that wakeup also clears the
+      hover. `exists`, the editor lookup, and the browser, the editor, and
+      explorer are spawned off the UI thread, and that thread initializes
+      COM before `ShellExecuteW`. Proven: 158 `#[test]` functions (118 on
+      main before these link tests), including OSC 8 open/close, URL
+      punctuation and surrounding Arabic, the four file:line shapes, the
+      scheme allowlist, the UNC forms, the association allowlist, every
+      old blocked extension plus PATHEXT, ADS colons, injected 8.3
+      expansion, explorer `/select`, a missing file, one-pass
+      placeholders, the absolute path, a stray `%`, the extra invisible
+      characters, a spaced path that must not match, hidden cells, the
+      row cache, the script hosts, userinfo, an IDN punycode card,
+      control/bidi rejection, the editor argv (no shell), an RTL hit
+      through `column_for_click`, and the overlay short-circuit in front
+      of `Route::press`. Not proven here: a live hover underline,
+      `ShellExecuteW` actually launching a browser, or a real editor spawn
+      — this tree doesn't run a window on the machine that built it.
 - [x] **M30** — the agent's own signals, drawn. OSC 9;4 progress (ConEmu's,
       read by Windows Terminal, Ghostty, WezTerm, Konsole — and emitted by
       Claude Code under `terminalProgressBarEnabled`) becomes a 3px bar along
@@ -280,12 +481,108 @@ key falls back to a sane default:
   "copy_on_select": true, "ligatures": true, "bell": "attention",
   "shell": "pwsh.exe", "padding": 8, "opacity": 0.9,
   "hide_single_tab": true, "confirm_close": true, "tab_switch": "recent",
-  "keybinds": { "new-tab": "ctrl+shift+n" }
+  "osc52": "off", "editor": "code -g {file}:{line}:{col}",
+  "keybinds": { "new-tab": "ctrl+shift+n" },
+  "keyboard": { "kitty_protocol": false, "kitty_base_layout_fallback": true }
 }
 ```
 
 Shell and scrollback apply to new tabs (no terminal restarts a live
-session); everything else applies immediately.
+session); everything else applies immediately. `osc52` is config-file
+only (there is no settings-panel row). Leave it out or set `"off"`.
+`"copy"` lets a focused window accept OSC 52 clipboard writes from the
+focused pane; no value enables a clipboard read. The decode backstop is
+64 KiB, and one scan sees about 48–51 KiB.
+
+## BiDi controls and the current directory
+
+Two escape sequences from ECMA-48 / the terminal-wg "BiDi in Terminal
+Emulators" recommendation, which `alacritty_terminal` 0.26 does not act on
+(mode 8 is an unknown SM/RM parameter; `CSI Ps SP k` is not in its CSI
+dispatch). Bayan strips them from the PTY stream before the parser, including
+when a sequence is split across reads. The tree has 224 unit tests.
+
+- **BDSM** — `CSI 8 h` implicit (Bayan applies UAX#9; this is the initial
+  state, so a shell that never sends BDSM still gets Arabic), `CSI 8 l`
+  explicit (the application already ordered the text, so that pane is not
+  reordered and Claude-mode restoration stays off).
+- **SCP** — `CSI 1 SP k` LTR, `CSI 2 SP k` RTL, `CSI 0 SP k` or `CSI SP k`
+  back to the default (first strong character). The direction applies to the
+  current line when the cursor is in column 0, and to the lines after it.
+- Both apply only while a command is running or the pane is on the alternate
+  screen, so `cat` of a file that contains them cannot restyle the prompt.
+  OSC 133 A and D reset them as well. They also reset on RIS (`ESC c`,
+  including `ESC ESC c`, `ESC` plus a C0 byte then `c`, and `ESC` plus a
+  byte >= 0x80 then `c`) and when a `?1049` / `?47` / `?1047` CSI is seen,
+  including a colon subparameter such as `?1049:0`, even if a second one in
+  the same read toggles the mode back. A resize drops SCP stamps. A BDSM or
+  SCP that ends an open OSC is stripped only after that OSC is closed, so
+  the text after it is not swallowed.
+
+`bidi.honor_bdsm` defaults to **true**, so explicit mode overrides Bayan's
+auto-detection. Set it false to keep that detection when an application
+sends `CSI 8 l`:
+
+```json
+{ "bidi": { "honor_bdsm": false } }
+```
+
+**OSC 7** (`ESC ] 7 ; file://host/path ST`, BEL or `ESC \`) stores the pane's
+working directory next to the existing OSC 9;9 report. Only the `file` scheme
+is accepted. The path is percent-decoded, `/C:/x` becomes `C:\x`, and the host
+must be empty, `localhost`, a loopback address, or this machine's name. Remote
+hosts, UNC (`//server/share`, `\\?\`, `\\.\`, `\??\`), control characters, bidi
+overrides, and payloads over 4096 bytes are rejected and do not replace a
+directory already stored. A new tab or split inherits the directory only when
+it exists. `SessionMeta::reported_cwd` is what an OSC 8 resolver should join a
+relative `file:line` path against.
+
+After percent-decoding, the path goes through `accept_local_cwd` — the same
+gate as OSC 9;9 and `session.json`. UNC, `\\?\`, `\\.\`, `\??\`, a comma or
+a quote, a `\\` or `//` anywhere, `..` that climbs past the drive, DOS
+device names (`CON`, `NUL`, `PRN`, `AUX`, `CONIN$`, `CONOUT$`, `CLOCK$`,
+`COM0`–`COM9`, `LPT0`–`LPT9`, including a superscript digit and a space as
+in `CON .txt`), alternate data streams, and bidi controls are rejected
+there, before any probe. A report is stored only when no command is running, Enter is not still
+pending, and the pane is not on the alt screen. Enter at the prompt sets
+`cmd_pending` even when the cursor never moves past the prompt column
+(paste and Enter in one chunk, Home then Enter, a wrapped command), and
+only a nonce-verified OSC 133 A or D clears it. While it is set, OSC 7
+needs the nonce the same way it does while a command is running.
+PowerShell's wrapper sends OSC 133 D and A with a per-session nonce, and
+only that A arms the report, so a spoofed `133;D` from `cat` cannot. An
+idle OSC 7 (cmd/clink, which has no 133) is still stored. A new tab calls
+`GetDriveTypeW` on the drive root and rejects a remote drive, and it
+rejects a reparse point without following it, before `is_dir`.
+
+PowerShell gets OSC 7 from the prompt wrapper Bayan already injects (it also
+still emits OSC 9;9). cmd does not, so a clink prompt filter does the same
+report. Both use an empty host (`file:///C:/…`):
+
+```lua
+-- %LOCALAPPDATA%\clink\bayan_osc7.lua
+local osc7 = clink.promptfilter(100)
+
+local function encode(path)
+  local out = {}
+  for i = 1, #path do
+    local b = path:byte(i)
+    local plain = b == 47 or b == 58
+      or (b >= 48 and b <= 57)
+      or (b >= 65 and b <= 90)
+      or (b >= 97 and b <= 122)
+      or b == 45 or b == 46 or b == 95 or b == 126
+    out[#out + 1] = plain and string.char(b) or string.format("%%%02X", b)
+  end
+  return table.concat(out)
+end
+
+function osc7:filter(prompt)
+  local cwd = (clink.get_cwd and clink.get_cwd() or os.getcwd()):gsub("\\", "/")
+  if cwd:match("^%a:") then cwd = "/" .. cwd end
+  return "\027]7;file://" .. encode(cwd) .. "\007" .. prompt
+end
+```
 
 ## Build
 
