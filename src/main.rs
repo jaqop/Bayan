@@ -1023,6 +1023,18 @@ impl App {
     /// move, Enter to run, Esc to dismiss.
     fn palette_input(&mut self, event: &KeyEvent, el: &ActiveEventLoop) {
         use winit::keyboard::{Key, NamedKey};
+        if self.modifiers.control_key() && !self.modifiers.alt_key()
+            && event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV) {
+            if self.clipboard.is_none() { self.clipboard = arboard::Clipboard::new().ok(); }
+            if let Some(text) = self.clipboard.as_mut().and_then(|c| c.get_text().ok()) {
+                if let Some(p) = self.palette.as_mut() {
+                    p.query.extend(text.chars().filter(|c| !c.is_control()).take(256));
+                    p.sel = 0;
+                }
+            }
+            self.request_redraw();
+            return;
+        }
         let Some(p) = self.palette.as_mut() else { return };
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => self.palette = None,
