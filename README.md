@@ -562,6 +562,11 @@ the shaped source-cell map; earlier shell scrollback retains its own text order.
 
 Press **Ctrl+Shift+P** to open the command palette:
 
+The palette has a responsive card, a separate search field and readable rows.
+Click a row to choose it, use the mouse wheel or arrow keys to navigate, and
+click outside or press Esc to dismiss. Pointer input stays inside the palette.
+Its text keeps its own UI size when the terminal is zoomed.
+
 - Search `تبويب جديد` or a shell name to open that installed shell in a new tab
   without changing the default shell or interrupting the current tab.
 - Search `claude` to insert a start or continue command. Confirm the paste card
@@ -573,6 +578,15 @@ Press **Ctrl+Shift+P** to open the command palette:
 Custom palette commands remain available through declarative plugins in
 `~/.bayan/plugins/`. For example, a JSON plugin can provide
 `{"name":"My commands","actions":[{"label":"Claude Code","send":"claude"}]}`.
+
+Use **Ctrl+=** or **Ctrl+plus** to enlarge terminal text, **Ctrl+-** to reduce it,
+and **Ctrl+0** to return to your configured size. Numpad plus/minus work too.
+Ctrl+Shift+Minus remains available to the running program for undo.
+
+**Ctrl+F** starts a literal search with the current single-line selection,
+including Arabic selected inside Claude. Opening it keeps the viewport where
+it is; press Enter to search or Esc to close. Multiline or large selections
+start with an empty search field.
 
 ```
 cargo run --release

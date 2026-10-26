@@ -78,9 +78,9 @@ fn prepare_window_close(pending: &mut Option<CloseTarget>, confirm: bool, runnin
 }
 
 fn consume_guard_release(pending: &mut bool, state: ElementState, button: MouseButton) -> bool {
-    if *pending && state == ElementState::Released && button == MouseButton::Left {
+    if *pending && button == MouseButton::Left {
         *pending = false;
-        true
+        state == ElementState::Released
     } else {
         false
     }
@@ -567,12 +567,40 @@ impl ClickTracker {
 struct SearchState {
     query: String,
     hl: Option<Match>,
+    /// A seeded selection searches the exact source cells while the field
+    /// shows readable logical Arabic. Editing returns to ordinary search.
+    selected_needle: Option<String>,
+}
+
+impl SearchState {
+    fn from_selection(text: Option<&str>, claude: bool) -> Self {
+        let query = selection_search_query(text, claude);
+        let selected_needle = (!query.is_empty()).then(|| text.unwrap_or_default().to_string());
+        Self { query, hl: None, selected_needle }
+    }
+}
+
+fn selection_search_query(text: Option<&str>, claude: bool) -> String {
+    let Some(text) = text else { return String::new() };
+    if text.chars().any(char::is_control) || text.chars().count() > 256 { return String::new(); }
+    if claude { bidi::restore_block(text) } else { text.to_string() }
+}
+
+fn keyboard_zoom(key: winit::keyboard::PhysicalKey, ctrl: bool, alt: bool, shift: bool) -> Option<i32> {
+    use winit::keyboard::{KeyCode, PhysicalKey};
+    if !ctrl || alt { return None; }
+    match key {
+        PhysicalKey::Code(KeyCode::Equal | KeyCode::NumpadAdd) => Some(1),
+        PhysicalKey::Code(KeyCode::Minus) if !shift => Some(-1),
+        PhysicalKey::Code(KeyCode::NumpadSubtract) => Some(-1),
+        _ => None,
+    }
 }
 
 /// One row of the command palette. Built-ins run through `perform_action`,
 /// the same path a keybinding takes, so the palette can never drift from
 /// what the shortcuts do.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum PaletteRow {
     Builtin(keybinds::Action),
     /// index into `plugins::registry().actions`
@@ -607,6 +635,8 @@ struct Palette {
     query: String,
     sel: usize,
     extras: Vec<(PaletteRow, String)>,
+    pressed: Option<(usize, PaletteRow)>,
+    wheel: f32,
 }
 
 /// A frame's snapshot of the picker: (names, previews, selected row).
@@ -1009,13 +1039,14 @@ impl App {
     }
 
     fn open_palette(&mut self, query: String) {
+        self.abandon_mouse();
         let links = self.session().map(|session| {
             let t = session.term.lock().unwrap();
             (0..t.screen_lines()).flat_map(|row| link::links_on_row(&t, row))
                 .take(500).collect::<Vec<_>>()
         }).unwrap_or_default();
         let extras = palette_extras(&self.shell_profiles, &links);
-        self.palette = Some(Palette { query, sel: 0, extras });
+        self.palette = Some(Palette { query, sel: 0, extras, pressed: None, wheel: 0.0 });
         self.request_redraw();
     }
 
@@ -1023,6 +1054,7 @@ impl App {
     /// move, Enter to run, Esc to dismiss.
     fn palette_input(&mut self, event: &KeyEvent, el: &ActiveEventLoop) {
         use winit::keyboard::{Key, NamedKey};
+        if let Some(p) = self.palette.as_mut() { p.pressed = None; p.wheel = 0.0; }
         if self.modifiers.control_key() && !self.modifiers.alt_key()
             && event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV) {
             if self.clipboard.is_none() { self.clipboard = arboard::Clipboard::new().ok(); }
@@ -1157,7 +1189,8 @@ impl App {
                 self.remove_pane(ti, pi, el);
             }
             Search => {
-                self.search = Some(SearchState::default());
+                let selected = self.session().and_then(|s| s.term.lock().unwrap().selection_to_string());
+                self.search = Some(SearchState::from_selection(selected.as_deref(), self.claude_active()));
                 self.request_redraw();
             }
             Settings => {
@@ -2713,7 +2746,7 @@ impl App {
     /// you can see is the one you want), Shift+Enter walks back down.
     fn search_step(&mut self, dir: Direction) {
         let query = match &self.search {
-            Some(st) if !st.query.is_empty() => st.query.clone(),
+            Some(st) if !st.query.is_empty() => st.selected_needle.as_ref().unwrap_or(&st.query).clone(),
             _ => return,
         };
         let Some(session) = self.session() else {
@@ -2753,6 +2786,7 @@ impl App {
                 if let Some(st) = self.search.as_mut() {
                     st.query.pop();
                     st.hl = None;
+                    st.selected_needle = None;
                 }
             }
             _ => {
@@ -2761,6 +2795,7 @@ impl App {
                         if !ch.is_control() {
                             st.query.push(ch);
                             st.hl = None;
+                            st.selected_needle = None;
                         }
                     }
                 }
@@ -3258,6 +3293,7 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::ShellProfiles(profiles) => {
                 if let Some(palette) = self.palette.as_mut() {
+                    palette.pressed = None;
                     palette.extras.retain(|(row, _)| !matches!(row, PaletteRow::Shell(_)));
                     palette.extras.extend(profiles.iter().map(|shell| (
                         PaletteRow::Shell(shell.command.clone()), format!("تبويب جديد — {}", shell.name)
@@ -3496,6 +3532,10 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if matches!(&event, WindowEvent::Focused(false) | WindowEvent::CursorLeft { .. }) {
+            self.swallow_guard_release = false;
+            if let Some(p) = self.palette.as_mut() { p.pressed = None; p.wheel = 0.0; }
+        }
         if let WindowEvent::MouseInput { state, button, .. } = &event {
             if consume_guard_release(&mut self.swallow_guard_release, *state, *button) {
                 return;
@@ -3530,6 +3570,68 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 WindowEvent::MouseWheel { .. } | WindowEvent::DroppedFile(_) => return,
+                _ => {}
+            }
+        }
+        if self.palette.is_some() {
+            match &event {
+                WindowEvent::CursorMoved { position, .. } => {
+                    self.cursor_pos = *position;
+                    return;
+                }
+                WindowEvent::MouseInput { state, button, .. } => {
+                    if *button != MouseButton::Left { return; }
+                    let p = self.palette.as_ref().unwrap();
+                    let rows = self.palette_rows(&p.query);
+                    let layout = self.renderer.as_ref().zip(self.window.as_ref()).map(|(r, w)| {
+                        let size = w.inner_size();
+                        r.palette_layout(size.width as usize, size.height as usize, rows.len(), p.sel)
+                    });
+                    let hit = layout.as_ref().and_then(|l| l.row_at(self.cursor_pos.x, self.cursor_pos.y));
+                    if *state == ElementState::Pressed {
+                        if layout.is_some_and(|l| !l.contains(self.cursor_pos.x, self.cursor_pos.y)) {
+                            self.palette = None;
+                            self.swallow_guard_release = true;
+                        } else if let Some(p) = self.palette.as_mut() {
+                            p.wheel = 0.0;
+                            p.pressed = hit.and_then(|i| rows.get(i).map(|(row, _)| (i, row.clone())));
+                        }
+                    } else {
+                        let pressed = self.palette.as_mut().and_then(|p| p.pressed.take());
+                        if let (Some((index, action)), Some(hit)) = (pressed, hit) {
+                            if index == hit && rows.get(hit).is_some_and(|(row, _)| *row == action) {
+                                self.palette_run(action, el);
+                            }
+                        }
+                    }
+                    self.request_redraw();
+                    return;
+                }
+                WindowEvent::MouseWheel { delta, .. } => {
+                    let step = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => *y,
+                        MouseScrollDelta::PixelDelta(p) => (p.y / 30.0) as f32,
+                    };
+                    let p = self.palette.as_ref().unwrap();
+                    let count = self.palette_rows(&p.query).len();
+                    if let Some(p) = self.palette.as_mut() {
+                        p.pressed = None;
+                        if step != 0.0 {
+                            p.wheel += step;
+                            let whole = p.wheel.trunc();
+                            p.wheel -= whole;
+                            let distance = whole.abs().min(12.0) as usize;
+                            p.sel = if whole > 0.0 { p.sel.saturating_sub(distance) }
+                                else { p.sel.saturating_add(distance).min(count.saturating_sub(1)) };
+                        }
+                    }
+                    self.request_redraw();
+                    return;
+                }
+                WindowEvent::DroppedFile(_) => return,
+                WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } | WindowEvent::Focused(false) => {
+                    if let Some(p) = self.palette.as_mut() { p.pressed = None; }
+                }
                 _ => {}
             }
         }
@@ -4114,6 +4216,11 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         return;
                     }
+                    if let Some(step) = keyboard_zoom(event.physical_key, ctrl, alt, shift) {
+                        self.font_delta = (self.font_delta + step as f32).clamp(-7.0, 25.0);
+                        self.rebuild_renderer();
+                        return;
+                    }
                     // Ctrl+0 resets the font zoom (physical digit key:
                     // works on the Arabic layout too)
                     {
@@ -4321,6 +4428,38 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn search_seed_is_bounded_literal_and_restores_claude_arabic() {
+        assert_eq!(selection_search_query(Some("a.b(c)"), false), "a.b(c)");
+        assert_eq!(selection_search_query(Some("ابحرم"), true), "مرحبا");
+        for text in ["one\ntwo".to_string(), "one\rtwo".to_string(), "x".repeat(257)] {
+            assert!(selection_search_query(Some(&text), false).is_empty());
+        }
+        assert!(selection_search_query(None, false).is_empty());
+        let seed = SearchState::from_selection(Some("ابحرم"), true);
+        assert_eq!(seed.query, "مرحبا");
+        let size = TermSize { cols: 40, rows: 3 };
+        let mut t = alacritty_terminal::term::Term::new(
+            alacritty_terminal::term::Config::default(), &size,
+            alacritty_terminal::event::VoidListener);
+        let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+        parser.advance(&mut t, "ابحرم\r\n".as_bytes());
+        assert!(find_match(&mut t, seed.selected_needle.as_deref().unwrap(),
+            &None, Direction::Left).is_some(), "the readable seed must still search Claude's source cells");
+    }
+
+    #[test]
+    fn keyboard_zoom_uses_physical_keys_and_leaves_altgr_alone() {
+        use winit::keyboard::{KeyCode, PhysicalKey};
+        for code in [KeyCode::Equal, KeyCode::NumpadAdd] {
+            assert_eq!(keyboard_zoom(PhysicalKey::Code(code), true, false, true), Some(1));
+            assert_eq!(keyboard_zoom(PhysicalKey::Code(code), true, true, false), None);
+        }
+        assert_eq!(keyboard_zoom(PhysicalKey::Code(KeyCode::Minus), true, false, false), Some(-1));
+        assert_eq!(keyboard_zoom(PhysicalKey::Code(KeyCode::Minus), true, false, true), None);
+        assert_eq!(keyboard_zoom(PhysicalKey::Code(KeyCode::NumpadSubtract), false, false, false), None);
+    }
+
+    #[test]
     fn palette_profiles_and_copy_targets_keep_exact_payloads() {
         let shells = vec![shells::Shell { name: "طرفية تجريبية".into(), command: "cmd.exe".into() }];
         let spans = vec![link::LinkSpan { start_col: 2, end_col: 20,
@@ -4348,11 +4487,18 @@ mod tests {
     #[test]
     fn dismissing_guard_consumes_its_release_even_after_the_modal_is_gone() {
         let mut pending = true;
-        assert!(!consume_guard_release(&mut pending, ElementState::Pressed, MouseButton::Left));
         assert!(!consume_guard_release(&mut pending, ElementState::Released, MouseButton::Right));
         assert!(pending);
         assert!(consume_guard_release(&mut pending, ElementState::Released, MouseButton::Left));
         assert!(!pending);
+        assert!(!consume_guard_release(&mut pending, ElementState::Released, MouseButton::Left));
+    }
+
+    #[test]
+    fn a_new_press_cancels_a_release_left_over_from_a_dismissed_modal() {
+        let mut pending = true;
+        assert!(!consume_guard_release(&mut pending, ElementState::Pressed, MouseButton::Left));
+        assert!(!pending, "a new press must not inherit the old modal's release suppression");
         assert!(!consume_guard_release(&mut pending, ElementState::Released, MouseButton::Left));
     }
 

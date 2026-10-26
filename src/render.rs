@@ -536,6 +536,28 @@ pub const TAB_MIN_CELLS: f32 = 9.0;
 /// A rect in frame pixels: (x, y, w, h).
 pub type Rect = (i32, i32, i32, i32);
 
+pub struct PaletteLayout {
+    pub card: Rect,
+    pub title: Rect,
+    pub query: Rect,
+    pub rows: Vec<(usize, Rect)>,
+    pub footer: Rect,
+    pub text_scale: f32,
+}
+
+impl PaletteLayout {
+    pub fn contains(&self, x: f64, y: f64) -> bool {
+        let (left, top, w, h) = self.card;
+        x >= left as f64 && y >= top as f64 && x < (left + w) as f64 && y < (top + h) as f64
+    }
+
+    pub fn row_at(&self, x: f64, y: f64) -> Option<usize> {
+        self.rows.iter().find_map(|&(index, (left, top, w, h))|
+            (x >= left as f64 && y >= top as f64 && x < (left + w) as f64 && y < (top + h) as f64)
+                .then_some(index))
+    }
+}
+
 /// One underline/strikethrough span on a grid row: (col_start, col_end, style, fg).
 type Deco = (usize, usize, u8, (u8, u8, u8));
 /// The same span resolved to pixels: (x0, x1, style, fg).
@@ -2788,6 +2810,37 @@ impl Renderer {
                       y + h - (self.cell_h as i32 + 14), 1.0);
     }
 
+    /// Shared geometry for painting and pointer input, independent of terminal zoom.
+    pub fn palette_layout(&self, fw: usize, fh: usize, count: usize, selected: usize) -> PaletteLayout {
+        let (fw, fh) = (fw as i32, fh as i32);
+        let dpi = self.dpi_scale;
+        let margin = (16.0 * dpi).round() as i32;
+        let margin = margin.min(fw / 8).min(fh / 8).max(0);
+        let top = (self.tab_bar_h() as i32).min(fh / 5) + margin;
+        let available = (fh - top - margin).max(0);
+        let compact = (available as f32 / (240.0 * dpi)).min(1.0);
+        let px = |n: f32| (n * dpi * compact).round().max(1.0) as i32;
+        let pad = px(12.0);
+        let (title_h, query_h, footer_h, row_h) = (px(40.0), px(44.0), px(34.0), px(42.0));
+        let fixed = title_h + query_h + footer_h + pad * 4;
+        let capacity = ((available - fixed).max(0) / row_h) as usize;
+        let shown = count.min(12).min(capacity);
+        let width = ((fw as f32 * 0.7).round() as i32)
+            .clamp((560.0 * dpi) as i32, (900.0 * dpi) as i32).min((fw - margin * 2).max(0));
+        let height = (fixed + row_h * shown as i32).min(available);
+        let x = (fw - width) / 2;
+        let y = top + (available - height) / 5;
+        let inner_w = (width - pad * 2).max(0);
+        let first = selected.saturating_sub(shown.saturating_sub(1))
+            .min(count.saturating_sub(shown));
+        let rows = (0..shown).map(|i| (first + i,
+            (x + pad, y + title_h + query_h + pad * 3 + i as i32 * row_h, inner_w, row_h))).collect();
+        PaletteLayout { card: (x, y, width, height),
+            title: (x + pad, y + pad, inner_w, title_h),
+            query: (x + pad, y + title_h + pad * 2, inner_w, query_h), rows,
+            footer: (x + pad, y + height - footer_h - pad, inner_w, footer_h), text_scale: compact.max(0.01) }
+    }
+
     /// The command palette (Ctrl+Shift+P). Query line, filtered rows, hint.
     /// `rows` is already filtered by the caller — the renderer never decides
     /// what matches, so the list drawn and the list Enter runs cannot differ.
@@ -2795,41 +2848,63 @@ impl Renderer {
                         query: &str, rows: &[String], sel: usize) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
         push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 120));
-        const MAX_ROWS: usize = 12;
-        let shown = rows.len().min(MAX_ROWS);
-        let w = ((self.cell_w * 52.0) as i32).min(fw as i32 - 60);
-        let row_h = (self.cell_h + 6.0) as i32;
-        let h = row_h * (shown as i32 + 2) + 22;
-        let x = (fw as i32 - w) / 2;
-        let y = self.tab_bar_h() as i32 + (fh as i32 - h) / 5;
-        push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 250));
-        push_rect(out, whole, x, y, w, 2, c4((0x2e, 0xa0, 0x43), 255));
-
-        // query line — a caret so an empty palette still looks like an input
-        let q = [
-            Seg::plain("⌕ ", (0x8a, 0x94, 0xa3)),
-            Seg { text: format!("{query}_"), fg: self.fg, style: ST_BOLD },
-        ];
-        self.draw_run(&q, true, out, whole, (x + 14) as f32, y + 10, 1.0);
-
-        // scroll the window so the selection stays visible past MAX_ROWS
-        let first = sel.saturating_sub(MAX_ROWS - 1).min(rows.len().saturating_sub(shown));
-        for i in 0..shown {
-            let idx = first + i;
-            let ry = y + 14 + row_h * (i as i32 + 1);
+        let layout = self.palette_layout(fw, fh, rows.len(), sel);
+        let saved_metrics = self.metrics;
+        let saved_cells = (self.cell_w, self.cell_h);
+        // This drawer also works outside the chrome pass: terminal zoom
+        // never sizes palette text. Very short windows scale the UI together.
+        self.metrics = Metrics::new(16.0 * self.dpi_scale * layout.text_scale,
+            self.ui_cell_h() * layout.text_scale);
+        self.cell_w = self.ui_cell_w() * layout.text_scale;
+        self.cell_h = self.metrics.line_height;
+        let (x, y, w, h) = layout.card;
+        let inset = (12.0 * self.dpi_scale * layout.text_scale).round() as i32;
+        let accent = (0x58, 0xa6, 0xff);
+        push_rect_top_rounded(out, whole, x + 4, y + 6, w, h, c4((0, 0, 0), 100));
+        push_rect_top_rounded(out, whole, x, y, w, h, c4((0x3d, 0x44, 0x4d), 255));
+        push_rect_top_rounded(out, whole, x + 1, y + 1, w - 2, h - 2, c4((0x16, 0x1b, 0x22), 255));
+        let title = [Seg { text: "لوحة الأوامر".into(), fg: (0xe6, 0xed, 0xf3), style: ST_BOLD }];
+        let tw = self.measure(&title, true);
+        let (tx, ty, twidth, th) = layout.title;
+        self.draw_run(&title, true, out, layout.title, tx as f32 + twidth as f32 - tw,
+            ty + (th - self.cell_h as i32) / 2, 1.0);
+        if w > (600.0 * self.dpi_scale) as i32 {
+            self.draw_run(&[Seg::plain("Ctrl + Shift + P", (0x8b, 0x94, 0x9e))], false,
+                out, layout.title, tx as f32, ty + (th - self.cell_h as i32) / 2, 1.0);
+        }
+        let (qx, qy, qw, qh) = layout.query;
+        push_rect(out, layout.card, qx, qy, qw, qh, c4((0x0d, 0x11, 0x17), 255));
+        push_rect(out, layout.card, qx, qy + qh - 2, qw, 2, c4(accent, 255));
+        let query_text = if query.is_empty() { "ابحث عن أمر أو طرفية…".to_string() } else { format!("{query}│") };
+        let query_text = self.guard_label(&query_text, (qw - inset * 2).max(0) as f32);
+        self.draw_run(&[Seg::plain(query_text, if query.is_empty() { (0x8b, 0x94, 0x9e) } else { self.fg })], true,
+            out, layout.query, (qx + inset) as f32, qy + (qh - self.cell_h as i32) / 2, 1.0);
+        for &(idx, rect @ (rx, ry, rw, rh)) in &layout.rows {
             let picked = idx == sel;
             if picked {
-                push_rect(out, whole, x + 6, ry - 3, w - 12, row_h, c4((0x2c, 0x3a, 0x33), 255));
+                push_rect(out, layout.card, rx, ry + 1, rw, rh - 2, c4((0x21, 0x36, 0x50), 255));
+                push_rect(out, layout.card, rx, ry + 1, 3, rh - 2, c4(accent, 255));
             }
-            let fg = if picked { self.fg } else { (0x9a, 0xa4, 0xb2) };
-            let seg = [Seg { text: rows[idx].clone(), fg, style: if picked { ST_BOLD } else { 0 } }];
-            self.draw_run(&seg, true, out, whole, (x + 18) as f32, ry, 1.0);
+            let text = self.guard_label(&rows[idx], (rw - inset * 2).max(0) as f32);
+            self.draw_run(&[Seg { text, fg: if picked { (0xf0, 0xf6, 0xfc) } else { (0xad, 0xb7, 0xc3) },
+                style: if picked { ST_BOLD } else { 0 } }], true, out, rect,
+                (rx + inset) as f32, ry + (rh - self.cell_h as i32) / 2, 1.0);
         }
-
-        let hint = palette_hint(rows.len());
-        let l = [Seg::plain(hint, (0x6e, 0x78, 0x85))];
-        self.draw_run(&l, true, out, whole, (x + 14) as f32,
-                      y + h - self.cell_h as i32 - 8, 1.0);
+        let hint = if w < (500.0 * self.dpi_scale) as i32 { "Enter · Esc".into() } else { palette_hint(rows.len()) };
+        let hint = self.guard_label(&hint, (layout.footer.2 - inset * 2).max(0) as f32);
+        // Keep shortcut keys in reading order; Arabic labels still shape
+        // as RTL runs inside this left-to-right instruction line.
+        let hint = [Seg::plain(hint, (0x9a, 0xa6, 0xb5))];
+        let key = self.ensure_shaped_dir(&hint, true, true);
+        let hint_y = layout.footer.1 + (layout.footer.3 - self.cell_h as i32).max(0) / 2;
+        {
+            let Renderer { cache_hot, font_system, cache, atlas, fg, .. } = self;
+            push_shaped(out, font_system, cache, atlas, &cache_hot[&key].buffer, layout.footer,
+                (layout.footer.0 + inset) as f32,
+                hint_y, 1.0, *fg);
+        }
+        self.metrics = saved_metrics;
+        (self.cell_w, self.cell_h) = saved_cells;
     }
 
 
@@ -3384,6 +3459,28 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn palette_rows_fit_the_card_and_hit_the_drawn_indices() {
+        for dpi in [1.0, 1.5, 2.0] {
+            let r = Renderer::new(dpi, &crate::config::UserConfig::default(), 0.0);
+            for (w, h) in [(400, 300), (1100, 700), (1800, 1200)] {
+                for selected in [0, 7, 39] {
+                    let layout = r.palette_layout(w, h, 40, selected);
+                    let (x, y, cw, ch) = layout.card;
+                    assert!(x >= 0 && y >= 0 && x + cw <= w as i32 && y + ch <= h as i32);
+                    assert!(layout.rows.iter().any(|(index, _)| *index == selected));
+                    for &(index, (rx, ry, rw, rh)) in &layout.rows {
+                        assert!(rh as f32 >= 22.4 * dpi * layout.text_scale,
+                            "palette row must fit its UI line height");
+                        assert!(rx >= x && ry >= y && rx + rw <= x + cw && ry + rh <= y + ch);
+                        assert_eq!(layout.row_at((rx + rw / 2) as f64, (ry + rh / 2) as f64), Some(index));
+                    }
+                    assert!(layout.row_at((x + 2) as f64, (y + 2) as f64).is_none());
+                }
+            }
+        }
+    }
 
     #[test]
     fn settings_remain_readable_when_terminal_font_is_eight() {
