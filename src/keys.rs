@@ -76,7 +76,9 @@ pub fn encode(
         // Ctrl+letter -> C0 control byte (Ctrl+C = \x03 ...). On Windows,
         // winit may hand us the control char itself instead of the letter —
         // pass it straight through.
-        Key::Character(s) if ctrl => {
+        // Ctrl+letter -> control byte. Ctrl+Alt is AltGr on Windows and is
+        // excluded: its composed text (@ € { } on non-US layouts) is the input.
+        Key::Character(s) if ctrl && !alt => {
             let c = s.chars().next()?;
             if ('\u{1}'..='\u{1a}').contains(&c) {
                 vec![c as u8]
@@ -88,6 +90,17 @@ pub fn encode(
                     return None;
                 }
             }
+        }
+        // Alt+<char> is the meta key: ESC then the char, the way every
+        // terminal emulator does it (readline's Alt+B/F word motion, and
+        // emacs-style bindings in TUIs). Not when Ctrl is also down — that is
+        // AltGr on many layouts, and the composed text is the real input.
+        Key::Character(_) if alt && !ctrl => {
+            let t = text?;
+            let mut v = Vec::with_capacity(t.len() + 1);
+            v.push(0x1b);
+            v.extend_from_slice(t.as_bytes());
+            v
         }
         _ => text?.as_bytes().to_vec(),
     };
@@ -180,6 +193,11 @@ pub fn encode_input(input: &EncodeInput<'_>) -> Option<Vec<u8>> {
         if let Some(letter) = input.physical_letter {
             return Some(vec![letter as u8 - b'a' + 1]);
         }
+    }
+    // Actual AltGr text returned above. Ctrl+Alt without composed text is
+    // a chord, including Ctrl+Alt+digits that have no legacy text encoding.
+    if input.ctrl && input.alt && matches!(input.key, Key::Character(_)) {
+        return encode(input.key, input.text, input.shift, false, true);
     }
     encode(input.key, input.text, input.shift, input.alt, input.ctrl)
 }
@@ -588,6 +606,20 @@ mod tests {
         // Windows hands over the pre-composed control char with Ctrl held
         let raw = Key::Character("\u{6}".into());
         assert_eq!(encode(&raw, None, false, false, true).unwrap(), vec![0x06]);
+    }
+
+    #[test]
+    fn alt_letter_is_meta_prefixed_but_altgr_is_not() {
+        let b = Key::Character("b".into());
+        assert_eq!(encode(&b, Some("b"), false, true, false).unwrap(), b"\x1bb".to_vec());
+        // AltGr arrives as Ctrl+Alt: the composed character passes as text
+        // (it used to fall into the Ctrl+letter branch and vanish)
+        let at = Key::Character("@".into());
+        assert_eq!(encode(&at, Some("@"), false, true, true).unwrap(), b"@".to_vec());
+        let euro = Key::Character("e".into());
+        assert_eq!(encode(&euro, Some("€"), false, true, true).unwrap(), "€".as_bytes().to_vec());
+        // plain typing is untouched
+        assert_eq!(encode(&b, Some("b"), false, false, false).unwrap(), b"b".to_vec());
     }
 
     #[test]

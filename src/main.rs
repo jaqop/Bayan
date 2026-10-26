@@ -8,6 +8,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod bidi;
+mod mru;
 mod bidi_ctl;
 mod plugins;
 mod posh;
@@ -37,6 +38,7 @@ type PaneSnap = (
     String,
     std::sync::Arc<bidi_ctl::BidiState>,
     u64,
+    Option<u64>,
 );
 
 /// The Windows caret rhythm; kitty's idea on top: stop after 15s idle.
@@ -60,6 +62,28 @@ enum CloseTarget {
     Pane(usize, usize),
     /// the whole window (the titlebar X)
     Window,
+}
+
+/// Return true when the window may close; otherwise retain a confirmation.
+fn prepare_window_close(pending: &mut Option<CloseTarget>, confirm: bool, running: usize) -> bool {
+    if matches!(pending, Some(CloseTarget::Window)) {
+        return false;
+    }
+    if confirm && running > 0 {
+        *pending = Some(CloseTarget::Window);
+        return false;
+    }
+    *pending = None;
+    true
+}
+
+fn consume_guard_release(pending: &mut bool, state: ElementState, button: MouseButton) -> bool {
+    if *pending && state == ElementState::Released && button == MouseButton::Left {
+        *pending = false;
+        true
+    } else {
+        false
+    }
 }
 
 /// The system notification sound (bell mode "sound"). Async — never blocks
@@ -163,6 +187,44 @@ fn jump_offset(marks: &[usize], hist: usize, off: usize, dir: i32) -> Option<usi
     Some((hist as i64 - target + 1).clamp(0, hist as i64) as usize)
 }
 
+/// The active tab index after tab `removed` leaves a list of `len` tabs.
+/// A background tab whose shell exits sits at a LOWER index than the active
+/// one often enough (the first tab is the one people leave running): the
+/// active index must slide down with it, or focus lands on the wrong tab.
+fn active_after_remove(active: usize, removed: usize, len_after: usize) -> usize {
+    if len_after == 0 {
+        return 0;
+    }
+    let a = if removed < active { active - 1 } else { active };
+    a.min(len_after - 1)
+}
+
+/// Bytes a wheel notch sends to a full-screen program (EasyTer's rule): a
+/// mouse report only when the app enabled mouse tracking — SGR encoded if it
+/// asked for that (DECSET 1006), X10 bytes otherwise — else an arrow key that
+/// honours DECCKM. `n` > 0 is a notch up. Bytes, not a String: X10 packs
+/// each value into ONE byte (32 + v), and past column 95 that byte is >= 0x80,
+/// which a String would UTF-8-encode into two.
+#[cfg(test)]
+fn wheel_seq(mode: TermMode, n: i32, row: usize, col: usize) -> Vec<u8> {
+    let btn = if n > 0 { 64 } else { 65 };
+    if mode.intersects(TermMode::MOUSE_MODE) {
+        if mode.contains(TermMode::SGR_MOUSE) {
+            format!("\x1b[<{btn};{col};{row}M").into_bytes()
+        } else {
+            let b = |v: usize| (32 + v.min(223)) as u8;
+            vec![0x1b, b'[', b'M', b(btn), b(col), b(row)]
+        }
+    } else {
+        let ch = if n > 0 { b'A' } else { b'B' };
+        if mode.contains(TermMode::APP_CURSOR) {
+            vec![0x1b, b'O', ch]
+        } else {
+            vec![0x1b, b'[', ch]
+        }
+    }
+}
+
 /// One cell step in the search direction, clamped to the buffer (used to
 /// move the search origin past the current hit so Enter advances).
 fn step_point(p: Point, cols: usize, top: i32, bottom: i32, dir: Direction) -> Point {
@@ -239,6 +301,7 @@ use winit::window::{ResizeDirection, Window, WindowId};
 use term::{Session, TermSize};
 
 pub enum UserEvent {
+    ShellProfiles(Vec<shells::Shell>),
     /// New PTY output was parsed in tab `id`: repaint (and busy-dot it).
     Wakeup(u64),
     /// Tab `id`'s emulator answers its child (DSR/DA replies TUIs block on).
@@ -255,6 +318,10 @@ pub enum UserEvent {
     Bell(u64),
     /// A command that ran ≥6s in pane `id` just finished (ok?).
     CommandFinished(u64, bool),
+    /// Pane `id`'s program asked for a desktop notification (title, body).
+    Notify(u64, String, String),
+    /// Pane `id` reported OSC 9;4 progress (None clears it).
+    Progress(u64, Option<term::Progress>),
     /// Pane `id`'s shell exited.
     Exit(u64),
     /// A link open failed, or `settle` refused it, off the UI thread.
@@ -296,6 +363,8 @@ struct Pane {
     session: Session,
     /// when this pane last produced output — feeds the busy dot
     last_output: Option<Instant>,
+    /// the program's OSC 9;4 progress report, until it clears it
+    progress: Option<term::Progress>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -318,6 +387,15 @@ struct Tab {
 }
 
 impl Tab {
+    /// The tab's progress: its focused pane's, else any pane's — a
+    /// background pane's Claude is still this tab's work.
+    fn progress(&self) -> Option<term::Progress> {
+        self.panes
+            .get(self.focused)
+            .and_then(|p| p.progress)
+            .or_else(|| self.panes.iter().find_map(|p| p.progress))
+    }
+
     fn busy(&self, now_active: bool) -> bool {
         !now_active
             && self.panes.iter().any(|p| {
@@ -383,6 +461,48 @@ struct SavedTab {
 struct SavedState {
     tabs: Vec<SavedTab>,
     active: usize,
+    /// where the window was, so it comes back there (WezTerm's most-asked
+    /// small thing). Physical pixels; absent in files from before M32.
+    #[serde(default)]
+    window: Option<WindowGeom>,
+}
+
+/// The window's last NON-maximized rectangle plus whether it was maximized —
+/// so restoring a maximized window also knows where "restore down" goes.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct WindowGeom {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    #[serde(default)]
+    maximized: bool,
+}
+
+/// A saved rectangle is worth restoring only if enough of it lands on a
+/// monitor that is still connected: a window last seen on an unplugged
+/// second screen must not come back off-screen with no way to grab it.
+/// `monitors` are (x, y, w, h) in physical pixels.
+fn geometry_on_screen(g: WindowGeom, monitors: &[(i32, i32, u32, u32)]) -> bool {
+    const NEED: i64 = 120; // px of the window's top strip that must be reachable
+    if g.w < 200 || g.h < 120 {
+        return false;
+    }
+    let (gx0, gy0) = (g.x as i64, g.y as i64);
+    let (gx1, gy1) = (gx0 + g.w as i64, gy0 + 64); // the title strip, where you grab it
+    monitors.iter().any(|&(mx, my, mw, mh)| {
+        let (mx0, my0, mx1, my1) = (mx as i64, my as i64, mx as i64 + mw as i64, my as i64 + mh as i64);
+        let ox = gx1.min(mx1) - gx0.max(mx0);
+        let oy = gy1.min(my1) - gy0.max(my0);
+        ox >= NEED && oy >= 32
+    })
+}
+
+/// Read and parse ~/.bayan/session.json (None when absent or corrupt).
+fn load_saved_state() -> Option<SavedState> {
+    state_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| parse_state(&s))
 }
 
 /// The pre-M9 file format (one cwd per tab) — read it rather than dropping
@@ -410,6 +530,7 @@ fn parse_state(json: &str) -> Option<SavedState> {
             })
             .collect(),
         active: legacy.active,
+        window: None,
     })
 }
 
@@ -451,18 +572,45 @@ struct SearchState {
 /// One row of the command palette. Built-ins run through `perform_action`,
 /// the same path a keybinding takes, so the palette can never drift from
 /// what the shortcuts do.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum PaletteRow {
     Builtin(keybinds::Action),
     /// index into `plugins::registry().actions`
     Plugin(usize),
+    Shell(String),
+    CopyText(String),
+    InsertCommand(&'static str),
+}
+
+fn palette_extras(profiles: &[shells::Shell], links: &[link::LinkSpan]) -> Vec<(PaletteRow, String)> {
+    let mut rows: Vec<_> = profiles.iter().map(|shell| (
+        PaletteRow::Shell(shell.command.clone()), format!("تبويب جديد — {}", shell.name)
+    )).collect();
+    rows.push((PaletteRow::InsertCommand("claude"), "إدراج أمر كلاود — claude".into()));
+    rows.push((PaletteRow::InsertCommand("claude --continue"), "متابعة محادثة كلاود — claude --continue".into()));
+    let mut seen = std::collections::HashSet::new();
+    for span in links {
+        let text = match &span.kind {
+            link::LinkKind::Osc { uri } | link::LinkKind::Url { uri } => uri,
+            link::LinkKind::File { path, .. } => path,
+        };
+        if text.is_empty() || !seen.insert(text.clone()) { continue; }
+        let shown = link::fit_status_bar(&span.tooltip(None), 90).text();
+        rows.push((PaletteRow::CopyText(text.clone()), format!("نسخ — {shown}")));
+        if seen.len() >= 100 { break; }
+    }
+    rows
 }
 
 /// Ctrl+Shift+P: type to filter, arrows to move, Enter to run.
 struct Palette {
     query: String,
     sel: usize,
+    extras: Vec<(PaletteRow, String)>,
 }
+
+/// A frame's snapshot of the picker: (names, previews, selected row).
+type PoshView = (Vec<String>, Vec<Option<Vec<u8>>>, usize);
 
 /// The prompt picker: theme names with LIVE previews rendered by oh-my-posh
 /// itself, so what you see is the prompt you get.
@@ -476,8 +624,11 @@ struct PoshPicker {
 struct App {
     /// the prompt picker, when open
     posh: Option<PoshPicker>,
+    /// most-recently-used tab history for Ctrl+Tab
+    mru: mru::Mru,
     /// the command palette, when open
     palette: Option<Palette>,
+    shell_profiles: Vec<shells::Shell>,
     /// last click on the empty title strip — powers double-click-to-maximise
     last_strip_click: Option<std::time::Instant>,
     proxy: EventLoopProxy<UserEvent>,
@@ -509,6 +660,7 @@ struct App {
     pending_paste: Option<PendingPaste>,
     /// a close awaiting Enter/Esc (a command is still running)
     pending_close: Option<CloseTarget>,
+    swallow_guard_release: bool,
     /// link under the pointer: underline + the target in the pane status
     link_hover: Option<LinkHover>,
     /// a refused link, or a userinfo URL waiting for Enter.
@@ -543,6 +695,9 @@ struct App {
     font_delta: f32,
     renderer_building: bool,
     inflight_delta: f32,
+    /// the last rectangle the window had while NOT maximized — what a
+    /// maximized window restores down to, and what the session saves
+    normal_geom: Option<WindowGeom>,
     /// Physical keys whose press never reached the PTY. The matching release
     /// must not either: a TUI that asked for key-up events would otherwise
     /// see a release whose press it never got. Copy clears the selection
@@ -579,13 +734,18 @@ impl App {
 
     // ---- settings panel ----
 
-    /// Index of the active theme (which the panel highlights).
+    /// Index of the active theme in the gallery order (built-ins, then
+    /// plugin themes) — the index the panel highlights and apply_theme takes.
     fn active_theme(&self) -> usize {
-        self.config
-            .theme
-            .as_deref()
-            .and_then(|n| render::THEMES.iter().position(|t| t.name == n))
-            .unwrap_or(0)
+        let name = self.config.theme.as_deref().unwrap_or(render::DEFAULT_THEME);
+        if let Some(i) = render::THEMES.iter().position(|t| t.name == name) {
+            return i;
+        }
+        plugins::registry()
+            .themes
+            .iter()
+            .position(|t| t.name == name)
+            .map_or(0, |i| render::THEMES.len() + i)
     }
 
     /// Apply theme `idx` (copy its colors into the config), live.
@@ -610,7 +770,7 @@ impl App {
     }
 
     fn change_font_size(&mut self, delta: i32) {
-        let s = (self.config.font_size.unwrap_or(15.0) + delta as f32).clamp(8.0, 40.0);
+        let s = (self.config.font_size.unwrap_or(render::DEFAULT_FONT_SIZE) + delta as f32).clamp(8.0, 40.0);
         self.config.font_size = Some(s);
         self.rebuild_renderer();
         self.request_redraw();
@@ -732,6 +892,16 @@ impl App {
         el.exit();
     }
 
+    fn resolve_close(&mut self, confirm: bool, el: &ActiveEventLoop) {
+        if let Some(target) = self.pending_close.take().filter(|_| confirm) {
+            match target {
+                CloseTarget::Pane(ti, pi) => self.remove_pane(ti, pi, el),
+                CloseTarget::Window => self.quit(el),
+            }
+        }
+        self.request_redraw();
+    }
+
     fn apply_opacity(&self) {
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let Some(w) = &self.window else { return };
@@ -752,6 +922,25 @@ impl App {
                 SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED as isize);
                 SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
             }
+        }
+    }
+
+    fn apply_window_frame(&self) {
+        let Some(hwnd) = self.hwnd() else { return };
+        use windows_sys::Win32::Graphics::Dwm::{
+            DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE,
+            DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+        };
+        let dark = 1i32;
+        let corner = DWMWCP_ROUND;
+        // Windows 10 ignores unsupported corner preferences; the native
+        // resize frame and shadow remain available there.
+        unsafe {
+            DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+                (&dark as *const i32).cast(), std::mem::size_of_val(&dark) as u32);
+            DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+                (&corner as *const i32).cast(),
+                std::mem::size_of_val(&corner) as u32);
         }
     }
 
@@ -819,10 +1008,33 @@ impl App {
         self.request_redraw();
     }
 
+    fn open_palette(&mut self, query: String) {
+        let links = self.session().map(|session| {
+            let t = session.term.lock().unwrap();
+            (0..t.screen_lines()).flat_map(|row| link::links_on_row(&t, row))
+                .take(500).collect::<Vec<_>>()
+        }).unwrap_or_default();
+        let extras = palette_extras(&self.shell_profiles, &links);
+        self.palette = Some(Palette { query, sel: 0, extras });
+        self.request_redraw();
+    }
+
     /// The palette owns the keyboard while open: type to filter, arrows to
     /// move, Enter to run, Esc to dismiss.
     fn palette_input(&mut self, event: &KeyEvent, el: &ActiveEventLoop) {
         use winit::keyboard::{Key, NamedKey};
+        if self.modifiers.control_key() && !self.modifiers.alt_key()
+            && event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV) {
+            if self.clipboard.is_none() { self.clipboard = arboard::Clipboard::new().ok(); }
+            if let Some(text) = self.clipboard.as_mut().and_then(|c| c.get_text().ok()) {
+                if let Some(p) = self.palette.as_mut() {
+                    p.query.extend(text.chars().filter(|c| !c.is_control()).take(256));
+                    p.sel = 0;
+                }
+            }
+            self.request_redraw();
+            return;
+        }
         let Some(p) = self.palette.as_mut() else { return };
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => self.palette = None,
@@ -879,6 +1091,9 @@ impl App {
                 rows.push((PaletteRow::Plugin(i), act.label.clone()));
             }
         }
+        if let Some(palette) = &self.palette {
+            rows.extend(palette.extras.iter().filter(|(_, label)| hit(label)).cloned());
+        }
         rows
     }
 
@@ -887,11 +1102,26 @@ impl App {
         match row {
             // the SAME dispatch a keybinding uses, not a parallel copy
             PaletteRow::Builtin(a) => self.perform_action(a, el),
+            PaletteRow::Shell(command) => {
+                let cwd = self.session().and_then(|s| s.meta.lock().unwrap().spawn_cwd());
+                let before = self.tabs.len();
+                self.spawn_tab_command(cwd, &command);
+                if self.tabs.len() == before && self.blocked_link.is_none() {
+                    self.blocked_link = Some(BlockedLink { reason: "تعذر تشغيل الطرفية".into(),
+                        shown: link::preview(&command, 240), confirm_uri: None });
+                }
+                self.update_title();
+            }
+            PaletteRow::CopyText(text) => self.set_clipboard(text),
+            PaletteRow::InsertCommand(text) => {
+                self.pending_paste = Some(PendingPaste { text: text.into(), lines: 1,
+                    chars: text.chars().count(), reason: "إدراج أمر من لوحة الأوامر".into() });
+            }
             PaletteRow::Plugin(i) => {
                 if let Some(act) = plugins::registry().actions.get(i) {
                     let text = act.send.clone();
                     if let Some(s) = self.session_mut() {
-                        let _ = s.write(text.as_bytes());
+                        s.write(text.as_bytes());
                     }
                 }
             }
@@ -1264,6 +1494,7 @@ impl App {
                     busy: t.busy(i == self.active),
                     attention: t.attention,
                     active: i == self.active,
+                    progress: t.progress(),
                 }
             })
             .collect()
@@ -1345,6 +1576,10 @@ impl App {
     }
 
     fn spawn_pane(&mut self, cwd: Option<&str>) -> Option<Pane> {
+        self.spawn_pane_command(cwd, &self.config.shell_program())
+    }
+
+    fn spawn_pane_command(&mut self, cwd: Option<&str>, command: &str) -> Option<Pane> {
         let id = self.next_id;
         self.next_id += 1;
         match Session::spawn(
@@ -1353,10 +1588,10 @@ impl App {
             id,
             cwd,
             self.config.scrollback_lines(),
-            &self.config.shell_program(),
+            command,
             self.config.kitty_protocol_on(),
         ) {
-            Ok(session) => Some(Pane { id, session, last_output: None }),
+            Ok(session) => Some(Pane { id, session, last_output: None, progress: None }),
             Err(e) => {
                 eprintln!("bayan: spawn failed: {e}");
                 None
@@ -1365,6 +1600,10 @@ impl App {
     }
 
     fn spawn_tab(&mut self, cwd: Option<String>) {
+        self.spawn_tab_command(cwd, &self.config.shell_program());
+    }
+
+    fn spawn_tab_command(&mut self, cwd: Option<String>, command: &str) {
         // Same gate as spawn: a restored UNC path must not become the tab
         // title either. accept_local_cwd does not touch the filesystem.
         let cwd = cwd.and_then(|c| term::accept_local_cwd(&c));
@@ -1372,7 +1611,7 @@ impl App {
             .as_deref()
             .and_then(|c| c.rsplit(['\\', '/']).next().map(str::to_string))
             .unwrap_or_else(|| "بيان".to_string());
-        if let Some(pane) = self.spawn_pane(cwd.as_deref()) {
+        if let Some(pane) = self.spawn_pane_command(cwd.as_deref(), command) {
             // this becomes the active tab without switch_tab, so a button
             // held on the previous tab has to go up first
             self.abandon_mouse();
@@ -1385,6 +1624,7 @@ impl App {
                 attention: false,
             });
             self.active = self.tabs.len() - 1;
+            self.mru.touch(self.active);
             self.relayout_active();
             self.sync_focus(None);
         }
@@ -1418,8 +1658,7 @@ impl App {
         }
         let rects = self.pane_rects();
         const GRAB: f64 = 4.0;
-        for i in 0..rects.len() - 1 {
-            let (x, y, w, h) = rects[i];
+        for (i, &(x, y, w, h)) in rects.iter().enumerate().take(rects.len() - 1) {
             let hit = match t.orientation {
                 Orientation::Row => {
                     (pos.x - (x + w) as f64).abs() <= GRAB
@@ -1519,6 +1758,11 @@ impl App {
         if pi >= t.panes.len() {
             return;
         }
+        // Pane indices can shift when a background shell exits. Dismiss an
+        // index-based confirmation rather than letting it target a neighbour.
+        if matches!(self.pending_close, Some(CloseTarget::Pane(..))) {
+            self.pending_close = None;
+        }
         let mut pane = t.panes.remove(pi);
         if pi < t.weights.len() {
             t.weights.remove(pi);
@@ -1530,9 +1774,9 @@ impl App {
                 self.quit(el);
                 return;
             }
-            if self.active >= self.tabs.len() {
-                self.active = self.tabs.len() - 1;
-            }
+            self.mru.removed(ti);
+            self.active = active_after_remove(self.active, ti, self.tabs.len());
+            self.mru.touch(self.active);
         } else if t.focused >= t.panes.len() {
             t.focused = t.panes.len() - 1;
         }
@@ -1543,6 +1787,13 @@ impl App {
     }
 
     fn switch_tab(&mut self, idx: usize) {
+        self.show_tab(idx);
+        self.mru.touch(self.active);
+    }
+
+    /// Show tab `idx` without touching the MRU history — the Ctrl+Tab walk
+    /// passes through tabs; only the one it ends on (Ctrl released) counts.
+    fn show_tab(&mut self, idx: usize) {
         if idx >= self.tabs.len() || idx == self.active {
             return;
         }
@@ -1597,6 +1848,10 @@ impl App {
                 })
                 .collect(),
             active: self.active,
+            window: self.normal_geom.map(|g| WindowGeom {
+                maximized: self.window.as_ref().is_some_and(|w| w.is_maximized()),
+                ..g
+            }),
         };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -1606,10 +1861,26 @@ impl App {
         }
     }
 
+    /// Note the window's current rectangle if it is in its normal state
+    /// (moved or resized by the user, not maximized).
+    fn track_geometry(&mut self) {
+        let Some(w) = &self.window else { return };
+        if w.is_maximized() || w.is_minimized().unwrap_or(false) {
+            return;
+        }
+        let (Ok(pos), size) = (w.outer_position(), w.inner_size()) else { return };
+        if size.width > 0 && size.height > 0 {
+            self.normal_geom =
+                Some(WindowGeom { x: pos.x, y: pos.y, w: size.width, h: size.height, maximized: false });
+        }
+    }
+
     fn restore_state(&mut self) {
-        let saved: Option<SavedState> = state_path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| parse_state(&s));
+        if !self.config.restore_tabs.unwrap_or(false) {
+            self.spawn_tab(None);
+            return;
+        }
+        let saved = load_saved_state();
         match saved {
             Some(state) if !state.tabs.is_empty() => {
                 for st in state.tabs {
@@ -1726,7 +1997,7 @@ impl App {
         if !self.auto_follow {
             return self.claude_manual;
         }
-        alt && bidi::cmd_is_claude(&running)
+        bidi::cmd_is_claude(&running)
     }
 
     /// Pixel position -> (pane index, viewport row, col, cell side).
@@ -1741,6 +2012,11 @@ impl App {
             r.cell_h as f64,
         )?;
         let side = if hit.left { Side::Left } else { Side::Right };
+        if let Some(rect) = self.pane_rects().get(hit.pane) {
+            if let Some((col, side)) = r.hit_cell(*rect, hit.row, pos.x) {
+                return Some((hit.pane, hit.row, col, side));
+            }
+        }
         Some((hit.pane, hit.row, hit.col, side))
     }
 
@@ -1849,7 +2125,7 @@ impl App {
     ) -> Option<(u64, usize, usize)> {
         // copy what the locks need, then drop the pane borrow so the term
         // lock below can re-borrow the tab
-        let (pane_id, running, bidi_state, evicted) = {
+        let (pane_id, running, bidi_state, evicted, claude_from) = {
             let pane = self.tabs.get(self.active)?.panes.get(hit.pane)?;
             let m = pane.session.meta.lock().unwrap();
             (
@@ -1857,6 +2133,7 @@ impl App {
                 m.running_cmd.clone(),
                 m.bidi.clone(),
                 m.evicted,
+                m.claude_from_abs,
             )
         };
         let (auto, manual) = (self.auto_follow, self.claude_manual);
@@ -1877,14 +2154,18 @@ impl App {
             let alt = t.mode().contains(TermMode::ALT_SCREEN);
             let (reorder, use_stamps) =
                 bidi_state.for_display(honor, !running.is_empty(), alt);
-            let claude = reorder
+            let mut claude = reorder
                 && if !auto {
                     manual
                 } else {
-                    alt && bidi::cmd_is_claude(&running)
+                    bidi::cmd_is_claude(&running)
                 };
             let history = t.grid().history_size() as u64;
             let off = t.grid().display_offset() as u64;
+            if !alt && auto {
+                let abs = bidi_ctl::viewport_line_abs(evicted, history, off, row as u64);
+                claude &= claude_from.is_none_or(|start| abs >= start);
+            }
             let dir = if use_stamps {
                 bidi_state.direction_at(bidi_ctl::viewport_line_abs(
                     evicted, history, off, row as u64,
@@ -1895,7 +2176,10 @@ impl App {
             let cells = render::snapshot_row(&t, row);
             (cols, row, cells, claude, hit.col.min(cols - 1), reorder, dir)
         };
-        let col = if reorder && cells.iter().any(|c| render::is_arabic(c.c)) {
+        let mapped = rects.get(hit.pane).and_then(|rect| self.renderer.as_ref()
+            .and_then(|r| r.hit_cell(*rect, row, pos.x))).map(|h| h.0);
+        let col = if let Some(col) = mapped { col }
+        else if reorder && cells.iter().any(|c| render::is_arabic(c.c)) {
             let rect = rects.get(hit.pane).copied().unwrap_or((0, 0, 1, 1));
             let x = (pos.x - rect.0 as f64) as f32;
             self.renderer
@@ -2302,12 +2586,14 @@ impl App {
             return false;
         }
         let pw = w.inner_size().width as usize;
-        if r.settings_button_hit(pw, pos.x, pos.y) {
+        if r.settings_button_hit(pw, pos.x, pos.y)
+            || r.tab_control_hit(pw, pos.x, pos.y).is_some() {
             return false;
         }
         self.tab_at(pos).is_none()
     }
 
+    /// Tab index under a pixel position, if it's in the tab bar.
     fn tab_at(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
         let r = self.renderer.as_ref()?;
         if r.tab_bar_h() == 0.0 || pos.y >= r.tab_bar_h() as f64 {
@@ -2315,13 +2601,12 @@ impl App {
         }
         // widths vary per title now, so walk them; the same tab_width the
         // renderer uses, or a click would land on the neighbour
-        let mut x = 0i32;
-        for (i, t) in self.tabs.iter().enumerate() {
-            let w = r.tab_width(&t.title);
+        let width = self.window.as_ref()?.inner_size().width as usize;
+        let titles: Vec<_> = self.tabs.iter().map(|t| t.title.as_str()).collect();
+        for (i, x, w) in r.tab_rects(width, &titles, self.active) {
             if pos.x >= x as f64 && pos.x < (x + w) as f64 {
                 return Some(i);
             }
-            x += w;
         }
         None
     }
@@ -2508,7 +2793,7 @@ impl App {
         };
         let settings_open = self.settings.is_some();
         let settings_theme = self.active_theme();
-        let settings_size = self.config.font_size.unwrap_or(15.0) as i32;
+        let settings_size = self.config.font_size.unwrap_or(render::DEFAULT_FONT_SIZE) as i32;
         // the family ACTUALLY in use (post-fallback), not the config wish
         let settings_family = self
             .renderer
@@ -2531,7 +2816,7 @@ impl App {
                     .collect();
                 (rows, st.sel, st.capturing, st.flash.clone())
             });
-        let posh_view: Option<(Vec<String>, Vec<Option<Vec<u8>>>, usize)> =
+        let posh_view: Option<PoshView> =
             self.posh.as_ref().map(|p| (p.names.clone(), p.previews.clone(), p.sel));
         // computed before the renderer is borrowed, like close_msg above
         let palette_view: Option<(String, Vec<String>, usize)> = self.palette.as_ref().map(|p| {
@@ -2559,6 +2844,7 @@ impl App {
                 busy: t.busy(i == self.active),
                 attention: t.attention,
                 active: i == self.active,
+                progress: t.progress(),
             })
             .collect();
         let Some(window) = self.window.as_ref() else { return };
@@ -2569,6 +2855,7 @@ impl App {
         let mut verts: Vec<gpu::Vertex> = Vec::new();
         match (self.renderer.as_mut(), self.tabs.get(self.active)) {
             (Some(renderer), Some(tab)) if !rects.is_empty() => {
+                renderer.begin_frame();
                 let bordered = tab.panes.len() > 1;
                 let (auto_follow, claude_manual) = (self.auto_follow, self.claude_manual);
                 let mut focused_claude = false;
@@ -2576,7 +2863,7 @@ impl App {
                     let focused = pi == tab.focused;
                     // meta snapshot BEFORE the term lock (lock order term>meta
                     // only applies when holding both; here they don't overlap)
-                    let (marks, running_cmd, bidi_state, evicted): PaneSnap = {
+                    let (marks, running_cmd, bidi_state, evicted, claude_from): PaneSnap = {
                         let m = pane.session.meta.lock().unwrap();
                         (
                             // global -> grid space: subtract the evictions
@@ -2588,6 +2875,7 @@ impl App {
                             m.running_cmd.clone(),
                             m.bidi.clone(),
                             m.evicted,
+                            m.claude_from_abs,
                         )
                     };
                     let t = pane.session.term.lock().unwrap();
@@ -2606,7 +2894,7 @@ impl App {
                         && if !auto_follow {
                             claude_manual
                         } else {
-                            alt && bidi::cmd_is_claude(&running_cmd)
+                            bidi::cmd_is_claude(&running_cmd)
                         };
                     if focused {
                         focused_claude = claude_pane;
@@ -2638,6 +2926,9 @@ impl App {
                         cursor_on,
                         bordered,
                         claude: claude_pane,
+                        claude_from: if alt || !auto_follow { None } else {
+                            claude_from.map(|start| start as i64 - evicted as i64 - history as i64 + off as i64)
+                        },
                         reorder,
                         line_dir: &line_dir,
                         search_match: if focused {
@@ -2651,6 +2942,7 @@ impl App {
                     };
                     renderer.draw_pane(&mut verts, &view, &t);
                 }
+                renderer.use_ui_metrics(true);
                 renderer.draw_chrome(
                     &mut verts,
                     px.width as usize,
@@ -2728,14 +3020,6 @@ impl App {
                         flash.as_deref(),
                     );
                 }
-                if let Some(msg) = &close_msg {
-                    renderer.draw_close_guard(
-                        &mut verts,
-                        px.width as usize,
-                        px.height as usize,
-                        msg,
-                    );
-                }
                 if let Some((q, rows, sel)) = &palette_view {
                     renderer.draw_palette(
                         &mut verts,
@@ -2756,6 +3040,15 @@ impl App {
                         *sel,
                     );
                 }
+                if let Some(msg) = &close_msg {
+                    renderer.draw_close_guard(
+                        &mut verts,
+                        px.width as usize,
+                        px.height as usize,
+                        msg,
+                    );
+                }
+                renderer.use_ui_metrics(false);
             }
             // renderer still warming up on its thread: clear-only dark frame
             _ => {}
@@ -2829,15 +3122,34 @@ impl ApplicationHandler<UserEvent> for App {
         // and generated from assets/bayan.ico so the two can't drift apart.
         const ICON_RGBA: &[u8] = include_bytes!("../assets/icon_64.rgba");
         let icon = winit::window::Icon::from_rgba(ICON_RGBA.to_vec(), 64, 64).ok();
-        let attrs = Window::default_attributes()
+        use winit::platform::windows::WindowAttributesExtWindows;
+        let mut attrs = Window::default_attributes()
             // M24: no OS title bar. The tab strip IS the title bar, so the
             // window carries one row of chrome instead of two. We draw the
             // caption buttons and handle drag/resize ourselves below.
             .with_decorations(false)
+            .with_undecorated_shadow(true)
             .with_title("Bayan — بيان")
             .with_window_icon(icon)
             .with_visible(visible)
             .with_inner_size(LogicalSize::new(1100.0, 700.0));
+        // yesterday's rectangle, if it is still on a connected monitor
+        let monitors: Vec<(i32, i32, u32, u32)> = el
+            .available_monitors()
+            .map(|m| {
+                let (p, s) = (m.position(), m.size());
+                (p.x, p.y, s.width, s.height)
+            })
+            .collect();
+        if let Some(g) = load_saved_state().and_then(|s| s.window) {
+            if geometry_on_screen(g, &monitors) {
+                attrs = attrs
+                    .with_position(winit::dpi::PhysicalPosition::new(g.x, g.y))
+                    .with_inner_size(winit::dpi::PhysicalSize::new(g.w, g.h))
+                    .with_maximized(g.maximized);
+                self.normal_geom = Some(WindowGeom { maximized: false, ..g });
+            }
+        }
         let window = Arc::new(el.create_window(attrs).expect("create window"));
         crate::prof::mark("window created");
         let px = window.inner_size();
@@ -2847,6 +3159,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.gpu = Some(gpu);
         self.window = Some(window.clone());
         self.apply_opacity(); // the configured window alpha, from frame one
+        self.apply_window_frame();
         if let Some(h) = self.hwnd() {
             // the tray icon: toast anchor + summon target
             if !toast::init(h) {
@@ -2859,7 +3172,7 @@ impl ApplicationHandler<UserEvent> for App {
         // the PTY + conhost + PowerShell chain is the slowest dependency:
         // start it immediately with a default grid; the exact grid follows
         // once cell metrics exist (EasyTer starts 110x32 the same way).
-        // Restores yesterday's tabs (each in its saved cwd) or opens one.
+        // Start one fresh tab unless saved-tab restoration is explicitly enabled.
         self.restore_state();
         // debug hook: BAYAN_SPLIT=1 opens the first tab pre-split, so the
         // pane machinery can be verified without injecting any input
@@ -2897,10 +3210,7 @@ impl ApplicationHandler<UserEvent> for App {
         // captured without injecting keystrokes (the debug-hook rule)
         if let Some(v) = std::env::var_os("BAYAN_PALETTE") {
             let q = v.to_str().unwrap_or("").to_string();
-            self.palette = Some(Palette {
-                query: if q == "1" { String::new() } else { q },
-                sel: 0,
-            });
+            self.open_palette(if q == "1" { String::new() } else { q });
         }
         // BAYAN_TOAST=<title|1>: fire a sample toast at startup (M19
         // verification; a custom value becomes the title, so direction
@@ -2946,6 +3256,16 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
         match event {
+            UserEvent::ShellProfiles(profiles) => {
+                if let Some(palette) = self.palette.as_mut() {
+                    palette.extras.retain(|(row, _)| !matches!(row, PaletteRow::Shell(_)));
+                    palette.extras.extend(profiles.iter().map(|shell| (
+                        PaletteRow::Shell(shell.command.clone()), format!("تبويب جديد — {}", shell.name)
+                    )));
+                }
+                self.shell_profiles = profiles;
+                self.request_redraw();
+            }
             UserEvent::Wakeup(id) => {
                 self.link_cache.invalidate_pane(id);
                 // The row that was hovered may have moved. Drop the tooltip
@@ -3009,6 +3329,52 @@ impl ApplicationHandler<UserEvent> for App {
                     if mode == config::BellMode::Sound && (background || !self.focused) {
                         beep();
                     }
+                    // the window is unfocused: a dot nobody can see is no
+                    // alert. A toast, like a finished command gets (Claude
+                    // Code with preferredNotifChannel=terminal_bell rings
+                    // exactly this bell when it needs an approval).
+                    if !self.focused && self.config.notifications_on() {
+                        if let Some(h) = self.hwnd() {
+                            let body = self.tabs[ti].title.clone();
+                            toast::show(h, "بيان — تنبيه", &body);
+                        }
+                        if let Some(w) = &self.window {
+                            w.request_user_attention(Some(
+                                winit::window::UserAttentionType::Informational,
+                            ));
+                        }
+                    }
+                }
+            }
+            UserEvent::Notify(id, title, body) => {
+                // an explicit ask (OSC 9 / 777 / 99): the program decided
+                // this deserves attention, so the only question is whether
+                // the user is already looking — same rule as the bell
+                if let Some((ti, _)) = self.find_pane(id) {
+                    let background = ti != self.active;
+                    if background {
+                        self.tabs[ti].attention = true;
+                    }
+                    if (background || !self.focused) && self.config.notifications_on() {
+                        if let Some(h) = self.hwnd() {
+                            let body = if body.is_empty() { self.tabs[ti].title.clone() } else { body };
+                            toast::show(h, &title, &body);
+                        }
+                        if !self.focused {
+                            if let Some(w) = &self.window {
+                                w.request_user_attention(Some(
+                                    winit::window::UserAttentionType::Informational,
+                                ));
+                            }
+                        }
+                    }
+                    self.request_redraw();
+                }
+            }
+            UserEvent::Progress(id, p) => {
+                if let Some((ti, pi)) = self.find_pane(id) {
+                    self.tabs[ti].panes[pi].progress = p;
+                    self.request_redraw(); // the tab bar and cockpit draw it
                 }
             }
             UserEvent::CommandFinished(id, ok) => {
@@ -3130,14 +3496,48 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if let WindowEvent::MouseInput { state, button, .. } = &event {
+            if consume_guard_release(&mut self.swallow_guard_release, *state, *button) {
+                return;
+            }
+        }
+        if self.pending_close.is_some() {
+            // A modal owns pointer input too: no tab changes, selections,
+            // dropped commands or wheel reports may reach the terminal below.
+            match &event {
+                WindowEvent::CursorMoved { position, .. } => {
+                    self.cursor_pos = *position;
+                    self.abandon_mouse();
+                    self.drag_divider = None;
+                    if let Some(w) = &self.window {
+                        w.set_cursor(winit::window::CursorIcon::Default);
+                    }
+                    return;
+                }
+                WindowEvent::MouseInput { state, button, .. } => {
+                    self.abandon_mouse();
+                    self.drag_divider = None;
+                    if *state == ElementState::Pressed && *button == MouseButton::Left {
+                        self.swallow_guard_release = true;
+                        let hit = self.renderer.as_ref().zip(self.window.as_ref())
+                            .and_then(|(r, w)| {
+                                let size = w.inner_size();
+                                r.close_guard_layout(size.width as usize, size.height as usize)
+                                    .hit(self.cursor_pos.x, self.cursor_pos.y)
+                            });
+                        if let Some(confirm) = hit { self.resolve_close(confirm, el); }
+                    }
+                    return;
+                }
+                WindowEvent::MouseWheel { .. } | WindowEvent::DroppedFile(_) => return,
+                _ => {}
+            }
+        }
         match event {
             WindowEvent::CloseRequested => {
                 // a running command deserves a second look before the kill
-                if self.config.confirm_close_on()
-                    && self.pending_close.is_none()
-                    && self.running_count() > 0
-                {
-                    self.pending_close = Some(CloseTarget::Window);
+                let running = self.running_count();
+                if !prepare_window_close(&mut self.pending_close, self.config.confirm_close_on(), running) {
                     self.request_redraw();
                     return;
                 }
@@ -3195,17 +3595,25 @@ impl ApplicationHandler<UserEvent> for App {
                     s.write(body.as_bytes());
                 }
             }
-            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            WindowEvent::ModifiersChanged(m) => {
+                self.modifiers = m.state();
+                self.refresh_link_hover(self.cursor_pos);
+                if !self.modifiers.control_key() && self.mru.walking() {
+                    self.mru.release(self.active); // the Ctrl+Tab walk ends here
+                }
+            }
             WindowEvent::ScaleFactorChanged { .. } => {
                 // HiDPI: the window moved to a monitor with another scale.
                 // Rebuild cell metrics off-thread; the current renderer keeps
                 // painting until RendererReady swaps it in and re-snaps the grid.
                 self.rebuild_renderer();
             }
+            WindowEvent::Moved(_) => self.track_geometry(),
             WindowEvent::Resized(px) => {
                 if px.width == 0 || px.height == 0 {
                     return;
                 }
+                self.track_geometry();
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.resize(px.width, px.height);
                 }
@@ -3321,11 +3729,9 @@ impl ApplicationHandler<UserEvent> for App {
                                             // running-command guard must not be
                                             // bypassed just because the button
                                             // is ours now
-                                            if self.config.confirm_close_on()
-                                                && self.pending_close.is_none()
-                                                && self.running_count() > 0
-                                            {
-                                                self.pending_close = Some(CloseTarget::Window);
+                                            let running = self.running_count();
+                                            if !prepare_window_close(&mut self.pending_close,
+                                                self.config.confirm_close_on(), running) {
                                                 self.request_redraw();
                                             } else {
                                                 self.quit(el);
@@ -3352,6 +3758,16 @@ impl ApplicationHandler<UserEvent> for App {
                         // (a click — layout-proof, unlike a comma shortcut)
                         if let (Some(r), Some(w)) = (self.renderer.as_ref(), self.window.as_ref()) {
                             let pw = w.inner_size().width as usize;
+                            if let Some(control) = r.tab_control_hit(pw, self.cursor_pos.x, self.cursor_pos.y) {
+                                match control {
+                                    0 if self.active > 0 => self.switch_tab(self.active - 1),
+                                    1 if self.active + 1 < self.tabs.len() => self.switch_tab(self.active + 1),
+                                    2 => self.perform_action(keybinds::Action::NewTab, el),
+                                    _ => {}
+                                }
+                                self.request_redraw();
+                                return;
+                            }
                             if r.settings_button_hit(pw, self.cursor_pos.x, self.cursor_pos.y) {
                                 self.settings = Some(0);
                                 self.request_redraw();
@@ -3537,16 +3953,10 @@ impl ApplicationHandler<UserEvent> for App {
                     event.logical_key, event.physical_key, event.text
                 ));
                 // a pending close owns the keyboard: Enter closes, Esc keeps
-                if let Some(target) = self.pending_close {
+                if self.pending_close.is_some() {
                     match &event.logical_key {
-                        Key::Named(NamedKey::Enter) => {
-                            self.pending_close = None;
-                            match target {
-                                CloseTarget::Pane(ti, pi) => self.remove_pane(ti, pi, el),
-                                CloseTarget::Window => self.quit(el),
-                            }
-                        }
-                        Key::Named(NamedKey::Escape) => self.pending_close = None,
+                        Key::Named(NamedKey::Enter) => self.resolve_close(true, el),
+                        Key::Named(NamedKey::Escape) => self.resolve_close(false, el),
                         _ => {}
                     }
                     self.request_redraw();
@@ -3629,7 +4039,7 @@ impl ApplicationHandler<UserEvent> for App {
                     && event.physical_key == winit::keyboard::PhysicalKey::Code(
                         winit::keyboard::KeyCode::KeyP)
                 {
-                    self.palette = Some(Palette { query: String::new(), sel: 0 });
+                    self.open_palette(String::new());
                     self.request_redraw();
                     return;
                 }
@@ -3643,18 +4053,20 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 let key = &event.logical_key;
                 // ---- rebindable shortcuts (the keymap; Ctrl+, ⌨ edits it).
-                // EasyTer's TUI rule, generalized: a PLAIN ctrl+letter chord
-                // belongs to a full-screen TUI when one is up — pass it on.
+                // Plain Ctrl+letters belong to TUIs, except clipboard paste.
                 if let Some(chord) =
                     keybinds::chord_from(event.physical_key, ctrl, shift, alt)
                 {
-                    if let Some(action) = keybinds::lookup(&self.keymap, chord) {
-                        let tui_owns = chord.is_plain_ctrl_letter()
-                            && self.term_mode().contains(TermMode::ALT_SCREEN);
-                        if !tui_owns {
-                            self.perform_action(action, el);
+                    let alt_screen = self.term_mode().contains(TermMode::ALT_SCREEN);
+                    if let Some(action) = keybinds::resolve(&self.keymap, chord, alt_screen, self.has_selection()) {
+                        if action == keybinds::Action::Copy && chord.is_plain_ctrl_letter()
+                            && chord.key == keybinds::ChordKey::Letter('c') {
+                            self.copy_selection(true);
+                            self.request_redraw();
                             return;
                         }
+                        self.perform_action(action, el);
+                        return;
                     }
                 }
                 // Alt+arrows move focus between panes (EasyTer's binding)
@@ -3686,12 +4098,20 @@ impl ApplicationHandler<UserEvent> for App {
                     // because winit reports Tab+shift with the shift modifier)
                     if matches!(key, Key::Named(NamedKey::Tab)) && !self.tabs.is_empty() {
                         let n = self.tabs.len();
-                        let next = if shift {
-                            (self.active + n - 1) % n
+                        if self.config.tab_switch_recent() {
+                            // stack-like: the previous tab first, deeper while
+                            // Ctrl stays down; ModifiersChanged commits the stop
+                            if let Some(next) = self.mru.step(!shift, n) {
+                                self.show_tab(next);
+                            }
                         } else {
-                            (self.active + 1) % n
-                        };
-                        self.switch_tab(next);
+                            let next = if shift {
+                                (self.active + n - 1) % n
+                            } else {
+                                (self.active + 1) % n
+                            };
+                            self.switch_tab(next);
+                        }
                         return;
                     }
                     // Ctrl+0 resets the font zoom (physical digit key:
@@ -3709,16 +4129,20 @@ impl ApplicationHandler<UserEvent> for App {
                     // Ctrl+C copies when a selection exists (Windows
                     // convention); otherwise falls through to \x03
                     if let Some(l) = key_letter(&event) {
-                        if !shift && l == 'c' && self.has_selection() {
+                        if !shift && !alt && l == 'c' && self.has_selection() {
                             self.copy_selection(true);
                             self.request_redraw();
                             return;
                         }
                     }
                 }
-                // Shift+PageUp/PageDown page through the scrollback
+                // Shift+PageUp/PageDown page through the scrollback, by the
+                // focused pane's REAL height (self.size is only the spawn grid)
                 if shift && !ctrl {
-                    let rows = self.size.rows as i32;
+                    let rows = self
+                        .session()
+                        .map_or(self.size.rows, |s| s.term.lock().unwrap().screen_lines())
+                        as i32;
                     match key {
                         Key::Named(NamedKey::PageUp) => {
                             self.scroll_lines(rows);
@@ -3812,6 +4236,10 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Wait);
     prof::mark("event loop built");
     let proxy = event_loop.create_proxy();
+    let profiles_proxy = proxy.clone();
+    std::thread::spawn(move || {
+        let _ = profiles_proxy.send_event(UserEvent::ShellProfiles(shells::detect()));
+    });
     let cfg = config::load();
     // plugins load once, before the first renderer, so a plugin theme named in
     // the config resolves on the very first frame
@@ -3826,7 +4254,9 @@ fn main() {
     let keymap = keybinds::effective_map(&cfg);
     let mut app = App {
         posh: None,
+        mru: mru::Mru::new(),
         palette: None,
+        shell_profiles: Vec::new(),
         last_strip_click: None,
         proxy,
         window: None,
@@ -3848,6 +4278,7 @@ fn main() {
         cockpit_sel: 0,
         pending_paste: None,
         pending_close: None,
+        swallow_guard_release: false,
         link_hover: None,
         blocked_link: None,
         link_cache: link::SpanCache::default(),
@@ -3868,6 +4299,7 @@ fn main() {
         font_delta: 0.0,
         renderer_building: false,
         inflight_delta: 0.0,
+        normal_geom: None,
         keys_held_away: Vec::new(),
     };
     event_loop.run_app(&mut app).expect("run event loop");
@@ -3887,6 +4319,60 @@ fn osc52_pane_is_focused(tabs: &[(usize, &[u64])], active: usize, source: u64) -
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn palette_profiles_and_copy_targets_keep_exact_payloads() {
+        let shells = vec![shells::Shell { name: "طرفية تجريبية".into(), command: "cmd.exe".into() }];
+        let spans = vec![link::LinkSpan { start_col: 2, end_col: 20,
+            kind: link::LinkKind::Url { uri: "https://example.org/ملف".into() } }];
+        let rows = palette_extras(&shells, &spans);
+        assert!(rows.iter().any(|(r, label)| matches!(r, PaletteRow::Shell(cmd) if cmd == "cmd.exe")
+            && label.contains("طرفية تجريبية")));
+        assert!(rows.iter().any(|(r, _)| matches!(r, PaletteRow::CopyText(text) if text == "https://example.org/ملف")));
+    }
+
+    #[test]
+    fn palette_copy_list_is_bounded_deduplicated_and_has_safe_labels() {
+        let span = link::LinkSpan { start_col: 0, end_col: 9,
+            kind: link::LinkKind::Osc { uri: "https://example.org/\u{202e}x".into() } };
+        let rows = palette_extras(&[], &vec![span; 200]);
+        let copies: Vec<_> = rows.iter().filter(|(r, _)| matches!(r, PaletteRow::CopyText(_))).collect();
+        assert_eq!(copies.len(), 1);
+        assert!(!copies[0].1.contains('\u{202e}'));
+        let spans: Vec<_> = (0..200).map(|n| link::LinkSpan { start_col: 0, end_col: 9,
+            kind: link::LinkKind::File { path: format!("file{n}.rs"), line: 0, col: None } }).collect();
+        let rows = palette_extras(&[], &spans);
+        assert_eq!(rows.iter().filter(|(r, _)| matches!(r, PaletteRow::CopyText(_))).count(), 100);
+    }
+
+    #[test]
+    fn dismissing_guard_consumes_its_release_even_after_the_modal_is_gone() {
+        let mut pending = true;
+        assert!(!consume_guard_release(&mut pending, ElementState::Pressed, MouseButton::Left));
+        assert!(!consume_guard_release(&mut pending, ElementState::Released, MouseButton::Right));
+        assert!(pending);
+        assert!(consume_guard_release(&mut pending, ElementState::Released, MouseButton::Left));
+        assert!(!pending);
+        assert!(!consume_guard_release(&mut pending, ElementState::Released, MouseButton::Left));
+    }
+
+    #[test]
+    fn window_close_replaces_pane_confirmation_and_preserves_window_guard() {
+        let mut pending = Some(CloseTarget::Pane(0, 0));
+        assert!(!prepare_window_close(&mut pending, true, 2));
+        assert!(matches!(pending, Some(CloseTarget::Window)));
+        assert!(!prepare_window_close(&mut pending, true, 2));
+
+        let mut pending = None;
+        assert!(!prepare_window_close(&mut pending, true, 1));
+        assert!(matches!(pending, Some(CloseTarget::Window)));
+
+        for (confirm, running) in [(false, 2), (true, 0)] {
+            let mut pending = Some(CloseTarget::Pane(0, 0));
+            assert!(prepare_window_close(&mut pending, confirm, running));
+            assert!(pending.is_none());
+        }
+    }
 
     #[test]
     fn blur_drops_keys_whose_press_was_swallowed() {
@@ -3974,6 +4460,26 @@ mod tests {
     }
 
     #[test]
+    fn window_geometry_restores_only_onto_a_live_monitor() {
+        let primary = (0, 0, 2560u32, 1440u32);
+        let second = (2560, 0, 1920u32, 1080u32);
+        let g = |x, y| WindowGeom { x, y, w: 1100, h: 700, maximized: false };
+        assert!(geometry_on_screen(g(100, 100), &[primary]));
+        // on the second monitor: fine while it is connected, not after
+        assert!(geometry_on_screen(g(3000, 200), &[primary, second]));
+        assert!(!geometry_on_screen(g(3000, 200), &[primary]));
+        // mostly off the right edge, but 160px of the grab strip still reaches in
+        assert!(geometry_on_screen(g(2400, 100), &[primary]));
+        // only 60px in: not enough to grab — treat as off-screen
+        assert!(!geometry_on_screen(g(2500, 100), &[primary]));
+        // above the top: the title strip is unreachable
+        assert!(!geometry_on_screen(g(100, -400), &[primary]));
+        // a degenerate size is not worth restoring
+        assert!(!geometry_on_screen(WindowGeom { w: 10, h: 10, ..g(0, 0) }, &[primary]));
+        assert!(!geometry_on_screen(g(0, 0), &[]));
+    }
+
+    #[test]
     fn saved_state_round_trips_with_layout() {
         let s = SavedState {
             tabs: vec![SavedTab {
@@ -3983,9 +4489,14 @@ mod tests {
                 focused: 1,
             }],
             active: 0,
+            window: Some(WindowGeom { x: 40, y: 60, w: 1280, h: 800, maximized: true }),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back = parse_state(&json).unwrap();
+        assert_eq!(back.window, s.window, "geometry survives the round trip");
+        // a pre-M32 file has no window field and must still parse
+        let old = r#"{"tabs":[{"cwds":[null]}],"active":0}"#;
+        assert_eq!(parse_state(old).unwrap().window, None);
         assert_eq!(back.tabs[0].cwds.len(), 2);
         assert_eq!(back.tabs[0].weights, vec![3.0, 1.0]);
         assert_eq!(back.tabs[0].orientation, 1);
@@ -4060,6 +4571,40 @@ mod tests {
         // no hits -> None, and a regex-special query is treated literally
         assert!(find_match(&mut t, "absent", &None, Direction::Left).is_none());
         assert!(find_match(&mut t, "needle (", &None, Direction::Left).is_none());
+    }
+
+    /// A background tab's shell exiting must not move focus to a different
+    /// tab than the one the user was looking at.
+    #[test]
+    fn closing_a_lower_tab_slides_the_active_index_down() {
+        // 4 tabs, looking at #2, tab #0 closes -> the same tab is now #1
+        assert_eq!(active_after_remove(2, 0, 3), 1);
+        // closing a higher tab leaves the index alone
+        assert_eq!(active_after_remove(1, 3, 3), 1);
+        // closing the active tab itself: clamp to the last remaining
+        assert_eq!(active_after_remove(2, 2, 2), 1);
+        assert_eq!(active_after_remove(0, 0, 2), 0);
+        assert_eq!(active_after_remove(5, 0, 0), 0);
+    }
+
+    /// The wheel inside a TUI: arrows unless the app tracks the mouse, and
+    /// then the encoding IT asked for — an SGR report to a program that only
+    /// enabled X10 tracking is as much garbage as one to a program with none.
+    #[test]
+    fn wheel_sends_what_the_tui_asked_for() {
+        let none = TermMode::ALT_SCREEN;
+        assert_eq!(wheel_seq(none, 1, 5, 7), b"\x1b[A");
+        assert_eq!(wheel_seq(none, -1, 5, 7), b"\x1b[B");
+        assert_eq!(wheel_seq(none | TermMode::APP_CURSOR, 1, 5, 7), b"\x1bOA");
+        let x10 = none | TermMode::MOUSE_REPORT_CLICK;
+        assert_eq!(wheel_seq(x10, 1, 5, 7), b"\x1b[M\x60\x27\x25");
+        let sgr = x10 | TermMode::SGR_MOUSE;
+        assert_eq!(wheel_seq(sgr, -1, 5, 7), b"\x1b[<65;7;5M");
+        // X10 is ONE byte per value: column 200 is 0xE8, never a two-byte
+        // UTF-8 pair, and anything past 223 clamps rather than wrapping
+        assert_eq!(wheel_seq(x10, 1, 3, 200), b"\x1b[M\x60\xe8\x23");
+        assert_eq!(wheel_seq(x10, 1, 500, 900).len(), 6);
+        assert_eq!(wheel_seq(x10, 1, 500, 900)[4], 255);
     }
 
     #[test]

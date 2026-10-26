@@ -56,6 +56,11 @@ fn parse_wsl_list(raw: &[u8]) -> Vec<String> {
         .collect()
 }
 
+fn parse_wsl_result(success: bool, raw: &[u8]) -> Vec<String> {
+    // WSL writes diagnostics to stdout too; only successful listings are names.
+    if success { parse_wsl_list(raw) } else { Vec::new() }
+}
+
 /// The 8.3 short path. ConPTY fails on paths containing spaces, and every
 /// default Git install lives under "Program Files".
 #[cfg(windows)]
@@ -97,7 +102,7 @@ fn wsl_distros() -> Vec<String> {
         .creation_flags(CREATE_NO_WINDOW)
         .output();
     match out {
-        Ok(o) => parse_wsl_list(&o.stdout),
+        Ok(o) => parse_wsl_result(o.status.success(), &o.stdout),
         Err(_) => Vec::new(), // no WSL installed is not an error
     }
 }
@@ -132,9 +137,29 @@ pub fn detect() -> Vec<Shell> {
     v
 }
 
+/// Friendly label for a stored command line, for the settings panel. Falls
+/// back to a trimmed command so a hand-edited config.json still reads sanely.
+pub fn label_for(command: &str) -> String {
+    detect()
+        .into_iter()
+        .find(|s| s.command == command)
+        .map(|s| s.name)
+        .unwrap_or_else(|| command.trim_end_matches(".exe").to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_wsl_discovery_does_not_offer_error_messages_as_shells() {
+        let error: Vec<u8> = "Access is denied.\r\n"
+            .encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert!(parse_wsl_result(false, &error).is_empty());
+        let valid: Vec<u8> = "Ubuntu\r\nDebian\r\n"
+            .encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(parse_wsl_result(true, &valid), vec!["Ubuntu", "Debian"]);
+    }
 
     #[test]
     fn git_bash_prefers_usr_bin_over_the_launcher() {
@@ -209,13 +234,3 @@ mod tests {
     }
 }
 
-
-/// Friendly label for a stored command line, for the settings panel. Falls
-/// back to a trimmed command so a hand-edited config.json still reads sanely.
-pub fn label_for(command: &str) -> String {
-    detect()
-        .into_iter()
-        .find(|s| s.command == command)
-        .map(|s| s.name)
-        .unwrap_or_else(|| command.trim_end_matches(".exe").to_string())
-}

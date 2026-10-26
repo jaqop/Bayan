@@ -176,8 +176,15 @@ pub struct SessionMeta {
     pub at_prompt: bool,
     /// column where prompt input begins (from OSC 133 B)
     pub prompt_col: Option<usize>,
+    /// Global row of OSC 133 B; a command may wrap below this row.
+    pub prompt_abs: Option<u64>,
     /// the command line currently executing ("" = idle) — feeds cmd_is_claude
     pub running_cmd: String,
+    /// One-shot cleanup once a newly launched interactive Claude is ready.
+    pub clean_claude_after: Option<u64>,
+    /// First absolute row belonging to the current inline Claude screen.
+    pub claude_from_abs: Option<u64>,
+    /// working directory from OSC 9;9
     /// Enter was sent at the prompt, and a trusted OSC 133 A or D has not
     /// been seen since. Set even when the cursor never moved past the prompt
     /// column, so `running_cmd` stayed empty: paste and Enter in one chunk,
@@ -266,6 +273,7 @@ const KITTY_STACK_CAP: u16 = 16;
 /// Events one PTY chunk produced, delivered to the UI thread by the reader.
 #[derive(Default)]
 pub(crate) struct ChunkEvents {
+    pub clean_claude: bool,
     pub clipboard: Option<String>,
     pub cwd: Option<String>,
     /// a LONG command just ended (ok?) — worth a notification if unfocused
@@ -274,6 +282,127 @@ pub(crate) struct ChunkEvents {
     /// parser's `kitty_keyboard` flag is false, so `CSI ? u` is answered
     /// here with `CSI ?0u` and the reader writes it to the PTY.
     pub pty_replies: Vec<String>,
+    /// the program asked for a desktop notification (title, body): OSC 9,
+    /// OSC 777 or OSC 99 — what Claude Code, ntfy, zellij and friends emit
+    pub notify: Option<(String, String)>,
+    /// OSC 9;4 progress: Some(None) clears, Some(Some(p)) sets
+    pub progress: Option<Option<Progress>>,
+}
+
+/// ConEmu's OSC 9;4 progress report, as Windows Terminal, Ghostty, WezTerm
+/// and Konsole read it — and as Claude Code emits it while it works
+/// (`terminalProgressBarEnabled`). The tab bar and the cockpit draw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Progress {
+    pub state: ProgressState,
+    /// 0..=100; meaningful for Normal, Error and Paused
+    pub percent: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgressState {
+    Normal,
+    Error,
+    Indeterminate,
+    Paused,
+}
+
+/// Parse an OSC 9;4 payload ("st;pr" after the "4;"): st 0 clears, 1 normal
+/// (pr%), 2 error, 3 indeterminate, 4 paused. Unknown states are ignored
+/// rather than drawn as something they are not.
+fn parse_progress(payload: &[u8]) -> Option<Option<Progress>> {
+    let s = std::str::from_utf8(payload).ok()?;
+    let mut it = s.split(';');
+    let st: u8 = it.next()?.trim().parse().ok()?;
+    let pr: u8 = it.next().and_then(|p| p.trim().parse().ok()).unwrap_or(0).min(100);
+    Some(match st {
+        0 => None,
+        1 => Some(Progress { state: ProgressState::Normal, percent: pr }),
+        2 => Some(Progress { state: ProgressState::Error, percent: pr }),
+        3 => Some(Progress { state: ProgressState::Indeterminate, percent: 0 }),
+        4 => Some(Progress { state: ProgressState::Paused, percent: pr }),
+        _ => return None,
+    })
+}
+
+/// The LAST OSC 9;4 in a chunk (a burst of progress updates collapses to
+/// its final value — nobody needs the intermediate ones drawn).
+fn scan_progress(data: &[u8]) -> Option<Option<Progress>> {
+    let payload = last_osc_payload(data, b"\x1b]9;4;")?;
+    parse_progress(payload)
+}
+
+/// Desktop-notification requests, three dialects, last one in the chunk wins:
+/// - OSC 9;<message> — iTerm2 / ConEmu (digit-prefixed ConEmu subcommands
+///   like 9;4; and 9;9; are NOT messages)
+/// - OSC 777;notify;<title>;<body> — rxvt-unicode, what Ghostty and WezTerm speak
+/// - OSC 99;<meta>;<payload> — kitty: `p=title`/`p=body` in the metadata
+fn scan_notify(data: &[u8]) -> Option<(String, String)> {
+    let mut best: Option<(usize, (String, String))> = None;
+    let mut consider = |pos: usize, n: (String, String)| {
+        if best.as_ref().is_none_or(|(p, _)| pos > *p) {
+            best = Some((pos, n));
+        }
+    };
+    let text = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
+    // OSC 9;<message>
+    let mut i = 0;
+    while let Some(rel) = find(&data[i..], b"\x1b]9;") {
+        let s = i + rel + 4;
+        let e = osc_end(data, s);
+        let payload = &data[s..e];
+        // ConEmu subcommand (9;4;progress, 9;9;cwd, 9;12;...): not a message
+        let is_subcommand = payload
+            .iter()
+            .position(|&b| b == b';')
+            .is_some_and(|k| k > 0 && payload[..k].iter().all(u8::is_ascii_digit));
+        if !is_subcommand && !payload.is_empty() {
+            consider(s, ("Bayan".to_string(), text(payload)));
+        }
+        i = e.max(s);
+    }
+    // OSC 777;notify;title;body
+    let mut i = 0;
+    while let Some(rel) = find(&data[i..], b"\x1b]777;notify;") {
+        let s = i + rel + 13;
+        let e = osc_end(data, s);
+        let payload = &data[s..e];
+        let (title, body) = match payload.iter().position(|&b| b == b';') {
+            Some(k) => (text(&payload[..k]), text(&payload[k + 1..])),
+            None => ("Bayan".to_string(), text(payload)),
+        };
+        consider(s, (title, body));
+        i = e.max(s);
+    }
+    // OSC 99;<k=v:k=v>;<payload>
+    let mut i = 0;
+    while let Some(rel) = find(&data[i..], b"\x1b]99;") {
+        let s = i + rel + 5;
+        let e = osc_end(data, s);
+        let payload = &data[s..e];
+        if let Some(k) = payload.iter().position(|&b| b == b';') {
+            let meta = String::from_utf8_lossy(&payload[..k]);
+            let is_title = meta.split(':').any(|kv| kv == "p=title");
+            let body = text(&payload[k + 1..]);
+            if !body.is_empty() {
+                consider(s, if is_title { (body, String::new()) } else { ("Bayan".to_string(), body) });
+            }
+        }
+        i = e.max(s);
+    }
+    best.map(|(_, n)| n)
+}
+
+/// End of an OSC payload that starts at `s`: the BEL / ESC, or the data end.
+fn osc_end(data: &[u8], s: usize) -> usize {
+    data[s..]
+        .iter()
+        .position(|&b| b == 0x07 || b == 0x1b)
+        .map_or(data.len(), |p| s + p)
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Commands shorter than this end silently (EasyTer's threshold).
@@ -840,7 +969,9 @@ fn handle_osc133<T: EventListener>(
                 return;
             }
             meta.running_cmd.clear();
+            meta.clean_claude_after = None;
             meta.cmd_pending = false;
+            meta.claude_from_abs = None;
             // a new prompt starts on the cursor's row: record its block
             // GLOBALLY (evicted + history + row — never drifts)
             let abs = meta.evicted
@@ -861,7 +992,9 @@ fn handle_osc133<T: EventListener>(
                 return;
             }
             meta.running_cmd.clear();
+            meta.clean_claude_after = None;
             meta.cmd_pending = false;
+            meta.claude_from_abs = None;
             if let Some(m) = meta.marks.last_mut() {
                 m.exit = exit;
             }
@@ -875,6 +1008,8 @@ fn handle_osc133<T: EventListener>(
         b'B' => {
             meta.at_prompt = true;
             meta.prompt_col = Some(t.grid().cursor.point.column.0);
+            meta.prompt_abs = Some(meta.evicted + t.grid().history_size() as u64
+                + t.grid().cursor.point.line.0.max(0) as u64);
         }
         _ => {}
     }
@@ -925,6 +1060,9 @@ fn feed_counted<T: EventListener>(
 }
 
 fn merge_chunk(dst: &mut ChunkEvents, src: ChunkEvents) {
+    dst.clean_claude |= src.clean_claude;
+    if src.notify.is_some() { dst.notify = src.notify; }
+    if src.progress.is_some() { dst.progress = src.progress; }
     if src.clipboard.is_some() {
         dst.clipboard = src.clipboard;
     }
@@ -1247,6 +1385,8 @@ fn process_bytes<T: EventListener>(
         meta.cwd = Some(cwd.clone());
         ev.cwd = Some(cwd);
     }
+    ev.notify = scan_notify(&buf);
+    ev.progress = scan_progress(&buf);
     let mut pos = 0;
     for (s, e, kind, exit, trusted) in find_osc133(&buf, &nonce) {
         feed_counted(parser, t, meta, &buf[pos..s], &mut ev.pty_replies);
@@ -1261,6 +1401,23 @@ fn process_bytes<T: EventListener>(
         pos = e;
     }
     feed_counted(parser, t, meta, &buf[pos..], &mut ev.pty_replies);
+    if let Some(start_abs) = meta.clean_claude_after {
+        let first = start_abs as i64 - meta.evicted as i64 - t.grid().history_size() as i64;
+        if first < 0 {
+            meta.clean_claude_after = None; // startup already scrolled out of view
+        } else if t.mode().contains(TermMode::BRACKETED_PASTE) {
+            for line in first as i32..t.screen_lines() as i32 {
+                let row = &t.grid()[alacritty_terminal::index::Line(line)];
+                let text: String = (0..t.columns()).map(|c| row[Column(c)].c).collect();
+                if text.contains("Claude Code v") {
+                    meta.clean_claude_after = None;
+                    meta.claude_from_abs = Some(meta.evicted + t.grid().history_size() as u64);
+                    ev.clean_claude = true;
+                    break;
+                }
+            }
+        }
+    }
     ev
 }
 
@@ -1393,17 +1550,35 @@ pub(crate) fn capture_command_core<T: EventListener>(t: &Term<T>, meta: &mut Ses
     };
     meta.at_prompt = false;
     let cur = t.grid().cursor.point;
-    if cur.column.0 <= pcol {
+    let first = meta.prompt_abs.map_or(cur.line.0 as i64, |abs| {
+        abs as i64 - meta.evicted as i64 - t.grid().history_size() as i64
+    });
+    if first < -(t.grid().history_size() as i64) || first > cur.line.0 as i64 {
         return;
     }
-    let row = &t.grid()[cur.line];
     let mut s = String::new();
-    for c in pcol..cur.column.0 {
-        s.push(row[Column(c)].c);
+    for line in first as i32..=cur.line.0 {
+        let row = &t.grid()[alacritty_terminal::index::Line(line)];
+        let start = if line == first as i32 { pcol } else { 0 };
+        let end = if line == cur.line.0 { cur.column.0 } else { t.columns() };
+        for c in start..end {
+            let cell = &row[Column(c)];
+            if cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            s.push(cell.c);
+            if let Some(marks) = cell.zerowidth() { s.extend(marks); }
+        }
     }
     let s = s.trim();
     if !s.is_empty() {
         meta.running_cmd = s.to_string();
+        if crate::bidi::cmd_is_claude(s)
+            && !s.split_whitespace().any(|arg| matches!(arg, "-p" | "--print")) {
+            meta.clean_claude_after = Some(meta.evicted + t.grid().history_size() as u64
+                + cur.line.0.max(0) as u64 + 1);
+            meta.claude_from_abs = meta.clean_claude_after;
+        }
         meta.cmd_started = Some(std::time::Instant::now());
     }
 }
@@ -1571,6 +1746,11 @@ impl Session {
         for a in &args {
             cmd.arg(a);
         }
+        // what programs key their terminal features on: Claude Code, ripgrep,
+        // delta and the rest read these before deciding what to emit
+        cmd.env("TERM_PROGRAM", "Bayan");
+        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        cmd.env("COLORTERM", "truecolor");
         // requested dir (a restored tab, or "new tab inherits the cwd"),
         // else the launcher's directory, else home.
         // accept_local_cwd runs BEFORE any probe: a UNC path must not be
@@ -1662,6 +1842,17 @@ impl Session {
                         if let Some(ok) = ev.finished {
                             let _ = proxy.send_event(UserEvent::CommandFinished(id, ok));
                         }
+                        if let Some((title, body)) = ev.notify {
+                            let _ = proxy.send_event(UserEvent::Notify(id, title, body));
+                        }
+                        if let Some(p) = ev.progress {
+                            let _ = proxy.send_event(UserEvent::Progress(id, p));
+                        }
+                        if ev.clean_claude {
+                            // Ask Claude to redraw its own screen (Ctrl+L),
+                            // preserving its conversation and terminal state.
+                            let _ = proxy.send_event(UserEvent::PtyWrite(id, "\x0c".into()));
+                        }
                         let mut loop_gone = false;
                         for reply in ev.pty_replies {
                             if proxy.send_event(UserEvent::PtyWrite(id, reply)).is_err() {
@@ -1722,7 +1913,7 @@ impl Session {
     pub fn write(&mut self, bytes: &[u8]) {
         // Enter at a prompt starts a command: read it off the screen now,
         // before the shell reacts (Claude mode auto-enable needs the name)
-        if bytes.contains(&b'\r') {
+        if submits_a_command(bytes) {
             let t = self.term.lock().unwrap();
             let mut m = self.meta.lock().unwrap();
             capture_command_core(&t, &mut m);
@@ -1743,6 +1934,15 @@ impl Session {
         self.term.lock().unwrap().resize(size);
         self.meta.lock().unwrap().bidi_mut().on_resize();
     }
+}
+
+/// Does this write submit the line at the prompt? A carriage return does —
+/// unless it sits inside a bracketed paste, where the shell treats the whole
+/// payload as typed text and runs nothing: capturing there read whatever was
+/// on the prompt line as a "running command" (a spurious close-guard prompt,
+/// or a stale name feeding Claude-mode detection).
+pub(crate) fn submits_a_command(bytes: &[u8]) -> bool {
+    bytes.contains(&b'\r') && !bytes.starts_with(b"\x1b[200~")
 }
 
 /// Why a paste or a drop is held for the confirm card.
@@ -2148,6 +2348,19 @@ mod tests {
             needs_paste_guard("echo\r\x1b[2J").map(|g| g.risk),
             Some(PasteRisk::EnterAndControl)
         );
+    }
+
+    #[test]
+    fn a_bracketed_paste_does_not_count_as_submitting_a_command() {
+        assert!(submits_a_command(b"ls\r"));
+        assert!(submits_a_command(b"\r"));
+        assert!(!submits_a_command(b"abc"));
+        // the wrapped payload of normalize_paste(_, true) carries \r inside
+        let wrapped = normalize_paste("a\nb\n", true);
+        assert!(wrapped.contains('\r'));
+        assert!(!submits_a_command(wrapped.as_bytes()));
+        // an UNbracketed multi-line paste really does run lines: still a submit
+        assert!(submits_a_command(normalize_paste("a\nb\n", false).as_bytes()));
     }
 
     #[test]
@@ -2663,6 +2876,39 @@ mod tests {
         assert!(meta.running_cmd.is_empty());
     }
 
+    #[test]
+    fn command_capture_keeps_wrapped_claude_commands() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry,
+            b"PS C:\\a-very-long-directory> \x1b]133;B\x07");
+        let command = format!("claude --safe-mode {}", "x".repeat(90));
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, command.as_bytes());
+        capture_command_core(&t, &mut meta);
+        assert_eq!(meta.running_cmd, command);
+        assert!(crate::bidi::cmd_is_claude(&meta.running_cmd));
+    }
+
+    #[test]
+    fn interactive_claude_cleans_shell_prefix_once_after_new_header() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry,
+            b"Claude Code vOLD\r\n> \x1b]133;B\x07claude");
+        capture_command_core(&t, &mut meta);
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\r\n\x1b[?2004hloading");
+        assert!(!ev.clean_claude, "an old header must not trigger cleanup");
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\r\nClaude Co");
+        assert!(!ev.clean_claude);
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"de v2.1.311");
+        assert!(ev.clean_claude);
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\r\nClaude Code v2.1.311");
+        assert!(!ev.clean_claude, "cleanup must never loop on redraw");
+
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"> \x1b]133;B\x07claude --print hello");
+        capture_command_core(&t, &mut meta);
+        assert!(meta.clean_claude_after.is_none());
+    }
+
     /// The whole Claude-mode enabling chain, GUI-free: prompt mark, typed
     /// command captured off the screen, alternate screen entered — the two
     /// conditions claude_active() checks are both true.
@@ -2991,6 +3237,55 @@ mod tests {
     }
 
     #[test]
+    fn progress_reports_parse_every_state_and_the_last_one_wins() {
+        assert_eq!(parse_progress(b"1;42"),
+                   Some(Some(Progress { state: ProgressState::Normal, percent: 42 })));
+        assert_eq!(parse_progress(b"2;7"),
+                   Some(Some(Progress { state: ProgressState::Error, percent: 7 })));
+        assert_eq!(parse_progress(b"3"),
+                   Some(Some(Progress { state: ProgressState::Indeterminate, percent: 0 })));
+        assert_eq!(parse_progress(b"4;50"),
+                   Some(Some(Progress { state: ProgressState::Paused, percent: 50 })));
+        assert_eq!(parse_progress(b"0"), Some(None), "state 0 clears");
+        assert_eq!(parse_progress(b"1;250").unwrap().unwrap().percent, 100, "clamped");
+        assert_eq!(parse_progress(b"9;1"), None, "unknown state ignored");
+        assert_eq!(parse_progress(b"x"), None);
+        // a burst collapses to its final value, through the real chunk path
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry,
+                               b"\x1b]9;4;1;10\x07work\x1b]9;4;1;90\x07");
+        assert_eq!(ev.progress.unwrap().unwrap().percent, 90);
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]9;4;0;0\x07");
+        assert_eq!(ev.progress, Some(None));
+        // the cwd report shares the OSC 9 prefix and must not be mistaken
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]9;9;C:\\x\x07");
+        assert_eq!(ev.progress, None);
+        assert_eq!(ev.notify, None);
+    }
+
+    #[test]
+    fn notification_sequences_in_three_dialects() {
+        // iTerm2 / ConEmu message form
+        assert_eq!(scan_notify(b"\x1b]9;Build done\x07"),
+                   Some(("Bayan".into(), "Build done".into())));
+        // ConEmu subcommands are not messages
+        assert_eq!(scan_notify(b"\x1b]9;4;1;50\x07"), None);
+        assert_eq!(scan_notify(b"\x1b]9;9;C:\\Users\x07"), None);
+        // rxvt-unicode form (Ghostty/WezTerm), ESC-backslash terminated
+        assert_eq!(scan_notify(b"\x1b]777;notify;Claude;needs your approval\x1b\\"),
+                   Some(("Claude".into(), "needs your approval".into())));
+        // kitty form: title chunk and body chunk
+        assert_eq!(scan_notify(b"\x1b]99;i=1:p=title;Tests\x07"),
+                   Some(("Tests".into(), String::new())));
+        assert_eq!(scan_notify(b"\x1b]99;i=1:d=1;all green\x07"),
+                   Some(("Bayan".into(), "all green".into())));
+        // several in one read: the LAST one is what the user sees
+        assert_eq!(scan_notify(b"\x1b]9;first\x07 x \x1b]777;notify;T;second\x07"),
+                   Some(("T".into(), "second".into())));
+        assert_eq!(scan_notify(b"plain text"), None);
+    }
+
+    #[test]
     fn posh_config_parses_common_profile_lines() {
         assert_eq!(
             parse_posh_config(
@@ -3264,8 +3559,9 @@ mod tests {
         p: &mut Processor,
         meta: &mut SessionMeta,
         carry: &mut Vec<u8>,
+        expected_command: &str,
     ) {
-        assert!(meta.running_cmd.is_empty(), "the command text was not captured");
+        assert_eq!(meta.running_cmd, expected_command, "command capture must match this scenario");
         assert!(meta.cmd_pending, "Enter at the prompt must arm the nonce gate");
         let ev = process_chunk(p, t, meta, carry, &osc7_of("file:///C:/evil"));
         assert!(ev.cwd.is_none());
@@ -3294,7 +3590,7 @@ mod tests {
         let (mut t, mut p, mut meta, mut carry) = prompt_ready();
         assert_eq!(t.grid().cursor.point.column.0, meta.prompt_col.unwrap());
         capture_command_core(&t, &mut meta);
-        assert_pending_blocks_osc7(&mut t, &mut p, &mut meta, &mut carry);
+        assert_pending_blocks_osc7(&mut t, &mut p, &mut meta, &mut carry, "");
     }
 
     /// Home, then Enter. The cursor is at column 0, which is not past the
@@ -3305,7 +3601,7 @@ mod tests {
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[H");
         assert_eq!(t.grid().cursor.point.column.0, 0);
         capture_command_core(&t, &mut meta);
-        assert_pending_blocks_osc7(&mut t, &mut p, &mut meta, &mut carry);
+        assert_pending_blocks_osc7(&mut t, &mut p, &mut meta, &mut carry, "");
     }
 
     /// The command wrapped onto the next line. The cursor column is back
@@ -3328,7 +3624,7 @@ mod tests {
             t.grid().cursor.point
         );
         capture_command_core(&t, &mut meta);
-        assert_pending_blocks_osc7(&mut t, &mut p, &mut meta, &mut carry);
+        assert_pending_blocks_osc7(&mut t, &mut p, &mut meta, &mut carry, &line);
     }
 
     #[test]

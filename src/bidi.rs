@@ -102,12 +102,10 @@ fn unbidi_indexed(chars: &[char]) -> (Vec<char>, Vec<usize>) {
             let mut j = i;
             while j < n {
                 let cj = rev[j];
-                if is_ltr_char(cj) {
-                    j += 1;
-                } else if (LTR_PUNCT.contains(&cj) || cj == ' ')
+                let joins_island = (LTR_PUNCT.contains(&cj) || cj == ' ')
                     && j + 1 < n
-                    && is_ltr_char(rev[j + 1])
-                {
+                    && is_ltr_char(rev[j + 1]);
+                if is_ltr_char(cj) || joins_island {
                     j += 1;
                 } else {
                     break;
@@ -185,6 +183,64 @@ pub fn restore_bidi_line(text: &str) -> Option<String> {
     restore_bidi_map(text).map(|(s, _)| s)
 }
 
+/// The same restoration with source-character identity retained, so repeated
+/// letters and combining marks can still map back to terminal cells.
+pub fn restore_bidi_line_with_order(text: &str) -> Option<(String, Vec<usize>)> {
+    let chars: Vec<char> = text.chars().collect();
+    if !chars.iter().copied().any(is_arabic_letter) { return None; }
+    let reverse = |indices: &[usize]| {
+        let mut clusters: Vec<Vec<usize>> = Vec::new();
+        for &i in indices {
+            if is_combining(chars[i]) && !clusters.is_empty() {
+                clusters.last_mut().unwrap().push(i);
+            } else {
+                clusters.push(vec![i]);
+            }
+        }
+        clusters.into_iter().rev().flatten().collect::<Vec<_>>()
+    };
+    let indices: Vec<usize> = (0..chars.len()).collect();
+    let mut order = Vec::with_capacity(chars.len());
+    if line_is_rtl_visual(text) {
+        let rev = reverse(&indices);
+        let mut i = 0;
+        while i < rev.len() {
+            if is_ltr_char(chars[rev[i]]) {
+                let mut j = i;
+                while j < rev.len() {
+                    let c = chars[rev[j]];
+                    let joins = (LTR_PUNCT.contains(&c) || c == ' ')
+                        && j + 1 < rev.len() && is_ltr_char(chars[rev[j + 1]]);
+                    if !is_ltr_char(c) && !joins { break; }
+                    j += 1;
+                }
+                order.extend(reverse(&rev[i..j]));
+                i = j;
+            } else {
+                order.push(rev[i]);
+                i += 1;
+            }
+        }
+    } else {
+        let mut i = 0;
+        while i < chars.len() {
+            if is_arabic_letter(chars[i]) {
+                let mut j = i;
+                while j < chars.len() && (is_arabic_letter(chars[j]) || is_combining(chars[j])
+                    || (chars[j] == ' ' && j + 1 < chars.len() && is_arabic_letter(chars[j + 1]))) {
+                    j += 1;
+                }
+                order.extend(reverse(&indices[i..j]));
+                i = j;
+            } else {
+                order.push(i);
+                i += 1;
+            }
+        }
+    }
+    Some((order.iter().map(|&i| chars[i]).collect(), order))
+}
+
 /// A whole copied block (selection in Claude mode): restore each line, so
 /// pasted text is logical-order Arabic, not Claude's visual order.
 pub fn restore_block(text: &str) -> String {
@@ -231,6 +287,19 @@ pub fn cmd_is_claude(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restoration_keeps_a_permutation_for_repeated_letters_and_marks() {
+        for text in ["ابحرم", "ملس ملس", "مَّلَس", "quoted ملس then ملس", "txt.1 رابتخا 123"] {
+            let (restored, order) = restore_bidi_line_with_order(text).unwrap();
+            assert_eq!(Some(restored.clone()), restore_bidi_line(text));
+            let chars: Vec<_> = text.chars().collect();
+            assert_eq!(order.iter().map(|&i| chars[i]).collect::<String>(), restored);
+            let mut indices = order;
+            indices.sort_unstable();
+            assert_eq!(indices, (0..chars.len()).collect::<Vec<_>>());
+        }
+    }
 
     #[test]
     fn pure_arabic_round_trips() {
@@ -285,6 +354,47 @@ mod tests {
             restore_block(block),
             "مرحبا\nplain english\nWhat are you working on مساعدتك؟"
         );
+    }
+
+    /// `tests/fixtures/bidi_cases.json` is published as a language-agnostic
+    /// corpus (shared with other terminals) and was generated FROM this
+    /// module. Nothing re-checked it after that: a change here would leave
+    /// the corpus quietly wrong. Every pair must still round-trip.
+    #[test]
+    fn the_published_fixture_corpus_still_round_trips() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bidi_cases.json");
+        let text = std::fs::read_to_string(path).expect("fixture corpus present");
+        let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        let cases = v["cases"].as_array().expect("cases array");
+        assert!(cases.len() >= 6, "corpus shrank to {} cases", cases.len());
+        for c in cases {
+            let name = c["name"].as_str().unwrap_or("?");
+            let logical = c["logical"].as_str().expect("logical");
+            let visual = c["visual"].as_str().expect("visual");
+            let got = restore_bidi_line(visual).unwrap_or_else(|| visual.to_string());
+            assert_eq!(got, logical, "fixture {name}: visual -> logical drifted");
+            let mapped = restore_bidi_line_with_order(visual).map(|r| r.0)
+                .unwrap_or_else(|| visual.to_string());
+            assert_eq!(mapped, logical, "fixture {name}: mapped restoration drifted");
+            // the codepoint listings must describe the strings they sit beside
+            let cps = |s: &str| {
+                s.chars().map(|ch| format!("{:04X}", ch as u32)).collect::<Vec<_>>().join(" ")
+            };
+            assert_eq!(cps(logical), c["logical_codepoints"].as_str().unwrap_or(""), "{name}");
+            assert_eq!(cps(visual), c["visual_codepoints"].as_str().unwrap_or(""), "{name}");
+        }
+        let ml = &v["multiline_case"];
+        assert_eq!(
+            restore_block(ml["visual_block"].as_str().unwrap()),
+            ml["logical_block"].as_str().unwrap()
+        );
+        let pg = &v["program_gating"];
+        for m in pg["matches"].as_array().unwrap() {
+            assert!(cmd_is_claude(m.as_str().unwrap()), "should match: {m}");
+        }
+        for m in pg["does_not_match"].as_array().unwrap() {
+            assert!(!cmd_is_claude(m.as_str().unwrap()), "should not match: {m}");
+        }
     }
 
     #[test]

@@ -131,11 +131,60 @@ pub fn preview(theme: &str) -> Option<Vec<u8>> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let out = cmd.output().ok()?;
+    let out = run_with_timeout(cmd, PREVIEW_TIMEOUT)?;
     if !out.status.success() || out.stdout.is_empty() {
         return None;
     }
     Some(out.stdout)
+}
+
+/// A preview that takes longer than this is not worth freezing the window
+/// for: the picker shows the name alone instead (the same as "no binary").
+const PREVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// `Command::output()` with a deadline. std has no wait-with-timeout, so poll
+/// `try_wait` and kill on expiry; the previews ran on the UI thread with no
+/// bound at all, so one stuck `oh-my-posh` (a broken theme, a slow shell
+/// plugin it shells out to) hung Bayan for good.
+fn run_with_timeout(
+    mut cmd: std::process::Command,
+    limit: std::time::Duration,
+) -> Option<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // previews and tests never open a console
+    }
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // drain stdout on its own thread so a chatty child never blocks on a
+    // full pipe while we wait on it
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let t0 = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if t0.elapsed() < limit => std::thread::sleep(std::time::Duration::from_millis(15)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let stdout = reader.join().ok()?;
+    Some(std::process::Output { status, stdout, stderr: Vec::new() })
 }
 
 #[cfg(test)]
@@ -191,6 +240,24 @@ mod tests {
         assert_eq!(&out[3..], &["aaa".to_string(), "zzz".to_string()]);
         // a featured name that is not installed must not appear
         assert!(!out.contains(&"paradox".to_string()));
+    }
+
+    /// A sleeping child must time out even when the network is unavailable.
+    #[test]
+    fn a_hung_preview_is_killed_at_the_deadline() {
+        let mut slow = std::process::Command::new("powershell.exe");
+        slow.args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"]);
+        let t0 = std::time::Instant::now();
+        let out = run_with_timeout(slow, std::time::Duration::from_millis(400));
+        assert!(out.is_none(), "a hung child must yield None");
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(400));
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "took {:?}", t0.elapsed());
+        // and a quick child still returns its output
+        let mut quick = std::process::Command::new("cmd");
+        quick.args(["/c", "echo", "hi"]);
+        let out = run_with_timeout(quick, std::time::Duration::from_secs(5)).expect("output");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
     }
 
     #[test]
