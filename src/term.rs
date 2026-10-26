@@ -1406,15 +1406,24 @@ fn process_bytes<T: EventListener>(
         if first < 0 {
             meta.clean_claude_after = None; // startup already scrolled out of view
         } else if t.mode().contains(TermMode::BRACKETED_PASTE) {
+            let mut has_input = false;
+            let mut has_rule = false;
+            let mut has_banner = false;
             for line in first as i32..t.screen_lines() as i32 {
                 let row = &t.grid()[alacritty_terminal::index::Line(line)];
                 let text: String = (0..t.columns()).map(|c| row[Column(c)].c).collect();
-                if text.contains("Claude Code v") {
-                    meta.clean_claude_after = None;
-                    meta.claude_from_abs = Some(meta.evicted + t.grid().history_size() as u64);
-                    ev.clean_claude = true;
-                    break;
-                }
+                has_banner |= text.contains("Claude Code v");
+                // --resume may paint the transcript and input directly,
+                // without the startup version banner. Require its frame
+                // as well as bracketed paste, and only inspect new rows.
+                let trimmed = text.trim_start();
+                has_input |= trimmed.starts_with(">\u{a0}") || trimmed.starts_with("❯\u{a0}");
+                has_rule |= trimmed.starts_with("────────");
+            }
+            if has_banner || (has_input && has_rule) {
+                meta.clean_claude_after = None;
+                meta.claude_from_abs = Some(meta.evicted + t.grid().history_size() as u64);
+                ev.clean_claude = true;
             }
         }
     }
@@ -2907,6 +2916,19 @@ mod tests {
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"> \x1b]133;B\x07claude --print hello");
         capture_command_core(&t, &mut meta);
         assert!(meta.clean_claude_after.is_none());
+    }
+
+    #[test]
+    fn resumed_claude_cleans_shell_prefix_without_a_startup_header() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry,
+            b"PS> \x1b]133;B\x07claude --resume test-session");
+        capture_command_core(&t, &mut meta);
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry,
+            "\r\n\x1b[?2004hResumed conversation\r\n──────────\r\n>\u{a0}".as_bytes());
+        assert!(ev.clean_claude, "a resumed input frame must not require a version banner");
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b" redraw");
+        assert!(!ev.clean_claude, "redraw is requested only once");
     }
 
     /// The whole Claude-mode enabling chain, GUI-free: prompt mark, typed

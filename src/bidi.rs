@@ -75,14 +75,22 @@ fn rev_clusters(s: &str) -> String {
 /// Is the line predominantly Arabic (so Claude reversed the whole line)?
 pub fn line_is_rtl_visual(text: &str) -> bool {
     let (mut ar, mut lt) = (0usize, 0usize);
+    let (mut first_arabic, mut last_arabic) = (None, None);
     for ch in text.chars() {
         if is_arabic_letter(ch) {
             ar += 1;
+            first_arabic.get_or_insert(true);
+            last_arabic = Some(true);
         } else if is_ltr_char(ch) && ch.is_alphabetic() {
             lt += 1;
+            first_arabic.get_or_insert(false);
+            last_arabic = Some(false);
         }
     }
-    ar > 0 && ar >= lt
+    // A Latin island cannot change an Arabic paragraph into an English
+    // paragraph merely by growing. Arabic at both strong-text edges
+    // establishes the base even when the island contains most letters.
+    (first_arabic == Some(true) && last_arabic == Some(true)) || (ar > 0 && ar >= lt)
 }
 
 /// Reverse L2 for an RTL-base line: reverse the whole line, then re-reverse
@@ -435,5 +443,14 @@ mod tests {
         assert!(!cmd_is_claude("git log claude"));
         assert!(!cmd_is_claude(""));
         assert!(!cmd_is_claude("htop"));
+    }
+
+    #[test]
+    fn arabic_base_survives_a_long_latin_island() {
+        let visual = "ملاع Windows Terminal 123 ابحرم";
+        assert_eq!(restore_bidi_line(visual).as_deref(), Some("مرحبا Windows Terminal 123 عالم"));
+        assert_eq!(restore_bidi_line_with_order(visual).unwrap().0,
+            "مرحبا Windows Terminal 123 عالم");
+        assert!(!line_is_rtl_visual("Hello ابحرم Windows Terminal"));
     }
 }
