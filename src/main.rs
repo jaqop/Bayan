@@ -301,6 +301,7 @@ use winit::window::{ResizeDirection, Window, WindowId};
 use term::{Session, TermSize};
 
 pub enum UserEvent {
+    ShellProfiles(Vec<shells::Shell>),
     /// New PTY output was parsed in tab `id`: repaint (and busy-dot it).
     Wakeup(u64),
     /// Tab `id`'s emulator answers its child (DSR/DA replies TUIs block on).
@@ -571,17 +572,41 @@ struct SearchState {
 /// One row of the command palette. Built-ins run through `perform_action`,
 /// the same path a keybinding takes, so the palette can never drift from
 /// what the shortcuts do.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum PaletteRow {
     Builtin(keybinds::Action),
     /// index into `plugins::registry().actions`
     Plugin(usize),
+    Shell(String),
+    CopyText(String),
+    InsertCommand(&'static str),
+}
+
+fn palette_extras(profiles: &[shells::Shell], links: &[link::LinkSpan]) -> Vec<(PaletteRow, String)> {
+    let mut rows: Vec<_> = profiles.iter().map(|shell| (
+        PaletteRow::Shell(shell.command.clone()), format!("تبويب جديد — {}", shell.name)
+    )).collect();
+    rows.push((PaletteRow::InsertCommand("claude"), "إدراج أمر كلاود — claude".into()));
+    rows.push((PaletteRow::InsertCommand("claude --continue"), "متابعة محادثة كلاود — claude --continue".into()));
+    let mut seen = std::collections::HashSet::new();
+    for span in links {
+        let text = match &span.kind {
+            link::LinkKind::Osc { uri } | link::LinkKind::Url { uri } => uri,
+            link::LinkKind::File { path, .. } => path,
+        };
+        if text.is_empty() || !seen.insert(text.clone()) { continue; }
+        let shown = link::fit_status_bar(&span.tooltip(None), 90).text();
+        rows.push((PaletteRow::CopyText(text.clone()), format!("نسخ — {shown}")));
+        if seen.len() >= 100 { break; }
+    }
+    rows
 }
 
 /// Ctrl+Shift+P: type to filter, arrows to move, Enter to run.
 struct Palette {
     query: String,
     sel: usize,
+    extras: Vec<(PaletteRow, String)>,
 }
 
 /// A frame's snapshot of the picker: (names, previews, selected row).
@@ -603,6 +628,7 @@ struct App {
     mru: mru::Mru,
     /// the command palette, when open
     palette: Option<Palette>,
+    shell_profiles: Vec<shells::Shell>,
     /// last click on the empty title strip — powers double-click-to-maximise
     last_strip_click: Option<std::time::Instant>,
     proxy: EventLoopProxy<UserEvent>,
@@ -982,6 +1008,17 @@ impl App {
         self.request_redraw();
     }
 
+    fn open_palette(&mut self, query: String) {
+        let links = self.session().map(|session| {
+            let t = session.term.lock().unwrap();
+            (0..t.screen_lines()).flat_map(|row| link::links_on_row(&t, row))
+                .take(500).collect::<Vec<_>>()
+        }).unwrap_or_default();
+        let extras = palette_extras(&self.shell_profiles, &links);
+        self.palette = Some(Palette { query, sel: 0, extras });
+        self.request_redraw();
+    }
+
     /// The palette owns the keyboard while open: type to filter, arrows to
     /// move, Enter to run, Esc to dismiss.
     fn palette_input(&mut self, event: &KeyEvent, el: &ActiveEventLoop) {
@@ -1042,6 +1079,9 @@ impl App {
                 rows.push((PaletteRow::Plugin(i), act.label.clone()));
             }
         }
+        if let Some(palette) = &self.palette {
+            rows.extend(palette.extras.iter().filter(|(_, label)| hit(label)).cloned());
+        }
         rows
     }
 
@@ -1050,6 +1090,21 @@ impl App {
         match row {
             // the SAME dispatch a keybinding uses, not a parallel copy
             PaletteRow::Builtin(a) => self.perform_action(a, el),
+            PaletteRow::Shell(command) => {
+                let cwd = self.session().and_then(|s| s.meta.lock().unwrap().spawn_cwd());
+                let before = self.tabs.len();
+                self.spawn_tab_command(cwd, &command);
+                if self.tabs.len() == before && self.blocked_link.is_none() {
+                    self.blocked_link = Some(BlockedLink { reason: "تعذر تشغيل الطرفية".into(),
+                        shown: link::preview(&command, 240), confirm_uri: None });
+                }
+                self.update_title();
+            }
+            PaletteRow::CopyText(text) => self.set_clipboard(text),
+            PaletteRow::InsertCommand(text) => {
+                self.pending_paste = Some(PendingPaste { text: text.into(), lines: 1,
+                    chars: text.chars().count(), reason: "إدراج أمر من لوحة الأوامر".into() });
+            }
             PaletteRow::Plugin(i) => {
                 if let Some(act) = plugins::registry().actions.get(i) {
                     let text = act.send.clone();
@@ -1509,6 +1564,10 @@ impl App {
     }
 
     fn spawn_pane(&mut self, cwd: Option<&str>) -> Option<Pane> {
+        self.spawn_pane_command(cwd, &self.config.shell_program())
+    }
+
+    fn spawn_pane_command(&mut self, cwd: Option<&str>, command: &str) -> Option<Pane> {
         let id = self.next_id;
         self.next_id += 1;
         match Session::spawn(
@@ -1517,7 +1576,7 @@ impl App {
             id,
             cwd,
             self.config.scrollback_lines(),
-            &self.config.shell_program(),
+            command,
             self.config.kitty_protocol_on(),
         ) {
             Ok(session) => Some(Pane { id, session, last_output: None, progress: None }),
@@ -1529,6 +1588,10 @@ impl App {
     }
 
     fn spawn_tab(&mut self, cwd: Option<String>) {
+        self.spawn_tab_command(cwd, &self.config.shell_program());
+    }
+
+    fn spawn_tab_command(&mut self, cwd: Option<String>, command: &str) {
         // Same gate as spawn: a restored UNC path must not become the tab
         // title either. accept_local_cwd does not touch the filesystem.
         let cwd = cwd.and_then(|c| term::accept_local_cwd(&c));
@@ -1536,7 +1599,7 @@ impl App {
             .as_deref()
             .and_then(|c| c.rsplit(['\\', '/']).next().map(str::to_string))
             .unwrap_or_else(|| "بيان".to_string());
-        if let Some(pane) = self.spawn_pane(cwd.as_deref()) {
+        if let Some(pane) = self.spawn_pane_command(cwd.as_deref(), command) {
             // this becomes the active tab without switch_tab, so a button
             // held on the previous tab has to go up first
             self.abandon_mouse();
@@ -3135,10 +3198,7 @@ impl ApplicationHandler<UserEvent> for App {
         // captured without injecting keystrokes (the debug-hook rule)
         if let Some(v) = std::env::var_os("BAYAN_PALETTE") {
             let q = v.to_str().unwrap_or("").to_string();
-            self.palette = Some(Palette {
-                query: if q == "1" { String::new() } else { q },
-                sel: 0,
-            });
+            self.open_palette(if q == "1" { String::new() } else { q });
         }
         // BAYAN_TOAST=<title|1>: fire a sample toast at startup (M19
         // verification; a custom value becomes the title, so direction
@@ -3184,6 +3244,16 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
         match event {
+            UserEvent::ShellProfiles(profiles) => {
+                if let Some(palette) = self.palette.as_mut() {
+                    palette.extras.retain(|(row, _)| !matches!(row, PaletteRow::Shell(_)));
+                    palette.extras.extend(profiles.iter().map(|shell| (
+                        PaletteRow::Shell(shell.command.clone()), format!("تبويب جديد — {}", shell.name)
+                    )));
+                }
+                self.shell_profiles = profiles;
+                self.request_redraw();
+            }
             UserEvent::Wakeup(id) => {
                 self.link_cache.invalidate_pane(id);
                 // The row that was hovered may have moved. Drop the tooltip
@@ -3957,7 +4027,7 @@ impl ApplicationHandler<UserEvent> for App {
                     && event.physical_key == winit::keyboard::PhysicalKey::Code(
                         winit::keyboard::KeyCode::KeyP)
                 {
-                    self.palette = Some(Palette { query: String::new(), sel: 0 });
+                    self.open_palette(String::new());
                     self.request_redraw();
                     return;
                 }
@@ -4154,6 +4224,10 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Wait);
     prof::mark("event loop built");
     let proxy = event_loop.create_proxy();
+    let profiles_proxy = proxy.clone();
+    std::thread::spawn(move || {
+        let _ = profiles_proxy.send_event(UserEvent::ShellProfiles(shells::detect()));
+    });
     let cfg = config::load();
     // plugins load once, before the first renderer, so a plugin theme named in
     // the config resolves on the very first frame
@@ -4170,6 +4244,7 @@ fn main() {
         posh: None,
         mru: mru::Mru::new(),
         palette: None,
+        shell_profiles: Vec::new(),
         last_strip_click: None,
         proxy,
         window: None,
@@ -4232,6 +4307,31 @@ fn osc52_pane_is_focused(tabs: &[(usize, &[u64])], active: usize, source: u64) -
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn palette_profiles_and_copy_targets_keep_exact_payloads() {
+        let shells = vec![shells::Shell { name: "طرفية تجريبية".into(), command: "cmd.exe".into() }];
+        let spans = vec![link::LinkSpan { start_col: 2, end_col: 20,
+            kind: link::LinkKind::Url { uri: "https://example.org/ملف".into() } }];
+        let rows = palette_extras(&shells, &spans);
+        assert!(rows.iter().any(|(r, label)| matches!(r, PaletteRow::Shell(cmd) if cmd == "cmd.exe")
+            && label.contains("طرفية تجريبية")));
+        assert!(rows.iter().any(|(r, _)| matches!(r, PaletteRow::CopyText(text) if text == "https://example.org/ملف")));
+    }
+
+    #[test]
+    fn palette_copy_list_is_bounded_deduplicated_and_has_safe_labels() {
+        let span = link::LinkSpan { start_col: 0, end_col: 9,
+            kind: link::LinkKind::Osc { uri: "https://example.org/\u{202e}x".into() } };
+        let rows = palette_extras(&[], &vec![span; 200]);
+        let copies: Vec<_> = rows.iter().filter(|(r, _)| matches!(r, PaletteRow::CopyText(_))).collect();
+        assert_eq!(copies.len(), 1);
+        assert!(!copies[0].1.contains('\u{202e}'));
+        let spans: Vec<_> = (0..200).map(|n| link::LinkSpan { start_col: 0, end_col: 9,
+            kind: link::LinkKind::File { path: format!("file{n}.rs"), line: 0, col: None } }).collect();
+        let rows = palette_extras(&[], &spans);
+        assert_eq!(rows.iter().filter(|(r, _)| matches!(r, PaletteRow::CopyText(_))).count(), 100);
+    }
 
     #[test]
     fn dismissing_guard_consumes_its_release_even_after_the_modal_is_gone() {

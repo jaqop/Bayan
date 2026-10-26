@@ -560,6 +560,20 @@ preceding shell text while retaining the conversation. Wrapped launch commands
 are detected. Arabic fields, selections and Claude's inverse-video cursor share
 the shaped source-cell map; earlier shell scrollback retains its own text order.
 
+Press **Ctrl+Shift+P** to open the command palette:
+
+- Search `تبويب جديد` or a shell name to open that installed shell in a new tab
+  without changing the default shell or interrupting the current tab.
+- Search `claude` to insert a start or continue command. Confirm the paste card
+  to insert it, then press Enter to run it.
+- Search `نسخ` to copy a visible link or file path with the keyboard. The list
+  is a snapshot of the active pane, deduplicated and limited to 100 targets.
+  Selecting a copy entry only writes the clipboard; it does not open the link.
+
+Custom palette commands remain available through declarative plugins in
+`~/.bayan/plugins/`. For example, a JSON plugin can provide
+`{"name":"My commands","actions":[{"label":"Claude Code","send":"claude"}]}`.
+
 ```
 cargo run --release
 ```
