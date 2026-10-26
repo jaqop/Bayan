@@ -8,6 +8,9 @@
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct UserConfig {
+    /// Restore saved tabs and panes on launch. Default off: start one fresh tab.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore_tabs: Option<bool>,
     /// Named built-in theme (set by the in-app settings). Explicit
     /// bg/fg/palette below still override it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16,7 +19,7 @@ pub struct UserConfig {
     /// Nerd-Font-first candidate list when absent or not found.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_family: Option<String>,
-    /// Base font size in points (default 15).
+    /// Base font size in points (default 18).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_size: Option<f32>,
     /// Background / foreground as "#rrggbb" (EasyTer's heritage defaults).

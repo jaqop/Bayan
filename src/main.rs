@@ -49,6 +49,28 @@ enum CloseTarget {
     Window,
 }
 
+/// Return true when the window may close; otherwise retain a confirmation.
+fn prepare_window_close(pending: &mut Option<CloseTarget>, confirm: bool, running: usize) -> bool {
+    if matches!(pending, Some(CloseTarget::Window)) {
+        return false;
+    }
+    if confirm && running > 0 {
+        *pending = Some(CloseTarget::Window);
+        return false;
+    }
+    *pending = None;
+    true
+}
+
+fn consume_guard_release(pending: &mut bool, state: ElementState, button: MouseButton) -> bool {
+    if *pending && state == ElementState::Released && button == MouseButton::Left {
+        *pending = false;
+        true
+    } else {
+        false
+    }
+}
+
 /// The system notification sound (bell mode "sound"). Async — never blocks
 /// the UI thread.
 fn beep() {
@@ -563,6 +585,7 @@ struct App {
     pending_paste: Option<String>,
     /// a close awaiting Enter/Esc (a command is still running)
     pending_close: Option<CloseTarget>,
+    swallow_guard_release: bool,
     /// last keystroke sent to a PTY — the cursor blinks for 15s after it,
     /// then parks solid so an idle window stops re-rendering (M14's win)
     last_input: Instant,
@@ -627,7 +650,7 @@ impl App {
     /// Index of the active theme in the gallery order (built-ins, then
     /// plugin themes) — the index the panel highlights and apply_theme takes.
     fn active_theme(&self) -> usize {
-        let Some(name) = self.config.theme.as_deref() else { return 0 };
+        let name = self.config.theme.as_deref().unwrap_or(render::DEFAULT_THEME);
         if let Some(i) = render::THEMES.iter().position(|t| t.name == name) {
             return i;
         }
@@ -660,7 +683,7 @@ impl App {
     }
 
     fn change_font_size(&mut self, delta: i32) {
-        let s = (self.config.font_size.unwrap_or(15.0) + delta as f32).clamp(8.0, 40.0);
+        let s = (self.config.font_size.unwrap_or(render::DEFAULT_FONT_SIZE) + delta as f32).clamp(8.0, 40.0);
         self.config.font_size = Some(s);
         self.rebuild_renderer();
         self.request_redraw();
@@ -782,6 +805,16 @@ impl App {
         el.exit();
     }
 
+    fn resolve_close(&mut self, confirm: bool, el: &ActiveEventLoop) {
+        if let Some(target) = self.pending_close.take().filter(|_| confirm) {
+            match target {
+                CloseTarget::Pane(ti, pi) => self.remove_pane(ti, pi, el),
+                CloseTarget::Window => self.quit(el),
+            }
+        }
+        self.request_redraw();
+    }
+
     fn apply_opacity(&self) {
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let Some(w) = &self.window else { return };
@@ -802,6 +835,25 @@ impl App {
                 SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED as isize);
                 SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
             }
+        }
+    }
+
+    fn apply_window_frame(&self) {
+        let Some(hwnd) = self.hwnd() else { return };
+        use windows_sys::Win32::Graphics::Dwm::{
+            DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE,
+            DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+        };
+        let dark = 1i32;
+        let corner = DWMWCP_ROUND;
+        // Windows 10 ignores unsupported corner preferences; the native
+        // resize frame and shadow remain available there.
+        unsafe {
+            DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+                (&dark as *const i32).cast(), std::mem::size_of_val(&dark) as u32);
+            DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+                (&corner as *const i32).cast(),
+                std::mem::size_of_val(&corner) as u32);
         }
     }
 
@@ -1536,6 +1588,11 @@ impl App {
         if pi >= t.panes.len() {
             return;
         }
+        // Pane indices can shift when a background shell exits. Dismiss an
+        // index-based confirmation rather than letting it target a neighbour.
+        if matches!(self.pending_close, Some(CloseTarget::Pane(..))) {
+            self.pending_close = None;
+        }
         let mut pane = t.panes.remove(pi);
         if pi < t.weights.len() {
             t.weights.remove(pi);
@@ -1637,6 +1694,10 @@ impl App {
     }
 
     fn restore_state(&mut self) {
+        if !self.config.restore_tabs.unwrap_or(false) {
+            self.spawn_tab(None);
+            return;
+        }
         let saved = load_saved_state();
         match saved {
             Some(state) if !state.tabs.is_empty() => {
@@ -1689,9 +1750,6 @@ impl App {
         let Some(s) = self.session() else {
             return false;
         };
-        if !self.term_mode().contains(TermMode::ALT_SCREEN) {
-            return false;
-        }
         bidi::cmd_is_claude(&s.meta.lock().unwrap().running_cmd)
     }
 
@@ -1714,6 +1772,9 @@ impl App {
         let colf = lx / r.cell_w as f64;
         let col = (colf.floor().max(0.0) as usize).min(max_col);
         let row = ((ly / r.cell_h as f64).floor().max(0.0) as usize).min(max_row);
+        if let Some((col, side)) = r.hit_cell(*rect, row, pos.x) {
+            return Some((pi, row, col.min(max_col), side));
+        }
         let side = if colf - col as f64 <= 0.5 { Side::Left } else { Side::Right };
         Some((pi, row, col, side))
     }
@@ -1770,7 +1831,8 @@ impl App {
             return false;
         }
         let pw = w.inner_size().width as usize;
-        if r.settings_button_hit(pw, pos.x, pos.y) {
+        if r.settings_button_hit(pw, pos.x, pos.y)
+            || r.tab_control_hit(pw, pos.x, pos.y).is_some() {
             return false;
         }
         self.tab_at(pos).is_none()
@@ -1784,13 +1846,12 @@ impl App {
         }
         // widths vary per title now, so walk them; the same tab_width the
         // renderer uses, or a click would land on the neighbour
-        let mut x = 0i32;
-        for (i, t) in self.tabs.iter().enumerate() {
-            let w = r.tab_width(&t.title);
+        let width = self.window.as_ref()?.inner_size().width as usize;
+        let titles: Vec<_> = self.tabs.iter().map(|t| t.title.as_str()).collect();
+        for (i, x, w) in r.tab_rects(width, &titles, self.active) {
             if pos.x >= x as f64 && pos.x < (x + w) as f64 {
                 return Some(i);
             }
-            x += w;
         }
         None
     }
@@ -2020,7 +2081,7 @@ impl App {
         };
         let settings_open = self.settings.is_some();
         let settings_theme = self.active_theme();
-        let settings_size = self.config.font_size.unwrap_or(15.0) as i32;
+        let settings_size = self.config.font_size.unwrap_or(render::DEFAULT_FONT_SIZE) as i32;
         // the family ACTUALLY in use (post-fallback), not the config wish
         let settings_family = self
             .renderer
@@ -2082,6 +2143,7 @@ impl App {
         let mut verts: Vec<gpu::Vertex> = Vec::new();
         match (self.renderer.as_mut(), self.tabs.get(self.active)) {
             (Some(renderer), Some(tab)) if !rects.is_empty() => {
+                renderer.begin_frame();
                 let bordered = tab.panes.len() > 1;
                 let (auto_follow, claude_manual) = (self.auto_follow, self.claude_manual);
                 let mut focused_claude = false;
@@ -2106,8 +2168,7 @@ impl App {
                     let claude_pane = if !auto_follow {
                         claude_manual
                     } else {
-                        t.mode().contains(TermMode::ALT_SCREEN)
-                            && bidi::cmd_is_claude(&running_cmd)
+                        bidi::cmd_is_claude(&running_cmd)
                     };
                     if focused {
                         focused_claude = claude_pane;
@@ -2133,6 +2194,7 @@ impl App {
                     };
                     renderer.draw_pane(&mut verts, &view, &t);
                 }
+                renderer.use_ui_metrics(true);
                 renderer.draw_chrome(
                     &mut verts,
                     px.width as usize,
@@ -2197,14 +2259,6 @@ impl App {
                         flash.as_deref(),
                     );
                 }
-                if let Some(msg) = &close_msg {
-                    renderer.draw_close_guard(
-                        &mut verts,
-                        px.width as usize,
-                        px.height as usize,
-                        msg,
-                    );
-                }
                 if let Some((q, rows, sel)) = &palette_view {
                     renderer.draw_palette(
                         &mut verts,
@@ -2225,6 +2279,15 @@ impl App {
                         *sel,
                     );
                 }
+                if let Some(msg) = &close_msg {
+                    renderer.draw_close_guard(
+                        &mut verts,
+                        px.width as usize,
+                        px.height as usize,
+                        msg,
+                    );
+                }
+                renderer.use_ui_metrics(false);
             }
             // renderer still warming up on its thread: clear-only dark frame
             _ => {}
@@ -2298,11 +2361,13 @@ impl ApplicationHandler<UserEvent> for App {
         // and generated from assets/bayan.ico so the two can't drift apart.
         const ICON_RGBA: &[u8] = include_bytes!("../assets/icon_64.rgba");
         let icon = winit::window::Icon::from_rgba(ICON_RGBA.to_vec(), 64, 64).ok();
+        use winit::platform::windows::WindowAttributesExtWindows;
         let mut attrs = Window::default_attributes()
             // M24: no OS title bar. The tab strip IS the title bar, so the
             // window carries one row of chrome instead of two. We draw the
             // caption buttons and handle drag/resize ourselves below.
             .with_decorations(false)
+            .with_undecorated_shadow(true)
             .with_title("Bayan — بيان")
             .with_window_icon(icon)
             .with_visible(visible)
@@ -2333,6 +2398,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.gpu = Some(gpu);
         self.window = Some(window.clone());
         self.apply_opacity(); // the configured window alpha, from frame one
+        self.apply_window_frame();
         if let Some(h) = self.hwnd() {
             // the tray icon: toast anchor + summon target
             if !toast::init(h) {
@@ -2345,7 +2411,7 @@ impl ApplicationHandler<UserEvent> for App {
         // the PTY + conhost + PowerShell chain is the slowest dependency:
         // start it immediately with a default grid; the exact grid follows
         // once cell metrics exist (EasyTer starts 110x32 the same way).
-        // Restores yesterday's tabs (each in its saved cwd) or opens one.
+        // Start one fresh tab unless saved-tab restoration is explicitly enabled.
         self.restore_state();
         // debug hook: BAYAN_SPLIT=1 opens the first tab pre-split, so the
         // pane machinery can be verified without injecting any input
@@ -2356,8 +2422,12 @@ impl ApplicationHandler<UserEvent> for App {
             self.cockpit = true;
             self.cockpit_sel = self.active;
         }
-        if std::env::var_os("BAYAN_GUARD").is_some() {
-            self.pending_paste = Some("echo one\necho two\necho three\n".into());
+        if let Some(guard) = std::env::var_os("BAYAN_GUARD") {
+            if guard == "close" {
+                self.pending_close = Some(CloseTarget::Window);
+            } else {
+                self.pending_paste = Some("echo one\necho two\necho three\n".into());
+            }
         }
         if std::env::var_os("BAYAN_SETTINGS").is_some() {
             self.settings = Some(0);
@@ -2620,14 +2690,48 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if let WindowEvent::MouseInput { state, button, .. } = &event {
+            if consume_guard_release(&mut self.swallow_guard_release, *state, *button) {
+                return;
+            }
+        }
+        if self.pending_close.is_some() {
+            // A modal owns pointer input too: no tab changes, selections,
+            // dropped commands or wheel reports may reach the terminal below.
+            match &event {
+                WindowEvent::CursorMoved { position, .. } => {
+                    self.cursor_pos = *position;
+                    self.mouse_left_down = false;
+                    self.drag_divider = None;
+                    if let Some(w) = &self.window {
+                        w.set_cursor(winit::window::CursorIcon::Default);
+                    }
+                    return;
+                }
+                WindowEvent::MouseInput { state, button, .. } => {
+                    self.mouse_left_down = false;
+                    self.drag_divider = None;
+                    if *state == ElementState::Pressed && *button == MouseButton::Left {
+                        self.swallow_guard_release = true;
+                        let hit = self.renderer.as_ref().zip(self.window.as_ref())
+                            .and_then(|(r, w)| {
+                                let size = w.inner_size();
+                                r.close_guard_layout(size.width as usize, size.height as usize)
+                                    .hit(self.cursor_pos.x, self.cursor_pos.y)
+                            });
+                        if let Some(confirm) = hit { self.resolve_close(confirm, el); }
+                    }
+                    return;
+                }
+                WindowEvent::MouseWheel { .. } | WindowEvent::DroppedFile(_) => return,
+                _ => {}
+            }
+        }
         match event {
             WindowEvent::CloseRequested => {
                 // a running command deserves a second look before the kill
-                if self.config.confirm_close_on()
-                    && self.pending_close.is_none()
-                    && self.running_count() > 0
-                {
-                    self.pending_close = Some(CloseTarget::Window);
+                let running = self.running_count();
+                if !prepare_window_close(&mut self.pending_close, self.config.confirm_close_on(), running) {
                     self.request_redraw();
                     return;
                 }
@@ -2751,11 +2855,8 @@ impl ApplicationHandler<UserEvent> for App {
                                         // running-command guard must not be
                                         // bypassed just because the button
                                         // is ours now
-                                        if self.config.confirm_close_on()
-                                            && self.pending_close.is_none()
-                                            && self.running_count() > 0
-                                        {
-                                            self.pending_close = Some(CloseTarget::Window);
+                                        let running = self.running_count();
+                                        if !prepare_window_close(&mut self.pending_close, self.config.confirm_close_on(), running) {
                                             self.request_redraw();
                                         } else {
                                             self.quit(el);
@@ -2782,6 +2883,16 @@ impl ApplicationHandler<UserEvent> for App {
                     // (a click — layout-proof, unlike a comma shortcut)
                     if let (Some(r), Some(w)) = (self.renderer.as_ref(), self.window.as_ref()) {
                         let pw = w.inner_size().width as usize;
+                        if let Some(control) = r.tab_control_hit(pw, self.cursor_pos.x, self.cursor_pos.y) {
+                            match control {
+                                0 if self.active > 0 => self.switch_tab(self.active - 1),
+                                1 if self.active + 1 < self.tabs.len() => self.switch_tab(self.active + 1),
+                                2 => self.perform_action(keybinds::Action::NewTab, el),
+                                _ => {}
+                            }
+                            self.request_redraw();
+                            return;
+                        }
                         if r.settings_button_hit(pw, self.cursor_pos.x, self.cursor_pos.y) {
                             self.settings = Some(0);
                             self.request_redraw();
@@ -2920,16 +3031,10 @@ impl ApplicationHandler<UserEvent> for App {
                     event.logical_key, event.physical_key, event.text
                 ));
                 // a pending close owns the keyboard: Enter closes, Esc keeps
-                if let Some(target) = self.pending_close {
+                if self.pending_close.is_some() {
                     match &event.logical_key {
-                        Key::Named(NamedKey::Enter) => {
-                            self.pending_close = None;
-                            match target {
-                                CloseTarget::Pane(ti, pi) => self.remove_pane(ti, pi, el),
-                                CloseTarget::Window => self.quit(el),
-                            }
-                        }
-                        Key::Named(NamedKey::Escape) => self.pending_close = None,
+                        Key::Named(NamedKey::Enter) => self.resolve_close(true, el),
+                        Key::Named(NamedKey::Escape) => self.resolve_close(false, el),
                         _ => {}
                     }
                     self.request_redraw();
@@ -2999,18 +3104,20 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 let key = &event.logical_key;
                 // ---- rebindable shortcuts (the keymap; Ctrl+, ⌨ edits it).
-                // EasyTer's TUI rule, generalized: a PLAIN ctrl+letter chord
-                // belongs to a full-screen TUI when one is up — pass it on.
+                // Plain Ctrl+letters belong to TUIs, except clipboard paste.
                 if let Some(chord) =
                     keybinds::chord_from(event.physical_key, ctrl, shift, alt)
                 {
-                    if let Some(action) = keybinds::lookup(&self.keymap, chord) {
-                        let tui_owns = chord.is_plain_ctrl_letter()
-                            && self.term_mode().contains(TermMode::ALT_SCREEN);
-                        if !tui_owns {
-                            self.perform_action(action, el);
+                    let alt_screen = self.term_mode().contains(TermMode::ALT_SCREEN);
+                    if let Some(action) = keybinds::resolve(&self.keymap, chord, alt_screen, self.has_selection()) {
+                        if action == keybinds::Action::Copy && chord.is_plain_ctrl_letter()
+                            && chord.key == keybinds::ChordKey::Letter('c') {
+                            self.copy_selection(true);
+                            self.request_redraw();
                             return;
                         }
+                        self.perform_action(action, el);
+                        return;
                     }
                 }
                 // Alt+arrows move focus between panes (EasyTer's binding)
@@ -3072,7 +3179,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // Ctrl+C copies when a selection exists (Windows
                     // convention); otherwise falls through to \x03
                     if let Some(l) = key_letter(&event) {
-                        if !shift && l == 'c' && self.has_selection() {
+                        if !shift && !alt && l == 'c' && self.has_selection() {
                             self.copy_selection(true);
                             self.request_redraw();
                             return;
@@ -3193,6 +3300,7 @@ fn main() {
         cockpit_sel: 0,
         pending_paste: None,
         pending_close: None,
+        swallow_guard_release: false,
         last_input: Instant::now(),
         blink_drawn_on: true,
         settings: None,
@@ -3219,6 +3327,35 @@ fn main() {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn dismissing_guard_consumes_its_release_even_after_the_modal_is_gone() {
+        let mut pending = true;
+        assert!(!consume_guard_release(&mut pending, ElementState::Pressed, MouseButton::Left));
+        assert!(!consume_guard_release(&mut pending, ElementState::Released, MouseButton::Right));
+        assert!(pending);
+        assert!(consume_guard_release(&mut pending, ElementState::Released, MouseButton::Left));
+        assert!(!pending);
+        assert!(!consume_guard_release(&mut pending, ElementState::Released, MouseButton::Left));
+    }
+
+    #[test]
+    fn window_close_replaces_pane_confirmation_and_preserves_window_guard() {
+        let mut pending = Some(CloseTarget::Pane(0, 0));
+        assert!(!prepare_window_close(&mut pending, true, 2));
+        assert!(matches!(pending, Some(CloseTarget::Window)));
+        assert!(!prepare_window_close(&mut pending, true, 2));
+
+        let mut pending = None;
+        assert!(!prepare_window_close(&mut pending, true, 1));
+        assert!(matches!(pending, Some(CloseTarget::Window)));
+
+        for (confirm, running) in [(false, 2), (true, 0)] {
+            let mut pending = Some(CloseTarget::Pane(0, 0));
+            assert!(prepare_window_close(&mut pending, confirm, running));
+            assert!(pending.is_none());
+        }
+    }
 
     #[test]
     fn split_rects_divide_by_weight() {

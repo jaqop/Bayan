@@ -137,6 +137,64 @@ pub fn restore_bidi_line(text: &str) -> Option<String> {
     None
 }
 
+/// The same restoration with source-character identity retained, so repeated
+/// letters and combining marks can still map back to terminal cells.
+pub fn restore_bidi_line_with_order(text: &str) -> Option<(String, Vec<usize>)> {
+    let chars: Vec<char> = text.chars().collect();
+    if !chars.iter().copied().any(is_arabic_letter) { return None; }
+    let reverse = |indices: &[usize]| {
+        let mut clusters: Vec<Vec<usize>> = Vec::new();
+        for &i in indices {
+            if is_combining(chars[i]) && !clusters.is_empty() {
+                clusters.last_mut().unwrap().push(i);
+            } else {
+                clusters.push(vec![i]);
+            }
+        }
+        clusters.into_iter().rev().flatten().collect::<Vec<_>>()
+    };
+    let indices: Vec<usize> = (0..chars.len()).collect();
+    let mut order = Vec::with_capacity(chars.len());
+    if line_is_rtl_visual(text) {
+        let rev = reverse(&indices);
+        let mut i = 0;
+        while i < rev.len() {
+            if is_ltr_char(chars[rev[i]]) {
+                let mut j = i;
+                while j < rev.len() {
+                    let c = chars[rev[j]];
+                    let joins = (LTR_PUNCT.contains(&c) || c == ' ')
+                        && j + 1 < rev.len() && is_ltr_char(chars[rev[j + 1]]);
+                    if !is_ltr_char(c) && !joins { break; }
+                    j += 1;
+                }
+                order.extend(reverse(&rev[i..j]));
+                i = j;
+            } else {
+                order.push(rev[i]);
+                i += 1;
+            }
+        }
+    } else {
+        let mut i = 0;
+        while i < chars.len() {
+            if is_arabic_letter(chars[i]) {
+                let mut j = i;
+                while j < chars.len() && (is_arabic_letter(chars[j]) || is_combining(chars[j])
+                    || (chars[j] == ' ' && j + 1 < chars.len() && is_arabic_letter(chars[j + 1]))) {
+                    j += 1;
+                }
+                order.extend(reverse(&indices[i..j]));
+                i = j;
+            } else {
+                order.push(i);
+                i += 1;
+            }
+        }
+    }
+    Some((order.iter().map(|&i| chars[i]).collect(), order))
+}
+
 /// A whole copied block (selection in Claude mode): restore each line, so
 /// pasted text is logical-order Arabic, not Claude's visual order.
 pub fn restore_block(text: &str) -> String {
@@ -183,6 +241,19 @@ pub fn cmd_is_claude(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restoration_keeps_a_permutation_for_repeated_letters_and_marks() {
+        for text in ["ابحرم", "ملس ملس", "مَّلَس", "quoted ملس then ملس", "txt.1 رابتخا 123"] {
+            let (restored, order) = restore_bidi_line_with_order(text).unwrap();
+            assert_eq!(Some(restored.clone()), restore_bidi_line(text));
+            let chars: Vec<_> = text.chars().collect();
+            assert_eq!(order.iter().map(|&i| chars[i]).collect::<String>(), restored);
+            let mut indices = order;
+            indices.sort_unstable();
+            assert_eq!(indices, (0..chars.len()).collect::<Vec<_>>());
+        }
+    }
 
     #[test]
     fn pure_arabic_round_trips() {
@@ -256,6 +327,9 @@ mod tests {
             let visual = c["visual"].as_str().expect("visual");
             let got = restore_bidi_line(visual).unwrap_or_else(|| visual.to_string());
             assert_eq!(got, logical, "fixture {name}: visual -> logical drifted");
+            let mapped = restore_bidi_line_with_order(visual).map(|r| r.0)
+                .unwrap_or_else(|| visual.to_string());
+            assert_eq!(mapped, logical, "fixture {name}: mapped restoration drifted");
             // the codepoint listings must describe the strings they sit beside
             let cps = |s: &str| {
                 s.chars().map(|ch| format!("{:04X}", ch as u32)).collect::<Vec<_>>().join(" ")

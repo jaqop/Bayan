@@ -43,7 +43,9 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       overflows; the cursor on RTL rows resolves through the shaped layout
       (logical column ≠ visual x); live monitor-scale changes rebuild metrics
 - [x] **M3** — mouse selection (drag / double-click word / triple-click
-      line, auto-copy on release), clipboard (Ctrl+V pass-through in TUIs,
+      line, auto-copy on release), clipboard (Ctrl+C copies a selection or interrupts
+      when nothing is selected; Ctrl+Shift+C explicitly copies; Ctrl+V and
+      Ctrl+Shift+V paste in shells and TUIs,
       bracketed-paste injection guard), wheel scrollback + indicator +
       Shift+PageUp/Down, Ctrl+F literal search with wrap-around; Ctrl
       shortcuts resolve by PHYSICAL key so they work on Arabic layouts
@@ -275,7 +277,7 @@ key falls back to a sane default:
 
 ```json
 {
-  "theme": "Bayan", "font_family": "Cascadia Code NF", "font_size": 15.0,
+  "theme": "بيان (الأزرق)", "font_family": "Cascadia Code NF", "font_size": 18.0,
   "cursor_style": "bar", "cursor_blink": true, "scrollback": 20000,
   "copy_on_select": true, "ligatures": true, "bell": "attention",
   "shell": "pwsh.exe", "padding": 8, "opacity": 0.9,
@@ -286,6 +288,15 @@ key falls back to a sane default:
 
 Shell and scrollback apply to new tabs (no terminal restarts a live
 session); everything else applies immediately.
+
+Settings and tab controls use a separate, readable UI font size, so reducing
+the terminal font does not shrink them. Claude mode detects commands on both
+terminal screens, including commands wrapped across multiple rows.
+Interactive Claude startup redraws once when ready to remove preceding shell
+commands from the screen without clearing the conversation.
+
+Bayan starts with one fresh tab. Saved tabs and panes are reopened only when
+`"restore_tabs": true` is set in config; window position and size still persist.
 
 ## Build
 
