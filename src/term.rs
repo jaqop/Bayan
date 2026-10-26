@@ -176,8 +176,15 @@ pub struct SessionMeta {
     pub at_prompt: bool,
     /// column where prompt input begins (from OSC 133 B)
     pub prompt_col: Option<usize>,
+    /// Global row of OSC 133 B; a command may wrap below this row.
+    pub prompt_abs: Option<u64>,
     /// the command line currently executing ("" = idle) — feeds cmd_is_claude
     pub running_cmd: String,
+    /// One-shot cleanup once a newly launched interactive Claude is ready.
+    pub clean_claude_after: Option<u64>,
+    /// First absolute row belonging to the current inline Claude screen.
+    pub claude_from_abs: Option<u64>,
+    /// working directory from OSC 9;9
     /// Enter was sent at the prompt, and a trusted OSC 133 A or D has not
     /// been seen since. Set even when the cursor never moved past the prompt
     /// column, so `running_cmd` stayed empty: paste and Enter in one chunk,
@@ -266,19 +273,20 @@ const KITTY_STACK_CAP: u16 = 16;
 /// Events one PTY chunk produced, delivered to the UI thread by the reader.
 #[derive(Default)]
 pub(crate) struct ChunkEvents {
+    pub clean_claude: bool,
     pub clipboard: Option<String>,
     pub cwd: Option<String>,
     /// a LONG command just ended (ok?) — worth a notification if unfocused
     pub finished: Option<bool>,
+    /// Replies alacritty did not emit. With the kitty protocol off the
+    /// parser's `kitty_keyboard` flag is false, so `CSI ? u` is answered
+    /// here with `CSI ?0u` and the reader writes it to the PTY.
+    pub pty_replies: Vec<String>,
     /// the program asked for a desktop notification (title, body): OSC 9,
     /// OSC 777 or OSC 99 — what Claude Code, ntfy, zellij and friends emit
     pub notify: Option<(String, String)>,
     /// OSC 9;4 progress: Some(None) clears, Some(Some(p)) sets
     pub progress: Option<Option<Progress>>,
-    /// Replies alacritty did not emit. With the kitty protocol off the
-    /// parser's `kitty_keyboard` flag is false, so `CSI ? u` is answered
-    /// here with `CSI ?0u` and the reader writes it to the PTY.
-    pub pty_replies: Vec<String>,
 }
 
 /// ConEmu's OSC 9;4 progress report, as Windows Terminal, Ghostty, WezTerm
@@ -961,6 +969,7 @@ fn handle_osc133<T: EventListener>(
                 return;
             }
             meta.running_cmd.clear();
+            meta.clean_claude_after = None;
             meta.cmd_pending = false;
             // Back at a prompt, so nothing is running and any OSC 9;4 bar
             // still showing is stale — a program killed with Ctrl+C never
@@ -969,6 +978,7 @@ fn handle_osc133<T: EventListener>(
             if ev.progress.is_none() {
                 ev.progress = Some(None);
             }
+            meta.claude_from_abs = None;
             // a new prompt starts on the cursor's row: record its block
             // GLOBALLY (evicted + history + row — never drifts)
             let abs = meta.evicted
@@ -989,11 +999,13 @@ fn handle_osc133<T: EventListener>(
                 return;
             }
             meta.running_cmd.clear();
+            meta.clean_claude_after = None;
             meta.cmd_pending = false;
             // the command is over: its progress bar goes with it
             if ev.progress.is_none() {
                 ev.progress = Some(None);
             }
+            meta.claude_from_abs = None;
             if let Some(m) = meta.marks.last_mut() {
                 m.exit = exit;
             }
@@ -1007,6 +1019,8 @@ fn handle_osc133<T: EventListener>(
         b'B' => {
             meta.at_prompt = true;
             meta.prompt_col = Some(t.grid().cursor.point.column.0);
+            meta.prompt_abs = Some(meta.evicted + t.grid().history_size() as u64
+                + t.grid().cursor.point.line.0.max(0) as u64);
         }
         _ => {}
     }
@@ -1057,6 +1071,7 @@ fn feed_counted<T: EventListener>(
 }
 
 fn merge_chunk(dst: &mut ChunkEvents, src: ChunkEvents) {
+    dst.clean_claude |= src.clean_claude;
     if src.clipboard.is_some() {
         dst.clipboard = src.clipboard;
     }
@@ -1403,6 +1418,23 @@ fn process_bytes<T: EventListener>(
         pos = e;
     }
     feed_counted(parser, t, meta, &buf[pos..], &mut ev.pty_replies);
+    if let Some(start_abs) = meta.clean_claude_after {
+        let first = start_abs as i64 - meta.evicted as i64 - t.grid().history_size() as i64;
+        if first < 0 {
+            meta.clean_claude_after = None; // startup already scrolled out of view
+        } else if t.mode().contains(TermMode::BRACKETED_PASTE) {
+            for line in first as i32..t.screen_lines() as i32 {
+                let row = &t.grid()[alacritty_terminal::index::Line(line)];
+                let text: String = (0..t.columns()).map(|c| row[Column(c)].c).collect();
+                if text.contains("Claude Code v") {
+                    meta.clean_claude_after = None;
+                    meta.claude_from_abs = Some(meta.evicted + t.grid().history_size() as u64);
+                    ev.clean_claude = true;
+                    break;
+                }
+            }
+        }
+    }
     ev
 }
 
@@ -1535,17 +1567,35 @@ pub(crate) fn capture_command_core<T: EventListener>(t: &Term<T>, meta: &mut Ses
     };
     meta.at_prompt = false;
     let cur = t.grid().cursor.point;
-    if cur.column.0 <= pcol {
+    let first = meta.prompt_abs.map_or(cur.line.0 as i64, |abs| {
+        abs as i64 - meta.evicted as i64 - t.grid().history_size() as i64
+    });
+    if first < -(t.grid().history_size() as i64) || first > cur.line.0 as i64 {
         return;
     }
-    let row = &t.grid()[cur.line];
     let mut s = String::new();
-    for c in pcol..cur.column.0 {
-        s.push(row[Column(c)].c);
+    for line in first as i32..=cur.line.0 {
+        let row = &t.grid()[alacritty_terminal::index::Line(line)];
+        let start = if line == first as i32 { pcol } else { 0 };
+        let end = if line == cur.line.0 { cur.column.0 } else { t.columns() };
+        for c in start..end {
+            let cell = &row[Column(c)];
+            if cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            s.push(cell.c);
+            if let Some(marks) = cell.zerowidth() { s.extend(marks); }
+        }
     }
     let s = s.trim();
     if !s.is_empty() {
         meta.running_cmd = s.to_string();
+        if crate::bidi::cmd_is_claude(s)
+            && !s.split_whitespace().any(|arg| matches!(arg, "-p" | "--print")) {
+            meta.clean_claude_after = Some(meta.evicted + t.grid().history_size() as u64
+                + cur.line.0.max(0) as u64 + 1);
+            meta.claude_from_abs = meta.clean_claude_after;
+        }
         meta.cmd_started = Some(std::time::Instant::now());
     }
 }
@@ -1808,6 +1858,11 @@ impl Session {
                         }
                         if let Some(ok) = ev.finished {
                             let _ = proxy.send_event(UserEvent::CommandFinished(id, ok));
+                        }
+                        if ev.clean_claude {
+                            // Ask Claude to redraw its own screen (Ctrl+L),
+                            // preserving its conversation and terminal state.
+                            let _ = proxy.send_event(UserEvent::PtyWrite(id, "\x0c".into()));
                         }
                         let mut loop_gone = false;
                         for reply in ev.pty_replies {
@@ -2838,6 +2893,39 @@ mod tests {
         assert!(meta.running_cmd.is_empty());
     }
 
+    #[test]
+    fn command_capture_keeps_wrapped_claude_commands() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry,
+            b"PS C:\\a-very-long-directory> \x1b]133;B\x07");
+        let command = format!("claude --safe-mode {}", "x".repeat(90));
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, command.as_bytes());
+        capture_command_core(&t, &mut meta);
+        assert_eq!(meta.running_cmd, command);
+        assert!(crate::bidi::cmd_is_claude(&meta.running_cmd));
+    }
+
+    #[test]
+    fn interactive_claude_cleans_shell_prefix_once_after_new_header() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry,
+            b"Claude Code vOLD\r\n> \x1b]133;B\x07claude");
+        capture_command_core(&t, &mut meta);
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\r\n\x1b[?2004hloading");
+        assert!(!ev.clean_claude, "an old header must not trigger cleanup");
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\r\nClaude Co");
+        assert!(!ev.clean_claude);
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"de v2.1.311");
+        assert!(ev.clean_claude);
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\r\nClaude Code v2.1.311");
+        assert!(!ev.clean_claude, "cleanup must never loop on redraw");
+
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"> \x1b]133;B\x07claude --print hello");
+        capture_command_core(&t, &mut meta);
+        assert!(meta.clean_claude_after.is_none());
+    }
+
     /// The whole Claude-mode enabling chain, GUI-free: prompt mark, typed
     /// command captured off the screen, alternate screen entered — the two
     /// conditions claude_active() checks are both true.
@@ -3511,8 +3599,9 @@ mod tests {
         p: &mut Processor,
         meta: &mut SessionMeta,
         carry: &mut Vec<u8>,
+        expected_command: &str,
     ) {
-        assert!(meta.running_cmd.is_empty(), "the command text was not captured");
+        assert_eq!(meta.running_cmd, expected_command, "command capture must match this scenario");
         assert!(meta.cmd_pending, "Enter at the prompt must arm the nonce gate");
         let ev = process_chunk(p, t, meta, carry, &osc7_of("file:///C:/evil"));
         assert!(ev.cwd.is_none());
@@ -3541,7 +3630,7 @@ mod tests {
         let (mut t, mut p, mut meta, mut carry) = prompt_ready();
         assert_eq!(t.grid().cursor.point.column.0, meta.prompt_col.unwrap());
         capture_command_core(&t, &mut meta);
-        assert_pending_blocks_osc7(&mut t, &mut p, &mut meta, &mut carry);
+        assert_pending_blocks_osc7(&mut t, &mut p, &mut meta, &mut carry, "");
     }
 
     /// Home, then Enter. The cursor is at column 0, which is not past the
@@ -3552,7 +3641,7 @@ mod tests {
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[H");
         assert_eq!(t.grid().cursor.point.column.0, 0);
         capture_command_core(&t, &mut meta);
-        assert_pending_blocks_osc7(&mut t, &mut p, &mut meta, &mut carry);
+        assert_pending_blocks_osc7(&mut t, &mut p, &mut meta, &mut carry, "");
     }
 
     /// The command wrapped onto the next line. The cursor column is back
@@ -3575,7 +3664,7 @@ mod tests {
             t.grid().cursor.point
         );
         capture_command_core(&t, &mut meta);
-        assert_pending_blocks_osc7(&mut t, &mut p, &mut meta, &mut carry);
+        assert_pending_blocks_osc7(&mut t, &mut p, &mut meta, &mut carry, &line);
     }
 
     #[test]

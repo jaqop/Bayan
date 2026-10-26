@@ -38,6 +38,7 @@ use crate::gpu::Vertex;
 // original uses almost no other hue and loud fillers would break it.
 pub const BG: (u8, u8, u8) = (0x06, 0x26, 0x26);
 pub const FG: (u8, u8, u8) = (0xc2, 0xb7, 0x96);
+pub const DEFAULT_THEME: &str = "بيان (الأزرق)";
 
 /// ESC, spelled out so a raw byte never sits inside a string literal.
 const ESC: char = '\u{1b}';
@@ -557,6 +558,21 @@ pub struct ShortcutsLayout {
     pub rows: Vec<Rect>,
 }
 
+pub struct CloseGuardLayout {
+    pub card: Rect,
+    pub text: Rect,
+    pub keep: Rect,
+    pub close: Rect,
+}
+
+impl CloseGuardLayout {
+    pub fn hit(&self, x: f64, y: f64) -> Option<bool> {
+        if rect_hit(self.close, x, y) { Some(true) }
+        else if rect_hit(self.keep, x, y) { Some(false) }
+        else { None }
+    }
+}
+
 /// Every clickable region of the settings panel (draw + hit-test agree).
 pub struct SettingsLayout {
     pub card: Rect,
@@ -657,6 +673,8 @@ pub struct PaneView<'a> {
     pub bordered: bool,
     /// Claude mode for THIS pane's content.
     pub claude: bool,
+    /// First visible Claude row; older shell scrollback stays logical.
+    pub claude_from: Option<i64>,
     /// False when explicit BDSM is honored: cells are already in visual
     /// order, so Arabic rows take the grid path and are not reordered.
     pub reorder: bool,
@@ -713,16 +731,53 @@ struct CellInfo {
     // tanwin, shadda ... ) — dropping them loses the diacritics
     zw: Option<Vec<char>>,
     fg: (u8, u8, u8),
+    bg: (u8, u8, u8),
     style: u8,
 }
 
+fn is_tui_row(cells: &[CellInfo]) -> bool {
+    let end = cells.iter().rposition(|c| c.c != ' ').map_or(0, |i| i + 1);
+    let cells = &cells[..end];
+    if cells.iter().find(|c| c.c != ' ').is_some_and(|c| matches!(c.c, '>' | '❯' | '›')) {
+        return true;
+    }
+    cells.iter().any(|c| matches!(c.c, '\u{2500}'..='\u{259f}' | '\u{e000}'..='\u{f8ff}'))
+        || cells.windows(3).any(|s| s.iter().all(|c| c.c == ' '))
+        || cells.windows(2).any(|s| s[1].col > s[0].col + s[0].w + 1)
+}
+
 impl CellInfo {
+    fn text_len(&self) -> usize {
+        self.c.len_utf8() + self.zw.as_ref().map_or(0, |z| z.iter().map(|c| c.len_utf8()).sum())
+    }
     fn push_text(&self, s: &mut String) {
         s.push(self.c);
         if let Some(z) = &self.zw {
             s.extend(z.iter());
         }
     }
+}
+
+/// Claude's prompt uses a logical cursor offset even though its output
+/// cells are visual. Resolve that offset through the same permutation.
+fn claude_logical_cursor_cell(cells: &[CellInfo], offset: usize) -> Option<usize> {
+    let mut text = String::new();
+    let mut owners = Vec::new();
+    for cell in cells {
+        cell.push_text(&mut text);
+        owners.push((cell.col, cell.w));
+        if let Some(marks) = &cell.zw {
+            owners.extend(marks.iter().map(|_| (cell.col, 0)));
+        }
+    }
+    let (_, order) = crate::bidi::restore_bidi_line_with_order(&text)?;
+    let mut logical = 0;
+    for source in order {
+        let &(col, width) = owners.get(source)?;
+        if width > 0 && logical <= offset && offset < logical + width { return Some(col); }
+        logical += width;
+    }
+    None
 }
 
 /// One visible cell, owned, so a mouse hit-test can drop the term lock
@@ -781,33 +836,12 @@ struct BidiPlan {
     segs: Vec<Seg>,
     /// Base-char bytes of the cursor, in the shaped string. Cleared when
     /// Claude restoration rewrites the line (the old mapping doesn't hold).
+    #[cfg(test)]
     cursor_bytes: Option<(usize, usize)>,
     /// `(start, end, grid column)` in the shaped string.
     byte_cols: Vec<(usize, usize, usize)>,
     /// First column not part of the shaped run (trailing blanks).
     first_blank: usize,
-}
-
-/// Underline / strikethrough spans of a BiDi row, as BYTE ranges of the
-/// shaped string. The grid path can place these from columns, but on a
-/// row cosmic-text reordered a column is not an x — so the style runs
-/// travel as bytes and the layout says where they landed. `byte_cols`
-/// stays correct through Claude-mode restoration, so these do too.
-fn bidi_decos(cells: &[CellInfo], plan: &BidiPlan) -> Vec<Deco> {
-    let mut out: Vec<Deco> = Vec::new();
-    for ci in cells {
-        if ci.style & (ST_UNDERLINE | ST_STRIKE) == 0 {
-            continue;
-        }
-        let Some(&(b0, b1, _)) = plan.byte_cols.iter().find(|&&(_, _, c)| c == ci.col) else {
-            continue; // a trailing blank, outside the shaped run
-        };
-        match out.last_mut() {
-            Some((_, e, st, fg)) if *e == b0 && *st == ci.style && *fg == ci.fg => *e = b1,
-            _ => out.push((b0, b1, ci.style, ci.fg)),
-        }
-    }
-    out
 }
 
 fn byte_cols_of(text: &str, char_cols: &[usize]) -> Vec<(usize, usize, usize)> {
@@ -926,13 +960,14 @@ fn bidi_plan(
     }
     Some(BidiPlan {
         segs,
+        #[cfg(test)]
         cursor_bytes: cur_bytes,
         byte_cols,
         first_blank,
     })
 }
 
-const FONT_SIZE: f32 = 15.0;
+pub const DEFAULT_FONT_SIZE: f32 = 18.0;
 // bundled so connected Arabic works from a fresh clone (same fonts EasyTer
 // ships) — bold included, so Arabic bold is a real weight, not a fake
 const AMIRI: &[u8] = include_bytes!("../fonts/Amiri-Regular.ttf");
@@ -1039,7 +1074,9 @@ struct ShapedRun {
 }
 
 /// Cache key: the exact rich-text content (text + color + style) + alignment.
-type RunKey = (Vec<Seg>, bool, bool);
+type RunKey = (Vec<Seg>, bool, bool, u32);
+type CellGeometry = Vec<(i32, i32, bool)>; // visual x, width, logical RTL
+type RowHit = (i32, i32, usize, bool); // x, width, column, logical RTL
 
 /// Generational cap: on overflow the hot map becomes the cold one and a
 /// fresh hot map starts — the working set survives, stale runs age out
@@ -1047,6 +1084,9 @@ type RunKey = (Vec<Seg>, bool, bool);
 const CACHE_CAP: usize = 4096;
 
 pub struct Renderer {
+    cell_geometry: std::collections::HashMap<(Rect, usize, usize), CellGeometry>,
+    row_hits: std::collections::HashMap<(Rect, usize), Vec<RowHit>>,
+    mapping_context: Option<(Rect, usize)>,
     /// which caption button the pointer is over (0..2) — hover feedback
     pub hover_caption: Option<usize>,
     /// pointer over the settings gear
@@ -1054,6 +1094,9 @@ pub struct Renderer {
     font_system: FontSystem,
     cache: SwashCache,
     metrics: Metrics,
+    terminal_metrics: Metrics,
+    terminal_cell_w: f32,
+    dpi_scale: f32,
     cache_hot: std::collections::HashMap<RunKey, ShapedRun>,
     cache_cold: std::collections::HashMap<RunKey, ShapedRun>,
     pub atlas: Atlas,
@@ -1100,7 +1143,7 @@ impl Renderer {
         font_system.db_mut().load_font_data(AMIRI_BOLD.to_vec());
         let ligatures = cfg.ligatures.unwrap_or(true);
         let family = pick_family(font_system.db(), cfg.font_family.as_deref(), ligatures);
-        let size = (cfg.font_size.unwrap_or(FONT_SIZE) + extra_pts).clamp(8.0, 40.0) * scale;
+        let size = (cfg.font_size.unwrap_or(DEFAULT_FONT_SIZE) + extra_pts).clamp(8.0, 40.0) * scale;
         let metrics = Metrics::new(size, (size * 1.4).ceil());
         // cell width = the primary monospace font's advance for an ASCII probe
         let mut probe = Buffer::new(&mut font_system, metrics);
@@ -1121,7 +1164,8 @@ impl Renderer {
             .unwrap_or(size * 0.6);
         // start from a named theme (if any), then let explicit config
         // bg/fg/palette override individual colors on top of it
-        let theme = cfg.theme.as_deref().and_then(theme_by_name);
+        let theme = cfg.theme.as_deref().and_then(theme_by_name)
+            .or_else(|| theme_by_name(DEFAULT_THEME));
         let (mut bg, mut fg, mut palette) = match theme {
             Some(t) => (t.bg, t.fg, t.palette),
             None => (BG, FG, PALETTE),
@@ -1140,11 +1184,17 @@ impl Renderer {
             }
         }
         Self {
+            cell_geometry: std::collections::HashMap::new(),
+            row_hits: std::collections::HashMap::new(),
+            mapping_context: None,
             hover_caption: None,
             hover_gear: false,
             font_system,
             cache: SwashCache::new(),
             metrics,
+            terminal_metrics: metrics,
+            terminal_cell_w: cell_w,
+            dpi_scale: scale,
             cache_hot: std::collections::HashMap::new(),
             cache_cold: std::collections::HashMap::new(),
             atlas: Atlas::new(),
@@ -1162,6 +1212,47 @@ impl Renderer {
     /// The app resolves "hide the bar with a single tab" each layout pass.
     pub fn set_bar_hidden(&mut self, hidden: bool) {
         self.bar_hidden = hidden;
+    }
+
+    pub fn begin_frame(&mut self) {
+        self.cell_geometry.clear();
+        self.row_hits.clear();
+        self.mapping_context = None;
+    }
+
+    fn ui_cell_w(&self) -> f32 {
+        self.terminal_cell_w * (16.0 * self.dpi_scale) / self.terminal_metrics.font_size
+    }
+
+    fn ui_cell_h(&self) -> f32 { 22.4 * self.dpi_scale }
+
+    pub fn use_ui_metrics(&mut self, active: bool) {
+        self.metrics = if active {
+            Metrics::new(16.0 * self.dpi_scale, self.ui_cell_h())
+        } else { self.terminal_metrics };
+        self.cell_w = if active { self.ui_cell_w() } else { self.terminal_cell_w };
+        self.cell_h = self.metrics.line_height;
+    }
+
+    fn finish_pane_layout(&mut self, pane_rect: Rect) {
+        self.row_hits.retain(|(pane, _), _| *pane != pane_rect);
+        for (&(pane, row, col), spans) in &self.cell_geometry {
+            if pane != pane_rect { continue; }
+            self.row_hits.entry((pane, row)).or_default()
+                .extend(spans.iter().map(|&(x, w, rtl)| (x, w, col, rtl)));
+        }
+        for ((pane, _), spans) in &mut self.row_hits {
+            if *pane == pane_rect { spans.sort_unstable(); spans.dedup(); }
+        }
+    }
+
+    pub fn hit_cell(&self, pane: Rect, row: usize, x: f64) -> Option<(usize, alacritty_terminal::index::Side)> {
+        use alacritty_terminal::index::Side;
+        let spans = self.row_hits.get(&(pane, row))?;
+        let &(left, width, col, rtl) = spans.iter().take_while(|s| s.0 as f64 <= x)
+            .filter(|s| x < (s.0 + s.1) as f64).min_by_key(|s| (s.1, s.2))?;
+        let right_half = x >= left as f64 + width as f64 / 2.0;
+        Some((col, if right_half ^ rtl { Side::Right } else { Side::Left }))
     }
 
     /// The primary family actually in use (post-fallback) — what the
@@ -1242,7 +1333,7 @@ impl Renderer {
     /// `BidiInfo` gets paragraph level 0 instead of detecting it from the
     /// first strong character. Terminal rows stay on auto.
     fn ensure_shaped_dir(&mut self, segs: &[Seg], align_left: bool, force_ltr: bool) -> RunKey {
-        let key: RunKey = (segs.to_vec(), align_left, force_ltr);
+        let key: RunKey = (segs.to_vec(), align_left, force_ltr, self.metrics.font_size.to_bits());
         if self.cache_hot.contains_key(&key) {
             return key;
         }
@@ -1291,7 +1382,7 @@ impl Renderer {
     /// measuring here would cost a shape on every frame.
     pub fn tab_width(&self, title: &str) -> i32 {
         let cells = (title.chars().count() as f32 + 6.0).clamp(TAB_MIN_CELLS, TAB_CELLS);
-        (self.cell_w * cells) as i32
+        (self.ui_cell_w() * cells) as i32
     }
 
     /// Height of the tab bar in pixels — pane content starts below it.
@@ -1300,7 +1391,7 @@ impl Renderer {
         if self.bar_hidden {
             0.0
         } else {
-            self.cell_h + 10.0
+            (self.ui_cell_h() + 18.0 * self.dpi_scale).max(42.0 * self.dpi_scale)
         }
     }
 
@@ -1366,47 +1457,181 @@ impl Renderer {
     /// UAX#9 BiDi (mixed directions, LTR islands). Compressed to the pane
     /// when overflowing; the cursor resolves THROUGH the shaped layout.
     #[allow(clippy::too_many_arguments)]
-    fn draw_line_bidi(
-        &mut self,
-        out: &mut Vec<Vertex>,
-        clip: Rect,
-        x0: i32,
-        y: i32,
-        pane_w: i32,
-        cells: &[CellInfo],
-        claude: bool,
-        cursor_col: Option<usize>,
-        dir: ParagraphDir,
-        hover: Option<(usize, usize)>,
-    ) -> Option<(i32, i32)> {
-        let plan = bidi_plan(cells, claude, self.fg, cursor_col, dir)?;
+    fn draw_line_bidi(&mut self, out: &mut Vec<Vertex>, clip: Rect,
+                      x0: i32, y: i32, pane_w: i32, cells: &[CellInfo], claude: bool,
+                      cursor_col: Option<usize>, dir: ParagraphDir,
+                      hover: Option<(usize, usize)>) -> Option<(i32, i32)> {
+        let mut end = cells.len();
+        while end > 0 && cells[end - 1].c == ' ' {
+            end -= 1;
+        }
+        let mut segs: Vec<Seg> = Vec::new();
+        let mut cur_bytes: Option<(usize, usize)> = None;
+        let mut cell_bytes = Vec::new();
+        let mut nbytes = 0usize;
+        // underline/strikethrough spans as BYTE ranges of the shaped text:
+        // on a BiDi row the pixels come from the layout, never from columns
+        let mut decos: Vec<Deco> = Vec::new();
+        for ci in &cells[..end] {
+            if cursor_col == Some(ci.col) {
+                cur_bytes = Some((nbytes, nbytes + ci.c.len_utf8()));
+            }
+            let b0 = nbytes;
+            nbytes += ci.text_len();
+            cell_bytes.push((ci.col, b0, nbytes));
+            if ci.style & (ST_UNDERLINE | ST_STRIKE) != 0 {
+                match decos.last_mut() {
+                    Some((_, e, st, fg)) if *e == b0 && *st == ci.style && *fg == ci.fg => {
+                        *e = nbytes;
+                    }
+                    _ => decos.push((b0, nbytes, ci.style, ci.fg)),
+                }
+            }
+            match segs.last_mut() {
+                Some(s) if s.fg == ci.fg && s.style == ci.style => ci.push_text(&mut s.text),
+                _ => {
+                    let mut s = String::new();
+                    ci.push_text(&mut s);
+                    segs.push(Seg { text: s, fg: ci.fg, style: ci.style });
+                }
+            }
+        }
+        if segs.is_empty() {
+            return None;
+        }
+        // Claude mode: the cells hold Claude's pre-reversed VISUAL order.
+        // Restore logical so cosmic-text's BiDi shows it right. Per-cell
+        // colors can't survive the reordering (EasyTer draws these lines in
+        // the default FG too), and the cursor byte-mapping no longer holds.
+        if claude {
+            let full: String = segs.iter().map(|s| s.text.as_str()).collect();
+            if let Some((fixed, order)) = crate::bidi::restore_bidi_line_with_order(&full) {
+                let owners: Vec<_> = cells[..end].iter().flat_map(|ci| {
+                    std::iter::repeat_n(ci, 1 + ci.zw.as_ref().map_or(0, Vec::len))
+                }).collect();
+                segs.clear();
+                cell_bytes.clear();
+                decos.clear();
+                nbytes = 0;
+                for (c, i) in fixed.chars().zip(order) {
+                    let ci = owners[i];
+                    let b0 = nbytes;
+                    nbytes += c.len_utf8();
+                    cell_bytes.push((ci.col, b0, nbytes));
+                    if ci.style & (ST_UNDERLINE | ST_STRIKE) != 0 {
+                        decos.push((b0, nbytes, ci.style, ci.fg));
+                    }
+                    match segs.last_mut() {
+                        Some(s) if s.fg == ci.fg && s.style == ci.style => s.text.push(c),
+                        _ => segs.push(Seg { text: c.to_string(), fg: ci.fg, style: ci.style }),
+                    }
+                }
+                cur_bytes = None;
+            }
+        }
+        if let Some(mark) = base_direction_mark(dir) {
+            let n = mark.len_utf8();
+            segs[0].text.insert(0, mark);
+            nbytes += n;
+            for (_, start, finish) in &mut cell_bytes { *start += n; *finish += n; }
+            for (start, finish, _, _) in &mut decos { *start += n; *finish += n; }
+            if let Some((start, finish)) = cur_bytes.as_mut() { *start += n; *finish += n; }
+        }
+        // A base and its tashkeel occupy one terminal cell. Coalesce them
+        // before highlighting, so overlays never darken the same cell twice.
+        cell_bytes.sort_unstable();
+        let mut merged: Vec<(usize, usize, usize)> = Vec::new();
+        for (col, start, finish) in cell_bytes {
+            if let Some(last) = merged.last_mut().filter(|last| last.0 == col) {
+                last.1 = last.1.min(start);
+                last.2 = last.2.max(finish);
+            } else { merged.push((col, start, finish)); }
+        }
+        let cell_bytes = merged;
+        let background_by_col: std::collections::HashMap<_, _> = cells[..end].iter()
+            .filter(|c| c.bg != self.bg).map(|c| (c.col, c.bg)).collect();
         // shape unconstrained (cached), then compress to the pane on overflow
-        let natw = self.measure(&plan.segs, true);
-        let scale = if natw > pane_w as f32 {
-            pane_w as f32 / natw
-        } else {
-            1.0
-        };
-        self.draw_run(&plan.segs, true, out, clip, x0 as f32, y, scale);
-        // SGR underline and strikethrough, through the same layout. Without
-        // this they are simply absent on any row holding Arabic: the grid
-        // path draws them from columns, and this path has no columns.
-        let decos = bidi_decos(cells, &plan);
+        let natw = self.measure(&segs, true);
+        let scale = if natw > pane_w as f32 { pane_w as f32 / natw } else { 1.0 };
+        let key = self.ensure_shaped(&segs, true);
+        let mut mapped_cursor = None;
+        let paragraph_rtl = self.cache_hot[&key].buffer.layout_runs().next().is_some_and(|run| run.rtl);
+        // Keep Claude's inverse trailing blank inside the shaped field.
+        let reserve = if claude && paragraph_rtl && cells[end..].iter().any(|c| c.bg != self.bg) {
+            self.cell_w.round() as i32
+        } else { 0 };
+        let text_x0 = x0 + reserve;
+        let mut backgrounds = Vec::new();
+        let mut end_anchor: Option<(i32, bool)> = None;
+        for run in self.cache_hot[&key].buffer.layout_runs() {
+            for &(col, b0, b1) in &cell_bytes {
+                let start = cosmic_text::Cursor::new(0, b0);
+                let finish = cosmic_text::Cursor::new(0, b1);
+                let rtl = !claude && run.glyphs.iter()
+                    .find(|g| g.start <= b0 && b0 < g.end).is_some_and(|g| g.level.is_rtl());
+                for (hx, hw) in run.highlight(start, finish) {
+                    let left = text_x0 + (hx * scale).round() as i32;
+                    let right = text_x0 + ((hx + hw) * scale).round() as i32;
+                    let bounds = (left, (right - left).max(1), rtl);
+                    if let Some(&bg) = background_by_col.get(&col) {
+                        backgrounds.push((bounds.0, bounds.1, bg));
+                    }
+                    if hover.is_some_and(|(start, finish)| col >= start && col < finish) {
+                        let th = (self.cell_h / 14.0).max(1.0) as i32;
+                        push_rect(out, clip, left, y + self.cell_h.round() as i32 - th,
+                            bounds.1, th, c4(LINK_UNDER, 255));
+                    }
+                    if let Some((pane, row)) = self.mapping_context {
+                        self.cell_geometry.entry((pane, row, col)).or_default().push(bounds);
+                    }
+                    if cursor_col == Some(col) { mapped_cursor = Some((bounds.0, bounds.1)); }
+                }
+            }
+            if let Some(x) = run.cursor_position(&cosmic_text::Cursor::new(0, nbytes)) {
+                    end_anchor = Some((text_x0 + (x * scale).round() as i32, run.rtl));
+            }
+        }
+        if let Some((anchor, rtl)) = end_anchor {
+            let end_col = cells[end - 1].col + cells[end - 1].w;
+            let width = self.cell_w.round() as i32;
+            let x_at = |col: usize| if rtl {
+                anchor - (((col - end_col + 1) as f32 * self.cell_w).round() as i32)
+            } else {
+                anchor + (((col - end_col) as f32 * self.cell_w).round() as i32)
+            };
+            for ci in &cells[end..] {
+                if ci.bg != self.bg {
+                    backgrounds.push((x_at(ci.col), width, ci.bg));
+                    if let Some((pane, row)) = self.mapping_context {
+                        self.cell_geometry.entry((pane, row, ci.col)).or_default()
+                            .push((x_at(ci.col), width, rtl));
+                    }
+                }
+            }
+            if let Some(col) = cursor_col.filter(|col| *col >= end_col) {
+                mapped_cursor = Some((x_at(col), width));
+            }
+        }
+        backgrounds.sort_unstable();
+        backgrounds.dedup();
+        for (left, width, bg) in backgrounds {
+            push_rect(out, clip, left, y, width, self.cell_h.ceil() as i32, c4(bg, 255));
+        }
+        self.draw_run(&segs, true, out, clip, text_x0 as f32, y, scale);
+        // decorations through the shaped layout: each byte span becomes the
+        // (possibly several, possibly reordered) glyph rects it occupies
         if !decos.is_empty() {
             let th = (self.cell_h / 14.0).max(1.0) as i32;
-            let key = self.ensure_shaped(&plan.segs, true);
+            let key = self.ensure_shaped(&segs, true);
             let mut rects: Vec<PxDeco> = Vec::new();
             for run in self.cache_hot[&key].buffer.layout_runs() {
                 for &(b0, b1, style, fg) in &decos {
                     let c0 = cosmic_text::Cursor::new(0, b0);
                     let c1 = cosmic_text::Cursor::new(0, b1);
                     for (hx, hw) in run.highlight(c0, c1) {
-                        rects.push((
-                            x0 + (hx * scale).round() as i32,
-                            x0 + ((hx + hw) * scale).round() as i32,
-                            style,
-                            fg,
-                        ));
+                        let dx0 = text_x0 + (hx * scale).round() as i32;
+                        let dx1 = text_x0 + ((hx + hw) * scale).round() as i32;
+                        rects.push((dx0, dx1, style, fg));
                     }
                 }
             }
@@ -1421,44 +1646,11 @@ impl Renderer {
                 }
             }
         }
-        // Hover underline follows the shaped glyphs. Column * cell_w would
-        // land on the wrong side of an RTL row — the same reason the cursor
-        // and the click go through this buffer.
-        if let Some((h0, h1)) = hover {
-            let key = self.ensure_shaped(&plan.segs, true);
-            let glyphs = {
-                let buffer = &self.cache_hot[&key].buffer;
-                let mut glyphs = Vec::new();
-                for run in buffer.layout_runs() {
-                    for g in run.glyphs.iter() {
-                        glyphs.push(crate::mouse::GlyphSpan {
-                            x: g.x,
-                            w: g.w,
-                            start: g.start,
-                            end: g.end,
-                            rtl: g.level.is_rtl(),
-                        });
-                    }
-                }
-                glyphs
-            };
-            let boxes = crate::mouse::boxes_for_glyphs(&glyphs, scale, |byte| {
-                crate::mouse::col_for_byte(&plan.byte_cols, byte)
-            });
-            let th = (self.cell_h / 14.0).max(1.0) as i32;
-            let uy = y + self.cell_h.round() as i32 - th - 1;
-            for b in boxes {
-                if b.col >= h0 && b.col < h1 && b.x1 > b.x0 {
-                    let x = x0 + b.x0.round() as i32;
-                    let w = (b.x1 - b.x0).round().max(1.0) as i32;
-                    push_rect(out, clip, x, uy, w, th, c4(LINK_UNDER, 255));
-                }
-            }
-        }
-        if let Some((b0, b1)) = plan.cursor_bytes {
+        if mapped_cursor.is_some() { return mapped_cursor; }
+        if let Some((b0, b1)) = cur_bytes {
             let c0 = cosmic_text::Cursor::new(0, b0);
             let c1 = cosmic_text::Cursor::new(0, b1);
-            let key = self.ensure_shaped(&plan.segs, true);
+            let key = self.ensure_shaped(&segs, true);
             for run in self.cache_hot[&key].buffer.layout_runs() {
                 // 0.19: highlight yields per-segment rects — merge to one
                 let merged = run.highlight(c0, c1).fold(None, |acc, (x, w)| {
@@ -1501,7 +1693,7 @@ impl Renderer {
         let infos: Vec<CellInfo> = cells
             .iter()
             .map(|c| {
-                let (fg, _bg, style) = self.cell_paint(c.fg, c.bg, c.flags);
+                let (fg, bg, style) = self.cell_paint(c.fg, c.bg, c.flags);
                 CellInfo {
                     col: c.col,
                     w: c.w,
@@ -1512,6 +1704,7 @@ impl Renderer {
                         Some(c.zw.clone())
                     },
                     fg,
+                    bg,
                     style,
                 }
             })
@@ -1559,8 +1752,12 @@ impl Renderer {
     /// ASCII batches into runs pinned at col*cell_w; every other glyph draws
     /// per cell, compressed into its box when wider.
     fn draw_line_grid(&mut self, out: &mut Vec<Vertex>, clip: Rect,
-                      x0: i32, y: i32, cells: &[CellInfo],
-                      hover: Option<(usize, usize)>) {
+                      x0: i32, y: i32, cells: &[CellInfo], hover: Option<(usize, usize)>) {
+        for ci in cells.iter().filter(|c| c.bg != self.bg) {
+            let left = x0 + (ci.col as f32 * self.cell_w).round() as i32;
+            let right = x0 + ((ci.col + ci.w) as f32 * self.cell_w).round() as i32;
+            push_rect(out, clip, left, y, right - left, self.cell_h.ceil() as i32, c4(ci.bg, 255));
+        }
         let n = cells.len();
         let mut i = 0;
         // underline/strikethrough decorations: (col_start, col_end, style, fg)
@@ -1665,10 +1862,75 @@ impl Renderer {
         }
     }
 
+    /// TUIs position separate labels and borders by terminal columns. Keep
+    /// those anchors while shaping each text field (including Arabic) together.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_line_tui(&mut self, out: &mut Vec<Vertex>, clip: Rect,
+                     x0: i32, y: i32, cells: &[CellInfo], claude: bool,
+                     cursor_col: Option<usize>, dir: ParagraphDir,
+                     hover: Option<(usize, usize)>) -> Option<(i32, i32)> {
+        let prompt_col = cells.iter().find(|c| c.c != ' ')
+            .filter(|c| matches!(c.c, '>' | '❯' | '›')).map(|c| c.col);
+        let logical_prompt = claude && prompt_col.is_some_and(|col|
+            cells.iter().any(|c| c.col == col + 1 && c.c == '\u{a0}'));
+        let border = |c: &CellInfo| Some(c.col) == prompt_col
+            || (logical_prompt && prompt_col.is_some_and(|col| c.col == col + 1))
+            || matches!(c.c, '\u{2500}'..='\u{259f}' | '\u{e000}'..='\u{f8ff}');
+        let mut i = 0;
+        let mut cursor = None;
+        while i < cells.len() {
+            if cells[i].c == ' ' && !(logical_prompt && i > 0 && cells[i - 1].c == '\u{a0}') {
+                self.draw_line_grid(out, clip, x0, y, &cells[i..i + 1], hover);
+                i += 1;
+                continue;
+            }
+            if border(&cells[i]) {
+                self.draw_line_grid(out, clip, x0, y, &cells[i..i + 1], hover);
+                i += 1;
+                continue;
+            }
+            let start = i;
+            i += 1;
+            while i < cells.len() {
+                if border(&cells[i])
+                    || cells[i].col != cells[i - 1].col + cells[i - 1].w
+                    || (cells[i].c == ' ' && cells[i].bg == self.bg
+                        && cells.get(i + 1).is_some_and(|c| c.c == ' ' && c.bg == self.bg))
+                {
+                    break;
+                }
+                i += 1;
+            }
+            let field = &cells[start..i];
+            if field.iter().any(|c| is_arabic(c.c)) {
+                let left = (field[0].col as f32 * self.cell_w).round() as i32;
+                let last = &field[field.len() - 1];
+                let right = ((last.col + last.w) as f32 * self.cell_w).round() as i32;
+                let field_left = (x0 + left).max(clip.0);
+                let field_right = (x0 + right).min(clip.0 + clip.2);
+                // Keep vertical headroom for tashkeel; only the field's
+                // horizontal boundary is tighter than the enclosing pane.
+                let field_clip = (field_left, clip.1, (field_right - field_left).max(0), clip.3);
+                let field_cursor = cursor_col.filter(|col| *col >= field[0].col && *col <= last.col + last.w);
+                let source_cursor = if logical_prompt {
+                    field_cursor.and_then(|col| claude_logical_cursor_cell(field, col - field[0].col))
+                        .or(field_cursor)
+                } else { field_cursor };
+                let mapped = self.draw_line_bidi(out, field_clip, x0 + left, y,
+                    right - left, field, claude, source_cursor, dir, hover);
+                cursor = mapped.or(cursor);
+            } else {
+                self.draw_line_grid(out, clip, x0, y, field, hover);
+            }
+        }
+        cursor
+    }
+
     /// Draw one pane's terminal into its rect.
     pub fn draw_pane<T: alacritty_terminal::event::EventListener>(
         &mut self, out: &mut Vec<Vertex>, view: &PaneView, term: &Term<T>,
     ) {
+        self.cell_geometry.retain(|(pane, _, _), _| *pane != view.rect);
         let (px, py, pw, ph) = view.rect;
         let clip = view.rect;
         let rows = term.screen_lines();
@@ -1711,13 +1973,6 @@ impl Renderer {
             } else {
                 cell.c
             };
-            if bg != self.bg {
-                let x0 = px + (col as f32 * self.cell_w).round() as i32;
-                let x1 = px + ((col + w) as f32 * self.cell_w).round() as i32;
-                let y0 = py + (li as f32 * self.cell_h).round() as i32;
-                let y1 = py + ((li + 1) as f32 * self.cell_h).round() as i32;
-                push_rect(out, clip, x0, y0, x1 - x0, y1 - y0, c4(bg, 255));
-            }
             if selection.is_some_and(|s| s.contains(cell.point)) {
                 sel_cells.push((li, col, w));
             }
@@ -1728,13 +1983,14 @@ impl Renderer {
                 hit_cells.push((li, col, w));
             }
             let zw = cell.zerowidth().map(|z| z.to_vec());
-            lines[li].push(CellInfo { col, w, c: ch, zw, fg, style });
+            lines[li].push(CellInfo { col, w, c: ch, zw, fg, bg, style });
         }
 
         let cursor_vrow = cursor.point.line.0 + off;
         let ccol = cursor.point.column.0;
         let mut cursor_rect: Option<(i32, i32)> = None; // (x, w) via shaped layout
         for (li, cells) in lines.iter().enumerate() {
+            self.mapping_context = Some((view.rect, li));
             if cells.is_empty() {
                 continue;
             }
@@ -1747,14 +2003,17 @@ impl Renderer {
             // run UAX#9 and does not reshape. Implicit mode keeps the
             // whole-line shaper, with SCP's base direction if one was set.
             let arabic = cells.iter().any(|ci| is_arabic(ci.c));
+            let row_claude = view.claude && view.claude_from.is_none_or(|start| li as i64 >= start);
             if arabic && view.reorder {
                 let on_row = cursor_vrow >= 0 && cursor_vrow as usize == li;
                 let dir = view.line_dir.get(li).copied().unwrap_or_default();
-                let r = self.draw_line_bidi(out, clip, px, y, pw, cells,
-                                            view.claude,
-                                            if on_row { Some(ccol) } else { None },
-                                            dir,
-                                            hover);
+                let col = if on_row { Some(ccol) } else { None };
+                let r = if (row_claude || term.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN))
+                    && is_tui_row(cells) {
+                    self.draw_line_tui(out, clip, px, y, cells, row_claude, col, dir, hover)
+                } else {
+                    self.draw_line_bidi(out, clip, px, y, pw, cells, row_claude, col, dir, hover)
+                };
                 if r.is_some() {
                     cursor_rect = r;
                 }
@@ -1762,11 +2021,20 @@ impl Renderer {
                 self.draw_line_grid(out, clip, px, y, cells, hover);
             }
         }
+        self.mapping_context = None;
+        self.finish_pane_layout(view.rect);
 
         // translucent overlays above the text (EasyTer's stacking): selection
         // blue, current search hit amber
         for (cells, ((r, g, b), a)) in [(&sel_cells, SELECTION_RGBA), (&hit_cells, SEARCH_RGBA)] {
             for &(li, col, w) in cells.iter() {
+                if let Some(spans) = self.cell_geometry.get(&(view.rect, li, col)) {
+                    let y0 = py + (li as f32 * self.cell_h).round() as i32;
+                    for &(x0, width, _) in spans {
+                        push_rect(out, clip, x0, y0, width, self.cell_h.ceil() as i32, c4((r, g, b), a as u8));
+                    }
+                    continue;
+                }
                 let x0 = px + (col as f32 * self.cell_w).round() as i32;
                 let x1 = px + ((col + w) as f32 * self.cell_w).round() as i32;
                 let y0 = py + (li as f32 * self.cell_h).round() as i32;
@@ -1778,7 +2046,9 @@ impl Renderer {
         // cursor: only the focused pane shows it (the block is translucent,
         // so the glyph stays legible); grid rows are column-exact, Arabic
         // rows map through the shaped layout
-        if view.focused && view.cursor_on && cursor_vrow >= 0 && (cursor_vrow as usize) < rows {
+        if view.focused && view.cursor_on
+            && cursor.shape != alacritty_terminal::vte::ansi::CursorShape::Hidden
+            && cursor_vrow >= 0 && (cursor_vrow as usize) < rows {
             let (x0, wpx) = cursor_rect.unwrap_or((
                 px + (ccol as f32 * self.cell_w).round() as i32,
                 self.cell_w.round() as i32,
@@ -1895,7 +2165,7 @@ impl Renderer {
 
     /// Cockpit panel geometry (shared with the app's click hit-test).
     pub fn cockpit_rect(&self, fw: usize, fh: usize, n: usize) -> Rect {
-        let w = ((self.cell_w * 64.0) as i32).min(fw as i32 - 60);
+        let w = ((self.ui_cell_w() * 64.0) as i32).min(fw as i32 - 60);
         let row_h = self.cockpit_row_h();
         let header = row_h + 6;
         let h = header + row_h * n.max(1) as i32 + 14;
@@ -1905,7 +2175,7 @@ impl Renderer {
     }
 
     pub fn cockpit_row_h(&self) -> i32 {
-        (self.cell_h + 12.0) as i32
+        (self.ui_cell_h() + 12.0) as i32
     }
 
     /// Which cockpit row a pixel position lands on.
@@ -2001,19 +2271,19 @@ impl Renderer {
         // The ledger grammar: every row is [control]···dotted leader···[label],
         // controls left, labels right (RTL), one shared control height.
         let pad = 24;
-        let w = ((self.cell_w * 52.0) as i32).clamp(430, fw as i32 - 60);
-        let rowh = (self.cell_h + 20.0) as i32; // 12 rows now — keep them tight
-        let ctl = rowh - 10; // every square control is this tall
-        let head_h = (self.cell_h + 30.0) as i32;
-        let foot_h = (self.cell_h + 30.0) as i32;
+        let w = ((self.ui_cell_w() * 52.0) as i32).clamp(430, fw as i32 - 60);
+        let rowh = (self.ui_cell_h() + 12.0 * self.dpi_scale) as i32;
+        let ctl = rowh - 4;
+        let head_h = (self.ui_cell_h() + 18.0 * self.dpi_scale) as i32;
+        let foot_h = (self.ui_cell_h() + 18.0 * self.dpi_scale) as i32;
         // the theme row obeys the same grammar: tiles left, label right,
         // so the strip leaves room for the "المظهر" label
-        let label_reserve = (self.cell_w * 6.0) as i32;
+        let label_reserve = (self.ui_cell_w() * 6.0) as i32;
         // sized by the ACTUAL tile count (built-ins + plugin themes), or the
         // strip overruns the label once a theme is added
         let n_tiles = gallery().len().max(1) as i32;
         let tile_w = ((w - pad * 2 - label_reserve - 6 * (n_tiles - 1)) / n_tiles).max(30);
-        let tile_h = (self.cell_h * 1.6) as i32;
+        let tile_h = (self.ui_cell_h() * 1.3) as i32;
         let theme_rowh = tile_h + 14;
         let h = head_h + 6 + theme_rowh + rowh * 14 + foot_h;
         let x = (fw as i32 - w) / 2;
@@ -2021,8 +2291,8 @@ impl Renderer {
             .max(self.tab_bar_h() as i32 + 12);
 
         // the shortcuts-editor button lives in the header, left side
-        let sb_w = (self.cell_w * 12.0) as i32;
-        let shortcuts_btn = (x + pad, y + 10, sb_w, (self.cell_h + 8.0) as i32);
+        let sb_w = (self.ui_cell_w() * 12.0) as i32;
+        let shortcuts_btn = (x + pad, y + 10, sb_w, (self.ui_cell_h() + 8.0) as i32);
 
         let theme_y = y + head_h + 6 + (theme_rowh - tile_h) / 2;
         let theme_tiles: Vec<Rect> = (0..gallery().len() as i32)
@@ -2035,13 +2305,13 @@ impl Renderer {
 
         // font family: [‹] name [›]
         let font_y = row_y(0);
-        let name_w = (self.cell_w * 17.0) as i32;
+        let name_w = (self.ui_cell_w() * 17.0) as i32;
         let font_prev = (x + pad, cy(font_y), ctl, ctl);
         let font_next = (x + pad + ctl + name_w, cy(font_y), ctl, ctl);
 
         // font size: [−  15  +]
         let size_y = row_y(1);
-        let size_slot = (self.cell_w * 4.0) as i32;
+        let size_slot = (self.ui_cell_w() * 4.0) as i32;
         let size_minus = (x + pad, cy(size_y), ctl, ctl);
         let size_plus = (x + pad + ctl + size_slot, cy(size_y), ctl, ctl);
 
@@ -2050,7 +2320,7 @@ impl Renderer {
         let cursor_btns = [0, 1, 2].map(|i| (x + pad + i * (ctl + 8), cy(cursor_y), ctl, ctl));
 
         // toggle pills (wide and shallow, so the track reads as a switch)
-        let pill_w = (self.cell_w * 4.2) as i32;
+        let pill_w = (self.ui_cell_w() * 4.2) as i32;
         let pill_h = ctl - 8;
         let pcy = |ry: i32| ry + (rowh - pill_h) / 2;
         let blink_y = row_y(3);
@@ -2058,17 +2328,17 @@ impl Renderer {
 
         // scrollback: [−  10k  +]
         let scroll_y = row_y(4);
-        let scroll_slot = (self.cell_w * 5.0) as i32;
+        let scroll_slot = (self.ui_cell_w() * 5.0) as i32;
         let scroll_minus = (x + pad, cy(scroll_y), ctl, ctl);
         let scroll_plus = (x + pad + ctl + scroll_slot, cy(scroll_y), ctl, ctl);
 
         // padding / opacity: the same stepper shape
         let pad_y = row_y(5);
-        let pad_slot = (self.cell_w * 4.0) as i32;
+        let pad_slot = (self.ui_cell_w() * 4.0) as i32;
         let pad_minus = (x + pad, cy(pad_y), ctl, ctl);
         let pad_plus = (x + pad + ctl + pad_slot, cy(pad_y), ctl, ctl);
         let opacity_y = row_y(6);
-        let op_slot = (self.cell_w * 5.0) as i32;
+        let op_slot = (self.ui_cell_w() * 5.0) as i32;
         let opacity_minus = (x + pad, cy(opacity_y), ctl, ctl);
         let opacity_plus = (x + pad + ctl + op_slot, cy(opacity_y), ctl, ctl);
 
@@ -2079,7 +2349,7 @@ impl Renderer {
 
         // bell: a three-segment control (all options visible, one active)
         let bell_y = row_y(9);
-        let seg_w = (self.cell_w * 4.6) as i32;
+        let seg_w = (self.ui_cell_w() * 4.6) as i32;
         let bell_btns = [0, 1, 2].map(|i| (x + pad + i * (seg_w + 6), cy(bell_y), seg_w, ctl));
 
         // native-toast toggle (M19)
@@ -2088,7 +2358,7 @@ impl Renderer {
 
         // shell cycler (new tabs only) — same shape as the font cycler
         let shell_y = row_y(11);
-        let shell_w = (self.cell_w * 12.0) as i32;
+        let shell_w = (self.ui_cell_w() * 12.0) as i32;
         let shell_prev = (x + pad, cy(shell_y), ctl, ctl);
         let shell_next = (x + pad + ctl + shell_w, cy(shell_y), ctl, ctl);
 
@@ -2405,10 +2675,10 @@ impl Renderer {
     /// Geometry of the shortcuts editor: one full-width clickable strip per
     /// action row (draw + hit-test agree, like the settings panel).
     pub fn shortcuts_layout(&self, fw: usize, fh: usize, n: usize) -> ShortcutsLayout {
-        let w = ((self.cell_w * 44.0) as i32).clamp(380, fw as i32 - 60);
-        let rowh = (self.cell_h + 18.0) as i32;
-        let head_h = (self.cell_h + 30.0) as i32;
-        let foot_h = (self.cell_h + 30.0) as i32;
+        let w = ((self.ui_cell_w() * 44.0) as i32).clamp(380, fw as i32 - 60);
+        let rowh = (self.ui_cell_h() + 18.0) as i32;
+        let head_h = (self.ui_cell_h() + 30.0) as i32;
+        let foot_h = (self.ui_cell_h() + 30.0) as i32;
         let h = head_h + 6 + rowh * n as i32 + foot_h;
         let x = (fw as i32 - w) / 2;
         let y = (self.tab_bar_h() as i32 + (fh as i32 - h) / 3)
@@ -2676,18 +2946,78 @@ impl Renderer {
     pub fn draw_close_guard(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
                             msg: &str) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
-        push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 110));
-        let w = ((self.cell_w * 56.0) as i32).min(fw as i32 - 60);
-        let h = (self.cell_h * 2.0 + 24.0) as i32;
-        let x = (fw as i32 - w) / 2;
-        let y = self.tab_bar_h() as i32 + (fh as i32 - h) / 4;
+        let layout = self.close_guard_layout(fw, fh);
+        let (x, y, w, h) = layout.card;
+        push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 165));
+        push_rect(out, whole, x - 3, y - 3, w + 6, h + 6, c4((0x0d, 0x11, 0x14), 255));
         push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 255));
-        push_rect(out, whole, x, y, w, 2, c4((0xf2, 0xcc, 0x60), 255)); // warn accent
-        let l1 = [Seg { text: msg.into(), fg: self.fg, style: ST_BOLD }];
-        self.draw_run(&l1, true, out, whole, (x + 14) as f32, y + 8, 1.0);
-        let l2 = [Seg::plain("Enter إغلاق   ·   Esc إبقاء", (0x9a, 0xa4, 0xb2))];
-        self.draw_run(&l2, true, out, whole, (x + 14) as f32,
-                      y + 12 + self.cell_h as i32, 1.0);
+        push_rect(out, whole, x, y, w, 3, c4((0xf2, 0xcc, 0x60), 255));
+        let inner = layout.text;
+        for (text, row, bold) in [
+            (msg, 0, true),
+            ("الإغلاق سيوقف الأوامر الجارية.", 1, false),
+        ] {
+            if row == 1 && inner.3 < (self.cell_h * 2.0).ceil() as i32 + 8 { continue; }
+            let text = self.guard_label(text, inner.2 as f32);
+            let seg = [Seg { text, fg: self.fg, style: if bold { ST_BOLD } else { 0 } }];
+            let tw = self.measure(&seg, true);
+            self.draw_run(&seg, true, out, inner, (x + w - 16) as f32 - tw,
+                y + 16 + row * (self.cell_h.ceil() as i32 + 8), 1.0);
+        }
+        for (rect, label, color) in [
+            (layout.close, "إغلاق · Enter", (0x9e, 0x32, 0x32)),
+            (layout.keep, "إبقاء · Esc", (0x30, 0x40, 0x50)),
+        ] {
+            let (bx, by, bw, bh) = rect;
+            push_rect(out, whole, bx, by, bw, bh, c4(color, 255));
+            let label = self.guard_label(label, (bw - 12).max(1) as f32);
+            let seg = [Seg::plain(label, (0xee, 0xfb, 0xfa))];
+            let tw = self.measure(&seg, true);
+            self.draw_run(&seg, true, out, rect, bx as f32 + (bw as f32 - tw) / 2.0,
+                by + (bh - self.cell_h.ceil() as i32) / 2, 1.0);
+        }
+    }
+
+    /// Bound command previews without squeezing the Arabic glyphs.
+    fn guard_label(&mut self, text: &str, width: f32) -> String {
+        let chars: Vec<char> = text.chars().take(160).collect();
+        let label: String = chars.iter().collect();
+        let measure = |r: &mut Self, text: &str| {
+            r.measure(&[Seg { text: text.into(), fg: r.fg, style: ST_BOLD }], true)
+        };
+        if label.len() == text.len() && measure(self, &label) <= width { return label; }
+        let (mut lo, mut hi) = (0, chars.len());
+        let mut best = String::new();
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2;
+            let candidate = format!("{}…", chars[..mid].iter().collect::<String>());
+            if measure(self, &candidate) <= width {
+                best = candidate;
+                lo = mid + 1;
+            } else if mid == 0 {
+                break;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        best
+    }
+
+    /// Drawing and pointer input share these exact rectangles.
+    pub fn close_guard_layout(&self, fw: usize, fh: usize) -> CloseGuardLayout {
+        let w = (self.ui_cell_w() * 58.0).round() as i32;
+        let w = w.max(320).min((fw as i32 - 32).max(1));
+        let h = (self.ui_cell_h() * 4.0 + 80.0).round() as i32;
+        let h = h.min((fh as i32 - 32).max(1));
+        let (x, y) = ((fw as i32 - w) / 2, (fh as i32 - h) / 2);
+        let bw = (w - 44) / 2;
+        let bh = (self.ui_cell_h().ceil() as i32 + 20).max(44);
+        CloseGuardLayout {
+            card: (x, y, w, h),
+            text: (x + 16, y + 16, (w - 32).max(1), (h - bh - 48).max(0)),
+            close: (x + 16, y + h - bh - 16, bw, bh),
+            keep: (x + w - bw - 16, y + h - bh - 16, bw, bh),
+        }
     }
 
     /// A link card. `may_open` is the confirm card (mint bar, Enter opens).
@@ -2831,22 +3161,6 @@ impl Renderer {
         let oy = self.tab_bar_h().round() as i32;
         let whole: Rect = (0, 0, width as i32, height as i32);
 
-        // Claude-mode badge, top-right below the tab bar (EasyTer's green badge)
-        if claude {
-            let segs = [Seg::plain("● وضع كلود", (0xff, 0xff, 0xff))];
-            let tw = self.measure(&segs, true);
-            let bw = tw as i32 + 16;
-            let bh = (self.cell_h + 8.0) as i32;
-            let bx = width as i32 - bw - 10;
-            let by = oy + if search_query.is_some() {
-                (self.cell_h + 24.0) as i32
-            } else {
-                6
-            };
-            push_rect(out, whole, bx, by, bw, bh, c4((0x2e, 0xa0, 0x43), 255));
-            self.draw_run(&segs, true, out, whole, (bx + 8) as f32, by + 4, 1.0);
-        }
-
         // search bar, top-right below the tab bar
         if let Some(q) = search_query {
             let bar_w = (self.cell_w * 34.0) as i32;
@@ -2865,18 +3179,18 @@ impl Renderer {
         if self.bar_hidden {
             return;
         }
-        let bar_bg = ((self.bg.0 as f32 * 0.55) as u8,
-                      (self.bg.1 as f32 * 0.55) as u8,
-                      (self.bg.2 as f32 * 0.55) as u8);
+        let bar_bg = ((self.bg.0 as f32 * 0.80) as u8,
+                      (self.bg.1 as f32 * 0.80) as u8,
+                      (self.bg.2 as f32 * 0.80) as u8);
         push_rect(out, whole, 0, 0, width as i32, oy, c4(bar_bg, 255));
+        push_rect(out, whole, 0, oy - 1, width as i32, 1, c4(self.fg, 28));
         // widths follow the titles now (M26): a fixed 24 cells left "Admin"
         // swimming in three times its own width. Clamped at both ends so a
         // long path can't eat the bar and a short name stays clickable.
-        let mut x_run = 0i32;
-        for tab in tabs.iter() {
-            let tw = self.tab_width(&tab.title);
-            let x0 = x_run;
-            x_run += tw;
+        let titles: Vec<_> = tabs.iter().map(|t| t.title.as_str()).collect();
+        let active = tabs.iter().position(|t| t.active).unwrap_or(0);
+        for (i, x0, tw) in self.tab_rects(width, &titles, active) {
+            let tab = &tabs[i];
             // The active tab takes the CONTENT background, so it reads as the
             // top of the pane below it rather than as a highlighted list row.
             // Inactive tabs recede into the bar instead of floating above it.
@@ -2884,18 +3198,19 @@ impl Renderer {
                 ((c.0 as f32 * f) as u8, (c.1 as f32 * f) as u8, (c.2 as f32 * f) as u8)
             };
             let (bg, fg): ((u8, u8, u8), (u8, u8, u8)) = if tab.active {
-                (self.bg, self.fg)
+                ((self.bg.0.saturating_add(14), self.bg.1.saturating_add(14), self.bg.2.saturating_add(14)), self.fg)
             } else {
-                (dim(self.bg, 0.72), dim(self.fg, 0.55))
+                (bar_bg, dim(self.fg, 0.75))
             };
             // tabs sit IN the bar rather than filling it: a 3px gutter above
             // and a real gap between them, so they read as separate cards
-            const TAB_GAP: i32 = 6;
-            const TAB_TOP: i32 = 3;
-            let tx = x0 + TAB_GAP / 2;
-            let tabw = tw - TAB_GAP;
-            push_rect_top_rounded(out, whole, tx, TAB_TOP, tabw, oy - TAB_TOP, c4(bg, 255));
-            if tab.active {
+            const TAB_GAP: i32 = 10;
+            const TAB_TOP: i32 = 7;
+            let gap = TAB_GAP.min(tw.saturating_sub(1));
+            let tx = x0 + gap / 2;
+            let tabw = tw - gap;
+            push_rect_top_rounded(out, whole, tx, TAB_TOP, tabw, oy - TAB_TOP - 4, c4(bg, 255));
+            if tab.active && tabw >= 12 {
                 // a hairline that hugs the curve — enough to mark focus without
                 // shouting; the background match already does most of the work
                 for (i, inset) in CORNER_INSET.iter().enumerate().take(2) {
@@ -2903,10 +3218,11 @@ impl Renderer {
                               tabw - 2 * inset, 1, c4((0x2e, 0xa0, 0x43), 220));
                 }
             }
-            let max_chars = (tw as f32 / self.cell_w) as usize - 4;
+            let max_chars = ((tw as f32 / self.cell_w) as usize).saturating_sub(4);
             let title: String = tab.title.chars().take(max_chars).collect();
             let segs = [Seg::plain(title, fg)];
-            self.draw_run(&segs, true, out, whole, (tx + 10) as f32, 6, 1.0);
+            self.draw_run(&segs, true, out, (tx, TAB_TOP, tabw, oy - TAB_TOP),
+                (tx + 12) as f32, (oy - self.cell_h.ceil() as i32) / 2, 1.0);
             // dots: amber attention (a Claude waiting on you) beats green busy
             let dot = if tab.attention {
                 Some((0xf2, 0xcc, 0x60))
@@ -2915,13 +3231,13 @@ impl Renderer {
             } else {
                 None
             };
-            if let Some(c) = dot {
+            if let Some(c) = dot.filter(|_| tw >= 28) {
                 let d = 6;
                 push_rect(out, whole, tx + tabw - 14, (oy + 3) / 2 - d / 2, d, d, c4(c, 255));
             }
             // progress: a 3px bar along the bottom edge, its track dimmed and
             // its fill at the reported percent (full-width dim = indeterminate)
-            if let Some(p) = tab.progress {
+            if let Some(p) = tab.progress.filter(|_| tw >= 28) {
                 let (bx, bw, by, bh) = (tx + 6, tabw - 12, oy - 3, 3);
                 let c = progress_color(p);
                 push_rect(out, whole, bx, by, bw, bh, c4(c, 70));
@@ -2932,6 +3248,27 @@ impl Renderer {
                 let alpha = if p.state == crate::term::ProgressState::Indeterminate { 140 } else { 255 };
                 push_rect(out, whole, bx, by, fill, bh, c4(c, alpha));
             }
+        }
+
+        if claude {
+            let label = [Seg::plain("● Claude", (0x7e, 0xe7, 0x87))];
+            let tw = self.measure(&label, false);
+            let x = self.tab_controls(width)[0].0 - tw.ceil() as i32 - 18;
+            let end = self.tab_rects(width, &titles, active).last().map_or(0, |r| r.1 + r.2);
+            if x >= end + 12 {
+                self.draw_run(&label, false, out, whole, x as f32,
+                    (oy - self.cell_h.ceil() as i32) / 2, 1.0);
+            }
+        }
+
+        for (rect, glyph) in self.tab_controls(width).iter().zip(["‹", "›", "+"]) {
+            let (bx, by, bw, bh) = *rect;
+            push_rect(out, whole, bx, by, bw, bh, c4(bar_bg, 255));
+            let seg = [Seg::plain(glyph, self.fg)];
+            let gw = self.measure(&seg, false);
+            self.draw_run(&seg, false, out, whole,
+                bx as f32 + (bw as f32 - gw) / 2.0,
+                by + bh / 2 - self.cell_h as i32 / 2, 1.0);
         }
 
         // window controls, drawn by us because the OS title bar is gone
@@ -2967,13 +3304,51 @@ impl Renderer {
         let seg = [Seg::plain("⚙", (0xb6, 0xc2, 0xcf))];
         let gw = self.measure(&seg, false);
         self.draw_run(&seg, false, out, whole,
-                      bx as f32 + (bw as f32 - gw) / 2.0, by + 3, 1.0);
+                      bx as f32 + (bw as f32 - gw) / 2.0,
+                      by + (bh - self.cell_h.ceil() as i32) / 2, 1.0);
     }
 
     /// Width of one caption button. Windows uses 46dip; match it so the
     /// controls feel native even though we draw them.
     pub fn caption_btn_w(&self) -> i32 {
-        (self.cell_w * 3.2).max(40.0) as i32
+        (self.ui_cell_w() * 3.2).max(46.0 * self.dpi_scale) as i32
+    }
+
+    /// Previous tab, next tab, and new tab; reserve this area before layout.
+    pub fn tab_controls(&self, width: usize) -> [Rect; 3] {
+        let (gear_x, _, bw, _) = self.settings_button_rect(width);
+        let h = self.tab_bar_h().round() as i32;
+        std::array::from_fn(|i| (gear_x - (3 - i as i32) * bw, 0, bw, h))
+    }
+
+    pub fn tab_control_hit(&self, width: usize, px: f64, py: f64) -> Option<usize> {
+        if self.bar_hidden { return None; }
+        self.tab_controls(width).iter().position(|&(x, y, w, h)|
+            px >= x as f64 && px < (x + w) as f64
+                && py >= y as f64 && py < (y + h) as f64)
+    }
+
+    /// A shared viewport for rendering and hit testing. Keep the active tab
+    /// visible, then fit its neighbours without entering the controls area.
+    pub fn tab_rects(&self, width: usize, titles: &[&str], active: usize) -> Vec<(usize, i32, i32)> {
+        let available = self.tab_controls(width)[0].0.max(0);
+        if titles.is_empty() || available == 0 { return Vec::new(); }
+        let active = active.min(titles.len() - 1);
+        let mut start = active;
+        let mut used = self.tab_width(titles[active]).min(available);
+        while start > 0 && used + self.tab_width(titles[start - 1]) <= available {
+            start -= 1;
+            used += self.tab_width(titles[start]);
+        }
+        let mut x = 0;
+        let mut rects = Vec::new();
+        for (i, title) in titles.iter().enumerate().skip(start) {
+            let w = self.tab_width(title).min(available);
+            if x + w > available { break; }
+            rects.push((i, x, w));
+            x += w;
+        }
+        rects
     }
 
     /// minimise, maximise, close — left to right, flush to the top-right.
@@ -3009,6 +3384,240 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_remain_readable_when_terminal_font_is_eight() {
+        let cfg = crate::config::UserConfig { font_size: Some(8.0), ..Default::default() };
+        let mut small = Renderer::new(1.0, &cfg, 0.0);
+        let normal = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let layout = small.settings_layout(1100, 700);
+        assert_eq!(layout.card, normal.settings_layout(1100, 700).card);
+        assert!(layout.card.1 + layout.card.3 <= 700);
+        let terminal_height = small.cell_h;
+        small.use_ui_metrics(true);
+        assert_eq!(small.metrics.font_size, 16.0);
+        assert!(small.cell_h > terminal_height);
+        small.use_ui_metrics(false);
+        assert_eq!(small.metrics.font_size, 8.0);
+        assert_eq!(small.cell_h, terminal_height);
+    }
+
+    #[test]
+    fn restored_arabic_cursor_and_hit_testing_use_the_same_layout() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let pane = (0, 0, 500, 200);
+        r.mapping_context = Some((pane, 0));
+        let cells = row_cells("ابحرم", 3);
+        let mut out = Vec::new();
+        let cursor = r.draw_line_bidi(&mut out, pane, 30, 40, 300, &cells, true, Some(3), ParagraphDir::Default, None);
+        r.finish_pane_layout(pane);
+        assert!(cursor.is_some(), "restoration must not discard cursor mapping");
+        for ci in &cells {
+            let spans = &r.cell_geometry[&(pane, 0, ci.col)];
+            let (x, w, _) = spans[0];
+            assert_eq!(r.hit_cell(pane, 0, x as f64 + w as f64 / 2.0).map(|hit| hit.0), Some(ci.col));
+        }
+        r.begin_frame();
+        assert!(r.hit_cell(pane, 0, 35.0).is_none(), "no stale hit map after a frame change");
+    }
+
+    #[test]
+    fn claude_cursor_after_arabic_uses_the_logical_end() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let cells = row_cells("ابحرم", 3);
+        let cursor = r.draw_line_bidi(&mut Vec::new(), (0, 0, 500, 200),
+            30, 40, 300, &cells, true, Some(8), ParagraphDir::Default, None).unwrap();
+        assert_eq!(cursor.0, 30 - r.cell_w.round() as i32, "RTL insertion precedes the leftmost glyph");
+    }
+
+    #[test]
+    fn claude_inverse_space_cursor_stays_attached_to_arabic_input() {
+        use alacritty_terminal::{event::VoidListener, term::{Config, Term}, vte::ansi::Processor};
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 40, rows: 3 };
+        let mut t = Term::new(Config::default(), &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        p.advance(&mut t, "> ابحرم\x1b[7m \x1b[0m  \x1b[?25l".as_bytes());
+        let pane = (0, 0, 600, 120);
+        let view = PaneView { rect: pane, focused: true,
+            cursor: crate::config::CursorStyle::Block, cursor_on: true,
+            bordered: false, claude: true, claude_from: None, reorder: true, line_dir: &[],
+            search_match: None, marks: &[], link_hover: None, link_tip: None };
+        r.draw_pane(&mut Vec::new(), &view, &t);
+        let inverse = r.cell_geometry.get(&(pane, 0, 7))
+            .expect("Claude's inverse cursor must use the shaped cell map")[0];
+        assert_eq!(inverse.0, (2.0 * r.cell_w).round() as i32);
+        for col in 2..7 {
+            assert!(r.cell_geometry[&(pane, 0, col)][0].0 >= inverse.0 + inverse.1);
+        }
+    }
+
+    #[test]
+    fn claude_prompt_cursor_uses_logical_offset_with_a_nonbreaking_separator() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        // Captured from the live Claude input: visual cells include a
+        // leading cursor placeholder, but CSI positions the cursor by its
+        // logical offset from column 2, not by the visual cell's column.
+        let cells = row_cells(">  رشؤملاو ةيبرعلا رابتخا", 0);
+        assert_eq!(cells[24].c, 'ا', "fixture must match the live visual cell under CSI's cursor");
+        let cursor = r.draw_line_tui(&mut Vec::new(), (0, 0, 900, 120),
+            0, 40, &cells, true, Some(24), ParagraphDir::Default, None).unwrap();
+        assert!(cursor.0 <= (3.0 * r.cell_w).round() as i32,
+            "end cursor must be at the left edge of Arabic, got {cursor:?}");
+        let home = r.draw_line_tui(&mut Vec::new(), (0, 0, 900, 120),
+            0, 40, &cells, true, Some(2), ParagraphDir::Default, None).unwrap();
+        assert!(home.0 > cursor.0, "Home must reach the logical start on the right");
+    }
+
+    #[test]
+    fn hidden_terminal_cursor_is_not_drawn_over_an_apps_own_cursor() {
+        use alacritty_terminal::{event::VoidListener, term::{Config, Term}, vte::ansi::Processor};
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 30, rows: 3 };
+        let mut t = Term::new(Config::default(), &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        p.advance(&mut t, b"\x1b[?25lclaude");
+        let view = PaneView { rect: (0, 0, 500, 120), focused: true,
+            cursor: crate::config::CursorStyle::Block, cursor_on: true, bordered: false,
+            claude: true, claude_from: None, search_match: None, marks: &[], link_hover: None, link_tip: None,
+            reorder: true, line_dir: &[] };
+        let mut out = Vec::new();
+        r.draw_pane(&mut out, &view, &t);
+        assert!(!out.iter().any(|v| v.color == c4(r.fg, 170)));
+    }
+
+    fn row_cells(text: &str, start: usize) -> Vec<CellInfo> {
+        text.chars().enumerate().map(|(i, c)| CellInfo {
+            col: start + i, w: 1, c, zw: None, fg: FG, bg: BG, style: 0,
+        }).collect()
+    }
+
+    #[test]
+    fn tui_fields_respect_pane_edges_and_leave_vertical_room_for_marks() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let clip = (100, 20, 90, 150);
+        let cells = row_cells("مَرْحَبًا بالعالم", 6);
+        let mut out = Vec::new();
+        r.draw_line_tui(&mut out, clip, 100, 40, &cells, false, None, ParagraphDir::Default, None);
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|v| v.pos[0] >= 100.0 && v.pos[0] <= 190.0
+            && v.pos[1] >= 20.0 && v.pos[1] <= 170.0));
+    }
+
+    #[test]
+    fn prose_with_double_spaces_is_not_classified_as_tui() {
+        assert!(!is_tui_row(&row_cells("مرحبا بالعالم  هذا نثر عربي", 0)));
+        assert!(is_tui_row(&row_cells("│ مرحبا بالعالم │", 0)));
+        assert!(is_tui_row(&row_cells("مرحبا   STATUS", 0)));
+    }
+
+    #[test]
+    fn claude_visual_arabic_field_renders_like_its_logical_text() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let cells = row_cells("ابحرم", 2);
+        let logical = row_cells("مرحبا", 2);
+        let clip = (0, 0, 500, 200);
+        let left = (2.0 * r.cell_w).round() as i32;
+        let width = (7.0 * r.cell_w).round() as i32 - left;
+        let mut actual = Vec::new();
+        r.draw_line_tui(&mut actual, clip, 0, 40, &cells, true, None, ParagraphDir::Default, None);
+        let mut expected = Vec::new();
+        r.draw_line_bidi(&mut expected, (left, 0, width, 200), left, 40,
+            width, &logical, false, None, ParagraphDir::Default, None);
+        assert!(!actual.is_empty());
+        let geometry = |out: Vec<Vertex>| out.into_iter()
+            .map(|v| (v.pos, v.uv, v.color, v.layer)).collect::<Vec<_>>();
+        assert_eq!(geometry(actual), geometry(expected));
+    }
+
+    #[test]
+    fn close_guard_buttons_stay_inside_and_hit_the_drawn_regions() {
+        for scale in [1.0, 1.5, 2.0] {
+            let r = Renderer::new(scale, &crate::config::UserConfig::default(), 0.0);
+            for (fw, fh) in [(300, 400), (800, 600), (1600, 900)] {
+                let lay = r.close_guard_layout(fw, fh);
+                let (x, y, w, h) = lay.card;
+                assert!(x >= 0 && y >= 0 && x + w <= fw as i32 && y + h <= fh as i32);
+                for (rect, confirm) in [(lay.keep, false), (lay.close, true)] {
+                    let (bx, by, bw, bh) = rect;
+                    assert!(bx >= x && by >= y && bw > 0 && bh >= 44);
+                    assert!(bx + bw <= x + w && by + bh <= y + h);
+                    assert_eq!(lay.hit((bx + bw / 2) as f64, (by + bh / 2) as f64), Some(confirm));
+                }
+                assert!(lay.close.0 + lay.close.2 <= lay.keep.0);
+                assert!(lay.text.1 + lay.text.3 <= lay.keep.1);
+                assert_eq!(lay.hit(0.0, 0.0), None);
+            }
+        }
+    }
+
+    #[test]
+    fn close_guard_truncates_long_commands_without_overflow() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let label = r.guard_label(&"أمر طويل جداً mixed-command ".repeat(100), 180.0);
+        assert!(label.ends_with('…'));
+        let seg = [Seg { text: label, fg: r.fg, style: ST_BOLD }];
+        assert!(r.measure(&seg, true) <= 180.0);
+    }
+
+    #[test]
+    fn arabic_tui_text_does_not_move_an_anchored_status() {
+        use alacritty_terminal::{event::VoidListener, term::{Config, Term}, vte::ansi::Processor};
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 80, rows: 4 };
+        let mut status_x = |prefix: &str, claude: bool| {
+            let mut t = Term::new(Config::default(), &size, VoidListener);
+            let bytes = format!("\x1b[?1049h\x1b[2;3H{prefix}\x1b[2;41H\x1b[31mSTATUS");
+            let mut processor: Processor = Processor::new();
+            processor.advance(&mut t, bytes.as_bytes());
+            let view = PaneView {
+                rect: (0, 0, 1000, 120), focused: false,
+                cursor: crate::config::CursorStyle::Block, cursor_on: false,
+                bordered: false, claude, claude_from: None, search_match: None,
+                marks: &[], link_hover: None, link_tip: None, reorder: true, line_dir: &[],
+            };
+            let mut out = Vec::new();
+            r.draw_pane(&mut out, &view, &t);
+            let red = c4(r.ansi_rgb(AnsiColor::Named(NamedColor::Red)), 255);
+            out.iter().filter(|v| v.color == red)
+                .map(|v| v.pos[0]).fold(f32::INFINITY, f32::min)
+        };
+        for claude in [false, true] {
+            let expected = status_x("", claude);
+            let actual = status_x("مرحبا بالعالم", claude);
+            assert!(expected.is_finite() && actual.is_finite());
+            assert!((expected - actual).abs() <= 1.0,
+                "Arabic moved the status from {expected} to {actual}, claude={claude}");
+        }
+    }
+
+    #[test]
+    fn tab_viewport_keeps_active_visible_and_clear_of_controls() {
+        let r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let titles = vec!["a long terminal title"; 20];
+        for width in [400, 800, 1600] {
+            for active in 0..titles.len() {
+                let rects = r.tab_rects(width, &titles, active);
+                assert!(rects.iter().any(|(i, _, _)| *i == active));
+                let limit = r.tab_controls(width)[0].0;
+                for (_, x, w) in rects {
+                    assert!(x >= 0 && w > 0 && x + w <= limit);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tab_controls_hit_the_drawn_buttons_and_hide_with_the_bar() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        for (i, (x, y, w, h)) in r.tab_controls(800).into_iter().enumerate() {
+            assert_eq!(r.tab_control_hit(800, (x + w / 2) as f64, (y + h / 2) as f64), Some(i));
+        }
+        assert_eq!(r.tab_control_hit(800, 10.0, 10.0), None);
+        let (x, y, w, h) = r.tab_controls(800)[2];
+        r.set_bar_hidden(true);
+        assert_eq!(r.tab_control_hit(800, (x + w / 2) as f64, (y + h / 2) as f64), None);
+    }
 
     /// Arabic must shape to real glyphs (no .notdef) through the fallback
     /// chain — this is Bayan's reason to exist. If this fails, the renderer
@@ -3223,6 +3832,7 @@ mod tests {
                     c,
                     zw: None,
                     fg: (0, 0, 0),
+                    bg: BG,
                     style: 0,
                 })
                 .collect()
@@ -3252,6 +3862,7 @@ mod tests {
             c: ' ',
             zw: None,
             fg: (0, 0, 0),
+            bg: BG,
             style: 0,
         });
         let plan = bidi_plan(&padded, false, (1, 1, 1), Some(0), ParagraphDir::Default).unwrap();
@@ -3343,8 +3954,8 @@ mod cache_tests {
         let normal = r.tab_width("Admin");
         let huge = r.tab_width(&"x".repeat(200));
         // clamped at both ends
-        assert_eq!(short, (r.cell_w * TAB_MIN_CELLS) as i32, "short titles hit the floor");
-        assert_eq!(huge, (r.cell_w * TAB_CELLS) as i32, "long titles hit the ceiling");
+        assert_eq!(short, (r.ui_cell_w() * TAB_MIN_CELLS) as i32, "short titles hit the floor");
+        assert_eq!(huge, (r.ui_cell_w() * TAB_CELLS) as i32, "long titles hit the ceiling");
         // and vary in between, which is the whole point of M26
         assert!(normal > short && normal < huge, "Admin={normal} short={short} huge={huge}");
         // monotonic: a longer title is never narrower
@@ -3456,7 +4067,7 @@ mod cache_tests {
     fn a_theme_changes_the_renderer_colors() {
         // default theme = بيان (dark GitHub-ish)
         let def = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
-        assert_eq!(def.bg, THEMES[0].bg);
+        assert_eq!(def.bg, theme_by_name(DEFAULT_THEME).unwrap().bg);
         // The Blow scheme's five MEASURED colours, sampled from captures of his
         // editor. Pinned so a future palette tweak cannot quietly drift off the
         // reference: background, the two greens that carry the scheme, the tan
@@ -3647,7 +4258,7 @@ mod cache_tests {
         let r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
         let lay = r.settings_layout(1400, 900);
         let (cx, _, cw, _) = lay.card;
-        let label_reserve = (r.cell_w * 6.0) as i32;
+        let label_reserve = (r.ui_cell_w() * 6.0) as i32;
         let last = lay.theme_tiles[lay.theme_tiles.len() - 1];
         assert!(gallery().len() >= 8, "this test assumes the eighth theme exists");
         assert!(
@@ -3680,12 +4291,10 @@ mod cache_tests {
                 cursor_on: false,
                 bordered: false,
                 claude: false,
-                reorder: true,
-                line_dir: &[],
+                claude_from: None,
                 search_match: None,
                 marks: &[],
-                link_hover: None,
-                link_tip: None,
+                link_hover: None, link_tip: None, reorder: true, line_dir: &[],
             };
             // an underline is a solid quad (page 0, white texel) th px tall
             let th = (r.cell_h / 14.0).max(1.0) as i32;

@@ -152,6 +152,11 @@ fn run_with_timeout(
 ) -> Option<std::process::Output> {
     use std::io::Read;
     use std::process::Stdio;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // previews and tests never open a console
+    }
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -247,15 +252,15 @@ mod tests {
         assert!(!out.contains(&"paradox".to_string()));
     }
 
-    /// A stuck preview must give up, not hang the window: `ping` with a
-    /// long count outlives the limit and gets killed.
+    /// A sleeping child must time out even when the network is unavailable.
     #[test]
     fn a_hung_preview_is_killed_at_the_deadline() {
-        let mut slow = std::process::Command::new("ping");
-        slow.args(["-n", "30", "127.0.0.1"]);
+        let mut slow = std::process::Command::new("powershell.exe");
+        slow.args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"]);
         let t0 = std::time::Instant::now();
         let out = run_with_timeout(slow, std::time::Duration::from_millis(400));
         assert!(out.is_none(), "a hung child must yield None");
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(400));
         assert!(t0.elapsed() < std::time::Duration::from_secs(5), "took {:?}", t0.elapsed());
         // and a quick child still returns its output
         let mut quick = std::process::Command::new("cmd");

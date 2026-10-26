@@ -181,6 +181,11 @@ pub fn encode_input(input: &EncodeInput<'_>) -> Option<Vec<u8>> {
             return Some(vec![letter as u8 - b'a' + 1]);
         }
     }
+    // Actual AltGr text returned above. Ctrl+Alt without composed text is
+    // a chord, including Ctrl+Alt+digits that have no legacy text encoding.
+    if input.ctrl && input.alt && matches!(input.key, Key::Character(_)) {
+        return encode(input.key, input.text, input.shift, false, true);
+    }
     encode(input.key, input.text, input.shift, input.alt, input.ctrl)
 }
 

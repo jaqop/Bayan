@@ -5,7 +5,8 @@
 //! fire even when the T key's logical char is "ف"). Fixed, non-configurable
 //! bindings stay out of this registry: Ctrl+Tab (cycle), Ctrl+wheel/Ctrl+0
 //! (zoom), Alt+arrows (pane focus), Shift+PageUp/Down (scrollback), the
-//! global quake hotkey, and plain Ctrl+C (copy-or-interrupt).
+//! global quake hotkey, plain Ctrl+C (copy-or-interrupt), and the Ctrl+V
+//! paste alias (an explicit rebind to that chord takes precedence).
 
 use winit::keyboard::{KeyCode, PhysicalKey};
 
@@ -321,9 +322,70 @@ pub fn lookup(map: &[(Action, Chord)], chord: Chord) -> Option<Action> {
     map.iter().find(|(_, c)| *c == chord).map(|(a, _)| *a)
 }
 
+/// Resolve an app action before sending an unhandled chord to the PTY.
+pub fn resolve(map: &[(Action, Chord)], chord: Chord, alt_screen: bool,
+               has_selection: bool) -> Option<Action> {
+    let action = lookup(map, chord).or_else(|| {
+        if !chord.is_plain_ctrl_letter() { return None; }
+        match chord.key {
+            ChordKey::Letter('v') => Some(Action::Paste),
+            ChordKey::Letter('c') if has_selection => Some(Action::Copy),
+            _ => None,
+        }
+    })?;
+    // Clipboard access belongs to the terminal, including bracketed-paste
+    // delivery to TUIs. Other plain Ctrl+letters retain their PTY meaning.
+    let clipboard_action = action == Action::Paste || (action == Action::Copy && has_selection);
+    if alt_screen && chord.is_plain_ctrl_letter() && !clipboard_action {
+        None
+    } else {
+        Some(action)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_paste_chords_work_in_shells_and_full_screen_apps() {
+        let map = effective_map(&crate::config::UserConfig::default());
+        for alt_screen in [false, true] {
+            for shortcut in ["ctrl+v", "ctrl+shift+v"] {
+                let chord = Chord::parse(shortcut).unwrap();
+                assert_eq!(resolve(&map, chord, alt_screen, false), Some(Action::Paste),
+                    "{shortcut}, alt_screen={alt_screen}");
+            }
+        }
+        assert_eq!(resolve(&map, Chord::parse("ctrl+f").unwrap(), true, false), None);
+    }
+
+    #[test]
+    fn paste_alias_respects_explicit_rebindings_and_altgr() {
+        let cfg = crate::config::UserConfig {
+            keybinds: Some(std::collections::HashMap::from([
+                ("search".into(), "ctrl+v".into()),
+                ("paste".into(), "ctrl+p".into()),
+            ])),
+            ..Default::default()
+        };
+        let map = effective_map(&cfg);
+        assert_eq!(resolve(&map, Chord::parse("ctrl+v").unwrap(), false, false), Some(Action::Search));
+        assert_eq!(resolve(&map, Chord::parse("ctrl+p").unwrap(), true, false), Some(Action::Paste));
+        assert_eq!(resolve(&map, Chord::parse("ctrl+alt+v").unwrap(), false, false), None);
+    }
+
+    #[test]
+    fn ctrl_c_copies_selection_and_otherwise_reaches_the_child() {
+        let map = effective_map(&crate::config::UserConfig::default());
+        let copy = Chord::parse("ctrl+c").unwrap();
+        for alt_screen in [false, true] {
+            assert_eq!(resolve(&map, copy, alt_screen, true), Some(Action::Copy));
+            assert_eq!(resolve(&map, copy, alt_screen, false), None);
+            assert_eq!(resolve(&map, Chord::parse("ctrl+shift+c").unwrap(), alt_screen, true), Some(Action::Copy));
+        }
+        assert_eq!(resolve(&map, Chord::parse("ctrl+alt+c").unwrap(), false, true), None);
+    }
 
     #[test]
     fn chords_round_trip_config_form() {
