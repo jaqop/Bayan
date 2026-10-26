@@ -11,7 +11,9 @@ license = "MIT"
 
 [dependencies]
 # VT emulation: Alacritty's battle-tested core, published as a library
-alacritty_terminal = "0.26"
+# 0.26.1-dev is the pre-release at the pinned commit below. A plain "0.26"
+# requirement will not select a pre-release, so the patch would be ignored.
+alacritty_terminal = "0.26.1-dev"
 # ConPTY (Windows) / openpty (unix), extracted from WezTerm
 portable-pty = "0.9"
 # windowing + GPU present + text shaping (HarfBuzz-class, BiDi, fallback)
@@ -37,6 +39,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_UI_Shell", # Shell_NotifyIcon balloons = native toasts, no WinRT
     "Win32_Storage_FileSystem", # GetShortPathNameW: ConPTY chokes on spaces in paths
+    "Win32_System_Com", # CoInitializeEx on the link-open thread, before ShellExecuteW
 ] }
 
 [target."cfg(windows)".build-dependencies]
@@ -45,3 +48,17 @@ winresource = "0.1"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# alacritty_terminal 0.26.0's push_keyboard_mode evicts from title_stack and
+# panics at depth 4096. This commit fixes that removal to use the keyboard
+# stack (alacritty#9071).
+# TODO: remove the alacritty pin and go back to the crates.io release once
+# alacritty_terminal 0.26.1 is published.
+#
+# cosmic-text 0.19.0 always passes None into BidiInfo, so the status bar
+# cannot force a paragraph level. Direction::LeftToRight landed in 5631bfb
+# (fix 4fe1195) and is not in a crates.io release. FontSystem::new is the
+# same call; the on-disk font cache in that range is opt-in.
+[patch.crates-io]
+alacritty_terminal = { git = "https://github.com/alacritty/alacritty", rev = "542147067dd016fc5f49120ef0ba605a98a4e3a7" }
+cosmic-text = { git = "https://github.com/pop-os/cosmic-text", rev = "4fe1195e6451d6aaa3dc383895d6fd366ea9fc7b" }
