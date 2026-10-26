@@ -758,6 +758,28 @@ impl CellInfo {
     }
 }
 
+/// Claude's prompt uses a logical cursor offset even though its output
+/// cells are visual. Resolve that offset through the same permutation.
+fn claude_logical_cursor_cell(cells: &[CellInfo], offset: usize) -> Option<usize> {
+    let mut text = String::new();
+    let mut owners = Vec::new();
+    for cell in cells {
+        cell.push_text(&mut text);
+        owners.push((cell.col, cell.w));
+        if let Some(marks) = &cell.zw {
+            owners.extend(marks.iter().map(|_| (cell.col, 0)));
+        }
+    }
+    let (_, order) = crate::bidi::restore_bidi_line_with_order(&text)?;
+    let mut logical = 0;
+    for source in order {
+        let &(col, width) = owners.get(source)?;
+        if width > 0 && logical <= offset && offset < logical + width { return Some(col); }
+        logical += width;
+    }
+    None
+}
+
 /// One visible cell, owned, so a mouse hit-test can drop the term lock
 /// before shaping. Fields match what `draw_pane` feeds `CellInfo`.
 pub struct SnapCell {
@@ -1849,12 +1871,15 @@ impl Renderer {
                      hover: Option<(usize, usize)>) -> Option<(i32, i32)> {
         let prompt_col = cells.iter().find(|c| c.c != ' ')
             .filter(|c| matches!(c.c, '>' | '❯' | '›')).map(|c| c.col);
+        let logical_prompt = claude && prompt_col.is_some_and(|col|
+            cells.iter().any(|c| c.col == col + 1 && c.c == '\u{a0}'));
         let border = |c: &CellInfo| Some(c.col) == prompt_col
+            || (logical_prompt && prompt_col.is_some_and(|col| c.col == col + 1))
             || matches!(c.c, '\u{2500}'..='\u{259f}' | '\u{e000}'..='\u{f8ff}');
         let mut i = 0;
         let mut cursor = None;
         while i < cells.len() {
-            if cells[i].c == ' ' {
+            if cells[i].c == ' ' && !(logical_prompt && i > 0 && cells[i - 1].c == '\u{a0}') {
                 self.draw_line_grid(out, clip, x0, y, &cells[i..i + 1], hover);
                 i += 1;
                 continue;
@@ -1886,9 +1911,13 @@ impl Renderer {
                 // Keep vertical headroom for tashkeel; only the field's
                 // horizontal boundary is tighter than the enclosing pane.
                 let field_clip = (field_left, clip.1, (field_right - field_left).max(0), clip.3);
+                let field_cursor = cursor_col.filter(|col| *col >= field[0].col && *col <= last.col + last.w);
+                let source_cursor = if logical_prompt {
+                    field_cursor.and_then(|col| claude_logical_cursor_cell(field, col - field[0].col))
+                        .or(field_cursor)
+                } else { field_cursor };
                 let mapped = self.draw_line_bidi(out, field_clip, x0 + left, y,
-                    right - left, field, claude,
-                    cursor_col.filter(|col| *col >= field[0].col && *col <= last.col + last.w), dir, hover);
+                    right - left, field, claude, source_cursor, dir, hover);
                 cursor = mapped.or(cursor);
             } else {
                 self.draw_line_grid(out, clip, x0, y, field, hover);
@@ -3421,6 +3450,23 @@ mod tests {
         for col in 2..7 {
             assert!(r.cell_geometry[&(pane, 0, col)][0].0 >= inverse.0 + inverse.1);
         }
+    }
+
+    #[test]
+    fn claude_prompt_cursor_uses_logical_offset_with_a_nonbreaking_separator() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        // Captured from the live Claude input: visual cells include a
+        // leading cursor placeholder, but CSI positions the cursor by its
+        // logical offset from column 2, not by the visual cell's column.
+        let cells = row_cells(">  رشؤملاو ةيبرعلا رابتخا", 0);
+        assert_eq!(cells[24].c, 'ا', "fixture must match the live visual cell under CSI's cursor");
+        let cursor = r.draw_line_tui(&mut Vec::new(), (0, 0, 900, 120),
+            0, 40, &cells, true, Some(24), ParagraphDir::Default, None).unwrap();
+        assert!(cursor.0 <= (3.0 * r.cell_w).round() as i32,
+            "end cursor must be at the left edge of Arabic, got {cursor:?}");
+        let home = r.draw_line_tui(&mut Vec::new(), (0, 0, 900, 120),
+            0, 40, &cells, true, Some(2), ParagraphDir::Default, None).unwrap();
+        assert!(home.0 > cursor.0, "Home must reach the logical start on the right");
     }
 
     #[test]
