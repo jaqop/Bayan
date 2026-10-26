@@ -555,10 +555,14 @@ metrics so a small terminal font does not shrink the controls. Ctrl+V pastes in
 shells and TUIs; Ctrl+C copies a selection or sends the interrupt when no text
 is selected. Explicit key bindings take precedence.
 
-Interactive Claude startup requests one redraw after its header appears, removing
-preceding shell text while retaining the conversation. Wrapped launch commands
+Interactive Claude startup requests one redraw after its header or resumed input
+frame appears, removing preceding shell text while retaining the conversation.
+PowerShell examples inside Claude replies remain part of the conversation.
+Wrapped launch commands
 are detected. Arabic fields, selections and Claude's inverse-video cursor share
 the shaped source-cell map; earlier shell scrollback retains its own text order.
+An Arabic sentence surrounding a long English phrase keeps its Arabic base
+direction even when the English phrase contains more letters.
 
 Press **Ctrl+Shift+P** to open the command palette:
 
