@@ -187,6 +187,17 @@ fn jump_offset(marks: &[usize], hist: usize, off: usize, dir: i32) -> Option<usi
     Some((hist as i64 - target + 1).clamp(0, hist as i64) as usize)
 }
 
+/// Minimum gap between two toasts a PROGRAM asked for. Terminal output is
+/// not trusted: a loop emitting OSC 777 (or `cat` of a file full of them)
+/// would otherwise fire one balloon per read chunk and bury the
+/// notification centre under text Bayan appears to have written itself.
+const TOAST_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// May a PTY-triggered toast fire now? `last` is when one last did.
+fn toast_due(last: Option<Instant>, now: Instant, gap: std::time::Duration) -> bool {
+    last.is_none_or(|t| now.duration_since(t) >= gap)
+}
+
 /// The active tab index after tab `removed` leaves a list of `len` tabs.
 /// A background tab whose shell exits sits at a LOWER index than the active
 /// one often enough (the first tab is the one people leave running): the
@@ -462,7 +473,7 @@ struct SavedState {
     tabs: Vec<SavedTab>,
     active: usize,
     /// where the window was, so it comes back there (WezTerm's most-asked
-    /// small thing). Physical pixels; absent in files from before M32.
+    /// small thing). Physical pixels; absent in files from before M34.
     #[serde(default)]
     window: Option<WindowGeom>,
 }
@@ -654,6 +665,9 @@ struct PoshPicker {
 struct App {
     /// the prompt picker, when open
     posh: Option<PoshPicker>,
+    /// when a PTY-triggered toast last fired — rate-limits program output
+    /// that asks for attention in a loop
+    last_toast: Option<Instant>,
     /// most-recently-used tab history for Ctrl+Tab
     mru: mru::Mru,
     /// the command palette, when open
@@ -2644,6 +2658,19 @@ impl App {
         None
     }
 
+    /// Fire a toast for something the PROGRAM asked for. Rate-limited:
+    /// the trigger is untrusted output, so it must not be able to spam.
+    fn toast_from_pty(&mut self, title: &str, body: &str) {
+        let now = Instant::now();
+        if !toast_due(self.last_toast, now, TOAST_MIN_GAP) {
+            return;
+        }
+        if let Some(h) = self.hwnd() {
+            self.last_toast = Some(now);
+            toast::show(h, title, body);
+        }
+    }
+
     fn has_selection(&self) -> bool {
         self.session().is_some_and(|s| {
             s.term
@@ -3370,10 +3397,8 @@ impl ApplicationHandler<UserEvent> for App {
                     // Code with preferredNotifChannel=terminal_bell rings
                     // exactly this bell when it needs an approval).
                     if !self.focused && self.config.notifications_on() {
-                        if let Some(h) = self.hwnd() {
-                            let body = self.tabs[ti].title.clone();
-                            toast::show(h, "بيان — تنبيه", &body);
-                        }
+                        let body = self.tabs[ti].title.clone();
+                        self.toast_from_pty("بيان — تنبيه", &body);
                         if let Some(w) = &self.window {
                             w.request_user_attention(Some(
                                 winit::window::UserAttentionType::Informational,
@@ -3392,10 +3417,8 @@ impl ApplicationHandler<UserEvent> for App {
                         self.tabs[ti].attention = true;
                     }
                     if (background || !self.focused) && self.config.notifications_on() {
-                        if let Some(h) = self.hwnd() {
-                            let body = if body.is_empty() { self.tabs[ti].title.clone() } else { body };
-                            toast::show(h, &title, &body);
-                        }
+                        let body = if body.is_empty() { self.tabs[ti].title.clone() } else { body };
+                        self.toast_from_pty(&title, &body);
                         if !self.focused {
                             if let Some(w) = &self.window {
                                 w.request_user_attention(Some(
@@ -3408,9 +3431,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Progress(id, p) => {
+                // only on a real change: a prompt clears progress, and
+                // prompts arrive constantly — redrawing for each one would
+                // churn the frame state M14's differential redraw relies on
                 if let Some((ti, pi)) = self.find_pane(id) {
-                    self.tabs[ti].panes[pi].progress = p;
-                    self.request_redraw(); // the tab bar and cockpit draw it
+                    if self.tabs[ti].panes[pi].progress != p {
+                        self.tabs[ti].panes[pi].progress = p;
+                        self.request_redraw(); // the tab bar and cockpit draw it
+                    }
                 }
             }
             UserEvent::CommandFinished(id, ok) => {
@@ -3427,11 +3455,9 @@ impl ApplicationHandler<UserEvent> for App {
                             ));
                         }
                         if self.config.notifications_on() && !self.focused {
-                            if let Some(h) = self.hwnd() {
-                                let title =
-                                    if ok { "اكتمل الأمر" } else { "فشل الأمر" };
-                                toast::show(h, title, &self.tabs[ti].title);
-                            }
+                            let title = if ok { "اكتمل الأمر" } else { "فشل الأمر" };
+                            let body = self.tabs[ti].title.clone();
+                            self.toast_from_pty(title, &body);
                         }
                         self.request_redraw();
                     }
@@ -4361,6 +4387,7 @@ fn main() {
     let keymap = keybinds::effective_map(&cfg);
     let mut app = App {
         posh: None,
+        last_toast: None,
         mru: mru::Mru::new(),
         palette: None,
         shell_profiles: Vec::new(),
@@ -4640,7 +4667,7 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let back = parse_state(&json).unwrap();
         assert_eq!(back.window, s.window, "geometry survives the round trip");
-        // a pre-M32 file has no window field and must still parse
+        // a pre-M34 file has no window field and must still parse
         let old = r#"{"tabs":[{"cwds":[null]}],"active":0}"#;
         assert_eq!(parse_state(old).unwrap().window, None);
         assert_eq!(back.tabs[0].cwds.len(), 2);
@@ -4751,6 +4778,20 @@ mod tests {
         assert_eq!(wheel_seq(x10, 1, 3, 200), b"\x1b[M\x60\xe8\x23");
         assert_eq!(wheel_seq(x10, 1, 500, 900).len(), 6);
         assert_eq!(wheel_seq(x10, 1, 500, 900)[4], 255);
+    }
+
+    /// The toast trigger is untrusted output: a program can ask for
+    /// attention in a loop, and one balloon per read chunk buries the
+    /// notification centre under text Bayan appears to have written.
+    #[test]
+    fn pty_toasts_are_rate_limited() {
+        let gap = std::time::Duration::from_secs(5);
+        let t0 = Instant::now();
+        assert!(toast_due(None, t0, gap), "the first one always fires");
+        assert!(!toast_due(Some(t0), t0, gap), "a second one in the same instant does not");
+        assert!(!toast_due(Some(t0), t0 + std::time::Duration::from_millis(4999), gap));
+        assert!(toast_due(Some(t0), t0 + gap, gap), "exactly at the gap it fires again");
+        assert!(toast_due(Some(t0), t0 + std::time::Duration::from_secs(60), gap));
     }
 
     #[test]
