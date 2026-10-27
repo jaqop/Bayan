@@ -40,6 +40,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Shell", # Shell_NotifyIcon balloons = native toasts, no WinRT
     "Win32_Storage_FileSystem", # GetShortPathNameW: ConPTY chokes on spaces in paths
     "Win32_System_Com", # CoInitializeEx on the link-open thread, before ShellExecuteW
+    "Win32_System_LibraryLoader", # SetDllDirectoryW; ConPTY comes from kernel32, not conpty.dll
+    "Win32_System_ProcessStatus", # EnumProcessModules in the planted-conpty.dll test
+    "Win32_System_Threading", # GetCurrentProcess for that module walk
+    "Win32_System_SystemInformation", # GetSystemDirectoryW: loaded kernel32 must sit under System32
 ] }
 
 [target."cfg(windows)".build-dependencies]
@@ -62,3 +66,7 @@ lto = "thin"
 [patch.crates-io]
 alacritty_terminal = { git = "https://github.com/alacritty/alacritty", rev = "542147067dd016fc5f49120ef0ba605a98a4e3a7" }
 cosmic-text = { git = "https://github.com/pop-os/cosmic-text", rev = "4fe1195e6451d6aaa3dc383895d6fd366ea9fc7b" }
+# portable-pty 0.9 loads conpty.dll by bare name. The vendored copy resolves
+# CreatePseudoConsole / ResizePseudoConsole / ClosePseudoConsole from
+# kernel32 via LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32).
+portable-pty = { path = "vendor/portable-pty" }
