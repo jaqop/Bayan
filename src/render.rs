@@ -4293,6 +4293,42 @@ mod cache_tests {
         assert!(!rect_hit(lay.size_plus, (t0x + 2) as f64, (t0y + 2) as f64));
     }
 
+    /// The settings and shortcuts panels are chrome, not content: zooming
+    /// the terminal font must move the text UNDER them, never inflate the
+    /// panels themselves. Ctrl+wheel used to carry the whole card with it
+    /// until the ledger ran off the bottom of the window.
+    #[test]
+    fn panels_ignore_the_terminal_font_size() {
+        let cfg = crate::config::UserConfig::default();
+        let small = Renderer::new(1.0, &cfg, 0.0);
+        let big = Renderer::new(1.0, &cfg, 14.0);
+        assert!(big.cell_h > small.cell_h, "the terminal font did grow");
+        assert_eq!(small.ui_cell_h(), big.ui_cell_h(), "chrome metrics are fixed");
+
+        let (fw, fh) = (1400usize, 900usize);
+        let a = small.settings_layout(fw, fh);
+        let b = big.settings_layout(fw, fh);
+        assert_eq!((a.card.2, a.card.3), (b.card.2, b.card.3), "card size moved");
+        assert_eq!((a.rowh, a.head_h), (b.rowh, b.head_h), "row height moved");
+        for (ta, tb) in a.theme_tiles.iter().zip(&b.theme_tiles) {
+            assert_eq!((ta.2, ta.3), (tb.2, tb.3), "theme tile size moved");
+            assert_eq!(ta.0 - a.card.0, tb.0 - b.card.0, "tile offset moved");
+        }
+        assert_eq!(a.size_plus.2, b.size_plus.2, "stepper size moved");
+        assert_eq!(a.bell_btns[2].0 - a.card.0, b.bell_btns[2].0 - b.card.0);
+        // the card still clears the tab bar, which DOES follow the font
+        assert!(a.card.1 >= small.tab_bar_h() as i32);
+        assert!(b.card.1 >= big.tab_bar_h() as i32);
+
+        let n = crate::keybinds::Action::ALL.len();
+        let sa = small.shortcuts_layout(fw, fh, n);
+        let sb = big.shortcuts_layout(fw, fh, n);
+        assert_eq!((sa.card.2, sa.card.3), (sb.card.2, sb.card.3));
+        assert_eq!(sa.rowh, sb.rowh);
+        // and the whole shortcuts ledger still fits on screen at 29pt
+        assert!(sb.card.1 + sb.card.3 <= fh as i32, "the editor runs off-screen");
+    }
+
     /// The shortcuts editor layout: one clickable strip per action, all
     /// inside the card, none overlapping, in row order top to bottom.
     #[test]
