@@ -104,7 +104,7 @@ pub struct UserConfig {
     pub bidi: Option<BidiConfig>,
     /// Kitty keyboard protocol. Off unless the user opts in — see
     /// [`KeyboardConfig`].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "KeyboardConfig::is_default")]
     pub keyboard: KeyboardConfig,
 }
 
@@ -155,6 +155,14 @@ pub struct KeyboardConfig {
     /// kitty spec so Claude Code can still be interrupted. Default on.
     #[serde(default = "default_true")]
     pub kitty_base_layout_fallback: bool,
+}
+
+impl KeyboardConfig {
+    /// Untouched keyboard settings are not written back: saving a config
+    /// the user never opened must not mint `"keyboard"` out of nothing.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl Default for KeyboardConfig {
@@ -439,6 +447,12 @@ mod tests {
         assert!(!order.tab_switch_recent());
         let typo: UserConfig = serde_json::from_str(r#"{"tab_switch":"ordr"}"#).unwrap();
         assert!(typo.tab_switch_recent(), "a typo must not silently change behaviour");
+    }
+
+    #[test]
+    fn saving_omits_unset_fields() {
+        let json = serde_json::to_string(&UserConfig::default()).unwrap();
+        assert_eq!(json, "{}", "an untouched config serializes to nothing: {json}");
     }
 
     #[test]

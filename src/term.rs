@@ -971,6 +971,13 @@ fn handle_osc133<T: EventListener>(
             meta.running_cmd.clear();
             meta.clean_claude_after = None;
             meta.cmd_pending = false;
+            // Back at a prompt, so nothing is running and any OSC 9;4 bar
+            // still showing is stale — a program killed with Ctrl+C never
+            // gets to send its own 9;4;0. An explicit report in this same
+            // chunk wins, so a prompt followed by fresh progress is kept.
+            if ev.progress.is_none() {
+                ev.progress = Some(None);
+            }
             meta.claude_from_abs = None;
             // a new prompt starts on the cursor's row: record its block
             // GLOBALLY (evicted + history + row — never drifts)
@@ -994,6 +1001,10 @@ fn handle_osc133<T: EventListener>(
             meta.running_cmd.clear();
             meta.clean_claude_after = None;
             meta.cmd_pending = false;
+            // the command is over: its progress bar goes with it
+            if ev.progress.is_none() {
+                ev.progress = Some(None);
+            }
             meta.claude_from_abs = None;
             if let Some(m) = meta.marks.last_mut() {
                 m.exit = exit;
@@ -1061,8 +1072,6 @@ fn feed_counted<T: EventListener>(
 
 fn merge_chunk(dst: &mut ChunkEvents, src: ChunkEvents) {
     dst.clean_claude |= src.clean_claude;
-    if src.notify.is_some() { dst.notify = src.notify; }
-    if src.progress.is_some() { dst.progress = src.progress; }
     if src.clipboard.is_some() {
         dst.clipboard = src.clipboard;
     }
@@ -1071,6 +1080,14 @@ fn merge_chunk(dst: &mut ChunkEvents, src: ChunkEvents) {
     }
     if src.finished.is_some() {
         dst.finished = src.finished;
+    }
+    if src.notify.is_some() {
+        dst.notify = src.notify;
+    }
+    // Last one wins, INCLUDING a clear: Some(None) is a real value here, so
+    // this cannot test `is_some()` on the inner option.
+    if src.progress.is_some() {
+        dst.progress = src.progress;
     }
     // The BiDi filter splits one PTY read into several `Bytes` items. A
     // kitty `CSI ? u` answered in an earlier item must not be dropped when
@@ -1851,12 +1868,6 @@ impl Session {
                         if let Some(ok) = ev.finished {
                             let _ = proxy.send_event(UserEvent::CommandFinished(id, ok));
                         }
-                        if let Some((title, body)) = ev.notify {
-                            let _ = proxy.send_event(UserEvent::Notify(id, title, body));
-                        }
-                        if let Some(p) = ev.progress {
-                            let _ = proxy.send_event(UserEvent::Progress(id, p));
-                        }
                         if ev.clean_claude {
                             // Ask Claude to redraw its own screen (Ctrl+L),
                             // preserving its conversation and terminal state.
@@ -1868,6 +1879,12 @@ impl Session {
                                 loop_gone = true;
                                 break;
                             }
+                        }
+                        if let Some((title, body)) = ev.notify {
+                            let _ = proxy.send_event(UserEvent::Notify(id, title, body));
+                        }
+                        if let Some(p) = ev.progress {
+                            let _ = proxy.send_event(UserEvent::Progress(id, p));
                         }
                         if loop_gone || proxy.send_event(UserEvent::Wakeup(id)).is_err() {
                             break; // the event loop is gone; still reset below
@@ -3283,6 +3300,29 @@ mod tests {
         let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]9;9;C:\\x\x07");
         assert_eq!(ev.progress, None);
         assert_eq!(ev.notify, None);
+    }
+
+    /// A program killed mid-report never sends its own 9;4;0, so the bar
+    /// would sit on the tab for the rest of the session. Coming back to a
+    /// prompt means nothing is running, which is the same information.
+    #[test]
+    fn a_returning_prompt_clears_a_stale_progress_bar() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]9;4;1;40\x07");
+        assert_eq!(ev.progress.unwrap().unwrap().percent, 40);
+        // Ctrl+C: the shell prints a fresh prompt, the program said nothing
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;A\x07PS> ");
+        assert_eq!(ev.progress, Some(None), "a returning prompt must clear it");
+        // a finished command does the same
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;D;0\x07");
+        assert_eq!(ev.progress, Some(None));
+        // but a report in the SAME chunk is live, not stale: it wins
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry,
+                               b"\x1b]133;A\x07\x1b]9;4;1;70\x07");
+        assert_eq!(ev.progress.unwrap().unwrap().percent, 70);
+        // and an ordinary chunk still reports nothing either way
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"just output\r\n");
+        assert_eq!(ev.progress, None);
     }
 
     #[test]
