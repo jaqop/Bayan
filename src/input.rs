@@ -358,7 +358,7 @@ impl App {
             return;
         }
         if let Some(s) = self.session() {
-            let mut t = s.term.lock().unwrap();
+            let mut t = s.term.lock();
             let off = t.grid().display_offset() as i32;
             let point = Point::new(Line(row as i32 - off), Column(col));
             if let Some(sel) = t.selection.as_mut() {
@@ -439,7 +439,6 @@ impl App {
                         .session
                         .term
                         .lock()
-                        .unwrap()
                         .scroll_display(Scroll::Delta(lines));
                 }
                 self.link_cache.invalidate_pane(pane);
@@ -463,7 +462,7 @@ impl App {
                 return;
             };
             // term, then meta — the lock order the reader uses too.
-            let mode = *session.term.lock().unwrap().mode();
+            let mode = *session.term.lock().mode();
             let at_prompt = session.meta.lock().unwrap().at_prompt;
             (arg, mode, at_prompt)
         };
@@ -659,7 +658,7 @@ impl App {
         let n = self.clicks.click(Instant::now(), (row, col));
         let ty = selection_type(n);
         if let Some(s) = self.session() {
-            let mut t = s.term.lock().unwrap();
+            let mut t = s.term.lock();
             let off = t.grid().display_offset() as i32;
             let point = Point::new(Line(row as i32 - off), Column(col));
             t.selection = Some(Selection::new(ty, point, side));

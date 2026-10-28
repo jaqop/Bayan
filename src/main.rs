@@ -1190,7 +1190,7 @@ impl App {
         let links = self
             .session()
             .map(|session| {
-                let t = session.term.lock().unwrap();
+                let t = session.term.lock();
                 (0..t.screen_lines())
                     .flat_map(|row| link::links_on_row(&t, row))
                     .take(500)
@@ -1378,7 +1378,7 @@ impl App {
             Search => {
                 let selected = self
                     .session()
-                    .and_then(|s| s.term.lock().unwrap().selection_to_string());
+                    .and_then(|s| s.term.lock().selection_to_string());
                 self.search = Some(SearchState::from_selection(
                     selected.as_deref(),
                     self.claude_active(),
@@ -1763,7 +1763,7 @@ impl App {
     fn jump_command(&mut self, dir: i32) {
         let Some(s) = self.session() else { return };
         {
-            let mut t = s.term.lock().unwrap();
+            let mut t = s.term.lock();
             let hist = t.grid().history_size();
             let off = t.grid().display_offset();
             let marks: Vec<usize> = {
@@ -2155,7 +2155,7 @@ impl App {
 
     fn term_mode(&self) -> TermMode {
         self.session()
-            .map_or(TermMode::empty(), |s| *s.term.lock().unwrap().mode())
+            .map_or(TermMode::empty(), |s| *s.term.lock().mode())
     }
 
     fn note_held_away(&mut self, event: &KeyEvent) {
@@ -2215,7 +2215,7 @@ impl App {
             return false;
         };
         // term first, then meta — the crate's lock order
-        let alt = s.term.lock().unwrap().mode().contains(TermMode::ALT_SCREEN);
+        let alt = s.term.lock().mode().contains(TermMode::ALT_SCREEN);
         let (bidi_state, running) = {
             let m = s.meta.lock().unwrap();
             (m.bidi.clone(), m.running_cmd.clone())
@@ -2257,7 +2257,7 @@ impl App {
         let Some((ti, pi)) = self.find_pane(id) else {
             return TermMode::empty();
         };
-        *self.tabs[ti].panes[pi].session.term.lock().unwrap().mode()
+        *self.tabs[ti].panes[pi].session.term.lock().mode()
     }
 
     fn write_pane(&mut self, id: u64, bytes: &[u8]) {
@@ -2372,11 +2372,7 @@ impl App {
         let (auto, manual) = (self.auto_follow, self.claude_manual);
         let honor = self.config.honor_bdsm();
         let (cols, row, cells, claude, vis, reorder, dir) = {
-            let t = self.tabs[self.active].panes[hit.pane]
-                .session
-                .term
-                .lock()
-                .unwrap();
+            let t = self.tabs[self.active].panes[hit.pane].session.term.lock();
             let cols = t.columns().max(1);
             let rows = t.screen_lines().max(1);
             let row = hit.row.min(rows - 1);
@@ -2524,7 +2520,7 @@ impl App {
             return Vec::new();
         };
         let spans = {
-            let term = self.tabs[ti].panes[pi].session.term.lock().unwrap();
+            let term = self.tabs[ti].panes[pi].session.term.lock();
             link::links_on_row(&term, row)
         };
         self.link_cache.insert(id, row, spans.clone());
@@ -2718,12 +2714,7 @@ impl App {
             self.write_pane(out.pane, &out.bytes);
         }
         if let Some((ti, pi)) = self.find_pane(id) {
-            self.tabs[ti].panes[pi]
-                .session
-                .term
-                .lock()
-                .unwrap()
-                .selection = None;
+            self.tabs[ti].panes[pi].session.term.lock().selection = None;
         }
         true
     }
@@ -2813,7 +2804,6 @@ impl App {
         self.session().is_some_and(|s| {
             s.term
                 .lock()
-                .unwrap()
                 .selection
                 .as_ref()
                 .is_some_and(|sel| !sel.is_empty())
@@ -2826,7 +2816,7 @@ impl App {
             return false;
         };
         let text = {
-            let mut t = session.term.lock().unwrap();
+            let mut t = session.term.lock();
             let txt = t.selection_to_string();
             if clear {
                 t.selection = None;
@@ -2906,7 +2896,7 @@ impl App {
 
     fn scroll_lines(&mut self, n: i32) {
         if let Some(s) = self.session() {
-            s.term.lock().unwrap().scroll_display(Scroll::Delta(n));
+            s.term.lock().scroll_display(Scroll::Delta(n));
         }
         self.invalidate_focused_links();
         self.request_redraw();
@@ -2925,7 +2915,7 @@ impl App {
             return;
         };
         let found = {
-            let mut t = session.term.lock().unwrap();
+            let mut t = session.term.lock();
             let hl = self.search.as_ref().and_then(|s| s.hl.clone());
             let m = find_match(&mut t, &query, &hl, dir);
             if let Some(m) = &m {
@@ -3094,7 +3084,7 @@ impl App {
                             m.claude_from_abs,
                         )
                     };
-                    let t = pane.session.term.lock().unwrap();
+                    let t = pane.session.term.lock();
                     // Explicit BDSM suppresses reordering for the whole pane,
                     // Claude restoration included, and only while the command
                     // is running or the alt screen is up. honor_bdsm defaults on.

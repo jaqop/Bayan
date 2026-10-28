@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Column;
+use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use base64::Engine;
@@ -1790,7 +1791,7 @@ impl EventListener for EventProxy {
 }
 
 pub struct Session {
-    pub term: Arc<Mutex<Term<EventProxy>>>,
+    pub term: Arc<FairMutex<Term<EventProxy>>>,
     pub meta: Arc<Mutex<SessionMeta>>,
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
@@ -1887,7 +1888,7 @@ impl Session {
             kitty_keyboard: kitty_protocol,
             ..Config::default()
         };
-        let term = Arc::new(Mutex::new(Term::new(
+        let term = Arc::new(FairMutex::new(Term::new(
             config,
             &size,
             EventProxy(proxy.clone(), id),
@@ -1912,7 +1913,7 @@ impl Session {
                         let ev = {
                             // term, then meta, then parser. reset_keyboard
                             // on the UI thread takes the same order.
-                            let mut t = term2.lock().unwrap();
+                            let mut t = term2.lock();
                             let mut m = meta2.lock().unwrap();
                             let mut p = parser2.lock().unwrap();
                             process_chunk(&mut p, &mut t, &mut m, &mut carry, &buf[..n])
@@ -1955,7 +1956,7 @@ impl Session {
             // This is the session parser, not a new one: a CSI the child
             // already started has to be the machine that sees the pop.
             {
-                let mut t = term2.lock().unwrap();
+                let mut t = term2.lock();
                 let mut m = meta2.lock().unwrap();
                 let mut p = parser2.lock().unwrap();
                 reset_keyboard_modes(&mut p, &mut t, &mut m);
@@ -1988,7 +1989,7 @@ impl Session {
     /// rebindable chord). Shell exit and `OSC 133;A` call
     /// [`reset_keyboard_modes`] on the reader thread, with this same parser.
     pub fn reset_keyboard(&mut self) {
-        let mut t = self.term.lock().unwrap();
+        let mut t = self.term.lock();
         let mut m = self.meta.lock().unwrap();
         let mut parser = self.parser.lock().unwrap();
         reset_keyboard_modes(&mut parser, &mut t, &mut m);
@@ -1998,7 +1999,7 @@ impl Session {
         // Enter at a prompt starts a command: read it off the screen now,
         // before the shell reacts (Claude mode auto-enable needs the name)
         if submits_a_command(bytes) {
-            let t = self.term.lock().unwrap();
+            let t = self.term.lock();
             let mut m = self.meta.lock().unwrap();
             capture_command_core(&t, &mut m);
         }
@@ -2015,7 +2016,7 @@ impl Session {
         });
         // Drop the term lock before meta. A resize reflows rows, so SCP
         // stamps no longer name the text they were written on.
-        self.term.lock().unwrap().resize(size);
+        self.term.lock().resize(size);
         self.meta.lock().unwrap().bidi_mut().on_resize();
     }
 }
@@ -2402,6 +2403,23 @@ pub fn regex_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panic_holding_the_term_lock_does_not_poison_it() {
+        // Session::term is a FairMutex for this: a std Mutex would hand
+        // every later lock a PoisonError, and the window would die with
+        // the reader thread.
+        let term = Arc::new(FairMutex::new(0u32));
+        let held = Arc::clone(&term);
+        let died = std::thread::spawn(move || {
+            let mut t = held.lock();
+            *t = 7;
+            panic!("reader thread dies holding the lock");
+        })
+        .join();
+        assert!(died.is_err());
+        assert_eq!(*term.lock(), 7);
+    }
 
     #[test]
     fn paste_normalizes_newlines_and_blocks_injection() {

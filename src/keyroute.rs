@@ -220,7 +220,7 @@ impl App {
             if let Some(dir) = page_direction(key) {
                 let rows = self
                     .session()
-                    .map_or(self.size.rows, |s| s.term.lock().unwrap().screen_lines())
+                    .map_or(self.size.rows, |s| s.term.lock().screen_lines())
                     as i32;
                 self.scroll_lines(dir * rows);
                 return;
@@ -385,7 +385,7 @@ impl App {
         self.take_held_away(event);
         if let Some(s) = self.session_mut() {
             {
-                let mut t = s.term.lock().unwrap();
+                let mut t = s.term.lock();
                 t.selection = None;
                 t.scroll_display(Scroll::Bottom);
             }
