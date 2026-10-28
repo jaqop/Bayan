@@ -61,3 +61,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+  # RustSec advisories against Cargo.lock. Fails on a known vulnerability;
+  # unmaintained or yanked crates print as warnings and do not fail it. It
+  # reads the lockfile and compiles nothing, so it is the one job that does
+  # not need Windows. At the time of writing it reports one warning:
+  # ttf-parser (via cosmic-text -> fontdb) is unmaintained upstream.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Audit
+        run: cargo audit
