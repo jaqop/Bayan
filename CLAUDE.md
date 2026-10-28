@@ -176,6 +176,9 @@ principle when adding new ones:
 | `BAYAN_COCKPIT=1` | open the agent cockpit |
 | `BAYAN_GUARD=1` | arm the PASTE guard with a 3-line sample (not the close guard — the name misleads) |
 | `BAYAN_TYPE=<text>` | feed text into the first pane's PTY — the hook for ligature and shaping checks |
+| `BAYAN_PASTE=<text>` | once the renderer is ready, put text on the clipboard and right-click the focused pane's centre through the real right-click path (`right_click_owner` → `mouse::right_click`) — right-click paste without injecting mouse input. Overwrites the clipboard |
+| `BAYAN_PALETTE=<query\|1>` | open the command palette at startup, pre-filtered by the query (`1` opens it empty) |
+| `BAYAN_POSH=1` | open the oh-my-posh prompt picker at startup |
 | `BAYAN_TOAST=<title\|1>` | fire a sample toast at startup (M19 A/B loops without rebuilding) |
 | `BAYAN_ATLAS_STRESS=1` | shape a large spread of unique glyphs to force page-1 atlas growth |
 | `BAYAN_PROFILE=1` | startup timeline marks to `%TEMP%\bayan_profile.log` (EasyTer's `EASYTER_PROFILE` pattern), zero cost when unset |
