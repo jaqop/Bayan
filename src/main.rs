@@ -853,6 +853,9 @@ struct App {
     /// before the key comes up, and a chord can open a panel, so this is
     /// recorded at press time rather than re-derived when the key is released.
     keys_held_away: Vec<winit::keyboard::PhysicalKey>,
+    /// BAYAN_PASTE's text, waiting for the first renderer: a right click
+    /// needs cell metrics to land on a pane.
+    debug_paste: Option<String>,
 }
 
 impl App {
@@ -3413,6 +3416,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
         }
+        // BAYAN_PASTE=<text>: put text on the clipboard and right-click the
+        // focused pane once the renderer exists, so right-click paste can
+        // be verified without injecting mouse input. It replaces whatever
+        // was on the clipboard.
+        if let Some(v) = std::env::var_os("BAYAN_PASTE") {
+            self.debug_paste = v.to_str().map(str::to_string);
+        }
         // BAYAN_POSH=1: open the prompt picker at startup (capture without keys)
         if std::env::var_os("BAYAN_POSH").is_some() {
             self.open_posh();
@@ -3647,6 +3657,9 @@ impl ApplicationHandler<UserEvent> for App {
                 // the zoom moved again while this build ran: chase it
                 if (self.font_delta - self.inflight_delta).abs() > f32::EPSILON {
                     self.rebuild_renderer();
+                }
+                if let Some(text) = self.debug_paste.take() {
+                    self.debug_right_click_paste(text);
                 }
                 self.request_redraw();
             }
@@ -3883,6 +3896,7 @@ fn main() {
         inflight_delta: 0.0,
         normal_geom: None,
         keys_held_away: Vec::new(),
+        debug_paste: None,
     };
     event_loop.run_app(&mut app).expect("run event loop");
 }

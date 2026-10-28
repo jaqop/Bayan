@@ -562,6 +562,22 @@ impl App {
         }
     }
 
+    /// BAYAN_PASTE: put `text` on the clipboard and right-click the centre
+    /// of the focused pane, through the same `right_press` a real click
+    /// takes. A pane whose program tracks the mouse hears the click instead.
+    pub(crate) fn debug_right_click_paste(&mut self, text: String) {
+        let Some(focused) = self.tabs.get(self.active).map(|t| t.focused) else {
+            return;
+        };
+        let Some(&(x, y, w, h)) = self.pane_rects().get(focused) else {
+            return;
+        };
+        self.set_clipboard(text);
+        self.cursor_pos =
+            PhysicalPosition::new(x as f64 + w as f64 / 2.0, y as f64 + h as f64 / 2.0);
+        self.right_press();
+    }
+
     /// The chrome first, in `chrome::left_press` order, then the terminal.
     fn left_press(&mut self, el: &ActiveEventLoop) {
         let pos = self.cursor_pos;
