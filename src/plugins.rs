@@ -58,8 +58,14 @@ struct Staged {
     actions: Vec<PaletteAction>,
 }
 
+/// Tests feed `load_from` broken plugins on purpose; their failures must not
+/// land in the user's real log.
 fn log_path() -> PathBuf {
-    crate::config::bayan_dir().join("plugins.log")
+    if cfg!(test) {
+        std::env::temp_dir().join("bayan-test-plugins.log")
+    } else {
+        crate::config::bayan_dir().join("plugins.log")
+    }
 }
 
 /// Append a line to the plugin log. Defensive to the point of silence: a
@@ -262,6 +268,11 @@ pub fn theme_by_name(name: &str) -> Option<&'static PluginTheme> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_runs_never_write_the_users_plugin_log() {
+        assert!(!log_path().starts_with(crate::config::bayan_dir()));
+    }
 
     /// Built with explicit escapes rather than raw strings: a hex colour's
     /// `#` collides with the `r#"..."#` delimiter and the noise hides bugs.

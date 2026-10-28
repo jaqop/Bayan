@@ -24,9 +24,8 @@ jobs:
       - name: Build
         run: cargo build --all-targets
       # The tests are pure unit tests — no GPU, no window, no PTY spawn —
-      # so they run headless. Note config.rs's tests read ~/.bayan/config.json
-      # if it exists; a CI runner has none, which is why they are reliable
-      # here and need the file removed when running locally.
+      # so they run headless. They never read or write ~/.bayan, so a local
+      # run with a live config.json behaves the same as this one.
       - name: Test
         run: cargo test --all-targets
 
@@ -61,3 +60,4 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
