@@ -78,6 +78,7 @@ fn short_path(p: &str) -> String {
         .chain(Some(0))
         .collect();
     let mut buf = [0u16; 260];
+    // SAFETY: `wide` is NUL-terminated, and the length passed is `buf`'s own.
     let n = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
     if n == 0 || n as usize >= buf.len() {
         return p.to_string(); // failure is not fatal: the long path may still work
