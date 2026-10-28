@@ -9,9 +9,12 @@
 
 mod bidi;
 mod bidi_ctl;
+mod chrome;
 mod config;
 mod gpu;
+mod input;
 mod keybinds;
+mod keyroute;
 mod keys;
 mod kitty;
 mod link;
@@ -29,6 +32,8 @@ mod toast;
 mod conpty_load;
 #[cfg(test)]
 #[path = "../vendor/portable-pty/src/win/conpty_resolve.rs"]
+// Vendored portable-pty code: its unsafe blocks are upstream's to document.
+#[allow(clippy::undocumented_unsafe_blocks)]
 mod conpty_resolve;
 
 /// rgb -> "#rrggbb" for the config file.
@@ -95,6 +100,8 @@ fn consume_guard_release(pending: &mut bool, state: ElementState, button: MouseB
 /// The system notification sound (bell mode "sound"). Async — never blocks
 /// the UI thread.
 fn beep() {
+    // SAFETY: MessageBeep takes one integer sound type and no pointers,
+    // and is safe to call from any thread.
     unsafe {
         // windows-sys files MessageBeep under Diagnostics::Debug (user32's
         // winuser.h function, but that's where the metadata puts it)
@@ -345,15 +352,14 @@ use std::time::Instant;
 
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
-use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::search::{Match, RegexSearch};
 use alacritty_terminal::term::TermMode;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{ResizeDirection, Window, WindowId};
+use winit::window::{Window, WindowId};
 
 use term::{Session, TermSize};
 
@@ -851,6 +857,9 @@ struct App {
     /// before the key comes up, and a chord can open a panel, so this is
     /// recorded at press time rather than re-derived when the key is released.
     keys_held_away: Vec<winit::keyboard::PhysicalKey>,
+    /// BAYAN_PASTE's text, waiting for the first renderer: a right click
+    /// needs cell metrics to land on a pane.
+    debug_paste: Option<String>,
 }
 
 impl App {
@@ -1076,6 +1085,9 @@ impl App {
         };
         let hwnd = h.hwnd.get() as windows_sys::Win32::Foundation::HWND;
         let alpha = (self.config.opacity_level() * 255.0).round() as u8;
+        // SAFETY: hwnd comes from winit's handle for self.window, which stays
+        // borrowed for this whole call, so it names our live top-level window.
+        // The GWL_EXSTYLE get/set and SetLayeredWindowAttributes take no pointers.
         unsafe {
             use windows_sys::Win32::UI::WindowsAndMessaging::{
                 GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, GWL_EXSTYLE,
@@ -1102,6 +1114,9 @@ impl App {
         let corner = DWMWCP_ROUND;
         // Windows 10 ignores unsupported corner preferences; the native
         // resize frame and shadow remain available there.
+        // SAFETY: hwnd is this window's live handle from self.hwnd(). Each
+        // pvAttribute points at a local i32 that outlives the call, and
+        // cbAttribute is that i32's size, the type both attributes expect.
         unsafe {
             DwmSetWindowAttribute(
                 hwnd,
@@ -1188,7 +1203,7 @@ impl App {
         let links = self
             .session()
             .map(|session| {
-                let t = session.term.lock().unwrap();
+                let t = session.term.lock();
                 (0..t.screen_lines())
                     .flat_map(|row| link::links_on_row(&t, row))
                     .take(500)
@@ -1219,10 +1234,7 @@ impl App {
             && event.physical_key
                 == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV)
         {
-            if self.clipboard.is_none() {
-                self.clipboard = arboard::Clipboard::new().ok();
-            }
-            if let Some(text) = self.clipboard.as_mut().and_then(|c| c.get_text().ok()) {
+            if let Some(text) = self.clipboard().and_then(|c| c.get_text().ok()) {
                 if let Some(p) = self.palette.as_mut() {
                     p.query
                         .extend(text.chars().filter(|c| !c.is_control()).take(256));
@@ -1376,7 +1388,7 @@ impl App {
             Search => {
                 let selected = self
                     .session()
-                    .and_then(|s| s.term.lock().unwrap().selection_to_string());
+                    .and_then(|s| s.term.lock().selection_to_string());
                 self.search = Some(SearchState::from_selection(
                     selected.as_deref(),
                     self.claude_active(),
@@ -1761,7 +1773,7 @@ impl App {
     fn jump_command(&mut self, dir: i32) {
         let Some(s) = self.session() else { return };
         {
-            let mut t = s.term.lock().unwrap();
+            let mut t = s.term.lock();
             let hist = t.grid().history_size();
             let off = t.grid().display_offset();
             let marks: Vec<usize> = {
@@ -1891,34 +1903,6 @@ impl App {
             (px.height as i32 - bar - pad * 2).max(1),
         );
         split_rects(content, &t.weights, t.orientation)
-    }
-
-    /// Divider index under the pointer (between pane i and i+1), if any.
-    fn divider_at(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
-        let t = self.tabs.get(self.active)?;
-        if t.panes.len() < 2 {
-            return None;
-        }
-        let rects = self.pane_rects();
-        const GRAB: f64 = 4.0;
-        for (i, &(x, y, w, h)) in rects.iter().enumerate().take(rects.len() - 1) {
-            let hit = match t.orientation {
-                Orientation::Row => {
-                    (pos.x - (x + w) as f64).abs() <= GRAB
-                        && pos.y >= y as f64
-                        && pos.y < (y + h) as f64
-                }
-                Orientation::Column => {
-                    (pos.y - (y + h) as f64).abs() <= GRAB
-                        && pos.x >= x as f64
-                        && pos.x < (x + w) as f64
-                }
-            };
-            if hit {
-                return Some(i);
-            }
-        }
-        None
     }
 
     /// Drag divider `i` to the pointer: redistribute the PAIR's weight.
@@ -2181,7 +2165,7 @@ impl App {
 
     fn term_mode(&self) -> TermMode {
         self.session()
-            .map_or(TermMode::empty(), |s| *s.term.lock().unwrap().mode())
+            .map_or(TermMode::empty(), |s| *s.term.lock().mode())
     }
 
     fn note_held_away(&mut self, event: &KeyEvent) {
@@ -2241,7 +2225,7 @@ impl App {
             return false;
         };
         // term first, then meta — the crate's lock order
-        let alt = s.term.lock().unwrap().mode().contains(TermMode::ALT_SCREEN);
+        let alt = s.term.lock().mode().contains(TermMode::ALT_SCREEN);
         let (bidi_state, running) = {
             let m = s.meta.lock().unwrap();
             (m.bidi.clone(), m.running_cmd.clone())
@@ -2283,7 +2267,7 @@ impl App {
         let Some((ti, pi)) = self.find_pane(id) else {
             return TermMode::empty();
         };
-        *self.tabs[ti].panes[pi].session.term.lock().unwrap().mode()
+        *self.tabs[ti].panes[pi].session.term.lock().mode()
     }
 
     fn write_pane(&mut self, id: u64, bytes: &[u8]) {
@@ -2398,11 +2382,7 @@ impl App {
         let (auto, manual) = (self.auto_follow, self.claude_manual);
         let honor = self.config.honor_bdsm();
         let (cols, row, cells, claude, vis, reorder, dir) = {
-            let t = self.tabs[self.active].panes[hit.pane]
-                .session
-                .term
-                .lock()
-                .unwrap();
+            let t = self.tabs[self.active].panes[hit.pane].session.term.lock();
             let cols = t.columns().max(1);
             let rows = t.screen_lines().max(1);
             let row = hit.row.min(rows - 1);
@@ -2550,7 +2530,7 @@ impl App {
             return Vec::new();
         };
         let spans = {
-            let term = self.tabs[ti].panes[pi].session.term.lock().unwrap();
+            let term = self.tabs[ti].panes[pi].session.term.lock();
             link::links_on_row(&term, row)
         };
         self.link_cache.insert(id, row, spans.clone());
@@ -2744,12 +2724,7 @@ impl App {
             self.write_pane(out.pane, &out.bytes);
         }
         if let Some((ti, pi)) = self.find_pane(id) {
-            self.tabs[ti].panes[pi]
-                .session
-                .term
-                .lock()
-                .unwrap()
-                .selection = None;
+            self.tabs[ti].panes[pi].session.term.lock().selection = None;
         }
         true
     }
@@ -2822,89 +2797,6 @@ impl App {
         }
     }
 
-    /// Which window edge the pointer is on, if any. 6px is the smallest band
-    /// that stays grabbable without stealing clicks from the content.
-    fn resize_edge_at(&self, pos: PhysicalPosition<f64>) -> Option<ResizeDirection> {
-        let w = self.window.as_ref()?;
-        if w.is_maximized() {
-            return None; // a maximized window has no edges to drag
-        }
-        const B: f64 = 6.0;
-        let s = w.inner_size();
-        let (x, y, ww, wh) = (pos.x, pos.y, s.width as f64, s.height as f64);
-        let l = x <= B;
-        let r = x >= ww - B;
-        let t = y <= B;
-        let b = y >= wh - B;
-        Some(match (l, r, t, b) {
-            (true, _, true, _) => ResizeDirection::NorthWest,
-            (_, true, true, _) => ResizeDirection::NorthEast,
-            (true, _, _, true) => ResizeDirection::SouthWest,
-            (_, true, _, true) => ResizeDirection::SouthEast,
-            (true, ..) => ResizeDirection::West,
-            (_, true, ..) => ResizeDirection::East,
-            (_, _, true, _) => ResizeDirection::North,
-            (_, _, _, true) => ResizeDirection::South,
-            _ => return None,
-        })
-    }
-
-    /// Caption button under the pointer: 0 minimise, 1 maximise, 2 close.
-    fn caption_button_at(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
-        let (r, w) = (self.renderer.as_ref()?, self.window.as_ref()?);
-        if r.tab_bar_h() == 0.0 {
-            return None;
-        }
-        let pw = w.inner_size().width as usize;
-        r.window_buttons(pw).iter().position(|&(bx, by, bw, bh)| {
-            pos.x >= bx as f64
-                && pos.x < (bx + bw) as f64
-                && pos.y >= by as f64
-                && pos.y < (by + bh) as f64
-        })
-    }
-
-    /// Empty title-strip space: dragging it moves the window, as a real
-    /// title bar would. Tabs, the gear and the caption buttons are excluded.
-    fn in_drag_strip(&self, pos: PhysicalPosition<f64>) -> bool {
-        let Some(r) = self.renderer.as_ref() else {
-            return false;
-        };
-        let Some(w) = self.window.as_ref() else {
-            return false;
-        };
-        if r.tab_bar_h() == 0.0 || pos.y >= r.tab_bar_h() as f64 {
-            return false;
-        }
-        if self.resize_edge_at(pos).is_some() || self.caption_button_at(pos).is_some() {
-            return false;
-        }
-        let pw = w.inner_size().width as usize;
-        if r.settings_button_hit(pw, pos.x, pos.y) || r.tab_control_hit(pw, pos.x, pos.y).is_some()
-        {
-            return false;
-        }
-        self.tab_at(pos).is_none()
-    }
-
-    /// Tab index under a pixel position, if it's in the tab bar.
-    fn tab_at(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
-        let r = self.renderer.as_ref()?;
-        if r.tab_bar_h() == 0.0 || pos.y >= r.tab_bar_h() as f64 {
-            return None;
-        }
-        // widths vary per title now, so walk them; the same tab_width the
-        // renderer uses, or a click would land on the neighbour
-        let width = self.window.as_ref()?.inner_size().width as usize;
-        let titles: Vec<_> = self.tabs.iter().map(|t| t.title.as_str()).collect();
-        for (i, x, w) in r.tab_rects(width, &titles, self.active) {
-            if pos.x >= x as f64 && pos.x < (x + w) as f64 {
-                return Some(i);
-            }
-        }
-        None
-    }
-
     /// Fire a toast for something the PROGRAM asked for. Rate-limited:
     /// the trigger is untrusted output, so it must not be able to spam.
     fn toast_from_pty(&mut self, title: &str, body: &str) {
@@ -2922,7 +2814,6 @@ impl App {
         self.session().is_some_and(|s| {
             s.term
                 .lock()
-                .unwrap()
                 .selection
                 .as_ref()
                 .is_some_and(|sel| !sel.is_empty())
@@ -2935,7 +2826,7 @@ impl App {
             return false;
         };
         let text = {
-            let mut t = session.term.lock().unwrap();
+            let mut t = session.term.lock();
             let txt = t.selection_to_string();
             if clear {
                 t.selection = None;
@@ -2958,20 +2849,23 @@ impl App {
         }
     }
 
-    fn set_clipboard(&mut self, s: String) {
+    /// The system clipboard, opened on first use. A failed open is retried
+    /// next time rather than remembered.
+    fn clipboard(&mut self) -> Option<&mut arboard::Clipboard> {
         if self.clipboard.is_none() {
             self.clipboard = arboard::Clipboard::new().ok();
         }
-        if let Some(c) = self.clipboard.as_mut() {
+        self.clipboard.as_mut()
+    }
+
+    fn set_clipboard(&mut self, s: String) {
+        if let Some(c) = self.clipboard() {
             let _ = c.set_text(s);
         }
     }
 
     fn paste(&mut self) {
-        if self.clipboard.is_none() {
-            self.clipboard = arboard::Clipboard::new().ok();
-        }
-        let Some(txt) = self.clipboard.as_mut().and_then(|c| c.get_text().ok()) else {
+        let Some(txt) = self.clipboard().and_then(|c| c.get_text().ok()) else {
             return;
         };
         if txt.is_empty() {
@@ -3015,7 +2909,7 @@ impl App {
 
     fn scroll_lines(&mut self, n: i32) {
         if let Some(s) = self.session() {
-            s.term.lock().unwrap().scroll_display(Scroll::Delta(n));
+            s.term.lock().scroll_display(Scroll::Delta(n));
         }
         self.invalidate_focused_links();
         self.request_redraw();
@@ -3034,7 +2928,7 @@ impl App {
             return;
         };
         let found = {
-            let mut t = session.term.lock().unwrap();
+            let mut t = session.term.lock();
             let hl = self.search.as_ref().and_then(|s| s.hl.clone());
             let m = find_match(&mut t, &query, &hl, dir);
             if let Some(m) = &m {
@@ -3203,7 +3097,7 @@ impl App {
                             m.claude_from_abs,
                         )
                     };
-                    let t = pane.session.term.lock().unwrap();
+                    let t = pane.session.term.lock();
                     // Explicit BDSM suppresses reordering for the whole pane,
                     // Claude restoration included, and only while the command
                     // is running or the alt screen is up. honor_bdsm defaults on.
@@ -3532,6 +3426,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
         }
+        // BAYAN_PASTE=<text>: put text on the clipboard and right-click the
+        // focused pane once the renderer exists, so right-click paste can
+        // be verified without injecting mouse input. It replaces whatever
+        // was on the clipboard.
+        if let Some(v) = std::env::var_os("BAYAN_PASTE") {
+            self.debug_paste = v.to_str().map(str::to_string);
+        }
         // BAYAN_POSH=1: open the prompt picker at startup (capture without keys)
         if std::env::var_os("BAYAN_POSH").is_some() {
             self.open_posh();
@@ -3571,6 +3472,9 @@ impl ApplicationHandler<UserEvent> for App {
         self.rebuild_renderer();
         // the quake hotkey (Ctrl+Alt+`): a null-hwnd registration posts
         // WM_HOTKEY to this thread's queue, where the msg hook catches it
+        // SAFETY: a null hwnd is the documented way to have WM_HOTKEY posted
+        // to this thread's queue; the rest are plain integers. A chord another
+        // program owns makes it return 0, which is ignored.
         unsafe {
             use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
                 RegisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, VK_OEM_3,
@@ -3767,6 +3671,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if (self.font_delta - self.inflight_delta).abs() > f32::EPSILON {
                     self.rebuild_renderer();
                 }
+                if let Some(text) = self.debug_paste.take() {
+                    self.debug_right_click_paste(text);
+                }
                 self.request_redraw();
             }
             UserEvent::Exit(id) => {
@@ -3839,217 +3746,14 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        if matches!(
-            &event,
-            WindowEvent::Focused(false) | WindowEvent::CursorLeft { .. }
-        ) {
-            self.swallow_guard_release = false;
-            if let Some(p) = self.palette.as_mut() {
-                p.pressed = None;
-                p.wheel = 0.0;
-            }
-        }
-        if let WindowEvent::MouseInput { state, button, .. } = &event {
-            if consume_guard_release(&mut self.swallow_guard_release, *state, *button) {
-                return;
-            }
-        }
-        if self.pending_close.is_some() {
-            // A modal owns pointer input too: no tab changes, selections,
-            // dropped commands or wheel reports may reach the terminal below.
-            match &event {
-                WindowEvent::CursorMoved { position, .. } => {
-                    self.cursor_pos = *position;
-                    self.abandon_mouse();
-                    self.drag_divider = None;
-                    if let Some(w) = &self.window {
-                        w.set_cursor(winit::window::CursorIcon::Default);
-                    }
-                    return;
-                }
-                WindowEvent::MouseInput { state, button, .. } => {
-                    self.abandon_mouse();
-                    self.drag_divider = None;
-                    if *state == ElementState::Pressed && *button == MouseButton::Left {
-                        self.swallow_guard_release = true;
-                        let hit =
-                            self.renderer
-                                .as_ref()
-                                .zip(self.window.as_ref())
-                                .and_then(|(r, w)| {
-                                    let size = w.inner_size();
-                                    r.close_guard_layout(size.width as usize, size.height as usize)
-                                        .hit(self.cursor_pos.x, self.cursor_pos.y)
-                                });
-                        if let Some(confirm) = hit {
-                            self.resolve_close(confirm, el);
-                        }
-                    }
-                    return;
-                }
-                WindowEvent::MouseWheel { .. } | WindowEvent::DroppedFile(_) => return,
-                _ => {}
-            }
-        }
-        if self.palette.is_some() {
-            match &event {
-                WindowEvent::CursorMoved { position, .. } => {
-                    self.cursor_pos = *position;
-                    return;
-                }
-                WindowEvent::MouseInput { state, button, .. } => {
-                    if *button != MouseButton::Left {
-                        return;
-                    }
-                    let p = self.palette.as_ref().unwrap();
-                    let rows = self.palette_rows(&p.query);
-                    let layout = self
-                        .renderer
-                        .as_ref()
-                        .zip(self.window.as_ref())
-                        .map(|(r, w)| {
-                            let size = w.inner_size();
-                            r.palette_layout(
-                                size.width as usize,
-                                size.height as usize,
-                                rows.len(),
-                                p.sel,
-                            )
-                        });
-                    let hit = layout
-                        .as_ref()
-                        .and_then(|l| l.row_at(self.cursor_pos.x, self.cursor_pos.y));
-                    if *state == ElementState::Pressed {
-                        if layout.is_some_and(|l| !l.contains(self.cursor_pos.x, self.cursor_pos.y))
-                        {
-                            self.palette = None;
-                            self.swallow_guard_release = true;
-                        } else if let Some(p) = self.palette.as_mut() {
-                            p.wheel = 0.0;
-                            p.pressed =
-                                hit.and_then(|i| rows.get(i).map(|(row, _)| (i, row.clone())));
-                        }
-                    } else {
-                        let pressed = self.palette.as_mut().and_then(|p| p.pressed.take());
-                        if let (Some((index, action)), Some(hit)) = (pressed, hit) {
-                            if index == hit && rows.get(hit).is_some_and(|(row, _)| *row == action)
-                            {
-                                self.palette_run(action, el);
-                            }
-                        }
-                    }
-                    self.request_redraw();
-                    return;
-                }
-                WindowEvent::MouseWheel { delta, .. } => {
-                    let step = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => *y,
-                        MouseScrollDelta::PixelDelta(p) => (p.y / 30.0) as f32,
-                    };
-                    let p = self.palette.as_ref().unwrap();
-                    let count = self.palette_rows(&p.query).len();
-                    if let Some(p) = self.palette.as_mut() {
-                        p.pressed = None;
-                        if step != 0.0 {
-                            p.wheel += step;
-                            let whole = p.wheel.trunc();
-                            p.wheel -= whole;
-                            let distance = whole.abs().min(12.0) as usize;
-                            p.sel = if whole > 0.0 {
-                                p.sel.saturating_sub(distance)
-                            } else {
-                                p.sel.saturating_add(distance).min(count.saturating_sub(1))
-                            };
-                        }
-                    }
-                    self.request_redraw();
-                    return;
-                }
-                WindowEvent::DroppedFile(_) => return,
-                WindowEvent::Resized(_)
-                | WindowEvent::ScaleFactorChanged { .. }
-                | WindowEvent::Focused(false) => {
-                    if let Some(p) = self.palette.as_mut() {
-                        p.pressed = None;
-                    }
-                }
-                _ => {}
-            }
+        if self.modal_pointer(&event, el) {
+            return;
         }
         match event {
-            WindowEvent::CloseRequested => {
-                // a running command deserves a second look before the kill
-                let running = self.running_count();
-                if !prepare_window_close(
-                    &mut self.pending_close,
-                    self.config.confirm_close_on(),
-                    running,
-                ) {
-                    self.request_redraw();
-                    return;
-                }
-                self.quit(el);
-            }
-            WindowEvent::Focused(f) => {
-                self.focused = f;
-                // A blur drops keys we were holding back. The matching
-                // release may never arrive (the user alt-tabbed mid-chord),
-                // and a later focus must not swallow an unrelated press.
-                blur_forgets_held_keys(f, &mut self.keys_held_away);
-                if f {
-                    // you're here now: the active tab's attention is served
-                    if let Some(t) = self.tabs.get_mut(self.active) {
-                        t.attention = false;
-                    }
-                    self.request_redraw();
-                } else {
-                    // Alt+Tab with the button down must not keep dragging
-                    self.abandon_mouse();
-                }
-                // The event bit, not has_focus: that query can still say
-                // true after Focused(false) and would drop CSI O.
-                self.sync_focus(Some(f));
-            }
-            WindowEvent::DroppedFile(path) => {
-                // Quote for the shell this pane was spawned with. A name like
-                // $(calc) must arrive as a literal; a control character is
-                // not typed at all. vim, less, and a shell that is not at its
-                // prompt (cmd inside PowerShell never emits OSC 133 B) confirm
-                // first. A program that asked for bracketed paste gets the wrap.
-                let decision = {
-                    let Some(session) = self.session() else {
-                        return;
-                    };
-                    let Some(arg) = term::dropped_path_arg(&path, session.shell()) else {
-                        return;
-                    };
-                    // term, then meta — the lock order the reader uses too.
-                    let mode = *session.term.lock().unwrap().mode();
-                    let at_prompt = session.meta.lock().unwrap().at_prompt;
-                    (arg, mode, at_prompt)
-                };
-                let (arg, mode, at_prompt) = decision;
-                let alt = mode.contains(TermMode::ALT_SCREEN);
-                if term::drop_needs_confirm(alt, at_prompt, &arg) {
-                    let why = if alt {
-                        term::PasteRisk::AltScreen
-                    } else {
-                        term::PasteRisk::NotAtPrompt
-                    };
-                    self.arm_pending_paste(arg, Some(why));
-                } else if let Some(s) = self.session_mut() {
-                    let body =
-                        term::normalize_paste(&arg, mode.contains(TermMode::BRACKETED_PASTE));
-                    s.write(body.as_bytes());
-                }
-            }
-            WindowEvent::ModifiersChanged(m) => {
-                self.modifiers = m.state();
-                self.refresh_link_hover(self.cursor_pos);
-                if !self.modifiers.control_key() && self.mru.walking() {
-                    self.mru.release(self.active); // the Ctrl+Tab walk ends here
-                }
-            }
+            WindowEvent::CloseRequested => self.request_close(el),
+            WindowEvent::Focused(f) => self.focus_changed(f),
+            WindowEvent::DroppedFile(path) => self.drop_file(&path),
+            WindowEvent::ModifiersChanged(m) => self.modifiers_changed(m.state()),
             WindowEvent::ScaleFactorChanged { .. } => {
                 // HiDPI: the window moved to a monitor with another scale.
                 // Rebuild cell metrics off-thread; the current renderer keeps
@@ -4057,626 +3761,12 @@ impl ApplicationHandler<UserEvent> for App {
                 self.rebuild_renderer();
             }
             WindowEvent::Moved(_) => self.track_geometry(),
-            WindowEvent::Resized(px) => {
-                if px.width == 0 || px.height == 0 {
-                    return;
-                }
-                self.track_geometry();
-                if let Some(gpu) = self.gpu.as_mut() {
-                    gpu.resize(px.width, px.height);
-                }
-                self.relayout_active();
-                self.request_redraw();
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_pos = position;
-                if let Some(i) = self.drag_divider {
-                    self.drag_divider_to(i, position);
-                    return;
-                }
-                if self.mouse.selecting {
-                    // the drag stays in the pane where it started. Shift+drag
-                    // takes this path even while the program is tracking the
-                    // mouse — the bypass is the whole point of Shift.
-                    self.clear_link_hover();
-                    if let Some((pi, row, col, side)) = self.pane_cell_at(position) {
-                        if pi == self.sel_pane {
-                            if let Some(s) = self.session() {
-                                let mut t = s.term.lock().unwrap();
-                                let off = t.grid().display_offset() as i32;
-                                let point = Point::new(Line(row as i32 - off), Column(col));
-                                if let Some(sel) = t.selection.as_mut() {
-                                    sel.update(point, side);
-                                }
-                            }
-                            self.request_redraw();
-                        }
-                    }
-                } else if self.mouse.grabbed_pane().is_some() {
-                    // 1002/1003: the program owns the drag. No local selection,
-                    // and no redraw — a still frame stays still.
-                    self.report_drag(position);
-                    self.clear_link_hover();
-                } else {
-                    // One hit-test: the hover and the 1003 report share the
-                    // logical cell `locate` mapped through column_for_click.
-                    let cell = self.refresh_link_hover(position);
-                    if let Some(w) = &self.window {
-                        // hovering a divider shows the resize cursor
-                        use winit::window::CursorIcon;
-                        // M24: an undecorated window has to advertise its own
-                        // edges, or the user has no way to learn they can grab.
-                        let icon = if let Some(dir) = self.resize_edge_at(position) {
-                            CursorIcon::from(dir)
-                        } else if self.divider_at(position).is_some() {
-                            match self.tabs.get(self.active).map(|t| t.orientation) {
-                                Some(Orientation::Column) => CursorIcon::NsResize,
-                                _ => CursorIcon::EwResize,
-                            }
-                        } else if self.link_hover.is_some() {
-                            CursorIcon::Pointer
-                        } else {
-                            CursorIcon::Default
-                        };
-                        w.set_cursor(icon);
-                        // caption/gear hover feedback
-                        let cap = self.caption_button_at(position);
-                        let pw = w.inner_size().width as usize;
-                        let gear = self
-                            .renderer
-                            .as_ref()
-                            .is_some_and(|r| r.settings_button_hit(pw, position.x, position.y));
-                        if let Some(r) = self.renderer.as_mut() {
-                            if r.hover_caption != cap || r.hover_gear != gear {
-                                r.hover_caption = cap;
-                                r.hover_gear = gear;
-                                self.request_redraw();
-                            }
-                        }
-                    }
-                    // 1003: motion with no button. Shift and overlays already
-                    // dropped out inside the report.
-                    if let Some((id, row, col)) = cell {
-                        self.report_motion_at(id, row, col);
-                    }
-                }
-            }
+            WindowEvent::Resized(px) => self.resized(px),
+            WindowEvent::CursorMoved { position, .. } => self.cursor_moved(position),
             WindowEvent::CursorLeft { .. } => self.clear_link_hover(),
-            WindowEvent::MouseInput { state, button, .. } => {
-                let mapped = match button {
-                    MouseButton::Left => Some(mouse::Btn::Left),
-                    MouseButton::Middle => Some(mouse::Btn::Middle),
-                    MouseButton::Right => Some(mouse::Btn::Right),
-                    _ => None,
-                };
-                match state {
-                    ElementState::Pressed => {
-                        // Right pastes (it copies a selection only when
-                        // copy-on-select is off), unless the program tracks the
-                        // mouse and Shift is up. It never touches chrome. The
-                        // release is reported or ignored below.
-                        if matches!(button, MouseButton::Right) {
-                            match self.right_click_owner() {
-                                Some((_, mouse::RightClick::Program)) => {
-                                    let _ = self.try_report_press(mouse::Btn::Right);
-                                }
-                                Some((_, mouse::RightClick::Copy)) => {
-                                    self.copy_selection(true);
-                                    self.request_redraw();
-                                }
-                                Some((pane, mouse::RightClick::Paste)) => {
-                                    self.focus_pane_at(pane);
-                                    self.sync_focus(None);
-                                    self.paste();
-                                }
-                                Some((_, mouse::RightClick::Blocked)) | None => {}
-                            }
-                            return;
-                        }
-                        // middle never touches chrome; it only reports when the
-                        // program asked. Left still walks the chrome first.
-                        if !matches!(button, MouseButton::Left) {
-                            if let Some(b) = mapped {
-                                let _ = self.try_report_press(b);
-                            }
-                            return;
-                        }
-                        // M24 order matters: edges are outermost, then the caption
-                        // buttons, and only then the panels — otherwise a resize
-                        // grab near the top-right would open settings instead.
-                        if self.shortcuts.is_none() && self.settings.is_none() {
-                            if let Some(dir) = self.resize_edge_at(self.cursor_pos) {
-                                if let Some(w) = self.window.as_ref() {
-                                    let _ = w.drag_resize_window(dir);
-                                }
-                                return;
-                            }
-                            if let Some(i) = self.caption_button_at(self.cursor_pos) {
-                                if let Some(w) = self.window.as_ref() {
-                                    match i {
-                                        0 => w.set_minimized(true),
-                                        1 => w.set_maximized(!w.is_maximized()),
-                                        _ => {
-                                            // identical to CloseRequested: the
-                                            // running-command guard must not be
-                                            // bypassed just because the button
-                                            // is ours now
-                                            let running = self.running_count();
-                                            if !prepare_window_close(
-                                                &mut self.pending_close,
-                                                self.config.confirm_close_on(),
-                                                running,
-                                            ) {
-                                                self.request_redraw();
-                                            } else {
-                                                self.quit(el);
-                                            }
-                                        }
-                                    }
-                                }
-                                return;
-                            }
-                        }
-                        // the shortcuts editor swallows clicks: a row starts a
-                        // capture, outside the card closes + saves
-                        if self.shortcuts.is_some() {
-                            self.shortcuts_click(self.cursor_pos.x, self.cursor_pos.y);
-                            return;
-                        }
-                        // the settings panel swallows clicks: apply the control
-                        // hit, or a click outside the card closes + saves
-                        if self.settings.is_some() {
-                            self.settings_click(self.cursor_pos.x, self.cursor_pos.y);
-                            return;
-                        }
-                        // the settings gear button in the tab bar opens settings
-                        // (a click — layout-proof, unlike a comma shortcut)
-                        if let (Some(r), Some(w)) = (self.renderer.as_ref(), self.window.as_ref()) {
-                            let pw = w.inner_size().width as usize;
-                            if let Some(control) =
-                                r.tab_control_hit(pw, self.cursor_pos.x, self.cursor_pos.y)
-                            {
-                                match control {
-                                    0 if self.active > 0 => self.switch_tab(self.active - 1),
-                                    1 if self.active + 1 < self.tabs.len() => {
-                                        self.switch_tab(self.active + 1)
-                                    }
-                                    2 => self.perform_action(keybinds::Action::NewTab, el),
-                                    _ => {}
-                                }
-                                self.request_redraw();
-                                return;
-                            }
-                            if r.settings_button_hit(pw, self.cursor_pos.x, self.cursor_pos.y) {
-                                self.settings = Some(0);
-                                self.request_redraw();
-                                return;
-                            }
-                        }
-                        // the cockpit swallows clicks: pick a row or dismiss
-                        if self.cockpit {
-                            let hit = self.cockpit_row_hit(self.cursor_pos);
-                            self.cockpit = false;
-                            if let Some(row) = hit {
-                                self.switch_tab(row);
-                            }
-                            self.request_redraw();
-                            return;
-                        }
-                        // grabbing a divider starts a resize drag
-                        if let Some(i) = self.divider_at(self.cursor_pos) {
-                            self.drag_divider = Some(i);
-                            return;
-                        }
-                        // a click in the tab bar switches tabs
-                        if let Some(idx) = self.tab_at(self.cursor_pos) {
-                            self.switch_tab(idx);
-                            return;
-                        }
-                        // empty title strip: double-click maximises, drag moves —
-                        // the two gestures a real title bar owes the user
-                        if self.in_drag_strip(self.cursor_pos) {
-                            if let Some(w) = self.window.as_ref() {
-                                let now = std::time::Instant::now();
-                                let dbl =
-                                    self.last_strip_click.is_some_and(|t: std::time::Instant| {
-                                        now.duration_since(t).as_millis() < 400
-                                    });
-                                self.last_strip_click = Some(now);
-                                if dbl {
-                                    w.set_maximized(!w.is_maximized());
-                                } else {
-                                    let _ = w.drag_window();
-                                }
-                            }
-                            return;
-                        }
-                        // Link, program, or local selection. Shift wins over
-                        // Ctrl. An overlay (including the refused-link card)
-                        // is neither a link open nor a selection. The cell
-                        // is the one Route::press reports.
-                        match self.left_click_owner() {
-                            link::ClickOwner::Blocked => return,
-                            link::ClickOwner::Link => {
-                                let _ = self.activate_link_at(self.cursor_pos);
-                                return;
-                            }
-                            link::ClickOwner::Program => {
-                                let _ = self.try_report_press(mouse::Btn::Left);
-                                return;
-                            }
-                            link::ClickOwner::Local => {}
-                        }
-                        if let Some((pi, row, col, side)) = self.pane_cell_at(self.cursor_pos) {
-                            // clicking a pane focuses it
-                            if let Some(t) = self.tabs.get_mut(self.active) {
-                                if t.focused != pi {
-                                    t.focused = pi;
-                                    self.update_title();
-                                }
-                            }
-                            self.sync_focus(None);
-                            self.sel_pane = pi;
-                            // 1 click = simple drag anchor, 2 = word, 3 = line
-                            let n = self.clicks.click(Instant::now(), (row, col));
-                            let ty = match n {
-                                2 => SelectionType::Semantic,
-                                3 => SelectionType::Lines,
-                                _ => SelectionType::Simple,
-                            };
-                            if let Some(s) = self.session() {
-                                let mut t = s.term.lock().unwrap();
-                                let off = t.grid().display_offset() as i32;
-                                let point = Point::new(Line(row as i32 - off), Column(col));
-                                t.selection = Some(Selection::new(ty, point, side));
-                            }
-                            self.mouse.selecting = true;
-                            self.clear_link_hover();
-                            if n >= 2 && self.config.copy_on_select_on() {
-                                // word/line selections are complete on click
-                                self.copy_selection(false);
-                            }
-                            self.request_redraw();
-                        }
-                    }
-                    ElementState::Released => {
-                        if self.drag_divider.take().is_some() {
-                            return; // a resize drag copies nothing
-                        }
-                        if let Some(b) = mapped {
-                            if self.release_mouse_report(b) {
-                                return;
-                            }
-                        }
-                        if !matches!(button, MouseButton::Left) {
-                            return;
-                        }
-                        self.mouse.selecting = false;
-                        // EasyTer convention: auto-copy the selection on release
-                        // (the settings panel can turn this off; explicit
-                        // Ctrl+C / Ctrl+Shift+C always copy)
-                        if self.config.copy_on_select_on() {
-                            self.copy_selection(false);
-                        }
-                    }
-                }
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let cell_h = self.renderer.as_ref().map_or(20.0, |r| r.cell_h);
-                let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y * 3.0,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / cell_h,
-                };
-                // accumulate: precision touchpads send many sub-line deltas
-                self.wheel_accum += lines;
-                let n = self.wheel_accum as i32;
-                if n == 0 {
-                    return;
-                }
-                self.wheel_accum -= n as f32;
-                // Ctrl+wheel = live font zoom (EasyTer's favorite)
-                if self.modifiers.control_key() {
-                    self.font_delta = (self.font_delta + n as f32).clamp(-7.0, 25.0);
-                    self.rebuild_renderer();
-                    return;
-                }
-                // the pane under the pointer, else the focused one. A notch
-                // over the tab bar or the padding is not a cell: tracking
-                // programs do not hear 1;1. Shift scrolls locally, including
-                // on the alt screen.
-                let hit = self.locate(self.cursor_pos);
-                let (at, view_id) = if let Some((_, id, row, col)) = hit {
-                    (Some(mouse::Cell { pane: id, row, col }), Some(id))
-                } else {
-                    let id = self
-                        .tabs
-                        .get(self.active)
-                        .and_then(|t| t.panes.get(t.focused).map(|p| p.id));
-                    (None, id)
-                };
-                let Some(id) = view_id else {
-                    return;
-                };
-                let decided = mouse::Route::wheel(at, self.wheel_view(id), n, self.mods_now());
-                match decided {
-                    Some(mouse::Wheel::Report { pane, bytes })
-                    | Some(mouse::Wheel::Arrows { pane, bytes }) => {
-                        self.write_pane(pane, &bytes);
-                    }
-                    Some(mouse::Wheel::Scroll { pane, lines }) => {
-                        if let Some((ti, pi)) = self.find_pane(pane) {
-                            self.tabs[ti].panes[pi]
-                                .session
-                                .term
-                                .lock()
-                                .unwrap()
-                                .scroll_display(Scroll::Delta(lines));
-                        }
-                        self.link_cache.invalidate_pane(pane);
-                        self.request_redraw();
-                    }
-                    None => {}
-                }
-            }
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                // Assume the press is swallowed until bytes actually go out.
-                // Every early return above the write leaves the key here, so
-                // its release stays out of the PTY too.
-                self.note_held_away(&event);
-                let m = self.modifiers;
-                let (ctrl, shift, alt) = (m.control_key(), m.shift_key(), m.alt_key());
-                crate::prof::mark(&format!(
-                    "key logical={:?} physical={:?} text={:?} ctrl={ctrl} shift={shift}",
-                    event.logical_key, event.physical_key, event.text
-                ));
-                // a pending close owns the keyboard: Enter closes, Esc keeps
-                if self.pending_close.is_some() {
-                    match &event.logical_key {
-                        Key::Named(NamedKey::Enter) => self.resolve_close(true, el),
-                        Key::Named(NamedKey::Escape) => self.resolve_close(false, el),
-                        _ => {}
-                    }
-                    self.request_redraw();
-                    return;
-                }
-                // a pending paste owns the keyboard: Enter sends, Esc drops
-                if self.pending_paste.is_some() {
-                    match &event.logical_key {
-                        Key::Named(NamedKey::Enter) => {
-                            if let Some(pending) = self.pending_paste.take() {
-                                self.send_paste(&pending.text);
-                            }
-                        }
-                        Key::Named(NamedKey::Escape) => self.pending_paste = None,
-                        _ => {}
-                    }
-                    self.request_redraw();
-                    return;
-                }
-                // a link card owns the keyboard. Esc dismisses. Enter
-                // dismisses a refusal and opens only a confirm card
-                // (userinfo, or a non-ASCII host). Nothing is typed into the PTY.
-                if self.blocked_link.is_some() {
-                    let enter = matches!(&event.logical_key, Key::Named(NamedKey::Enter));
-                    let escape = matches!(&event.logical_key, Key::Named(NamedKey::Escape));
-                    let may_open = self
-                        .blocked_link
-                        .as_ref()
-                        .is_some_and(|c| c.confirm_uri.is_some());
-                    match link::card_decision(enter, escape, may_open) {
-                        link::CardDecision::Open => {
-                            if let Some(card) = self.blocked_link.take() {
-                                if let Some(uri) = card.confirm_uri {
-                                    self.spawn_link_open(link::Action::Browse(uri));
-                                }
-                            }
-                            self.request_redraw();
-                        }
-                        link::CardDecision::Dismiss => {
-                            self.blocked_link = None;
-                            self.request_redraw();
-                        }
-                        link::CardDecision::Ignore => {}
-                    }
-                    return;
-                }
-                // the prompt picker owns the keyboard while open
-                if self.posh.is_some() {
-                    self.posh_input(&event);
-                    return;
-                }
-                // the palette owns the keyboard while open
-                if self.palette.is_some() {
-                    self.palette_input(&event, el);
-                    return;
-                }
-                // the shortcuts editor owns the keyboard while open
-                if self.shortcuts.is_some() {
-                    self.shortcuts_input(&event, el);
-                    return;
-                }
-                // the settings panel owns the keyboard while open
-                if self.settings.is_some() {
-                    self.settings_input(&event);
-                    return;
-                }
-                // the cockpit owns the keyboard while open
-                if self.cockpit {
-                    self.cockpit_input(&event);
-                    return;
-                }
-                // the search bar owns the keyboard while open
-                if self.search.is_some() {
-                    self.search_input(&event, shift);
-                    return;
-                }
-                // Ctrl+Shift+P opens the palette. Physical key, like every
-                // other chord here, so an Arabic layout does not break it.
-                if ctrl
-                    && shift
-                    && event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyP)
-                {
-                    self.open_palette(String::new());
-                    self.request_redraw();
-                    return;
-                }
-                // Ctrl+Shift+O: the prompt picker (O for oh-my-posh)
-                if ctrl
-                    && shift
-                    && event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyO)
-                {
-                    self.open_posh();
-                    return;
-                }
-                let key = &event.logical_key;
-                // ---- rebindable shortcuts (the keymap; Ctrl+, ⌨ edits it).
-                // Plain Ctrl+letters belong to TUIs, except clipboard paste.
-                if let Some(chord) = keybinds::chord_from(event.physical_key, ctrl, shift, alt) {
-                    let alt_screen = self.term_mode().contains(TermMode::ALT_SCREEN);
-                    if let Some(action) =
-                        keybinds::resolve(&self.keymap, chord, alt_screen, self.has_selection())
-                    {
-                        if action == keybinds::Action::Copy
-                            && chord.is_plain_ctrl_letter()
-                            && chord.key == keybinds::ChordKey::Letter('c')
-                        {
-                            self.copy_selection(true);
-                            self.request_redraw();
-                            return;
-                        }
-                        self.perform_action(action, el);
-                        return;
-                    }
-                }
-                // Alt+arrows move focus between panes (EasyTer's binding)
-                if alt && !ctrl {
-                    let step = match key {
-                        Key::Named(NamedKey::ArrowLeft) | Key::Named(NamedKey::ArrowUp) => {
-                            Some(-1i32)
-                        }
-                        Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::ArrowDown) => {
-                            Some(1)
-                        }
-                        _ => None,
-                    };
-                    if let Some(d) = step {
-                        if let Some(t) = self.tabs.get_mut(self.active) {
-                            if t.panes.len() > 1 {
-                                let n = t.panes.len() as i32;
-                                t.focused = ((t.focused as i32 + d + n) % n) as usize;
-                                self.update_title();
-                                self.sync_focus(None);
-                                self.request_redraw();
-                                return;
-                            }
-                        }
-                    }
-                } else if ctrl {
-                    // Ctrl+Tab / Ctrl+Shift+Tab cycle tabs (shift handled here
-                    // because winit reports Tab+shift with the shift modifier)
-                    if matches!(key, Key::Named(NamedKey::Tab)) && !self.tabs.is_empty() {
-                        let n = self.tabs.len();
-                        if self.config.tab_switch_recent() {
-                            // stack-like: the previous tab first, deeper while
-                            // Ctrl stays down; ModifiersChanged commits the stop
-                            if let Some(next) = self.mru.step(!shift, n) {
-                                self.show_tab(next);
-                            }
-                        } else {
-                            let next = if shift {
-                                (self.active + n - 1) % n
-                            } else {
-                                (self.active + 1) % n
-                            };
-                            self.switch_tab(next);
-                        }
-                        return;
-                    }
-                    if let Some(step) = keyboard_zoom(event.physical_key, ctrl, alt, shift) {
-                        self.font_delta = (self.font_delta + step as f32).clamp(-7.0, 25.0);
-                        self.rebuild_renderer();
-                        return;
-                    }
-                    // Ctrl+0 resets the font zoom (physical digit key:
-                    // works on the Arabic layout too)
-                    {
-                        use winit::keyboard::{KeyCode, PhysicalKey};
-                        if !shift
-                            && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Digit0))
-                        {
-                            self.font_delta = 0.0;
-                            self.rebuild_renderer();
-                            return;
-                        }
-                    }
-                    // Ctrl+C copies when a selection exists (Windows
-                    // convention); otherwise falls through to \x03
-                    if let Some(l) = key_letter(&event) {
-                        if !shift && !alt && l == 'c' && self.has_selection() {
-                            self.copy_selection(true);
-                            self.request_redraw();
-                            return;
-                        }
-                    }
-                }
-                // Shift+PageUp/PageDown page through the scrollback, by the
-                // focused pane's REAL height (self.size is only the spawn grid)
-                if shift && !ctrl {
-                    let rows = self
-                        .session()
-                        .map_or(self.size.rows, |s| s.term.lock().unwrap().screen_lines())
-                        as i32;
-                    match key {
-                        Key::Named(NamedKey::PageUp) => {
-                            self.scroll_lines(rows);
-                            return;
-                        }
-                        Key::Named(NamedKey::PageDown) => {
-                            self.scroll_lines(-rows);
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                // Legacy Ctrl+letter still resolves by PHYSICAL key inside
-                // encode_input (Arabic: Ctrl+C interrupts even though the C
-                // key's logical char is "ؤ"). A child that pushed kitty
-                // flags gets CSI u instead, from the same call.
-                let bytes = self.encode_key_event(&event, false);
-                if let Some(bytes) = bytes {
-                    // typing snaps to the bottom and clears any selection;
-                    // it also restarts the blink window, cursor visible
-                    self.last_input = Instant::now();
-                    // The press reached the encoder. Drop it from the
-                    // swallowed set before borrowing the session.
-                    self.take_held_away(&event);
-                    if let Some(s) = self.session_mut() {
-                        {
-                            let mut t = s.term.lock().unwrap();
-                            t.selection = None;
-                            t.scroll_display(Scroll::Bottom);
-                        }
-                        s.write(&bytes);
-                    }
-                    self.invalidate_focused_links();
-                }
-            }
-            // Key-up is invisible until the child asks for event types.
-            // Presses still own every shortcut above; a release only
-            // reports, and only when the press itself reached the PTY.
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Released => {
-                let held_away = self.take_held_away(&event);
-                if held_away || !self.term_mode().contains(TermMode::REPORT_EVENT_TYPES) {
-                    return;
-                }
-                if let Some(bytes) = self.encode_key_event(&event, true) {
-                    if let Some(s) = self.session_mut() {
-                        s.write(&bytes);
-                    }
-                }
-            }
+            WindowEvent::MouseInput { state, button, .. } => self.mouse_input(state, button, el),
+            WindowEvent::MouseWheel { delta, .. } => self.mouse_wheel(delta),
+            WindowEvent::KeyboardInput { event, .. } => self.key_input(&event, el),
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }
@@ -4717,6 +3807,8 @@ fn blur_forgets_held_keys(focused: bool, held: &mut Vec<winit::keyboard::Physica
 pub(crate) fn harden_dll_search() {
     // An empty string removes the CWD. NULL would put it back.
     let empty = [0u16];
+    // SAFETY: `empty` is a NUL-terminated UTF-16 string that outlives the
+    // call, and SetDllDirectoryW copies it rather than keeping the pointer.
     unsafe {
         let _ = windows_sys::Win32::System::LibraryLoader::SetDllDirectoryW(empty.as_ptr());
     }
@@ -4730,6 +3822,8 @@ fn main() {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .with_msg_hook(|msg| {
             use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_HOTKEY};
+            // SAFETY: winit's msg hook is handed a pointer to the MSG being
+            // dispatched, valid for the duration of the callback. It is only read.
             let m = unsafe { &*(msg as *const MSG) };
             if m.message == WM_HOTKEY && m.wParam == QUAKE_ID {
                 QUAKE_HIT.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -4819,6 +3913,7 @@ fn main() {
         inflight_delta: 0.0,
         normal_geom: None,
         keys_held_away: Vec::new(),
+        debug_paste: None,
     };
     event_loop.run_app(&mut app).expect("run event loop");
 }

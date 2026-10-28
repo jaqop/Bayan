@@ -10,7 +10,10 @@ selection and BiDi paths must do.
 
 | File | Role |
 |---|---|
-| `main.rs` | event loop, tabs, panes, settings panel, cockpit, OSC handling |
+| `main.rs` | event loop, tabs, panes, settings panel, cockpit, OSC handling; `window_event` only dispatches |
+| `chrome.rs` | window chrome hit-testing (edges, caption buttons, tab bar, dividers, drag strip) and the left-press order |
+| `input.rs` | pointer routing: buttons, motion, wheel, drops, and the pointer side of the close guard and palette |
+| `keyroute.rs` | keyboard routing: which overlay owns a press, then the window chords before `keys.rs` encodes it |
 | `render.rs` | the dual text engine + shaped-run cache (see below) |
 | `gpu.rs` | wgpu: one pipeline, one 2048² atlas, one draw call per frame |
 | `term.rs` | ConPTY via `portable-pty`, VT via `alacritty_terminal` |
@@ -30,7 +33,7 @@ selection and BiDi paths must do.
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-303 tests across the tree. `term.rs` (59), `link.rs` (59) and `render.rs` (42)
+331 tests across the tree. `term.rs` (60), `link.rs` (59) and `render.rs` (42)
 carry the most.
 
 ## Invariants — do not "simplify" these
@@ -192,6 +195,12 @@ Every milestone gets a README entry recording what was built *and what was
 proven* — the README is the project log, not a brochure. Keep failed
 approaches and upstream limits in it; M14 flagging cosmic-text 0.12's
 featureless shape plan is why M20 was a clean swap rather than a surprise.
+
+Window input decisions are pure functions beside the code that acts on them:
+`chrome::left_press`, `input::press_route` and `motion_route`,
+`keyroute::key_owner`, `link::click_owner`, `mouse::right_click`. A new branch
+in the press chain or the key path is a new case there with a test, not another
+`if` in `window_event`, which only dispatches.
 
 Dependencies stay few and deliberate. M19 delivered native toasts with zero new
 crates by reusing the `windows-sys` features already present for the quake
