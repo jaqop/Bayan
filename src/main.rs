@@ -32,6 +32,8 @@ mod toast;
 mod conpty_load;
 #[cfg(test)]
 #[path = "../vendor/portable-pty/src/win/conpty_resolve.rs"]
+// Vendored portable-pty code: its unsafe blocks are upstream's to document.
+#[allow(clippy::undocumented_unsafe_blocks)]
 mod conpty_resolve;
 
 /// rgb -> "#rrggbb" for the config file.

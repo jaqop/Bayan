@@ -70,3 +70,7 @@ cosmic-text = { git = "https://github.com/pop-os/cosmic-text", rev = "4fe1195e64
 # CreatePseudoConsole / ResizePseudoConsole / ClosePseudoConsole from
 # kernel32 via LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32).
 portable-pty = { path = "vendor/portable-pty" }
+
+[lints.clippy]
+# every unsafe block carries a // SAFETY: comment; CI's -D warnings enforces it
+undocumented_unsafe_blocks = "warn"
