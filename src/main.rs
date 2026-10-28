@@ -2488,6 +2488,18 @@ impl App {
         link::click_owner(false, tracking, shift, ctrl, on_link)
     }
 
+    /// What this right click does, and the pane under the pointer. `None`
+    /// off the panes: the tab bar and the padding neither copy nor paste.
+    fn right_click_owner(&mut self) -> Option<(usize, mouse::RightClick)> {
+        let overlay = self.overlay_blocks_mouse();
+        let (pane, id, _, _) = self.locate(self.cursor_pos)?;
+        let tracking = mouse::Proto::from_mode(self.mode_of(id)).tracking();
+        let shift = self.modifiers.shift_key();
+        let sel = self.has_selection();
+        let cos = self.config.copy_on_select_on();
+        Some((pane, mouse::right_click(overlay, tracking, shift, sel, cos)))
+    }
+
     /// Press in a tracking mode, and not Shift (Shift keeps the gesture
     /// for local selection). Focus moves first so the program sees CSI I
     /// before the click.
@@ -3835,8 +3847,30 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 match state {
                     ElementState::Pressed => {
-                        // middle/right never touch chrome; they only report when
-                        // the program asked. Left still walks the chrome first.
+                        // Right pastes (it copies a selection only when
+                        // copy-on-select is off), unless the program tracks the
+                        // mouse and Shift is up. It never touches chrome. The
+                        // release is reported or ignored below.
+                        if matches!(button, MouseButton::Right) {
+                            match self.right_click_owner() {
+                                Some((_, mouse::RightClick::Program)) => {
+                                    let _ = self.try_report_press(mouse::Btn::Right);
+                                }
+                                Some((_, mouse::RightClick::Copy)) => {
+                                    self.copy_selection(true);
+                                    self.request_redraw();
+                                }
+                                Some((pane, mouse::RightClick::Paste)) => {
+                                    self.focus_pane_at(pane);
+                                    self.sync_focus(None);
+                                    self.paste();
+                                }
+                                Some((_, mouse::RightClick::Blocked)) | None => {}
+                            }
+                            return;
+                        }
+                        // middle never touches chrome; it only reports when the
+                        // program asked. Left still walks the chrome first.
                         if !matches!(button, MouseButton::Left) {
                             if let Some(b) = mapped {
                                 let _ = self.try_report_press(b);

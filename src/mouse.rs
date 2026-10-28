@@ -124,6 +124,43 @@ impl Proto {
     }
 }
 
+/// What a right click does. It pastes. With copy-on-select on, the drag
+/// already copied, and the highlight it leaves behind must not turn the
+/// next right click into a second copy. With copy-on-select off, a right
+/// click on a selection copies it instead, so the mouse can still copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RightClick {
+    /// Copy the selection and clear it. Only when copy-on-select is off.
+    Copy,
+    /// Paste the clipboard, through the paste guard like Ctrl+V.
+    Paste,
+    /// 1000/1002/1003 is on and Shift is not held. The program hears it.
+    Program,
+    /// A card or panel is up. Nothing is copied, pasted or reported.
+    Blocked,
+}
+
+/// `overlay` wins, then the program (unless Shift keeps the click local),
+/// then paste. Same order as `link::click_owner` for the left button, so
+/// Shift means the same thing on both.
+pub fn right_click(
+    overlay: bool,
+    tracking: bool,
+    shift: bool,
+    has_selection: bool,
+    copy_on_select: bool,
+) -> RightClick {
+    if overlay {
+        RightClick::Blocked
+    } else if tracking && !shift {
+        RightClick::Program
+    } else if has_selection && !copy_on_select {
+        RightClick::Copy
+    } else {
+        RightClick::Paste
+    }
+}
+
 /// CSI I on focus, CSI O on blur. The caller checks mode 1004.
 pub fn focus_seq(focused: bool) -> &'static [u8] {
     if focused {
@@ -789,6 +826,48 @@ mod tests {
 
     fn mods(shift: bool, alt: bool, ctrl: bool) -> Mods {
         Mods { shift, alt, ctrl }
+    }
+
+    #[test]
+    fn right_click_pastes_even_over_the_highlight_a_copying_drag_left() {
+        // copy-on-select on (the default): the drag already copied
+        assert_eq!(right_click(false, false, false, true, true), RightClick::Paste);
+        assert_eq!(right_click(false, false, false, false, true), RightClick::Paste);
+        assert_eq!(right_click(false, false, true, true, true), RightClick::Paste);
+    }
+
+    #[test]
+    fn right_click_copies_a_selection_when_copy_on_select_is_off() {
+        assert_eq!(right_click(false, false, false, true, false), RightClick::Copy);
+        assert_eq!(right_click(false, false, false, false, false), RightClick::Paste);
+    }
+
+    #[test]
+    fn right_click_belongs_to_a_tracking_program_unless_shift() {
+        for sel in [false, true] {
+            for cos in [false, true] {
+                assert_eq!(right_click(false, true, false, sel, cos), RightClick::Program);
+            }
+        }
+        assert_eq!(right_click(false, true, true, false, true), RightClick::Paste);
+        assert_eq!(right_click(false, true, true, true, true), RightClick::Paste);
+        assert_eq!(right_click(false, true, true, true, false), RightClick::Copy);
+    }
+
+    #[test]
+    fn right_click_under_an_overlay_does_nothing() {
+        for tracking in [false, true] {
+            for shift in [false, true] {
+                for sel in [false, true] {
+                    for cos in [false, true] {
+                        assert_eq!(
+                            right_click(true, tracking, shift, sel, cos),
+                            RightClick::Blocked
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
