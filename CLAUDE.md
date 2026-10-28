@@ -15,12 +15,23 @@ selection and BiDi paths must do.
 | `gpu.rs` | wgpu: one pipeline, one 2048² atlas, one draw call per frame |
 | `term.rs` | ConPTY via `portable-pty`, VT via `alacritty_terminal` |
 | `bidi.rs` | Claude mode: visual → logical BiDi restoration |
+| `bidi_ctl.rs` | BDSM / SCP (terminal-wg BiDi controls), filtered out of the PTY stream before the parser |
+| `link.rs` | hyperlinks: OSC 8 spans, detected URLs and `path:line`, the narrow open policy |
+| `osc7.rs` | OSC 7 cwd reports, parsed then gated by `term::accept_local_cwd` |
+| `mouse.rs` | mouse tracking modes 1000/1002/1003, SGR vs X10, focus events (1004) |
 | `keybinds.rs` | action registry + chord map |
 | `keys.rs` | keyboard → VT byte sequences (ported from EasyTer) |
+| `kitty.rs` | kitty keyboard protocol encoder, layout-aware alternate keys |
+| `mru.rs` | most-recently-used tab order for Ctrl+Tab |
+| `shells.rs` | installed-shell detection (ported from EasyTer's `profiles.py`) |
+| `posh.rs` | oh-my-posh theme picker with a live ANSI preview |
+| `plugins.rs` | declarative JSON plugin host (`~/.bayan/plugins/`) |
 | `config.rs` | `~/.bayan/config.json`, optional and BOM-tolerant |
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
+| `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-97 tests across the tree. `term.rs` (29) and `render.rs` (19) carry the most.
+298 tests across the tree. `term.rs` (59), `link.rs` (59) and `render.rs` (42)
+carry the most.
 
 ## Invariants — do not "simplify" these
 
