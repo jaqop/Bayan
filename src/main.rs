@@ -1221,10 +1221,7 @@ impl App {
             && event.physical_key
                 == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV)
         {
-            if self.clipboard.is_none() {
-                self.clipboard = arboard::Clipboard::new().ok();
-            }
-            if let Some(text) = self.clipboard.as_mut().and_then(|c| c.get_text().ok()) {
+            if let Some(text) = self.clipboard().and_then(|c| c.get_text().ok()) {
                 if let Some(p) = self.palette.as_mut() {
                     p.query
                         .extend(text.chars().filter(|c| !c.is_control()).take(256));
@@ -2839,20 +2836,23 @@ impl App {
         }
     }
 
-    fn set_clipboard(&mut self, s: String) {
+    /// The system clipboard, opened on first use. A failed open is retried
+    /// next time rather than remembered.
+    fn clipboard(&mut self) -> Option<&mut arboard::Clipboard> {
         if self.clipboard.is_none() {
             self.clipboard = arboard::Clipboard::new().ok();
         }
-        if let Some(c) = self.clipboard.as_mut() {
+        self.clipboard.as_mut()
+    }
+
+    fn set_clipboard(&mut self, s: String) {
+        if let Some(c) = self.clipboard() {
             let _ = c.set_text(s);
         }
     }
 
     fn paste(&mut self) {
-        if self.clipboard.is_none() {
-            self.clipboard = arboard::Clipboard::new().ok();
-        }
-        let Some(txt) = self.clipboard.as_mut().and_then(|c| c.get_text().ok()) else {
+        let Some(txt) = self.clipboard().and_then(|c| c.get_text().ok()) else {
             return;
         };
         if txt.is_empty() {
