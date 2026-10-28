@@ -48,8 +48,8 @@ fn pick_git_bash<F: Fn(&str) -> bool>(exists: F) -> Option<&'static str> {
 /// `wsl -l -q` writes UTF-16LE, and pads entries with NULs. Decoding it as
 /// UTF-8 yields separated letters and empty-looking names.
 fn parse_wsl_list(raw: &[u8]) -> Vec<String> {
-    let (pairs, _odd) = raw.as_chunks::<2>();
-    let units: Vec<u16> = pairs.iter().map(|&p| u16::from_le_bytes(p)).collect();
+    let (pairs, _odd_byte) = raw.as_chunks::<2>();
+    let units: Vec<u16> = pairs.iter().map(|&c| u16::from_le_bytes(c)).collect();
     String::from_utf16_lossy(&units)
         .lines()
         .map(|l| l.trim().trim_matches('\0').trim().to_string())
