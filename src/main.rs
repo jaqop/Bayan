@@ -98,6 +98,8 @@ fn consume_guard_release(pending: &mut bool, state: ElementState, button: MouseB
 /// The system notification sound (bell mode "sound"). Async — never blocks
 /// the UI thread.
 fn beep() {
+    // SAFETY: MessageBeep takes one integer sound type and no pointers,
+    // and is safe to call from any thread.
     unsafe {
         // windows-sys files MessageBeep under Diagnostics::Debug (user32's
         // winuser.h function, but that's where the metadata puts it)
@@ -1081,6 +1083,9 @@ impl App {
         };
         let hwnd = h.hwnd.get() as windows_sys::Win32::Foundation::HWND;
         let alpha = (self.config.opacity_level() * 255.0).round() as u8;
+        // SAFETY: hwnd comes from winit's handle for self.window, which stays
+        // borrowed for this whole call, so it names our live top-level window.
+        // The GWL_EXSTYLE get/set and SetLayeredWindowAttributes take no pointers.
         unsafe {
             use windows_sys::Win32::UI::WindowsAndMessaging::{
                 GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, GWL_EXSTYLE,
@@ -1107,6 +1112,9 @@ impl App {
         let corner = DWMWCP_ROUND;
         // Windows 10 ignores unsupported corner preferences; the native
         // resize frame and shadow remain available there.
+        // SAFETY: hwnd is this window's live handle from self.hwnd(). Each
+        // pvAttribute points at a local i32 that outlives the call, and
+        // cbAttribute is that i32's size, the type both attributes expect.
         unsafe {
             DwmSetWindowAttribute(
                 hwnd,
@@ -3462,6 +3470,9 @@ impl ApplicationHandler<UserEvent> for App {
         self.rebuild_renderer();
         // the quake hotkey (Ctrl+Alt+`): a null-hwnd registration posts
         // WM_HOTKEY to this thread's queue, where the msg hook catches it
+        // SAFETY: a null hwnd is the documented way to have WM_HOTKEY posted
+        // to this thread's queue; the rest are plain integers. A chord another
+        // program owns makes it return 0, which is ignored.
         unsafe {
             use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
                 RegisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, VK_OEM_3,
@@ -3794,6 +3805,8 @@ fn blur_forgets_held_keys(focused: bool, held: &mut Vec<winit::keyboard::Physica
 pub(crate) fn harden_dll_search() {
     // An empty string removes the CWD. NULL would put it back.
     let empty = [0u16];
+    // SAFETY: `empty` is a NUL-terminated UTF-16 string that outlives the
+    // call, and SetDllDirectoryW copies it rather than keeping the pointer.
     unsafe {
         let _ = windows_sys::Win32::System::LibraryLoader::SetDllDirectoryW(empty.as_ptr());
     }
@@ -3807,6 +3820,8 @@ fn main() {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .with_msg_hook(|msg| {
             use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_HOTKEY};
+            // SAFETY: winit's msg hook is handed a pointer to the MSG being
+            // dispatched, valid for the duration of the callback. It is only read.
             let m = unsafe { &*(msg as *const MSG) };
             if m.message == WM_HOTKEY && m.wParam == QUAKE_ID {
                 QUAKE_HIT.store(true, std::sync::atomic::Ordering::Relaxed);
