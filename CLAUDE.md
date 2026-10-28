@@ -33,7 +33,7 @@ selection and BiDi paths must do.
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-329 tests across the tree. `term.rs` (59), `link.rs` (59) and `render.rs` (42)
+331 tests across the tree. `term.rs` (60), `link.rs` (59) and `render.rs` (42)
 carry the most.
 
 ## Invariants — do not "simplify" these
@@ -125,8 +125,7 @@ the launcher's directory (a shortcut's "Start in"), then `USERPROFILE`. The
 session wins deliberately — restoring a tab in the wrong folder is worse than
 ignoring a shortcut — but it is also why a shortcut change appears to do
 nothing: `~/.bayan/session.json` is answering first. Delete it when testing
-start-directory behaviour, the same way `config.json` has to go before
-`cargo test`. The launcher directory is honoured EXCEPT under `%SystemRoot%`,
+start-directory behaviour. The launcher directory is honoured EXCEPT under `%SystemRoot%`,
 because Explorer and the Start menu often hand a process `System32`.
 
 **Two performance properties are load-bearing.** The shaped-run cache reshapes
@@ -149,13 +148,14 @@ The tree is rustfmt-clean with default settings. Run `cargo fmt` before
 committing. The whole-tree reformat is listed in `.git-blame-ignore-revs`,
 so `git blame` skips it.
 
-**Before `cargo test`, remove `~/.bayan/config.json`.** The live user config
-perturbs the config tests. This has bitten before:
-
-```powershell
-Remove-Item "$env:USERPROFILE\.bayan\config.json" -Force -ErrorAction SilentlyContinue
-cargo test --quiet
-```
+**Tests stay out of `~/.bayan`.** Nothing in a test calls `config::load` or
+`plugins::init`, so the live `config.json` and plugins are never read, and
+`plugins.rs` sends its failure log to `%TEMP%\bayan-test-plugins.log` under
+`cfg(test)`. Up to October 2026 the guidance here was to delete
+`config.json` before `cargo test`. That was never the real coupling. The real
+one was the plugin tests appending deliberate `b_broken` failures to the
+user's `plugins.log`. Keep any new test that needs a home directory on a temp
+path, the same way.
 
 **`cargo test` does NOT relink `target/debug/bayan.exe`.** Run `cargo build`
 before any launch-and-screenshot round, or you will verify a stale binary. This

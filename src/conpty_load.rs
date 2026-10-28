@@ -105,11 +105,13 @@ fn load_bait(dll: &std::ffi::OsStr) -> i32 {
     use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
     // Don't let a bad image pop a dialog and stall CI.
+    // SAFETY: SetErrorMode takes a flag word and touches no caller memory.
     unsafe { SetErrorMode(0x0001 | 0x0002 | 0x8000) };
     let wide: Vec<u16> = std::ffi::OsStr::new(dll)
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
+    // SAFETY: `wide` is NUL-terminated and outlives the call.
     let module = unsafe { LoadLibraryW(wide.as_ptr()) };
     if module.is_null() {
         return 2;
@@ -122,6 +124,8 @@ fn load_bait(dll: &std::ffi::OsStr) -> i32 {
         let mut c_name = Vec::with_capacity(name.len() + 1);
         c_name.extend_from_slice(name.as_bytes());
         c_name.push(0);
+        // SAFETY: `module` is a live handle from LoadLibraryW above, and
+        // `c_name` is a NUL-terminated ANSI name that outlives the call.
         let sym = unsafe { GetProcAddress(module, c_name.as_ptr()) };
         if sym.is_none() {
             return 3;
@@ -443,6 +447,7 @@ fn assert_modules_clean(temp: &Path) {
 fn system32_dir() -> PathBuf {
     use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
     let mut buf = [0u16; 260];
+    // SAFETY: the length passed is `buf`'s own, so the write stays in bounds.
     let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
     assert!(
         n > 0 && (n as usize) < buf.len(),
@@ -457,10 +462,13 @@ fn loaded_module_paths() -> Vec<PathBuf> {
     use windows_sys::Win32::System::ProcessStatus::EnumProcessModules;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
+    // SAFETY: returns a pseudo-handle; no arguments, nothing to free.
     let process = unsafe { GetCurrentProcess() };
     let mut modules = vec![std::ptr::null_mut::<c_void>(); 1024];
     let bytes = u32::try_from(modules.len() * std::mem::size_of::<*mut c_void>()).unwrap();
     let mut needed = 0u32;
+    // SAFETY: `bytes` is exactly the size of `modules`, so the write stays in
+    // bounds, and `needed` is a live local.
     let ok = unsafe { EnumProcessModules(process, modules.as_mut_ptr(), bytes, &mut needed) };
     assert_ne!(
         ok,
@@ -479,6 +487,8 @@ fn loaded_module_paths() -> Vec<PathBuf> {
             continue;
         }
         let mut buf = [0u16; 1024];
+        // SAFETY: `module` came from EnumProcessModules for this process, and
+        // the length passed is `buf`'s own.
         let len = unsafe { GetModuleFileNameW(*module, buf.as_mut_ptr(), buf.len() as u32) };
         if len == 0 || len as usize >= buf.len() {
             continue;

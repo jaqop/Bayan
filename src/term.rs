@@ -153,6 +153,7 @@ extern "system" {
 
 fn fresh_prompt_nonce() -> String {
     let mut bytes = [0u8; 16];
+    // SAFETY: the length passed is `bytes`'s own, so the write stays in bounds.
     let ok = unsafe { SystemFunction036(bytes.as_mut_ptr().cast(), bytes.len() as u32) != 0 };
     if !ok {
         let tick = std::time::SystemTime::now()
@@ -805,6 +806,7 @@ fn drive_root_is_local(path: &str) -> bool {
     // DRIVE_REMOTE is 4. The constant lives in Win32_System_WindowsProgramming,
     // which this crate does not enable; the value is the Win32 one.
     const DRIVE_REMOTE: u32 = 4;
+    // SAFETY: `wide` comes from `wide_nul`, so it is NUL-terminated.
     unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(wide.as_ptr()) != DRIVE_REMOTE }
 }
 
@@ -813,6 +815,7 @@ fn is_reparse_point(path: &str) -> bool {
         GetFileAttributesW, FILE_ATTRIBUTE_REPARSE_POINT,
     };
     let wide = wide_nul(path);
+    // SAFETY: `wide` comes from `wide_nul`, so it is NUL-terminated.
     let attr = unsafe { GetFileAttributesW(wide.as_ptr()) };
     attr != u32::MAX && attr & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
