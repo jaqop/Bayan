@@ -81,8 +81,12 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    pub fn new(window: Arc<Window>, width: u32, height: u32, atlas_size: u32)
-               -> Result<Self, String> {
+    pub fn new(
+        window: Arc<Window>,
+        width: u32,
+        height: u32,
+        atlas_size: u32,
+    ) -> Result<Self, String> {
         // DX12 first (native on Windows, fastest to initialize), GL as the
         // universal fallback — enumerating every backend cost ~800ms
         // wgpu 30 dropped Default for InstanceDescriptor (a display handle is
@@ -94,24 +98,20 @@ impl Gpu {
         let surface = instance
             .create_surface(window)
             .map_err(|e| format!("create_surface: {e}"))?;
-        let adapter = pollster::block_on(instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-                // browser-style fingerprinting defence; a native terminal wants
-                // the adapter's real limits, not a bucketed approximation
-                apply_limit_buckets: false,
-            },
-        ))
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+            // browser-style fingerprinting defence; a native terminal wants
+            // the adapter's real limits, not a bucketed approximation
+            apply_limit_buckets: false,
+        }))
         .map_err(|e| format!("no graphics adapter: {e}"))?;
         // wgpu 30 dropped the trace-path argument
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("bayan"),
-                ..Default::default()
-            },
-        ))
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("bayan"),
+            ..Default::default()
+        }))
         .map_err(|e| format!("request_device: {e}"))?;
 
         let caps = surface.get_capabilities(&adapter);
@@ -334,7 +334,11 @@ impl Gpu {
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.atlas_tex,
                     mip_level: 0,
-                    origin: wgpu::Origin3d { x: 0, y: 0, z: layer as u32 },
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: layer as u32,
+                    },
                     aspect: wgpu::TextureAspect::All,
                 },
                 page,

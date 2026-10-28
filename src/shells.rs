@@ -19,7 +19,10 @@ pub struct Shell {
 
 impl Shell {
     fn new(name: &str, command: impl Into<String>) -> Self {
-        Self { name: name.to_string(), command: command.into() }
+        Self {
+            name: name.to_string(),
+            command: command.into(),
+        }
     }
 }
 
@@ -58,7 +61,11 @@ fn parse_wsl_list(raw: &[u8]) -> Vec<String> {
 
 fn parse_wsl_result(success: bool, raw: &[u8]) -> Vec<String> {
     // WSL writes diagnostics to stdout too; only successful listings are names.
-    if success { parse_wsl_list(raw) } else { Vec::new() }
+    if success {
+        parse_wsl_list(raw)
+    } else {
+        Vec::new()
+    }
 }
 
 /// The 8.3 short path. ConPTY fails on paths containing spaces, and every
@@ -68,7 +75,10 @@ fn short_path(p: &str) -> String {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
 
-    let wide: Vec<u16> = std::ffi::OsStr::new(p).encode_wide().chain(Some(0)).collect();
+    let wide: Vec<u16> = std::ffi::OsStr::new(p)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
     let mut buf = [0u16; 260];
     let n = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
     if n == 0 || n as usize >= buf.len() {
@@ -86,7 +96,9 @@ fn short_path(p: &str) -> String {
 
 /// Is `prog` resolvable on PATH? (`shutil.which` equivalent, exe-only.)
 fn on_path(prog: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else { return false };
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
     std::env::split_paths(&paths).any(|dir| {
         let exe = dir.join(format!("{prog}.exe"));
         exe.is_file() || dir.join(prog).is_file()
@@ -127,7 +139,10 @@ pub fn detect() -> Vec<Shell> {
     v.push(Shell::new("Command Prompt", "cmd.exe"));
 
     if let Some(p) = pick_git_bash(|p| Path::new(p).exists()) {
-        v.push(Shell::new("Git Bash", format!("{} --login -i", short_path(p))));
+        v.push(Shell::new(
+            "Git Bash",
+            format!("{} --login -i", short_path(p)),
+        ));
     }
 
     for d in wsl_distros() {
@@ -154,10 +169,14 @@ mod tests {
     #[test]
     fn failed_wsl_discovery_does_not_offer_error_messages_as_shells() {
         let error: Vec<u8> = "Access is denied.\r\n"
-            .encode_utf16().flat_map(u16::to_le_bytes).collect();
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
         assert!(parse_wsl_result(false, &error).is_empty());
         let valid: Vec<u8> = "Ubuntu\r\nDebian\r\n"
-            .encode_utf16().flat_map(u16::to_le_bytes).collect();
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
         assert_eq!(parse_wsl_result(true, &valid), vec!["Ubuntu", "Debian"]);
     }
 
@@ -196,7 +215,10 @@ mod tests {
     fn utf8_decoding_of_wsl_output_would_be_wrong() {
         // guards the bug this port exists to avoid: reading it as UTF-8 gives
         // NUL-separated letters, which strip() cannot rescue
-        let raw: Vec<u8> = "Ubuntu".encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        let raw: Vec<u8> = "Ubuntu"
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
         assert_eq!(parse_wsl_list(&raw), vec!["Ubuntu"]);
         assert_ne!(String::from_utf8_lossy(&raw).trim(), "Ubuntu");
     }
@@ -233,4 +255,3 @@ mod tests {
         assert_eq!(cmds.len(), before, "duplicate shell commands: {found:?}");
     }
 }
-

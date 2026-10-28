@@ -7,9 +7,9 @@
 
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP,
-    NIIF_INFO, NIIF_RESPECT_QUIET_TIME, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO,
+    NIIF_RESPECT_QUIET_TIME, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW,
+    NOTIFYICON_VERSION_4,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{LoadIconW, IDI_APPLICATION};
 
@@ -22,9 +22,11 @@ pub const WM_LBUTTONUP: u32 = 0x0202;
 const TRAY_UID: u32 = 1;
 
 fn has_arabic(s: &str) -> bool {
-    s.chars().any(|c| matches!(c as u32,
+    s.chars().any(|c| {
+        matches!(c as u32,
         0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF
-        | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF))
+        | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF)
+    })
 }
 
 /// The balloon/toast text renderer lays runs out in LOGICAL order,

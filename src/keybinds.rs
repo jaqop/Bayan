@@ -85,7 +85,12 @@ impl Action {
 
     pub fn default_chord(self) -> Chord {
         use ChordKey::*;
-        let c = |ctrl, shift, key| Chord { ctrl, shift, alt: false, key };
+        let c = |ctrl, shift, key| Chord {
+            ctrl,
+            shift,
+            alt: false,
+            key,
+        };
         match self {
             Action::NewTab => c(true, false, Letter('t')),
             Action::ClosePane => c(true, true, Letter('w')),
@@ -181,9 +186,7 @@ impl Chord {
                     let mut chars = p.chars();
                     match (chars.next(), chars.as_str()) {
                         (Some(l @ 'a'..='z'), "") => key = Some(ChordKey::Letter(l)),
-                        (Some(d @ '0'..='9'), "") => {
-                            key = Some(ChordKey::Digit(d as u8 - b'0'))
-                        }
+                        (Some(d @ '0'..='9'), "") => key = Some(ChordKey::Digit(d as u8 - b'0')),
                         (Some('f'), n) => {
                             let n: u8 = n.parse().ok()?;
                             if !(1..=12).contains(&n) {
@@ -196,7 +199,12 @@ impl Chord {
                 }
             }
         }
-        key.map(|key| Chord { ctrl, shift, alt, key })
+        key.map(|key| Chord {
+            ctrl,
+            shift,
+            alt,
+            key,
+        })
     }
 
     /// Display form for the editor's keycaps: "Ctrl+Shift+T".
@@ -239,7 +247,9 @@ impl Chord {
 /// can't anchor a chord (Enter, Esc, bare modifiers, …).
 pub fn chord_from(physical: PhysicalKey, ctrl: bool, shift: bool, alt: bool) -> Option<Chord> {
     use KeyCode::*;
-    let PhysicalKey::Code(code) = physical else { return None };
+    let PhysicalKey::Code(code) = physical else {
+        return None;
+    };
     let key = match code {
         KeyA => ChordKey::Letter('a'),
         KeyB => ChordKey::Letter('b'),
@@ -296,7 +306,12 @@ pub fn chord_from(physical: PhysicalKey, ctrl: bool, shift: bool, alt: bool) -> 
         ArrowRight => ChordKey::Right,
         _ => return None,
     };
-    Some(Chord { ctrl, shift, alt, key })
+    Some(Chord {
+        ctrl,
+        shift,
+        alt,
+        key,
+    })
 }
 
 /// Every action's effective chord: the default unless config overrides it.
@@ -323,10 +338,16 @@ pub fn lookup(map: &[(Action, Chord)], chord: Chord) -> Option<Action> {
 }
 
 /// Resolve an app action before sending an unhandled chord to the PTY.
-pub fn resolve(map: &[(Action, Chord)], chord: Chord, alt_screen: bool,
-               has_selection: bool) -> Option<Action> {
+pub fn resolve(
+    map: &[(Action, Chord)],
+    chord: Chord,
+    alt_screen: bool,
+    has_selection: bool,
+) -> Option<Action> {
     let action = lookup(map, chord).or_else(|| {
-        if !chord.is_plain_ctrl_letter() { return None; }
+        if !chord.is_plain_ctrl_letter() {
+            return None;
+        }
         match chord.key {
             ChordKey::Letter('v') => Some(Action::Paste),
             ChordKey::Letter('c') if has_selection => Some(Action::Copy),
@@ -353,11 +374,17 @@ mod tests {
         for alt_screen in [false, true] {
             for shortcut in ["ctrl+v", "ctrl+shift+v"] {
                 let chord = Chord::parse(shortcut).unwrap();
-                assert_eq!(resolve(&map, chord, alt_screen, false), Some(Action::Paste),
-                    "{shortcut}, alt_screen={alt_screen}");
+                assert_eq!(
+                    resolve(&map, chord, alt_screen, false),
+                    Some(Action::Paste),
+                    "{shortcut}, alt_screen={alt_screen}"
+                );
             }
         }
-        assert_eq!(resolve(&map, Chord::parse("ctrl+f").unwrap(), true, false), None);
+        assert_eq!(
+            resolve(&map, Chord::parse("ctrl+f").unwrap(), true, false),
+            None
+        );
     }
 
     #[test]
@@ -370,9 +397,18 @@ mod tests {
             ..Default::default()
         };
         let map = effective_map(&cfg);
-        assert_eq!(resolve(&map, Chord::parse("ctrl+v").unwrap(), false, false), Some(Action::Search));
-        assert_eq!(resolve(&map, Chord::parse("ctrl+p").unwrap(), true, false), Some(Action::Paste));
-        assert_eq!(resolve(&map, Chord::parse("ctrl+alt+v").unwrap(), false, false), None);
+        assert_eq!(
+            resolve(&map, Chord::parse("ctrl+v").unwrap(), false, false),
+            Some(Action::Search)
+        );
+        assert_eq!(
+            resolve(&map, Chord::parse("ctrl+p").unwrap(), true, false),
+            Some(Action::Paste)
+        );
+        assert_eq!(
+            resolve(&map, Chord::parse("ctrl+alt+v").unwrap(), false, false),
+            None
+        );
     }
 
     #[test]
@@ -382,9 +418,20 @@ mod tests {
         for alt_screen in [false, true] {
             assert_eq!(resolve(&map, copy, alt_screen, true), Some(Action::Copy));
             assert_eq!(resolve(&map, copy, alt_screen, false), None);
-            assert_eq!(resolve(&map, Chord::parse("ctrl+shift+c").unwrap(), alt_screen, true), Some(Action::Copy));
+            assert_eq!(
+                resolve(
+                    &map,
+                    Chord::parse("ctrl+shift+c").unwrap(),
+                    alt_screen,
+                    true
+                ),
+                Some(Action::Copy)
+            );
         }
-        assert_eq!(resolve(&map, Chord::parse("ctrl+alt+c").unwrap(), false, true), None);
+        assert_eq!(
+            resolve(&map, Chord::parse("ctrl+alt+c").unwrap(), false, true),
+            None
+        );
     }
 
     #[test]
@@ -394,10 +441,7 @@ mod tests {
             assert_eq!(Chord::parse(&d.to_config()), Some(d), "{}", a.id());
         }
         // punctuation and F-keys included
-        assert_eq!(
-            Chord::parse("ctrl+,").unwrap().key,
-            ChordKey::Comma
-        );
+        assert_eq!(Chord::parse("ctrl+,").unwrap().key, ChordKey::Comma);
         assert_eq!(Chord::parse("f2").unwrap().key, ChordKey::F(2));
         // garbage is None, not a panic
         assert_eq!(Chord::parse(""), None);

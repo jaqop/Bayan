@@ -831,27 +831,54 @@ mod tests {
     #[test]
     fn right_click_pastes_even_over_the_highlight_a_copying_drag_left() {
         // copy-on-select on (the default): the drag already copied
-        assert_eq!(right_click(false, false, false, true, true), RightClick::Paste);
-        assert_eq!(right_click(false, false, false, false, true), RightClick::Paste);
-        assert_eq!(right_click(false, false, true, true, true), RightClick::Paste);
+        assert_eq!(
+            right_click(false, false, false, true, true),
+            RightClick::Paste
+        );
+        assert_eq!(
+            right_click(false, false, false, false, true),
+            RightClick::Paste
+        );
+        assert_eq!(
+            right_click(false, false, true, true, true),
+            RightClick::Paste
+        );
     }
 
     #[test]
     fn right_click_copies_a_selection_when_copy_on_select_is_off() {
-        assert_eq!(right_click(false, false, false, true, false), RightClick::Copy);
-        assert_eq!(right_click(false, false, false, false, false), RightClick::Paste);
+        assert_eq!(
+            right_click(false, false, false, true, false),
+            RightClick::Copy
+        );
+        assert_eq!(
+            right_click(false, false, false, false, false),
+            RightClick::Paste
+        );
     }
 
     #[test]
     fn right_click_belongs_to_a_tracking_program_unless_shift() {
         for sel in [false, true] {
             for cos in [false, true] {
-                assert_eq!(right_click(false, true, false, sel, cos), RightClick::Program);
+                assert_eq!(
+                    right_click(false, true, false, sel, cos),
+                    RightClick::Program
+                );
             }
         }
-        assert_eq!(right_click(false, true, true, false, true), RightClick::Paste);
-        assert_eq!(right_click(false, true, true, true, true), RightClick::Paste);
-        assert_eq!(right_click(false, true, true, true, false), RightClick::Copy);
+        assert_eq!(
+            right_click(false, true, true, false, true),
+            RightClick::Paste
+        );
+        assert_eq!(
+            right_click(false, true, true, true, true),
+            RightClick::Paste
+        );
+        assert_eq!(
+            right_click(false, true, true, true, false),
+            RightClick::Copy
+        );
     }
 
     #[test]

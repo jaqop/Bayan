@@ -167,7 +167,10 @@ impl KeyboardConfig {
 
 impl Default for KeyboardConfig {
     fn default() -> Self {
-        Self { kitty_protocol: false, kitty_base_layout_fallback: true }
+        Self {
+            kitty_protocol: false,
+            kitty_base_layout_fallback: true,
+        }
     }
 }
 
@@ -237,16 +240,25 @@ pub const PADDING_STEPS: [u32; 6] = [0, 4, 8, 12, 16, 24]; // px
 
 impl UserConfig {
     pub fn cursor(&self) -> CursorStyle {
-        self.cursor_style.as_deref().map(CursorStyle::parse).unwrap_or(CursorStyle::Block)
+        self.cursor_style
+            .as_deref()
+            .map(CursorStyle::parse)
+            .unwrap_or(CursorStyle::Block)
     }
 
     pub fn bell_mode(&self) -> BellMode {
-        self.bell.as_deref().map(BellMode::parse).unwrap_or(BellMode::Attention)
+        self.bell
+            .as_deref()
+            .map(BellMode::parse)
+            .unwrap_or(BellMode::Attention)
     }
 
     pub fn scrollback_lines(&self) -> usize {
-        (self.scrollback.map(|n| n as usize).unwrap_or(DEFAULT_SCROLLBACK))
-            .clamp(100, 100_000)
+        (self
+            .scrollback
+            .map(|n| n as usize)
+            .unwrap_or(DEFAULT_SCROLLBACK))
+        .clamp(100, 100_000)
     }
 
     pub fn copy_on_select_on(&self) -> bool {
@@ -269,7 +281,9 @@ impl UserConfig {
     }
 
     pub fn shell_program(&self) -> String {
-        self.shell.clone().unwrap_or_else(|| crate::term::DEFAULT_SHELL.to_string())
+        self.shell
+            .clone()
+            .unwrap_or_else(|| crate::term::DEFAULT_SHELL.to_string())
     }
 
     pub fn hide_single_tab_on(&self) -> bool {
@@ -297,7 +311,10 @@ impl UserConfig {
     /// Ctrl+Tab walks the most-recently-used history unless the config says
     /// "order" (anything else, including a typo, keeps the default).
     pub fn tab_switch_recent(&self) -> bool {
-        !self.tab_switch.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("order"))
+        !self
+            .tab_switch
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("order"))
     }
 
     /// Explicit BDSM overrides Claude-mode auto-detection. Default true.
@@ -380,8 +397,7 @@ mod tests {
         assert!(serde_json::from_str::<UserConfig>("{oops").is_err());
         // a UTF-8 BOM (Windows editors) must not kill the whole config
         let bom = "\u{feff}{\"font_size\":12.0}";
-        let cfg: UserConfig =
-            serde_json::from_str(bom.trim_start_matches('\u{feff}')).unwrap();
+        let cfg: UserConfig = serde_json::from_str(bom.trim_start_matches('\u{feff}')).unwrap();
         assert_eq!(cfg.font_size, Some(12.0));
     }
 
@@ -422,7 +438,11 @@ mod tests {
         assert_eq!(d.shell_program(), "powershell.exe");
         assert!(!d.hide_single_tab_on());
         assert!(d.confirm_close_on());
-        assert_eq!(d.padding_px(), 10, "a default gutter, not flush to the edge");
+        assert_eq!(
+            d.padding_px(),
+            10,
+            "a default gutter, not flush to the edge"
+        );
         let c: UserConfig = serde_json::from_str(
             r#"{"opacity":0.8,"shell":"pwsh.exe","hide_single_tab":true,
                 "confirm_close":false,"padding":12}"#,
@@ -434,8 +454,7 @@ mod tests {
         assert!(!c.confirm_close_on());
         assert_eq!(c.padding_px(), 12);
         // out-of-range values clamp instead of vanishing the window
-        let wild: UserConfig =
-            serde_json::from_str(r#"{"opacity":0.05,"padding":500}"#).unwrap();
+        let wild: UserConfig = serde_json::from_str(r#"{"opacity":0.05,"padding":500}"#).unwrap();
         assert_eq!(wild.opacity_level(), 0.5);
         assert_eq!(wild.padding_px(), 32);
     }
@@ -446,13 +465,19 @@ mod tests {
         let order: UserConfig = serde_json::from_str(r#"{"tab_switch":"order"}"#).unwrap();
         assert!(!order.tab_switch_recent());
         let typo: UserConfig = serde_json::from_str(r#"{"tab_switch":"ordr"}"#).unwrap();
-        assert!(typo.tab_switch_recent(), "a typo must not silently change behaviour");
+        assert!(
+            typo.tab_switch_recent(),
+            "a typo must not silently change behaviour"
+        );
     }
 
     #[test]
     fn saving_omits_unset_fields() {
         let json = serde_json::to_string(&UserConfig::default()).unwrap();
-        assert_eq!(json, "{}", "an untouched config serializes to nothing: {json}");
+        assert_eq!(
+            json, "{}",
+            "an untouched config serializes to nothing: {json}"
+        );
     }
 
     #[test]
@@ -500,7 +525,10 @@ mod tests {
         assert!(!missing.osc52_copy_enabled());
         for off in ["off", "paste", "read", "copy-paste", "on", ""] {
             let cfg: UserConfig = serde_json::from_str(&format!(r#"{{"osc52":"{off}"}}"#)).unwrap();
-            assert!(!cfg.osc52_copy_enabled(), "{off} must not enable a write or a read");
+            assert!(
+                !cfg.osc52_copy_enabled(),
+                "{off} must not enable a write or a read"
+            );
         }
         let on: UserConfig = serde_json::from_str(r#"{"osc52":"copy"}"#).unwrap();
         assert!(on.osc52_copy_enabled());

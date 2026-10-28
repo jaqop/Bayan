@@ -17,8 +17,17 @@ use std::path::PathBuf;
 /// EasyTer's `FEATURED`, kept because the ordering is a curation decision,
 /// not an implementation detail.
 const FEATURED: &[&str] = &[
-    "kali", "jandedobbeleer", "paradox", "atomic", "powerlevel10k_rainbow",
-    "clean-detailed", "montys", "agnoster", "robbyrussell", "pure", "night-owl",
+    "kali",
+    "jandedobbeleer",
+    "paradox",
+    "atomic",
+    "powerlevel10k_rainbow",
+    "clean-detailed",
+    "montys",
+    "agnoster",
+    "robbyrussell",
+    "pure",
+    "night-owl",
 ];
 
 /// Where the `.omp.json` files live. `POSH_THEMES_PATH` wins, as oh-my-posh
@@ -66,7 +75,11 @@ fn order_featured_first(names: Vec<String>) -> Vec<String> {
         .filter(|f| names.iter().any(|n| n == *f))
         .map(|f| f.to_string())
         .collect();
-    out.extend(names.into_iter().filter(|n| !FEATURED.contains(&n.as_str())));
+    out.extend(
+        names
+            .into_iter()
+            .filter(|n| !FEATURED.contains(&n.as_str())),
+    );
     out
 }
 
@@ -176,7 +189,9 @@ fn run_with_timeout(
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break st,
-            Ok(None) if t0.elapsed() < limit => std::thread::sleep(std::time::Duration::from_millis(15)),
+            Ok(None) if t0.elapsed() < limit => {
+                std::thread::sleep(std::time::Duration::from_millis(15))
+            }
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -194,7 +209,11 @@ fn run_with_timeout(
         .saturating_sub(t0.elapsed())
         .max(std::time::Duration::from_millis(250));
     let stdout = rx.recv_timeout(left).ok()?;
-    Some(std::process::Output { status, stdout, stderr: Vec::new() })
+    Some(std::process::Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    })
 }
 
 #[cfg(test)]
@@ -229,7 +248,10 @@ mod tests {
         assert!(out.contains("if (Get-Command oh-my-posh"));
         assert_eq!(out.lines().count(), PROFILE.lines().count());
         // the directory form is preserved, so a portable profile stays portable
-        assert!(out.contains("$env:USERPROFILE"), "absolute path was injected: {out}");
+        assert!(
+            out.contains("$env:USERPROFILE"),
+            "absolute path was injected: {out}"
+        );
     }
 
     #[test]
@@ -240,12 +262,18 @@ mod tests {
     #[test]
     fn featured_themes_lead_and_the_rest_follow_sorted() {
         let names = vec![
-            "aaa".to_string(), "kali".to_string(), "zzz".to_string(),
-            "pure".to_string(), "atomic".to_string(),
+            "aaa".to_string(),
+            "kali".to_string(),
+            "zzz".to_string(),
+            "pure".to_string(),
+            "atomic".to_string(),
         ];
         let out = order_featured_first(names);
         // FEATURED order, not alphabetical, for the ones that are featured
-        assert_eq!(&out[..3], &["kali".to_string(), "atomic".to_string(), "pure".to_string()]);
+        assert_eq!(
+            &out[..3],
+            &["kali".to_string(), "atomic".to_string(), "pure".to_string()]
+        );
         // then the others, in the order given (already sorted by the caller)
         assert_eq!(&out[3..], &["aaa".to_string(), "zzz".to_string()]);
         // a featured name that is not installed must not appear
@@ -256,12 +284,21 @@ mod tests {
     #[test]
     fn a_hung_preview_is_killed_at_the_deadline() {
         let mut slow = std::process::Command::new("powershell.exe");
-        slow.args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"]);
+        slow.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 30",
+        ]);
         let t0 = std::time::Instant::now();
         let out = run_with_timeout(slow, std::time::Duration::from_millis(400));
         assert!(out.is_none(), "a hung child must yield None");
         assert!(t0.elapsed() >= std::time::Duration::from_millis(400));
-        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "took {:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            t0.elapsed()
+        );
         // and a quick child still returns its output
         let mut quick = std::process::Command::new("cmd");
         quick.args(["/c", "echo", "hi"]);
@@ -294,4 +331,3 @@ mod tests {
         assert!(order_featured_first(Vec::new()).is_empty());
     }
 }
-
