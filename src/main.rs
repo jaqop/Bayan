@@ -8,11 +8,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod bidi;
-mod mru;
 mod bidi_ctl;
-mod plugins;
-mod posh;
-mod shells;
 mod config;
 mod gpu;
 mod keybinds;
@@ -20,16 +16,20 @@ mod keys;
 mod kitty;
 mod link;
 mod mouse;
-mod toast;
-mod render;
+mod mru;
 mod osc7;
+mod plugins;
+mod posh;
+mod render;
+mod shells;
 mod term;
+mod toast;
 
+#[cfg(test)]
+mod conpty_load;
 #[cfg(test)]
 #[path = "../vendor/portable-pty/src/win/conpty_resolve.rs"]
 mod conpty_resolve;
-#[cfg(test)]
-mod conpty_load;
 
 /// rgb -> "#rrggbb" for the config file.
 fn hex((r, g, b): (u8, u8, u8)) -> String {
@@ -119,11 +119,31 @@ fn key_letter(event: &KeyEvent) -> Option<char> {
     if let PhysicalKey::Code(c) = event.physical_key {
         use KeyCode::*;
         let l = match c {
-            KeyA => 'a', KeyB => 'b', KeyC => 'c', KeyD => 'd', KeyE => 'e',
-            KeyF => 'f', KeyG => 'g', KeyH => 'h', KeyI => 'i', KeyJ => 'j',
-            KeyK => 'k', KeyL => 'l', KeyM => 'm', KeyN => 'n', KeyO => 'o',
-            KeyP => 'p', KeyQ => 'q', KeyR => 'r', KeyS => 's', KeyT => 't',
-            KeyU => 'u', KeyV => 'v', KeyW => 'w', KeyX => 'x', KeyY => 'y',
+            KeyA => 'a',
+            KeyB => 'b',
+            KeyC => 'c',
+            KeyD => 'd',
+            KeyE => 'e',
+            KeyF => 'f',
+            KeyG => 'g',
+            KeyH => 'h',
+            KeyI => 'i',
+            KeyJ => 'j',
+            KeyK => 'k',
+            KeyL => 'l',
+            KeyM => 'm',
+            KeyN => 'n',
+            KeyO => 'o',
+            KeyP => 'p',
+            KeyQ => 'q',
+            KeyR => 'r',
+            KeyS => 's',
+            KeyT => 't',
+            KeyU => 'u',
+            KeyV => 'v',
+            KeyW => 'w',
+            KeyX => 'x',
+            KeyY => 'y',
             KeyZ => 'z',
             _ => return ctrl_letter(&event.logical_key),
         };
@@ -164,12 +184,20 @@ fn find_match<T: alacritty_terminal::event::EventListener>(
     let bottom = t.screen_lines() as i32 - 1;
     let origin = match hl {
         Some(m) => {
-            let p = if matches!(dir, Direction::Right) { *m.end() } else { *m.start() };
+            let p = if matches!(dir, Direction::Right) {
+                *m.end()
+            } else {
+                *m.start()
+            };
             step_point(p, cols, top, bottom, dir)
         }
         None => Point::new(Line(bottom), Column(cols.saturating_sub(1))),
     };
-    let side = if matches!(dir, Direction::Right) { Side::Left } else { Side::Right };
+    let side = if matches!(dir, Direction::Right) {
+        Side::Left
+    } else {
+        Side::Right
+    };
     t.search_next(&mut rs, origin, dir, side, None).or_else(|| {
         // wrap around from the far end
         let wrap = match dir {
@@ -186,9 +214,17 @@ fn find_match<T: alacritty_terminal::event::EventListener>(
 fn jump_offset(marks: &[usize], hist: usize, off: usize, dir: i32) -> Option<usize> {
     let abs_top = hist as i64 - off as i64;
     let target = if dir < 0 {
-        marks.iter().map(|&a| a as i64).filter(|&a| a < abs_top).max()
+        marks
+            .iter()
+            .map(|&a| a as i64)
+            .filter(|&a| a < abs_top)
+            .max()
     } else {
-        marks.iter().map(|&a| a as i64).filter(|&a| a > abs_top).min()
+        marks
+            .iter()
+            .map(|&a| a as i64)
+            .filter(|&a| a > abs_top)
+            .min()
     }?;
     Some((hist as i64 - target + 1).clamp(0, hist as i64) as usize)
 }
@@ -289,7 +325,11 @@ mod prof {
             return;
         }
         let t0 = *T0.get_or_init(Instant::now);
-        let line = format!("{:9.1} ms  {}\n", t0.elapsed().as_secs_f64() * 1000.0, label);
+        let line = format!(
+            "{:9.1} ms  {}\n",
+            t0.elapsed().as_secs_f64() * 1000.0,
+            label
+        );
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -343,7 +383,10 @@ pub enum UserEvent {
     Exit(u64),
     /// A link open failed, or `settle` refused it, off the UI thread.
     /// `reason` is already [`link::RefuseReason::label`].
-    LinkFailed { reason: String, shown: String },
+    LinkFailed {
+        reason: String,
+        shown: String,
+    },
 }
 
 /// The link under the pointer. Stable while the pointer stays inside it,
@@ -508,7 +551,12 @@ fn geometry_on_screen(g: WindowGeom, monitors: &[(i32, i32, u32, u32)]) -> bool 
     let (gx0, gy0) = (g.x as i64, g.y as i64);
     let (gx1, gy1) = (gx0 + g.w as i64, gy0 + 64); // the title strip, where you grab it
     monitors.iter().any(|&(mx, my, mw, mh)| {
-        let (mx0, my0, mx1, my1) = (mx as i64, my as i64, mx as i64 + mw as i64, my as i64 + mh as i64);
+        let (mx0, my0, mx1, my1) = (
+            mx as i64,
+            my as i64,
+            mx as i64 + mw as i64,
+            my as i64 + mh as i64,
+        );
         let ox = gx1.min(mx1) - gx0.max(mx0);
         let oy = gy1.min(my1) - gy0.max(my0);
         ox >= NEED && oy >= 32
@@ -553,7 +601,11 @@ fn parse_state(json: &str) -> Option<SavedState> {
 
 fn state_path() -> Option<std::path::PathBuf> {
     let home = std::env::var("USERPROFILE").ok()?;
-    Some(std::path::Path::new(&home).join(".bayan").join("session.json"))
+    Some(
+        std::path::Path::new(&home)
+            .join(".bayan")
+            .join("session.json"),
+    )
 }
 
 /// Multi-click detection: 1 = simple, 2 = word (semantic), 3 = line.
@@ -564,14 +616,21 @@ struct ClickTracker {
 
 impl ClickTracker {
     fn new() -> Self {
-        Self { last: None, count: 0 }
+        Self {
+            last: None,
+            count: 0,
+        }
     }
 
     fn click(&mut self, now: Instant, cell: (usize, usize)) -> u8 {
         const DOUBLE_MS: u128 = 400;
         self.count = match self.last {
             Some((t, c)) if now.duration_since(t).as_millis() <= DOUBLE_MS && c == cell => {
-                if self.count >= 3 { 1 } else { self.count + 1 }
+                if self.count >= 3 {
+                    1
+                } else {
+                    self.count + 1
+                }
             }
             _ => 1,
         };
@@ -593,19 +652,38 @@ impl SearchState {
     fn from_selection(text: Option<&str>, claude: bool) -> Self {
         let query = selection_search_query(text, claude);
         let selected_needle = (!query.is_empty()).then(|| text.unwrap_or_default().to_string());
-        Self { query, hl: None, selected_needle }
+        Self {
+            query,
+            hl: None,
+            selected_needle,
+        }
     }
 }
 
 fn selection_search_query(text: Option<&str>, claude: bool) -> String {
-    let Some(text) = text else { return String::new() };
-    if text.chars().any(char::is_control) || text.chars().count() > 256 { return String::new(); }
-    if claude { bidi::restore_block(text) } else { text.to_string() }
+    let Some(text) = text else {
+        return String::new();
+    };
+    if text.chars().any(char::is_control) || text.chars().count() > 256 {
+        return String::new();
+    }
+    if claude {
+        bidi::restore_block(text)
+    } else {
+        text.to_string()
+    }
 }
 
-fn keyboard_zoom(key: winit::keyboard::PhysicalKey, ctrl: bool, alt: bool, shift: bool) -> Option<i32> {
+fn keyboard_zoom(
+    key: winit::keyboard::PhysicalKey,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+) -> Option<i32> {
     use winit::keyboard::{KeyCode, PhysicalKey};
-    if !ctrl || alt { return None; }
+    if !ctrl || alt {
+        return None;
+    }
     match key {
         PhysicalKey::Code(KeyCode::Equal | KeyCode::NumpadAdd) => Some(1),
         PhysicalKey::Code(KeyCode::Minus) if !shift => Some(-1),
@@ -627,22 +705,41 @@ enum PaletteRow {
     InsertCommand(&'static str),
 }
 
-fn palette_extras(profiles: &[shells::Shell], links: &[link::LinkSpan]) -> Vec<(PaletteRow, String)> {
-    let mut rows: Vec<_> = profiles.iter().map(|shell| (
-        PaletteRow::Shell(shell.command.clone()), format!("تبويب جديد — {}", shell.name)
-    )).collect();
-    rows.push((PaletteRow::InsertCommand("claude"), "إدراج أمر كلاود — claude".into()));
-    rows.push((PaletteRow::InsertCommand("claude --continue"), "متابعة محادثة كلاود — claude --continue".into()));
+fn palette_extras(
+    profiles: &[shells::Shell],
+    links: &[link::LinkSpan],
+) -> Vec<(PaletteRow, String)> {
+    let mut rows: Vec<_> = profiles
+        .iter()
+        .map(|shell| {
+            (
+                PaletteRow::Shell(shell.command.clone()),
+                format!("تبويب جديد — {}", shell.name),
+            )
+        })
+        .collect();
+    rows.push((
+        PaletteRow::InsertCommand("claude"),
+        "إدراج أمر كلاود — claude".into(),
+    ));
+    rows.push((
+        PaletteRow::InsertCommand("claude --continue"),
+        "متابعة محادثة كلاود — claude --continue".into(),
+    ));
     let mut seen = std::collections::HashSet::new();
     for span in links {
         let text = match &span.kind {
             link::LinkKind::Osc { uri } | link::LinkKind::Url { uri } => uri,
             link::LinkKind::File { path, .. } => path,
         };
-        if text.is_empty() || !seen.insert(text.clone()) { continue; }
+        if text.is_empty() || !seen.insert(text.clone()) {
+            continue;
+        }
         let shown = link::fit_status_bar(&span.tooltip(None), 90).text();
         rows.push((PaletteRow::CopyText(text.clone()), format!("نسخ — {shown}")));
-        if seen.len() >= 100 { break; }
+        if seen.len() >= 100 {
+            break;
+        }
     }
     rows
 }
@@ -787,7 +884,11 @@ impl App {
     /// Index of the active theme in the gallery order (built-ins, then
     /// plugin themes) — the index the panel highlights and apply_theme takes.
     fn active_theme(&self) -> usize {
-        let name = self.config.theme.as_deref().unwrap_or(render::DEFAULT_THEME);
+        let name = self
+            .config
+            .theme
+            .as_deref()
+            .unwrap_or(render::DEFAULT_THEME);
         if let Some(i) = render::THEMES.iter().position(|t| t.name == name) {
             return i;
         }
@@ -820,7 +921,8 @@ impl App {
     }
 
     fn change_font_size(&mut self, delta: i32) {
-        let s = (self.config.font_size.unwrap_or(render::DEFAULT_FONT_SIZE) + delta as f32).clamp(8.0, 40.0);
+        let s = (self.config.font_size.unwrap_or(render::DEFAULT_FONT_SIZE) + delta as f32)
+            .clamp(8.0, 40.0);
         self.config.font_size = Some(s);
         self.rebuild_renderer();
         self.request_redraw();
@@ -836,7 +938,9 @@ impl App {
     /// Step to the previous/next installed monospace family. The renderer
     /// rebuild applies it live (same path as the theme).
     fn cycle_font(&mut self, dir: i32) {
-        let Some(r) = self.renderer.as_ref() else { return };
+        let Some(r) = self.renderer.as_ref() else {
+            return;
+        };
         let choices = r.font_choices();
         if choices.len() < 2 {
             return;
@@ -867,7 +971,10 @@ impl App {
         let cur = self.config.scrollback_lines();
         let steps = config::SCROLLBACK_STEPS;
         // nearest preset, then step
-        let i = steps.iter().position(|&s| s >= cur).unwrap_or(steps.len() - 1) as i32;
+        let i = steps
+            .iter()
+            .position(|&s| s >= cur)
+            .unwrap_or(steps.len() - 1) as i32;
         let j = (i + dir).clamp(0, steps.len() as i32 - 1) as usize;
         self.config.scrollback = Some(steps[j] as u32);
         self.request_redraw();
@@ -902,7 +1009,10 @@ impl App {
     fn change_padding(&mut self, dir: i32) {
         let cur = self.config.padding_px() as u32;
         let steps = config::PADDING_STEPS;
-        let i = steps.iter().position(|&s| s >= cur).unwrap_or(steps.len() - 1) as i32;
+        let i = steps
+            .iter()
+            .position(|&s| s >= cur)
+            .unwrap_or(steps.len() - 1) as i32;
         let j = (i + dir).clamp(0, steps.len() as i32 - 1) as usize;
         self.config.padding = Some(steps[j]);
         self.relayout_active(); // pane rects (and PTY sizes) follow the inset
@@ -912,7 +1022,10 @@ impl App {
     fn change_opacity(&mut self, dir: i32) {
         let cur = (self.config.opacity_level() * 100.0).round() as u32;
         let steps = config::OPACITY_STEPS;
-        let i = steps.iter().position(|&s| s >= cur).unwrap_or(steps.len() - 1) as i32;
+        let i = steps
+            .iter()
+            .position(|&s| s >= cur)
+            .unwrap_or(steps.len() - 1) as i32;
         let j = (i + dir).clamp(0, steps.len() as i32 - 1) as usize;
         self.config.opacity = Some(steps[j] as f32 / 100.0);
         self.apply_opacity();
@@ -955,14 +1068,18 @@ impl App {
     fn apply_opacity(&self) {
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let Some(w) = &self.window else { return };
-        let Ok(handle) = w.window_handle() else { return };
-        let RawWindowHandle::Win32(h) = handle.as_raw() else { return };
+        let Ok(handle) = w.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::Win32(h) = handle.as_raw() else {
+            return;
+        };
         let hwnd = h.hwnd.get() as windows_sys::Win32::Foundation::HWND;
         let alpha = (self.config.opacity_level() * 255.0).round() as u8;
         unsafe {
             use windows_sys::Win32::UI::WindowsAndMessaging::{
-                GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW,
-                GWL_EXSTYLE, LWA_ALPHA, WS_EX_LAYERED,
+                GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, GWL_EXSTYLE,
+                LWA_ALPHA, WS_EX_LAYERED,
             };
             let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
             if alpha == 255 {
@@ -978,19 +1095,26 @@ impl App {
     fn apply_window_frame(&self) {
         let Some(hwnd) = self.hwnd() else { return };
         use windows_sys::Win32::Graphics::Dwm::{
-            DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE,
-            DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+            DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+            DWMWCP_ROUND,
         };
         let dark = 1i32;
         let corner = DWMWCP_ROUND;
         // Windows 10 ignores unsupported corner preferences; the native
         // resize frame and shadow remain available there.
         unsafe {
-            DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
-                (&dark as *const i32).cast(), std::mem::size_of_val(&dark) as u32);
-            DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+                (&dark as *const i32).cast(),
+                std::mem::size_of_val(&dark) as u32,
+            );
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE as u32,
                 (&corner as *const i32).cast(),
-                std::mem::size_of_val(&corner) as u32);
+                std::mem::size_of_val(&corner) as u32,
+            );
         }
     }
 
@@ -1017,9 +1141,6 @@ impl App {
         self.request_redraw();
     }
 
-
-
-
     /// Open the prompt picker, rendering every theme once up front. One
     /// subprocess per theme is fine at ~11 themes and keeps scrolling instant;
     /// rendering lazily would stutter exactly while the user is browsing.
@@ -1033,7 +1154,11 @@ impl App {
         let sel = cur
             .and_then(|c| names.iter().position(|n| *n == c))
             .unwrap_or(0);
-        self.posh = Some(PoshPicker { names, previews, sel });
+        self.posh = Some(PoshPicker {
+            names,
+            previews,
+            sel,
+        });
         self.request_redraw();
     }
 
@@ -1060,13 +1185,24 @@ impl App {
 
     fn open_palette(&mut self, query: String) {
         self.abandon_mouse();
-        let links = self.session().map(|session| {
-            let t = session.term.lock().unwrap();
-            (0..t.screen_lines()).flat_map(|row| link::links_on_row(&t, row))
-                .take(500).collect::<Vec<_>>()
-        }).unwrap_or_default();
+        let links = self
+            .session()
+            .map(|session| {
+                let t = session.term.lock().unwrap();
+                (0..t.screen_lines())
+                    .flat_map(|row| link::links_on_row(&t, row))
+                    .take(500)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let extras = palette_extras(&self.shell_profiles, &links);
-        self.palette = Some(Palette { query, sel: 0, extras, pressed: None, wheel: 0.0 });
+        self.palette = Some(Palette {
+            query,
+            sel: 0,
+            extras,
+            pressed: None,
+            wheel: 0.0,
+        });
         self.request_redraw();
     }
 
@@ -1074,20 +1210,31 @@ impl App {
     /// move, Enter to run, Esc to dismiss.
     fn palette_input(&mut self, event: &KeyEvent, el: &ActiveEventLoop) {
         use winit::keyboard::{Key, NamedKey};
-        if let Some(p) = self.palette.as_mut() { p.pressed = None; p.wheel = 0.0; }
-        if self.modifiers.control_key() && !self.modifiers.alt_key()
-            && event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV) {
-            if self.clipboard.is_none() { self.clipboard = arboard::Clipboard::new().ok(); }
+        if let Some(p) = self.palette.as_mut() {
+            p.pressed = None;
+            p.wheel = 0.0;
+        }
+        if self.modifiers.control_key()
+            && !self.modifiers.alt_key()
+            && event.physical_key
+                == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV)
+        {
+            if self.clipboard.is_none() {
+                self.clipboard = arboard::Clipboard::new().ok();
+            }
             if let Some(text) = self.clipboard.as_mut().and_then(|c| c.get_text().ok()) {
                 if let Some(p) = self.palette.as_mut() {
-                    p.query.extend(text.chars().filter(|c| !c.is_control()).take(256));
+                    p.query
+                        .extend(text.chars().filter(|c| !c.is_control()).take(256));
                     p.sel = 0;
                 }
             }
             self.request_redraw();
             return;
         }
-        let Some(p) = self.palette.as_mut() else { return };
+        let Some(p) = self.palette.as_mut() else {
+            return;
+        };
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => self.palette = None,
             Key::Named(NamedKey::Backspace) => {
@@ -1095,14 +1242,18 @@ impl App {
                 p.sel = 0;
             }
             Key::Named(NamedKey::ArrowDown) => {
-                let n = self.palette_rows(&self.palette.as_ref().unwrap().query.clone()).len();
+                let n = self
+                    .palette_rows(&self.palette.as_ref().unwrap().query.clone())
+                    .len();
                 if n > 0 {
                     let p = self.palette.as_mut().unwrap();
                     p.sel = (p.sel + 1) % n;
                 }
             }
             Key::Named(NamedKey::ArrowUp) => {
-                let n = self.palette_rows(&self.palette.as_ref().unwrap().query.clone()).len();
+                let n = self
+                    .palette_rows(&self.palette.as_ref().unwrap().query.clone())
+                    .len();
                 if n > 0 {
                     let p = self.palette.as_mut().unwrap();
                     p.sel = (p.sel + n - 1) % n;
@@ -1144,7 +1295,13 @@ impl App {
             }
         }
         if let Some(palette) = &self.palette {
-            rows.extend(palette.extras.iter().filter(|(_, label)| hit(label)).cloned());
+            rows.extend(
+                palette
+                    .extras
+                    .iter()
+                    .filter(|(_, label)| hit(label))
+                    .cloned(),
+            );
         }
         rows
     }
@@ -1155,19 +1312,28 @@ impl App {
             // the SAME dispatch a keybinding uses, not a parallel copy
             PaletteRow::Builtin(a) => self.perform_action(a, el),
             PaletteRow::Shell(command) => {
-                let cwd = self.session().and_then(|s| s.meta.lock().unwrap().spawn_cwd());
+                let cwd = self
+                    .session()
+                    .and_then(|s| s.meta.lock().unwrap().spawn_cwd());
                 let before = self.tabs.len();
                 self.spawn_tab_command(cwd, &command);
                 if self.tabs.len() == before && self.blocked_link.is_none() {
-                    self.blocked_link = Some(BlockedLink { reason: "تعذر تشغيل الطرفية".into(),
-                        shown: link::preview(&command, 240), confirm_uri: None });
+                    self.blocked_link = Some(BlockedLink {
+                        reason: "تعذر تشغيل الطرفية".into(),
+                        shown: link::preview(&command, 240),
+                        confirm_uri: None,
+                    });
                 }
                 self.update_title();
             }
             PaletteRow::CopyText(text) => self.set_clipboard(text),
             PaletteRow::InsertCommand(text) => {
-                self.pending_paste = Some(PendingPaste { text: text.into(), lines: 1,
-                    chars: text.chars().count(), reason: "إدراج أمر من لوحة الأوامر".into() });
+                self.pending_paste = Some(PendingPaste {
+                    text: text.into(),
+                    lines: 1,
+                    chars: text.chars().count(),
+                    reason: "إدراج أمر من لوحة الأوامر".into(),
+                });
             }
             PaletteRow::Plugin(i) => {
                 if let Some(act) = plugins::registry().actions.get(i) {
@@ -1200,8 +1366,7 @@ impl App {
                     self.active,
                     self.tabs.get(self.active).map_or(0, |t| t.focused),
                 );
-                if self.config.confirm_close_on() && self.running_command(ti, pi).is_some()
-                {
+                if self.config.confirm_close_on() && self.running_command(ti, pi).is_some() {
                     self.pending_close = Some(CloseTarget::Pane(ti, pi));
                     self.request_redraw();
                     return;
@@ -1209,8 +1374,13 @@ impl App {
                 self.remove_pane(ti, pi, el);
             }
             Search => {
-                let selected = self.session().and_then(|s| s.term.lock().unwrap().selection_to_string());
-                self.search = Some(SearchState::from_selection(selected.as_deref(), self.claude_active()));
+                let selected = self
+                    .session()
+                    .and_then(|s| s.term.lock().unwrap().selection_to_string());
+                self.search = Some(SearchState::from_selection(
+                    selected.as_deref(),
+                    self.claude_active(),
+                ));
                 self.request_redraw();
             }
             Settings => {
@@ -1253,7 +1423,9 @@ impl App {
     /// capture). A capture takes the next bindable chord.
     fn shortcuts_input(&mut self, event: &KeyEvent, el: &ActiveEventLoop) {
         let _ = el;
-        let Some(st) = self.shortcuts.as_mut() else { return };
+        let Some(st) = self.shortcuts.as_mut() else {
+            return;
+        };
         let n = keybinds::Action::ALL.len();
         if st.capturing {
             if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
@@ -1266,8 +1438,7 @@ impl App {
                 self.modifiers.shift_key(),
                 self.modifiers.alt_key(),
             );
-            let Some(chord) = keybinds::chord_from(event.physical_key, ctrl, shift, alt)
-            else {
+            let Some(chord) = keybinds::chord_from(event.physical_key, ctrl, shift, alt) else {
                 return; // a bare modifier — keep waiting for the real key
             };
             if !chord.is_bindable() {
@@ -1279,8 +1450,7 @@ impl App {
             let action = keybinds::Action::ALL[st.sel];
             if let Some(owner) = keybinds::lookup(&self.keymap, chord) {
                 if owner != action {
-                    st.flash =
-                        Some(format!("«{}» يستخدم هذا الاختصار", owner.label()));
+                    st.flash = Some(format!("«{}» يستخدم هذا الاختصار", owner.label()));
                     st.capturing = false;
                     self.request_redraw();
                     return;
@@ -1358,7 +1528,10 @@ impl App {
             return;
         };
         let n = keybinds::Action::ALL.len();
-        let Some(lay) = self.renderer.as_ref().map(|r| r.shortcuts_layout(fw, fh, n))
+        let Some(lay) = self
+            .renderer
+            .as_ref()
+            .map(|r| r.shortcuts_layout(fw, fh, n))
         else {
             return;
         };
@@ -1390,8 +1563,8 @@ impl App {
         }
         let k = elapsed.as_millis() / BLINK_MS;
         let on = k.is_multiple_of(2);
-        let next_flip = self.last_input
-            + std::time::Duration::from_millis(((k + 1) * BLINK_MS) as u64);
+        let next_flip =
+            self.last_input + std::time::Duration::from_millis(((k + 1) * BLINK_MS) as u64);
         // the wake at the 15s mark restores the solid cursor
         let deadline = self.last_input + BLINK_STOP;
         (on, Some(next_flip.min(deadline)))
@@ -1440,8 +1613,10 @@ impl App {
             self.close_settings();
             self.shortcuts = Some(ShortcutsState::default());
             self.request_redraw();
-        } else if let Some(i) =
-            lay.theme_tiles.iter().position(|&t| render::rect_hit(t, px, py))
+        } else if let Some(i) = lay
+            .theme_tiles
+            .iter()
+            .position(|&t| render::rect_hit(t, px, py))
         {
             self.apply_theme(i);
         } else if render::rect_hit(lay.font_prev, px, py) {
@@ -1452,8 +1627,10 @@ impl App {
             self.change_font_size(-1);
         } else if render::rect_hit(lay.size_plus, px, py) {
             self.change_font_size(1);
-        } else if let Some(i) =
-            lay.cursor_btns.iter().position(|&b| render::rect_hit(b, px, py))
+        } else if let Some(i) = lay
+            .cursor_btns
+            .iter()
+            .position(|&b| render::rect_hit(b, px, py))
         {
             self.set_cursor_style(config::CursorStyle::ALL[i]);
         } else if render::rect_hit(lay.blink_toggle, px, py) {
@@ -1466,8 +1643,10 @@ impl App {
             self.toggle_copy_on_select();
         } else if render::rect_hit(lay.liga_toggle, px, py) {
             self.toggle_ligatures();
-        } else if let Some(i) =
-            lay.bell_btns.iter().position(|&b| render::rect_hit(b, px, py))
+        } else if let Some(i) = lay
+            .bell_btns
+            .iter()
+            .position(|&b| render::rect_hit(b, px, py))
         {
             self.set_bell(render::BELL_SEGMENTS[i]);
         } else if render::rect_hit(lay.notif_toggle, px, py) {
@@ -1511,8 +1690,13 @@ impl App {
         let r = self.renderer.as_ref()?;
         let w = self.window.as_ref()?;
         let px = w.inner_size();
-        r.cockpit_row_at(px.width as usize, px.height as usize, self.tabs.len(),
-                         pos.x, pos.y)
+        r.cockpit_row_at(
+            px.width as usize,
+            px.height as usize,
+            self.tabs.len(),
+            pos.x,
+            pos.y,
+        )
     }
 
     /// One cockpit row per tab: focused pane's command or idle directory.
@@ -1566,8 +1750,7 @@ impl App {
                 self.cockpit_sel = self.cockpit_sel.saturating_sub(1);
             }
             Key::Named(NamedKey::ArrowDown) => {
-                self.cockpit_sel =
-                    (self.cockpit_sel + 1).min(self.tabs.len().saturating_sub(1));
+                self.cockpit_sel = (self.cockpit_sel + 1).min(self.tabs.len().saturating_sub(1));
             }
             _ => {}
         }
@@ -1644,7 +1827,12 @@ impl App {
             command,
             self.config.kitty_protocol_on(),
         ) {
-            Ok(session) => Some(Pane { id, session, last_output: None, progress: None }),
+            Ok(session) => Some(Pane {
+                id,
+                session,
+                last_output: None,
+                progress: None,
+            }),
             Err(e) => {
                 eprintln!("bayan: spawn failed: {e}");
                 None
@@ -1685,9 +1873,11 @@ impl App {
 
     /// Pane rects for the active tab within the window's content area.
     fn pane_rects(&self) -> Vec<render::Rect> {
-        let (Some(r), Some(w), Some(t)) =
-            (self.renderer.as_ref(), self.window.as_ref(), self.tabs.get(self.active))
-        else {
+        let (Some(r), Some(w), Some(t)) = (
+            self.renderer.as_ref(),
+            self.window.as_ref(),
+            self.tabs.get(self.active),
+        ) else {
             return Vec::new();
         };
         let px = w.inner_size();
@@ -1734,7 +1924,9 @@ impl App {
     /// Drag divider `i` to the pointer: redistribute the PAIR's weight.
     fn drag_divider_to(&mut self, i: usize, pos: PhysicalPosition<f64>) {
         let rects = self.pane_rects();
-        let Some(t) = self.tabs.get_mut(self.active) else { return };
+        let Some(t) = self.tabs.get_mut(self.active) else {
+            return;
+        };
         if i + 1 >= rects.len() {
             return;
         }
@@ -1767,7 +1959,9 @@ impl App {
             r.set_bar_hidden(hide);
         }
         let rects = self.pane_rects();
-        let Some(r) = self.renderer.as_ref() else { return };
+        let Some(r) = self.renderer.as_ref() else {
+            return;
+        };
         let (cw, ch) = (r.cell_w, r.cell_h);
         if let Some(t) = self.tabs.get_mut(self.active) {
             for (pane, rect) in t.panes.iter_mut().zip(&rects) {
@@ -1783,13 +1977,19 @@ impl App {
     /// Split the active tab (EasyTer: Ctrl+Shift+E side-by-side, O stacked).
     fn split(&mut self, orientation: Orientation) {
         // four panes per tab is the v1 cap (one axis, equal sizes)
-        if self.tabs.get(self.active).is_none_or(|t| t.panes.len() >= 4) {
+        if self
+            .tabs
+            .get(self.active)
+            .is_none_or(|t| t.panes.len() >= 4)
+        {
             return;
         }
         let cwd = self
             .session()
             .and_then(|s| s.meta.lock().unwrap().spawn_cwd());
-        let Some(pane) = self.spawn_pane(cwd.as_deref()) else { return };
+        let Some(pane) = self.spawn_pane(cwd.as_deref()) else {
+            return;
+        };
         if let Some(t) = self.tabs.get_mut(self.active) {
             if t.panes.len() == 1 {
                 t.orientation = orientation;
@@ -1807,7 +2007,9 @@ impl App {
     fn remove_pane(&mut self, ti: usize, pi: usize, el: &ActiveEventLoop) {
         // before the pane is gone, so a tracked button can still be released
         self.abandon_mouse();
-        let Some(t) = self.tabs.get_mut(ti) else { return };
+        let Some(t) = self.tabs.get_mut(ti) else {
+            return;
+        };
         if pi >= t.panes.len() {
             return;
         }
@@ -1921,10 +2123,17 @@ impl App {
         if w.is_maximized() || w.is_minimized().unwrap_or(false) {
             return;
         }
-        let (Ok(pos), size) = (w.outer_position(), w.inner_size()) else { return };
+        let (Ok(pos), size) = (w.outer_position(), w.inner_size()) else {
+            return;
+        };
         if size.width > 0 && size.height > 0 {
-            self.normal_geom =
-                Some(WindowGeom { x: pos.x, y: pos.y, w: size.width, h: size.height, maximized: false });
+            self.normal_geom = Some(WindowGeom {
+                x: pos.x,
+                y: pos.y,
+                w: size.width,
+                h: size.height,
+                maximized: false,
+            });
         }
     }
 
@@ -2039,11 +2248,8 @@ impl App {
         };
         // Idle explicit mode (a command that forgot to reset) must not
         // suppress restoration at the prompt. A live explicit mode still does.
-        let (reorder, _) = bidi_state.for_display(
-            self.config.honor_bdsm(),
-            !running.is_empty(),
-            alt,
-        );
+        let (reorder, _) =
+            bidi_state.for_display(self.config.honor_bdsm(), !running.is_empty(), alt);
         if !reorder {
             return false;
         }
@@ -2205,8 +2411,7 @@ impl App {
             // SCP mark included. Neither applies once the command has ended
             // and the pane is back on the primary screen.
             let alt = t.mode().contains(TermMode::ALT_SCREEN);
-            let (reorder, use_stamps) =
-                bidi_state.for_display(honor, !running.is_empty(), alt);
+            let (reorder, use_stamps) = bidi_state.for_display(honor, !running.is_empty(), alt);
             let mut claude = reorder
                 && if !auto {
                     manual
@@ -2227,12 +2432,27 @@ impl App {
                 bidi_ctl::ParagraphDir::Default
             };
             let cells = render::snapshot_row(&t, row);
-            (cols, row, cells, claude, hit.col.min(cols - 1), reorder, dir)
+            (
+                cols,
+                row,
+                cells,
+                claude,
+                hit.col.min(cols - 1),
+                reorder,
+                dir,
+            )
         };
-        let mapped = rects.get(hit.pane).and_then(|rect| self.renderer.as_ref()
-            .and_then(|r| r.hit_cell(*rect, row, pos.x))).map(|h| h.0);
-        let col = if let Some(col) = mapped { col }
-        else if reorder && cells.iter().any(|c| render::is_arabic(c.c)) {
+        let mapped = rects
+            .get(hit.pane)
+            .and_then(|rect| {
+                self.renderer
+                    .as_ref()
+                    .and_then(|r| r.hit_cell(*rect, row, pos.x))
+            })
+            .map(|h| h.0);
+        let col = if let Some(col) = mapped {
+            col
+        } else if reorder && cells.iter().any(|c| render::is_arabic(c.c)) {
             let rect = rects.get(hit.pane).copied().unwrap_or((0, 0, 1, 1));
             let x = (pos.x - rect.0 as f64) as f32;
             self.renderer
@@ -2312,7 +2532,13 @@ impl App {
     /// OSC 7 (PR5) writes the same field and this is the only reader.
     fn pane_link_cwd(&self, id: u64) -> Option<String> {
         let (ti, pi) = self.find_pane(id)?;
-        let raw = self.tabs[ti].panes[pi].session.meta.lock().unwrap().cwd.clone();
+        let raw = self.tabs[ti].panes[pi]
+            .session
+            .meta
+            .lock()
+            .unwrap()
+            .cwd
+            .clone();
         link::cwd_hook(raw.as_deref())
     }
 
@@ -2345,10 +2571,7 @@ impl App {
     /// Recompute the hover from `pos`. Returns the logical cell so mouse
     /// motion can be reported without a second hit-test. `None` when the
     /// pointer is not over a pane.
-    fn refresh_link_hover(
-        &mut self,
-        pos: PhysicalPosition<f64>,
-    ) -> Option<(u64, usize, usize)> {
+    fn refresh_link_hover(&mut self, pos: PhysicalPosition<f64>) -> Option<(u64, usize, usize)> {
         if self.overlay_blocks_mouse() {
             self.clear_link_hover();
             return None;
@@ -2488,6 +2711,18 @@ impl App {
         link::click_owner(false, tracking, shift, ctrl, on_link)
     }
 
+    /// What this right click does, and the pane under the pointer. `None`
+    /// off the panes: the tab bar and the padding neither copy nor paste.
+    fn right_click_owner(&mut self) -> Option<(usize, mouse::RightClick)> {
+        let overlay = self.overlay_blocks_mouse();
+        let (pane, id, _, _) = self.locate(self.cursor_pos)?;
+        let tracking = mouse::Proto::from_mode(self.mode_of(id)).tracking();
+        let shift = self.modifiers.shift_key();
+        let sel = self.has_selection();
+        let cos = self.config.copy_on_select_on();
+        Some((pane, mouse::right_click(overlay, tracking, shift, sel, cos)))
+    }
+
     /// Press in a tracking mode, and not Shift (Shift keeps the gesture
     /// for local selection). Focus moves first so the program sees CSI I
     /// before the click.
@@ -2622,16 +2857,22 @@ impl App {
         }
         let pw = w.inner_size().width as usize;
         r.window_buttons(pw).iter().position(|&(bx, by, bw, bh)| {
-            pos.x >= bx as f64 && pos.x < (bx + bw) as f64
-                && pos.y >= by as f64 && pos.y < (by + bh) as f64
+            pos.x >= bx as f64
+                && pos.x < (bx + bw) as f64
+                && pos.y >= by as f64
+                && pos.y < (by + bh) as f64
         })
     }
 
     /// Empty title-strip space: dragging it moves the window, as a real
     /// title bar would. Tabs, the gear and the caption buttons are excluded.
     fn in_drag_strip(&self, pos: PhysicalPosition<f64>) -> bool {
-        let Some(r) = self.renderer.as_ref() else { return false };
-        let Some(w) = self.window.as_ref() else { return false };
+        let Some(r) = self.renderer.as_ref() else {
+            return false;
+        };
+        let Some(w) = self.window.as_ref() else {
+            return false;
+        };
         if r.tab_bar_h() == 0.0 || pos.y >= r.tab_bar_h() as f64 {
             return false;
         }
@@ -2639,8 +2880,8 @@ impl App {
             return false;
         }
         let pw = w.inner_size().width as usize;
-        if r.settings_button_hit(pw, pos.x, pos.y)
-            || r.tab_control_hit(pw, pos.x, pos.y).is_some() {
+        if r.settings_button_hit(pw, pos.x, pos.y) || r.tab_control_hit(pw, pos.x, pos.y).is_some()
+        {
             return false;
         }
         self.tab_at(pos).is_none()
@@ -2754,7 +2995,12 @@ impl App {
             self.send_paste(&txt);
             return;
         };
-        self.pending_paste = Some(PendingPaste { text: txt, lines, chars, reason });
+        self.pending_paste = Some(PendingPaste {
+            text: txt,
+            lines,
+            chars,
+            reason,
+        });
         self.request_redraw();
     }
 
@@ -2779,7 +3025,9 @@ impl App {
     /// you can see is the one you want), Shift+Enter walks back down.
     fn search_step(&mut self, dir: Direction) {
         let query = match &self.search {
-            Some(st) if !st.query.is_empty() => st.selected_needle.as_ref().unwrap_or(&st.query).clone(),
+            Some(st) if !st.query.is_empty() => {
+                st.selected_needle.as_ref().unwrap_or(&st.query).clone()
+            }
             _ => return,
         };
         let Some(session) = self.session() else {
@@ -2812,7 +3060,11 @@ impl App {
                 self.search = None;
             }
             Key::Named(NamedKey::Enter) => {
-                self.search_step(if shift { Direction::Right } else { Direction::Left });
+                self.search_step(if shift {
+                    Direction::Right
+                } else {
+                    Direction::Left
+                });
                 return; // search_step already redraws
             }
             Key::Named(NamedKey::Backspace) => {
@@ -2841,9 +3093,7 @@ impl App {
         // A scroll under a still pointer moves the link. Refresh only while
         // a hover is showing, and never during a drag: that path must not
         // redraw on every pixel.
-        if self.link_hover.is_some()
-            && !self.mouse.selecting
-            && self.mouse.grabbed_pane().is_none()
+        if self.link_hover.is_some() && !self.mouse.selecting && self.mouse.grabbed_pane().is_none()
         {
             let pos = self.cursor_pos;
             let _ = self.refresh_link_hover(pos);
@@ -2884,12 +3134,17 @@ impl App {
                     .collect();
                 (rows, st.sel, st.capturing, st.flash.clone())
             });
-        let posh_view: Option<PoshView> =
-            self.posh.as_ref().map(|p| (p.names.clone(), p.previews.clone(), p.sel));
+        let posh_view: Option<PoshView> = self
+            .posh
+            .as_ref()
+            .map(|p| (p.names.clone(), p.previews.clone(), p.sel));
         // computed before the renderer is borrowed, like close_msg above
         let palette_view: Option<(String, Vec<String>, usize)> = self.palette.as_ref().map(|p| {
-            let rows: Vec<String> =
-                self.palette_rows(&p.query).into_iter().map(|(_, l)| l).collect();
+            let rows: Vec<String> = self
+                .palette_rows(&p.query)
+                .into_iter()
+                .map(|(_, l)| l)
+                .collect();
             let sel = p.sel.min(rows.len().saturating_sub(1));
             (p.query.clone(), rows, sel)
         });
@@ -2915,7 +3170,9 @@ impl App {
                 progress: t.progress(),
             })
             .collect();
-        let Some(window) = self.window.as_ref() else { return };
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
         let px = window.inner_size();
         if px.width == 0 || px.height == 0 {
             return;
@@ -2981,10 +3238,9 @@ impl App {
                         Vec::new()
                     };
                     let (link_hover, link_tip) = match &self.link_hover {
-                        Some(h) if h.pane_id == pane.id => (
-                            Some((h.row, h.start_col, h.end_col)),
-                            Some(&h.target),
-                        ),
+                        Some(h) if h.pane_id == pane.id => {
+                            (Some((h.row, h.start_col, h.end_col)), Some(&h.target))
+                        }
                         _ => (None, None),
                     };
                     let view = render::PaneView {
@@ -2994,8 +3250,12 @@ impl App {
                         cursor_on,
                         bordered,
                         claude: claude_pane,
-                        claude_from: if alt || !auto_follow { None } else {
-                            claude_from.map(|start| start as i64 - evicted as i64 - history as i64 + off as i64)
+                        claude_from: if alt || !auto_follow {
+                            None
+                        } else {
+                            claude_from.map(|start| {
+                                start as i64 - evicted as i64 - history as i64 + off as i64
+                            })
                         },
                         reorder,
                         line_dir: &line_dir,
@@ -3045,8 +3305,7 @@ impl App {
                             bell: self.config.bell_mode(),
                             notifications: self.config.notifications_on(),
                             padding: self.config.padding_px(),
-                            opacity_pct: (self.config.opacity_level() * 100.0).round()
-                                as i32,
+                            opacity_pct: (self.config.opacity_level() * 100.0).round() as i32,
                             shell: &shells::label_for(&self.config.shell_program()),
                             hide_single_tab: self.config.hide_single_tab_on(),
                             confirm_close: self.config.confirm_close_on(),
@@ -3215,7 +3474,10 @@ impl ApplicationHandler<UserEvent> for App {
                     .with_position(winit::dpi::PhysicalPosition::new(g.x, g.y))
                     .with_inner_size(winit::dpi::PhysicalSize::new(g.w, g.h))
                     .with_maximized(g.maximized);
-                self.normal_geom = Some(WindowGeom { maximized: false, ..g });
+                self.normal_geom = Some(WindowGeom {
+                    maximized: false,
+                    ..g
+                });
             }
         }
         let window = Arc::new(el.create_window(attrs).expect("create window"));
@@ -3327,10 +3589,15 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ShellProfiles(profiles) => {
                 if let Some(palette) = self.palette.as_mut() {
                     palette.pressed = None;
-                    palette.extras.retain(|(row, _)| !matches!(row, PaletteRow::Shell(_)));
-                    palette.extras.extend(profiles.iter().map(|shell| (
-                        PaletteRow::Shell(shell.command.clone()), format!("تبويب جديد — {}", shell.name)
-                    )));
+                    palette
+                        .extras
+                        .retain(|(row, _)| !matches!(row, PaletteRow::Shell(_)));
+                    palette.extras.extend(profiles.iter().map(|shell| {
+                        (
+                            PaletteRow::Shell(shell.command.clone()),
+                            format!("تبويب جديد — {}", shell.name),
+                        )
+                    }));
                 }
                 self.shell_profiles = profiles;
                 self.request_redraw();
@@ -3423,7 +3690,11 @@ impl ApplicationHandler<UserEvent> for App {
                         self.tabs[ti].attention = true;
                     }
                     if (background || !self.focused) && self.config.notifications_on() {
-                        let body = if body.is_empty() { self.tabs[ti].title.clone() } else { body };
+                        let body = if body.is_empty() {
+                            self.tabs[ti].title.clone()
+                        } else {
+                            body
+                        };
                         self.toast_from_pty(&title, &body);
                         if !self.focused {
                             if let Some(w) = &self.window {
@@ -3461,7 +3732,11 @@ impl ApplicationHandler<UserEvent> for App {
                             ));
                         }
                         if self.config.notifications_on() && !self.focused {
-                            let title = if ok { "اكتمل الأمر" } else { "فشل الأمر" };
+                            let title = if ok {
+                                "اكتمل الأمر"
+                            } else {
+                                "فشل الأمر"
+                            };
                             let body = self.tabs[ti].title.clone();
                             self.toast_from_pty(title, &body);
                         }
@@ -3564,9 +3839,15 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        if matches!(&event, WindowEvent::Focused(false) | WindowEvent::CursorLeft { .. }) {
+        if matches!(
+            &event,
+            WindowEvent::Focused(false) | WindowEvent::CursorLeft { .. }
+        ) {
             self.swallow_guard_release = false;
-            if let Some(p) = self.palette.as_mut() { p.pressed = None; p.wheel = 0.0; }
+            if let Some(p) = self.palette.as_mut() {
+                p.pressed = None;
+                p.wheel = 0.0;
+            }
         }
         if let WindowEvent::MouseInput { state, button, .. } = &event {
             if consume_guard_release(&mut self.swallow_guard_release, *state, *button) {
@@ -3591,13 +3872,18 @@ impl ApplicationHandler<UserEvent> for App {
                     self.drag_divider = None;
                     if *state == ElementState::Pressed && *button == MouseButton::Left {
                         self.swallow_guard_release = true;
-                        let hit = self.renderer.as_ref().zip(self.window.as_ref())
-                            .and_then(|(r, w)| {
-                                let size = w.inner_size();
-                                r.close_guard_layout(size.width as usize, size.height as usize)
-                                    .hit(self.cursor_pos.x, self.cursor_pos.y)
-                            });
-                        if let Some(confirm) = hit { self.resolve_close(confirm, el); }
+                        let hit =
+                            self.renderer
+                                .as_ref()
+                                .zip(self.window.as_ref())
+                                .and_then(|(r, w)| {
+                                    let size = w.inner_size();
+                                    r.close_guard_layout(size.width as usize, size.height as usize)
+                                        .hit(self.cursor_pos.x, self.cursor_pos.y)
+                                });
+                        if let Some(confirm) = hit {
+                            self.resolve_close(confirm, el);
+                        }
                     }
                     return;
                 }
@@ -3612,26 +3898,42 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 WindowEvent::MouseInput { state, button, .. } => {
-                    if *button != MouseButton::Left { return; }
+                    if *button != MouseButton::Left {
+                        return;
+                    }
                     let p = self.palette.as_ref().unwrap();
                     let rows = self.palette_rows(&p.query);
-                    let layout = self.renderer.as_ref().zip(self.window.as_ref()).map(|(r, w)| {
-                        let size = w.inner_size();
-                        r.palette_layout(size.width as usize, size.height as usize, rows.len(), p.sel)
-                    });
-                    let hit = layout.as_ref().and_then(|l| l.row_at(self.cursor_pos.x, self.cursor_pos.y));
+                    let layout = self
+                        .renderer
+                        .as_ref()
+                        .zip(self.window.as_ref())
+                        .map(|(r, w)| {
+                            let size = w.inner_size();
+                            r.palette_layout(
+                                size.width as usize,
+                                size.height as usize,
+                                rows.len(),
+                                p.sel,
+                            )
+                        });
+                    let hit = layout
+                        .as_ref()
+                        .and_then(|l| l.row_at(self.cursor_pos.x, self.cursor_pos.y));
                     if *state == ElementState::Pressed {
-                        if layout.is_some_and(|l| !l.contains(self.cursor_pos.x, self.cursor_pos.y)) {
+                        if layout.is_some_and(|l| !l.contains(self.cursor_pos.x, self.cursor_pos.y))
+                        {
                             self.palette = None;
                             self.swallow_guard_release = true;
                         } else if let Some(p) = self.palette.as_mut() {
                             p.wheel = 0.0;
-                            p.pressed = hit.and_then(|i| rows.get(i).map(|(row, _)| (i, row.clone())));
+                            p.pressed =
+                                hit.and_then(|i| rows.get(i).map(|(row, _)| (i, row.clone())));
                         }
                     } else {
                         let pressed = self.palette.as_mut().and_then(|p| p.pressed.take());
                         if let (Some((index, action)), Some(hit)) = (pressed, hit) {
-                            if index == hit && rows.get(hit).is_some_and(|(row, _)| *row == action) {
+                            if index == hit && rows.get(hit).is_some_and(|(row, _)| *row == action)
+                            {
                                 self.palette_run(action, el);
                             }
                         }
@@ -3653,16 +3955,23 @@ impl ApplicationHandler<UserEvent> for App {
                             let whole = p.wheel.trunc();
                             p.wheel -= whole;
                             let distance = whole.abs().min(12.0) as usize;
-                            p.sel = if whole > 0.0 { p.sel.saturating_sub(distance) }
-                                else { p.sel.saturating_add(distance).min(count.saturating_sub(1)) };
+                            p.sel = if whole > 0.0 {
+                                p.sel.saturating_sub(distance)
+                            } else {
+                                p.sel.saturating_add(distance).min(count.saturating_sub(1))
+                            };
                         }
                     }
                     self.request_redraw();
                     return;
                 }
                 WindowEvent::DroppedFile(_) => return,
-                WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } | WindowEvent::Focused(false) => {
-                    if let Some(p) = self.palette.as_mut() { p.pressed = None; }
+                WindowEvent::Resized(_)
+                | WindowEvent::ScaleFactorChanged { .. }
+                | WindowEvent::Focused(false) => {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.pressed = None;
+                    }
                 }
                 _ => {}
             }
@@ -3671,7 +3980,11 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => {
                 // a running command deserves a second look before the kill
                 let running = self.running_count();
-                if !prepare_window_close(&mut self.pending_close, self.config.confirm_close_on(), running) {
+                if !prepare_window_close(
+                    &mut self.pending_close,
+                    self.config.confirm_close_on(),
+                    running,
+                ) {
                     self.request_redraw();
                     return;
                 }
@@ -3725,7 +4038,8 @@ impl ApplicationHandler<UserEvent> for App {
                     };
                     self.arm_pending_paste(arg, Some(why));
                 } else if let Some(s) = self.session_mut() {
-                    let body = term::normalize_paste(&arg, mode.contains(TermMode::BRACKETED_PASTE));
+                    let body =
+                        term::normalize_paste(&arg, mode.contains(TermMode::BRACKETED_PASTE));
                     s.write(body.as_bytes());
                 }
             }
@@ -3808,7 +4122,9 @@ impl ApplicationHandler<UserEvent> for App {
                         // caption/gear hover feedback
                         let cap = self.caption_button_at(position);
                         let pw = w.inner_size().width as usize;
-                        let gear = self.renderer.as_ref()
+                        let gear = self
+                            .renderer
+                            .as_ref()
                             .is_some_and(|r| r.settings_button_hit(pw, position.x, position.y));
                         if let Some(r) = self.renderer.as_mut() {
                             if r.hover_caption != cap || r.hover_gear != gear {
@@ -3835,8 +4151,30 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 match state {
                     ElementState::Pressed => {
-                        // middle/right never touch chrome; they only report when
-                        // the program asked. Left still walks the chrome first.
+                        // Right pastes (it copies a selection only when
+                        // copy-on-select is off), unless the program tracks the
+                        // mouse and Shift is up. It never touches chrome. The
+                        // release is reported or ignored below.
+                        if matches!(button, MouseButton::Right) {
+                            match self.right_click_owner() {
+                                Some((_, mouse::RightClick::Program)) => {
+                                    let _ = self.try_report_press(mouse::Btn::Right);
+                                }
+                                Some((_, mouse::RightClick::Copy)) => {
+                                    self.copy_selection(true);
+                                    self.request_redraw();
+                                }
+                                Some((pane, mouse::RightClick::Paste)) => {
+                                    self.focus_pane_at(pane);
+                                    self.sync_focus(None);
+                                    self.paste();
+                                }
+                                Some((_, mouse::RightClick::Blocked)) | None => {}
+                            }
+                            return;
+                        }
+                        // middle never touches chrome; it only reports when the
+                        // program asked. Left still walks the chrome first.
                         if !matches!(button, MouseButton::Left) {
                             if let Some(b) = mapped {
                                 let _ = self.try_report_press(b);
@@ -3864,8 +4202,11 @@ impl ApplicationHandler<UserEvent> for App {
                                             // bypassed just because the button
                                             // is ours now
                                             let running = self.running_count();
-                                            if !prepare_window_close(&mut self.pending_close,
-                                                self.config.confirm_close_on(), running) {
+                                            if !prepare_window_close(
+                                                &mut self.pending_close,
+                                                self.config.confirm_close_on(),
+                                                running,
+                                            ) {
                                                 self.request_redraw();
                                             } else {
                                                 self.quit(el);
@@ -3892,10 +4233,14 @@ impl ApplicationHandler<UserEvent> for App {
                         // (a click — layout-proof, unlike a comma shortcut)
                         if let (Some(r), Some(w)) = (self.renderer.as_ref(), self.window.as_ref()) {
                             let pw = w.inner_size().width as usize;
-                            if let Some(control) = r.tab_control_hit(pw, self.cursor_pos.x, self.cursor_pos.y) {
+                            if let Some(control) =
+                                r.tab_control_hit(pw, self.cursor_pos.x, self.cursor_pos.y)
+                            {
                                 match control {
                                     0 if self.active > 0 => self.switch_tab(self.active - 1),
-                                    1 if self.active + 1 < self.tabs.len() => self.switch_tab(self.active + 1),
+                                    1 if self.active + 1 < self.tabs.len() => {
+                                        self.switch_tab(self.active + 1)
+                                    }
                                     2 => self.perform_action(keybinds::Action::NewTab, el),
                                     _ => {}
                                 }
@@ -4073,9 +4418,7 @@ impl ApplicationHandler<UserEvent> for App {
                     None => {}
                 }
             }
-            WindowEvent::KeyboardInput { event, .. }
-                if event.state == ElementState::Pressed =>
-            {
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 // Assume the press is swallowed until bytes actually go out.
                 // Every early return above the write leaves the key here, so
                 // its release stays out of the PTY too.
@@ -4169,18 +4512,20 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // Ctrl+Shift+P opens the palette. Physical key, like every
                 // other chord here, so an Arabic layout does not break it.
-                if ctrl && shift
-                    && event.physical_key == winit::keyboard::PhysicalKey::Code(
-                        winit::keyboard::KeyCode::KeyP)
+                if ctrl
+                    && shift
+                    && event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyP)
                 {
                     self.open_palette(String::new());
                     self.request_redraw();
                     return;
                 }
                 // Ctrl+Shift+O: the prompt picker (O for oh-my-posh)
-                if ctrl && shift
-                    && event.physical_key == winit::keyboard::PhysicalKey::Code(
-                        winit::keyboard::KeyCode::KeyO)
+                if ctrl
+                    && shift
+                    && event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyO)
                 {
                     self.open_posh();
                     return;
@@ -4188,13 +4533,15 @@ impl ApplicationHandler<UserEvent> for App {
                 let key = &event.logical_key;
                 // ---- rebindable shortcuts (the keymap; Ctrl+, ⌨ edits it).
                 // Plain Ctrl+letters belong to TUIs, except clipboard paste.
-                if let Some(chord) =
-                    keybinds::chord_from(event.physical_key, ctrl, shift, alt)
-                {
+                if let Some(chord) = keybinds::chord_from(event.physical_key, ctrl, shift, alt) {
                     let alt_screen = self.term_mode().contains(TermMode::ALT_SCREEN);
-                    if let Some(action) = keybinds::resolve(&self.keymap, chord, alt_screen, self.has_selection()) {
-                        if action == keybinds::Action::Copy && chord.is_plain_ctrl_letter()
-                            && chord.key == keybinds::ChordKey::Letter('c') {
+                    if let Some(action) =
+                        keybinds::resolve(&self.keymap, chord, alt_screen, self.has_selection())
+                    {
+                        if action == keybinds::Action::Copy
+                            && chord.is_plain_ctrl_letter()
+                            && chord.key == keybinds::ChordKey::Letter('c')
+                        {
                             self.copy_selection(true);
                             self.request_redraw();
                             return;
@@ -4218,8 +4565,7 @@ impl ApplicationHandler<UserEvent> for App {
                         if let Some(t) = self.tabs.get_mut(self.active) {
                             if t.panes.len() > 1 {
                                 let n = t.panes.len() as i32;
-                                t.focused =
-                                    ((t.focused as i32 + d + n) % n) as usize;
+                                t.focused = ((t.focused as i32 + d + n) % n) as usize;
                                 self.update_title();
                                 self.sync_focus(None);
                                 self.request_redraw();
@@ -4320,9 +4666,7 @@ impl ApplicationHandler<UserEvent> for App {
             // Key-up is invisible until the child asks for event types.
             // Presses still own every shortcut above; a release only
             // reports, and only when the press itself reached the PTY.
-            WindowEvent::KeyboardInput { event, .. }
-                if event.state == ElementState::Released =>
-            {
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Released => {
                 let held_away = self.take_held_away(&event);
                 if held_away || !self.term_mode().contains(TermMode::REPORT_EVENT_TYPES) {
                     return;
@@ -4436,7 +4780,10 @@ fn main() {
         tabs: Vec::new(),
         active: 0,
         next_id: 0,
-        size: TermSize { cols: 110, rows: 32 },
+        size: TermSize {
+            cols: 110,
+            rows: 32,
+        },
         modifiers: ModifiersState::default(),
         first_frame: false,
         first_output: false,
@@ -4495,7 +4842,11 @@ mod tests {
     fn search_seed_is_bounded_literal_and_restores_claude_arabic() {
         assert_eq!(selection_search_query(Some("a.b(c)"), false), "a.b(c)");
         assert_eq!(selection_search_query(Some("ابحرم"), true), "مرحبا");
-        for text in ["one\ntwo".to_string(), "one\rtwo".to_string(), "x".repeat(257)] {
+        for text in [
+            "one\ntwo".to_string(),
+            "one\rtwo".to_string(),
+            "x".repeat(257),
+        ] {
             assert!(selection_search_query(Some(&text), false).is_empty());
         }
         assert!(selection_search_query(None, false).is_empty());
@@ -4503,67 +4854,155 @@ mod tests {
         assert_eq!(seed.query, "مرحبا");
         let size = TermSize { cols: 40, rows: 3 };
         let mut t = alacritty_terminal::term::Term::new(
-            alacritty_terminal::term::Config::default(), &size,
-            alacritty_terminal::event::VoidListener);
-        let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+            alacritty_terminal::term::Config::default(),
+            &size,
+            alacritty_terminal::event::VoidListener,
+        );
+        let mut parser: alacritty_terminal::vte::ansi::Processor =
+            alacritty_terminal::vte::ansi::Processor::new();
         parser.advance(&mut t, "ابحرم\r\n".as_bytes());
-        assert!(find_match(&mut t, seed.selected_needle.as_deref().unwrap(),
-            &None, Direction::Left).is_some(), "the readable seed must still search Claude's source cells");
+        assert!(
+            find_match(
+                &mut t,
+                seed.selected_needle.as_deref().unwrap(),
+                &None,
+                Direction::Left
+            )
+            .is_some(),
+            "the readable seed must still search Claude's source cells"
+        );
     }
 
     #[test]
     fn keyboard_zoom_uses_physical_keys_and_leaves_altgr_alone() {
         use winit::keyboard::{KeyCode, PhysicalKey};
         for code in [KeyCode::Equal, KeyCode::NumpadAdd] {
-            assert_eq!(keyboard_zoom(PhysicalKey::Code(code), true, false, true), Some(1));
-            assert_eq!(keyboard_zoom(PhysicalKey::Code(code), true, true, false), None);
+            assert_eq!(
+                keyboard_zoom(PhysicalKey::Code(code), true, false, true),
+                Some(1)
+            );
+            assert_eq!(
+                keyboard_zoom(PhysicalKey::Code(code), true, true, false),
+                None
+            );
         }
-        assert_eq!(keyboard_zoom(PhysicalKey::Code(KeyCode::Minus), true, false, false), Some(-1));
-        assert_eq!(keyboard_zoom(PhysicalKey::Code(KeyCode::Minus), true, false, true), None);
-        assert_eq!(keyboard_zoom(PhysicalKey::Code(KeyCode::NumpadSubtract), false, false, false), None);
+        assert_eq!(
+            keyboard_zoom(PhysicalKey::Code(KeyCode::Minus), true, false, false),
+            Some(-1)
+        );
+        assert_eq!(
+            keyboard_zoom(PhysicalKey::Code(KeyCode::Minus), true, false, true),
+            None
+        );
+        assert_eq!(
+            keyboard_zoom(
+                PhysicalKey::Code(KeyCode::NumpadSubtract),
+                false,
+                false,
+                false
+            ),
+            None
+        );
     }
 
     #[test]
     fn palette_profiles_and_copy_targets_keep_exact_payloads() {
-        let shells = vec![shells::Shell { name: "طرفية تجريبية".into(), command: "cmd.exe".into() }];
-        let spans = vec![link::LinkSpan { start_col: 2, end_col: 20,
-            kind: link::LinkKind::Url { uri: "https://example.org/ملف".into() } }];
+        let shells = vec![shells::Shell {
+            name: "طرفية تجريبية".into(),
+            command: "cmd.exe".into(),
+        }];
+        let spans = vec![link::LinkSpan {
+            start_col: 2,
+            end_col: 20,
+            kind: link::LinkKind::Url {
+                uri: "https://example.org/ملف".into(),
+            },
+        }];
         let rows = palette_extras(&shells, &spans);
-        assert!(rows.iter().any(|(r, label)| matches!(r, PaletteRow::Shell(cmd) if cmd == "cmd.exe")
-            && label.contains("طرفية تجريبية")));
-        assert!(rows.iter().any(|(r, _)| matches!(r, PaletteRow::CopyText(text) if text == "https://example.org/ملف")));
+        assert!(rows.iter().any(
+            |(r, label)| matches!(r, PaletteRow::Shell(cmd) if cmd == "cmd.exe")
+                && label.contains("طرفية تجريبية")
+        ));
+        assert!(rows.iter().any(
+            |(r, _)| matches!(r, PaletteRow::CopyText(text) if text == "https://example.org/ملف")
+        ));
     }
 
     #[test]
     fn palette_copy_list_is_bounded_deduplicated_and_has_safe_labels() {
-        let span = link::LinkSpan { start_col: 0, end_col: 9,
-            kind: link::LinkKind::Osc { uri: "https://example.org/\u{202e}x".into() } };
+        let span = link::LinkSpan {
+            start_col: 0,
+            end_col: 9,
+            kind: link::LinkKind::Osc {
+                uri: "https://example.org/\u{202e}x".into(),
+            },
+        };
         let rows = palette_extras(&[], &vec![span; 200]);
-        let copies: Vec<_> = rows.iter().filter(|(r, _)| matches!(r, PaletteRow::CopyText(_))).collect();
+        let copies: Vec<_> = rows
+            .iter()
+            .filter(|(r, _)| matches!(r, PaletteRow::CopyText(_)))
+            .collect();
         assert_eq!(copies.len(), 1);
         assert!(!copies[0].1.contains('\u{202e}'));
-        let spans: Vec<_> = (0..200).map(|n| link::LinkSpan { start_col: 0, end_col: 9,
-            kind: link::LinkKind::File { path: format!("file{n}.rs"), line: 0, col: None } }).collect();
+        let spans: Vec<_> = (0..200)
+            .map(|n| link::LinkSpan {
+                start_col: 0,
+                end_col: 9,
+                kind: link::LinkKind::File {
+                    path: format!("file{n}.rs"),
+                    line: 0,
+                    col: None,
+                },
+            })
+            .collect();
         let rows = palette_extras(&[], &spans);
-        assert_eq!(rows.iter().filter(|(r, _)| matches!(r, PaletteRow::CopyText(_))).count(), 100);
+        assert_eq!(
+            rows.iter()
+                .filter(|(r, _)| matches!(r, PaletteRow::CopyText(_)))
+                .count(),
+            100
+        );
     }
 
     #[test]
     fn dismissing_guard_consumes_its_release_even_after_the_modal_is_gone() {
         let mut pending = true;
-        assert!(!consume_guard_release(&mut pending, ElementState::Released, MouseButton::Right));
+        assert!(!consume_guard_release(
+            &mut pending,
+            ElementState::Released,
+            MouseButton::Right
+        ));
         assert!(pending);
-        assert!(consume_guard_release(&mut pending, ElementState::Released, MouseButton::Left));
+        assert!(consume_guard_release(
+            &mut pending,
+            ElementState::Released,
+            MouseButton::Left
+        ));
         assert!(!pending);
-        assert!(!consume_guard_release(&mut pending, ElementState::Released, MouseButton::Left));
+        assert!(!consume_guard_release(
+            &mut pending,
+            ElementState::Released,
+            MouseButton::Left
+        ));
     }
 
     #[test]
     fn a_new_press_cancels_a_release_left_over_from_a_dismissed_modal() {
         let mut pending = true;
-        assert!(!consume_guard_release(&mut pending, ElementState::Pressed, MouseButton::Left));
-        assert!(!pending, "a new press must not inherit the old modal's release suppression");
-        assert!(!consume_guard_release(&mut pending, ElementState::Released, MouseButton::Left));
+        assert!(!consume_guard_release(
+            &mut pending,
+            ElementState::Pressed,
+            MouseButton::Left
+        ));
+        assert!(
+            !pending,
+            "a new press must not inherit the old modal's release suppression"
+        );
+        assert!(!consume_guard_release(
+            &mut pending,
+            ElementState::Released,
+            MouseButton::Left
+        ));
     }
 
     #[test]
@@ -4601,11 +5040,20 @@ mod tests {
         // active tab's focused pane is index 1 (id 20). Id 10 is the other split.
         let tabs: [(usize, &[u64]); 2] = [(1, &[10, 20]), (0, &[30])];
         assert!(super::osc52_pane_is_focused(&tabs, 0, 20));
-        assert!(!super::osc52_pane_is_focused(&tabs, 0, 10), "unfocused split");
-        assert!(!super::osc52_pane_is_focused(&tabs, 0, 30), "background tab");
+        assert!(
+            !super::osc52_pane_is_focused(&tabs, 0, 10),
+            "unfocused split"
+        );
+        assert!(
+            !super::osc52_pane_is_focused(&tabs, 0, 30),
+            "background tab"
+        );
         assert!(!super::osc52_pane_is_focused(&tabs, 5, 20), "no such tab");
         let past_end: [(usize, &[u64]); 1] = [(3, &[1])];
-        assert!(!super::osc52_pane_is_focused(&past_end, 0, 1), "focused index past the end");
+        assert!(
+            !super::osc52_pane_is_focused(&past_end, 0, 1),
+            "focused index past the end"
+        );
     }
 
     #[test]
@@ -4617,14 +5065,14 @@ mod tests {
         assert_eq!(two[0], (0, 30, 499, 700));
         assert_eq!(two[1], (500, 30, 500, 700)); // absorbs the rounding
         assert_eq!(two[0].0 + two[0].2 + 1, two[1].0); // 1px divider gap
-        // a dragged divider: 3:1 weights give a 3:1 width split
+                                                       // a dragged divider: 3:1 weights give a 3:1 width split
         let uneven = split_rects(content, &[3.0, 1.0], Orientation::Row);
         assert_eq!(uneven[0].2, 749); // 999 * 0.75
         assert_eq!(uneven[1].0 + uneven[1].2, 1000); // flush right
         let stacked = split_rects(content, &[1.0, 1.0, 1.0], Orientation::Column);
         assert_eq!(stacked.len(), 3);
         assert_eq!(stacked[2].1 + stacked[2].3, 30 + 700); // flush bottom
-        // widths untouched in a column split
+                                                           // widths untouched in a column split
         assert!(stacked.iter().all(|r| r.2 == 1000));
     }
 
@@ -4655,13 +5103,28 @@ mod tests {
         let mut p: Processor = Processor::new();
         let mut meta = term::SessionMeta::default();
         let mut carry = Vec::new();
-        let feed = |p: &mut Processor, t: &mut Term<VoidListener>,
-                    m: &mut term::SessionMeta, c: &mut Vec<u8>, d: &[u8]| {
+        let feed = |p: &mut Processor,
+                    t: &mut Term<VoidListener>,
+                    m: &mut term::SessionMeta,
+                    c: &mut Vec<u8>,
+                    d: &[u8]| {
             term::process_chunk(p, t, m, c, d);
         };
-        feed(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;A\x07> ok\r\n");
+        feed(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;A\x07> ok\r\n",
+        );
         feed(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;D;0\x07");
-        feed(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;A\x07> bad\r\n");
+        feed(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;A\x07> bad\r\n",
+        );
         feed(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;D;1\x07");
         assert_eq!(meta.marks.len(), 2);
         assert_eq!(meta.marks[0].exit, Some(0));
@@ -4673,7 +5136,13 @@ mod tests {
     fn window_geometry_restores_only_onto_a_live_monitor() {
         let primary = (0, 0, 2560u32, 1440u32);
         let second = (2560, 0, 1920u32, 1080u32);
-        let g = |x, y| WindowGeom { x, y, w: 1100, h: 700, maximized: false };
+        let g = |x, y| WindowGeom {
+            x,
+            y,
+            w: 1100,
+            h: 700,
+            maximized: false,
+        };
         assert!(geometry_on_screen(g(100, 100), &[primary]));
         // on the second monitor: fine while it is connected, not after
         assert!(geometry_on_screen(g(3000, 200), &[primary, second]));
@@ -4685,7 +5154,14 @@ mod tests {
         // above the top: the title strip is unreachable
         assert!(!geometry_on_screen(g(100, -400), &[primary]));
         // a degenerate size is not worth restoring
-        assert!(!geometry_on_screen(WindowGeom { w: 10, h: 10, ..g(0, 0) }, &[primary]));
+        assert!(!geometry_on_screen(
+            WindowGeom {
+                w: 10,
+                h: 10,
+                ..g(0, 0)
+            },
+            &[primary]
+        ));
         assert!(!geometry_on_screen(g(0, 0), &[]));
     }
 
@@ -4699,7 +5175,13 @@ mod tests {
                 focused: 1,
             }],
             active: 0,
-            window: Some(WindowGeom { x: 40, y: 60, w: 1280, h: 800, maximized: true }),
+            window: Some(WindowGeom {
+                x: 40,
+                y: 60,
+                w: 1280,
+                h: 800,
+                maximized: true,
+            }),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back = parse_state(&json).unwrap();
@@ -4738,7 +5220,7 @@ mod tests {
         assert_eq!(c.click(t0, (5, 10)), 1);
         assert_eq!(c.click(t0 + Duration::from_millis(150), (5, 10)), 2); // word
         assert_eq!(c.click(t0 + Duration::from_millis(300), (5, 10)), 3); // line
-        // a 4th quick click starts over
+                                                                          // a 4th quick click starts over
         assert_eq!(c.click(t0 + Duration::from_millis(450), (5, 10)), 1);
         // too slow -> single again
         assert_eq!(c.click(t0 + Duration::from_millis(2000), (5, 10)), 1);
@@ -4763,20 +5245,18 @@ mod tests {
         }
 
         // Enter: nearest match above the bottom = "needle two" (row 2)
-        let m1 = find_match(&mut t, "needle", &None, Direction::Left)
-            .expect("first match");
+        let m1 = find_match(&mut t, "needle", &None, Direction::Left).expect("first match");
         assert_eq!(m1.start().line.0, 2);
         // Enter again: steps up to "needle one" (row 0)
-        let m2 = find_match(&mut t, "needle", &Some(m1.clone()), Direction::Left)
-            .expect("second match");
+        let m2 =
+            find_match(&mut t, "needle", &Some(m1.clone()), Direction::Left).expect("second match");
         assert_eq!(m2.start().line.0, 0);
         // Enter once more: wraps around back to row 2
         let m3 = find_match(&mut t, "needle", &Some(m2.clone()), Direction::Left)
             .expect("wrapped match");
         assert_eq!(m3.start().line.0, 2);
         // Shift+Enter from the first hit walks back down
-        let m4 = find_match(&mut t, "needle", &Some(m2), Direction::Right)
-            .expect("forward match");
+        let m4 = find_match(&mut t, "needle", &Some(m2), Direction::Right).expect("forward match");
         assert_eq!(m4.start().line.0, 2);
         // no hits -> None, and a regex-special query is treated literally
         assert!(find_match(&mut t, "absent", &None, Direction::Left).is_none());
@@ -4825,21 +5305,39 @@ mod tests {
         let gap = std::time::Duration::from_secs(5);
         let t0 = Instant::now();
         assert!(toast_due(None, t0, gap), "the first one always fires");
-        assert!(!toast_due(Some(t0), t0, gap), "a second one in the same instant does not");
-        assert!(!toast_due(Some(t0), t0 + std::time::Duration::from_millis(4999), gap));
-        assert!(toast_due(Some(t0), t0 + gap, gap), "exactly at the gap it fires again");
-        assert!(toast_due(Some(t0), t0 + std::time::Duration::from_secs(60), gap));
+        assert!(
+            !toast_due(Some(t0), t0, gap),
+            "a second one in the same instant does not"
+        );
+        assert!(!toast_due(
+            Some(t0),
+            t0 + std::time::Duration::from_millis(4999),
+            gap
+        ));
+        assert!(
+            toast_due(Some(t0), t0 + gap, gap),
+            "exactly at the gap it fires again"
+        );
+        assert!(toast_due(
+            Some(t0),
+            t0 + std::time::Duration::from_secs(60),
+            gap
+        ));
     }
 
     #[test]
     fn step_point_walks_and_clamps() {
         let (cols, top, bottom) = (10, -100, 31);
         let p = Point::new(Line(0), Column(9));
-        assert_eq!(step_point(p, cols, top, bottom, Direction::Right),
-                   Point::new(Line(1), Column(0)));
+        assert_eq!(
+            step_point(p, cols, top, bottom, Direction::Right),
+            Point::new(Line(1), Column(0))
+        );
         let q = Point::new(Line(0), Column(0));
-        assert_eq!(step_point(q, cols, top, bottom, Direction::Left),
-                   Point::new(Line(-1), Column(9)));
+        assert_eq!(
+            step_point(q, cols, top, bottom, Direction::Left),
+            Point::new(Line(-1), Column(9))
+        );
         // clamped at the extremes
         let end = Point::new(Line(bottom), Column(9));
         assert_eq!(step_point(end, cols, top, bottom, Direction::Right), end);
@@ -4870,4 +5368,3 @@ mod palette_tests {
         assert_eq!(render::palette_hint(0), "لا نتائج · Esc إغلاق");
     }
 }
-

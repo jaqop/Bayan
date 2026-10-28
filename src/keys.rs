@@ -238,9 +238,10 @@ fn same_key_or_pc101_shift(input: &EncodeInput<'_>, text: &str) -> bool {
     }
     // The physical key when we have one. Otherwise the unmodified character,
     // so Shift+1 is `!` even if the event carried no keycode.
-    let base = input.physical.and_then(pc101_unshifted).or_else(|| {
-        unmod.and_then(one_char).filter(|c| c.is_ascii())
-    });
+    let base = input
+        .physical
+        .and_then(pc101_unshifted)
+        .or_else(|| unmod.and_then(one_char).filter(|c| c.is_ascii()));
     match base.and_then(pc101_shifted) {
         Some(shifted) => one_char(text) == Some(shifted),
         None => false,
@@ -579,30 +580,69 @@ mod tests {
 
     #[test]
     fn arrows_match_easyter_spec() {
-        assert_eq!(enc(Key::Named(NamedKey::ArrowRight), false, false, false), "\x1b[C");
-        assert_eq!(enc(Key::Named(NamedKey::ArrowRight), false, false, true), "\x1b[1;5C");
-        assert_eq!(enc(Key::Named(NamedKey::ArrowLeft), false, false, true), "\x1b[1;5D");
-        assert_eq!(enc(Key::Named(NamedKey::ArrowUp), true, false, false), "\x1b[1;2A");
-        assert_eq!(enc(Key::Named(NamedKey::Home), false, false, true), "\x1b[1;5H");
-        assert_eq!(enc(Key::Named(NamedKey::End), false, false, true), "\x1b[1;5F");
+        assert_eq!(
+            enc(Key::Named(NamedKey::ArrowRight), false, false, false),
+            "\x1b[C"
+        );
+        assert_eq!(
+            enc(Key::Named(NamedKey::ArrowRight), false, false, true),
+            "\x1b[1;5C"
+        );
+        assert_eq!(
+            enc(Key::Named(NamedKey::ArrowLeft), false, false, true),
+            "\x1b[1;5D"
+        );
+        assert_eq!(
+            enc(Key::Named(NamedKey::ArrowUp), true, false, false),
+            "\x1b[1;2A"
+        );
+        assert_eq!(
+            enc(Key::Named(NamedKey::Home), false, false, true),
+            "\x1b[1;5H"
+        );
+        assert_eq!(
+            enc(Key::Named(NamedKey::End), false, false, true),
+            "\x1b[1;5F"
+        );
     }
 
     #[test]
     fn editing_keys() {
-        assert_eq!(enc(Key::Named(NamedKey::Delete), false, false, false), "\x1b[3~");
-        assert_eq!(enc(Key::Named(NamedKey::Delete), false, false, true), "\x1b[3;5~");
-        assert_eq!(enc(Key::Named(NamedKey::Backspace), false, false, false), "\x7f");
-        assert_eq!(enc(Key::Named(NamedKey::Backspace), false, false, true), "\x08");
+        assert_eq!(
+            enc(Key::Named(NamedKey::Delete), false, false, false),
+            "\x1b[3~"
+        );
+        assert_eq!(
+            enc(Key::Named(NamedKey::Delete), false, false, true),
+            "\x1b[3;5~"
+        );
+        assert_eq!(
+            enc(Key::Named(NamedKey::Backspace), false, false, false),
+            "\x7f"
+        );
+        assert_eq!(
+            enc(Key::Named(NamedKey::Backspace), false, false, true),
+            "\x08"
+        );
         assert_eq!(enc(Key::Named(NamedKey::Enter), false, false, false), "\r");
-        assert_eq!(enc(Key::Named(NamedKey::Enter), true, false, false), "\x1b\r");
+        assert_eq!(
+            enc(Key::Named(NamedKey::Enter), true, false, false),
+            "\x1b\r"
+        );
     }
 
     #[test]
     fn ctrl_letters() {
         let c = Key::Character("c".into());
-        assert_eq!(encode(&c, Some("c"), false, false, true).unwrap(), vec![0x03]);
+        assert_eq!(
+            encode(&c, Some("c"), false, false, true).unwrap(),
+            vec![0x03]
+        );
         let t = Key::Character("t".into());
-        assert_eq!(encode(&t, Some("t"), false, false, true).unwrap(), vec![0x14]);
+        assert_eq!(
+            encode(&t, Some("t"), false, false, true).unwrap(),
+            vec![0x14]
+        );
         // Windows hands over the pre-composed control char with Ctrl held
         let raw = Key::Character("\u{6}".into());
         assert_eq!(encode(&raw, None, false, false, true).unwrap(), vec![0x06]);
@@ -611,15 +651,27 @@ mod tests {
     #[test]
     fn alt_letter_is_meta_prefixed_but_altgr_is_not() {
         let b = Key::Character("b".into());
-        assert_eq!(encode(&b, Some("b"), false, true, false).unwrap(), b"\x1bb".to_vec());
+        assert_eq!(
+            encode(&b, Some("b"), false, true, false).unwrap(),
+            b"\x1bb".to_vec()
+        );
         // AltGr arrives as Ctrl+Alt: the composed character passes as text
         // (it used to fall into the Ctrl+letter branch and vanish)
         let at = Key::Character("@".into());
-        assert_eq!(encode(&at, Some("@"), false, true, true).unwrap(), b"@".to_vec());
+        assert_eq!(
+            encode(&at, Some("@"), false, true, true).unwrap(),
+            b"@".to_vec()
+        );
         let euro = Key::Character("e".into());
-        assert_eq!(encode(&euro, Some("€"), false, true, true).unwrap(), "€".as_bytes().to_vec());
+        assert_eq!(
+            encode(&euro, Some("€"), false, true, true).unwrap(),
+            "€".as_bytes().to_vec()
+        );
         // plain typing is untouched
-        assert_eq!(encode(&b, Some("b"), false, false, false).unwrap(), b"b".to_vec());
+        assert_eq!(
+            encode(&b, Some("b"), false, false, false).unwrap(),
+            b"b".to_vec()
+        );
     }
 
     #[test]
@@ -946,7 +998,11 @@ mod tests {
         for input in &mut cases {
             input.mode = masked;
             if let Some(bytes) = encode_input(input) {
-                assert!(!is_csi_u(&bytes), "off produced {}", String::from_utf8_lossy(&bytes));
+                assert!(
+                    !is_csi_u(&bytes),
+                    "off produced {}",
+                    String::from_utf8_lossy(&bytes)
+                );
             }
             input.released = true;
             if let Some(bytes) = encode_input(input) {

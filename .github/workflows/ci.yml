@@ -24,9 +24,8 @@ jobs:
       - name: Build
         run: cargo build --all-targets
       # The tests are pure unit tests — no GPU, no window, no PTY spawn —
-      # so they run headless. Note config.rs's tests read ~/.bayan/config.json
-      # if it exists; a CI runner has none, which is why they are reliable
-      # here and need the file removed when running locally.
+      # so they run headless. They never read or write ~/.bayan, so a local
+      # run with a live config.json behaves the same as this one.
       - name: Test
         run: cargo test --all-targets
 
@@ -43,18 +42,37 @@ jobs:
       - name: Check against the declared minimum
         run: cargo check --all-targets
 
-  # Informational on purpose: no -D warnings. There are known style lints the
-  # project keeps deliberately — most notably bidi.rs's LTR-island scanner,
-  # where clippy wants two if-arms merged and the split is what encodes the
-  # punctuation lookahead. Clippy still fails the job on real errors.
-  clippy:
-    name: clippy
+  # The tree is rustfmt-clean and clippy-clean with -D warnings, and these
+  # two steps keep it that way. A lint the project disagrees with gets a
+  # scoped #[allow] with a reason next to the code, not a quiet CI job.
+  # The cost: a new stable clippy that adds a lint can turn this red without
+  # a code change; fix or allow it then.
+  lint:
+    name: fmt + clippy
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --all-targets
+        run: cargo clippy --all-targets -- -D warnings
+
+  # RustSec advisories against Cargo.lock. Fails on a known vulnerability;
+  # unmaintained or yanked crates print as warnings and do not fail it. It
+  # reads the lockfile and compiles nothing, so it is the one job that does
+  # not need Windows. At the time of writing it reports one warning:
+  # ttf-parser (via cosmic-text -> fontdb) is unmaintained upstream.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Audit
+        run: cargo audit

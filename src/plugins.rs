@@ -58,8 +58,14 @@ struct Staged {
     actions: Vec<PaletteAction>,
 }
 
+/// Tests feed `load_from` broken plugins on purpose; their failures must not
+/// land in the user's real log.
 fn log_path() -> PathBuf {
-    crate::config::bayan_dir().join("plugins.log")
+    if cfg!(test) {
+        std::env::temp_dir().join("bayan-test-plugins.log")
+    } else {
+        crate::config::bayan_dir().join("plugins.log")
+    }
 }
 
 /// Append a line to the plugin log. Defensive to the point of silence: a
@@ -70,7 +76,11 @@ fn log(msg: &str) {
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&p)
+    {
         let _ = writeln!(f, "{}", msg.trim_end());
     }
 }
@@ -88,21 +98,46 @@ fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
 
 /// The 16 ANSI slots, in the order the built-in table uses.
 const ANSI_KEYS: [&str; 16] = [
-    "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
-    "brightblack", "brightred", "brightgreen", "brightyellow",
-    "brightblue", "brightmagenta", "brightcyan", "brightwhite",
+    "black",
+    "red",
+    "green",
+    "yellow",
+    "blue",
+    "magenta",
+    "cyan",
+    "white",
+    "brightblack",
+    "brightred",
+    "brightgreen",
+    "brightyellow",
+    "brightblue",
+    "brightmagenta",
+    "brightcyan",
+    "brightwhite",
 ];
 
 /// Validate one theme object. EasyTer's `_validate_theme` requires string
 /// bg/fg and an ansi dict; this additionally checks every colour parses,
 /// because a half-valid palette would render as silent black.
 fn parse_theme(v: &serde_json::Value) -> Result<PluginTheme, String> {
-    let name = v.get("name").and_then(|x| x.as_str()).ok_or("theme needs a string 'name'")?;
-    let bg = v.get("bg").and_then(|x| x.as_str()).ok_or("theme needs a string 'bg'")?;
-    let fg = v.get("fg").and_then(|x| x.as_str()).ok_or("theme needs a string 'fg'")?;
+    let name = v
+        .get("name")
+        .and_then(|x| x.as_str())
+        .ok_or("theme needs a string 'name'")?;
+    let bg = v
+        .get("bg")
+        .and_then(|x| x.as_str())
+        .ok_or("theme needs a string 'bg'")?;
+    let fg = v
+        .get("fg")
+        .and_then(|x| x.as_str())
+        .ok_or("theme needs a string 'fg'")?;
     let bg = parse_hex(bg).ok_or_else(|| format!("bad bg colour {bg:?}"))?;
     let fg = parse_hex(fg).ok_or_else(|| format!("bad fg colour {fg:?}"))?;
-    let ansi = v.get("ansi").and_then(|x| x.as_object()).ok_or("theme needs an 'ansi' object")?;
+    let ansi = v
+        .get("ansi")
+        .and_then(|x| x.as_object())
+        .ok_or("theme needs an 'ansi' object")?;
     let mut palette = [(0u8, 0u8, 0u8); 16];
     for (i, key) in ANSI_KEYS.iter().enumerate() {
         // a missing slot inherits fg rather than rendering invisible black
@@ -111,13 +146,27 @@ fn parse_theme(v: &serde_json::Value) -> Result<PluginTheme, String> {
             None => fg,
         };
     }
-    Ok(PluginTheme { name: name.to_string(), bg, fg, palette })
+    Ok(PluginTheme {
+        name: name.to_string(),
+        bg,
+        fg,
+        palette,
+    })
 }
 
 fn parse_action(v: &serde_json::Value) -> Result<PaletteAction, String> {
-    let label = v.get("label").and_then(|x| x.as_str()).ok_or("action needs a string 'label'")?;
-    let send = v.get("send").and_then(|x| x.as_str()).ok_or("action needs a string 'send'")?;
-    Ok(PaletteAction { label: label.to_string(), send: send.to_string() })
+    let label = v
+        .get("label")
+        .and_then(|x| x.as_str())
+        .ok_or("action needs a string 'label'")?;
+    let send = v
+        .get("send")
+        .and_then(|x| x.as_str())
+        .ok_or("action needs a string 'send'")?;
+    Ok(PaletteAction {
+        label: label.to_string(),
+        send: send.to_string(),
+    })
 }
 
 /// Parse one plugin file into a staging area. Any error rejects the WHOLE
@@ -155,12 +204,19 @@ pub fn load_from(dir: &Path, disabled: &[String]) -> Registry {
     };
     let mut files: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("json")))
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("json"))
+        })
         .collect();
     files.sort(); // deterministic order, so a duplicate name resolves the same way twice
 
     for path in files {
-        let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
+        let Some(name) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
             continue;
         };
         if name.starts_with('_') || disabled.iter().any(|d| d == &name) {
@@ -213,6 +269,11 @@ pub fn theme_by_name(name: &str) -> Option<&'static PluginTheme> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_runs_never_write_the_users_plugin_log() {
+        assert!(!log_path().starts_with(crate::config::bayan_dir()));
+    }
+
     /// Built with explicit escapes rather than raw strings: a hex colour's
     /// `#` collides with the `r#"..."#` delimiter and the noise hides bugs.
     fn theme_json(name: &str, bg: &str) -> String {
@@ -245,7 +306,10 @@ mod tests {
             "]}"
         );
         let err = parse_plugin(merged).unwrap_err();
-        assert!(err.contains("bad bg"), "expected a colour error, got: {err}");
+        assert!(
+            err.contains("bad bg"),
+            "expected a colour error, got: {err}"
+        );
     }
 
     #[test]
@@ -287,7 +351,11 @@ mod tests {
         std::fs::write(dir.join("_skipped.json"), theme_json("Nope", "#333333")).unwrap();
 
         let reg = load_from(&dir, &[]);
-        assert_eq!(reg.loaded, vec!["a_good", "c_good"], "a broken plugin is skipped, not fatal");
+        assert_eq!(
+            reg.loaded,
+            vec!["a_good", "c_good"],
+            "a broken plugin is skipped, not fatal"
+        );
         assert_eq!(reg.failed.len(), 1);
         assert_eq!(reg.failed[0].0, "b_broken");
         assert_eq!(reg.themes.len(), 2, "the underscore file is ignored");

@@ -55,7 +55,11 @@ impl Mru {
         }
         self.order.retain(|&i| i < len);
         let n = self.order.len();
-        self.walk = if forward { (self.walk + 1) % n } else { (self.walk + n - 1) % n };
+        self.walk = if forward {
+            (self.walk + 1) % n
+        } else {
+            (self.walk + n - 1) % n
+        };
         Some(self.order[self.walk])
     }
 
@@ -105,7 +109,11 @@ mod tests {
         assert_eq!(m.step(false, 4), Some(0));
         m.release(0);
         assert!(!m.walking());
-        assert_eq!(m.step(true, 4), Some(3), "0 is now first, 3 (where the walk began) next");
+        assert_eq!(
+            m.step(true, 4),
+            Some(3),
+            "0 is now first, 3 (where the walk began) next"
+        );
     }
 
     #[test]

@@ -76,19 +76,28 @@ const fn rgb(v: u32) -> (u8, u8, u8) {
     ((v >> 16) as u8, (v >> 8) as u8, v as u8)
 }
 
-
 /// Every theme the settings gallery offers: the built-in table, then whatever
 /// plugins contributed. One list, so the tiles drawn, the tile clicked and the
 /// theme applied are always the same index into the same order.
 pub fn gallery() -> Vec<Theme> {
     let mut v: Vec<Theme> = THEMES
         .iter()
-        .map(|t| Theme { name: t.name, bg: t.bg, fg: t.fg, palette: t.palette })
+        .map(|t| Theme {
+            name: t.name,
+            bg: t.bg,
+            fg: t.fg,
+            palette: t.palette,
+        })
         .collect();
     for p in &crate::plugins::registry().themes {
         // the &'static name field cannot hold a runtime string; the gallery
         // identifies tiles by index and colour, not by name
-        v.push(Theme { name: "", bg: p.bg, fg: p.fg, palette: p.palette });
+        v.push(Theme {
+            name: "",
+            bg: p.bg,
+            fg: p.fg,
+            palette: p.palette,
+        });
     }
     v
 }
@@ -98,7 +107,12 @@ pub fn gallery() -> Vec<Theme> {
 /// can add but never silently replace a shipped theme.
 pub fn theme_by_name(name: &str) -> Option<Theme> {
     if let Some(t) = THEMES.iter().find(|t| t.name == name) {
-        return Some(Theme { name: t.name, bg: t.bg, fg: t.fg, palette: t.palette });
+        return Some(Theme {
+            name: t.name,
+            bg: t.bg,
+            fg: t.fg,
+            palette: t.palette,
+        });
     }
     crate::plugins::theme_by_name(name).map(|p| Theme {
         // the built-in table is &'static; a plugin name is not, and the field
@@ -120,86 +134,189 @@ pub const THEMES: &[Theme] = &[
     // usual saturated set, so the restraint of the original survives.
     Theme {
         name: "Jonathan Blow",
-        bg: rgb(0x062626), fg: rgb(0xc2b796),
+        bg: rgb(0x062626),
+        fg: rgb(0xc2b796),
         palette: [
-            rgb(0x062626), rgb(0xc0503f), rgb(0x62cc54), rgb(0xcba64f),
-            rgb(0x4f8f95), rgb(0xa97fb0), rgb(0x58d1c0), rgb(0xc2b796),
-            rgb(0x2d5450), rgb(0xd97160), rgb(0x7ee06d), rgb(0xdcc98f),
-            rgb(0x74afb4), rgb(0xc49ed0), rgb(0x7fe4d5), rgb(0xeefbfa),
+            rgb(0x062626),
+            rgb(0xc0503f),
+            rgb(0x62cc54),
+            rgb(0xcba64f),
+            rgb(0x4f8f95),
+            rgb(0xa97fb0),
+            rgb(0x58d1c0),
+            rgb(0xc2b796),
+            rgb(0x2d5450),
+            rgb(0xd97160),
+            rgb(0x7ee06d),
+            rgb(0xdcc98f),
+            rgb(0x74afb4),
+            rgb(0xc49ed0),
+            rgb(0x7fe4d5),
+            rgb(0xeefbfa),
         ],
     },
     Theme {
         name: "بيان (الأزرق)",
-        bg: rgb(0x0d1117), fg: rgb(0xe6edf3),
+        bg: rgb(0x0d1117),
+        fg: rgb(0xe6edf3),
         palette: [
-            rgb(0x0d1117), rgb(0xff6b6b), rgb(0x7ee787), rgb(0xe3b341),
-            rgb(0x6ca0f6), rgb(0xd2a8ff), rgb(0x56d4dd), rgb(0xe6edf3),
-            rgb(0x6e7681), rgb(0xff8a8a), rgb(0xa2f5b0), rgb(0xf2cc60),
-            rgb(0x8db4f8), rgb(0xe0c1ff), rgb(0x7ee0e6), rgb(0xffffff),
+            rgb(0x0d1117),
+            rgb(0xff6b6b),
+            rgb(0x7ee787),
+            rgb(0xe3b341),
+            rgb(0x6ca0f6),
+            rgb(0xd2a8ff),
+            rgb(0x56d4dd),
+            rgb(0xe6edf3),
+            rgb(0x6e7681),
+            rgb(0xff8a8a),
+            rgb(0xa2f5b0),
+            rgb(0xf2cc60),
+            rgb(0x8db4f8),
+            rgb(0xe0c1ff),
+            rgb(0x7ee0e6),
+            rgb(0xffffff),
         ],
     },
     Theme {
         name: "أسود مطلق",
-        bg: rgb(0x000000), fg: rgb(0xd0d0d0),
+        bg: rgb(0x000000),
+        fg: rgb(0xd0d0d0),
         palette: [
-            rgb(0x000000), rgb(0xff5555), rgb(0x50fa7b), rgb(0xf1fa8c),
-            rgb(0x6ca0f6), rgb(0xff79c6), rgb(0x8be9fd), rgb(0xd0d0d0),
-            rgb(0x555555), rgb(0xff6e6e), rgb(0x69ff94), rgb(0xffffa5),
-            rgb(0x8db4f8), rgb(0xff92df), rgb(0xa4ffff), rgb(0xffffff),
+            rgb(0x000000),
+            rgb(0xff5555),
+            rgb(0x50fa7b),
+            rgb(0xf1fa8c),
+            rgb(0x6ca0f6),
+            rgb(0xff79c6),
+            rgb(0x8be9fd),
+            rgb(0xd0d0d0),
+            rgb(0x555555),
+            rgb(0xff6e6e),
+            rgb(0x69ff94),
+            rgb(0xffffa5),
+            rgb(0x8db4f8),
+            rgb(0xff92df),
+            rgb(0xa4ffff),
+            rgb(0xffffff),
         ],
     },
     Theme {
         name: "Dracula",
-        bg: rgb(0x282a36), fg: rgb(0xf8f8f2),
+        bg: rgb(0x282a36),
+        fg: rgb(0xf8f8f2),
         palette: [
-            rgb(0x21222c), rgb(0xff5555), rgb(0x50fa7b), rgb(0xf1fa8c),
-            rgb(0xbd93f9), rgb(0xff79c6), rgb(0x8be9fd), rgb(0xf8f8f2),
-            rgb(0x6272a4), rgb(0xff6e6e), rgb(0x69ff94), rgb(0xffffa5),
-            rgb(0xd6acff), rgb(0xff92df), rgb(0xa4ffff), rgb(0xffffff),
+            rgb(0x21222c),
+            rgb(0xff5555),
+            rgb(0x50fa7b),
+            rgb(0xf1fa8c),
+            rgb(0xbd93f9),
+            rgb(0xff79c6),
+            rgb(0x8be9fd),
+            rgb(0xf8f8f2),
+            rgb(0x6272a4),
+            rgb(0xff6e6e),
+            rgb(0x69ff94),
+            rgb(0xffffa5),
+            rgb(0xd6acff),
+            rgb(0xff92df),
+            rgb(0xa4ffff),
+            rgb(0xffffff),
         ],
     },
     Theme {
         name: "Gruvbox",
-        bg: rgb(0x282828), fg: rgb(0xebdbb2),
+        bg: rgb(0x282828),
+        fg: rgb(0xebdbb2),
         palette: [
-            rgb(0x282828), rgb(0xcc241d), rgb(0x98971a), rgb(0xd79921),
-            rgb(0x458588), rgb(0xb16286), rgb(0x689d6a), rgb(0xa89984),
-            rgb(0x928374), rgb(0xfb4934), rgb(0xb8bb26), rgb(0xfabd2f),
-            rgb(0x83a598), rgb(0xd3869b), rgb(0x8ec07c), rgb(0xebdbb2),
+            rgb(0x282828),
+            rgb(0xcc241d),
+            rgb(0x98971a),
+            rgb(0xd79921),
+            rgb(0x458588),
+            rgb(0xb16286),
+            rgb(0x689d6a),
+            rgb(0xa89984),
+            rgb(0x928374),
+            rgb(0xfb4934),
+            rgb(0xb8bb26),
+            rgb(0xfabd2f),
+            rgb(0x83a598),
+            rgb(0xd3869b),
+            rgb(0x8ec07c),
+            rgb(0xebdbb2),
         ],
     },
     Theme {
         name: "Nord",
-        bg: rgb(0x2e3440), fg: rgb(0xd8dee9),
+        bg: rgb(0x2e3440),
+        fg: rgb(0xd8dee9),
         palette: [
-            rgb(0x3b4252), rgb(0xbf616a), rgb(0xa3be8c), rgb(0xebcb8b),
-            rgb(0x81a1c1), rgb(0xb48ead), rgb(0x88c0d0), rgb(0xe5e9f0),
-            rgb(0x4c566a), rgb(0xbf616a), rgb(0xa3be8c), rgb(0xebcb8b),
-            rgb(0x81a1c1), rgb(0xb48ead), rgb(0x8fbcbb), rgb(0xeceff4),
+            rgb(0x3b4252),
+            rgb(0xbf616a),
+            rgb(0xa3be8c),
+            rgb(0xebcb8b),
+            rgb(0x81a1c1),
+            rgb(0xb48ead),
+            rgb(0x88c0d0),
+            rgb(0xe5e9f0),
+            rgb(0x4c566a),
+            rgb(0xbf616a),
+            rgb(0xa3be8c),
+            rgb(0xebcb8b),
+            rgb(0x81a1c1),
+            rgb(0xb48ead),
+            rgb(0x8fbcbb),
+            rgb(0xeceff4),
         ],
     },
     Theme {
         name: "Solarized",
-        bg: rgb(0x002b36), fg: rgb(0x93a1a1),
+        bg: rgb(0x002b36),
+        fg: rgb(0x93a1a1),
         palette: [
-            rgb(0x073642), rgb(0xdc322f), rgb(0x859900), rgb(0xb58900),
-            rgb(0x268bd2), rgb(0xd33682), rgb(0x2aa198), rgb(0xeee8d5),
-            rgb(0x586e75), rgb(0xcb4b16), rgb(0x859900), rgb(0x657b83),
-            rgb(0x839496), rgb(0x6c71c4), rgb(0x93a1a1), rgb(0xfdf6e3),
+            rgb(0x073642),
+            rgb(0xdc322f),
+            rgb(0x859900),
+            rgb(0xb58900),
+            rgb(0x268bd2),
+            rgb(0xd33682),
+            rgb(0x2aa198),
+            rgb(0xeee8d5),
+            rgb(0x586e75),
+            rgb(0xcb4b16),
+            rgb(0x859900),
+            rgb(0x657b83),
+            rgb(0x839496),
+            rgb(0x6c71c4),
+            rgb(0x93a1a1),
+            rgb(0xfdf6e3),
         ],
     },
     Theme {
         name: "Tokyo Night",
-        bg: rgb(0x1a1b26), fg: rgb(0xc0caf5),
+        bg: rgb(0x1a1b26),
+        fg: rgb(0xc0caf5),
         palette: [
-            rgb(0x15161e), rgb(0xf7768e), rgb(0x9ece6a), rgb(0xe0af68),
-            rgb(0x7aa2f7), rgb(0xbb9af7), rgb(0x7dcfff), rgb(0xa9b1d6),
-            rgb(0x414868), rgb(0xf7768e), rgb(0x9ece6a), rgb(0xe0af68),
-            rgb(0x7aa2f7), rgb(0xbb9af7), rgb(0x7dcfff), rgb(0xc0caf5),
+            rgb(0x15161e),
+            rgb(0xf7768e),
+            rgb(0x9ece6a),
+            rgb(0xe0af68),
+            rgb(0x7aa2f7),
+            rgb(0xbb9af7),
+            rgb(0x7dcfff),
+            rgb(0xa9b1d6),
+            rgb(0x414868),
+            rgb(0xf7768e),
+            rgb(0x9ece6a),
+            rgb(0xe0af68),
+            rgb(0x7aa2f7),
+            rgb(0xbb9af7),
+            rgb(0x7dcfff),
+            rgb(0xc0caf5),
         ],
     },
 ];
-
 
 /// Arabic counted-noun agreement for lines (see the note on the caller).
 fn arabic_lines(n: usize) -> String {
@@ -245,8 +362,20 @@ const WHITE_UV: f32 = 1.0 / ATLAS_SIZE as f32;
 /// Emit one quad clipped to `clip` (uv adjusted proportionally): a pane's
 /// content can never bleed into a neighbouring pane. `layer` is the atlas page.
 #[allow(clippy::too_many_arguments)]
-fn push_quad(out: &mut Vec<Vertex>, clip: Rect, x: f32, y: f32, w: f32, h: f32,
-             layer: u32, u0: f32, v0: f32, u1: f32, v1: f32, color: [f32; 4]) {
+fn push_quad(
+    out: &mut Vec<Vertex>,
+    clip: Rect,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    layer: u32,
+    u0: f32,
+    v0: f32,
+    u1: f32,
+    v1: f32,
+    color: [f32; 4],
+) {
     if w <= 0.0 || h <= 0.0 || color[3] <= 0.0 {
         return;
     }
@@ -281,10 +410,11 @@ fn push_quad(out: &mut Vec<Vertex>, clip: Rect, x: f32, y: f32, w: f32, h: f32,
 }
 
 /// Solid rect (samples the white texel on page 0).
-fn push_rect(out: &mut Vec<Vertex>, clip: Rect, x: i32, y: i32, w: i32, h: i32,
-             color: [f32; 4]) {
-    push_quad(out, clip, x as f32, y as f32, w as f32, h as f32,
-              0, WHITE_UV, WHITE_UV, WHITE_UV, WHITE_UV, color);
+fn push_rect(out: &mut Vec<Vertex>, clip: Rect, x: i32, y: i32, w: i32, h: i32, color: [f32; 4]) {
+    push_quad(
+        out, clip, x as f32, y as f32, w as f32, h as f32, 0, WHITE_UV, WHITE_UV, WHITE_UV,
+        WHITE_UV, color,
+    );
 }
 
 /// Per-row inset for a rounded top corner, radius 4. A true rounded rect would
@@ -295,8 +425,15 @@ const CORNER_INSET: [i32; 4] = [3, 2, 1, 1];
 
 /// Rect whose TOP corners are rounded. Bottom stays square: the tab meets the
 /// content area there and a curve would leave a notch.
-fn push_rect_top_rounded(out: &mut Vec<Vertex>, clip: Rect, x: i32, y: i32,
-                         w: i32, h: i32, color: [f32; 4]) {
+fn push_rect_top_rounded(
+    out: &mut Vec<Vertex>,
+    clip: Rect,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    color: [f32; 4],
+) {
     let r = CORNER_INSET.len() as i32;
     if w <= 2 * r || h <= r {
         push_rect(out, clip, x, y, w, h, color);
@@ -389,7 +526,8 @@ impl Atlas {
         if self.shelf_y + h + pad > ATLAS_SIZE {
             // this page is full: grow a new one (no loss), or reset at the cap
             if (self.pages.len() as u32) < MAX_PAGES {
-                self.pages.push(vec![0; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize]);
+                self.pages
+                    .push(vec![0; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize]);
                 self.cur = self.pages.len() as u32 - 1;
                 self.layer_gen = self.layer_gen.wrapping_add(1);
             } else {
@@ -412,8 +550,12 @@ impl Atlas {
     }
 
     /// Get-or-rasterize a glyph (None = zero-size, e.g. spaces).
-    fn entry(&mut self, fs: &mut FontSystem, swash: &mut SwashCache,
-             key: cosmic_text::CacheKey) -> Option<GlyphEntry> {
+    fn entry(
+        &mut self,
+        fs: &mut FontSystem,
+        swash: &mut SwashCache,
+        key: cosmic_text::CacheKey,
+    ) -> Option<GlyphEntry> {
         if let Some(e) = self.map.get(&key) {
             return *e;
         }
@@ -435,7 +577,12 @@ impl Atlas {
                         }
                         SwashContent::Color => {
                             let s = ((row * w + col) * 4) as usize;
-                            [img.data[s], img.data[s + 1], img.data[s + 2], img.data[s + 3]]
+                            [
+                                img.data[s],
+                                img.data[s + 1],
+                                img.data[s + 2],
+                                img.data[s + 3],
+                            ]
                         }
                         SwashContent::SubpixelMask => {
                             let s = ((row * w + col) * 4) as usize;
@@ -468,9 +615,18 @@ impl Atlas {
 /// Emit a shaped buffer's glyphs as atlas quads at (x_off, y_off), with the
 /// horizontal compression `scale` (EasyTer's fit — now a free GPU transform).
 #[allow(clippy::too_many_arguments)]
-fn push_shaped(out: &mut Vec<Vertex>, fs: &mut FontSystem, swash: &mut SwashCache,
-               atlas: &mut Atlas, buf: &Buffer, clip: Rect,
-               x_off: f32, y_off: i32, scale: f32, default_fg: (u8, u8, u8)) {
+fn push_shaped(
+    out: &mut Vec<Vertex>,
+    fs: &mut FontSystem,
+    swash: &mut SwashCache,
+    atlas: &mut Atlas,
+    buf: &Buffer,
+    clip: Rect,
+    x_off: f32,
+    y_off: i32,
+    scale: f32,
+    default_fg: (u8, u8, u8),
+) {
     for run in buf.layout_runs() {
         for glyph in run.glyphs.iter() {
             let phys = glyph.physical((0.0, 0.0), 1.0);
@@ -487,8 +643,20 @@ fn push_shaped(out: &mut Vec<Vertex>, fs: &mut FontSystem, swash: &mut SwashCach
             };
             let gx = x_off + (phys.x as f32 + e.left as f32) * scale;
             let gy = y_off as f32 + run.line_y + phys.y as f32 - e.top as f32;
-            push_quad(out, clip, gx, gy, e.w as f32 * scale, e.h as f32,
-                      e.layer, e.u0, e.v0, e.u1, e.v1, color);
+            push_quad(
+                out,
+                clip,
+                gx,
+                gy,
+                e.w as f32 * scale,
+                e.h as f32,
+                e.layer,
+                e.u0,
+                e.v0,
+                e.u1,
+                e.v1,
+                color,
+            );
         }
     }
 }
@@ -552,9 +720,10 @@ impl PaletteLayout {
     }
 
     pub fn row_at(&self, x: f64, y: f64) -> Option<usize> {
-        self.rows.iter().find_map(|&(index, (left, top, w, h))|
+        self.rows.iter().find_map(|&(index, (left, top, w, h))| {
             (x >= left as f64 && y >= top as f64 && x < (left + w) as f64 && y < (top + h) as f64)
-                .then_some(index))
+                .then_some(index)
+        })
     }
 }
 
@@ -589,9 +758,13 @@ pub struct CloseGuardLayout {
 
 impl CloseGuardLayout {
     pub fn hit(&self, x: f64, y: f64) -> Option<bool> {
-        if rect_hit(self.close, x, y) { Some(true) }
-        else if rect_hit(self.keep, x, y) { Some(false) }
-        else { None }
+        if rect_hit(self.close, x, y) {
+            Some(true)
+        } else if rect_hit(self.keep, x, y) {
+            Some(false)
+        } else {
+            None
+        }
     }
 }
 
@@ -760,17 +933,27 @@ struct CellInfo {
 fn is_tui_row(cells: &[CellInfo]) -> bool {
     let end = cells.iter().rposition(|c| c.c != ' ').map_or(0, |i| i + 1);
     let cells = &cells[..end];
-    if cells.iter().find(|c| c.c != ' ').is_some_and(|c| matches!(c.c, '>' | '❯' | '›')) {
+    if cells
+        .iter()
+        .find(|c| c.c != ' ')
+        .is_some_and(|c| matches!(c.c, '>' | '❯' | '›'))
+    {
         return true;
     }
-    cells.iter().any(|c| matches!(c.c, '\u{2500}'..='\u{259f}' | '\u{e000}'..='\u{f8ff}'))
+    cells
+        .iter()
+        .any(|c| matches!(c.c, '\u{2500}'..='\u{259f}' | '\u{e000}'..='\u{f8ff}'))
         || cells.windows(3).any(|s| s.iter().all(|c| c.c == ' '))
         || cells.windows(2).any(|s| s[1].col > s[0].col + s[0].w + 1)
 }
 
 impl CellInfo {
     fn text_len(&self) -> usize {
-        self.c.len_utf8() + self.zw.as_ref().map_or(0, |z| z.iter().map(|c| c.len_utf8()).sum())
+        self.c.len_utf8()
+            + self
+                .zw
+                .as_ref()
+                .map_or(0, |z| z.iter().map(|c| c.len_utf8()).sum())
     }
     fn push_text(&self, s: &mut String) {
         s.push(self.c);
@@ -796,7 +979,9 @@ fn claude_logical_cursor_cell(cells: &[CellInfo], offset: usize) -> Option<usize
     let mut logical = 0;
     for source in order {
         let &(col, width) = owners.get(source)?;
-        if width > 0 && logical <= offset && offset < logical + width { return Some(col); }
+        if width > 0 && logical <= offset && offset < logical + width {
+            return Some(col);
+        }
         logical += width;
     }
     None
@@ -1041,8 +1226,11 @@ const FONT_CANDIDATES: &[&str] = &[
     "MesloLGS NF",
 ];
 
-fn pick_family(db: &cosmic_text::fontdb::Database, preferred: Option<&str>,
-               ligatures: bool) -> String {
+fn pick_family(
+    db: &cosmic_text::fontdb::Database,
+    preferred: Option<&str>,
+    ligatures: bool,
+) -> String {
     let has = |name: &str| {
         db.faces()
             .any(|f| f.families.iter().any(|(n, _)| n == name))
@@ -1082,7 +1270,11 @@ pub(crate) struct Seg {
 
 impl Seg {
     fn plain(text: impl Into<String>, fg: (u8, u8, u8)) -> Self {
-        Seg { text: text.into(), fg, style: 0 }
+        Seg {
+            text: text.into(),
+            fg,
+            style: 0,
+        }
     }
 }
 
@@ -1165,7 +1357,8 @@ impl Renderer {
         font_system.db_mut().load_font_data(AMIRI_BOLD.to_vec());
         let ligatures = cfg.ligatures.unwrap_or(true);
         let family = pick_family(font_system.db(), cfg.font_family.as_deref(), ligatures);
-        let size = (cfg.font_size.unwrap_or(DEFAULT_FONT_SIZE) + extra_pts).clamp(8.0, 40.0) * scale;
+        let size =
+            (cfg.font_size.unwrap_or(DEFAULT_FONT_SIZE) + extra_pts).clamp(8.0, 40.0) * scale;
         let metrics = Metrics::new(size, (size * 1.4).ceil());
         // cell width = the primary monospace font's advance for an ASCII probe
         let mut probe = Buffer::new(&mut font_system, metrics);
@@ -1186,7 +1379,10 @@ impl Renderer {
             .unwrap_or(size * 0.6);
         // start from a named theme (if any), then let explicit config
         // bg/fg/palette override individual colors on top of it
-        let theme = cfg.theme.as_deref().and_then(theme_by_name)
+        let theme = cfg
+            .theme
+            .as_deref()
+            .and_then(theme_by_name)
             .or_else(|| theme_by_name(DEFAULT_THEME));
         let (mut bg, mut fg, mut palette) = match theme {
             Some(t) => (t.bg, t.fg, t.palette),
@@ -1246,35 +1442,65 @@ impl Renderer {
         self.terminal_cell_w * (16.0 * self.dpi_scale) / self.terminal_metrics.font_size
     }
 
-    fn ui_cell_h(&self) -> f32 { 22.4 * self.dpi_scale }
+    fn ui_cell_h(&self) -> f32 {
+        22.4 * self.dpi_scale
+    }
 
     pub fn use_ui_metrics(&mut self, active: bool) {
         self.metrics = if active {
             Metrics::new(16.0 * self.dpi_scale, self.ui_cell_h())
-        } else { self.terminal_metrics };
-        self.cell_w = if active { self.ui_cell_w() } else { self.terminal_cell_w };
+        } else {
+            self.terminal_metrics
+        };
+        self.cell_w = if active {
+            self.ui_cell_w()
+        } else {
+            self.terminal_cell_w
+        };
         self.cell_h = self.metrics.line_height;
     }
 
     fn finish_pane_layout(&mut self, pane_rect: Rect) {
         self.row_hits.retain(|(pane, _), _| *pane != pane_rect);
         for (&(pane, row, col), spans) in &self.cell_geometry {
-            if pane != pane_rect { continue; }
-            self.row_hits.entry((pane, row)).or_default()
+            if pane != pane_rect {
+                continue;
+            }
+            self.row_hits
+                .entry((pane, row))
+                .or_default()
                 .extend(spans.iter().map(|&(x, w, rtl)| (x, w, col, rtl)));
         }
         for ((pane, _), spans) in &mut self.row_hits {
-            if *pane == pane_rect { spans.sort_unstable(); spans.dedup(); }
+            if *pane == pane_rect {
+                spans.sort_unstable();
+                spans.dedup();
+            }
         }
     }
 
-    pub fn hit_cell(&self, pane: Rect, row: usize, x: f64) -> Option<(usize, alacritty_terminal::index::Side)> {
+    pub fn hit_cell(
+        &self,
+        pane: Rect,
+        row: usize,
+        x: f64,
+    ) -> Option<(usize, alacritty_terminal::index::Side)> {
         use alacritty_terminal::index::Side;
         let spans = self.row_hits.get(&(pane, row))?;
-        let &(left, width, col, rtl) = spans.iter().take_while(|s| s.0 as f64 <= x)
-            .filter(|s| x < (s.0 + s.1) as f64).min_by_key(|s| (s.1, s.2))?;
+        let &(left, width, col, rtl) = spans
+            .iter()
+            .take_while(|s| s.0 as f64 <= x)
+            .filter(|s| x < (s.0 + s.1) as f64)
+            .min_by_key(|s| (s.1, s.2))?;
         let right_half = x >= left as f64 + width as f64 / 2.0;
-        Some((col, if right_half ^ rtl { Side::Right } else { Side::Left }))
+        Some((
+            col,
+            if right_half ^ rtl {
+                Side::Right
+            } else {
+                Side::Left
+            },
+        ))
     }
 
     /// The primary family actually in use (post-fallback) — what the
@@ -1288,7 +1514,8 @@ impl Renderer {
     pub fn font_choices(&self) -> Vec<String> {
         let db = self.font_system.db();
         let has = |name: &str| {
-            db.faces().any(|f| f.families.iter().any(|(n, _)| n == name))
+            db.faces()
+                .any(|f| f.families.iter().any(|(n, _)| n == name))
         };
         let mut out: Vec<String> = FONT_CANDIDATES
             .iter()
@@ -1355,7 +1582,12 @@ impl Renderer {
     /// `BidiInfo` gets paragraph level 0 instead of detecting it from the
     /// first strong character. Terminal rows stay on auto.
     fn ensure_shaped_dir(&mut self, segs: &[Seg], align_left: bool, force_ltr: bool) -> RunKey {
-        let key: RunKey = (segs.to_vec(), align_left, force_ltr, self.metrics.font_size.to_bits());
+        let key: RunKey = (
+            segs.to_vec(),
+            align_left,
+            force_ltr,
+            self.metrics.font_size.to_bits(),
+        );
         if self.cache_hot.contains_key(&key) {
             return key;
         }
@@ -1394,7 +1626,8 @@ impl Renderer {
         if self.cache_hot.len() >= CACHE_CAP {
             self.cache_cold = std::mem::take(&mut self.cache_hot);
         }
-        self.cache_hot.insert(key.clone(), ShapedRun { buffer, natw });
+        self.cache_hot
+            .insert(key.clone(), ShapedRun { buffer, natw });
         key
     }
 
@@ -1426,13 +1659,38 @@ impl Renderer {
     /// Shape (cached) and emit a run's glyph quads at (x, y), optionally
     /// compressed horizontally, clipped to `clip`. Returns the natural width.
     #[allow(clippy::too_many_arguments)]
-    fn draw_run(&mut self, segs: &[Seg], align_left: bool,
-                out: &mut Vec<Vertex>, clip: Rect,
-                x: f32, y: i32, scale: f32) -> f32 {
+    fn draw_run(
+        &mut self,
+        segs: &[Seg],
+        align_left: bool,
+        out: &mut Vec<Vertex>,
+        clip: Rect,
+        x: f32,
+        y: i32,
+        scale: f32,
+    ) -> f32 {
         let key = self.ensure_shaped(segs, align_left);
-        let Renderer { cache_hot, font_system, cache, atlas, fg, .. } = self;
+        let Renderer {
+            cache_hot,
+            font_system,
+            cache,
+            atlas,
+            fg,
+            ..
+        } = self;
         let run = &cache_hot[&key];
-        push_shaped(out, font_system, cache, atlas, &run.buffer, clip, x, y, scale, *fg);
+        push_shaped(
+            out,
+            font_system,
+            cache,
+            atlas,
+            &run.buffer,
+            clip,
+            x,
+            y,
+            scale,
+            *fg,
+        );
         run.natw
     }
 
@@ -1479,10 +1737,19 @@ impl Renderer {
     /// UAX#9 BiDi (mixed directions, LTR islands). Compressed to the pane
     /// when overflowing; the cursor resolves THROUGH the shaped layout.
     #[allow(clippy::too_many_arguments)]
-    fn draw_line_bidi(&mut self, out: &mut Vec<Vertex>, clip: Rect,
-                      x0: i32, y: i32, pane_w: i32, cells: &[CellInfo], claude: bool,
-                      cursor_col: Option<usize>, dir: ParagraphDir,
-                      hover: Option<(usize, usize)>) -> Option<(i32, i32)> {
+    fn draw_line_bidi(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        clip: Rect,
+        x0: i32,
+        y: i32,
+        pane_w: i32,
+        cells: &[CellInfo],
+        claude: bool,
+        cursor_col: Option<usize>,
+        dir: ParagraphDir,
+        hover: Option<(usize, usize)>,
+    ) -> Option<(i32, i32)> {
         let mut end = cells.len();
         while end > 0 && cells[end - 1].c == ' ' {
             end -= 1;
@@ -1514,7 +1781,11 @@ impl Renderer {
                 _ => {
                     let mut s = String::new();
                     ci.push_text(&mut s);
-                    segs.push(Seg { text: s, fg: ci.fg, style: ci.style });
+                    segs.push(Seg {
+                        text: s,
+                        fg: ci.fg,
+                        style: ci.style,
+                    });
                 }
             }
         }
@@ -1528,9 +1799,10 @@ impl Renderer {
         if claude {
             let full: String = segs.iter().map(|s| s.text.as_str()).collect();
             if let Some((fixed, order)) = crate::bidi::restore_bidi_line_with_order(&full) {
-                let owners: Vec<_> = cells[..end].iter().flat_map(|ci| {
-                    std::iter::repeat_n(ci, 1 + ci.zw.as_ref().map_or(0, Vec::len))
-                }).collect();
+                let owners: Vec<_> = cells[..end]
+                    .iter()
+                    .flat_map(|ci| std::iter::repeat_n(ci, 1 + ci.zw.as_ref().map_or(0, Vec::len)))
+                    .collect();
                 segs.clear();
                 cell_bytes.clear();
                 decos.clear();
@@ -1545,7 +1817,11 @@ impl Renderer {
                     }
                     match segs.last_mut() {
                         Some(s) if s.fg == ci.fg && s.style == ci.style => s.text.push(c),
-                        _ => segs.push(Seg { text: c.to_string(), fg: ci.fg, style: ci.style }),
+                        _ => segs.push(Seg {
+                            text: c.to_string(),
+                            fg: ci.fg,
+                            style: ci.style,
+                        }),
                     }
                 }
                 cur_bytes = None;
@@ -1555,9 +1831,18 @@ impl Renderer {
             let n = mark.len_utf8();
             segs[0].text.insert(0, mark);
             nbytes += n;
-            for (_, start, finish) in &mut cell_bytes { *start += n; *finish += n; }
-            for (start, finish, _, _) in &mut decos { *start += n; *finish += n; }
-            if let Some((start, finish)) = cur_bytes.as_mut() { *start += n; *finish += n; }
+            for (_, start, finish) in &mut cell_bytes {
+                *start += n;
+                *finish += n;
+            }
+            for (start, finish, _, _) in &mut decos {
+                *start += n;
+                *finish += n;
+            }
+            if let Some((start, finish)) = cur_bytes.as_mut() {
+                *start += n;
+                *finish += n;
+            }
         }
         // A base and its tashkeel occupy one terminal cell. Coalesce them
         // before highlighting, so overlays never darken the same cell twice.
@@ -1567,21 +1852,36 @@ impl Renderer {
             if let Some(last) = merged.last_mut().filter(|last| last.0 == col) {
                 last.1 = last.1.min(start);
                 last.2 = last.2.max(finish);
-            } else { merged.push((col, start, finish)); }
+            } else {
+                merged.push((col, start, finish));
+            }
         }
         let cell_bytes = merged;
-        let background_by_col: std::collections::HashMap<_, _> = cells[..end].iter()
-            .filter(|c| c.bg != self.bg).map(|c| (c.col, c.bg)).collect();
+        let background_by_col: std::collections::HashMap<_, _> = cells[..end]
+            .iter()
+            .filter(|c| c.bg != self.bg)
+            .map(|c| (c.col, c.bg))
+            .collect();
         // shape unconstrained (cached), then compress to the pane on overflow
         let natw = self.measure(&segs, true);
-        let scale = if natw > pane_w as f32 { pane_w as f32 / natw } else { 1.0 };
+        let scale = if natw > pane_w as f32 {
+            pane_w as f32 / natw
+        } else {
+            1.0
+        };
         let key = self.ensure_shaped(&segs, true);
         let mut mapped_cursor = None;
-        let paragraph_rtl = self.cache_hot[&key].buffer.layout_runs().next().is_some_and(|run| run.rtl);
+        let paragraph_rtl = self.cache_hot[&key]
+            .buffer
+            .layout_runs()
+            .next()
+            .is_some_and(|run| run.rtl);
         // Keep Claude's inverse trailing blank inside the shaped field.
         let reserve = if claude && paragraph_rtl && cells[end..].iter().any(|c| c.bg != self.bg) {
             self.cell_w.round() as i32
-        } else { 0 };
+        } else {
+            0
+        };
         let text_x0 = x0 + reserve;
         let mut backgrounds = Vec::new();
         let mut end_anchor: Option<(i32, bool)> = None;
@@ -1589,8 +1889,12 @@ impl Renderer {
             for &(col, b0, b1) in &cell_bytes {
                 let start = cosmic_text::Cursor::new(0, b0);
                 let finish = cosmic_text::Cursor::new(0, b1);
-                let rtl = !claude && run.glyphs.iter()
-                    .find(|g| g.start <= b0 && b0 < g.end).is_some_and(|g| g.level.is_rtl());
+                let rtl = !claude
+                    && run
+                        .glyphs
+                        .iter()
+                        .find(|g| g.start <= b0 && b0 < g.end)
+                        .is_some_and(|g| g.level.is_rtl());
                 for (hx, hw) in run.highlight(start, finish) {
                     let left = text_x0 + (hx * scale).round() as i32;
                     let right = text_x0 + ((hx + hw) * scale).round() as i32;
@@ -1600,32 +1904,48 @@ impl Renderer {
                     }
                     if hover.is_some_and(|(start, finish)| col >= start && col < finish) {
                         let th = (self.cell_h / 14.0).max(1.0) as i32;
-                        push_rect(out, clip, left, y + self.cell_h.round() as i32 - th,
-                            bounds.1, th, c4(LINK_UNDER, 255));
+                        push_rect(
+                            out,
+                            clip,
+                            left,
+                            y + self.cell_h.round() as i32 - th,
+                            bounds.1,
+                            th,
+                            c4(LINK_UNDER, 255),
+                        );
                     }
                     if let Some((pane, row)) = self.mapping_context {
-                        self.cell_geometry.entry((pane, row, col)).or_default().push(bounds);
+                        self.cell_geometry
+                            .entry((pane, row, col))
+                            .or_default()
+                            .push(bounds);
                     }
-                    if cursor_col == Some(col) { mapped_cursor = Some((bounds.0, bounds.1)); }
+                    if cursor_col == Some(col) {
+                        mapped_cursor = Some((bounds.0, bounds.1));
+                    }
                 }
             }
             if let Some(x) = run.cursor_position(&cosmic_text::Cursor::new(0, nbytes)) {
-                    end_anchor = Some((text_x0 + (x * scale).round() as i32, run.rtl));
+                end_anchor = Some((text_x0 + (x * scale).round() as i32, run.rtl));
             }
         }
         if let Some((anchor, rtl)) = end_anchor {
             let end_col = cells[end - 1].col + cells[end - 1].w;
             let width = self.cell_w.round() as i32;
-            let x_at = |col: usize| if rtl {
-                anchor - (((col - end_col + 1) as f32 * self.cell_w).round() as i32)
-            } else {
-                anchor + (((col - end_col) as f32 * self.cell_w).round() as i32)
+            let x_at = |col: usize| {
+                if rtl {
+                    anchor - (((col - end_col + 1) as f32 * self.cell_w).round() as i32)
+                } else {
+                    anchor + (((col - end_col) as f32 * self.cell_w).round() as i32)
+                }
             };
             for ci in &cells[end..] {
                 if ci.bg != self.bg {
                     backgrounds.push((x_at(ci.col), width, ci.bg));
                     if let Some((pane, row)) = self.mapping_context {
-                        self.cell_geometry.entry((pane, row, ci.col)).or_default()
+                        self.cell_geometry
+                            .entry((pane, row, ci.col))
+                            .or_default()
                             .push((x_at(ci.col), width, rtl));
                     }
                 }
@@ -1637,7 +1957,15 @@ impl Renderer {
         backgrounds.sort_unstable();
         backgrounds.dedup();
         for (left, width, bg) in backgrounds {
-            push_rect(out, clip, left, y, width, self.cell_h.ceil() as i32, c4(bg, 255));
+            push_rect(
+                out,
+                clip,
+                left,
+                y,
+                width,
+                self.cell_h.ceil() as i32,
+                c4(bg, 255),
+            );
         }
         self.draw_run(&segs, true, out, clip, text_x0 as f32, y, scale);
         // decorations through the shaped layout: each byte span becomes the
@@ -1668,7 +1996,9 @@ impl Renderer {
                 }
             }
         }
-        if mapped_cursor.is_some() { return mapped_cursor; }
+        if mapped_cursor.is_some() {
+            return mapped_cursor;
+        }
         if let Some((b0, b1)) = cur_bytes {
             let c0 = cosmic_text::Cursor::new(0, b0);
             let c1 = cosmic_text::Cursor::new(0, b1);
@@ -1773,12 +2103,27 @@ impl Renderer {
     /// A row without Arabic (prompts, code, TUIs): strict grid placement.
     /// ASCII batches into runs pinned at col*cell_w; every other glyph draws
     /// per cell, compressed into its box when wider.
-    fn draw_line_grid(&mut self, out: &mut Vec<Vertex>, clip: Rect,
-                      x0: i32, y: i32, cells: &[CellInfo], hover: Option<(usize, usize)>) {
+    fn draw_line_grid(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        clip: Rect,
+        x0: i32,
+        y: i32,
+        cells: &[CellInfo],
+        hover: Option<(usize, usize)>,
+    ) {
         for ci in cells.iter().filter(|c| c.bg != self.bg) {
             let left = x0 + (ci.col as f32 * self.cell_w).round() as i32;
             let right = x0 + ((ci.col + ci.w) as f32 * self.cell_w).round() as i32;
-            push_rect(out, clip, left, y, right - left, self.cell_h.ceil() as i32, c4(ci.bg, 255));
+            push_rect(
+                out,
+                clip,
+                left,
+                y,
+                right - left,
+                self.cell_h.ceil() as i32,
+                c4(ci.bg, 255),
+            );
         }
         let n = cells.len();
         let mut i = 0;
@@ -1818,7 +2163,11 @@ impl Renderer {
                         _ => {
                             let mut s = String::new();
                             cj.push_text(&mut s);
-                            segs.push(Seg { text: s, fg: cj.fg, style: cj.style });
+                            segs.push(Seg {
+                                text: s,
+                                fg: cj.fg,
+                                style: cj.style,
+                            });
                         }
                     }
                     expect = cj.col + cj.w;
@@ -1836,8 +2185,15 @@ impl Renderer {
                     }
                 }
                 if !segs.is_empty() {
-                    self.draw_run(&segs, false, out, clip,
-                                  x0 as f32 + col0 as f32 * self.cell_w, y, 1.0);
+                    self.draw_run(
+                        &segs,
+                        false,
+                        out,
+                        clip,
+                        x0 as f32 + col0 as f32 * self.cell_w,
+                        y,
+                        1.0,
+                    );
                 }
                 i = j;
             } else {
@@ -1848,12 +2204,23 @@ impl Renderer {
                 if ci.c != ' ' {
                     let mut s = String::new();
                     ci.push_text(&mut s);
-                    let seg = [Seg { text: s, fg: ci.fg, style: ci.style }];
+                    let seg = [Seg {
+                        text: s,
+                        fg: ci.fg,
+                        style: ci.style,
+                    }];
                     let natw = self.measure(&seg, false);
                     let boxw = ci.w as f32 * self.cell_w;
                     let scale = if natw > boxw + 0.5 { boxw / natw } else { 1.0 };
-                    self.draw_run(&seg, false, out, clip,
-                                  x0 as f32 + ci.col as f32 * self.cell_w, y, scale);
+                    self.draw_run(
+                        &seg,
+                        false,
+                        out,
+                        clip,
+                        x0 as f32 + ci.col as f32 * self.cell_w,
+                        y,
+                        scale,
+                    );
                 }
                 i += 1;
             }
@@ -1879,7 +2246,15 @@ impl Renderer {
                 let dx1 = x0 + (h1 as f32 * self.cell_w).round() as i32;
                 let th = (self.cell_h / 14.0).max(1.0) as i32;
                 let uy = y + self.cell_h.round() as i32 - th - 1;
-                push_rect(out, clip, dx0, uy, (dx1 - dx0).max(1), th, c4(LINK_UNDER, 255));
+                push_rect(
+                    out,
+                    clip,
+                    dx0,
+                    uy,
+                    (dx1 - dx0).max(1),
+                    th,
+                    c4(LINK_UNDER, 255),
+                );
             }
         }
     }
@@ -1887,17 +2262,31 @@ impl Renderer {
     /// TUIs position separate labels and borders by terminal columns. Keep
     /// those anchors while shaping each text field (including Arabic) together.
     #[allow(clippy::too_many_arguments)]
-    fn draw_line_tui(&mut self, out: &mut Vec<Vertex>, clip: Rect,
-                     x0: i32, y: i32, cells: &[CellInfo], claude: bool,
-                     cursor_col: Option<usize>, dir: ParagraphDir,
-                     hover: Option<(usize, usize)>) -> Option<(i32, i32)> {
-        let prompt_col = cells.iter().find(|c| c.c != ' ')
-            .filter(|c| matches!(c.c, '>' | '❯' | '›')).map(|c| c.col);
-        let logical_prompt = claude && prompt_col.is_some_and(|col|
-            cells.iter().any(|c| c.col == col + 1 && c.c == '\u{a0}'));
-        let border = |c: &CellInfo| Some(c.col) == prompt_col
-            || (logical_prompt && prompt_col.is_some_and(|col| c.col == col + 1))
-            || matches!(c.c, '\u{2500}'..='\u{259f}' | '\u{e000}'..='\u{f8ff}');
+    fn draw_line_tui(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        clip: Rect,
+        x0: i32,
+        y: i32,
+        cells: &[CellInfo],
+        claude: bool,
+        cursor_col: Option<usize>,
+        dir: ParagraphDir,
+        hover: Option<(usize, usize)>,
+    ) -> Option<(i32, i32)> {
+        let prompt_col = cells
+            .iter()
+            .find(|c| c.c != ' ')
+            .filter(|c| matches!(c.c, '>' | '❯' | '›'))
+            .map(|c| c.col);
+        let logical_prompt = claude
+            && prompt_col
+                .is_some_and(|col| cells.iter().any(|c| c.col == col + 1 && c.c == '\u{a0}'));
+        let border = |c: &CellInfo| {
+            Some(c.col) == prompt_col
+                || (logical_prompt && prompt_col.is_some_and(|col| c.col == col + 1))
+                || matches!(c.c, '\u{2500}'..='\u{259f}' | '\u{e000}'..='\u{f8ff}')
+        };
         let mut i = 0;
         let mut cursor = None;
         while i < cells.len() {
@@ -1916,8 +2305,11 @@ impl Renderer {
             while i < cells.len() {
                 if border(&cells[i])
                     || cells[i].col != cells[i - 1].col + cells[i - 1].w
-                    || (cells[i].c == ' ' && cells[i].bg == self.bg
-                        && cells.get(i + 1).is_some_and(|c| c.c == ' ' && c.bg == self.bg))
+                    || (cells[i].c == ' '
+                        && cells[i].bg == self.bg
+                        && cells
+                            .get(i + 1)
+                            .is_some_and(|c| c.c == ' ' && c.bg == self.bg))
                 {
                     break;
                 }
@@ -1932,14 +2324,33 @@ impl Renderer {
                 let field_right = (x0 + right).min(clip.0 + clip.2);
                 // Keep vertical headroom for tashkeel; only the field's
                 // horizontal boundary is tighter than the enclosing pane.
-                let field_clip = (field_left, clip.1, (field_right - field_left).max(0), clip.3);
-                let field_cursor = cursor_col.filter(|col| *col >= field[0].col && *col <= last.col + last.w);
+                let field_clip = (
+                    field_left,
+                    clip.1,
+                    (field_right - field_left).max(0),
+                    clip.3,
+                );
+                let field_cursor =
+                    cursor_col.filter(|col| *col >= field[0].col && *col <= last.col + last.w);
                 let source_cursor = if logical_prompt {
-                    field_cursor.and_then(|col| claude_logical_cursor_cell(field, col - field[0].col))
+                    field_cursor
+                        .and_then(|col| claude_logical_cursor_cell(field, col - field[0].col))
                         .or(field_cursor)
-                } else { field_cursor };
-                let mapped = self.draw_line_bidi(out, field_clip, x0 + left, y,
-                    right - left, field, claude, source_cursor, dir, hover);
+                } else {
+                    field_cursor
+                };
+                let mapped = self.draw_line_bidi(
+                    out,
+                    field_clip,
+                    x0 + left,
+                    y,
+                    right - left,
+                    field,
+                    claude,
+                    source_cursor,
+                    dir,
+                    hover,
+                );
                 cursor = mapped.or(cursor);
             } else {
                 self.draw_line_grid(out, clip, x0, y, field, hover);
@@ -1950,9 +2361,13 @@ impl Renderer {
 
     /// Draw one pane's terminal into its rect.
     pub fn draw_pane<T: alacritty_terminal::event::EventListener>(
-        &mut self, out: &mut Vec<Vertex>, view: &PaneView, term: &Term<T>,
+        &mut self,
+        out: &mut Vec<Vertex>,
+        view: &PaneView,
+        term: &Term<T>,
     ) {
-        self.cell_geometry.retain(|(pane, _, _), _| *pane != view.rect);
+        self.cell_geometry
+            .retain(|(pane, _, _), _| *pane != view.rect);
         let (px, py, pw, ph) = view.rect;
         let clip = view.rect;
         let rows = term.screen_lines();
@@ -2005,7 +2420,15 @@ impl Renderer {
                 hit_cells.push((li, col, w));
             }
             let zw = cell.zerowidth().map(|z| z.to_vec());
-            lines[li].push(CellInfo { col, w, c: ch, zw, fg, bg, style });
+            lines[li].push(CellInfo {
+                col,
+                w,
+                c: ch,
+                zw,
+                fg,
+                bg,
+                style,
+            });
         }
 
         let cursor_vrow = cursor.point.line.0 + off;
@@ -2030,8 +2453,12 @@ impl Renderer {
                 let on_row = cursor_vrow >= 0 && cursor_vrow as usize == li;
                 let dir = view.line_dir.get(li).copied().unwrap_or_default();
                 let col = if on_row { Some(ccol) } else { None };
-                let r = if (row_claude || term.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN))
-                    && is_tui_row(cells) {
+                let r = if (row_claude
+                    || term
+                        .mode()
+                        .contains(alacritty_terminal::term::TermMode::ALT_SCREEN))
+                    && is_tui_row(cells)
+                {
                     self.draw_line_tui(out, clip, px, y, cells, row_claude, col, dir, hover)
                 } else {
                     self.draw_line_bidi(out, clip, px, y, pw, cells, row_claude, col, dir, hover)
@@ -2053,7 +2480,15 @@ impl Renderer {
                 if let Some(spans) = self.cell_geometry.get(&(view.rect, li, col)) {
                     let y0 = py + (li as f32 * self.cell_h).round() as i32;
                     for &(x0, width, _) in spans {
-                        push_rect(out, clip, x0, y0, width, self.cell_h.ceil() as i32, c4((r, g, b), a as u8));
+                        push_rect(
+                            out,
+                            clip,
+                            x0,
+                            y0,
+                            width,
+                            self.cell_h.ceil() as i32,
+                            c4((r, g, b), a as u8),
+                        );
                     }
                     continue;
                 }
@@ -2068,9 +2503,12 @@ impl Renderer {
         // cursor: only the focused pane shows it (the block is translucent,
         // so the glyph stays legible); grid rows are column-exact, Arabic
         // rows map through the shaped layout
-        if view.focused && view.cursor_on
+        if view.focused
+            && view.cursor_on
             && cursor.shape != alacritty_terminal::vte::ansi::CursorShape::Hidden
-            && cursor_vrow >= 0 && (cursor_vrow as usize) < rows {
+            && cursor_vrow >= 0
+            && (cursor_vrow as usize) < rows
+        {
             let (x0, wpx) = cursor_rect.unwrap_or((
                 px + (ccol as f32 * self.cell_w).round() as i32,
                 self.cell_w.round() as i32,
@@ -2104,8 +2542,15 @@ impl Renderer {
                 None => (0x6e, 0x76, 0x81),
             };
             let y0 = py + (vrow as f32 * self.cell_h).round() as i32;
-            push_rect(out, clip, px, y0, 3, self.cell_h.round() as i32,
-                      c4(color, 255));
+            push_rect(
+                out,
+                clip,
+                px,
+                y0,
+                3,
+                self.cell_h.round() as i32,
+                c4(color, 255),
+            );
         }
 
         // scroll position indicator while in history (EasyTer's slim bar)
@@ -2201,7 +2646,14 @@ impl Renderer {
     }
 
     /// Which cockpit row a pixel position lands on.
-    pub fn cockpit_row_at(&self, fw: usize, fh: usize, n: usize, px: f64, py: f64) -> Option<usize> {
+    pub fn cockpit_row_at(
+        &self,
+        fw: usize,
+        fh: usize,
+        n: usize,
+        px: f64,
+        py: f64,
+    ) -> Option<usize> {
         let (x, y, w, _h) = self.cockpit_rect(fw, fh, n);
         let row_h = self.cockpit_row_h();
         let rows_top = y + row_h + 6;
@@ -2214,8 +2666,14 @@ impl Renderer {
 
     /// The agent cockpit: every tab's state on one card. Amber = waiting for
     /// you (bell), green = working, dim = idle. Enter/click jumps.
-    pub fn draw_cockpit(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
-                        entries: &[CockpitEntry], sel: usize) {
+    pub fn draw_cockpit(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        fw: usize,
+        fh: usize,
+        entries: &[CockpitEntry],
+        sel: usize,
+    ) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
         let (x, y, w, h) = self.cockpit_rect(fw, fh, entries.len());
         // dim the world behind the card
@@ -2224,13 +2682,25 @@ impl Renderer {
         push_rect(out, whole, x, y, w, 2, c4((0x2e, 0xa0, 0x43), 255)); // accent
         let row_h = self.cockpit_row_h();
         // header (bold — and a live proof the style pipeline works)
-        let head = [Seg { text: "مقصورة الوكلاء".into(), fg: self.fg, style: ST_BOLD }];
+        let head = [Seg {
+            text: "مقصورة الوكلاء".into(),
+            fg: self.fg,
+            style: ST_BOLD,
+        }];
         self.draw_run(&head, true, out, whole, (x + 14) as f32, y + 8, 1.0);
         let rows_top = y + row_h + 6;
         for (i, e) in entries.iter().enumerate() {
             let ry = rows_top + i as i32 * row_h;
             if i == sel {
-                push_rect(out, whole, x + 4, ry, w - 8, row_h, c4((0x24, 0x2b, 0x36), 255));
+                push_rect(
+                    out,
+                    whole,
+                    x + 4,
+                    ry,
+                    w - 8,
+                    row_h,
+                    c4((0x24, 0x2b, 0x36), 255),
+                );
             }
             // state dot: attention (amber) beats busy (green) beats idle (dim)
             let dot = if e.attention {
@@ -2241,8 +2711,20 @@ impl Renderer {
                 (0x6e, 0x76, 0x81)
             };
             let d = 8;
-            push_rect(out, whole, x + 14, ry + row_h / 2 - d / 2, d, d, c4(dot, 255));
-            let fg = if e.active { self.fg } else { (0xb0, 0xb8, 0xc4) };
+            push_rect(
+                out,
+                whole,
+                x + 14,
+                ry + row_h / 2 - d / 2,
+                d,
+                d,
+                c4(dot, 255),
+            );
+            let fg = if e.active {
+                self.fg
+            } else {
+                (0xb0, 0xb8, 0xc4)
+            };
             let mark = if e.active { "● " } else { "" };
             let title: String = e.title.chars().take(22).collect();
             let status: String = e.status.chars().take(48).collect();
@@ -2253,7 +2735,11 @@ impl Renderer {
             let segs = [
                 Seg::plain(format!("{mark}{title}"), fg),
                 Seg::plain("   —   ", (0x6e, 0x76, 0x81)),
-                Seg { text: pct, fg: pct_fg, style: ST_BOLD },
+                Seg {
+                    text: pct,
+                    fg: pct_fg,
+                    style: ST_BOLD,
+                },
                 Seg::plain(status, (0x9a, 0xa4, 0xb2)),
             ];
             self.draw_run(&segs, true, out, whole, (x + 32) as f32, ry + 6, 1.0);
@@ -2282,7 +2768,11 @@ impl Renderer {
             y += self.cell_h as i32;
         }
         // page count now > 1; this ASCII line's glyphs live on page 0
-        let tag = [Seg { text: "ATLAS PAGE OK — الصفحة تعمل".into(), fg: (0x7e, 0xe7, 0x87), style: ST_BOLD }];
+        let tag = [Seg {
+            text: "ATLAS PAGE OK — الصفحة تعمل".into(),
+            fg: (0x7e, 0xe7, 0x87),
+            style: ST_BOLD,
+        }];
         self.draw_run(&tag, false, out, whole, 4.0, fh as i32 - 30, 1.0);
     }
 
@@ -2309,8 +2799,7 @@ impl Renderer {
         let theme_rowh = tile_h + 14;
         let h = head_h + 6 + theme_rowh + rowh * 14 + foot_h;
         let x = (fw as i32 - w) / 2;
-        let y = (self.tab_bar_h() as i32 + (fh as i32 - h) / 3)
-            .max(self.tab_bar_h() as i32 + 12);
+        let y = (self.tab_bar_h() as i32 + (fh as i32 - h) / 3).max(self.tab_bar_h() as i32 + 12);
 
         // the shortcuts-editor button lives in the header, left side
         let sb_w = (self.ui_cell_w() * 12.0) as i32;
@@ -2437,8 +2926,7 @@ impl Renderer {
     /// dots tying each control to its name the way a book index does. One
     /// control height, one border color, labels vertically centered — the
     /// grid IS the design. Every control is a hit region in SettingsLayout.
-    pub fn draw_settings(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
-                         v: &SettingsView) {
+    pub fn draw_settings(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize, v: &SettingsView) {
         const CARD: (u8, u8, u8) = (0x14, 0x19, 0x20);
         const EDGE: (u8, u8, u8) = (0x2a, 0x31, 0x3a); // card + control borders
         const CTL_BG: (u8, u8, u8) = (0x24, 0x2b, 0x34);
@@ -2461,10 +2949,30 @@ impl Renderer {
         push_rect(out, whole, x, y, w, 3, c4(GREEN, 255)); // accent
 
         // title + hairline under it
-        let head = [Seg { text: "الإعدادات".into(), fg: self.fg, style: ST_BOLD }];
+        let head = [Seg {
+            text: "الإعدادات".into(),
+            fg: self.fg,
+            style: ST_BOLD,
+        }];
         let hw = self.measure(&head, true);
-        self.draw_run(&head, true, out, whole, (x + w - pad) as f32 - hw, y + 14, 1.0);
-        push_rect(out, whole, x + pad, y + lay.head_h, w - pad * 2, 1, c4(EDGE, 255));
+        self.draw_run(
+            &head,
+            true,
+            out,
+            whole,
+            (x + w - pad) as f32 - hw,
+            y + 14,
+            1.0,
+        );
+        push_rect(
+            out,
+            whole,
+            x + pad,
+            y + lay.head_h,
+            w - pad * 2,
+            1,
+            c4(EDGE, 255),
+        );
 
         // the shortcuts-editor button (header, left)
         {
@@ -2473,8 +2981,15 @@ impl Renderer {
             push_rect(out, whole, bx, by, bw, bh, c4(CTL_BG, 255));
             let seg = [Seg::plain("الاختصارات ‹", MUTED)];
             let lw = self.measure(&seg, true);
-            self.draw_run(&seg, true, out, whole,
-                          bx as f32 + (bw as f32 - lw) / 2.0, by + 3, 1.0);
+            self.draw_run(
+                &seg,
+                true,
+                out,
+                whole,
+                bx as f32 + (bw as f32 - lw) / 2.0,
+                by + 3,
+                1.0,
+            );
         }
 
         // right-aligned row label; returns where the leader dots must stop
@@ -2494,8 +3009,10 @@ impl Renderer {
                 dx += 9;
             }
         };
-        let bordered = |out: &mut Vec<Vertex>, (bx, by, bw, bh): Rect,
-                        bg: (u8, u8, u8), edge: (u8, u8, u8)| {
+        let bordered = |out: &mut Vec<Vertex>,
+                        (bx, by, bw, bh): Rect,
+                        bg: (u8, u8, u8),
+                        edge: (u8, u8, u8)| {
             push_rect(out, whole, bx - 1, by - 1, bw + 2, bh + 2, c4(edge, 255));
             push_rect(out, whole, bx, by, bw, bh, c4(bg, 255));
         };
@@ -2523,22 +3040,44 @@ impl Renderer {
             let dots = [t.palette[1], t.palette[2], t.palette[4], t.palette[3]];
             let dw = (tw2 - 10) / 4;
             for (k, c) in dots.iter().enumerate() {
-                push_rect(out, whole, tx + 5 + k as i32 * dw, ty + th - 9, dw - 2, 4,
-                          c4(*c, 255));
+                push_rect(
+                    out,
+                    whole,
+                    tx + 5 + k as i32 * dw,
+                    ty + th - 9,
+                    dw - 2,
+                    4,
+                    c4(*c, 255),
+                );
             }
         }
 
         let draw_btn = |r: &mut Self, out: &mut Vec<Vertex>, rect: Rect, glyph: &str| {
             bordered(out, rect, CTL_BG, EDGE);
             let (bx, by, bw, bh) = rect;
-            let seg = [Seg { text: glyph.into(), fg: r.fg, style: ST_BOLD }];
+            let seg = [Seg {
+                text: glyph.into(),
+                fg: r.fg,
+                style: ST_BOLD,
+            }];
             let lw = r.measure(&seg, false);
             let gy = by + ((bh as f32 - r.cell_h) / 2.0) as i32;
-            r.draw_run(&seg, false, out, whole,
-                       bx as f32 + (bw as f32 - lw) / 2.0, gy, 1.0);
+            r.draw_run(
+                &seg,
+                false,
+                out,
+                whole,
+                bx as f32 + (bw as f32 - lw) / 2.0,
+                gy,
+                1.0,
+            );
         };
-        let draw_val = |r: &mut Self, out: &mut Vec<Vertex>, text: String,
-                        left: Rect, right: Rect, row_top: i32| {
+        let draw_val = |r: &mut Self,
+                        out: &mut Vec<Vertex>,
+                        text: String,
+                        left: Rect,
+                        right: Rect,
+                        row_top: i32| {
             // Clamp to the gap between the two arrows. Shell detection can hand
             // us "PowerShell (سريع · بلا profile)" or a WSL distro name, and an
             // uncapped centred label overflows in BOTH directions — it collided
@@ -2547,11 +3086,23 @@ impl Renderer {
             let gap = (right.0 - (left.0 + left.2) - 8).max(0);
             let mut text = text;
             loop {
-                let seg = [Seg { text: text.clone(), fg: VALUE, style: ST_BOLD }];
+                let seg = [Seg {
+                    text: text.clone(),
+                    fg: VALUE,
+                    style: ST_BOLD,
+                }];
                 let vw = r.measure(&seg, false);
                 if vw as i32 <= gap || text.chars().count() <= 2 {
                     let mid = (left.0 + left.2 + right.0) / 2;
-                    r.draw_run(&seg, false, out, whole, mid as f32 - vw / 2.0, row_top + tc, 1.0);
+                    r.draw_run(
+                        &seg,
+                        false,
+                        out,
+                        whole,
+                        mid as f32 - vw / 2.0,
+                        row_top + tc,
+                        1.0,
+                    );
                     return;
                 }
                 // drop a char and re-measure: cell width is not a reliable
@@ -2566,7 +3117,11 @@ impl Renderer {
             bordered(out, rect, track, if on { GREEN } else { EDGE });
             let knob = gh - 8;
             let kx = if on { gx + gw - knob - 4 } else { gx + 4 };
-            let kc = if on { (0xff, 0xff, 0xff) } else { (0x8a, 0x94, 0xa3) };
+            let kc = if on {
+                (0xff, 0xff, 0xff)
+            } else {
+                (0x8a, 0x94, 0xa3)
+            };
             push_rect(out, whole, kx, gy + 4, knob, knob, c4(kc, 255));
         };
 
@@ -2575,16 +3130,28 @@ impl Renderer {
         leader(out, lay.font_next.0 + lay.font_next.2, ll, lay.font_label_y);
         draw_btn(self, out, lay.font_prev, "‹");
         draw_btn(self, out, lay.font_next, "›");
-        draw_val(self, out, v.font_family.to_string(),
-                 lay.font_prev, lay.font_next, lay.font_label_y);
+        draw_val(
+            self,
+            out,
+            v.font_family.to_string(),
+            lay.font_prev,
+            lay.font_next,
+            lay.font_label_y,
+        );
 
         // ---- font size stepper ----
         let ll = label(self, out, "حجم الخطّ", lay.size_label_y);
         leader(out, lay.size_plus.0 + lay.size_plus.2, ll, lay.size_label_y);
         draw_btn(self, out, lay.size_minus, "−");
         draw_btn(self, out, lay.size_plus, "+");
-        draw_val(self, out, format!("{}", v.font_size),
-                 lay.size_minus, lay.size_plus, lay.size_label_y);
+        draw_val(
+            self,
+            out,
+            format!("{}", v.font_size),
+            lay.size_minus,
+            lay.size_plus,
+            lay.size_label_y,
+        );
 
         // ---- cursor shape swatches (block / bar / underline) ----
         let ll = label(self, out, "المؤشّر", lay.cursor_label_y);
@@ -2592,29 +3159,50 @@ impl Renderer {
         leader(out, lastc.0 + lastc.2, ll, lay.cursor_label_y);
         for (i, &(bx, by, bw, bh)) in lay.cursor_btns.iter().enumerate() {
             let active = crate::config::CursorStyle::ALL[i] == v.cursor;
-            bordered(out, (bx, by, bw, bh),
-                     if active { GREEN_DIM } else { CTL_BG },
-                     if active { GREEN } else { EDGE });
+            bordered(
+                out,
+                (bx, by, bw, bh),
+                if active { GREEN_DIM } else { CTL_BG },
+                if active { GREEN } else { EDGE },
+            );
             // the shape itself, drawn as rects — no glyphs to go missing
             let c = c4(if active { (0xff, 0xff, 0xff) } else { MUTED }, 255);
             match crate::config::CursorStyle::ALL[i] {
-                crate::config::CursorStyle::Block =>
-                    push_rect(out, whole, bx + 8, by + 7, bw - 16, bh - 14, c),
-                crate::config::CursorStyle::Bar =>
-                    push_rect(out, whole, bx + bw / 2 - 1, by + 7, 3, bh - 14, c),
-                crate::config::CursorStyle::Underline =>
-                    push_rect(out, whole, bx + 8, by + bh - 10, bw - 16, 3, c),
+                crate::config::CursorStyle::Block => {
+                    push_rect(out, whole, bx + 8, by + 7, bw - 16, bh - 14, c)
+                }
+                crate::config::CursorStyle::Bar => {
+                    push_rect(out, whole, bx + bw / 2 - 1, by + 7, 3, bh - 14, c)
+                }
+                crate::config::CursorStyle::Underline => {
+                    push_rect(out, whole, bx + 8, by + bh - 10, bw - 16, 3, c)
+                }
             }
         }
 
         // ---- cursor blink toggle ----
         let ll = label(self, out, "وميض المؤشّر", lay.blink_label_y);
-        leader(out, lay.blink_toggle.0 + lay.blink_toggle.2, ll, lay.blink_label_y);
+        leader(
+            out,
+            lay.blink_toggle.0 + lay.blink_toggle.2,
+            ll,
+            lay.blink_label_y,
+        );
         draw_toggle(out, lay.blink_toggle, v.cursor_blink);
 
         // ---- scrollback stepper (new tabs only) ----
-        let ll = label(self, out, "سجلّ التمرير (التبويبات الجديدة)", lay.scroll_label_y);
-        leader(out, lay.scroll_plus.0 + lay.scroll_plus.2, ll, lay.scroll_label_y);
+        let ll = label(
+            self,
+            out,
+            "سجلّ التمرير (التبويبات الجديدة)",
+            lay.scroll_label_y,
+        );
+        leader(
+            out,
+            lay.scroll_plus.0 + lay.scroll_plus.2,
+            ll,
+            lay.scroll_label_y,
+        );
         draw_btn(self, out, lay.scroll_minus, "−");
         draw_btn(self, out, lay.scroll_plus, "+");
         let sb = if v.scrollback.is_multiple_of(1000) {
@@ -2622,28 +3210,62 @@ impl Renderer {
         } else {
             format!("{}", v.scrollback)
         };
-        draw_val(self, out, sb, lay.scroll_minus, lay.scroll_plus, lay.scroll_label_y);
+        draw_val(
+            self,
+            out,
+            sb,
+            lay.scroll_minus,
+            lay.scroll_plus,
+            lay.scroll_label_y,
+        );
 
         // ---- padding / opacity steppers ----
         let ll = label(self, out, "الحواشي", lay.pad_label_y);
         leader(out, lay.pad_plus.0 + lay.pad_plus.2, ll, lay.pad_label_y);
         draw_btn(self, out, lay.pad_minus, "−");
         draw_btn(self, out, lay.pad_plus, "+");
-        draw_val(self, out, format!("{}", v.padding),
-                 lay.pad_minus, lay.pad_plus, lay.pad_label_y);
+        draw_val(
+            self,
+            out,
+            format!("{}", v.padding),
+            lay.pad_minus,
+            lay.pad_plus,
+            lay.pad_label_y,
+        );
         let ll = label(self, out, "شفافية النافذة", lay.opacity_label_y);
-        leader(out, lay.opacity_plus.0 + lay.opacity_plus.2, ll, lay.opacity_label_y);
+        leader(
+            out,
+            lay.opacity_plus.0 + lay.opacity_plus.2,
+            ll,
+            lay.opacity_label_y,
+        );
         draw_btn(self, out, lay.opacity_minus, "−");
         draw_btn(self, out, lay.opacity_plus, "+");
-        draw_val(self, out, format!("{}%", v.opacity_pct),
-                 lay.opacity_minus, lay.opacity_plus, lay.opacity_label_y);
+        draw_val(
+            self,
+            out,
+            format!("{}%", v.opacity_pct),
+            lay.opacity_minus,
+            lay.opacity_plus,
+            lay.opacity_label_y,
+        );
 
         // ---- copy-on-select / ligatures toggles ----
         let ll = label(self, out, "النسخ عند التحديد", lay.copy_label_y);
-        leader(out, lay.copy_toggle.0 + lay.copy_toggle.2, ll, lay.copy_label_y);
+        leader(
+            out,
+            lay.copy_toggle.0 + lay.copy_toggle.2,
+            ll,
+            lay.copy_label_y,
+        );
         draw_toggle(out, lay.copy_toggle, v.copy_on_select);
         let ll = label(self, out, "الأربطة", lay.liga_label_y);
-        leader(out, lay.liga_toggle.0 + lay.liga_toggle.2, ll, lay.liga_label_y);
+        leader(
+            out,
+            lay.liga_toggle.0 + lay.liga_toggle.2,
+            ll,
+            lay.liga_label_y,
+        );
         draw_toggle(out, lay.liga_toggle, v.ligatures);
 
         // ---- bell: segmented, all three options visible ----
@@ -2653,45 +3275,102 @@ impl Renderer {
         let names = ["صامت", "صوت", "تنبيه"];
         for (i, &(bx, by, bw, bh)) in lay.bell_btns.iter().enumerate() {
             let active = BELL_SEGMENTS[i] == v.bell;
-            bordered(out, (bx, by, bw, bh),
-                     if active { GREEN_DIM } else { CTL_BG },
-                     if active { GREEN } else { EDGE });
+            bordered(
+                out,
+                (bx, by, bw, bh),
+                if active { GREEN_DIM } else { CTL_BG },
+                if active { GREEN } else { EDGE },
+            );
             let fg = if active { (0xff, 0xff, 0xff) } else { MUTED };
-            let seg = [Seg { text: names[i].into(), fg, style: if active { ST_BOLD } else { 0 } }];
+            let seg = [Seg {
+                text: names[i].into(),
+                fg,
+                style: if active { ST_BOLD } else { 0 },
+            }];
             let lw = self.measure(&seg, true);
             let gy = by + ((bh as f32 - self.cell_h) / 2.0) as i32;
-            self.draw_run(&seg, true, out, whole,
-                          bx as f32 + (bw as f32 - lw) / 2.0, gy, 1.0);
+            self.draw_run(
+                &seg,
+                true,
+                out,
+                whole,
+                bx as f32 + (bw as f32 - lw) / 2.0,
+                gy,
+                1.0,
+            );
         }
 
         // ---- native-toast toggle ----
         let ll = label(self, out, "إشعار عند اكتمال الأوامر", lay.notif_label_y);
-        leader(out, lay.notif_toggle.0 + lay.notif_toggle.2, ll, lay.notif_label_y);
+        leader(
+            out,
+            lay.notif_toggle.0 + lay.notif_toggle.2,
+            ll,
+            lay.notif_label_y,
+        );
         draw_toggle(out, lay.notif_toggle, v.notifications);
 
         // ---- shell cycler (new tabs only) ----
         let ll = label(self, out, "الصدفة (التبويبات الجديدة)", lay.shell_label_y);
-        leader(out, lay.shell_next.0 + lay.shell_next.2, ll, lay.shell_label_y);
+        leader(
+            out,
+            lay.shell_next.0 + lay.shell_next.2,
+            ll,
+            lay.shell_label_y,
+        );
         draw_btn(self, out, lay.shell_prev, "‹");
         draw_btn(self, out, lay.shell_next, "›");
-        draw_val(self, out, v.shell.to_string(),
-                 lay.shell_prev, lay.shell_next, lay.shell_label_y);
+        draw_val(
+            self,
+            out,
+            v.shell.to_string(),
+            lay.shell_prev,
+            lay.shell_next,
+            lay.shell_label_y,
+        );
 
         // ---- hide-bar / confirm-close toggles ----
         let ll = label(self, out, "إخفاء الشريط مع تبويب واحد", lay.bar_label_y);
-        leader(out, lay.bar_toggle.0 + lay.bar_toggle.2, ll, lay.bar_label_y);
+        leader(
+            out,
+            lay.bar_toggle.0 + lay.bar_toggle.2,
+            ll,
+            lay.bar_label_y,
+        );
         draw_toggle(out, lay.bar_toggle, v.hide_single_tab);
         let ll = label(self, out, "تأكيد الإغلاق أثناء أمر جارٍ", lay.close_label_y);
-        leader(out, lay.close_toggle.0 + lay.close_toggle.2, ll, lay.close_label_y);
+        leader(
+            out,
+            lay.close_toggle.0 + lay.close_toggle.2,
+            ll,
+            lay.close_label_y,
+        );
         draw_toggle(out, lay.close_toggle, v.confirm_close);
 
         // footer: hairline + hint
-        push_rect(out, whole, x + pad, y + h - (self.cell_h as i32 + 24), w - pad * 2, 1,
-                  c4(EDGE, 255));
-        let hint = [Seg::plain("انقر للتغيير · Esc للإغلاق والحفظ", (0x6e, 0x78, 0x85))];
+        push_rect(
+            out,
+            whole,
+            x + pad,
+            y + h - (self.cell_h as i32 + 24),
+            w - pad * 2,
+            1,
+            c4(EDGE, 255),
+        );
+        let hint = [Seg::plain(
+            "انقر للتغيير · Esc للإغلاق والحفظ",
+            (0x6e, 0x78, 0x85),
+        )];
         let fw2 = self.measure(&hint, true);
-        self.draw_run(&hint, true, out, whole, (x + w - pad) as f32 - fw2,
-                      y + h - (self.cell_h as i32 + 14), 1.0);
+        self.draw_run(
+            &hint,
+            true,
+            out,
+            whole,
+            (x + w - pad) as f32 - fw2,
+            y + h - (self.cell_h as i32 + 14),
+            1.0,
+        );
     }
 
     /// Geometry of the shortcuts editor: one full-width clickable strip per
@@ -2703,22 +3382,32 @@ impl Renderer {
         let foot_h = (self.ui_cell_h() + 30.0) as i32;
         let h = head_h + 6 + rowh * n as i32 + foot_h;
         let x = (fw as i32 - w) / 2;
-        let y = (self.tab_bar_h() as i32 + (fh as i32 - h) / 3)
-            .max(self.tab_bar_h() as i32 + 12);
+        let y = (self.tab_bar_h() as i32 + (fh as i32 - h) / 3).max(self.tab_bar_h() as i32 + 12);
         let rows_top = y + head_h + 6;
         let rows = (0..n as i32)
             .map(|i| (x + 8, rows_top + rowh * i, w - 16, rowh))
             .collect();
-        ShortcutsLayout { card: (x, y, w, h), rowh, rows }
+        ShortcutsLayout {
+            card: (x, y, w, h),
+            rowh,
+            rows,
+        }
     }
 
     /// The shortcuts editor: the settings ledger grammar again — keycap
     /// chips left ··· action label right. The selected row highlights; a
     /// capturing row swaps its chips for an amber "press the new chord".
     #[allow(clippy::too_many_arguments)]
-    pub fn draw_shortcuts(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
-                          rows: &[ShortcutRow], sel: usize, capturing: bool,
-                          flash: Option<&str>) {
+    pub fn draw_shortcuts(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        fw: usize,
+        fh: usize,
+        rows: &[ShortcutRow],
+        sel: usize,
+        capturing: bool,
+        flash: Option<&str>,
+    ) {
         const CARD: (u8, u8, u8) = (0x14, 0x19, 0x20);
         const EDGE: (u8, u8, u8) = (0x2a, 0x31, 0x3a);
         const CTL_BG: (u8, u8, u8) = (0x24, 0x2b, 0x34);
@@ -2739,11 +3428,30 @@ impl Renderer {
         push_rect(out, whole, x, y, w, h, c4(CARD, 255));
         push_rect(out, whole, x, y, w, 3, c4(GREEN, 255));
 
-        let head = [Seg { text: "الاختصارات".into(), fg: self.fg, style: ST_BOLD }];
+        let head = [Seg {
+            text: "الاختصارات".into(),
+            fg: self.fg,
+            style: ST_BOLD,
+        }];
         let hw = self.measure(&head, true);
-        self.draw_run(&head, true, out, whole, (x + w - pad) as f32 - hw, y + 14, 1.0);
-        push_rect(out, whole, x + pad, y + (self.cell_h + 30.0) as i32, w - pad * 2, 1,
-                  c4(EDGE, 255));
+        self.draw_run(
+            &head,
+            true,
+            out,
+            whole,
+            (x + w - pad) as f32 - hw,
+            y + 14,
+            1.0,
+        );
+        push_rect(
+            out,
+            whole,
+            x + pad,
+            y + (self.cell_h + 30.0) as i32,
+            w - pad * 2,
+            1,
+            c4(EDGE, 255),
+        );
 
         for (i, row) in rows.iter().enumerate() {
             let (rx, ry, rw, rh) = lay.rows[i];
@@ -2754,16 +3462,21 @@ impl Renderer {
                 push_rect(out, whole, rx + rw - 3, ry + 2, 3, rh - 4, c4(GREEN, 255));
             }
             // label, right-aligned
-            let lseg = [Seg::plain(row.label.clone(),
-                                   if selected { self.fg } else { MUTED })];
+            let lseg = [Seg::plain(
+                row.label.clone(),
+                if selected { self.fg } else { MUTED },
+            )];
             let lw = self.measure(&lseg, true);
             let label_x = (x + w - pad) as f32 - lw;
             self.draw_run(&lseg, true, out, whole, label_x, ry + tc, 1.0);
 
             let chips_end = if selected && capturing {
                 // amber capture prompt in place of the chips
-                let seg = [Seg { text: "اضغط الاختصار الجديد…".into(),
-                                 fg: AMBER, style: ST_BOLD }];
+                let seg = [Seg {
+                    text: "اضغط الاختصار الجديد…".into(),
+                    fg: AMBER,
+                    style: ST_BOLD,
+                }];
                 let cw = self.measure(&seg, true);
                 self.draw_run(&seg, true, out, whole, (x + pad) as f32, ry + tc, 1.0);
                 x + pad + cw as i32
@@ -2774,13 +3487,24 @@ impl Renderer {
                 let cy = ry + (lay.rowh - ch) / 2;
                 for token in row.chord.split('+') {
                     let fg = if row.custom { VALUE } else { self.fg };
-                    let seg = [Seg { text: token.to_string(), fg, style: 0 }];
+                    let seg = [Seg {
+                        text: token.to_string(),
+                        fg,
+                        style: 0,
+                    }];
                     let tw = self.measure(&seg, false);
                     let cw = tw as i32 + 14;
                     push_rect(out, whole, cx - 1, cy - 1, cw + 2, ch + 2, c4(EDGE, 255));
                     push_rect(out, whole, cx, cy, cw, ch, c4(CTL_BG, 255));
-                    self.draw_run(&seg, false, out, whole, (cx + 7) as f32,
-                                  cy + ((ch as f32 - self.cell_h) / 2.0) as i32, 1.0);
+                    self.draw_run(
+                        &seg,
+                        false,
+                        out,
+                        whole,
+                        (cx + 7) as f32,
+                        cy + ((ch as f32 - self.cell_h) / 2.0) as i32,
+                        1.0,
+                    );
                     cx += cw + 6;
                 }
                 cx - 6
@@ -2795,8 +3519,15 @@ impl Renderer {
         }
 
         // footer: hairline + flash (amber, right) or the hint
-        push_rect(out, whole, x + pad, y + h - (self.cell_h as i32 + 24), w - pad * 2, 1,
-                  c4(EDGE, 255));
+        push_rect(
+            out,
+            whole,
+            x + pad,
+            y + h - (self.cell_h as i32 + 24),
+            w - pad * 2,
+            1,
+            c4(EDGE, 255),
+        );
         let (text, color) = match flash {
             Some(f) => (f.to_string(), AMBER),
             None => (
@@ -2806,12 +3537,25 @@ impl Renderer {
         };
         let seg = [Seg::plain(text, color)];
         let fw2 = self.measure(&seg, true);
-        self.draw_run(&seg, true, out, whole, (x + w - pad) as f32 - fw2,
-                      y + h - (self.cell_h as i32 + 14), 1.0);
+        self.draw_run(
+            &seg,
+            true,
+            out,
+            whole,
+            (x + w - pad) as f32 - fw2,
+            y + h - (self.cell_h as i32 + 14),
+            1.0,
+        );
     }
 
     /// Shared geometry for painting and pointer input, independent of terminal zoom.
-    pub fn palette_layout(&self, fw: usize, fh: usize, count: usize, selected: usize) -> PaletteLayout {
+    pub fn palette_layout(
+        &self,
+        fw: usize,
+        fh: usize,
+        count: usize,
+        selected: usize,
+    ) -> PaletteLayout {
         let (fw, fh) = (fw as i32, fh as i32);
         let dpi = self.dpi_scale;
         let margin = (16.0 * dpi).round() as i32;
@@ -2826,26 +3570,50 @@ impl Renderer {
         let capacity = ((available - fixed).max(0) / row_h) as usize;
         let shown = count.min(12).min(capacity);
         let width = ((fw as f32 * 0.7).round() as i32)
-            .clamp((560.0 * dpi) as i32, (900.0 * dpi) as i32).min((fw - margin * 2).max(0));
+            .clamp((560.0 * dpi) as i32, (900.0 * dpi) as i32)
+            .min((fw - margin * 2).max(0));
         let height = (fixed + row_h * shown as i32).min(available);
         let x = (fw - width) / 2;
         let y = top + (available - height) / 5;
         let inner_w = (width - pad * 2).max(0);
-        let first = selected.saturating_sub(shown.saturating_sub(1))
+        let first = selected
+            .saturating_sub(shown.saturating_sub(1))
             .min(count.saturating_sub(shown));
-        let rows = (0..shown).map(|i| (first + i,
-            (x + pad, y + title_h + query_h + pad * 3 + i as i32 * row_h, inner_w, row_h))).collect();
-        PaletteLayout { card: (x, y, width, height),
+        let rows = (0..shown)
+            .map(|i| {
+                (
+                    first + i,
+                    (
+                        x + pad,
+                        y + title_h + query_h + pad * 3 + i as i32 * row_h,
+                        inner_w,
+                        row_h,
+                    ),
+                )
+            })
+            .collect();
+        PaletteLayout {
+            card: (x, y, width, height),
             title: (x + pad, y + pad, inner_w, title_h),
-            query: (x + pad, y + title_h + pad * 2, inner_w, query_h), rows,
-            footer: (x + pad, y + height - footer_h - pad, inner_w, footer_h), text_scale: compact.max(0.01) }
+            query: (x + pad, y + title_h + pad * 2, inner_w, query_h),
+            rows,
+            footer: (x + pad, y + height - footer_h - pad, inner_w, footer_h),
+            text_scale: compact.max(0.01),
+        }
     }
 
     /// The command palette (Ctrl+Shift+P). Query line, filtered rows, hint.
     /// `rows` is already filtered by the caller — the renderer never decides
     /// what matches, so the list drawn and the list Enter runs cannot differ.
-    pub fn draw_palette(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
-                        query: &str, rows: &[String], sel: usize) {
+    pub fn draw_palette(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        fw: usize,
+        fh: usize,
+        query: &str,
+        rows: &[String],
+        sel: usize,
+    ) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
         push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 120));
         let layout = self.palette_layout(fw, fh, rows.len(), sel);
@@ -2853,8 +3621,10 @@ impl Renderer {
         let saved_cells = (self.cell_w, self.cell_h);
         // This drawer also works outside the chrome pass: terminal zoom
         // never sizes palette text. Very short windows scale the UI together.
-        self.metrics = Metrics::new(16.0 * self.dpi_scale * layout.text_scale,
-            self.ui_cell_h() * layout.text_scale);
+        self.metrics = Metrics::new(
+            16.0 * self.dpi_scale * layout.text_scale,
+            self.ui_cell_h() * layout.text_scale,
+        );
         self.cell_w = self.ui_cell_w() * layout.text_scale;
         self.cell_h = self.metrics.line_height;
         let (x, y, w, h) = layout.card;
@@ -2862,35 +3632,113 @@ impl Renderer {
         let accent = (0x58, 0xa6, 0xff);
         push_rect_top_rounded(out, whole, x + 4, y + 6, w, h, c4((0, 0, 0), 100));
         push_rect_top_rounded(out, whole, x, y, w, h, c4((0x3d, 0x44, 0x4d), 255));
-        push_rect_top_rounded(out, whole, x + 1, y + 1, w - 2, h - 2, c4((0x16, 0x1b, 0x22), 255));
-        let title = [Seg { text: "لوحة الأوامر".into(), fg: (0xe6, 0xed, 0xf3), style: ST_BOLD }];
+        push_rect_top_rounded(
+            out,
+            whole,
+            x + 1,
+            y + 1,
+            w - 2,
+            h - 2,
+            c4((0x16, 0x1b, 0x22), 255),
+        );
+        let title = [Seg {
+            text: "لوحة الأوامر".into(),
+            fg: (0xe6, 0xed, 0xf3),
+            style: ST_BOLD,
+        }];
         let tw = self.measure(&title, true);
         let (tx, ty, twidth, th) = layout.title;
-        self.draw_run(&title, true, out, layout.title, tx as f32 + twidth as f32 - tw,
-            ty + (th - self.cell_h as i32) / 2, 1.0);
+        self.draw_run(
+            &title,
+            true,
+            out,
+            layout.title,
+            tx as f32 + twidth as f32 - tw,
+            ty + (th - self.cell_h as i32) / 2,
+            1.0,
+        );
         if w > (600.0 * self.dpi_scale) as i32 {
-            self.draw_run(&[Seg::plain("Ctrl + Shift + P", (0x8b, 0x94, 0x9e))], false,
-                out, layout.title, tx as f32, ty + (th - self.cell_h as i32) / 2, 1.0);
+            self.draw_run(
+                &[Seg::plain("Ctrl + Shift + P", (0x8b, 0x94, 0x9e))],
+                false,
+                out,
+                layout.title,
+                tx as f32,
+                ty + (th - self.cell_h as i32) / 2,
+                1.0,
+            );
         }
         let (qx, qy, qw, qh) = layout.query;
-        push_rect(out, layout.card, qx, qy, qw, qh, c4((0x0d, 0x11, 0x17), 255));
+        push_rect(
+            out,
+            layout.card,
+            qx,
+            qy,
+            qw,
+            qh,
+            c4((0x0d, 0x11, 0x17), 255),
+        );
         push_rect(out, layout.card, qx, qy + qh - 2, qw, 2, c4(accent, 255));
-        let query_text = if query.is_empty() { "ابحث عن أمر أو طرفية…".to_string() } else { format!("{query}│") };
+        let query_text = if query.is_empty() {
+            "ابحث عن أمر أو طرفية…".to_string()
+        } else {
+            format!("{query}│")
+        };
         let query_text = self.guard_label(&query_text, (qw - inset * 2).max(0) as f32);
-        self.draw_run(&[Seg::plain(query_text, if query.is_empty() { (0x8b, 0x94, 0x9e) } else { self.fg })], true,
-            out, layout.query, (qx + inset) as f32, qy + (qh - self.cell_h as i32) / 2, 1.0);
+        self.draw_run(
+            &[Seg::plain(
+                query_text,
+                if query.is_empty() {
+                    (0x8b, 0x94, 0x9e)
+                } else {
+                    self.fg
+                },
+            )],
+            true,
+            out,
+            layout.query,
+            (qx + inset) as f32,
+            qy + (qh - self.cell_h as i32) / 2,
+            1.0,
+        );
         for &(idx, rect @ (rx, ry, rw, rh)) in &layout.rows {
             let picked = idx == sel;
             if picked {
-                push_rect(out, layout.card, rx, ry + 1, rw, rh - 2, c4((0x21, 0x36, 0x50), 255));
+                push_rect(
+                    out,
+                    layout.card,
+                    rx,
+                    ry + 1,
+                    rw,
+                    rh - 2,
+                    c4((0x21, 0x36, 0x50), 255),
+                );
                 push_rect(out, layout.card, rx, ry + 1, 3, rh - 2, c4(accent, 255));
             }
             let text = self.guard_label(&rows[idx], (rw - inset * 2).max(0) as f32);
-            self.draw_run(&[Seg { text, fg: if picked { (0xf0, 0xf6, 0xfc) } else { (0xad, 0xb7, 0xc3) },
-                style: if picked { ST_BOLD } else { 0 } }], true, out, rect,
-                (rx + inset) as f32, ry + (rh - self.cell_h as i32) / 2, 1.0);
+            self.draw_run(
+                &[Seg {
+                    text,
+                    fg: if picked {
+                        (0xf0, 0xf6, 0xfc)
+                    } else {
+                        (0xad, 0xb7, 0xc3)
+                    },
+                    style: if picked { ST_BOLD } else { 0 },
+                }],
+                true,
+                out,
+                rect,
+                (rx + inset) as f32,
+                ry + (rh - self.cell_h as i32) / 2,
+                1.0,
+            );
         }
-        let hint = if w < (500.0 * self.dpi_scale) as i32 { "Enter · Esc".into() } else { palette_hint(rows.len()) };
+        let hint = if w < (500.0 * self.dpi_scale) as i32 {
+            "Enter · Esc".into()
+        } else {
+            palette_hint(rows.len())
+        };
         let hint = self.guard_label(&hint, (layout.footer.2 - inset * 2).max(0) as f32);
         // Keep shortcut keys in reading order; Arabic labels still shape
         // as RTL runs inside this left-to-right instruction line.
@@ -2898,15 +3746,30 @@ impl Renderer {
         let key = self.ensure_shaped_dir(&hint, true, true);
         let hint_y = layout.footer.1 + (layout.footer.3 - self.cell_h as i32).max(0) / 2;
         {
-            let Renderer { cache_hot, font_system, cache, atlas, fg, .. } = self;
-            push_shaped(out, font_system, cache, atlas, &cache_hot[&key].buffer, layout.footer,
+            let Renderer {
+                cache_hot,
+                font_system,
+                cache,
+                atlas,
+                fg,
+                ..
+            } = self;
+            push_shaped(
+                out,
+                font_system,
+                cache,
+                atlas,
+                &cache_hot[&key].buffer,
+                layout.footer,
                 (layout.footer.0 + inset) as f32,
-                hint_y, 1.0, *fg);
+                hint_y,
+                1.0,
+                *fg,
+            );
         }
         self.metrics = saved_metrics;
         (self.cell_w, self.cell_h) = saved_cells;
     }
-
 
     /// Minimal SGR reader for preview text: enough of oh-my-posh's output to
     /// colour it faithfully (24-bit foreground, reset). Background runs are
@@ -2947,10 +3810,13 @@ impl Renderer {
                 if c.is_ascii_alphabetic() {
                     if c == 'm' {
                         if !buf.is_empty() {
-                            segs.push(Seg { text: std::mem::take(&mut buf), fg, style: 0 });
+                            segs.push(Seg {
+                                text: std::mem::take(&mut buf),
+                                fg,
+                                style: 0,
+                            });
                         }
-                        let n: Vec<u32> =
-                            code.split(';').filter_map(|p| p.parse().ok()).collect();
+                        let n: Vec<u32> = code.split(';').filter_map(|p| p.parse().ok()).collect();
                         match n.as_slice() {
                             [] | [0] => fg = default_fg,
                             [38, 2, r, g, b, ..] => fg = (*r as u8, *g as u8, *b as u8),
@@ -2963,14 +3829,25 @@ impl Renderer {
             }
         }
         if !buf.is_empty() {
-            segs.push(Seg { text: buf, fg, style: 0 });
+            segs.push(Seg {
+                text: buf,
+                fg,
+                style: 0,
+            });
         }
         segs
     }
 
     /// The prompt picker: each theme's name above its REAL rendered prompt.
-    pub fn draw_posh(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
-                     names: &[String], previews: &[Option<Vec<u8>>], sel: usize) {
+    pub fn draw_posh(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        fw: usize,
+        fh: usize,
+        names: &[String],
+        previews: &[Option<Vec<u8>>],
+        sel: usize,
+    ) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
         push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 130));
         const MAX: usize = 9;
@@ -2986,58 +3863,118 @@ impl Renderer {
         let title = [Seg::plain("شكل الموجِّه — معاينة حيّة", self.fg)];
         self.draw_run(&title, true, out, whole, (x + 14) as f32, y + 8, 1.0);
 
-        let first = sel.saturating_sub(MAX - 1).min(names.len().saturating_sub(shown));
+        let first = sel
+            .saturating_sub(MAX - 1)
+            .min(names.len().saturating_sub(shown));
         for i in 0..shown {
             let idx = first + i;
             let ry = y + (self.cell_h * 2.2) as i32 + rh * i as i32;
             if idx == sel {
-                push_rect(out, whole, x + 6, ry - 4, w - 12, rh, c4((0x2c, 0x3a, 0x33), 255));
+                push_rect(
+                    out,
+                    whole,
+                    x + 6,
+                    ry - 4,
+                    w - 12,
+                    rh,
+                    c4((0x2c, 0x3a, 0x33), 255),
+                );
             }
-            let name_fg = if idx == sel { self.fg } else { (0x8a, 0x94, 0xa3) };
-            let n = [Seg { text: names[idx].clone(), fg: name_fg, style: ST_BOLD }];
+            let name_fg = if idx == sel {
+                self.fg
+            } else {
+                (0x8a, 0x94, 0xa3)
+            };
+            let n = [Seg {
+                text: names[idx].clone(),
+                fg: name_fg,
+                style: ST_BOLD,
+            }];
             self.draw_run(&n, false, out, whole, (x + 14) as f32, ry, 1.0);
             match &previews[idx] {
                 Some(bytes) => {
                     // oh-my-posh's own bytes, through our own renderer: the
                     // preview and the real prompt cannot disagree
                     let segs = self.ansi_segments(bytes, self.fg);
-                    self.draw_run(&segs, false, out, whole, (x + 24) as f32,
-                                  ry + self.cell_h as i32, 1.0);
+                    self.draw_run(
+                        &segs,
+                        false,
+                        out,
+                        whole,
+                        (x + 24) as f32,
+                        ry + self.cell_h as i32,
+                        1.0,
+                    );
                 }
                 None => {
                     let m = [Seg::plain("(تعذّر التصيير)", (0x6e, 0x78, 0x85))];
-                    self.draw_run(&m, true, out, whole, (x + 24) as f32,
-                                  ry + self.cell_h as i32, 1.0);
+                    self.draw_run(
+                        &m,
+                        true,
+                        out,
+                        whole,
+                        (x + 24) as f32,
+                        ry + self.cell_h as i32,
+                        1.0,
+                    );
                 }
             }
         }
-        let hint = [Seg::plain("Enter تطبيق · ↑↓ تنقّل · Esc إغلاق", (0x6e, 0x78, 0x85))];
-        self.draw_run(&hint, true, out, whole, (x + 14) as f32,
-                      y + h - self.cell_h as i32 - 8, 1.0);
+        let hint = [Seg::plain(
+            "Enter تطبيق · ↑↓ تنقّل · Esc إغلاق",
+            (0x6e, 0x78, 0x85),
+        )];
+        self.draw_run(
+            &hint,
+            true,
+            out,
+            whole,
+            (x + 14) as f32,
+            y + h - self.cell_h as i32 - 8,
+            1.0,
+        );
     }
 
     /// The close guard (same family as the paste guard): a pane or the
     /// window is about to close while a command still runs — confirm.
-    pub fn draw_close_guard(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
-                            msg: &str) {
+    pub fn draw_close_guard(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize, msg: &str) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
         let layout = self.close_guard_layout(fw, fh);
         let (x, y, w, h) = layout.card;
         push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 165));
-        push_rect(out, whole, x - 3, y - 3, w + 6, h + 6, c4((0x0d, 0x11, 0x14), 255));
+        push_rect(
+            out,
+            whole,
+            x - 3,
+            y - 3,
+            w + 6,
+            h + 6,
+            c4((0x0d, 0x11, 0x14), 255),
+        );
         push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 255));
         push_rect(out, whole, x, y, w, 3, c4((0xf2, 0xcc, 0x60), 255));
         let inner = layout.text;
-        for (text, row, bold) in [
-            (msg, 0, true),
-            ("الإغلاق سيوقف الأوامر الجارية.", 1, false),
-        ] {
-            if row == 1 && inner.3 < (self.cell_h * 2.0).ceil() as i32 + 8 { continue; }
+        for (text, row, bold) in [(msg, 0, true), ("الإغلاق سيوقف الأوامر الجارية.", 1, false)]
+        {
+            if row == 1 && inner.3 < (self.cell_h * 2.0).ceil() as i32 + 8 {
+                continue;
+            }
             let text = self.guard_label(text, inner.2 as f32);
-            let seg = [Seg { text, fg: self.fg, style: if bold { ST_BOLD } else { 0 } }];
+            let seg = [Seg {
+                text,
+                fg: self.fg,
+                style: if bold { ST_BOLD } else { 0 },
+            }];
             let tw = self.measure(&seg, true);
-            self.draw_run(&seg, true, out, inner, (x + w - 16) as f32 - tw,
-                y + 16 + row * (self.cell_h.ceil() as i32 + 8), 1.0);
+            self.draw_run(
+                &seg,
+                true,
+                out,
+                inner,
+                (x + w - 16) as f32 - tw,
+                y + 16 + row * (self.cell_h.ceil() as i32 + 8),
+                1.0,
+            );
         }
         for (rect, label, color) in [
             (layout.close, "إغلاق · Enter", (0x9e, 0x32, 0x32)),
@@ -3048,8 +3985,15 @@ impl Renderer {
             let label = self.guard_label(label, (bw - 12).max(1) as f32);
             let seg = [Seg::plain(label, (0xee, 0xfb, 0xfa))];
             let tw = self.measure(&seg, true);
-            self.draw_run(&seg, true, out, rect, bx as f32 + (bw as f32 - tw) / 2.0,
-                by + (bh - self.cell_h.ceil() as i32) / 2, 1.0);
+            self.draw_run(
+                &seg,
+                true,
+                out,
+                rect,
+                bx as f32 + (bw as f32 - tw) / 2.0,
+                by + (bh - self.cell_h.ceil() as i32) / 2,
+                1.0,
+            );
         }
     }
 
@@ -3058,9 +4002,18 @@ impl Renderer {
         let chars: Vec<char> = text.chars().take(160).collect();
         let label: String = chars.iter().collect();
         let measure = |r: &mut Self, text: &str| {
-            r.measure(&[Seg { text: text.into(), fg: r.fg, style: ST_BOLD }], true)
+            r.measure(
+                &[Seg {
+                    text: text.into(),
+                    fg: r.fg,
+                    style: ST_BOLD,
+                }],
+                true,
+            )
         };
-        if label.len() == text.len() && measure(self, &label) <= width { return label; }
+        if label.len() == text.len() && measure(self, &label) <= width {
+            return label;
+        }
         let (mut lo, mut hi) = (0, chars.len());
         let mut best = String::new();
         while lo <= hi {
@@ -3097,8 +4050,15 @@ impl Renderer {
 
     /// A link card. `may_open` is the confirm card (mint bar, Enter opens).
     /// A refusal is the red bar, and Enter only dismisses it.
-    pub fn draw_link_block(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
-                           reason: &str, target: &str, may_open: bool) {
+    pub fn draw_link_block(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        fw: usize,
+        fh: usize,
+        reason: &str,
+        target: &str,
+        may_open: bool,
+    ) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
         push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 150));
         let w = ((self.cell_w * 62.0) as i32).min(fw as i32 - 80);
@@ -3117,7 +4077,15 @@ impl Renderer {
         } else {
             (0xcf, 0x22, 0x2e)
         };
-        push_rect(out, whole, x - 3, y - 3, w + 6, h + 6, c4((0x0d, 0x11, 0x14), 235));
+        push_rect(
+            out,
+            whole,
+            x - 3,
+            y - 3,
+            w + 6,
+            h + 6,
+            c4((0x0d, 0x11, 0x14), 235),
+        );
         push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 255));
         push_rect(out, whole, x, y, w, 3, c4(accent, 255));
         let prefix = crate::link::card_title_prefix(may_open);
@@ -3137,23 +4105,51 @@ impl Renderer {
             host_line.to_string()
         };
         let dest = [Seg::plain(host_draw, host_color)];
-        self.draw_run(&dest, false, out, whole, (x + pad) as f32,
-                      y + pad + self.cell_h as i32, 1.0);
+        self.draw_run(
+            &dest,
+            false,
+            out,
+            whole,
+            (x + pad) as f32,
+            y + pad + self.cell_h as i32,
+            1.0,
+        );
         let keys_at = if let Some(rest) = rest_line {
             let path = [Seg::plain(rest.to_string(), (0xc5, 0xcd, 0xd6))];
-            self.draw_run(&path, false, out, whole, (x + pad) as f32,
-                          y + pad + (self.cell_h * 2.0) as i32, 1.0);
+            self.draw_run(
+                &path,
+                false,
+                out,
+                whole,
+                (x + pad) as f32,
+                y + pad + (self.cell_h * 2.0) as i32,
+                1.0,
+            );
             3.0
         } else {
             2.0
         };
         let (ar, en) = crate::link::card_key_lines(may_open);
         let keys_ar = [Seg::plain(ar.to_string(), (0x9a, 0xa4, 0xb2))];
-        self.draw_run(&keys_ar, true, out, whole, (x + pad) as f32,
-                      y + pad + (self.cell_h * keys_at) as i32 + 4, 1.0);
+        self.draw_run(
+            &keys_ar,
+            true,
+            out,
+            whole,
+            (x + pad) as f32,
+            y + pad + (self.cell_h * keys_at) as i32 + 4,
+            1.0,
+        );
         let keys_en = [Seg::plain(en.to_string(), (0x6e, 0x78, 0x85))];
-        self.draw_run(&keys_en, true, out, whole, (x + pad) as f32,
-                      y + pad + (self.cell_h * (keys_at + 1.0)) as i32 + 6, 1.0);
+        self.draw_run(
+            &keys_en,
+            true,
+            out,
+            whole,
+            (x + pad) as f32,
+            y + pad + (self.cell_h * (keys_at + 1.0)) as i32 + 6,
+            1.0,
+        );
     }
 
     /// Keep the end of `text` when it is wider than `max_w`. Stable for a
@@ -3194,8 +4190,13 @@ impl Renderer {
     /// drop into a program that is not a cooked prompt, can execute on arrival.
     /// `reason` says why (Enter, controls, not at a prompt). `preview` is the
     /// text with controls drawn as visible symbols — the card used to hide it.
-    pub fn draw_paste_guard(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize,
-                            card: &PasteCard<'_>) {
+    pub fn draw_paste_guard(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        fw: usize,
+        fh: usize,
+        card: &PasteCard<'_>,
+    ) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
         // heavier dim than the close guard: this card lands on top of whatever
         // the user was reading, and a thin strip over dense text reads as a
@@ -3207,32 +4208,73 @@ impl Renderer {
         let x = (fw as i32 - w) / 2;
         let y = self.tab_bar_h() as i32 + (fh as i32 - h) / 3;
         // a ring of background around the card separates it from the text
-        push_rect(out, whole, x - 3, y - 3, w + 6, h + 6, c4((0x0d, 0x11, 0x14), 235));
+        push_rect(
+            out,
+            whole,
+            x - 3,
+            y - 3,
+            w + 6,
+            h + 6,
+            c4((0x0d, 0x11, 0x14), 235),
+        );
         push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 255));
         push_rect(out, whole, x, y, w, 3, c4((0xf2, 0xcc, 0x60), 255)); // warn accent
 
         let title = [Seg {
-            text: format!("لصق {} ({})؟", arabic_lines(card.lines), arabic_chars(card.chars)),
+            text: format!(
+                "لصق {} ({})؟",
+                arabic_lines(card.lines),
+                arabic_chars(card.chars)
+            ),
             fg: self.fg,
             style: ST_BOLD,
         }];
         self.draw_run(&title, true, out, whole, (x + pad) as f32, y + pad, 1.0);
         let why = [Seg::plain(card.reason, (0xf2, 0xcc, 0x60))];
-        self.draw_run(&why, true, out, whole, (x + pad) as f32,
-                      y + pad + self.cell_h as i32, 1.0);
+        self.draw_run(
+            &why,
+            true,
+            out,
+            whole,
+            (x + pad) as f32,
+            y + pad + self.cell_h as i32,
+            1.0,
+        );
         let shown = [Seg::plain(card.preview, (0xc5, 0xcd, 0xd6))];
-        self.draw_run(&shown, true, out, whole, (x + pad) as f32,
-                      y + pad + (self.cell_h * 2.0) as i32, 1.0);
-        let keys = [Seg::plain("Enter تأكيد   ·   Esc إلغاء", (0x9a, 0xa4, 0xb2))];
-        self.draw_run(&keys, true, out, whole, (x + pad) as f32,
-                      y + pad + (self.cell_h * 3.0) as i32 + 6, 1.0);
+        self.draw_run(
+            &shown,
+            true,
+            out,
+            whole,
+            (x + pad) as f32,
+            y + pad + (self.cell_h * 2.0) as i32,
+            1.0,
+        );
+        let keys = [Seg::plain(
+            "Enter تأكيد   ·   Esc إلغاء",
+            (0x9a, 0xa4, 0xb2),
+        )];
+        self.draw_run(
+            &keys,
+            true,
+            out,
+            whole,
+            (x + pad) as f32,
+            y + pad + (self.cell_h * 3.0) as i32 + 6,
+            1.0,
+        );
     }
 
-
-
     /// Window-level chrome: tab bar, search bar, Claude badge.
-    pub fn draw_chrome(&mut self, out: &mut Vec<Vertex>, width: usize, height: usize,
-                       tabs: &[TabInfo], search_query: Option<&str>, claude: bool) {
+    pub fn draw_chrome(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        width: usize,
+        height: usize,
+        tabs: &[TabInfo],
+        search_query: Option<&str>,
+        claude: bool,
+    ) {
         let oy = self.tab_bar_h().round() as i32;
         let whole: Rect = (0, 0, width as i32, height as i32);
 
@@ -3242,9 +4284,24 @@ impl Renderer {
             let bar_h = (self.cell_h + 10.0) as i32;
             let bx = width as i32 - bar_w - 10;
             let by = oy + 6;
-            push_rect(out, whole, bx, by, bar_w, bar_h, c4((0x1c, 0x21, 0x28), 255));
-            push_rect(out, whole, bx, by + bar_h - 2, bar_w, 2,
-                      c4(PALETTE[11], 200)); // amber underline = search accent
+            push_rect(
+                out,
+                whole,
+                bx,
+                by,
+                bar_w,
+                bar_h,
+                c4((0x1c, 0x21, 0x28), 255),
+            );
+            push_rect(
+                out,
+                whole,
+                bx,
+                by + bar_h - 2,
+                bar_w,
+                2,
+                c4(PALETTE[11], 200),
+            ); // amber underline = search accent
             let segs = [Seg::plain(format!("بحث: {q}_"), self.fg)];
             self.draw_run(&segs, true, out, whole, (bx + 8) as f32, by + 5, 1.0);
         }
@@ -3254,9 +4311,11 @@ impl Renderer {
         if self.bar_hidden {
             return;
         }
-        let bar_bg = ((self.bg.0 as f32 * 0.80) as u8,
-                      (self.bg.1 as f32 * 0.80) as u8,
-                      (self.bg.2 as f32 * 0.80) as u8);
+        let bar_bg = (
+            (self.bg.0 as f32 * 0.80) as u8,
+            (self.bg.1 as f32 * 0.80) as u8,
+            (self.bg.2 as f32 * 0.80) as u8,
+        );
         push_rect(out, whole, 0, 0, width as i32, oy, c4(bar_bg, 255));
         push_rect(out, whole, 0, oy - 1, width as i32, 1, c4(self.fg, 28));
         // widths follow the titles now (M26): a fixed 24 cells left "Admin"
@@ -3270,10 +4329,21 @@ impl Renderer {
             // top of the pane below it rather than as a highlighted list row.
             // Inactive tabs recede into the bar instead of floating above it.
             let dim = |c: (u8, u8, u8), f: f32| {
-                ((c.0 as f32 * f) as u8, (c.1 as f32 * f) as u8, (c.2 as f32 * f) as u8)
+                (
+                    (c.0 as f32 * f) as u8,
+                    (c.1 as f32 * f) as u8,
+                    (c.2 as f32 * f) as u8,
+                )
             };
             let (bg, fg): ((u8, u8, u8), (u8, u8, u8)) = if tab.active {
-                ((self.bg.0.saturating_add(14), self.bg.1.saturating_add(14), self.bg.2.saturating_add(14)), self.fg)
+                (
+                    (
+                        self.bg.0.saturating_add(14),
+                        self.bg.1.saturating_add(14),
+                        self.bg.2.saturating_add(14),
+                    ),
+                    self.fg,
+                )
             } else {
                 (bar_bg, dim(self.fg, 0.75))
             };
@@ -3289,15 +4359,29 @@ impl Renderer {
                 // a hairline that hugs the curve — enough to mark focus without
                 // shouting; the background match already does most of the work
                 for (i, inset) in CORNER_INSET.iter().enumerate().take(2) {
-                    push_rect(out, whole, tx + inset, TAB_TOP + i as i32,
-                              tabw - 2 * inset, 1, c4((0x2e, 0xa0, 0x43), 220));
+                    push_rect(
+                        out,
+                        whole,
+                        tx + inset,
+                        TAB_TOP + i as i32,
+                        tabw - 2 * inset,
+                        1,
+                        c4((0x2e, 0xa0, 0x43), 220),
+                    );
                 }
             }
             let max_chars = ((tw as f32 / self.cell_w) as usize).saturating_sub(4);
             let title: String = tab.title.chars().take(max_chars).collect();
             let segs = [Seg::plain(title, fg)];
-            self.draw_run(&segs, true, out, (tx, TAB_TOP, tabw, oy - TAB_TOP),
-                (tx + 12) as f32, (oy - self.cell_h.ceil() as i32) / 2, 1.0);
+            self.draw_run(
+                &segs,
+                true,
+                out,
+                (tx, TAB_TOP, tabw, oy - TAB_TOP),
+                (tx + 12) as f32,
+                (oy - self.cell_h.ceil() as i32) / 2,
+                1.0,
+            );
             // dots: amber attention (a Claude waiting on you) beats green busy
             let dot = if tab.attention {
                 Some((0xf2, 0xcc, 0x60))
@@ -3308,7 +4392,15 @@ impl Renderer {
             };
             if let Some(c) = dot.filter(|_| tw >= 28) {
                 let d = 6;
-                push_rect(out, whole, tx + tabw - 14, (oy + 3) / 2 - d / 2, d, d, c4(c, 255));
+                push_rect(
+                    out,
+                    whole,
+                    tx + tabw - 14,
+                    (oy + 3) / 2 - d / 2,
+                    d,
+                    d,
+                    c4(c, 255),
+                );
             }
             // progress: a 3px bar along the bottom edge, its track dimmed and
             // its fill at the reported percent (full-width dim = indeterminate)
@@ -3320,7 +4412,11 @@ impl Renderer {
                     crate::term::ProgressState::Indeterminate => bw,
                     _ => (bw as f32 * p.percent as f32 / 100.0).round() as i32,
                 };
-                let alpha = if p.state == crate::term::ProgressState::Indeterminate { 140 } else { 255 };
+                let alpha = if p.state == crate::term::ProgressState::Indeterminate {
+                    140
+                } else {
+                    255
+                };
                 push_rect(out, whole, bx, by, fill, bh, c4(c, alpha));
             }
         }
@@ -3329,10 +4425,20 @@ impl Renderer {
             let label = [Seg::plain("● Claude", (0x7e, 0xe7, 0x87))];
             let tw = self.measure(&label, false);
             let x = self.tab_controls(width)[0].0 - tw.ceil() as i32 - 18;
-            let end = self.tab_rects(width, &titles, active).last().map_or(0, |r| r.1 + r.2);
+            let end = self
+                .tab_rects(width, &titles, active)
+                .last()
+                .map_or(0, |r| r.1 + r.2);
             if x >= end + 12 {
-                self.draw_run(&label, false, out, whole, x as f32,
-                    (oy - self.cell_h.ceil() as i32) / 2, 1.0);
+                self.draw_run(
+                    &label,
+                    false,
+                    out,
+                    whole,
+                    x as f32,
+                    (oy - self.cell_h.ceil() as i32) / 2,
+                    1.0,
+                );
             }
         }
 
@@ -3341,9 +4447,15 @@ impl Renderer {
             push_rect(out, whole, bx, by, bw, bh, c4(bar_bg, 255));
             let seg = [Seg::plain(glyph, self.fg)];
             let gw = self.measure(&seg, false);
-            self.draw_run(&seg, false, out, whole,
+            self.draw_run(
+                &seg,
+                false,
+                out,
+                whole,
                 bx as f32 + (bw as f32 - gw) / 2.0,
-                by + bh / 2 - self.cell_h as i32 / 2, 1.0);
+                by + bh / 2 - self.cell_h as i32 / 2,
+                1.0,
+            );
         }
 
         // window controls, drawn by us because the OS title bar is gone
@@ -3357,17 +4469,31 @@ impl Renderer {
         {
             let (bx, by, bw, bh) = *rect;
             if self.hover_caption == Some(i) {
-                let tint = if i == 2 { (0xc4, 0x2b, 0x1c) } else { (0x33, 0x3c, 0x48) };
+                let tint = if i == 2 {
+                    (0xc4, 0x2b, 0x1c)
+                } else {
+                    (0x33, 0x3c, 0x48)
+                };
                 push_rect(out, whole, bx, by, bw, bh, c4(tint, 255));
             }
-            let seg = [Seg::plain(glyph, if self.hover_caption == Some(2) && i == 2 {
-                (0xff, 0xff, 0xff)
-            } else {
-                (0xb6, 0xc2, 0xcf)
-            })];
+            let seg = [Seg::plain(
+                glyph,
+                if self.hover_caption == Some(2) && i == 2 {
+                    (0xff, 0xff, 0xff)
+                } else {
+                    (0xb6, 0xc2, 0xcf)
+                },
+            )];
             let gw = self.measure(&seg, false);
-            self.draw_run(&seg, false, out, whole,
-                          bx as f32 + (bw as f32 - gw) / 2.0, by + bh / 2 - self.cell_h as i32 / 2, 1.0);
+            self.draw_run(
+                &seg,
+                false,
+                out,
+                whole,
+                bx as f32 + (bw as f32 - gw) / 2.0,
+                by + bh / 2 - self.cell_h as i32 / 2,
+                1.0,
+            );
         }
 
         // the settings gear sits left of the window controls — discoverable
@@ -3378,9 +4504,15 @@ impl Renderer {
         }
         let seg = [Seg::plain("⚙", (0xb6, 0xc2, 0xcf))];
         let gw = self.measure(&seg, false);
-        self.draw_run(&seg, false, out, whole,
-                      bx as f32 + (bw as f32 - gw) / 2.0,
-                      by + (bh - self.cell_h.ceil() as i32) / 2, 1.0);
+        self.draw_run(
+            &seg,
+            false,
+            out,
+            whole,
+            bx as f32 + (bw as f32 - gw) / 2.0,
+            by + (bh - self.cell_h.ceil() as i32) / 2,
+            1.0,
+        );
     }
 
     /// Width of one caption button. Windows uses 46dip; match it so the
@@ -3397,17 +4529,26 @@ impl Renderer {
     }
 
     pub fn tab_control_hit(&self, width: usize, px: f64, py: f64) -> Option<usize> {
-        if self.bar_hidden { return None; }
-        self.tab_controls(width).iter().position(|&(x, y, w, h)|
-            px >= x as f64 && px < (x + w) as f64
-                && py >= y as f64 && py < (y + h) as f64)
+        if self.bar_hidden {
+            return None;
+        }
+        self.tab_controls(width).iter().position(|&(x, y, w, h)| {
+            px >= x as f64 && px < (x + w) as f64 && py >= y as f64 && py < (y + h) as f64
+        })
     }
 
     /// A shared viewport for rendering and hit testing. Keep the active tab
     /// visible, then fit its neighbours without entering the controls area.
-    pub fn tab_rects(&self, width: usize, titles: &[&str], active: usize) -> Vec<(usize, i32, i32)> {
+    pub fn tab_rects(
+        &self,
+        width: usize,
+        titles: &[&str],
+        active: usize,
+    ) -> Vec<(usize, i32, i32)> {
         let available = self.tab_controls(width)[0].0.max(0);
-        if titles.is_empty() || available == 0 { return Vec::new(); }
+        if titles.is_empty() || available == 0 {
+            return Vec::new();
+        }
         let active = active.min(titles.len() - 1);
         let mut start = active;
         let mut used = self.tab_width(titles[active]).min(available);
@@ -3419,7 +4560,9 @@ impl Renderer {
         let mut rects = Vec::new();
         for (i, title) in titles.iter().enumerate().skip(start) {
             let w = self.tab_width(title).min(available);
-            if x + w > available { break; }
+            if x + w > available {
+                break;
+            }
             rects.push((i, x, w));
             x += w;
         }
@@ -3442,7 +4585,12 @@ impl Renderer {
     pub fn settings_button_rect(&self, width: usize) -> Rect {
         let oy = self.tab_bar_h().round() as i32;
         let bw = (self.cell_w * 3.0).max(28.0) as i32;
-        (width as i32 - 3 * self.caption_btn_w() - bw - 4, 3, bw, oy - 6)
+        (
+            width as i32 - 3 * self.caption_btn_w() - bw - 4,
+            3,
+            bw,
+            oy - 6,
+        )
     }
 
     /// Is (px, py) on the settings-gear button? Never while the bar is
@@ -3471,10 +4619,15 @@ mod tests {
                     assert!(x >= 0 && y >= 0 && x + cw <= w as i32 && y + ch <= h as i32);
                     assert!(layout.rows.iter().any(|(index, _)| *index == selected));
                     for &(index, (rx, ry, rw, rh)) in &layout.rows {
-                        assert!(rh as f32 >= 22.4 * dpi * layout.text_scale,
-                            "palette row must fit its UI line height");
+                        assert!(
+                            rh as f32 >= 22.4 * dpi * layout.text_scale,
+                            "palette row must fit its UI line height"
+                        );
                         assert!(rx >= x && ry >= y && rx + rw <= x + cw && ry + rh <= y + ch);
-                        assert_eq!(layout.row_at((rx + rw / 2) as f64, (ry + rh / 2) as f64), Some(index));
+                        assert_eq!(
+                            layout.row_at((rx + rw / 2) as f64, (ry + rh / 2) as f64),
+                            Some(index)
+                        );
                     }
                     assert!(layout.row_at((x + 2) as f64, (y + 2) as f64).is_none());
                 }
@@ -3484,7 +4637,10 @@ mod tests {
 
     #[test]
     fn settings_remain_readable_when_terminal_font_is_eight() {
-        let cfg = crate::config::UserConfig { font_size: Some(8.0), ..Default::default() };
+        let cfg = crate::config::UserConfig {
+            font_size: Some(8.0),
+            ..Default::default()
+        };
         let mut small = Renderer::new(1.0, &cfg, 0.0);
         let normal = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
         let layout = small.settings_layout(1100, 700);
@@ -3506,42 +4662,96 @@ mod tests {
         r.mapping_context = Some((pane, 0));
         let cells = row_cells("ابحرم", 3);
         let mut out = Vec::new();
-        let cursor = r.draw_line_bidi(&mut out, pane, 30, 40, 300, &cells, true, Some(3), ParagraphDir::Default, None);
+        let cursor = r.draw_line_bidi(
+            &mut out,
+            pane,
+            30,
+            40,
+            300,
+            &cells,
+            true,
+            Some(3),
+            ParagraphDir::Default,
+            None,
+        );
         r.finish_pane_layout(pane);
-        assert!(cursor.is_some(), "restoration must not discard cursor mapping");
+        assert!(
+            cursor.is_some(),
+            "restoration must not discard cursor mapping"
+        );
         for ci in &cells {
             let spans = &r.cell_geometry[&(pane, 0, ci.col)];
             let (x, w, _) = spans[0];
-            assert_eq!(r.hit_cell(pane, 0, x as f64 + w as f64 / 2.0).map(|hit| hit.0), Some(ci.col));
+            assert_eq!(
+                r.hit_cell(pane, 0, x as f64 + w as f64 / 2.0)
+                    .map(|hit| hit.0),
+                Some(ci.col)
+            );
         }
         r.begin_frame();
-        assert!(r.hit_cell(pane, 0, 35.0).is_none(), "no stale hit map after a frame change");
+        assert!(
+            r.hit_cell(pane, 0, 35.0).is_none(),
+            "no stale hit map after a frame change"
+        );
     }
 
     #[test]
     fn claude_cursor_after_arabic_uses_the_logical_end() {
         let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
         let cells = row_cells("ابحرم", 3);
-        let cursor = r.draw_line_bidi(&mut Vec::new(), (0, 0, 500, 200),
-            30, 40, 300, &cells, true, Some(8), ParagraphDir::Default, None).unwrap();
-        assert_eq!(cursor.0, 30 - r.cell_w.round() as i32, "RTL insertion precedes the leftmost glyph");
+        let cursor = r
+            .draw_line_bidi(
+                &mut Vec::new(),
+                (0, 0, 500, 200),
+                30,
+                40,
+                300,
+                &cells,
+                true,
+                Some(8),
+                ParagraphDir::Default,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            cursor.0,
+            30 - r.cell_w.round() as i32,
+            "RTL insertion precedes the leftmost glyph"
+        );
     }
 
     #[test]
     fn claude_inverse_space_cursor_stays_attached_to_arabic_input() {
-        use alacritty_terminal::{event::VoidListener, term::{Config, Term}, vte::ansi::Processor};
+        use alacritty_terminal::{
+            event::VoidListener,
+            term::{Config, Term},
+            vte::ansi::Processor,
+        };
         let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
         let size = crate::term::TermSize { cols: 40, rows: 3 };
         let mut t = Term::new(Config::default(), &size, VoidListener);
         let mut p: Processor = Processor::new();
         p.advance(&mut t, "> ابحرم\x1b[7m \x1b[0m  \x1b[?25l".as_bytes());
         let pane = (0, 0, 600, 120);
-        let view = PaneView { rect: pane, focused: true,
-            cursor: crate::config::CursorStyle::Block, cursor_on: true,
-            bordered: false, claude: true, claude_from: None, reorder: true, line_dir: &[],
-            search_match: None, marks: &[], link_hover: None, link_tip: None };
+        let view = PaneView {
+            rect: pane,
+            focused: true,
+            cursor: crate::config::CursorStyle::Block,
+            cursor_on: true,
+            bordered: false,
+            claude: true,
+            claude_from: None,
+            reorder: true,
+            line_dir: &[],
+            search_match: None,
+            marks: &[],
+            link_hover: None,
+            link_tip: None,
+        };
         r.draw_pane(&mut Vec::new(), &view, &t);
-        let inverse = r.cell_geometry.get(&(pane, 0, 7))
+        let inverse = r
+            .cell_geometry
+            .get(&(pane, 0, 7))
             .expect("Claude's inverse cursor must use the shaped cell map")[0];
         assert_eq!(inverse.0, (2.0 * r.cell_w).round() as i32);
         for col in 2..7 {
@@ -3556,37 +4766,91 @@ mod tests {
         // leading cursor placeholder, but CSI positions the cursor by its
         // logical offset from column 2, not by the visual cell's column.
         let cells = row_cells(">  رشؤملاو ةيبرعلا رابتخا", 0);
-        assert_eq!(cells[24].c, 'ا', "fixture must match the live visual cell under CSI's cursor");
-        let cursor = r.draw_line_tui(&mut Vec::new(), (0, 0, 900, 120),
-            0, 40, &cells, true, Some(24), ParagraphDir::Default, None).unwrap();
-        assert!(cursor.0 <= (3.0 * r.cell_w).round() as i32,
-            "end cursor must be at the left edge of Arabic, got {cursor:?}");
-        let home = r.draw_line_tui(&mut Vec::new(), (0, 0, 900, 120),
-            0, 40, &cells, true, Some(2), ParagraphDir::Default, None).unwrap();
-        assert!(home.0 > cursor.0, "Home must reach the logical start on the right");
+        assert_eq!(
+            cells[24].c, 'ا',
+            "fixture must match the live visual cell under CSI's cursor"
+        );
+        let cursor = r
+            .draw_line_tui(
+                &mut Vec::new(),
+                (0, 0, 900, 120),
+                0,
+                40,
+                &cells,
+                true,
+                Some(24),
+                ParagraphDir::Default,
+                None,
+            )
+            .unwrap();
+        assert!(
+            cursor.0 <= (3.0 * r.cell_w).round() as i32,
+            "end cursor must be at the left edge of Arabic, got {cursor:?}"
+        );
+        let home = r
+            .draw_line_tui(
+                &mut Vec::new(),
+                (0, 0, 900, 120),
+                0,
+                40,
+                &cells,
+                true,
+                Some(2),
+                ParagraphDir::Default,
+                None,
+            )
+            .unwrap();
+        assert!(
+            home.0 > cursor.0,
+            "Home must reach the logical start on the right"
+        );
     }
 
     #[test]
     fn hidden_terminal_cursor_is_not_drawn_over_an_apps_own_cursor() {
-        use alacritty_terminal::{event::VoidListener, term::{Config, Term}, vte::ansi::Processor};
+        use alacritty_terminal::{
+            event::VoidListener,
+            term::{Config, Term},
+            vte::ansi::Processor,
+        };
         let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
         let size = crate::term::TermSize { cols: 30, rows: 3 };
         let mut t = Term::new(Config::default(), &size, VoidListener);
         let mut p: Processor = Processor::new();
         p.advance(&mut t, b"\x1b[?25lclaude");
-        let view = PaneView { rect: (0, 0, 500, 120), focused: true,
-            cursor: crate::config::CursorStyle::Block, cursor_on: true, bordered: false,
-            claude: true, claude_from: None, search_match: None, marks: &[], link_hover: None, link_tip: None,
-            reorder: true, line_dir: &[] };
+        let view = PaneView {
+            rect: (0, 0, 500, 120),
+            focused: true,
+            cursor: crate::config::CursorStyle::Block,
+            cursor_on: true,
+            bordered: false,
+            claude: true,
+            claude_from: None,
+            search_match: None,
+            marks: &[],
+            link_hover: None,
+            link_tip: None,
+            reorder: true,
+            line_dir: &[],
+        };
         let mut out = Vec::new();
         r.draw_pane(&mut out, &view, &t);
         assert!(!out.iter().any(|v| v.color == c4(r.fg, 170)));
     }
 
     fn row_cells(text: &str, start: usize) -> Vec<CellInfo> {
-        text.chars().enumerate().map(|(i, c)| CellInfo {
-            col: start + i, w: 1, c, zw: None, fg: FG, bg: BG, style: 0,
-        }).collect()
+        text.chars()
+            .enumerate()
+            .map(|(i, c)| CellInfo {
+                col: start + i,
+                w: 1,
+                c,
+                zw: None,
+                fg: FG,
+                bg: BG,
+                style: 0,
+            })
+            .collect()
     }
 
     #[test]
@@ -3595,10 +4859,22 @@ mod tests {
         let clip = (100, 20, 90, 150);
         let cells = row_cells("مَرْحَبًا بالعالم", 6);
         let mut out = Vec::new();
-        r.draw_line_tui(&mut out, clip, 100, 40, &cells, false, None, ParagraphDir::Default, None);
+        r.draw_line_tui(
+            &mut out,
+            clip,
+            100,
+            40,
+            &cells,
+            false,
+            None,
+            ParagraphDir::Default,
+            None,
+        );
         assert!(!out.is_empty());
-        assert!(out.iter().all(|v| v.pos[0] >= 100.0 && v.pos[0] <= 190.0
-            && v.pos[1] >= 20.0 && v.pos[1] <= 170.0));
+        assert!(out.iter().all(|v| v.pos[0] >= 100.0
+            && v.pos[0] <= 190.0
+            && v.pos[1] >= 20.0
+            && v.pos[1] <= 170.0));
     }
 
     #[test]
@@ -3617,13 +4893,36 @@ mod tests {
         let left = (2.0 * r.cell_w).round() as i32;
         let width = (7.0 * r.cell_w).round() as i32 - left;
         let mut actual = Vec::new();
-        r.draw_line_tui(&mut actual, clip, 0, 40, &cells, true, None, ParagraphDir::Default, None);
+        r.draw_line_tui(
+            &mut actual,
+            clip,
+            0,
+            40,
+            &cells,
+            true,
+            None,
+            ParagraphDir::Default,
+            None,
+        );
         let mut expected = Vec::new();
-        r.draw_line_bidi(&mut expected, (left, 0, width, 200), left, 40,
-            width, &logical, false, None, ParagraphDir::Default, None);
+        r.draw_line_bidi(
+            &mut expected,
+            (left, 0, width, 200),
+            left,
+            40,
+            width,
+            &logical,
+            false,
+            None,
+            ParagraphDir::Default,
+            None,
+        );
         assert!(!actual.is_empty());
-        let geometry = |out: Vec<Vertex>| out.into_iter()
-            .map(|v| (v.pos, v.uv, v.color, v.layer)).collect::<Vec<_>>();
+        let geometry = |out: Vec<Vertex>| {
+            out.into_iter()
+                .map(|v| (v.pos, v.uv, v.color, v.layer))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(geometry(actual), geometry(expected));
     }
 
@@ -3639,7 +4938,10 @@ mod tests {
                     let (bx, by, bw, bh) = rect;
                     assert!(bx >= x && by >= y && bw > 0 && bh >= 44);
                     assert!(bx + bw <= x + w && by + bh <= y + h);
-                    assert_eq!(lay.hit((bx + bw / 2) as f64, (by + bh / 2) as f64), Some(confirm));
+                    assert_eq!(
+                        lay.hit((bx + bw / 2) as f64, (by + bh / 2) as f64),
+                        Some(confirm)
+                    );
                 }
                 assert!(lay.close.0 + lay.close.2 <= lay.keep.0);
                 assert!(lay.text.1 + lay.text.3 <= lay.keep.1);
@@ -3653,13 +4955,21 @@ mod tests {
         let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
         let label = r.guard_label(&"أمر طويل جداً mixed-command ".repeat(100), 180.0);
         assert!(label.ends_with('…'));
-        let seg = [Seg { text: label, fg: r.fg, style: ST_BOLD }];
+        let seg = [Seg {
+            text: label,
+            fg: r.fg,
+            style: ST_BOLD,
+        }];
         assert!(r.measure(&seg, true) <= 180.0);
     }
 
     #[test]
     fn arabic_tui_text_does_not_move_an_anchored_status() {
-        use alacritty_terminal::{event::VoidListener, term::{Config, Term}, vte::ansi::Processor};
+        use alacritty_terminal::{
+            event::VoidListener,
+            term::{Config, Term},
+            vte::ansi::Processor,
+        };
         let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
         let size = crate::term::TermSize { cols: 80, rows: 4 };
         let mut status_x = |prefix: &str, claude: bool| {
@@ -3668,23 +4978,36 @@ mod tests {
             let mut processor: Processor = Processor::new();
             processor.advance(&mut t, bytes.as_bytes());
             let view = PaneView {
-                rect: (0, 0, 1000, 120), focused: false,
-                cursor: crate::config::CursorStyle::Block, cursor_on: false,
-                bordered: false, claude, claude_from: None, search_match: None,
-                marks: &[], link_hover: None, link_tip: None, reorder: true, line_dir: &[],
+                rect: (0, 0, 1000, 120),
+                focused: false,
+                cursor: crate::config::CursorStyle::Block,
+                cursor_on: false,
+                bordered: false,
+                claude,
+                claude_from: None,
+                search_match: None,
+                marks: &[],
+                link_hover: None,
+                link_tip: None,
+                reorder: true,
+                line_dir: &[],
             };
             let mut out = Vec::new();
             r.draw_pane(&mut out, &view, &t);
             let red = c4(r.ansi_rgb(AnsiColor::Named(NamedColor::Red)), 255);
-            out.iter().filter(|v| v.color == red)
-                .map(|v| v.pos[0]).fold(f32::INFINITY, f32::min)
+            out.iter()
+                .filter(|v| v.color == red)
+                .map(|v| v.pos[0])
+                .fold(f32::INFINITY, f32::min)
         };
         for claude in [false, true] {
             let expected = status_x("", claude);
             let actual = status_x("مرحبا بالعالم", claude);
             assert!(expected.is_finite() && actual.is_finite());
-            assert!((expected - actual).abs() <= 1.0,
-                "Arabic moved the status from {expected} to {actual}, claude={claude}");
+            assert!(
+                (expected - actual).abs() <= 1.0,
+                "Arabic moved the status from {expected} to {actual}, claude={claude}"
+            );
         }
     }
 
@@ -3708,12 +5031,18 @@ mod tests {
     fn tab_controls_hit_the_drawn_buttons_and_hide_with_the_bar() {
         let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
         for (i, (x, y, w, h)) in r.tab_controls(800).into_iter().enumerate() {
-            assert_eq!(r.tab_control_hit(800, (x + w / 2) as f64, (y + h / 2) as f64), Some(i));
+            assert_eq!(
+                r.tab_control_hit(800, (x + w / 2) as f64, (y + h / 2) as f64),
+                Some(i)
+            );
         }
         assert_eq!(r.tab_control_hit(800, 10.0, 10.0), None);
         let (x, y, w, h) = r.tab_controls(800)[2];
         r.set_bar_hidden(true);
-        assert_eq!(r.tab_control_hit(800, (x + w / 2) as f64, (y + h / 2) as f64), None);
+        assert_eq!(
+            r.tab_control_hit(800, (x + w / 2) as f64, (y + h / 2) as f64),
+            None
+        );
     }
 
     /// Arabic must shape to real glyphs (no .notdef) through the fallback
@@ -3732,8 +5061,15 @@ mod tests {
         let run = b.layout_runs().next().expect("one layout run");
         assert!(!run.glyphs.is_empty(), "no glyphs laid out at all");
         let notdef = run.glyphs.iter().filter(|g| g.glyph_id == 0).count();
-        assert_eq!(notdef, 0, ".notdef glyphs: Arabic fell through the fallback");
-        assert!(run.line_w > 10.0, "line width {} suspiciously small", run.line_w);
+        assert_eq!(
+            notdef, 0,
+            ".notdef glyphs: Arabic fell through the fallback"
+        );
+        assert!(
+            run.line_w > 10.0,
+            "line width {} suspiciously small",
+            run.line_w
+        );
     }
 
     /// Latin text must keep working through the same path.
@@ -3797,7 +5133,10 @@ mod tests {
         let parts = crate::link::host_tooltip("https://1.2.3.4/א/github.com/ا/login");
         let line = status_line_text(&parts, 80);
         assert!(line.starts_with("https://1.2.3.4"), "{line}");
-        assert!(line.contains('\u{2066}') && line.contains('\u{2069}'), "{line}");
+        assert!(
+            line.contains('\u{2066}') && line.contains('\u{2069}'),
+            "{line}"
+        );
         let key = r.ensure_shaped_dir(&[Seg::plain(line.clone(), FG)], false, true);
         let buffer = &r.cache_hot[&key].buffer;
         assert_eq!(buffer.is_rtl(0), Some(false));
@@ -3935,7 +5274,14 @@ mod tests {
                 .collect()
         };
         // non-Claude: the grid IS logical, byte 0 is column 0
-        let logical = bidi_plan(&cells("مرحبا"), false, (1, 1, 1), None, ParagraphDir::Default).unwrap();
+        let logical = bidi_plan(
+            &cells("مرحبا"),
+            false,
+            (1, 1, 1),
+            None,
+            ParagraphDir::Default,
+        )
+        .unwrap();
         assert_eq!(logical.byte_cols[0].2, 0);
         assert_eq!(logical.byte_cols.last().unwrap().2, 4);
         assert_eq!(logical.first_blank, 5);
@@ -3944,7 +5290,14 @@ mod tests {
         // Restoration yields مرحبا; its first char (م) is grid column 4
         // and its last char (ا) is grid column 0 — the left of the screen
         // once cosmic-text shapes the restored line.
-        let claude = bidi_plan(&cells("ابحرم"), true, (1, 1, 1), None, ParagraphDir::Default).unwrap();
+        let claude = bidi_plan(
+            &cells("ابحرم"),
+            true,
+            (1, 1, 1),
+            None,
+            ParagraphDir::Default,
+        )
+        .unwrap();
         assert_eq!(claude.segs.len(), 1);
         assert_eq!(claude.segs[0].text, "مرحبا");
         assert_eq!(claude.byte_cols[0].2, 4);
@@ -3987,10 +5340,10 @@ mod tests {
     #[test]
     fn arabic_detection_ranges() {
         assert!(is_arabic('م'));
-        assert!(is_arabic('ﻻ'));  // presentation form
+        assert!(is_arabic('ﻻ')); // presentation form
         assert!(!is_arabic('a'));
         assert!(!is_arabic('\u{e0b0}')); // powerline triangle -> grid path
-        assert!(!is_arabic('─'));        // box drawing -> grid path
+        assert!(!is_arabic('─')); // box drawing -> grid path
     }
 }
 
@@ -4051,10 +5404,21 @@ mod cache_tests {
         let normal = r.tab_width("Admin");
         let huge = r.tab_width(&"x".repeat(200));
         // clamped at both ends
-        assert_eq!(short, (r.ui_cell_w() * TAB_MIN_CELLS) as i32, "short titles hit the floor");
-        assert_eq!(huge, (r.ui_cell_w() * TAB_CELLS) as i32, "long titles hit the ceiling");
+        assert_eq!(
+            short,
+            (r.ui_cell_w() * TAB_MIN_CELLS) as i32,
+            "short titles hit the floor"
+        );
+        assert_eq!(
+            huge,
+            (r.ui_cell_w() * TAB_CELLS) as i32,
+            "long titles hit the ceiling"
+        );
         // and vary in between, which is the whole point of M26
-        assert!(normal > short && normal < huge, "Admin={normal} short={short} huge={huge}");
+        assert!(
+            normal > short && normal < huge,
+            "Admin={normal} short={short} huge={huge}"
+        );
         // monotonic: a longer title is never narrower
         let mut last = 0;
         for n in 1..40 {
@@ -4082,7 +5446,11 @@ mod cache_tests {
         r.measure(&b, false);
         assert_eq!(r.cache_hot.len(), 2, "a different color is a new run");
         // bold is a different run too (and usually a different width)
-        let bold = [Seg { text: "hello بيان".into(), fg: FG, style: ST_BOLD }];
+        let bold = [Seg {
+            text: "hello بيان".into(),
+            fg: FG,
+            style: ST_BOLD,
+        }];
         r.measure(&bold, false);
         assert_eq!(r.cache_hot.len(), 3, "a different style is a new run");
         // alignment is part of the key too
@@ -4131,10 +5499,12 @@ mod cache_tests {
         // a ligature keeps per-cell advances: natw stays n_cells x cell_w
         // (that's what makes programming ligatures terminal-safe)
         let natw = r.measure(&[Seg::plain("a -> b", FG)], false);
-        assert!((natw - 6.0 * r.cell_w).abs() <= 1.0, "natw {natw} left the grid");
+        assert!(
+            (natw - 6.0 * r.cell_w).abs() <= 1.0,
+            "natw {natw} left the grid"
+        );
         let fam = r.family.clone();
-        if fam.contains("Cascadia") || fam.contains("Fira") || fam.contains("JetBrains")
-        {
+        if fam.contains("Cascadia") || fam.contains("Fira") || fam.contains("JetBrains") {
             let arrow = glyph_ids(&mut r, "->");
             let mut apart = glyph_ids(&mut r, "-");
             apart.extend(glyph_ids(&mut r, ">"));
@@ -4171,8 +5541,16 @@ mod cache_tests {
         // foreground, and the keyword white.
         assert_eq!(BG, (0x06, 0x26, 0x26), "measured background");
         assert_eq!(FG, (0xc2, 0xb7, 0x96), "measured foreground tan");
-        assert_eq!(PALETTE[2], (0x62, 0xcc, 0x54), "darker grass green (comments)");
-        assert_eq!(PALETTE[6], (0x58, 0xd1, 0xc0), "lighter mint (strings, types)");
+        assert_eq!(
+            PALETTE[2],
+            (0x62, 0xcc, 0x54),
+            "darker grass green (comments)"
+        );
+        assert_eq!(
+            PALETTE[6],
+            (0x58, 0xd1, 0xc0),
+            "lighter mint (strings, types)"
+        );
         assert_eq!(PALETTE[15], (0xee, 0xfb, 0xfa), "keyword white");
         // and THEMES[0] must be that same scheme, since it is the first look
         assert_eq!(THEMES[0].name, "Jonathan Blow");
@@ -4189,7 +5567,10 @@ mod cache_tests {
         assert_eq!(r.bg, dracula.bg, "theme bg must reach the renderer");
         assert_eq!(r.fg, dracula.fg);
         assert_eq!(r.palette, dracula.palette);
-        assert_eq!(r.ansi_rgb(AnsiColor::Named(NamedColor::Red)), dracula.palette[1]);
+        assert_eq!(
+            r.ansi_rgb(AnsiColor::Named(NamedColor::Red)),
+            dracula.palette[1]
+        );
 
         // an explicit bg overrides the theme (config precedence)
         cfg.bg = Some("#123456".into());
@@ -4208,7 +5589,10 @@ mod cache_tests {
     /// ligature-capable default doesn't sneak substitutions in later).
     #[test]
     fn ligatures_off_prefers_a_mono_family() {
-        let cfg = crate::config::UserConfig { ligatures: Some(false), ..Default::default() };
+        let cfg = crate::config::UserConfig {
+            ligatures: Some(false),
+            ..Default::default()
+        };
         let r = Renderer::new(1.0, &cfg, 0.0);
         assert!(!r.ligatures);
         // the picked family is the first installed MONO candidate (or a
@@ -4267,25 +5651,41 @@ mod cache_tests {
         // every control is a distinct rect, inside the card, and none of
         // them overlap (each row's controls sit in their own band)
         let mut controls: Vec<Rect> = vec![
-            lay.font_prev, lay.font_next,
-            lay.size_minus, lay.size_plus,
-            lay.scroll_minus, lay.scroll_plus,
-            lay.copy_toggle, lay.liga_toggle,
-            lay.pad_minus, lay.pad_plus,
-            lay.opacity_minus, lay.opacity_plus,
-            lay.shell_prev, lay.shell_next,
-            lay.bar_toggle, lay.close_toggle, lay.blink_toggle, lay.notif_toggle,
+            lay.font_prev,
+            lay.font_next,
+            lay.size_minus,
+            lay.size_plus,
+            lay.scroll_minus,
+            lay.scroll_plus,
+            lay.copy_toggle,
+            lay.liga_toggle,
+            lay.pad_minus,
+            lay.pad_plus,
+            lay.opacity_minus,
+            lay.opacity_plus,
+            lay.shell_prev,
+            lay.shell_next,
+            lay.bar_toggle,
+            lay.close_toggle,
+            lay.blink_toggle,
+            lay.notif_toggle,
         ];
         controls.extend(lay.cursor_btns);
         controls.extend(lay.bell_btns);
         for (i, &(rx, ry, rw, rh)) in controls.iter().enumerate() {
-            assert!(rx >= cx && rx + rw <= cx + cw && ry >= cy && ry + rh <= cy + ch,
-                    "control {i} escapes the card");
+            assert!(
+                rx >= cx && rx + rw <= cx + cw && ry >= cy && ry + rh <= cy + ch,
+                "control {i} escapes the card"
+            );
             assert!(rect_hit(controls[i], (rx + 2) as f64, (ry + 2) as f64));
             for &other in &controls[i + 1..] {
                 let (ox, oy, ow, oh) = other;
                 let disjoint = rx + rw <= ox || ox + ow <= rx || ry + rh <= oy || oy + oh <= ry;
-                assert!(disjoint, "controls overlap: {:?} vs {:?}", controls[i], other);
+                assert!(
+                    disjoint,
+                    "controls overlap: {:?} vs {:?}",
+                    controls[i], other
+                );
             }
         }
         // a point in the first tile does NOT hit the +/− or toggle
@@ -4303,12 +5703,20 @@ mod cache_tests {
         let small = Renderer::new(1.0, &cfg, 0.0);
         let big = Renderer::new(1.0, &cfg, 14.0);
         assert!(big.cell_h > small.cell_h, "the terminal font did grow");
-        assert_eq!(small.ui_cell_h(), big.ui_cell_h(), "chrome metrics are fixed");
+        assert_eq!(
+            small.ui_cell_h(),
+            big.ui_cell_h(),
+            "chrome metrics are fixed"
+        );
 
         let (fw, fh) = (1400usize, 900usize);
         let a = small.settings_layout(fw, fh);
         let b = big.settings_layout(fw, fh);
-        assert_eq!((a.card.2, a.card.3), (b.card.2, b.card.3), "card size moved");
+        assert_eq!(
+            (a.card.2, a.card.3),
+            (b.card.2, b.card.3),
+            "card size moved"
+        );
         assert_eq!((a.rowh, a.head_h), (b.rowh, b.head_h), "row height moved");
         for (ta, tb) in a.theme_tiles.iter().zip(&b.theme_tiles) {
             assert_eq!((ta.2, ta.3), (tb.2, tb.3), "theme tile size moved");
@@ -4326,7 +5734,10 @@ mod cache_tests {
         assert_eq!((sa.card.2, sa.card.3), (sb.card.2, sb.card.3));
         assert_eq!(sa.rowh, sb.rowh);
         // and the whole shortcuts ledger still fits on screen at 29pt
-        assert!(sb.card.1 + sb.card.3 <= fh as i32, "the editor runs off-screen");
+        assert!(
+            sb.card.1 + sb.card.3 <= fh as i32,
+            "the editor runs off-screen"
+        );
     }
 
     /// The shortcuts editor layout: one clickable strip per action, all
@@ -4393,7 +5804,10 @@ mod cache_tests {
         let (cx, _, cw, _) = lay.card;
         let label_reserve = (r.ui_cell_w() * 6.0) as i32;
         let last = lay.theme_tiles[lay.theme_tiles.len() - 1];
-        assert!(gallery().len() >= 8, "this test assumes the eighth theme exists");
+        assert!(
+            gallery().len() >= 8,
+            "this test assumes the eighth theme exists"
+        );
         assert!(
             last.0 + last.2 <= cx + cw - 24 - label_reserve,
             "the last tile ends at {} but the label starts at {}",
@@ -4427,7 +5841,10 @@ mod cache_tests {
                 claude_from: None,
                 search_match: None,
                 marks: &[],
-                link_hover: None, link_tip: None, reorder: true, line_dir: &[],
+                link_hover: None,
+                link_tip: None,
+                reorder: true,
+                line_dir: &[],
             };
             // an underline is a solid quad (page 0, white texel) th px tall
             let th = (r.cell_h / 14.0).max(1.0) as i32;
@@ -4441,8 +5858,14 @@ mod cache_tests {
                 .count()
         };
         let plain = count_rows(&mut r, "\u{645}\u{631}\u{62d}\u{628}\u{627}".as_bytes());
-        let underlined = count_rows(&mut r, "\x1b[4m\u{645}\u{631}\u{62d}\u{628}\u{627}\x1b[0m".as_bytes());
-        assert!(underlined > plain, "no underline quads on the Arabic row ({underlined} vs {plain})");
+        let underlined = count_rows(
+            &mut r,
+            "\x1b[4m\u{645}\u{631}\u{62d}\u{628}\u{627}\x1b[0m".as_bytes(),
+        );
+        assert!(
+            underlined > plain,
+            "no underline quads on the Arabic row ({underlined} vs {plain})"
+        );
     }
 
     /// A tab with OSC 9;4 progress draws its bar (track + fill) and the
@@ -4452,7 +5875,11 @@ mod cache_tests {
         use crate::term::{Progress, ProgressState};
         let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
         let tab = |p: Option<Progress>| TabInfo {
-            title: "claude".into(), busy: false, attention: false, active: true, progress: p,
+            title: "claude".into(),
+            busy: false,
+            attention: false,
+            active: true,
+            progress: p,
         };
         // the bar's quads: 3px tall, on the tab's bottom edge (track, then fill)
         let bar_y = r.tab_bar_h().round() - 3.0;
@@ -4465,26 +5892,64 @@ mod cache_tests {
                 .collect()
         };
         assert!(quads(&mut r, None).is_empty(), "no bar without progress");
-        let half = quads(&mut r, Some(Progress { state: ProgressState::Normal, percent: 50 }));
-        let full = quads(&mut r, Some(Progress { state: ProgressState::Normal, percent: 100 }));
+        let half = quads(
+            &mut r,
+            Some(Progress {
+                state: ProgressState::Normal,
+                percent: 50,
+            }),
+        );
+        let full = quads(
+            &mut r,
+            Some(Progress {
+                state: ProgressState::Normal,
+                percent: 100,
+            }),
+        );
         assert_eq!(half.len(), 2, "track + fill");
         let (w50, _) = half[1];
         let (w100, c100) = full[1];
         assert!((w100 - 2.0 * w50).abs() <= 2.0, "50%={w50} 100%={w100}");
         assert_eq!(w100, full[0].0, "100% fills the track");
         assert_eq!(c100, c4((0x2e, 0xa0, 0x43), 255), "working = green");
-        let err = quads(&mut r, Some(Progress { state: ProgressState::Error, percent: 30 }));
+        let err = quads(
+            &mut r,
+            Some(Progress {
+                state: ProgressState::Error,
+                percent: 30,
+            }),
+        );
         assert_eq!(err[1].1, c4((0xcf, 0x22, 0x2e), 255), "error = red");
-        let ind = quads(&mut r, Some(Progress { state: ProgressState::Indeterminate, percent: 0 }));
+        let ind = quads(
+            &mut r,
+            Some(Progress {
+                state: ProgressState::Indeterminate,
+                percent: 0,
+            }),
+        );
         assert_eq!(ind[1].0, ind[0].0, "indeterminate spans the track");
-        assert_eq!(progress_label(Progress { state: ProgressState::Paused, percent: 5 }), "⏸ 5%");
+        assert_eq!(
+            progress_label(Progress {
+                state: ProgressState::Paused,
+                percent: 5
+            }),
+            "⏸ 5%"
+        );
     }
 
     /// Solid rects always reference page 0 (the white texel lives there).
     #[test]
     fn solid_rects_target_page_zero() {
         let mut out = Vec::new();
-        push_rect(&mut out, (0, 0, 100, 100), 10, 10, 20, 20, [1.0, 0.0, 0.0, 1.0]);
+        push_rect(
+            &mut out,
+            (0, 0, 100, 100),
+            10,
+            10,
+            20,
+            20,
+            [1.0, 0.0, 0.0, 1.0],
+        );
         assert!(out.iter().all(|v| v.layer == 0.0));
     }
 
@@ -4493,7 +5958,12 @@ mod cache_tests {
     fn measure_cache_speedup_probe() {
         let mut r = test_renderer();
         let rows: Vec<[Seg; 1]> = (0..40)
-            .map(|i| [Seg::plain(format!("line {i} of some shell output مع عربية"), FG)])
+            .map(|i| {
+                [Seg::plain(
+                    format!("line {i} of some shell output مع عربية"),
+                    FG,
+                )]
+            })
             .collect();
         let t0 = Instant::now();
         for row in &rows {
@@ -4508,8 +5978,10 @@ mod cache_tests {
         }
         let warm_100 = t1.elapsed();
         eprintln!("PROBE shape 40 rows cold  = {cold:?}");
-        eprintln!("PROBE 100 cached frames   = {warm_100:?} (per frame: {:?})",
-                  warm_100 / 100);
+        eprintln!(
+            "PROBE 100 cached frames   = {warm_100:?} (per frame: {:?})",
+            warm_100 / 100
+        );
     }
 }
 
@@ -4532,12 +6004,21 @@ mod startup_probe {
         let t3 = Instant::now();
         let mut b = Buffer::new(&mut fs, Metrics::new(15.0, 21.0));
         b.set_size(Some(100.0), Some(21.0));
-        b.set_text("M", &Attrs::new().family(Family::Name(&fam)), Shaping::Advanced, None);
+        b.set_text(
+            "M",
+            &Attrs::new().family(Family::Name(&fam)),
+            Shaping::Advanced,
+            None,
+        );
         b.shape_until_scroll(&mut fs, false);
         let t_first_shape = t3.elapsed();
         eprintln!("PROBE FontSystem::new = {:?}", t_fontsystem);
         eprintln!("PROBE load amiri      = {:?}", t_amiri);
-        eprintln!("PROBE pick_family     = {:?} (faces: {})", t_pick, fs.db().faces().count());
+        eprintln!(
+            "PROBE pick_family     = {:?} (faces: {})",
+            t_pick,
+            fs.db().faces().count()
+        );
         eprintln!("PROBE first shape     = {:?}", t_first_shape);
     }
 }

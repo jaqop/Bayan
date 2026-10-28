@@ -28,7 +28,10 @@ const PTY_READ: usize = 64 * 1024;
 /// pwsh when present, cmd, Git Bash, and every WSL distribution. Ported from
 /// EasyTer, whose generator this mirrors.
 pub fn shell_choices() -> Vec<String> {
-    crate::shells::detect().into_iter().map(|s| s.command).collect()
+    crate::shells::detect()
+        .into_iter()
+        .map(|s| s.command)
+        .collect()
 }
 
 /// The directory Bayan itself was started in — a shortcut's "Start in" field,
@@ -55,7 +58,10 @@ fn launcher_dir() -> Option<String> {
 /// Case-insensitive "is `path` inside `root`" — Windows paths are not
 /// case-sensitive, so a plain starts_with would miss `c:\windows\system32`.
 fn is_under(path: &str, root: &str) -> bool {
-    let (p, r) = (path.to_lowercase().replace('/', "\\"), root.to_lowercase().replace('/', "\\"));
+    let (p, r) = (
+        path.to_lowercase().replace('/', "\\"),
+        root.to_lowercase().replace('/', "\\"),
+    );
     let r = r.trim_end_matches('\\');
     p == r || p.starts_with(&format!("{r}\\"))
 }
@@ -92,7 +98,10 @@ pub fn split_command(cmd: &str) -> (String, Vec<String>) {
         return (c[..end].to_string(), split_args(&c[end..]));
     }
     let mut it = c.split_whitespace();
-    (it.next().unwrap_or(c).to_string(), it.map(str::to_string).collect())
+    (
+        it.next().unwrap_or(c).to_string(),
+        it.map(str::to_string).collect(),
+    )
 }
 
 /// OSC 133 prompt wrapper injected into PowerShell (EasyTer's __et_wrap,
@@ -124,7 +133,8 @@ $([char]27)]9;9;$($PWD.ProviderPath)$([char]7)$(__by_osc7)\"\
 /// nonce keeps the old "any A/D" rule for tests. cmd/clink has no 133 marks;
 /// its OSC 7 is still accepted while the pane is already idle.
 pub(crate) fn shell_integration_ps(nonce: &str) -> String {
-    let mut s = String::with_capacity(PS_HEAD.len() + PS_MID.len() + PS_TAIL.len() + nonce.len() * 2);
+    let mut s =
+        String::with_capacity(PS_HEAD.len() + PS_MID.len() + PS_TAIL.len() + nonce.len() * 2);
     s.push_str(PS_HEAD);
     s.push_str(nonce);
     s.push_str(PS_MID);
@@ -142,6 +152,7 @@ extern "system" {
 
 fn fresh_prompt_nonce() -> String {
     let mut bytes = [0u8; 16];
+    // SAFETY: the length passed is `bytes`'s own, so the write stays in bounds.
     let ok = unsafe { SystemFunction036(bytes.as_mut_ptr().cast(), bytes.len() as u32) != 0 };
     if !ok {
         let tick = std::time::SystemTime::now()
@@ -314,13 +325,29 @@ fn parse_progress(payload: &[u8]) -> Option<Option<Progress>> {
     let s = std::str::from_utf8(payload).ok()?;
     let mut it = s.split(';');
     let st: u8 = it.next()?.trim().parse().ok()?;
-    let pr: u8 = it.next().and_then(|p| p.trim().parse().ok()).unwrap_or(0).min(100);
+    let pr: u8 = it
+        .next()
+        .and_then(|p| p.trim().parse().ok())
+        .unwrap_or(0)
+        .min(100);
     Some(match st {
         0 => None,
-        1 => Some(Progress { state: ProgressState::Normal, percent: pr }),
-        2 => Some(Progress { state: ProgressState::Error, percent: pr }),
-        3 => Some(Progress { state: ProgressState::Indeterminate, percent: 0 }),
-        4 => Some(Progress { state: ProgressState::Paused, percent: pr }),
+        1 => Some(Progress {
+            state: ProgressState::Normal,
+            percent: pr,
+        }),
+        2 => Some(Progress {
+            state: ProgressState::Error,
+            percent: pr,
+        }),
+        3 => Some(Progress {
+            state: ProgressState::Indeterminate,
+            percent: 0,
+        }),
+        4 => Some(Progress {
+            state: ProgressState::Paused,
+            percent: pr,
+        }),
         _ => return None,
     })
 }
@@ -385,7 +412,14 @@ fn scan_notify(data: &[u8]) -> Option<(String, String)> {
             let is_title = meta.split(':').any(|kv| kv == "p=title");
             let body = text(&payload[k + 1..]);
             if !body.is_empty() {
-                consider(s, if is_title { (body, String::new()) } else { ("Bayan".to_string(), body) });
+                consider(
+                    s,
+                    if is_title {
+                        (body, String::new())
+                    } else {
+                        ("Bayan".to_string(), body)
+                    },
+                );
             }
         }
         i = e.max(s);
@@ -575,7 +609,9 @@ fn scan_osc52(data: &[u8]) -> Option<String> {
     if encoded.len() > max_encoded {
         return None;
     }
-    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
     if bytes.is_empty() || bytes.len() > OSC52_MAX_BYTES {
         return None;
     }
@@ -617,7 +653,9 @@ pub fn accept_local_cwd(raw: &str) -> Option<String> {
     if s.is_empty() || s.chars().count() > MAX_CWD_CHARS {
         return None;
     }
-    if s.chars().any(|c| c.is_control() || crate::osc7::is_bidi_control(c)) {
+    if s.chars()
+        .any(|c| c.is_control() || crate::osc7::is_bidi_control(c))
+    {
         return None;
     }
     // A comma or a quote breaks out of `explorer /select,"<path>"`.
@@ -767,6 +805,7 @@ fn drive_root_is_local(path: &str) -> bool {
     // DRIVE_REMOTE is 4. The constant lives in Win32_System_WindowsProgramming,
     // which this crate does not enable; the value is the Win32 one.
     const DRIVE_REMOTE: u32 = 4;
+    // SAFETY: `wide` comes from `wide_nul`, so it is NUL-terminated.
     unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(wide.as_ptr()) != DRIVE_REMOTE }
 }
 
@@ -775,6 +814,7 @@ fn is_reparse_point(path: &str) -> bool {
         GetFileAttributesW, FILE_ATTRIBUTE_REPARSE_POINT,
     };
     let wide = wide_nul(path);
+    // SAFETY: `wide` comes from `wide_nul`, so it is NUL-terminated.
     let attr = unsafe { GetFileAttributesW(wide.as_ptr()) };
     attr != u32::MAX && attr & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
@@ -1019,8 +1059,11 @@ fn handle_osc133<T: EventListener>(
         b'B' => {
             meta.at_prompt = true;
             meta.prompt_col = Some(t.grid().cursor.point.column.0);
-            meta.prompt_abs = Some(meta.evicted + t.grid().history_size() as u64
-                + t.grid().cursor.point.line.0.max(0) as u64);
+            meta.prompt_abs = Some(
+                meta.evicted
+                    + t.grid().history_size() as u64
+                    + t.grid().cursor.point.line.0.max(0) as u64,
+            );
         }
         _ => {}
     }
@@ -1117,7 +1160,10 @@ fn kitty_seq_at(data: &[u8], i: usize) -> Option<KittySeq> {
     // is a query. The strict scanner misses the NUL, and with the protocol
     // off the parser will not answer, so this has to.
     let end = kitty_query_with_c0(data, i)?;
-    Some(KittySeq { end, kind: KittySeqKind::Query })
+    Some(KittySeq {
+        end,
+        kind: KittySeqKind::Query,
+    })
 }
 
 /// `0x00..=0x17`, `0x19`, `0x1C..=0x1F`. CAN, SUB and ESC abort the CSI.
@@ -1172,7 +1218,10 @@ fn kitty_seq_strict(data: &[u8], i: usize) -> Option<KittySeq> {
 
 /// vte treats a missing or zero parameter as the default, which for pop is 1.
 fn kitty_pop_count(params: &[u8]) -> u16 {
-    let end = params.iter().position(|&b| b == b';').unwrap_or(params.len());
+    let end = params
+        .iter()
+        .position(|&b| b == b';')
+        .unwrap_or(params.len());
     if end == 0 {
         return 1;
     }
@@ -1586,23 +1635,35 @@ pub(crate) fn capture_command_core<T: EventListener>(t: &Term<T>, meta: &mut Ses
     for line in first as i32..=cur.line.0 {
         let row = &t.grid()[alacritty_terminal::index::Line(line)];
         let start = if line == first as i32 { pcol } else { 0 };
-        let end = if line == cur.line.0 { cur.column.0 } else { t.columns() };
+        let end = if line == cur.line.0 {
+            cur.column.0
+        } else {
+            t.columns()
+        };
         for c in start..end {
             let cell = &row[Column(c)];
-            if cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER) {
+            if cell
+                .flags
+                .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER)
+            {
                 continue;
             }
             s.push(cell.c);
-            if let Some(marks) = cell.zerowidth() { s.extend(marks); }
+            if let Some(marks) = cell.zerowidth() {
+                s.extend(marks);
+            }
         }
     }
     let s = s.trim();
     if !s.is_empty() {
         meta.running_cmd = s.to_string();
         if crate::bidi::cmd_is_claude(s)
-            && !s.split_whitespace().any(|arg| matches!(arg, "-p" | "--print")) {
-            meta.clean_claude_after = Some(meta.evicted + t.grid().history_size() as u64
-                + cur.line.0.max(0) as u64 + 1);
+            && !s
+                .split_whitespace()
+                .any(|arg| matches!(arg, "-p" | "--print"))
+        {
+            meta.clean_claude_after =
+                Some(meta.evicted + t.grid().history_size() as u64 + cur.line.0.max(0) as u64 + 1);
             meta.claude_from_abs = meta.clean_claude_after;
         }
         meta.cmd_started = Some(std::time::Instant::now());
@@ -2386,7 +2447,9 @@ mod tests {
         assert!(wrapped.contains('\r'));
         assert!(!submits_a_command(wrapped.as_bytes()));
         // an UNbracketed multi-line paste really does run lines: still a submit
-        assert!(submits_a_command(normalize_paste("a\nb\n", false).as_bytes()));
+        assert!(submits_a_command(
+            normalize_paste("a\nb\n", false).as_bytes()
+        ));
     }
 
     #[test]
@@ -2400,7 +2463,10 @@ mod tests {
         assert_eq!(needs_paste_guard("rm -rf x\n").map(|g| g.lines), Some(1));
         let huge = "x".repeat(3000);
         assert_eq!(needs_paste_guard(&huge).map(|g| g.lines), Some(1));
-        assert_eq!(needs_paste_guard(&huge).map(|g| g.risk), Some(PasteRisk::TooLong));
+        assert_eq!(
+            needs_paste_guard(&huge).map(|g| g.risk),
+            Some(PasteRisk::TooLong)
+        );
     }
 
     /// BAYAN-002: CR is Enter. A short CR-separated paste must ask, and so
@@ -2473,8 +2539,15 @@ mod tests {
             assert_eq!(normalize_paste(&text, false), "abcd");
             assert_eq!(paste_preview(&text, 48), format!("ab{label}cd"));
         }
-        assert_eq!(needs_paste_guard("a\u{200D}b\u{200C}c"), None, "ZWJ and ZWNJ stay");
-        assert_eq!(normalize_paste("a\u{200D}b\u{200C}c", false), "a\u{200D}b\u{200C}c");
+        assert_eq!(
+            needs_paste_guard("a\u{200D}b\u{200C}c"),
+            None,
+            "ZWJ and ZWNJ stay"
+        );
+        assert_eq!(
+            normalize_paste("a\u{200D}b\u{200C}c", false),
+            "a\u{200D}b\u{200C}c"
+        );
     }
 
     /// Arabic copied from the web is full of LRM, RLM, and ALM. Those marks
@@ -2484,7 +2557,11 @@ mod tests {
         let text = "السلام\u{200E} عليكم\u{200F} و\u{061C}رحمة";
         assert_eq!(needs_paste_guard(text), None);
         assert_eq!(normalize_paste(text, false), text);
-        for (c, label) in [('\u{200E}', "<LRM>"), ('\u{200F}', "<RLM>"), ('\u{061C}', "<ALM>")] {
+        for (c, label) in [
+            ('\u{200E}', "<LRM>"),
+            ('\u{200F}', "<RLM>"),
+            ('\u{061C}', "<ALM>"),
+        ] {
             let marked = format!("مرحبا{c}بك");
             assert_eq!(needs_paste_guard(&marked), None, "{label}");
             assert_eq!(normalize_paste(&marked, false), marked);
@@ -2529,7 +2606,11 @@ mod tests {
             Some(r"'C:\My Files\$(calc).txt' ")
         );
         assert_eq!(
-            dropped_path_arg(Path::new(r"C:\tmp\a`ncalc.txt"), "powershell.exe -NoProfile").as_deref(),
+            dropped_path_arg(
+                Path::new(r"C:\tmp\a`ncalc.txt"),
+                "powershell.exe -NoProfile"
+            )
+            .as_deref(),
             Some(r"'C:\tmp\a`ncalc.txt' ")
         );
         assert_eq!(
@@ -2552,12 +2633,21 @@ mod tests {
             Some(r#""C:\." "#)
         );
         assert_eq!(
-            dropped_path_arg(Path::new(r"C:\tmp\a&calc.exe"), r"C:\Windows\System32\cmd.exe")
-                .as_deref(),
+            dropped_path_arg(
+                Path::new(r"C:\tmp\a&calc.exe"),
+                r"C:\Windows\System32\cmd.exe"
+            )
+            .as_deref(),
             Some(r#""C:\tmp\a&calc.exe" "#)
         );
-        assert_eq!(dropped_path_arg(Path::new(r"C:\tmp\%COMSPEC%.txt"), "cmd.exe"), None);
-        assert_eq!(dropped_path_arg(Path::new(r"C:\tmp\!PATH!.txt"), "cmd.exe"), None);
+        assert_eq!(
+            dropped_path_arg(Path::new(r"C:\tmp\%COMSPEC%.txt"), "cmd.exe"),
+            None
+        );
+        assert_eq!(
+            dropped_path_arg(Path::new(r"C:\tmp\!PATH!.txt"), "cmd.exe"),
+            None
+        );
         // Git Bash and WSL are POSIX shells. `'\''` is the embedded apostrophe.
         let bash = r"C:\Program Files\Git\usr\bin\bash.exe --login -i";
         assert_eq!(
@@ -2574,9 +2664,18 @@ mod tests {
             Some(r"'C:\tmp\$(calc).txt' ")
         );
         // CR/LF in a name would be Enter. Refuse for every shell.
-        assert_eq!(dropped_path_arg(Path::new("C:\\tmp\\a\nb.txt"), "powershell.exe"), None);
-        assert_eq!(dropped_path_arg(Path::new("C:\\tmp\\a\rb.txt"), "cmd.exe"), None);
-        assert_eq!(dropped_path_arg(Path::new("C:\\tmp\\a\rb.txt"), "wsl.exe -d Ubuntu"), None);
+        assert_eq!(
+            dropped_path_arg(Path::new("C:\\tmp\\a\nb.txt"), "powershell.exe"),
+            None
+        );
+        assert_eq!(
+            dropped_path_arg(Path::new("C:\\tmp\\a\rb.txt"), "cmd.exe"),
+            None
+        );
+        assert_eq!(
+            dropped_path_arg(Path::new("C:\\tmp\\a\rb.txt"), "wsl.exe -d Ubuntu"),
+            None
+        );
     }
 
     /// PowerShell treats U+2018..=U+201B as `'`. Doubling them is the same
@@ -2617,9 +2716,15 @@ mod tests {
     #[test]
     fn shell_family_quotes_git_bash_fish_and_cmd() {
         use std::path::Path;
-        assert_eq!(shell_family(r"C:\Program Files\Git\git-bash.exe"), ShellFamily::Posix);
+        assert_eq!(
+            shell_family(r"C:\Program Files\Git\git-bash.exe"),
+            ShellFamily::Posix
+        );
         assert_eq!(shell_family("notbash.exe"), ShellFamily::PowerShell);
-        assert_eq!(shell_family(r"C:\Windows\System32\cmd.exe"), ShellFamily::Cmd);
+        assert_eq!(
+            shell_family(r"C:\Windows\System32\cmd.exe"),
+            ShellFamily::Cmd
+        );
         assert_eq!(shell_family("cmd.exe /K chcp 65001"), ShellFamily::Cmd);
         assert_eq!(shell_family("fish.exe"), ShellFamily::Fish);
         assert_eq!(
@@ -2703,17 +2808,29 @@ mod tests {
     #[test]
     fn drop_off_prompt_confirms_and_bracketed_wraps() {
         use std::path::Path;
-        assert!(drop_needs_confirm(true, true, "safe"), "alt screen, even at a prompt mark");
+        assert!(
+            drop_needs_confirm(true, true, "safe"),
+            "alt screen, even at a prompt mark"
+        );
         assert!(drop_needs_confirm(false, false, "safe"), "no OSC 133 B");
-        assert!(!drop_needs_confirm(false, true, r"'C:\safe.txt' "), "cooked prompt types immediately");
+        assert!(
+            !drop_needs_confirm(false, true, r"'C:\safe.txt' "),
+            "cooked prompt types immediately"
+        );
         // RLO / ZWSP in the name would be stripped on the way to the shell
         // with no card. A prompt does not make that silent.
         let rlo = dropped_path_arg(Path::new("C:\\d\\a\u{202E}b.txt"), "powershell.exe").unwrap();
-        assert!(drop_needs_confirm(false, true, &rlo), "RLO at the prompt still confirms");
+        assert!(
+            drop_needs_confirm(false, true, &rlo),
+            "RLO at the prompt still confirms"
+        );
         let zwsp = dropped_path_arg(Path::new("C:\\d\\a\u{200B}b.txt"), "cmd.exe").unwrap();
         assert!(drop_needs_confirm(false, true, &zwsp));
         let zwj = dropped_path_arg(Path::new("C:\\d\\a\u{200D}b.txt"), "powershell.exe").unwrap();
-        assert!(!drop_needs_confirm(false, true, &zwj), "ZWJ is part of the name");
+        assert!(
+            !drop_needs_confirm(false, true, &zwj),
+            "ZWJ is part of the name"
+        );
         // LRM / RLM / ALM do not confirm a paste. In a filename they still do.
         for mark in ['\u{200E}', '\u{200F}', '\u{061C}'] {
             let raw = format!("C:\\d\\a{mark}b.txt");
@@ -2739,11 +2856,21 @@ mod tests {
         let c = shell_choices();
         assert_eq!(c[0], DEFAULT_SHELL, "PowerShell 5 leads (always present)");
         assert!(c.contains(&"cmd.exe".to_string()));
-        assert_eq!(c, crate::shells::detect().into_iter().map(|s| s.command).collect::<Vec<_>>());
+        assert_eq!(
+            c,
+            crate::shells::detect()
+                .into_iter()
+                .map(|s| s.command)
+                .collect::<Vec<_>>()
+        );
         let mut sorted = c.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), c.len(), "cycling must not repeat a shell: {c:?}");
+        assert_eq!(
+            sorted.len(),
+            c.len(),
+            "cycling must not repeat a shell: {c:?}"
+        );
         // family detection drives the setup injection
         assert!(is_powershell("powershell.exe"));
         assert!(is_powershell(r"C:\Program Files\PowerShell\7\pwsh.exe"));
@@ -2769,7 +2896,10 @@ mod tests {
         ] {
             let out = expand_env(form);
             assert!(out.starts_with(&home), "{form} did not expand: {out}");
-            assert!(!out.contains("$env:") && !out.contains('%'), "leftover: {out}");
+            assert!(
+                !out.contains("$env:") && !out.contains('%'),
+                "leftover: {out}"
+            );
         }
         // an already-absolute path passes through untouched
         let abs = format!("{home}\\.poshthemes\\pure.omp.json");
@@ -2784,7 +2914,10 @@ mod tests {
         // are case-insensitive, so a plain starts_with would miss these
         assert!(is_under(r"C:\Windows\System32", r"C:\Windows"));
         assert!(is_under(r"c:\windows\system32", r"C:\Windows"));
-        assert!(is_under(r"C:\WINDOWS\System32\WindowsPowerShell", r"c:\Windows"));
+        assert!(is_under(
+            r"C:\WINDOWS\System32\WindowsPowerShell",
+            r"c:\Windows"
+        ));
         // the root itself counts as inside it
         assert!(is_under(r"C:\Windows", r"C:\Windows"));
         // a sibling that merely shares a prefix does NOT — the trap a naive
@@ -2805,12 +2938,17 @@ mod tests {
         );
         assert_eq!(
             split_command(r"C:\PROGRA~1\Git\usr\bin\bash.exe --login -i"),
-            (r"C:\PROGRA~1\Git\usr\bin\bash.exe".into(),
-             vec!["--login".to_string(), "-i".to_string()])
+            (
+                r"C:\PROGRA~1\Git\usr\bin\bash.exe".into(),
+                vec!["--login".to_string(), "-i".to_string()]
+            )
         );
         assert_eq!(
             split_command("wsl.exe -d Ubuntu"),
-            ("wsl.exe".into(), vec!["-d".to_string(), "Ubuntu".to_string()])
+            (
+                "wsl.exe".into(),
+                vec!["-d".to_string(), "Ubuntu".to_string()]
+            )
         );
         // a program path WITH spaces must survive: splitting on the first
         // space would yield "C:\Program" and break is_powershell
@@ -2821,7 +2959,10 @@ mod tests {
         // every detected shell splits to a real program
         for c in shell_choices() {
             let (prog, _) = split_command(&c);
-            assert!(prog.to_lowercase().ends_with(".exe"), "bad program in {c:?}");
+            assert!(
+                prog.to_lowercase().ends_with(".exe"),
+                "bad program in {c:?}"
+            );
         }
     }
 
@@ -2849,13 +2990,7 @@ mod tests {
         let (mut t, mut p, mut meta, mut carry) = test_term();
         // RIS, then 1004 in the same read. The final mode has focus
         // reporting; the router still has to forget the previous CSI I.
-        process_chunk(
-            &mut p,
-            &mut t,
-            &mut meta,
-            &mut carry,
-            b"\x1bc\x1b[?1004h",
-        );
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1bc\x1b[?1004h");
         assert!(meta.saw_ris);
         assert!(t.mode().contains(TermMode::FOCUS_IN_OUT));
     }
@@ -2905,8 +3040,13 @@ mod tests {
     #[test]
     fn command_capture_keeps_wrapped_claude_commands() {
         let (mut t, mut p, mut meta, mut carry) = test_term();
-        process_chunk(&mut p, &mut t, &mut meta, &mut carry,
-            b"PS C:\\a-very-long-directory> \x1b]133;B\x07");
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"PS C:\\a-very-long-directory> \x1b]133;B\x07",
+        );
         let command = format!("claude --safe-mode {}", "x".repeat(90));
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, command.as_bytes());
         capture_command_core(&t, &mut meta);
@@ -2917,20 +3057,43 @@ mod tests {
     #[test]
     fn interactive_claude_cleans_shell_prefix_once_after_new_header() {
         let (mut t, mut p, mut meta, mut carry) = test_term();
-        process_chunk(&mut p, &mut t, &mut meta, &mut carry,
-            b"Claude Code vOLD\r\n> \x1b]133;B\x07claude");
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"Claude Code vOLD\r\n> \x1b]133;B\x07claude",
+        );
         capture_command_core(&t, &mut meta);
-        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\r\n\x1b[?2004hloading");
+        let ev = process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\r\n\x1b[?2004hloading",
+        );
         assert!(!ev.clean_claude, "an old header must not trigger cleanup");
         let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\r\nClaude Co");
         assert!(!ev.clean_claude);
         let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"de v2.1.311");
         assert!(ev.clean_claude);
-        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\r\nClaude Code v2.1.311");
+        let ev = process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\r\nClaude Code v2.1.311",
+        );
         assert!(!ev.clean_claude, "cleanup must never loop on redraw");
 
         let (mut t, mut p, mut meta, mut carry) = test_term();
-        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"> \x1b]133;B\x07claude --print hello");
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"> \x1b]133;B\x07claude --print hello",
+        );
         capture_command_core(&t, &mut meta);
         assert!(meta.clean_claude_after.is_none());
     }
@@ -2938,12 +3101,25 @@ mod tests {
     #[test]
     fn resumed_claude_cleans_shell_prefix_without_a_startup_header() {
         let (mut t, mut p, mut meta, mut carry) = test_term();
-        process_chunk(&mut p, &mut t, &mut meta, &mut carry,
-            b"PS> \x1b]133;B\x07claude --resume test-session");
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"PS> \x1b]133;B\x07claude --resume test-session",
+        );
         capture_command_core(&t, &mut meta);
-        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry,
-            "\r\n\x1b[?2004hResumed conversation\r\n──────────\r\n>\u{a0}".as_bytes());
-        assert!(ev.clean_claude, "a resumed input frame must not require a version banner");
+        let ev = process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            "\r\n\x1b[?2004hResumed conversation\r\n──────────\r\n>\u{a0}".as_bytes(),
+        );
+        assert!(
+            ev.clean_claude,
+            "a resumed input frame must not require a version banner"
+        );
         let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b" redraw");
         assert!(!ev.clean_claude, "redraw is requested only once");
     }
@@ -2961,7 +3137,13 @@ mod tests {
         assert!(t.mode().contains(TermMode::ALT_SCREEN));
         assert!(crate::bidi::cmd_is_claude(&meta.running_cmd));
         // leaving the TUI: alt screen off, D mark clears the command
-        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?1049l\x1b]133;D;0\x07");
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[?1049l\x1b]133;D;0\x07",
+        );
         assert!(!t.mode().contains(TermMode::ALT_SCREEN));
         assert!(meta.running_cmd.is_empty());
     }
@@ -2971,7 +3153,10 @@ mod tests {
     #[test]
     fn marks_survive_scrollback_eviction() {
         let size = TermSize { cols: 20, rows: 4 };
-        let config = Config { scrolling_history: 8, ..Config::default() };
+        let config = Config {
+            scrolling_history: 8,
+            ..Config::default()
+        };
         let mut t = Term::new(config, &size, VoidListener);
         let mut p: Processor = Processor::new();
         let mut meta = SessionMeta::default();
@@ -3001,7 +3186,10 @@ mod tests {
         assert_eq!(ev.clipboard.as_deref(), Some("hello"));
 
         let ev = process_chunk(
-            &mut p, &mut t, &mut meta, &mut carry,
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
             b"\x1b]9;9;\"C:\\Users\\Admin\\Bayan\\\"\x07",
         );
         assert_eq!(ev.cwd.as_deref(), Some(r"C:\Users\Admin\Bayan"));
@@ -3015,8 +3203,14 @@ mod tests {
         assert_eq!(scan_osc52(b"\x1b]52;c;aGVsbG8="), None, "unterminated");
         // the ESC of a following CSI is not a terminator either
         assert_eq!(scan_osc52(b"\x1b]52;c;aGVsbG8=\x1b[0m"), None);
-        assert_eq!(scan_osc52(b"\x1b]52;c;aGVsbG8=\x07").as_deref(), Some("hello"));
-        assert_eq!(scan_osc52(b"\x1b]52;c;aGVsbG8=\x1b\\").as_deref(), Some("hello"));
+        assert_eq!(
+            scan_osc52(b"\x1b]52;c;aGVsbG8=\x07").as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            scan_osc52(b"\x1b]52;c;aGVsbG8=\x1b\\").as_deref(),
+            Some("hello")
+        );
         // query forms. None of these may decode, and none is a reply.
         assert_eq!(scan_osc52(b"\x1b]52;c;?\x07"), None);
         assert_eq!(scan_osc52(b"\x1b]52;c;?\x1b\\"), None);
@@ -3033,11 +3227,19 @@ mod tests {
         );
         // past the cap, even with a real BEL
         let mut big = b"\x1b]52;c;".to_vec();
-        big.extend(base64::engine::general_purpose::STANDARD.encode(vec![b'A'; OSC52_MAX_BYTES + 1]).as_bytes());
+        big.extend(
+            base64::engine::general_purpose::STANDARD
+                .encode(vec![b'A'; OSC52_MAX_BYTES + 1])
+                .as_bytes(),
+        );
         big.push(0x07);
         assert_eq!(scan_osc52(&big), None);
         let mut at_cap = b"\x1b]52;c;".to_vec();
-        at_cap.extend(base64::engine::general_purpose::STANDARD.encode(vec![b'B'; OSC52_MAX_BYTES]).as_bytes());
+        at_cap.extend(
+            base64::engine::general_purpose::STANDARD
+                .encode(vec![b'B'; OSC52_MAX_BYTES])
+                .as_bytes(),
+        );
         at_cap.push(0x07);
         assert_eq!(scan_osc52(&at_cap).map(|s| s.len()), Some(OSC52_MAX_BYTES));
         // longer than the carry window, still unterminated: not a write
@@ -3047,7 +3249,10 @@ mod tests {
 
         assert!(!allow_osc52_write(false, true, true), "default is off");
         assert!(!allow_osc52_write(false, false, true));
-        assert!(!allow_osc52_write(true, false, true), "unfocused opt-in still does not write");
+        assert!(
+            !allow_osc52_write(true, false, true),
+            "unfocused opt-in still does not write"
+        );
         assert!(allow_osc52_write(true, true, true));
     }
 
@@ -3109,12 +3314,18 @@ mod tests {
             assert_eq!(accept_local_cwd(bad), None, "accepted {bad:?}");
         }
         assert_eq!(accept_local_cwd(r"C:\COM10").as_deref(), Some(r"C:\COM10"));
-        assert_eq!(accept_local_cwd(r"C:\config").as_deref(), Some(r"C:\config"));
+        assert_eq!(
+            accept_local_cwd(r"C:\config").as_deref(),
+            Some(r"C:\config")
+        );
         assert_eq!(
             accept_local_cwd(r"C:\Users\Admin\Bayan\").as_deref(),
             Some(r"C:\Users\Admin\Bayan")
         );
-        assert_eq!(accept_local_cwd("C:/Users/Admin").as_deref(), Some(r"C:\Users\Admin"));
+        assert_eq!(
+            accept_local_cwd("C:/Users/Admin").as_deref(),
+            Some(r"C:\Users\Admin")
+        );
         assert_eq!(accept_local_cwd(r"D:\").as_deref(), Some(r"D:\"));
         let long = format!(r"C:\{}", "a".repeat(5000));
         assert_eq!(accept_local_cwd(&long), None);
@@ -3204,7 +3415,13 @@ mod tests {
         let (mut t, mut p, mut meta, mut carry) = test_term();
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?1049h");
         assert!(t.mode().contains(TermMode::ALT_SCREEN));
-        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &osc7("file:///C:/alt"));
+        let ev = process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            &osc7("file:///C:/alt"),
+        );
         assert!(ev.cwd.is_none());
         let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &osc9(r"C:\alt"));
         assert!(ev.cwd.is_none());
@@ -3277,22 +3494,51 @@ mod tests {
 
     #[test]
     fn progress_reports_parse_every_state_and_the_last_one_wins() {
-        assert_eq!(parse_progress(b"1;42"),
-                   Some(Some(Progress { state: ProgressState::Normal, percent: 42 })));
-        assert_eq!(parse_progress(b"2;7"),
-                   Some(Some(Progress { state: ProgressState::Error, percent: 7 })));
-        assert_eq!(parse_progress(b"3"),
-                   Some(Some(Progress { state: ProgressState::Indeterminate, percent: 0 })));
-        assert_eq!(parse_progress(b"4;50"),
-                   Some(Some(Progress { state: ProgressState::Paused, percent: 50 })));
+        assert_eq!(
+            parse_progress(b"1;42"),
+            Some(Some(Progress {
+                state: ProgressState::Normal,
+                percent: 42
+            }))
+        );
+        assert_eq!(
+            parse_progress(b"2;7"),
+            Some(Some(Progress {
+                state: ProgressState::Error,
+                percent: 7
+            }))
+        );
+        assert_eq!(
+            parse_progress(b"3"),
+            Some(Some(Progress {
+                state: ProgressState::Indeterminate,
+                percent: 0
+            }))
+        );
+        assert_eq!(
+            parse_progress(b"4;50"),
+            Some(Some(Progress {
+                state: ProgressState::Paused,
+                percent: 50
+            }))
+        );
         assert_eq!(parse_progress(b"0"), Some(None), "state 0 clears");
-        assert_eq!(parse_progress(b"1;250").unwrap().unwrap().percent, 100, "clamped");
+        assert_eq!(
+            parse_progress(b"1;250").unwrap().unwrap().percent,
+            100,
+            "clamped"
+        );
         assert_eq!(parse_progress(b"9;1"), None, "unknown state ignored");
         assert_eq!(parse_progress(b"x"), None);
         // a burst collapses to its final value, through the real chunk path
         let (mut t, mut p, mut meta, mut carry) = test_term();
-        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry,
-                               b"\x1b]9;4;1;10\x07work\x1b]9;4;1;90\x07");
+        let ev = process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]9;4;1;10\x07work\x1b]9;4;1;90\x07",
+        );
         assert_eq!(ev.progress.unwrap().unwrap().percent, 90);
         let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]9;4;0;0\x07");
         assert_eq!(ev.progress, Some(None));
@@ -3317,8 +3563,13 @@ mod tests {
         let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;D;0\x07");
         assert_eq!(ev.progress, Some(None));
         // but a report in the SAME chunk is live, not stale: it wins
-        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry,
-                               b"\x1b]133;A\x07\x1b]9;4;1;70\x07");
+        let ev = process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;A\x07\x1b]9;4;1;70\x07",
+        );
         assert_eq!(ev.progress.unwrap().unwrap().percent, 70);
         // and an ordinary chunk still reports nothing either way
         let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"just output\r\n");
@@ -3328,22 +3579,32 @@ mod tests {
     #[test]
     fn notification_sequences_in_three_dialects() {
         // iTerm2 / ConEmu message form
-        assert_eq!(scan_notify(b"\x1b]9;Build done\x07"),
-                   Some(("Bayan".into(), "Build done".into())));
+        assert_eq!(
+            scan_notify(b"\x1b]9;Build done\x07"),
+            Some(("Bayan".into(), "Build done".into()))
+        );
         // ConEmu subcommands are not messages
         assert_eq!(scan_notify(b"\x1b]9;4;1;50\x07"), None);
         assert_eq!(scan_notify(b"\x1b]9;9;C:\\Users\x07"), None);
         // rxvt-unicode form (Ghostty/WezTerm), ESC-backslash terminated
-        assert_eq!(scan_notify(b"\x1b]777;notify;Claude;needs your approval\x1b\\"),
-                   Some(("Claude".into(), "needs your approval".into())));
+        assert_eq!(
+            scan_notify(b"\x1b]777;notify;Claude;needs your approval\x1b\\"),
+            Some(("Claude".into(), "needs your approval".into()))
+        );
         // kitty form: title chunk and body chunk
-        assert_eq!(scan_notify(b"\x1b]99;i=1:p=title;Tests\x07"),
-                   Some(("Tests".into(), String::new())));
-        assert_eq!(scan_notify(b"\x1b]99;i=1:d=1;all green\x07"),
-                   Some(("Bayan".into(), "all green".into())));
+        assert_eq!(
+            scan_notify(b"\x1b]99;i=1:p=title;Tests\x07"),
+            Some(("Tests".into(), String::new()))
+        );
+        assert_eq!(
+            scan_notify(b"\x1b]99;i=1:d=1;all green\x07"),
+            Some(("Bayan".into(), "all green".into()))
+        );
         // several in one read: the LAST one is what the user sees
-        assert_eq!(scan_notify(b"\x1b]9;first\x07 x \x1b]777;notify;T;second\x07"),
-                   Some(("T".into(), "second".into())));
+        assert_eq!(
+            scan_notify(b"\x1b]9;first\x07 x \x1b]777;notify;T;second\x07"),
+            Some(("T".into(), "second".into()))
+        );
         assert_eq!(scan_notify(b"plain text"), None);
     }
 
@@ -3393,11 +3654,17 @@ mod tests {
         let size = TermSize { cols: 40, rows: 6 };
         // Off means the parser never touches its keyboard stack. The probe
         // reply is synthesized by process_chunk, not by alacritty.
-        let config = Config { kitty_keyboard: protocol, ..Config::default() };
+        let config = Config {
+            kitty_keyboard: protocol,
+            ..Config::default()
+        };
         KittyFixture {
             term: Term::new(config, &size, PtyLog(Arc::clone(&log))),
             parser: Processor::new(),
-            meta: SessionMeta { kitty_protocol: protocol, ..SessionMeta::default() },
+            meta: SessionMeta {
+                kitty_protocol: protocol,
+                ..SessionMeta::default()
+            },
             carry: Vec::new(),
             log,
         }
@@ -3508,13 +3775,7 @@ mod tests {
             mut carry,
             log,
         } = kitty_term(false);
-        let ev = process_chunk(
-            &mut p,
-            &mut t,
-            &mut meta,
-            &mut carry,
-            b"\x1b[?u\x1b[8lNEXT",
-        );
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?u\x1b[8lNEXT");
         assert_eq!(ev.pty_replies, vec!["\x1b[?0u".to_string()]);
         assert!(take_writes(&log).is_empty());
         let row = &t.grid()[alacritty_terminal::index::Line(0)];
@@ -3556,7 +3817,11 @@ mod tests {
             &mut carry,
             &osc7("file:///C:/work"),
         );
-        assert_eq!(ev.cwd.as_deref(), Some(r"C:\work"), "idle OSC 7 needs no 133");
+        assert_eq!(
+            ev.cwd.as_deref(),
+            Some(r"C:\work"),
+            "idle OSC 7 needs no 133"
+        );
 
         meta.running_cmd = "cat".into();
         meta.bidi_mut().mode = crate::bidi_ctl::BidiMode::Explicit;
@@ -3565,7 +3830,10 @@ mod tests {
         let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &spoof);
         assert!(ev.cwd.is_none());
         assert_eq!(meta.cwd.as_deref(), Some(r"C:\work"));
-        assert_eq!(meta.running_cmd, "cat", "a spoofed D must not clear the command");
+        assert_eq!(
+            meta.running_cmd, "cat",
+            "a spoofed D must not clear the command"
+        );
         assert_eq!(
             meta.bidi.mode,
             crate::bidi_ctl::BidiMode::Implicit,
@@ -3608,7 +3876,13 @@ mod tests {
         assert!(meta.at_prompt);
         assert_eq!(meta.prompt_col, Some(4));
         meta.prompt_nonce = "n0nce".into();
-        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &osc7_of("file:///C:/work"));
+        let ev = process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            &osc7_of("file:///C:/work"),
+        );
         assert_eq!(ev.cwd.as_deref(), Some(r"C:\work"));
         (t, p, meta, carry)
     }
@@ -3623,8 +3897,14 @@ mod tests {
         carry: &mut Vec<u8>,
         expected_command: &str,
     ) {
-        assert_eq!(meta.running_cmd, expected_command, "command capture must match this scenario");
-        assert!(meta.cmd_pending, "Enter at the prompt must arm the nonce gate");
+        assert_eq!(
+            meta.running_cmd, expected_command,
+            "command capture must match this scenario"
+        );
+        assert!(
+            meta.cmd_pending,
+            "Enter at the prompt must arm the nonce gate"
+        );
         let ev = process_chunk(p, t, meta, carry, &osc7_of("file:///C:/evil"));
         assert!(ev.cwd.is_none());
         assert_eq!(meta.cwd.as_deref(), Some(r"C:\work"));
@@ -3633,7 +3913,10 @@ mod tests {
         spoof.extend(osc7_of("file:///C:/spoof"));
         let ev = process_chunk(p, t, meta, carry, &spoof);
         assert!(ev.cwd.is_none());
-        assert!(meta.cmd_pending, "a spoofed D must not clear the pending command");
+        assert!(
+            meta.cmd_pending,
+            "a spoofed D must not clear the pending command"
+        );
         assert_eq!(meta.cwd.as_deref(), Some(r"C:\work"));
 
         let mut prompt = b"\x1b]133;D;0;n0nce\x07\x1b]133;A;n0nce\x07".to_vec();
@@ -3760,7 +4043,13 @@ mod tests {
         } = kitty_term(true);
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[>31uHi");
         assert!(t.mode().contains(TermMode::REPORT_ASSOCIATED_TEXT));
-        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;A\x07\x1b[?u");
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;A\x07\x1b[?u",
+        );
         assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
         assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
         assert_eq!(meta.kitty_depth, 0);
@@ -3830,15 +4119,30 @@ mod tests {
             mut carry,
             log,
         } = kitty_term(true);
-        process_chunk(&mut p, &mut t, &mut meta, &mut carry, &repeat(b"\x1b[>1u", 16));
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            &repeat(b"\x1b[>1u", 16),
+        );
         assert_eq!(meta.kitty_depth, 16);
-        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?1049h\x1b[>4u");
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[?1049h\x1b[>4u",
+        );
         assert!(t.mode().contains(TermMode::ALT_SCREEN));
         assert_eq!(meta.kitty_depth, 1);
         assert_eq!(meta.kitty_alt_depth, 16);
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1bc");
         assert!(meta.saw_ris, "the focus-tracking flag is the RIS signal");
-        assert_eq!(meta.kitty_depth, 0, "RIS clears the counter, not only the parser");
+        assert_eq!(
+            meta.kitty_depth, 0,
+            "RIS clears the counter, not only the parser"
+        );
         assert_eq!(meta.kitty_alt_depth, 0);
         assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
         // the cap is not stuck at 16: a push after RIS is accepted
@@ -3873,9 +4177,22 @@ mod tests {
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[>1u");
         assert_eq!(meta.kitty_depth, 1);
         t.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
-        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;A\x07\x1b[?u");
-        assert!(t.selection.is_some(), "prompt reset must not clear the selection");
-        assert_eq!(t.grid().saved_cursor.point, saved, "DECSC must survive the prompt");
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;A\x07\x1b[?u",
+        );
+        assert!(
+            t.selection.is_some(),
+            "prompt reset must not clear the selection"
+        );
+        assert_eq!(
+            t.grid().saved_cursor.point,
+            saved,
+            "DECSC must survive the prompt"
+        );
         assert!(!t.mode().contains(TermMode::ALT_SCREEN));
         assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
         assert_eq!(meta.kitty_depth, 0);
@@ -3909,7 +4226,10 @@ mod tests {
         let point = Point::new(alacritty_terminal::index::Line(0), Column(0));
         t.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
         reset_keyboard_modes(&mut p, &mut t, &mut meta);
-        assert!(t.mode().contains(TermMode::ALT_SCREEN), "reset must not leave the alt screen");
+        assert!(
+            t.mode().contains(TermMode::ALT_SCREEN),
+            "reset must not leave the alt screen"
+        );
         assert_eq!(cell(&t, 0), 'T');
         assert_eq!(cell(&t, 1), 'U');
         assert_eq!(cell(&t, 2), 'I');
@@ -3949,10 +4269,20 @@ mod tests {
             &repeat(b"\x1b[>1\x00u", 5000),
         );
         reset_keyboard_modes(&mut p, &mut t, &mut meta);
-        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;A\x07\x1b[?u");
+        let ev = process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;A\x07\x1b[?u",
+        );
         assert!(t.selection.is_some());
         assert_eq!(t.grid().saved_cursor.point, saved);
-        assert_eq!(t.grid().cursor.point, cursor, "the prompt must not move the cursor");
+        assert_eq!(
+            t.grid().cursor.point,
+            cursor,
+            "the prompt must not move the cursor"
+        );
         assert_eq!(cell(&t, 0), 'H');
         assert!(!t.mode().contains(TermMode::ALT_SCREEN));
         assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
@@ -3996,7 +4326,13 @@ mod tests {
         // A `:` sub-parameter is not counted, so kitty_depth stays 0 while
         // the real stack is 20 deep and disambiguate is on. Popping from
         // the flag bits would drain it. The depth is what we pop.
-        process_chunk(&mut p, &mut t, &mut meta, &mut carry, &repeat(b"\x1b[>1:1u", 20));
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            &repeat(b"\x1b[>1:1u", 20),
+        );
         assert_eq!(meta.kitty_depth, 0);
         assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
         reset_keyboard_modes(&mut p, &mut t, &mut meta);

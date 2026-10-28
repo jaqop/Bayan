@@ -26,7 +26,9 @@ fn is_ltr_char(c: char) -> bool {
 }
 
 /// Punctuation that stays inside an LTR island (paths, filenames, versions).
-const LTR_PUNCT: &[char] = &['.', '_', '-', '/', ':', '\\', '@', '~', '+', '=', '#', '&', '%'];
+const LTR_PUNCT: &[char] = &[
+    '.', '_', '-', '/', ':', '\\', '@', '~', '+', '=', '#', '&', '%',
+];
 
 /// Combining marks (Arabic tashkeel + generic): must travel WITH their base
 /// character when reversing, or shadda/tanwin land on the wrong letter.
@@ -110,9 +112,8 @@ fn unbidi_indexed(chars: &[char]) -> (Vec<char>, Vec<usize>) {
             let mut j = i;
             while j < n {
                 let cj = rev[j];
-                let joins_island = (LTR_PUNCT.contains(&cj) || cj == ' ')
-                    && j + 1 < n
-                    && is_ltr_char(rev[j + 1]);
+                let joins_island =
+                    (LTR_PUNCT.contains(&cj) || cj == ' ') && j + 1 < n && is_ltr_char(rev[j + 1]);
                 if is_ltr_char(cj) || joins_island {
                     j += 1;
                 } else {
@@ -195,7 +196,9 @@ pub fn restore_bidi_line(text: &str) -> Option<String> {
 /// letters and combining marks can still map back to terminal cells.
 pub fn restore_bidi_line_with_order(text: &str) -> Option<(String, Vec<usize>)> {
     let chars: Vec<char> = text.chars().collect();
-    if !chars.iter().copied().any(is_arabic_letter) { return None; }
+    if !chars.iter().copied().any(is_arabic_letter) {
+        return None;
+    }
     let reverse = |indices: &[usize]| {
         let mut clusters: Vec<Vec<usize>> = Vec::new();
         for &i in indices {
@@ -218,8 +221,11 @@ pub fn restore_bidi_line_with_order(text: &str) -> Option<(String, Vec<usize>)> 
                 while j < rev.len() {
                     let c = chars[rev[j]];
                     let joins = (LTR_PUNCT.contains(&c) || c == ' ')
-                        && j + 1 < rev.len() && is_ltr_char(chars[rev[j + 1]]);
-                    if !is_ltr_char(c) && !joins { break; }
+                        && j + 1 < rev.len()
+                        && is_ltr_char(chars[rev[j + 1]]);
+                    if !is_ltr_char(c) && !joins {
+                        break;
+                    }
                     j += 1;
                 }
                 order.extend(reverse(&rev[i..j]));
@@ -234,8 +240,13 @@ pub fn restore_bidi_line_with_order(text: &str) -> Option<(String, Vec<usize>)> 
         while i < chars.len() {
             if is_arabic_letter(chars[i]) {
                 let mut j = i;
-                while j < chars.len() && (is_arabic_letter(chars[j]) || is_combining(chars[j])
-                    || (chars[j] == ' ' && j + 1 < chars.len() && is_arabic_letter(chars[j + 1]))) {
+                while j < chars.len()
+                    && (is_arabic_letter(chars[j])
+                        || is_combining(chars[j])
+                        || (chars[j] == ' '
+                            && j + 1 < chars.len()
+                            && is_arabic_letter(chars[j + 1])))
+                {
                     j += 1;
                 }
                 order.extend(reverse(&indices[i..j]));
@@ -298,11 +309,20 @@ mod tests {
 
     #[test]
     fn restoration_keeps_a_permutation_for_repeated_letters_and_marks() {
-        for text in ["ابحرم", "ملس ملس", "مَّلَس", "quoted ملس then ملس", "txt.1 رابتخا 123"] {
+        for text in [
+            "ابحرم",
+            "ملس ملس",
+            "مَّلَس",
+            "quoted ملس then ملس",
+            "txt.1 رابتخا 123",
+        ] {
             let (restored, order) = restore_bidi_line_with_order(text).unwrap();
             assert_eq!(Some(restored.clone()), restore_bidi_line(text));
             let chars: Vec<_> = text.chars().collect();
-            assert_eq!(order.iter().map(|&i| chars[i]).collect::<String>(), restored);
+            assert_eq!(
+                order.iter().map(|&i| chars[i]).collect::<String>(),
+                restored
+            );
             let mut indices = order;
             indices.sort_unstable();
             assert_eq!(indices, (0..chars.len()).collect::<Vec<_>>());
@@ -314,7 +334,10 @@ mod tests {
         // what Claude emits (visual) restores to logical
         assert_eq!(restore_bidi_line("ابحرم").as_deref(), Some("مرحبا"));
         // and reversing logical twice is identity
-        assert_eq!(unbidi_rtl_line(&rev_clusters("مرحبا بالعالم")), "مرحبا بالعالم");
+        assert_eq!(
+            unbidi_rtl_line(&rev_clusters("مرحبا بالعالم")),
+            "مرحبا بالعالم"
+        );
     }
 
     #[test]
@@ -370,7 +393,10 @@ mod tests {
     /// the corpus quietly wrong. Every pair must still round-trip.
     #[test]
     fn the_published_fixture_corpus_still_round_trips() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bidi_cases.json");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/bidi_cases.json"
+        );
         let text = std::fs::read_to_string(path).expect("fixture corpus present");
         let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         let cases = v["cases"].as_array().expect("cases array");
@@ -381,15 +407,30 @@ mod tests {
             let visual = c["visual"].as_str().expect("visual");
             let got = restore_bidi_line(visual).unwrap_or_else(|| visual.to_string());
             assert_eq!(got, logical, "fixture {name}: visual -> logical drifted");
-            let mapped = restore_bidi_line_with_order(visual).map(|r| r.0)
+            let mapped = restore_bidi_line_with_order(visual)
+                .map(|r| r.0)
                 .unwrap_or_else(|| visual.to_string());
-            assert_eq!(mapped, logical, "fixture {name}: mapped restoration drifted");
+            assert_eq!(
+                mapped, logical,
+                "fixture {name}: mapped restoration drifted"
+            );
             // the codepoint listings must describe the strings they sit beside
             let cps = |s: &str| {
-                s.chars().map(|ch| format!("{:04X}", ch as u32)).collect::<Vec<_>>().join(" ")
+                s.chars()
+                    .map(|ch| format!("{:04X}", ch as u32))
+                    .collect::<Vec<_>>()
+                    .join(" ")
             };
-            assert_eq!(cps(logical), c["logical_codepoints"].as_str().unwrap_or(""), "{name}");
-            assert_eq!(cps(visual), c["visual_codepoints"].as_str().unwrap_or(""), "{name}");
+            assert_eq!(
+                cps(logical),
+                c["logical_codepoints"].as_str().unwrap_or(""),
+                "{name}"
+            );
+            assert_eq!(
+                cps(visual),
+                c["visual_codepoints"].as_str().unwrap_or(""),
+                "{name}"
+            );
         }
         let ml = &v["multiline_case"];
         assert_eq!(
@@ -448,9 +489,14 @@ mod tests {
     #[test]
     fn arabic_base_survives_a_long_latin_island() {
         let visual = "ملاع Windows Terminal 123 ابحرم";
-        assert_eq!(restore_bidi_line(visual).as_deref(), Some("مرحبا Windows Terminal 123 عالم"));
-        assert_eq!(restore_bidi_line_with_order(visual).unwrap().0,
-            "مرحبا Windows Terminal 123 عالم");
+        assert_eq!(
+            restore_bidi_line(visual).as_deref(),
+            Some("مرحبا Windows Terminal 123 عالم")
+        );
+        assert_eq!(
+            restore_bidi_line_with_order(visual).unwrap().0,
+            "مرحبا Windows Terminal 123 عالم"
+        );
         assert!(!line_is_rtl_visual("Hello ابحرم Windows Terminal"));
     }
 }

@@ -479,6 +479,31 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       Verified live with driven input: three tabs, click the first, Ctrl+Tab —
       the third (previously used) tab activates, where a plain cycle would
       have picked the second
+- [x] **M36** — right-click pastes. Before this, the right button only reached
+      a program that tracks the mouse and was dropped everywhere else, so
+      there was no mouse paste at all. The first attempt copied Windows
+      Terminal: copy if there is a selection, else paste. It failed in real
+      use, because copy-on-select leaves the highlight up after a drag, so the
+      next right-click copied a second time instead of pasting. Now right-click
+      pastes through the paste guard, like Ctrl+V. It copies only when
+      copy-on-select is off. A tracking program still hears the click unless
+      Shift is held, and an overlay blocks it (`mouse::right_click`, ordered
+      like `link::click_owner`). Verified live with real mouse input: dragging
+      across `COPYTEST-12345` put it on the clipboard, and a right-click pasted
+      it at the prompt
+- [x] **M37** — clean-code gate. First whole-tree `cargo fmt` (a mechanical
+      commit, listed in `.git-blame-ignore-revs`). CI now fails on
+      `cargo fmt --check`, on any clippy warning (`-D warnings`) and on a
+      RustSec vulnerability (`cargo audit`, which also found and dropped a
+      yanked clipboard-win 5.4.1). `// SAFETY:` comments went on the `unsafe`
+      blocks outside `main.rs`. Two lessons. First, GitHub's stable clippy
+      (1.99) rejected `chunks_exact(2)` in `shells.rs` the day the gate went
+      on, while the local 1.97 had never heard of that lint, so `-D warnings`
+      on `stable` means accepting new lints as they ship. Second, the old
+      "delete config.json before cargo test" rule was folklore. No test reads
+      it. What the tests really did was append their deliberate `b_broken`
+      plugin failures to the user's `~/.bayan/plugins.log`. Under `cfg(test)`
+      that log now goes to `%TEMP%`
 
 ## Settings
 

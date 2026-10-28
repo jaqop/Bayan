@@ -959,9 +959,9 @@ mod tests {
                 if ignore || intermediates != b"?" || !matches!(action, 'h' | 'l') {
                     return;
                 }
-                let hit = params.iter().any(|p| {
-                    matches!(p.first().copied(), Some(1049 | 47 | 1047))
-                });
+                let hit = params
+                    .iter()
+                    .any(|p| matches!(p.first().copied(), Some(1049 | 47 | 1047)));
                 if hit {
                     self.alt += 1;
                 }
@@ -1016,7 +1016,10 @@ mod tests {
                 }
             }
             assert_eq!(ris_items, raw_w.ris, "RIS items, case {case}");
-            assert_eq!(filt_w.ris, raw_w.ris, "RIS bytes passed through, case {case}");
+            assert_eq!(
+                filt_w.ris, raw_w.ris,
+                "RIS bytes passed through, case {case}"
+            );
             assert_eq!(filt_w.alt, raw_w.alt, "alt-screen CSI, case {case}");
             if raw_w.ris > 0 {
                 saw_ris = true;

@@ -15,12 +15,23 @@ selection and BiDi paths must do.
 | `gpu.rs` | wgpu: one pipeline, one 2048² atlas, one draw call per frame |
 | `term.rs` | ConPTY via `portable-pty`, VT via `alacritty_terminal` |
 | `bidi.rs` | Claude mode: visual → logical BiDi restoration |
+| `bidi_ctl.rs` | BDSM / SCP (terminal-wg BiDi controls), filtered out of the PTY stream before the parser |
+| `link.rs` | hyperlinks: OSC 8 spans, detected URLs and `path:line`, the narrow open policy |
+| `osc7.rs` | OSC 7 cwd reports, parsed then gated by `term::accept_local_cwd` |
+| `mouse.rs` | mouse tracking modes 1000/1002/1003, SGR vs X10, focus events (1004), right-click paste |
 | `keybinds.rs` | action registry + chord map |
 | `keys.rs` | keyboard → VT byte sequences (ported from EasyTer) |
+| `kitty.rs` | kitty keyboard protocol encoder, layout-aware alternate keys |
+| `mru.rs` | most-recently-used tab order for Ctrl+Tab |
+| `shells.rs` | installed-shell detection (ported from EasyTer's `profiles.py`) |
+| `posh.rs` | oh-my-posh theme picker with a live ANSI preview |
+| `plugins.rs` | declarative JSON plugin host (`~/.bayan/plugins/`) |
 | `config.rs` | `~/.bayan/config.json`, optional and BOM-tolerant |
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
+| `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-97 tests across the tree. `term.rs` (29) and `render.rs` (19) carry the most.
+303 tests across the tree. `term.rs` (59), `link.rs` (59) and `render.rs` (42)
+carry the most.
 
 ## Invariants — do not "simplify" these
 
@@ -111,8 +122,7 @@ the launcher's directory (a shortcut's "Start in"), then `USERPROFILE`. The
 session wins deliberately — restoring a tab in the wrong folder is worse than
 ignoring a shortcut — but it is also why a shortcut change appears to do
 nothing: `~/.bayan/session.json` is answering first. Delete it when testing
-start-directory behaviour, the same way `config.json` has to go before
-`cargo test`. The launcher directory is honoured EXCEPT under `%SystemRoot%`,
+start-directory behaviour. The launcher directory is honoured EXCEPT under `%SystemRoot%`,
 because Explorer and the Start menu often hand a process `System32`.
 
 **Two performance properties are load-bearing.** The shaped-run cache reshapes
@@ -127,16 +137,22 @@ fills — it does not wipe.
 ```
 cargo build              # debug
 cargo run --release
-cargo clippy
+cargo fmt                                   # CI runs cargo fmt --check
+cargo clippy --all-targets -- -D warnings   # CI fails on any warning
 ```
 
-**Before `cargo test`, remove `~/.bayan/config.json`.** The live user config
-perturbs the config tests. This has bitten before:
+The tree is rustfmt-clean with default settings. Run `cargo fmt` before
+committing. The whole-tree reformat is listed in `.git-blame-ignore-revs`,
+so `git blame` skips it.
 
-```powershell
-Remove-Item "$env:USERPROFILE\.bayan\config.json" -Force -ErrorAction SilentlyContinue
-cargo test --quiet
-```
+**Tests stay out of `~/.bayan`.** Nothing in a test calls `config::load` or
+`plugins::init`, so the live `config.json` and plugins are never read, and
+`plugins.rs` sends its failure log to `%TEMP%\bayan-test-plugins.log` under
+`cfg(test)`. Up to October 2026 the guidance here was to delete
+`config.json` before `cargo test`. That was never the real coupling. The real
+one was the plugin tests appending deliberate `b_broken` failures to the
+user's `plugins.log`. Keep any new test that needs a home directory on a temp
+path, the same way.
 
 **`cargo test` does NOT relink `target/debug/bayan.exe`.** Run `cargo build`
 before any launch-and-screenshot round, or you will verify a stale binary. This

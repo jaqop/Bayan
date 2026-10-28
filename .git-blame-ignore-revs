@@ -1,0 +1,4 @@
+# Mechanical, whole-tree reformats. git blame --ignore-revs-file .git-blame-ignore-revs
+# (GitHub's blame view reads this file on its own).
+# cargo fmt the whole tree
+0945856bf94b9fcd24fb82985095c1e6261102b4

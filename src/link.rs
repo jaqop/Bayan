@@ -1442,6 +1442,8 @@ fn win_long_path(path: &str) -> Option<String> {
             .chain(std::iter::once(0))
             .collect();
         let mut buf = vec![0u16; 32_768];
+        // SAFETY: `wide` is NUL-terminated, and the length passed is `buf`'s
+        // own, so the write stays in bounds.
         let n = unsafe { GetLongPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
         if n == 0 || n as usize >= buf.len() {
             return None;
@@ -1590,6 +1592,8 @@ pub fn init_link_thread() {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        // SAFETY: the reserved pointer must be null. Called once per link
+        // thread, and a repeat init only returns S_FALSE.
         unsafe {
             let _hr = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
         }
@@ -1937,6 +1941,8 @@ fn shell_execute_w(target: &str) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
     let op: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
     let file: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `op` and `file` are NUL-terminated and outlive the call. The
+    // null window, parameters and directory are all allowed.
     let rc = unsafe {
         ShellExecuteW(
             std::ptr::null_mut(),
