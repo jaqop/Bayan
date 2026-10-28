@@ -43,18 +43,21 @@ jobs:
       - name: Check against the declared minimum
         run: cargo check --all-targets
 
-  # Informational on purpose: no -D warnings. There are known style lints the
-  # project keeps deliberately — most notably bidi.rs's LTR-island scanner,
-  # where clippy wants two if-arms merged and the split is what encodes the
-  # punctuation lookahead. Clippy still fails the job on real errors.
-  clippy:
-    name: clippy
+  # The tree is rustfmt-clean and clippy-clean with -D warnings, and these
+  # two steps keep it that way. A lint the project disagrees with gets a
+  # scoped #[allow] with a reason next to the code, not a quiet CI job.
+  # The cost: a new stable clippy that adds a lint can turn this red without
+  # a code change; fix or allow it then.
+  lint:
+    name: fmt + clippy
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --all-targets
+        run: cargo clippy --all-targets -- -D warnings

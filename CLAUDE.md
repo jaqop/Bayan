@@ -138,8 +138,13 @@ fills — it does not wipe.
 ```
 cargo build              # debug
 cargo run --release
-cargo clippy
+cargo fmt                                   # CI runs cargo fmt --check
+cargo clippy --all-targets -- -D warnings   # CI fails on any warning
 ```
+
+The tree is rustfmt-clean with default settings. Run `cargo fmt` before
+committing. The whole-tree reformat is listed in `.git-blame-ignore-revs`,
+so `git blame` skips it.
 
 **Before `cargo test`, remove `~/.bayan/config.json`.** The live user config
 perturbs the config tests. This has bitten before:
