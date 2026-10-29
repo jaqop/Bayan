@@ -352,6 +352,7 @@ use std::time::Instant;
 
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::search::{Match, RegexSearch};
 use alacritty_terminal::term::TermMode;
 use winit::application::ApplicationHandler;
@@ -448,11 +449,34 @@ struct Tab {
     orientation: Orientation,
     /// cwd basename of the focused pane (falls back to a plain name)
     title: String,
+    /// a name the user gave the tab; wins over `title` until cleared
+    name: Option<String>,
     /// a background pane rang the bell: show the amber dot until visited
     attention: bool,
+    /// typed keys and pastes go to every pane of this tab, not just the
+    /// focused one (Ctrl+Shift+B)
+    broadcast: bool,
+    /// the focused pane fills the tab; the others keep their PTY size and
+    /// are not drawn (Ctrl+Shift+Z)
+    zoomed: bool,
 }
 
 impl Tab {
+    /// What the tab bar, the cockpit and a toast call this tab: the user's
+    /// name when there is one, else the focused pane's folder. Broadcast
+    /// is marked in the label so it can't be left on by accident.
+    fn label(&self) -> String {
+        tab_label(
+            self.name.as_deref().unwrap_or(&self.title),
+            self.broadcast,
+            if self.zoomed {
+                self.panes.len().saturating_sub(1)
+            } else {
+                0
+            },
+        )
+    }
+
     /// The tab's progress: its focused pane's, else any pane's — a
     /// background pane's Claude is still this tab's work.
     fn progress(&self) -> Option<term::Progress> {
@@ -469,6 +493,86 @@ impl Tab {
                     .is_some_and(|ts| ts.elapsed() < std::time::Duration::from_secs(2))
             })
     }
+}
+
+/// Pane rects with the focused pane zoomed: it gets the whole content
+/// rect and every other pane an empty one. An empty rect is not drawn, is
+/// not hit by the pointer, and is skipped by relayout, so a hidden pane
+/// keeps its PTY size and its program never sees a resize to nothing.
+fn zoom_rects(content: render::Rect, panes: usize, focused: usize) -> Vec<render::Rect> {
+    (0..panes)
+        .map(|i| {
+            if i == focused {
+                content
+            } else {
+                (content.0, content.1, 0, 0)
+            }
+        })
+        .collect()
+}
+
+/// A rect that holds at least one cell's worth of pixels. Zoomed-away
+/// panes have none.
+fn rect_visible(rect: &render::Rect) -> bool {
+    rect.2 > 0 && rect.3 > 0
+}
+
+/// A tab's label: `» ` while broadcasting, and ` +N` while zoomed, N being
+/// the panes the zoom hides. Both states change where keys go or what is
+/// on screen, so neither may be invisible.
+fn tab_label(base: &str, broadcast: bool, hidden: usize) -> String {
+    let mut label = String::new();
+    if broadcast {
+        label.push_str("» ");
+    }
+    label.push_str(base);
+    if hidden > 0 {
+        label.push_str(&format!(" +{hidden}"));
+    }
+    label
+}
+
+/// Which panes besides the focused one hear typed input. Broadcast with a
+/// single pane is nothing extra.
+fn broadcast_targets(on: bool, panes: usize, focused: usize) -> Vec<usize> {
+    if !on {
+        return Vec::new();
+    }
+    (0..panes).filter(|&i| i != focused).collect()
+}
+
+/// Global rows `[start, end)` to the grid lines of their first and last
+/// row, for the current history size. Rows already pushed out of the
+/// scrollback are dropped from the top; nothing left is `None`.
+fn output_lines(
+    start: u64,
+    end: u64,
+    evicted: u64,
+    history: u64,
+    screen_lines: usize,
+) -> Option<(i32, i32)> {
+    let to_line = |abs: u64| abs as i64 - evicted as i64 - history as i64;
+    let first = to_line(start).max(-(history as i64));
+    let last = to_line(end.checked_sub(1)?).min(screen_lines as i64 - 1);
+    (end > start && first <= last).then_some((first as i32, last as i32))
+}
+
+/// Longest tab name kept, in characters. The tab bar truncates further.
+const TAB_NAME_MAX: usize = 40;
+
+/// The name a user typed, made safe to draw: trimmed, without control
+/// characters or bidi embeddings/overrides/isolates (a name must not be
+/// able to reorder the tab bar around it), and capped. Empty is no name.
+fn clean_tab_name(raw: &str) -> Option<String> {
+    let kept: String = raw
+        .chars()
+        .filter(|c| {
+            !c.is_control() && !matches!(*c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+        })
+        .take(TAB_NAME_MAX)
+        .collect();
+    let name = kept.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// Weighted split of a content rect along one axis, 1px gaps between panes.
@@ -521,6 +625,9 @@ struct SavedTab {
     orientation: u8,
     #[serde(default)]
     focused: usize,
+    /// the user's tab name; absent in files from before M38
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -598,6 +705,7 @@ fn parse_state(json: &str) -> Option<SavedState> {
                 weights: vec![1.0],
                 orientation: 0,
                 focused: 0,
+                name: None,
             })
             .collect(),
         active: legacy.active,
@@ -709,6 +817,22 @@ enum PaletteRow {
     Shell(String),
     CopyText(String),
     InsertCommand(&'static str),
+    /// name the active tab; `None` gives it back its folder name
+    RenameTab(Option<String>),
+}
+
+/// The palette's rows while naming a tab: the typed name first, so Enter
+/// takes it, then the way back to the folder name.
+fn rename_rows(query: &str) -> Vec<(PaletteRow, String)> {
+    let mut rows = Vec::new();
+    if let Some(name) = clean_tab_name(query) {
+        rows.push((
+            PaletteRow::RenameTab(Some(name.clone())),
+            format!("تسمية التبويب «{name}»"),
+        ));
+    }
+    rows.push((PaletteRow::RenameTab(None), "إعادة اسم المجلد".to_string()));
+    rows
 }
 
 fn palette_extras(
@@ -753,6 +877,8 @@ fn palette_extras(
 /// Ctrl+Shift+P: type to filter, arrows to move, Enter to run.
 struct Palette {
     query: String,
+    /// naming the active tab: the query is the new name, not a filter
+    rename: bool,
     sel: usize,
     extras: Vec<(PaletteRow, String)>,
     pressed: Option<(usize, PaletteRow)>,
@@ -1213,6 +1339,7 @@ impl App {
         let extras = palette_extras(&self.shell_profiles, &links);
         self.palette = Some(Palette {
             query,
+            rename: false,
             sel: 0,
             extras,
             pressed: None,
@@ -1284,6 +1411,13 @@ impl App {
                 p.query.push_str(c);
                 p.sel = 0; // a new filter invalidates the old position
             }
+            // winit names the space bar; without this a label with a space
+            // in it (most Arabic labels, every tab name of two words) could
+            // not be typed
+            Key::Named(NamedKey::Space) => {
+                p.query.push(' ');
+                p.sel = 0;
+            }
             _ => {}
         }
         self.request_redraw();
@@ -1293,6 +1427,9 @@ impl App {
     /// Matching is case-insensitive and substring, on the label the user
     /// actually sees — searching a hidden id would be a guessing game.
     fn palette_rows(&self, query: &str) -> Vec<(PaletteRow, String)> {
+        if self.palette.as_ref().is_some_and(|p| p.rename) {
+            return rename_rows(query);
+        }
         let q = query.trim().to_lowercase();
         let hit = |label: &str| q.is_empty() || label.to_lowercase().contains(&q);
         let mut rows: Vec<(PaletteRow, String)> = Vec::new();
@@ -1339,6 +1476,7 @@ impl App {
                 self.update_title();
             }
             PaletteRow::CopyText(text) => self.set_clipboard(text),
+            PaletteRow::RenameTab(name) => self.rename_tab(name),
             PaletteRow::InsertCommand(text) => {
                 self.pending_paste = Some(PendingPaste {
                     text: text.into(),
@@ -1427,6 +1565,10 @@ impl App {
                     s.reset_keyboard();
                 }
             }
+            RenameTab => self.open_rename_tab(),
+            Broadcast => self.toggle_broadcast(),
+            ZoomPane => self.toggle_zoom(),
+            CopyLastOutput => self.copy_last_output(),
         }
     }
 
@@ -1738,7 +1880,7 @@ impl App {
                     status
                 };
                 render::CockpitEntry {
-                    title: t.title.clone(),
+                    title: t.label(),
                     status,
                     busy: t.busy(i == self.active),
                     attention: t.attention,
@@ -1874,7 +2016,10 @@ impl App {
                 focused: 0,
                 orientation: Orientation::Row,
                 title,
+                name: None,
                 attention: false,
+                broadcast: false,
+                zoomed: false,
             });
             self.active = self.tabs.len() - 1;
             self.mru.touch(self.active);
@@ -1902,7 +2047,11 @@ impl App {
             (px.width as i32 - pad * 2).max(1),
             (px.height as i32 - bar - pad * 2).max(1),
         );
-        split_rects(content, &t.weights, t.orientation)
+        if t.zoomed && t.panes.len() > 1 {
+            zoom_rects(content, t.panes.len(), t.focused)
+        } else {
+            split_rects(content, &t.weights, t.orientation)
+        }
     }
 
     /// Drag divider `i` to the pointer: redistribute the PAIR's weight.
@@ -1949,6 +2098,9 @@ impl App {
         let (cw, ch) = (r.cell_w, r.cell_h);
         if let Some(t) = self.tabs.get_mut(self.active) {
             for (pane, rect) in t.panes.iter_mut().zip(&rects) {
+                if !rect_visible(rect) {
+                    continue; // zoomed away: keep the size it had
+                }
                 let g = TermSize {
                     cols: ((rect.2 as f32 / cw) as usize).max(10),
                     rows: ((rect.3 as f32 / ch) as usize).max(3),
@@ -1981,6 +2133,8 @@ impl App {
             t.panes.push(pane);
             t.weights.push(1.0);
             t.focused = t.panes.len() - 1;
+            // the new pane has to be seen: a split ends the zoom
+            t.zoomed = false;
         }
         self.relayout_active();
         self.sync_focus(None);
@@ -2016,8 +2170,15 @@ impl App {
             self.mru.removed(ti);
             self.active = active_after_remove(self.active, ti, self.tabs.len());
             self.mru.touch(self.active);
-        } else if t.focused >= t.panes.len() {
-            t.focused = t.panes.len() - 1;
+        } else {
+            if t.focused >= t.panes.len() {
+                t.focused = t.panes.len() - 1;
+            }
+            // the layout changed under the zoom: show the panes that are left
+            t.zoomed = false;
+            if t.panes.len() < 2 {
+                t.broadcast = false; // nothing left to broadcast to
+            }
         }
         self.relayout_active();
         self.update_title();
@@ -2084,6 +2245,7 @@ impl App {
                         Orientation::Column => 1,
                     },
                     focused: t.focused,
+                    name: t.name.clone(),
                 })
                 .collect(),
             active: self.active,
@@ -2154,6 +2316,7 @@ impl App {
                             }
                         }
                         t.focused = st.focused.min(t.panes.len() - 1);
+                        t.name = st.name.as_deref().and_then(clean_tab_name);
                     }
                 }
                 self.active = state.active.min(self.tabs.len().saturating_sub(1));
@@ -2187,6 +2350,18 @@ impl App {
     }
 
     fn encode_key_event(&self, event: &KeyEvent, released: bool) -> Option<Vec<u8>> {
+        self.encode_key_event_for(event, released, self.term_mode())
+    }
+
+    /// The same encoding against another pane's modes: a broadcast key
+    /// reaches vim in application-cursor mode as vim expects it, and a
+    /// pane that pushed kitty flags gets CSI u while its neighbour does not.
+    fn encode_key_event_for(
+        &self,
+        event: &KeyEvent,
+        released: bool,
+        mode: TermMode,
+    ) -> Option<Vec<u8>> {
         use winit::keyboard::PhysicalKey;
         use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
         let m = self.modifiers;
@@ -2207,7 +2382,7 @@ impl App {
             super_key: m.super_key(),
             repeat: event.repeat,
             released,
-            mode: keys::mode_for_keys(self.term_mode(), self.config.kitty_protocol_on()),
+            mode: keys::mode_for_keys(mode, self.config.kitty_protocol_on()),
             physical_letter: key_letter(event),
             base_layout_fallback: self.config.kitty_base_layout_fallback_on(),
         })
@@ -2864,6 +3039,93 @@ impl App {
         }
     }
 
+    /// Indices of the active tab's panes that also receive typed input:
+    /// every pane but the focused one while broadcast is on, else none.
+    fn broadcast_targets(&self) -> Vec<usize> {
+        self.tabs
+            .get(self.active)
+            .map(|t| broadcast_targets(t.broadcast, t.panes.len(), t.focused))
+            .unwrap_or_default()
+    }
+
+    /// Ctrl+Shift+B. A tab with one pane has nobody to broadcast to.
+    fn toggle_broadcast(&mut self) {
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            t.broadcast = !t.broadcast && t.panes.len() > 1;
+        }
+        self.request_redraw();
+    }
+
+    /// Ctrl+Shift+Z: the focused pane fills the tab, or the split comes back.
+    fn toggle_zoom(&mut self) {
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            t.zoomed = !t.zoomed && t.panes.len() > 1;
+        }
+        // a drag in progress was measured against the old rects
+        self.abandon_mouse();
+        self.drag_divider = None;
+        self.relayout_active();
+        self.request_redraw();
+    }
+
+    /// Ctrl+Shift+R: the palette, in naming mode. Whatever is typed becomes
+    /// the tab's name on Enter; the first row restores the folder name.
+    fn open_rename_tab(&mut self) {
+        let current = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.name.clone())
+            .unwrap_or_default();
+        self.open_palette(current);
+        if let Some(p) = self.palette.as_mut() {
+            p.rename = true;
+        }
+    }
+
+    fn rename_tab(&mut self, name: Option<String>) {
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            t.name = name.as_deref().and_then(clean_tab_name);
+        }
+        self.save_state();
+        self.request_redraw();
+    }
+
+    /// Ctrl+Shift+L: select and copy what the last finished command
+    /// printed, read between its OSC 133 marks. The selection is the
+    /// feedback: the copied block stays highlighted. It goes through
+    /// `copy_selection`, so Claude rows are restored to logical order the
+    /// same way a mouse copy is. Nothing happens without shell integration
+    /// (cmd, or a shell Bayan did not wrap).
+    fn copy_last_output(&mut self) {
+        let Some(s) = self.session() else {
+            return;
+        };
+        let range = {
+            let m = s.meta.lock().unwrap();
+            term::last_output_range(&m.marks).map(|r| (r, m.evicted))
+        };
+        let Some(((start, end), evicted)) = range else {
+            return;
+        };
+        {
+            let mut t = s.term.lock();
+            let history = t.grid().history_size() as u64;
+            let Some((first, last)) = output_lines(start, end, evicted, history, t.screen_lines())
+            else {
+                return;
+            };
+            let mut sel = Selection::new(
+                SelectionType::Lines,
+                Point::new(Line(first), Column(0)),
+                Side::Left,
+            );
+            sel.update(Point::new(Line(last), Column(0)), Side::Right);
+            t.selection = Some(sel);
+        }
+        self.copy_selection(false);
+        self.request_redraw();
+    }
+
     fn paste(&mut self) {
         let Some(txt) = self.clipboard().and_then(|c| c.get_text().ok()) else {
             return;
@@ -2902,6 +3164,17 @@ impl App {
         let bracketed = self.term_mode().contains(TermMode::BRACKETED_PASTE);
         let body = term::normalize_paste(txt, bracketed);
         self.last_input = Instant::now(); // pasting is typing, blink-wise
+                                          // broadcast: each other pane gets the paste wrapped for its own
+                                          // bracketed-paste mode
+        for pi in self.broadcast_targets() {
+            let session = &mut self.tabs[self.active].panes[pi].session;
+            let bracketed = session
+                .term
+                .lock()
+                .mode()
+                .contains(TermMode::BRACKETED_PASTE);
+            session.write(term::normalize_paste(txt, bracketed).as_bytes());
+        }
         if let Some(s) = self.session_mut() {
             s.write(body.as_bytes());
         }
@@ -3057,7 +3330,7 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, t)| render::TabInfo {
-                title: t.title.clone(),
+                title: t.label(),
                 busy: t.busy(i == self.active),
                 attention: t.attention,
                 active: i == self.active,
@@ -3075,10 +3348,13 @@ impl App {
         match (self.renderer.as_mut(), self.tabs.get(self.active)) {
             (Some(renderer), Some(tab)) if !rects.is_empty() => {
                 renderer.begin_frame();
-                let bordered = tab.panes.len() > 1;
+                let bordered = tab.panes.len() > 1 && !tab.zoomed;
                 let (auto_follow, claude_manual) = (self.auto_follow, self.claude_manual);
                 let mut focused_claude = false;
                 for (pi, (pane, rect)) in tab.panes.iter().zip(&rects).enumerate() {
+                    if !rect_visible(rect) {
+                        continue; // a pane zoomed away is not drawn
+                    }
                     let focused = pi == tab.focused;
                     // meta snapshot BEFORE the term lock (lock order term>meta
                     // only applies when holding both; here they don't overlap)
@@ -3574,7 +3850,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // Code with preferredNotifChannel=terminal_bell rings
                     // exactly this bell when it needs an approval).
                     if !self.focused && self.config.notifications_on() {
-                        let body = self.tabs[ti].title.clone();
+                        let body = self.tabs[ti].label();
                         self.toast_from_pty("بيان — تنبيه", &body);
                         if let Some(w) = &self.window {
                             w.request_user_attention(Some(
@@ -3595,7 +3871,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     if (background || !self.focused) && self.config.notifications_on() {
                         let body = if body.is_empty() {
-                            self.tabs[ti].title.clone()
+                            self.tabs[ti].label()
                         } else {
                             body
                         };
@@ -3641,7 +3917,7 @@ impl ApplicationHandler<UserEvent> for App {
                             } else {
                                 "فشل الأمر"
                             };
-                            let body = self.tabs[ti].title.clone();
+                            let body = self.tabs[ti].label();
                             self.toast_from_pty(title, &body);
                         }
                         self.request_redraw();
@@ -4268,6 +4544,7 @@ mod tests {
                 weights: vec![3.0, 1.0],
                 orientation: 1,
                 focused: 1,
+                name: Some("خادم".into()),
             }],
             active: 0,
             window: Some(WindowGeom {
@@ -4461,5 +4738,131 @@ mod palette_tests {
             format!("{extra} نتيجة · Enter تشغيل · ↑↓ تنقّل · Esc إغلاق"),
         );
         assert_eq!(render::palette_hint(0), "لا نتائج · Esc إغلاق");
+    }
+}
+
+#[cfg(test)]
+mod m38_tests {
+    use super::*;
+
+    #[test]
+    fn tab_names_are_trimmed_capped_and_stripped_of_bidi_controls() {
+        assert_eq!(clean_tab_name("  خادم الويب  "), Some("خادم الويب".into()));
+        assert_eq!(clean_tab_name(""), None);
+        assert_eq!(clean_tab_name("   "), None);
+        // an override must not be able to reorder the tab bar around it
+        assert_eq!(clean_tab_name("abc\u{202E}fed"), Some("abcfed".into()));
+        assert_eq!(clean_tab_name("\u{2067}x\u{2069}"), Some("x".into()));
+        assert_eq!(clean_tab_name("a\x1b[31mb\n"), Some("a[31mb".into()));
+        let long = "ب".repeat(100);
+        assert_eq!(clean_tab_name(&long).unwrap().chars().count(), TAB_NAME_MAX);
+        // the digits stay digits: ١٧٥ is a name like any other
+        assert_eq!(clean_tab_name("لوحة ١٧٥"), Some("لوحة ١٧٥".into()));
+    }
+
+    #[test]
+    fn the_label_marks_broadcast_and_zoom() {
+        assert_eq!(tab_label("Bayan", false, 0), "Bayan");
+        assert_eq!(tab_label("Bayan", true, 0), "» Bayan");
+        assert_eq!(tab_label("Bayan", false, 2), "Bayan +2");
+        assert_eq!(tab_label("Bayan", true, 1), "» Bayan +1");
+    }
+
+    #[test]
+    fn rename_rows_put_the_typed_name_first_and_always_offer_the_reset() {
+        let rows = rename_rows(" api ");
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].0 == PaletteRow::RenameTab(Some("api".into())));
+        assert!(rows[1].0 == PaletteRow::RenameTab(None));
+        // nothing typed: Enter restores the folder name
+        let rows = rename_rows("");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].0 == PaletteRow::RenameTab(None));
+    }
+
+    #[test]
+    fn zoom_gives_the_focused_pane_everything_and_hides_the_rest() {
+        let content = (10, 40, 1000, 600);
+        let rects = zoom_rects(content, 3, 1);
+        assert_eq!(
+            rects.len(),
+            3,
+            "one rect per pane, so indices still line up"
+        );
+        assert_eq!(rects[1], content);
+        assert!(!rect_visible(&rects[0]) && !rect_visible(&rects[2]));
+        // a hidden rect is not a cell either
+        assert_eq!(mouse::cell_at(15.0, 45.0, &[rects[0]], 8.0, 16.0), None);
+        assert!(rect_visible(&content));
+    }
+
+    #[test]
+    fn broadcast_reaches_every_other_pane_only_when_on() {
+        assert!(broadcast_targets(false, 3, 0).is_empty());
+        assert_eq!(broadcast_targets(true, 3, 1), vec![0, 2]);
+        assert!(broadcast_targets(true, 1, 0).is_empty());
+    }
+
+    #[test]
+    fn output_rows_map_to_grid_lines_and_drop_what_scrolled_away() {
+        // 100 rows of history, nothing evicted: global row 100 is line 0
+        assert_eq!(output_lines(100, 105, 0, 100, 30), Some((0, 4)));
+        assert_eq!(output_lines(90, 95, 0, 100, 30), Some((-10, -6)));
+        // 50 rows evicted past the cap: the same content moved up by 50
+        assert_eq!(output_lines(150, 155, 50, 100, 30), Some((0, 4)));
+        // the start fell off the top of the scrollback: keep what is left
+        assert_eq!(output_lines(10, 60, 0, 40, 30), Some((-40, 19)));
+        // wholly gone, or empty
+        assert_eq!(output_lines(0, 5, 0, 40, 30), None);
+        assert_eq!(output_lines(7, 7, 0, 40, 30), None);
+    }
+
+    #[test]
+    fn last_output_is_between_the_enter_and_the_next_prompt() {
+        use term::CmdMark;
+        let m = |abs, out| CmdMark {
+            abs,
+            exit: Some(0),
+            out,
+        };
+        // prompt at 10, Enter on 10 -> output 11..20, prompt at 20 (idle)
+        assert_eq!(
+            term::last_output_range(&[m(10, Some(11)), m(20, None)]),
+            Some((11, 20))
+        );
+        // an empty Enter at 20 printed nothing: the block before still counts
+        let marks = [m(10, Some(11)), m(20, Some(21)), m(21, None)];
+        assert_eq!(term::last_output_range(&marks), Some((11, 20)));
+        // a wrapped command: Enter on the prompt's third row
+        assert_eq!(
+            term::last_output_range(&[m(5, Some(8)), m(12, None)]),
+            Some((8, 12))
+        );
+        // no submitted command, or only the current prompt
+        assert_eq!(term::last_output_range(&[m(3, None), m(9, None)]), None);
+        assert_eq!(term::last_output_range(&[m(3, Some(4))]), None);
+        assert_eq!(term::last_output_range(&[]), None);
+    }
+
+    #[test]
+    fn a_saved_name_survives_and_old_files_still_parse() {
+        let s = SavedState {
+            tabs: vec![SavedTab {
+                cwds: vec![None],
+                weights: vec![1.0],
+                orientation: 0,
+                focused: 0,
+                name: Some("سجلات".into()),
+            }],
+            active: 0,
+            window: None,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(
+            parse_state(&json).unwrap().tabs[0].name.as_deref(),
+            Some("سجلات")
+        );
+        let old = r#"{"tabs":[{"cwds":[null]}],"active":0}"#;
+        assert_eq!(parse_state(old).unwrap().tabs[0].name, None);
     }
 }

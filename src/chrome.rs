@@ -276,14 +276,18 @@ impl App {
             return None;
         }
         let width = self.window.as_ref()?.inner_size().width as usize;
-        let titles: Vec<_> = self.tabs.iter().map(|t| t.title.as_str()).collect();
+        // the labels the renderer measured, user names and the broadcast
+        // mark included, or a click would land on the neighbour
+        let labels: Vec<String> = self.tabs.iter().map(|t| t.label()).collect();
+        let titles: Vec<&str> = labels.iter().map(String::as_str).collect();
         tab_index_at(&r.tab_rects(width, &titles, self.active), pos.x)
     }
 
     /// Divider index under the pointer (between pane i and i+1), if any.
     pub(crate) fn divider_at(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
         let t = self.tabs.get(self.active)?;
-        if t.panes.len() < 2 {
+        // a zoomed tab shows one pane: there is no divider to grab
+        if t.panes.len() < 2 || t.zoomed {
             return None;
         }
         divider_index(&self.pane_rects(), t.orientation, pos.x, pos.y)

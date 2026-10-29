@@ -327,6 +327,12 @@ impl App {
             return false;
         }
         t.focused = cycle(t.focused, step, t.panes.len());
+        // zoomed, the zoom follows focus: the newly focused pane is the
+        // one that fills the tab, and it is resized to that rect
+        let zoomed = t.zoomed;
+        if zoomed {
+            self.relayout_active();
+        }
         self.update_title();
         self.sync_focus(None);
         self.request_redraw();
@@ -383,6 +389,21 @@ impl App {
         // The press reached the encoder. Drop it from the swallowed set
         // before borrowing the session.
         self.take_held_away(event);
+        // Broadcast: every other pane of the tab gets the key too, encoded
+        // for its own modes, and snaps to its bottom like the focused one.
+        for pi in self.broadcast_targets() {
+            let mode = *self.tabs[self.active].panes[pi].session.term.lock().mode();
+            let Some(other) = self.encode_key_event_for(event, false, mode) else {
+                continue;
+            };
+            let session = &mut self.tabs[self.active].panes[pi].session;
+            {
+                let mut t = session.term.lock();
+                t.selection = None;
+                t.scroll_display(Scroll::Bottom);
+            }
+            session.write(&other);
+        }
         if let Some(s) = self.session_mut() {
             {
                 let mut t = s.term.lock();
@@ -399,7 +420,21 @@ impl App {
     /// press itself reached the PTY.
     fn key_released(&mut self, event: &KeyEvent) {
         let held_away = self.take_held_away(event);
-        if held_away || !self.term_mode().contains(TermMode::REPORT_EVENT_TYPES) {
+        if held_away {
+            return;
+        }
+        // a broadcast press owes its release to every pane that asked for
+        // event types, not only the focused one
+        for pi in self.broadcast_targets() {
+            let mode = *self.tabs[self.active].panes[pi].session.term.lock().mode();
+            if !mode.contains(TermMode::REPORT_EVENT_TYPES) {
+                continue;
+            }
+            if let Some(bytes) = self.encode_key_event_for(event, true, mode) {
+                self.tabs[self.active].panes[pi].session.write(&bytes);
+            }
+        }
+        if !self.term_mode().contains(TermMode::REPORT_EVENT_TYPES) {
             return;
         }
         if let Some(bytes) = self.encode_key_event(event, true) {

@@ -504,6 +504,42 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       it. What the tests really did was append their deliberate `b_broken`
       plugin failures to the user's `~/.bayan/plugins.log`. Under `cfg(test)`
       that log now goes to `%TEMP%`
+- [x] **M38** — four features from a survey of what people ask terminals
+      for (Ghostty's most-voted discussions, Windows Terminal's 1.18/1.19
+      headliners, agent-CLI workflow write-ups). Each is a rebindable action,
+      so it is in the shortcuts editor and the palette too.
+      **Tab names** (Ctrl+Shift+R): the palette opens in naming mode, the
+      typed text becomes the name on Enter, and its last row gives the folder
+      name back. Control characters and bidi embeddings, overrides and
+      isolates are stripped, so a name cannot reorder the tab bar; 40
+      characters at most. The name is saved in `session.json`.
+      **Broadcast input** (Ctrl+Shift+B): typed keys and pastes go to every
+      pane of the tab. Each pane gets the key encoded for its own modes
+      (application cursor, kitty flags) and the paste wrapped for its own
+      bracketed-paste mode, not a copy of the focused pane's bytes. The tab
+      label starts with `»` while it is on, and it turns off when the tab is
+      down to one pane.
+      **Pane zoom** (Ctrl+Shift+Z, WezTerm's chord): the focused pane fills
+      the tab and the label ends in `+N` for the N hidden panes. Hidden panes
+      get an empty rect, so they are not drawn, not hit by the pointer, and
+      not resized, and their programs never see a resize to nothing.
+      Alt+arrows move the zoom with focus; a split or a pane close ends it.
+      **Copy last output** (Ctrl+Shift+L): Enter at a prompt now records the
+      row below the cursor on that prompt's OSC 133 mark, so a command's
+      output is the rows from there to the next prompt. The block is
+      selected, which is the feedback, and copied through `copy_selection`,
+      so Claude rows are restored the way a mouse copy restores them. An
+      empty Enter does not hide the command before it. It needs shell
+      integration, so cmd copies nothing.
+      Also fixed: the palette ignored the space bar (winit names it), so no
+      label or name with a space in it could be typed.
+      Proven by unit tests on the pure parts (`clean_tab_name`, `tab_label`,
+      `rename_rows`, `zoom_rects`, `broadcast_targets`, `output_lines`,
+      `term::last_output_range`, the saved name round trip), and by a
+      Windows-target `cargo check`/`cargo clippy -D warnings`/`cargo fmt
+      --check` from a Linux container. Not proven here: a live window. These
+      were written where Bayan cannot run, so `cargo test` and a
+      launch-and-screenshot round on Windows are still owed
 
 ## Settings
 

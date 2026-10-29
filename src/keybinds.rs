@@ -26,10 +26,14 @@ pub enum Action {
     PromptNext,
     ClaudeToggle,
     ResetKeyboard,
+    RenameTab,
+    Broadcast,
+    ZoomPane,
+    CopyLastOutput,
 }
 
 impl Action {
-    pub const ALL: [Action; 13] = [
+    pub const ALL: [Action; 17] = [
         Action::NewTab,
         Action::ClosePane,
         Action::Search,
@@ -43,6 +47,10 @@ impl Action {
         Action::PromptNext,
         Action::ClaudeToggle,
         Action::ResetKeyboard,
+        Action::RenameTab,
+        Action::Broadcast,
+        Action::ZoomPane,
+        Action::CopyLastOutput,
     ];
 
     /// The config.json key.
@@ -61,6 +69,10 @@ impl Action {
             Action::PromptNext => "prompt-next",
             Action::ClaudeToggle => "claude-toggle",
             Action::ResetKeyboard => "reset-keyboard",
+            Action::RenameTab => "rename-tab",
+            Action::Broadcast => "broadcast",
+            Action::ZoomPane => "zoom-pane",
+            Action::CopyLastOutput => "copy-last-output",
         }
     }
 
@@ -80,6 +92,10 @@ impl Action {
             Action::PromptNext => "الأمر التالي",
             Action::ClaudeToggle => "وضع كلود",
             Action::ResetKeyboard => "إعادة ضبط لوحة المفاتيح",
+            Action::RenameTab => "تسمية التبويب",
+            Action::Broadcast => "الكتابة في كل اللوحات",
+            Action::ZoomPane => "تكبير اللوحة",
+            Action::CopyLastOutput => "نسخ ناتج آخر أمر",
         }
     }
 
@@ -107,6 +123,12 @@ impl Action {
             // Ctrl+Shift+K: the leaked-flags escape hatch. Physical K, so an
             // Arabic layout still reaches it.
             Action::ResetKeyboard => c(true, true, Letter('k')),
+            // R for rename, B for broadcast, Z for zoom (WezTerm's
+            // TogglePaneZoomState chord), L for the last command's lines
+            Action::RenameTab => c(true, true, Letter('r')),
+            Action::Broadcast => c(true, true, Letter('b')),
+            Action::ZoomPane => c(true, true, Letter('z')),
+            Action::CopyLastOutput => c(true, true, Letter('l')),
         }
     }
 }

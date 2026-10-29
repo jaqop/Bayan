@@ -178,6 +178,21 @@ fn fresh_prompt_nonce() -> String {
 pub struct CmdMark {
     pub abs: u64,
     pub exit: Option<i32>,
+    /// First row of the command's output: the row below the cursor when
+    /// Enter was sent at this prompt. `None` until a command is submitted.
+    pub out: Option<u64>,
+}
+
+/// Global rows `[start, end)` of the most recent finished command's
+/// output: from the row after its Enter to the row before the next
+/// prompt. A prompt where Enter produced nothing (`out` at or past the
+/// next prompt) is skipped, so an empty Enter does not hide the command
+/// before it.
+pub fn last_output_range(marks: &[CmdMark]) -> Option<(u64, u64)> {
+    marks.windows(2).rev().find_map(|w| {
+        let out = w[0].out?;
+        (out < w[1].abs).then_some((out, w[1].abs))
+    })
 }
 
 /// Shared shell-integration state, updated by the reader thread's scanners.
@@ -1025,7 +1040,11 @@ fn handle_osc133<T: EventListener>(
             let abs = meta.evicted
                 + t.grid().history_size() as u64
                 + t.grid().cursor.point.line.0.max(0) as u64;
-            meta.marks.push(CmdMark { abs, exit: None });
+            meta.marks.push(CmdMark {
+                abs,
+                exit: None,
+                out: None,
+            });
             if meta.marks.len() > 2000 {
                 meta.marks.drain(..1000); // EasyTer's trim
             }
@@ -1621,11 +1640,16 @@ pub(crate) fn capture_command_core<T: EventListener>(t: &Term<T>, meta: &mut Ses
     // wrapped line all leave the cursor at or before the prompt column, so
     // `running_cmd` stays empty. The nonce gate still has to close.
     meta.cmd_pending = true;
+    let cur = t.grid().cursor.point;
+    // the output starts on the row below the one Enter was pressed on
+    let out = meta.evicted + t.grid().history_size() as u64 + cur.line.0.max(0) as u64 + 1;
+    if let Some(m) = meta.marks.last_mut() {
+        m.out = Some(out);
+    }
     let Some(pcol) = meta.prompt_col else {
         return;
     };
     meta.at_prompt = false;
-    let cur = t.grid().cursor.point;
     let first = meta.prompt_abs.map_or(cur.line.0 as i64, |abs| {
         abs as i64 - meta.evicted as i64 - t.grid().history_size() as i64
     });
