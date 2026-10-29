@@ -23,7 +23,7 @@ use winit::window::{CursorIcon, ResizeDirection};
 use crate::chrome::{self, Caption, LeftPress, TabControl};
 use crate::{
     blur_forgets_held_keys, consume_guard_release, keybinds, link, mouse, prepare_window_close,
-    term, App, Orientation,
+    render, term, App, Orientation,
 };
 
 /// The font zoom range, in points on top of the configured size.
@@ -262,11 +262,21 @@ impl App {
         match event {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = *position;
+                self.menu_hover();
                 true
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if *button == MouseButton::Left {
                     self.palette_click(*state, el);
+                } else if *button == MouseButton::Right
+                    && *state == ElementState::Pressed
+                    && self.palette.as_ref().is_some_and(|p| p.menu.is_some())
+                {
+                    // a second right-click moves the menu to the new spot,
+                    // on whichever pane is under it now
+                    self.palette = None;
+                    self.right_press();
+                    self.request_redraw();
                 }
                 true
             }
@@ -301,14 +311,7 @@ impl App {
             return;
         };
         let rows = self.palette_rows(&p.query);
-        let layout = self
-            .renderer
-            .as_ref()
-            .zip(self.window.as_ref())
-            .map(|(r, w)| {
-                let size = w.inner_size();
-                r.palette_layout(size.width as usize, size.height as usize, rows.len(), p.sel)
-            });
+        let layout = self.palette_geometry(rows.len(), p.sel);
         let (x, y) = (self.cursor_pos.x, self.cursor_pos.y);
         let hit = layout.as_ref().and_then(|l| l.row_at(x, y));
         if state == ElementState::Pressed {
@@ -326,6 +329,37 @@ impl App {
             }
         }
         self.request_redraw();
+    }
+
+    /// Where the palette is on screen: centred, or as the right-click
+    /// popup at its anchor. Painting and hit-testing both ask here.
+    fn palette_geometry(&self, count: usize, sel: usize) -> Option<render::PaletteLayout> {
+        let p = self.palette.as_ref()?;
+        let (r, w) = self.renderer.as_ref().zip(self.window.as_ref())?;
+        let size = w.inner_size();
+        let (fw, fh) = (size.width as usize, size.height as usize);
+        Some(match p.menu {
+            Some(anchor) => r.menu_layout(fw, fh, count, anchor),
+            None => r.palette_layout(fw, fh, count, sel),
+        })
+    }
+
+    /// In the menu the row under the pointer is the selected one, like any
+    /// native popup. A redraw only when it changed.
+    fn menu_hover(&mut self) {
+        let Some(p) = self.palette.as_ref().filter(|p| p.menu.is_some()) else {
+            return;
+        };
+        let count = self.palette_rows(&p.query).len();
+        let hit = self
+            .palette_geometry(count, p.sel)
+            .and_then(|l| l.row_at(self.cursor_pos.x, self.cursor_pos.y));
+        if let (Some(i), Some(p)) = (hit, self.palette.as_mut()) {
+            if p.sel != i {
+                p.sel = i;
+                self.request_redraw();
+            }
+        }
     }
 
     /// `WindowEvent::CursorMoved`, after the modals.
@@ -558,6 +592,12 @@ impl App {
                 self.sync_focus(None);
                 self.paste();
             }
+            Some((pane, mouse::RightClick::Menu)) => {
+                // the menu acts on the pane that was clicked
+                self.focus_pane_at(pane);
+                self.sync_focus(None);
+                self.open_context_menu();
+            }
             Some((_, mouse::RightClick::Blocked)) | None => {}
         }
     }
@@ -576,6 +616,12 @@ impl App {
         self.cursor_pos =
             PhysicalPosition::new(x as f64 + w as f64 / 2.0, y as f64 + h as f64 / 2.0);
         self.right_press();
+        // With the menu on (the default), the click opened it: take its
+        // لصق row, which is what the user would click next.
+        if self.palette.as_ref().is_some_and(|p| p.menu.is_some()) {
+            self.palette = None;
+            self.paste();
+        }
     }
 
     /// The chrome first, in `chrome::left_press` order, then the terminal.

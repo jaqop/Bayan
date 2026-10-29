@@ -1340,6 +1340,19 @@ pub struct PasteCard<'a> {
 
 /// Hint under the command palette. The number is the filtered list the
 /// caller is about to draw and index, not a fixed action count.
+/// Top-left of a popup of `size` opened at `anchor` inside `frame`. The
+/// UI reads right to left, so the menu opens to the LEFT of the pointer and
+/// below it, flips right when there is no room on the left, flips up when
+/// there is none below, and is finally clamped inside the window.
+pub fn menu_origin(anchor: (f64, f64), size: (i32, i32), frame: (i32, i32)) -> (i32, i32) {
+    let (ax, ay) = (anchor.0.round() as i32, anchor.1.round() as i32);
+    let (w, h) = size;
+    let (fw, fh) = frame;
+    let x = if ax - w >= 0 { ax - w } else { ax };
+    let y = if ay + h <= fh { ay } else { ay - h };
+    (x.clamp(0, (fw - w).max(0)), y.clamp(0, (fh - h).max(0)))
+}
+
 pub(crate) fn palette_hint(count: usize) -> String {
     if count == 0 {
         "لا نتائج · Esc إغلاق".to_string()
@@ -3602,6 +3615,123 @@ impl Renderer {
         }
     }
 
+    /// The right-click menu: a narrow card at the pointer. Only `card` and
+    /// `rows` mean anything; the title, query and footer are empty, so the
+    /// palette's hit-testing works on it unchanged. Every row is shown (the
+    /// list is short) unless the window is too short, and then the rows
+    /// that fit.
+    pub fn menu_layout(
+        &self,
+        fw: usize,
+        fh: usize,
+        count: usize,
+        anchor: (f64, f64),
+    ) -> PaletteLayout {
+        let dpi = self.dpi_scale;
+        let pad = (6.0 * dpi).round() as i32;
+        let row_h = (self.ui_cell_h() + 14.0 * dpi).round() as i32;
+        let width = ((self.ui_cell_w() * 26.0).round() as i32)
+            .max((220.0 * dpi) as i32)
+            .min((fw as i32 - 8).max(0));
+        let fit = ((fh as i32 - pad * 2 - 8).max(0) / row_h.max(1)) as usize;
+        let shown = count.min(fit);
+        let height = pad * 2 + row_h * shown as i32;
+        let (x, y) = menu_origin(anchor, (width, height), (fw as i32, fh as i32));
+        let rows = (0..shown)
+            .map(|i| {
+                (
+                    i,
+                    (x + pad, y + pad + i as i32 * row_h, width - pad * 2, row_h),
+                )
+            })
+            .collect();
+        PaletteLayout {
+            card: (x, y, width, height),
+            title: (x, y, 0, 0),
+            query: (x, y, 0, 0),
+            rows,
+            footer: (x, y + height, 0, 0),
+            text_scale: 1.0,
+        }
+    }
+
+    /// The right-click menu. No backdrop: the terminal stays readable around
+    /// it, as under any native popup. Labels are right-aligned (the UI is
+    /// Arabic); a typed filter shows as an accent line under the card.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_menu(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        fw: usize,
+        fh: usize,
+        rows: &[String],
+        sel: usize,
+        anchor: (f64, f64),
+        query: &str,
+    ) {
+        let whole: Rect = (0, 0, fw as i32, fh as i32);
+        let layout = self.menu_layout(fw, fh, rows.len(), anchor);
+        let saved_metrics = self.metrics;
+        let saved_cells = (self.cell_w, self.cell_h);
+        self.metrics = Metrics::new(15.0 * self.dpi_scale, self.ui_cell_h());
+        self.cell_w = self.ui_cell_w();
+        self.cell_h = self.metrics.line_height;
+        let (x, y, w, h) = layout.card;
+        let accent = (0x58, 0xa6, 0xff);
+        let inset = (12.0 * self.dpi_scale).round() as i32;
+        push_rect(out, whole, x + 3, y + 4, w, h, c4((0, 0, 0), 90));
+        push_rect(out, whole, x, y, w, h, c4((0x3d, 0x44, 0x4d), 255));
+        push_rect(
+            out,
+            whole,
+            x + 1,
+            y + 1,
+            w - 2,
+            h - 2,
+            c4((0x16, 0x1b, 0x22), 255),
+        );
+        for &(idx, rect @ (rx, ry, rw, rh)) in &layout.rows {
+            let picked = idx == sel;
+            if picked {
+                push_rect(
+                    out,
+                    layout.card,
+                    rx,
+                    ry,
+                    rw,
+                    rh,
+                    c4((0x21, 0x36, 0x50), 255),
+                );
+                push_rect(out, layout.card, rx + rw - 3, ry, 3, rh, c4(accent, 255));
+            }
+            let label = self.guard_label(&rows[idx], (rw - inset * 2).max(0) as f32);
+            let seg = [Seg {
+                text: label,
+                fg: if picked {
+                    (0xf0, 0xf6, 0xfc)
+                } else {
+                    (0xc9, 0xd1, 0xd9)
+                },
+                style: 0,
+            }];
+            let tw = self.measure(&seg, true);
+            self.draw_run(
+                &seg,
+                true,
+                out,
+                rect,
+                (rx + rw - inset) as f32 - tw,
+                ry + (rh - self.cell_h as i32) / 2,
+                1.0,
+            );
+        }
+        if !query.is_empty() {
+            push_rect(out, whole, x, y + h, w, 2, c4(accent, 255));
+        }
+        self.metrics = saved_metrics;
+        (self.cell_w, self.cell_h) = saved_cells;
+    }
+
     /// The command palette (Ctrl+Shift+P). Query line, filtered rows, hint.
     /// `rows` is already filtered by the caller — the renderer never decides
     /// what matches, so the list drawn and the list Enter runs cannot differ.
@@ -5738,6 +5868,26 @@ mod cache_tests {
             sb.card.1 + sb.card.3 <= fh as i32,
             "the editor runs off-screen"
         );
+    }
+
+    /// The right-click menu: every row inside the card, hit-testable, and
+    /// a short window shows the rows that fit.
+    #[test]
+    fn the_menu_layout_lists_every_row_inside_its_card() {
+        let r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let lay = r.menu_layout(1400, 900, 12, (700.0, 200.0));
+        assert_eq!(lay.rows.len(), 12);
+        let (cx, cy, cw, ch) = lay.card;
+        assert!(cx >= 0 && cy >= 0 && cx + cw <= 1400 && cy + ch <= 900);
+        for &(_, (x, y, w, h)) in &lay.rows {
+            assert!(x >= cx && y >= cy && x + w <= cx + cw && y + h <= cy + ch);
+        }
+        // the row under a point inside it is that row
+        let (_, (x, y, w, h)) = lay.rows[3];
+        assert_eq!(lay.row_at((x + w / 2) as f64, (y + h / 2) as f64), Some(3));
+        // a window too short for all of them shows the ones that fit
+        let short = r.menu_layout(1400, 160, 12, (700.0, 10.0));
+        assert!(short.rows.len() < 12 && !short.rows.is_empty());
     }
 
     /// The shortcuts editor layout: one clickable strip per action, all

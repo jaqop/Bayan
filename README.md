@@ -540,6 +540,24 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       --check` from a Linux container. Not proven here: a live window. These
       were written where Bayan cannot run, so `cargo test` and a
       launch-and-screenshot round on Windows are still owed
+- [x] **M39** — a right-click menu. M36 made right-click paste, and that was
+      all it did: there was no menu, so nothing in Bayan could be found by
+      right-clicking. Now a right-click on a pane opens a popup at the
+      pointer: نسخ (only with a selection), لصق, copy last output, search,
+      both splits, zoom and broadcast (only with a split, each labelled with
+      the way it will flip), new tab, rename tab, close pane and settings.
+      Every row is a keymap action, so a row does exactly what its shortcut
+      does. It is the palette in a menu mode, not a second overlay: arrows,
+      Enter, Esc, the wheel and type-to-filter already worked, the hovered
+      row is the selected one, a click outside closes it, and a second
+      right-click moves it. It opens to the left of the pointer, because the
+      UI reads right to left, and flips right or up at the window edges
+      (`render::menu_origin`). Who owns the click did not change
+      (`mouse::with_menu`): a program that tracks the mouse still hears it,
+      Shift still keeps it local, and an overlay still blocks it.
+      `"right_click": "paste"` in config.json brings back M36's paste on
+      right-click; anything else, or nothing, is the menu. `BAYAN_PASTE`
+      still pastes: with the menu on it takes the menu's لصق row
 
 ## Settings
 

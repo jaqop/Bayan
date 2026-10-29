@@ -821,6 +821,52 @@ enum PaletteRow {
     RenameTab(Option<String>),
 }
 
+/// Rows of the right-click menu, most used first. Each one is a keymap
+/// action, so a row does exactly what its shortcut does.
+fn context_menu_rows(
+    has_selection: bool,
+    panes: usize,
+    zoomed: bool,
+    broadcast: bool,
+) -> Vec<(PaletteRow, String)> {
+    use keybinds::Action::*;
+    let mut rows = Vec::new();
+    let mut add = |a: keybinds::Action, label: &str| {
+        rows.push((PaletteRow::Builtin(a), label.to_string()));
+    };
+    if has_selection {
+        add(Copy, "نسخ");
+    }
+    add(Paste, "لصق");
+    add(CopyLastOutput, "نسخ ناتج آخر أمر");
+    add(Search, "البحث");
+    add(SplitH, "تقسيم جانبي");
+    add(SplitV, "تقسيم عمودي");
+    if panes > 1 {
+        add(
+            ZoomPane,
+            if zoomed {
+                "إلغاء تكبير اللوحة"
+            } else {
+                "تكبير اللوحة"
+            },
+        );
+        add(
+            Broadcast,
+            if broadcast {
+                "إيقاف الكتابة في كل اللوحات"
+            } else {
+                "الكتابة في كل اللوحات"
+            },
+        );
+    }
+    add(NewTab, "تبويب جديد");
+    add(RenameTab, "تسمية التبويب");
+    add(ClosePane, "إغلاق اللوحة");
+    add(Settings, "الإعدادات");
+    rows
+}
+
 /// The palette's rows while naming a tab: the typed name first, so Enter
 /// takes it, then the way back to the folder name.
 fn rename_rows(query: &str) -> Vec<(PaletteRow, String)> {
@@ -879,11 +925,18 @@ struct Palette {
     query: String,
     /// naming the active tab: the query is the new name, not a filter
     rename: bool,
+    /// the right-click menu: a popup at this window point instead of the
+    /// centred palette, listing `context_rows`
+    menu: Option<(f64, f64)>,
     sel: usize,
     extras: Vec<(PaletteRow, String)>,
     pressed: Option<(usize, PaletteRow)>,
     wheel: f32,
 }
+
+/// A frame's snapshot of the palette: (query, row labels, selected row,
+/// the right-click anchor when it is the menu).
+type PaletteView = (String, Vec<String>, usize, Option<(f64, f64)>);
 
 /// A frame's snapshot of the picker: (names, previews, selected row).
 type PoshView = (Vec<String>, Vec<Option<Vec<u8>>>, usize);
@@ -1340,6 +1393,7 @@ impl App {
         self.palette = Some(Palette {
             query,
             rename: false,
+            menu: None,
             sel: 0,
             extras,
             pressed: None,
@@ -1429,6 +1483,14 @@ impl App {
     fn palette_rows(&self, query: &str) -> Vec<(PaletteRow, String)> {
         if self.palette.as_ref().is_some_and(|p| p.rename) {
             return rename_rows(query);
+        }
+        if self.palette.as_ref().is_some_and(|p| p.menu.is_some()) {
+            let q = query.trim().to_lowercase();
+            return self
+                .context_rows()
+                .into_iter()
+                .filter(|(_, label)| q.is_empty() || label.to_lowercase().contains(&q))
+                .collect();
         }
         let q = query.trim().to_lowercase();
         let hit = |label: &str| q.is_empty() || label.to_lowercase().contains(&q);
@@ -2875,7 +2937,11 @@ impl App {
         let shift = self.modifiers.shift_key();
         let sel = self.has_selection();
         let cos = self.config.copy_on_select_on();
-        Some((pane, mouse::right_click(overlay, tracking, shift, sel, cos)))
+        let decision = mouse::right_click(overlay, tracking, shift, sel, cos);
+        Some((
+            pane,
+            mouse::with_menu(decision, self.config.right_click_menu_on()),
+        ))
     }
 
     /// Press in a tracking mode, and not Shift (Shift keeps the gesture
@@ -3066,6 +3132,28 @@ impl App {
         self.drag_divider = None;
         self.relayout_active();
         self.request_redraw();
+    }
+
+    /// The right-click menu's rows, for the active tab as it is now: copy
+    /// only with a selection, the pane rows only with a split, and the
+    /// zoom and broadcast rows saying which way they will flip.
+    fn context_rows(&self) -> Vec<(PaletteRow, String)> {
+        let (panes, zoomed, broadcast) =
+            self.tabs.get(self.active).map_or((1, false, false), |t| {
+                (t.panes.len(), t.zoomed, t.broadcast)
+            });
+        context_menu_rows(self.has_selection(), panes, zoomed, broadcast)
+    }
+
+    /// Right-click: the menu opens under the pointer, on the pane that was
+    /// clicked. It is the palette in menu mode, so the keyboard, the wheel
+    /// and Esc already work on it.
+    fn open_context_menu(&mut self) {
+        let at = (self.cursor_pos.x, self.cursor_pos.y);
+        self.open_palette(String::new());
+        if let Some(p) = self.palette.as_mut() {
+            p.menu = Some(at);
+        }
     }
 
     /// Ctrl+Shift+R: the palette, in naming mode. Whatever is typed becomes
@@ -3306,14 +3394,14 @@ impl App {
             .as_ref()
             .map(|p| (p.names.clone(), p.previews.clone(), p.sel));
         // computed before the renderer is borrowed, like close_msg above
-        let palette_view: Option<(String, Vec<String>, usize)> = self.palette.as_ref().map(|p| {
+        let palette_view: Option<PaletteView> = self.palette.as_ref().map(|p| {
             let rows: Vec<String> = self
                 .palette_rows(&p.query)
                 .into_iter()
                 .map(|(_, l)| l)
                 .collect();
             let sel = p.sel.min(rows.len().saturating_sub(1));
-            (p.query.clone(), rows, sel)
+            (p.query.clone(), rows, sel, p.menu)
         });
         let close_msg: Option<String> = self.pending_close.map(|target| match target {
             CloseTarget::Pane(ti, pi) => {
@@ -3517,15 +3605,27 @@ impl App {
                         flash.as_deref(),
                     );
                 }
-                if let Some((q, rows, sel)) = &palette_view {
-                    renderer.draw_palette(
-                        &mut verts,
-                        px.width as usize,
-                        px.height as usize,
-                        q,
-                        rows,
-                        *sel,
-                    );
+                if let Some((q, rows, sel, menu)) = &palette_view {
+                    if let Some(anchor) = menu {
+                        renderer.draw_menu(
+                            &mut verts,
+                            px.width as usize,
+                            px.height as usize,
+                            rows,
+                            *sel,
+                            *anchor,
+                            q,
+                        );
+                    } else {
+                        renderer.draw_palette(
+                            &mut verts,
+                            px.width as usize,
+                            px.height as usize,
+                            q,
+                            rows,
+                            *sel,
+                        );
+                    }
                 }
                 if let Some((names, previews, sel)) = &posh_view {
                     renderer.draw_posh(
@@ -4845,6 +4945,55 @@ mod m38_tests {
         assert_eq!(term::last_output_range(&[m(3, None), m(9, None)]), None);
         assert_eq!(term::last_output_range(&[m(3, Some(4))]), None);
         assert_eq!(term::last_output_range(&[]), None);
+    }
+
+    #[test]
+    fn the_menu_opens_left_of_the_pointer_and_stays_inside_the_window() {
+        let frame = (1000, 800);
+        // room on the left and below: left of the pointer, top at the pointer
+        assert_eq!(
+            render::menu_origin((600.0, 300.0), (250, 400), frame),
+            (350, 300)
+        );
+        // too close to the left edge: it opens to the right instead
+        assert_eq!(
+            render::menu_origin((100.0, 300.0), (250, 400), frame),
+            (100, 300)
+        );
+        // too close to the bottom: it opens upward
+        assert_eq!(
+            render::menu_origin((600.0, 700.0), (250, 400), frame),
+            (350, 300)
+        );
+        // bigger than the window: pinned to the top-left corner
+        assert_eq!(
+            render::menu_origin((10.0, 10.0), (1200, 900), frame),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn menu_rows_follow_the_tab() {
+        let labels = |rows: Vec<(PaletteRow, String)>| -> Vec<String> {
+            rows.into_iter().map(|(_, l)| l).collect()
+        };
+        let one = labels(context_menu_rows(false, 1, false, false));
+        assert_eq!(one[0], "لصق", "paste first when nothing is selected");
+        assert!(!one.iter().any(|l| l == "نسخ"));
+        assert!(
+            !one.iter().any(|l| l.contains("تكبير")),
+            "no zoom with one pane"
+        );
+        assert!(one.iter().any(|l| l == "الإعدادات"));
+        let sel = labels(context_menu_rows(true, 1, false, false));
+        assert_eq!(&sel[..2], ["نسخ", "لصق"]);
+        let split = labels(context_menu_rows(false, 2, true, true));
+        assert!(split.iter().any(|l| l == "إلغاء تكبير اللوحة"));
+        assert!(split.iter().any(|l| l == "إيقاف الكتابة في كل اللوحات"));
+        // every row is a keymap action: the menu cannot drift from the keys
+        assert!(context_menu_rows(true, 3, false, false)
+            .iter()
+            .all(|(r, _)| matches!(r, PaletteRow::Builtin(_))));
     }
 
     #[test]

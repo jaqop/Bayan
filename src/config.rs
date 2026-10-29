@@ -49,6 +49,9 @@ pub struct UserConfig {
     /// EasyTer's convention). Explicit Ctrl+C copy always works.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub copy_on_select: Option<bool>,
+    /// `"menu"` (default) or `"paste"`: what a right-click does at the prompt
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right_click: Option<String>,
     /// OSC 52 clipboard writes from the child. Off unless this is exactly
     /// `"copy"`. There is no read setting: a query never returns clipboard
     /// bytes, whatever this says. Writes also require the window to be focused.
@@ -263,6 +266,12 @@ impl UserConfig {
 
     pub fn copy_on_select_on(&self) -> bool {
         self.copy_on_select.unwrap_or(true)
+    }
+
+    /// Right-click outside a mouse-tracking program opens the context menu.
+    /// Only an explicit `"paste"` brings back M36's paste-on-right-click.
+    pub fn right_click_menu_on(&self) -> bool {
+        self.right_click.as_deref() != Some("paste")
     }
 
     /// True only for an explicit `"copy"`. `"paste"`, `"read"`, `"on"`, and

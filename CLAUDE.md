@@ -21,7 +21,7 @@ selection and BiDi paths must do.
 | `bidi_ctl.rs` | BDSM / SCP (terminal-wg BiDi controls), filtered out of the PTY stream before the parser |
 | `link.rs` | hyperlinks: OSC 8 spans, detected URLs and `path:line`, the narrow open policy |
 | `osc7.rs` | OSC 7 cwd reports, parsed then gated by `term::accept_local_cwd` |
-| `mouse.rs` | mouse tracking modes 1000/1002/1003, SGR vs X10, focus events (1004), right-click paste |
+| `mouse.rs` | mouse tracking modes 1000/1002/1003, SGR vs X10, focus events (1004), who owns a right-click (menu, paste, program) |
 | `keybinds.rs` | action registry + chord map |
 | `keys.rs` | keyboard → VT byte sequences (ported from EasyTer) |
 | `kitty.rs` | kitty keyboard protocol encoder, layout-aware alternate keys |
@@ -33,7 +33,7 @@ selection and BiDi paths must do.
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-339 tests across the tree. `term.rs` (60), `link.rs` (59) and `render.rs` (42)
+343 tests across the tree. `term.rs` (60), `link.rs` (59) and `render.rs` (42)
 carry the most.
 
 ## Invariants — do not "simplify" these
