@@ -4810,10 +4810,13 @@ mod m38_tests {
         assert_eq!(output_lines(90, 95, 0, 100, 30), Some((-10, -6)));
         // 50 rows evicted past the cap: the same content moved up by 50
         assert_eq!(output_lines(150, 155, 50, 100, 30), Some((0, 4)));
-        // the start fell off the top of the scrollback: keep what is left
-        assert_eq!(output_lines(10, 60, 0, 40, 30), Some((-40, 19)));
-        // wholly gone, or empty
-        assert_eq!(output_lines(0, 5, 0, 40, 30), None);
+        // still inside the scrollback: global row 10 is history line -30
+        assert_eq!(output_lines(10, 60, 0, 40, 30), Some((-30, 19)));
+        // 20 rows evicted: rows 0..20 are gone, so the block starts at the
+        // top of what is left (line -40) instead of at line -50
+        assert_eq!(output_lines(10, 80, 20, 40, 30), Some((-40, 19)));
+        // wholly evicted, or empty
+        assert_eq!(output_lines(0, 5, 20, 40, 30), None);
         assert_eq!(output_lines(7, 7, 0, 40, 30), None);
     }
 
