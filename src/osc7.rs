@@ -376,5 +376,9 @@ mod tests {
             s.contains("]133;D;$c;abc123"),
             "command end carries the exit code and the nonce"
         );
+        assert!(
+            s.contains("]133;B;abc123"),
+            "input start carries the session nonce"
+        );
     }
 }

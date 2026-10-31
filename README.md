@@ -587,9 +587,10 @@ pending, and the pane is not on the alt screen. Enter at the prompt sets
 (paste and Enter in one chunk, Home then Enter, a wrapped command), and
 only a nonce-verified OSC 133 A or D clears it. While it is set, OSC 7
 needs the nonce the same way it does while a command is running.
-PowerShell's wrapper sends OSC 133 D and A with a per-session nonce, and
-only that A arms the report, so a spoofed `133;D` from `cat` cannot. An
-idle OSC 7 (cmd/clink, which has no 133) is still stored. A new tab calls
+PowerShell's wrapper sends OSC 133 D, A, and B with a per-session nonce, and
+only that A arms the report, so a spoofed `133;D` from `cat` cannot. A `133;B`
+without the nonce clears the at-prompt flag, so drag-and-drop still confirms.
+An idle OSC 7 (cmd/clink, which has no 133) is still stored. A new tab calls
 `GetDriveTypeW` on the drive root and rejects a remote drive, and it
 rejects a reparse point without following it, before `is_dir`.
 

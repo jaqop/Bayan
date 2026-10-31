@@ -123,24 +123,32 @@ const PS_MID: &str = "$([char]7)$([char]27)]133;A;";
 
 const PS_TAIL: &str = "$([char]7)\
 $([char]27)]9;9;$($PWD.ProviderPath)$([char]7)$(__by_osc7)\"\
-+(& $global:__BY_OP)+\"$([char]27)]133;B$([char]7)\"}}}; __by_wrap";
++(& $global:__BY_OP)+\"$([char]27)]133;B;";
+
+/// Closes the `B;<nonce>` mark and the prompt function.
+const PS_END: &str = "$([char]7)\"}}}; __by_wrap";
 
 /// The PowerShell prompt wrapper injected at spawn.
 ///
-/// `nonce` is embedded in OSC 133 D and A (`D;<exit>;<nonce>`, `A;<nonce>`).
-/// A report from a running command is stored only after an A that carries
-/// the same nonce, so a spoofed `133;D` cannot authorize the OSC 7 that
-/// follows it. Hex is safe inside the double-quoted prompt string. An empty
-/// nonce keeps the old "any A/D" rule for tests. cmd/clink has no 133 marks;
-/// its OSC 7 is still accepted while the pane is already idle.
+/// `nonce` is embedded in OSC 133 D, A, and B (`D;<exit>;<nonce>`,
+/// `A;<nonce>`, `B;<nonce>`). A report from a running command is stored
+/// only after an A that carries the same nonce, so a spoofed `133;D` cannot
+/// authorize the OSC 7 that follows it. A `B` without the nonce does not
+/// mark the pane at a prompt. Hex is safe inside the double-quoted prompt
+/// string. An empty nonce keeps the old "any A/B/D" rule for tests.
+/// cmd/clink has no 133 marks; its OSC 7 is still accepted while the pane
+/// is already idle.
 pub(crate) fn shell_integration_ps(nonce: &str) -> String {
-    let mut s =
-        String::with_capacity(PS_HEAD.len() + PS_MID.len() + PS_TAIL.len() + nonce.len() * 2);
+    let mut s = String::with_capacity(
+        PS_HEAD.len() + PS_MID.len() + PS_TAIL.len() + PS_END.len() + nonce.len() * 3,
+    );
     s.push_str(PS_HEAD);
     s.push_str(nonce);
     s.push_str(PS_MID);
     s.push_str(nonce);
     s.push_str(PS_TAIL);
+    s.push_str(nonce);
+    s.push_str(PS_END);
     s
 }
 
@@ -184,9 +192,9 @@ pub struct CmdMark {
 /// Lock order everywhere: term FIRST, then meta.
 #[derive(Default)]
 pub struct SessionMeta {
-    /// idle at an interactive prompt (OSC 133 B seen, no command running)
+    /// idle at an interactive prompt (trusted OSC 133 B seen, no command running)
     pub at_prompt: bool,
-    /// column where prompt input begins (from OSC 133 B)
+    /// column where prompt input begins (from a trusted OSC 133 B)
     pub prompt_col: Option<usize>,
     /// Global row of OSC 133 B; a command may wrap below this row.
     pub prompt_abs: Option<u64>,
@@ -241,8 +249,8 @@ pub struct SessionMeta {
     /// uses this same byte test, inside the feed, because the flag stays
     /// set until the UI reads it.
     pub saw_ris: bool,
-    /// Secret mixed into OSC 133 A and D by the PowerShell prompt wrapper.
-    /// Empty in tests: any A or D is trusted. A live session sets 32 hex
+    /// Secret mixed into OSC 133 A, B, and D by the PowerShell prompt wrapper.
+    /// Empty in tests: any A, B, or D is trusted. A live session sets 32 hex
     /// characters at spawn. While a command is running, OSC 7 / OSC 9;9 are
     /// stored only after an A that carries this nonce. Clink's OSC 7 has no
     /// 133 and is still accepted when the pane is already idle.
@@ -897,15 +905,15 @@ fn cwd_from_osc7(payload: &[u8]) -> Option<String> {
     crate::osc7::parse_osc7(text, crate::osc7::cached_local_names())
 }
 
-/// `A` or `D` whose `;`-separated fields contain `nonce`.
+/// `A`, `B`, or `D` whose `;`-separated fields contain `nonce`.
 ///
-/// An empty nonce trusts every A and D, which is what the unit tests send.
-/// A live nonce is 32 hex characters from [`fresh_prompt_nonce`].
+/// An empty nonce trusts every A, B, and D, which is what the unit tests
+/// send. A live nonce is 32 hex characters from [`fresh_prompt_nonce`].
 fn osc133_trusted(payload: &[u8], nonce: &str) -> bool {
     let Some(&kind) = payload.first() else {
         return false;
     };
-    if kind != b'A' && kind != b'D' {
+    if !matches!(kind, b'A' | b'B' | b'D') {
         return false;
     }
     if nonce.is_empty() {
@@ -923,11 +931,12 @@ fn osc133_trusted(payload: &[u8], nonce: &str) -> bool {
 /// `running` is also true when Enter was sent at the prompt and no trusted
 /// 133 A/D has cleared `cmd_pending` yet, even if the command text was not
 /// captured. The prompt wrapper emits OSC 133 D, then A, then 9;9, then 7,
-/// in one read. A trusted A or D clears `running` for reports that follow
+/// in one read. A trusted A, B, or D clears `running` for reports that follow
 /// them in this slice. With a session nonce, only an A that carries it arms
-/// the report: a spoofed `133;D` leaves the command running and does not
-/// authorize the OSC 7 after it. An empty nonce (tests) arms at the start,
-/// so any A/D is enough. A pane that is already idle stays armed, which is
+/// the report: a spoofed `133;D` or `133;B` leaves the command running and
+/// does not authorize the OSC 7 after it. A trusted B clears `running` but
+/// does not arm. An empty nonce (tests) arms at the start,
+/// so any A, B, or D is enough. A pane that is already idle stays armed, which is
 /// how clink's OSC 7 — no 133 at all — still updates the directory. A
 /// `?1049` / `?47` /
 /// `?1047` updates `alt` for reports after that CSI. RIS (`ESC c`) leaves
@@ -1058,6 +1067,15 @@ fn handle_osc133<T: EventListener>(
             }
         }
         b'B' => {
+            // Input begins. A nested program can print a bare `133;B`.
+            // Only a trusted B (the session nonce, or any B when the nonce
+            // is empty) arms drag-and-drop and records the prompt column.
+            // An untrusted B clears `at_prompt` so a stale mark cannot skip
+            // the confirm card, and it does not move `prompt_col`.
+            if !trusted {
+                meta.at_prompt = false;
+                return;
+            }
             meta.at_prompt = true;
             meta.prompt_col = Some(t.grid().cursor.point.column.0);
             meta.prompt_abs = Some(
@@ -3039,6 +3057,104 @@ mod tests {
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"B\x07");
         assert!(meta.at_prompt);
         assert_eq!(meta.prompt_col, Some(4)); // input begins after "PS> "
+    }
+
+    /// OSC 133 B arms the prompt only when it carries the session nonce.
+    /// A bare or wrong-nonce B clears `at_prompt` and leaves `prompt_col`
+    /// where the trusted mark put it, so drag-and-drop still confirms.
+    /// An empty nonce (the other tests) still treats every B as trusted.
+    #[test]
+    fn osc133_b_requires_the_session_nonce() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.prompt_nonce = "n0nce".into();
+
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"PS> \x1b]133;B;n0nce\x07",
+        );
+        assert!(meta.at_prompt, "a B with the session nonce arms the prompt");
+        assert_eq!(meta.prompt_col, Some(4));
+        assert!(
+            !drop_needs_confirm(false, meta.at_prompt, "safe"),
+            "a trusted prompt types a safe drop straight in"
+        );
+
+        let col = meta.prompt_col;
+        let abs = meta.prompt_abs;
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\r\nnested\x1b]133;B\x07",
+        );
+        assert!(
+            !meta.at_prompt,
+            "a bare B from a nested program clears at_prompt"
+        );
+        assert_eq!(
+            meta.prompt_col, col,
+            "an untrusted B does not move prompt_col"
+        );
+        assert_eq!(
+            meta.prompt_abs, abs,
+            "an untrusted B does not move prompt_abs"
+        );
+        assert!(
+            drop_needs_confirm(false, meta.at_prompt, "safe"),
+            "a drop after an untrusted B confirms"
+        );
+
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;B;other\x07",
+        );
+        assert!(!meta.at_prompt, "a B with the wrong nonce stays disarmed");
+        assert_eq!(meta.prompt_col, col);
+
+        // The next real prompt arms again.
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"PS> \x1b]133;B;n0nce\x07",
+        );
+        assert!(meta.at_prompt, "a later trusted B arms the prompt again");
+        assert!(!drop_needs_confirm(false, meta.at_prompt, "safe"));
+
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.prompt_nonce = "n0nce".into();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"> \x1b]133;B\x07");
+        assert!(!meta.at_prompt, "an untrusted B does not arm from idle");
+        assert!(meta.prompt_col.is_none());
+        assert!(drop_needs_confirm(false, meta.at_prompt, "safe"));
+
+        // Neither form of B ends the command or arms the OSC 7 after it.
+        // Only a trusted A does that. The B above left the cursor on this row.
+        meta.running_cmd = "cmd".into();
+        meta.cwd = Some(r"C:\work".into());
+        let mut bare = b"\x1b]133;B\x07".to_vec();
+        bare.extend(osc7_of("file:///C:/evil"));
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &bare);
+        assert!(ev.cwd.is_none());
+        assert_eq!(meta.running_cmd, "cmd");
+        assert_eq!(meta.cwd.as_deref(), Some(r"C:\work"));
+        assert!(!meta.at_prompt);
+
+        let mut with_nonce = b"\x1b]133;B;n0nce\x07".to_vec();
+        with_nonce.extend(osc7_of("file:///C:/fromb"));
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &with_nonce);
+        assert!(ev.cwd.is_none(), "a trusted B does not arm OSC 7");
+        assert_eq!(meta.running_cmd, "cmd");
+        assert_eq!(meta.cwd.as_deref(), Some(r"C:\work"));
+        assert!(meta.at_prompt);
     }
 
     #[test]
