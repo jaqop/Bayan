@@ -154,6 +154,8 @@ pub(crate) struct Hits {
     pub cockpit_row: Option<usize>,
     pub divider: Option<usize>,
     pub tab: Option<usize>,
+    /// The × on a tab: closing that tab, not switching to it.
+    pub tab_close: Option<usize>,
     pub drag_strip: bool,
 }
 
@@ -176,6 +178,8 @@ pub(crate) enum LeftPress {
     Cockpit(Option<usize>),
     Divider(usize),
     Tab(usize),
+    /// The × on a tab closes that tab (EasyTer's tabCloseRequested).
+    CloseTab(usize),
     /// Empty title strip: double-click maximises, drag moves.
     DragStrip,
     /// Nothing chrome-side. Link, program or local selection decide next.
@@ -212,6 +216,9 @@ pub(crate) fn left_press(h: &Hits) -> LeftPress {
     }
     if let Some(i) = h.divider {
         return LeftPress::Divider(i);
+    }
+    if let Some(i) = h.tab_close {
+        return LeftPress::CloseTab(i);
     }
     if let Some(i) = h.tab {
         return LeftPress::Tab(i);
@@ -283,6 +290,18 @@ impl App {
         tab_index_at(&r.tab_rects(width, &titles, self.active), pos.x)
     }
 
+    /// Tab whose close × is under the pointer, if any.
+    pub(crate) fn tab_close_at(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
+        let r = self.renderer.as_ref()?;
+        if r.tab_bar_h() == 0.0 || pos.y >= r.tab_bar_h() as f64 {
+            return None;
+        }
+        let width = self.window.as_ref()?.inner_size().width as usize;
+        let labels: Vec<String> = self.tabs.iter().map(|t| t.label()).collect();
+        let titles: Vec<&str> = labels.iter().map(String::as_str).collect();
+        r.tab_close_at(width, &titles, self.active, pos.x, pos.y)
+    }
+
     /// Divider index under the pointer (between pane i and i+1), if any.
     pub(crate) fn divider_at(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
         let t = self.tabs.get(self.active)?;
@@ -319,6 +338,7 @@ impl App {
             cockpit_row: self.cockpit_row_hit(pos),
             divider: self.divider_at(pos),
             tab: self.tab_at(pos),
+            tab_close: self.tab_close_at(pos),
             drag_strip: self.in_drag_strip(pos),
         }
     }
@@ -485,7 +505,16 @@ mod tests {
         assert_eq!(left_press(&h), LeftPress::Divider(0));
         let h = Hits { divider: None, ..h };
         assert_eq!(left_press(&h), LeftPress::Tab(2));
-        let h = Hits { tab: None, ..h };
+        let h = Hits {
+            tab_close: Some(2),
+            ..h
+        };
+        assert_eq!(left_press(&h), LeftPress::CloseTab(2));
+        let h = Hits {
+            tab_close: None,
+            tab: None,
+            ..h
+        };
         assert_eq!(left_press(&h), LeftPress::DragStrip);
         assert_eq!(left_press(&Hits::default()), LeftPress::Terminal);
     }

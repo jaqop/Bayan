@@ -71,6 +71,8 @@ struct ShortcutsState {
 enum CloseTarget {
     /// the focused pane of tab .0 (Ctrl+Shift+W)
     Pane(usize, usize),
+    /// every pane in tab .0 (the tab-bar close control)
+    Tab(usize),
     /// the whole window (the titlebar X)
     Window,
 }
@@ -1247,6 +1249,7 @@ impl App {
         if let Some(target) = self.pending_close.take().filter(|_| confirm) {
             match target {
                 CloseTarget::Pane(ti, pi) => self.remove_pane(ti, pi, el),
+                CloseTarget::Tab(ti) => self.remove_tab(ti, el),
                 CloseTarget::Window => self.quit(el),
             }
         }
@@ -2203,6 +2206,50 @@ impl App {
         self.request_redraw();
     }
 
+    /// Close a whole tab (the tab-bar ×). Confirms when any pane still runs.
+    fn request_close_tab(&mut self, ti: usize, el: &ActiveEventLoop) {
+        let Some(t) = self.tabs.get(ti) else {
+            return;
+        };
+        let running = t
+            .panes
+            .iter()
+            .any(|p| !p.session.meta.lock().unwrap().running_cmd.is_empty());
+        if self.config.confirm_close_on() && running {
+            self.pending_close = Some(CloseTarget::Tab(ti));
+            self.request_redraw();
+            return;
+        }
+        self.remove_tab(ti, el);
+    }
+
+    /// Kill every pane in a tab and drop the tab; the last tab closes Bayan.
+    fn remove_tab(&mut self, ti: usize, el: &ActiveEventLoop) {
+        self.abandon_mouse();
+        let Some(mut t) = (ti < self.tabs.len()).then(|| self.tabs.remove(ti)) else {
+            return;
+        };
+        if matches!(self.pending_close, Some(CloseTarget::Tab(i)) if i == ti)
+            || matches!(self.pending_close, Some(CloseTarget::Pane(i, _)) if i == ti)
+        {
+            self.pending_close = None;
+        }
+        for mut pane in t.panes.drain(..) {
+            pane.session.kill();
+        }
+        if self.tabs.is_empty() {
+            self.quit(el);
+            return;
+        }
+        self.mru.removed(ti);
+        self.active = active_after_remove(self.active, ti, self.tabs.len());
+        self.mru.touch(self.active);
+        self.relayout_active();
+        self.update_title();
+        self.sync_focus(None);
+        self.request_redraw();
+    }
+
     /// Remove one pane; a tab with no panes closes, the last tab closes Bayan.
     fn remove_pane(&mut self, ti: usize, pi: usize, el: &ActiveEventLoop) {
         // before the pane is gone, so a tracked button can still be released
@@ -2215,7 +2262,10 @@ impl App {
         }
         // Pane indices can shift when a background shell exits. Dismiss an
         // index-based confirmation rather than letting it target a neighbour.
-        if matches!(self.pending_close, Some(CloseTarget::Pane(..))) {
+        if matches!(
+            self.pending_close,
+            Some(CloseTarget::Pane(..)) | Some(CloseTarget::Tab(_))
+        ) {
             self.pending_close = None;
         }
         let mut pane = t.panes.remove(pi);
@@ -3407,6 +3457,19 @@ impl App {
             CloseTarget::Pane(ti, pi) => {
                 let cmd = self.running_command(ti, pi).unwrap_or_default();
                 format!("الأمر «{cmd}» ما يزال يعمل — إغلاق اللوحة؟")
+            }
+            CloseTarget::Tab(ti) => {
+                let n = self
+                    .tabs
+                    .get(ti)
+                    .map(|t| {
+                        t.panes
+                            .iter()
+                            .filter(|p| !p.session.meta.lock().unwrap().running_cmd.is_empty())
+                            .count()
+                    })
+                    .unwrap_or(0);
+                format!("{n} أمر ما يزال يعمل — إغلاق التبويب؟")
             }
             CloseTarget::Window => {
                 format!("{} أمر ما يزال يعمل — إغلاق بيان؟", self.running_count())

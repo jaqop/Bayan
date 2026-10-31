@@ -566,6 +566,14 @@ impl App {
             ElementState::Pressed => match press_route(button) {
                 Press::Right => self.right_press(),
                 Press::Report(b) => {
+                    // middle-click on a tab closes it (browser convention);
+                    // otherwise report to the program when it asked
+                    if b == mouse::Btn::Middle {
+                        if let Some(i) = self.tab_at(self.cursor_pos) {
+                            self.request_close_tab(i, el);
+                            return;
+                        }
+                    }
                     let _ = self.try_report_press(b);
                 }
                 Press::Left => self.left_press(el),
@@ -668,6 +676,7 @@ impl App {
             }
             LeftPress::Divider(i) => self.drag_divider = Some(i),
             LeftPress::Tab(i) => self.switch_tab(i),
+            LeftPress::CloseTab(i) => self.request_close_tab(i, el),
             LeftPress::DragStrip => {
                 // the two gestures a real title bar owes the user
                 if let Some(w) = self.window.as_ref() {

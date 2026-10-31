@@ -4500,7 +4500,11 @@ impl Renderer {
                     );
                 }
             }
-            let max_chars = ((tw as f32 / self.cell_w) as usize).saturating_sub(4);
+            let close_w = self.tab_close_size();
+            let has_close = tabw >= close_w + 20;
+            // leave room for the close control (and the status dot left of it)
+            let reserve = if has_close { 6 } else { 4 };
+            let max_chars = ((tw as f32 / self.cell_w) as usize).saturating_sub(reserve);
             let title: String = tab.title.chars().take(max_chars).collect();
             let segs = [Seg::plain(title, fg)];
             self.draw_run(
@@ -4512,6 +4516,23 @@ impl Renderer {
                 (oy - self.cell_h.ceil() as i32) / 2,
                 1.0,
             );
+            // close control: same glyph as the window caption close
+            if has_close {
+                let ch = (oy - TAB_TOP - 4).min(close_w + 4).max(close_w);
+                let cx = tx + tabw - close_w - 4;
+                let cy = TAB_TOP + ((oy - TAB_TOP - 4) - ch).max(0) / 2;
+                let xseg = [Seg::plain("✕", dim(self.fg, 0.55))];
+                let gw = self.measure(&xseg, false);
+                self.draw_run(
+                    &xseg,
+                    false,
+                    out,
+                    whole,
+                    cx as f32 + (close_w as f32 - gw) / 2.0,
+                    cy + (ch - self.cell_h.ceil() as i32) / 2,
+                    1.0,
+                );
+            }
             // dots: amber attention (a Claude waiting on you) beats green busy
             let dot = if tab.attention {
                 Some((0xf2, 0xcc, 0x60))
@@ -4522,10 +4543,15 @@ impl Renderer {
             };
             if let Some(c) = dot.filter(|_| tw >= 28) {
                 let d = 6;
+                let dx = if has_close {
+                    tx + tabw - close_w - 4 - 12
+                } else {
+                    tx + tabw - 14
+                };
                 push_rect(
                     out,
                     whole,
-                    tx + tabw - 14,
+                    dx,
                     (oy + 3) / 2 - d / 2,
                     d,
                     d,
@@ -4665,6 +4691,56 @@ impl Renderer {
         self.tab_controls(width).iter().position(|&(x, y, w, h)| {
             px >= x as f64 && px < (x + w) as f64 && py >= y as f64 && py < (y + h) as f64
         })
+    }
+
+    /// Pixel size of the \u{00d7}-style close control on a tab.
+    fn tab_close_size(&self) -> i32 {
+        (self.ui_cell_w() * 1.6).max(16.0 * self.dpi_scale) as i32
+    }
+
+    /// Close-button rects for each visible tab (same geometry as the draw loop).
+    pub fn tab_close_rects(
+        &self,
+        width: usize,
+        titles: &[&str],
+        active: usize,
+    ) -> Vec<(usize, Rect)> {
+        if self.bar_hidden {
+            return Vec::new();
+        }
+        const TAB_GAP: i32 = 10;
+        const TAB_TOP: i32 = 7;
+        let oy = self.tab_bar_h().round() as i32;
+        let cw = self.tab_close_size();
+        let mut out = Vec::new();
+        for (i, x0, tw) in self.tab_rects(width, titles, active) {
+            let gap = TAB_GAP.min(tw.saturating_sub(1));
+            let tx = x0 + gap / 2;
+            let tabw = tw - gap;
+            // too narrow for a usable close control — keyboard ClosePane still works
+            if tabw < cw + 20 {
+                continue;
+            }
+            let ch = (oy - TAB_TOP - 4).min(cw + 4).max(cw);
+            let cx = tx + tabw - cw - 4;
+            let cy = TAB_TOP + ((oy - TAB_TOP - 4) - ch).max(0) / 2;
+            out.push((i, (cx, cy, cw, ch)));
+        }
+        out
+    }
+
+    /// Tab index whose close control contains (px, py).
+    pub fn tab_close_at(
+        &self,
+        width: usize,
+        titles: &[&str],
+        active: usize,
+        px: f64,
+        py: f64,
+    ) -> Option<usize> {
+        self.tab_close_rects(width, titles, active)
+            .into_iter()
+            .find_map(|(i, r)| rect_hit(r, px, py).then_some(i))
     }
 
     /// A shared viewport for rendering and hit testing. Keep the active tab
@@ -5173,6 +5249,28 @@ mod tests {
             r.tab_control_hit(800, (x + w / 2) as f64, (y + h / 2) as f64),
             None
         );
+    }
+
+    #[test]
+    fn tab_close_hits_the_drawn_control_and_misses_the_title() {
+        let r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let titles = ["shell-one", "shell-two", "shell-three"];
+        let closes = r.tab_close_rects(900, &titles, 1);
+        assert_eq!(closes.len(), 3, "each tab gets a close control");
+        for &(i, (x, y, w, h)) in &closes {
+            assert_eq!(
+                r.tab_close_at(900, &titles, 1, (x + w / 2) as f64, (y + h / 2) as f64),
+                Some(i)
+            );
+        }
+        // title area of the active tab is not the close control
+        let rects = r.tab_rects(900, &titles, 1);
+        let (_, tx, tw) = rects.iter().find(|(i, _, _)| *i == 1).copied().unwrap();
+        assert_eq!(
+            r.tab_close_at(900, &titles, 1, (tx + 16) as f64, 20.0),
+            None
+        );
+        let _ = tw;
     }
 
     /// Arabic must shape to real glyphs (no .notdef) through the fallback
