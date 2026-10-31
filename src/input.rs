@@ -61,6 +61,25 @@ pub(crate) fn press_route(button: MouseButton) -> Press {
     }
 }
 
+/// Middle-click on a tab closes it. Anywhere else it still reports to a
+/// program that asked. An overlay (the paste card, the link card, settings)
+/// swallows the close: those cards are not bound to a pane, and a settings
+/// panel should not grow a close gesture it did not have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MiddleHit {
+    CloseTab(usize),
+    Report,
+    Ignore,
+}
+
+pub(crate) fn middle_hit(blocked: bool, tab: Option<usize>) -> MiddleHit {
+    match tab {
+        Some(i) if !blocked => MiddleHit::CloseTab(i),
+        Some(_) => MiddleHit::Ignore,
+        None => MiddleHit::Report,
+    }
+}
+
 /// What a pointer move feeds, in priority order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Motion {
@@ -368,6 +387,17 @@ impl App {
         self.request_redraw();
     }
 
+    pub(crate) fn clear_tab_hover(&mut self) {
+        let Some(r) = self.renderer.as_mut() else {
+            return;
+        };
+        if r.hover_tab.is_some() || r.hover_tab_close.is_some() {
+            r.hover_tab = None;
+            r.hover_tab_close = None;
+            self.request_redraw();
+        }
+    }
+
     /// No button held. One hit-test: the hover and the 1003 report share
     /// the logical cell `locate` mapped through column_for_click.
     fn hover(&mut self, position: PhysicalPosition<f64>) {
@@ -389,10 +419,18 @@ impl App {
                 .renderer
                 .as_ref()
                 .is_some_and(|r| r.settings_button_hit(pw, position.x, position.y));
+            let tab = self.tab_at(position);
+            let tab_close = self.tab_close_at(position);
             if let Some(r) = self.renderer.as_mut() {
-                if r.hover_caption != cap || r.hover_gear != gear {
+                if r.hover_caption != cap
+                    || r.hover_gear != gear
+                    || r.hover_tab != tab
+                    || r.hover_tab_close != tab_close
+                {
                     r.hover_caption = cap;
                     r.hover_gear = gear;
+                    r.hover_tab = tab;
+                    r.hover_tab_close = tab_close;
                     self.request_redraw();
                 }
             }
@@ -529,14 +567,26 @@ impl App {
         el: &ActiveEventLoop,
     ) {
         match state {
-            ElementState::Pressed => match press_route(button) {
-                Press::Right => self.right_press(),
-                Press::Report(b) => {
-                    let _ = self.try_report_press(b);
+            ElementState::Pressed => {
+                if button == MouseButton::Middle {
+                    match middle_hit(self.overlay_blocks_mouse(), self.tab_at(self.cursor_pos)) {
+                        MiddleHit::CloseTab(i) => {
+                            self.request_close_tab(i, el);
+                            return;
+                        }
+                        MiddleHit::Ignore => return,
+                        MiddleHit::Report => {}
+                    }
                 }
-                Press::Left => self.left_press(el),
-                Press::Ignore => {}
-            },
+                match press_route(button) {
+                    Press::Right => self.right_press(),
+                    Press::Report(b) => {
+                        let _ = self.try_report_press(b);
+                    }
+                    Press::Left => self.left_press(el),
+                    Press::Ignore => {}
+                }
+            }
             ElementState::Released => self.mouse_release(button),
         }
     }
@@ -581,7 +631,13 @@ impl App {
     /// The chrome first, in `chrome::left_press` order, then the terminal.
     fn left_press(&mut self, el: &ActiveEventLoop) {
         let pos = self.cursor_pos;
-        match chrome::left_press(&self.chrome_hits(pos)) {
+        let Some(press) = chrome::tab_bar_action(
+            self.pending_paste.is_some() || self.blocked_link.is_some(),
+            chrome::left_press(&self.chrome_hits(pos)),
+        ) else {
+            return;
+        };
+        match press {
             LeftPress::Resize(dir) => {
                 if let Some(w) = self.window.as_ref() {
                     let _ = w.drag_resize_window(dir);
@@ -621,6 +677,7 @@ impl App {
                 self.request_redraw();
             }
             LeftPress::Divider(i) => self.drag_divider = Some(i),
+            LeftPress::TabClose(i) => self.request_close_tab(i, el),
             LeftPress::Tab(i) => self.switch_tab(i),
             LeftPress::DragStrip => {
                 // the two gestures a real title bar owes the user
@@ -728,6 +785,14 @@ mod tests {
         assert_eq!(press_route(MouseButton::Other(7)), Press::Ignore);
         assert_eq!(button_of(MouseButton::Back), None);
         assert_eq!(button_of(MouseButton::Right), Some(mouse::Btn::Right));
+    }
+
+    #[test]
+    fn middle_click_closes_a_tab_unless_an_overlay_is_up() {
+        assert_eq!(middle_hit(false, Some(2)), MiddleHit::CloseTab(2));
+        assert_eq!(middle_hit(true, Some(2)), MiddleHit::Ignore);
+        assert_eq!(middle_hit(false, None), MiddleHit::Report);
+        assert_eq!(middle_hit(true, None), MiddleHit::Report);
     }
 
     #[test]

@@ -698,8 +698,22 @@ pub fn progress_label(p: crate::term::Progress) -> String {
 
 /// Fixed tab width in cells — the app's click hit-test relies on this.
 pub const TAB_CELLS: f32 = 24.0;
-/// A tab never shrinks below this: "sh" must still be a clickable target.
-pub const TAB_MIN_CELLS: f32 = 9.0;
+/// A tab never shrinks below this: the close control and a few title
+/// letters still have to be a clickable target. A window narrower than
+/// that omits the close glyph; middle-click still closes the tab.
+pub const TAB_MIN_CELLS: f32 = 11.0;
+/// Points under the 16pt tab-chrome face. The terminal font is a separate
+/// metric and is not touched.
+pub const TAB_TITLE_FONT_DELTA: f32 = -2.0;
+/// Gap between tab cards. Drawing and hit-testing both read this.
+pub const TAB_GAP: i32 = 10;
+/// Top of a tab card inside the bar. Drawing and hit-testing both read this.
+pub const TAB_TOP: i32 = 7;
+/// Cells beside the title: padding, the status dot, and the close control.
+const TAB_CHROME_CELLS: f32 = 8.0;
+/// Title slot stays at least this many title-font cells wide before the
+/// close control is drawn. Narrower cards omit the glyph.
+const TAB_TEXT_MIN_CELLS: f32 = 5.0;
 
 /// A rect in frame pixels: (x, y, w, h).
 pub type Rect = (i32, i32, i32, i32);
@@ -1305,6 +1319,10 @@ pub struct Renderer {
     pub hover_caption: Option<usize>,
     /// pointer over the settings gear
     pub hover_gear: bool,
+    /// tab under the pointer, for the full-title tooltip
+    pub hover_tab: Option<usize>,
+    /// tab whose close control is under the pointer
+    pub hover_tab_close: Option<usize>,
     font_system: FontSystem,
     cache: SwashCache,
     metrics: Metrics,
@@ -1346,6 +1364,63 @@ pub(crate) fn palette_hint(count: usize) -> String {
     } else {
         format!("{count} نتيجة · Enter تشغيل · ↑↓ تنقّل · Esc إغلاق")
     }
+}
+
+/// A mark that must travel with the base it sits on. Cutting a tab title
+/// between the two would draw the vowel on the following letter.
+fn is_combining_mark(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0300}'..='\u{036F}'
+            | '\u{064B}'..='\u{065F}'
+            | '\u{0670}'
+            | '\u{06D6}'..='\u{06ED}'
+            | '\u{FE20}'..='\u{FE2F}'
+    )
+}
+
+/// `mid` scalars, extended so a combining mark stays on its base.
+fn snap_prefix(chars: &[char], mid: usize) -> usize {
+    let mut end = mid.min(chars.len());
+    while end < chars.len() && is_combining_mark(chars[end]) {
+        end += 1;
+    }
+    end
+}
+
+/// The longest logical prefix of `title` that fits in `max_w`, with an
+/// ellipsis when it had to be cut. Marks stay with their base. The string
+/// is not reordered: BiDi happens later, when the label is shaped.
+pub(crate) fn fit_tab_title(
+    title: &str,
+    max_w: f32,
+    mut measure: impl FnMut(&str) -> f32,
+) -> String {
+    if title.is_empty() || max_w <= 0.0 {
+        return String::new();
+    }
+    if measure(title) <= max_w {
+        return title.to_string();
+    }
+    let chars: Vec<char> = title.chars().collect();
+    let mut best = String::new();
+    if measure("…") <= max_w {
+        best = "…".to_string();
+    }
+    let (mut lo, mut hi) = (0, chars.len());
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        let end = snap_prefix(&chars, mid);
+        let mut candidate: String = chars[..end].iter().collect();
+        candidate.push('…');
+        if measure(&candidate) <= max_w {
+            best = candidate;
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best
 }
 
 impl Renderer {
@@ -1407,6 +1482,8 @@ impl Renderer {
             mapping_context: None,
             hover_caption: None,
             hover_gear: false,
+            hover_tab: None,
+            hover_tab_close: None,
             font_system,
             cache: SwashCache::new(),
             metrics,
@@ -1631,13 +1708,112 @@ impl Renderer {
         key
     }
 
-    /// Width of the tab holding `title`: the title plus room for the status
-    /// dot and the gap, clamped between TAB_MIN_CELLS and TAB_CELLS. Counted
-    /// in chars rather than measured, because the tab bar is grid-aligned and
-    /// measuring here would cost a shape on every frame.
+    /// Width of the tab holding `title`: the title plus room for padding,
+    /// the status dot and the close control, clamped between TAB_MIN_CELLS
+    /// and TAB_CELLS. Counted in chars rather than measured, because the tab
+    /// bar is grid-aligned and measuring here would cost a shape on every
+    /// frame. The painted label is measured separately, two points under
+    /// the chrome face, and ellipsized into the slot this width leaves.
     pub fn tab_width(&self, title: &str) -> i32 {
-        let cells = (title.chars().count() as f32 + 6.0).clamp(TAB_MIN_CELLS, TAB_CELLS);
+        let cells =
+            (title.chars().count() as f32 + TAB_CHROME_CELLS).clamp(TAB_MIN_CELLS, TAB_CELLS);
         (self.ui_cell_w() * cells) as i32
+    }
+
+    /// Tab-title face: [`TAB_TITLE_FONT_DELTA`] under the 16pt chrome, scaled
+    /// with the monitor. The line box stays the chrome line so the bar does
+    /// not grow and the first terminal row keeps its inset.
+    pub(crate) fn tab_title_px(&self) -> f32 {
+        (16.0 + TAB_TITLE_FONT_DELTA).max(8.0) * self.dpi_scale
+    }
+
+    fn tab_title_cell_w(&self) -> f32 {
+        let chrome = (16.0 * self.dpi_scale).max(1.0);
+        self.ui_cell_w() * self.tab_title_px() / chrome
+    }
+
+    fn tab_text_min_px(&self) -> i32 {
+        (self.tab_title_cell_w() * TAB_TEXT_MIN_CELLS)
+            .round()
+            .max(1.0) as i32
+    }
+
+    fn tab_close_side(&self) -> i32 {
+        (16.0 * self.dpi_scale).round().max(14.0) as i32
+    }
+
+    /// Shape `f` at the title face, then put the chrome face back. The
+    /// terminal metrics are not part of this swap.
+    fn with_tab_title_font<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = self.metrics;
+        self.metrics = Metrics::new(self.tab_title_px(), self.ui_cell_h());
+        let out = f(self);
+        self.metrics = saved;
+        out
+    }
+
+    /// The rounded card for a tab span `(x0, tw)`. `TAB_GAP` and `TAB_TOP`
+    /// are the same constants the hit-test uses.
+    pub(crate) fn tab_card(&self, x0: i32, tw: i32) -> Rect {
+        let gap = TAB_GAP.min(tw.saturating_sub(1));
+        let tx = x0 + gap / 2;
+        let tabw = (tw - gap).max(0);
+        let oy = self.tab_bar_h().round() as i32;
+        let h = (oy - TAB_TOP - 4).max(0);
+        (tx, TAB_TOP, tabw, h)
+    }
+
+    /// Pixels the title may occupy. `close` reserves the trailing control;
+    /// `dot_reserve` is the busy/attention dot when one is drawn.
+    fn tab_text_width(&self, card: Rect, close: Option<Rect>, dot_reserve: i32) -> i32 {
+        let (tx, _, tw, _) = card;
+        let left = tx + 12;
+        let mut right = tx + tw - 8;
+        if let Some((cx, ..)) = close {
+            right = cx - 4;
+        }
+        right -= dot_reserve;
+        (right - left).max(0)
+    }
+
+    /// The close control on the trailing edge of the card, or nothing when
+    /// the remaining title slot would fall under [`TAB_TEXT_MIN_CELLS`].
+    /// The strip itself stays left-to-right (controls live on the right);
+    /// the title inside the slot is still shaped with BiDi.
+    pub(crate) fn tab_close_rect(&self, card: Rect) -> Option<Rect> {
+        let (tx, ty, tw, th) = card;
+        if tw <= 0 || th < 8 {
+            return None;
+        }
+        let side = self.tab_close_side().min(th - 4);
+        if side < 12 {
+            return None;
+        }
+        let x = tx + tw - 6 - side;
+        let y = ty + (th - side).max(0) / 2;
+        let rect = (x, y, side, side);
+        let text_w = self.tab_text_width(card, Some(rect), 0);
+        (text_w >= self.tab_text_min_px()).then_some(rect)
+    }
+
+    /// Close control under `(x, y)`, if that tab is wide enough to draw one.
+    pub(crate) fn tab_close_at(
+        &self,
+        width: usize,
+        titles: &[&str],
+        active: usize,
+        x: f64,
+        y: f64,
+    ) -> Option<usize> {
+        if self.bar_hidden {
+            return None;
+        }
+        self.tab_rects(width, titles, active)
+            .into_iter()
+            .find_map(|(i, x0, tw)| {
+                let close = self.tab_close_rect(self.tab_card(x0, tw))?;
+                rect_hit(close, x, y).then_some(i)
+            })
     }
 
     /// Height of the tab bar in pixels — pane content starts below it.
@@ -4323,6 +4499,9 @@ impl Renderer {
         // long path can't eat the bar and a short name stays clickable.
         let titles: Vec<_> = tabs.iter().map(|t| t.title.as_str()).collect();
         let active = tabs.iter().position(|t| t.active).unwrap_or(0);
+        let title_y = (oy - self.cell_h.ceil() as i32) / 2;
+        // anchor x of a truncated title the pointer is resting on
+        let mut tooltip: Option<(i32, String)> = None;
         for (i, x0, tw) in self.tab_rects(width, &titles, active) {
             let tab = &tabs[i];
             // The active tab takes the CONTENT background, so it reads as the
@@ -4347,41 +4526,28 @@ impl Renderer {
             } else {
                 (bar_bg, dim(self.fg, 0.75))
             };
-            // tabs sit IN the bar rather than filling it: a 3px gutter above
-            // and a real gap between them, so they read as separate cards
-            const TAB_GAP: i32 = 10;
-            const TAB_TOP: i32 = 7;
-            let gap = TAB_GAP.min(tw.saturating_sub(1));
-            let tx = x0 + gap / 2;
-            let tabw = tw - gap;
+            // tabs sit IN the bar rather than filling it: a gutter above
+            // and a real gap between them, so they read as separate cards.
+            // TAB_GAP and TAB_TOP are shared with the close hit-test.
+            let card = self.tab_card(x0, tw);
+            let (tx, _, tabw, _) = card;
             push_rect_top_rounded(out, whole, tx, TAB_TOP, tabw, oy - TAB_TOP - 4, c4(bg, 255));
             if tab.active && tabw >= 12 {
                 // a hairline that hugs the curve — enough to mark focus without
                 // shouting; the background match already does most of the work
-                for (i, inset) in CORNER_INSET.iter().enumerate().take(2) {
+                for (step, inset) in CORNER_INSET.iter().enumerate().take(2) {
                     push_rect(
                         out,
                         whole,
                         tx + inset,
-                        TAB_TOP + i as i32,
+                        TAB_TOP + step as i32,
                         tabw - 2 * inset,
                         1,
                         c4((0x2e, 0xa0, 0x43), 220),
                     );
                 }
             }
-            let max_chars = ((tw as f32 / self.cell_w) as usize).saturating_sub(4);
-            let title: String = tab.title.chars().take(max_chars).collect();
-            let segs = [Seg::plain(title, fg)];
-            self.draw_run(
-                &segs,
-                true,
-                out,
-                (tx, TAB_TOP, tabw, oy - TAB_TOP),
-                (tx + 12) as f32,
-                (oy - self.cell_h.ceil() as i32) / 2,
-                1.0,
-            );
+            let close = self.tab_close_rect(card);
             // dots: amber attention (a Claude waiting on you) beats green busy
             let dot = if tab.attention {
                 Some((0xf2, 0xcc, 0x60))
@@ -4390,16 +4556,61 @@ impl Renderer {
             } else {
                 None
             };
-            if let Some(c) = dot.filter(|_| tw >= 28) {
+            let show_dot = dot.is_some() && tw >= 28;
+            let text_w = self.tab_text_width(card, close, if show_dot { 10 } else { 0 });
+            let truncated = self.with_tab_title_font(|r| {
+                let fitted = fit_tab_title(&tab.title, text_w as f32, |s| {
+                    r.measure(&[Seg::plain(s, fg)], true)
+                });
+                let truncated = fitted != tab.title;
+                if text_w > 0 && !fitted.is_empty() {
+                    let segs = [Seg::plain(fitted, fg)];
+                    r.draw_run(
+                        &segs,
+                        true,
+                        out,
+                        (tx + 12, TAB_TOP, text_w, (oy - TAB_TOP).max(0)),
+                        (tx + 12) as f32,
+                        title_y,
+                        1.0,
+                    );
+                }
+                truncated
+            });
+            if truncated && self.hover_tab == Some(i) {
+                tooltip = Some((tx, tab.title.clone()));
+            }
+            if let Some(c) = dot.filter(|_| show_dot) {
                 let d = 6;
-                push_rect(
+                let dx = match close {
+                    Some((cx, ..)) => cx - 4 - d,
+                    None => tx + tabw - 14,
+                };
+                if dx >= tx + 12 {
+                    push_rect(out, whole, dx, (oy + 3) / 2 - d / 2, d, d, c4(c, 255));
+                }
+            }
+            if let Some((bx, by, bw, bh)) = close {
+                if self.hover_tab_close == Some(i) {
+                    push_rect(out, whole, bx, by, bw, bh, c4((0xc4, 0x2b, 0x1c), 255));
+                }
+                let seg = [Seg::plain(
+                    "\u{2715}",
+                    if self.hover_tab_close == Some(i) {
+                        (0xff, 0xff, 0xff)
+                    } else {
+                        (0xb6, 0xc2, 0xcf)
+                    },
+                )];
+                let gw = self.measure(&seg, false);
+                self.draw_run(
+                    &seg,
+                    false,
                     out,
-                    whole,
-                    tx + tabw - 14,
-                    (oy + 3) / 2 - d / 2,
-                    d,
-                    d,
-                    c4(c, 255),
+                    card,
+                    bx as f32 + (bw as f32 - gw) / 2.0,
+                    by + (bh - self.cell_h.ceil() as i32) / 2,
+                    1.0,
                 );
             }
             // progress: a 3px bar along the bottom edge, its track dimmed and
@@ -4511,6 +4722,55 @@ impl Renderer {
             whole,
             bx as f32 + (bw as f32 - gw) / 2.0,
             by + (bh - self.cell_h.ceil() as i32) / 2,
+            1.0,
+        );
+
+        if let Some((anchor, title)) = tooltip {
+            self.draw_tab_tooltip(out, whole, anchor, &title, width, height);
+        }
+    }
+
+    /// Full title under the tab, in the chrome face. It floats over the
+    /// first terminal row and does not change the bar height, so the
+    /// content inset stays where `tab_bar_h` put it.
+    fn draw_tab_tooltip(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        whole: Rect,
+        anchor_x: i32,
+        title: &str,
+        width: usize,
+        height: usize,
+    ) {
+        let pad = 8;
+        let max_w = (width as i32 - 16 - pad * 2).max(8) as f32;
+        let fg = (0xee, 0xfb, 0xfa);
+        let shown = fit_tab_title(title, max_w, |s| self.measure(&[Seg::plain(s, fg)], true));
+        if shown.is_empty() {
+            return;
+        }
+        let segs = [Seg::plain(shown, fg)];
+        let text_w = self.measure(&segs, true).ceil() as i32;
+        let tw = (text_w + pad * 2).min((width as i32 - 8).max(1));
+        let th = self.cell_h.ceil() as i32 + 10;
+        let mut x = anchor_x;
+        if x + tw > width as i32 - 4 {
+            x = (width as i32 - 4 - tw).max(4);
+        }
+        let bar = self.tab_bar_h().round() as i32;
+        let mut y = bar + 4;
+        if y + th > height as i32 - 4 {
+            y = (height as i32 - 4 - th).max(0);
+        }
+        push_rect(out, whole, x, y, tw, th, c4((0x1c, 0x21, 0x28), 245));
+        push_rect(out, whole, x, y, tw, 2, c4((0x58, 0xd1, 0xc0), 220));
+        self.draw_run(
+            &segs,
+            true,
+            out,
+            (x + pad, y, (tw - pad * 2).max(1), th),
+            (x + pad) as f32,
+            y + 5,
             1.0,
         );
     }
@@ -5426,9 +5686,155 @@ mod cache_tests {
             assert!(w >= last, "width shrank at n={n}");
             last = w;
         }
-        // the draw loop derives its truncation budget as (w / cell_w) - 4, so
-        // the narrowest tab must still leave that positive
-        assert!((short as f32 / r.cell_w) as usize > 4);
+        // the narrowest tab still has a title slot. The close control is
+        // omitted there when it would eat the label.
+        let card = r.tab_card(0, short);
+        assert!(r.tab_text_width(card, None, 0) > 0);
+        assert!(card.1 + card.3 <= r.tab_bar_h().round() as i32);
+    }
+
+    #[test]
+    fn fit_tab_title_ellipsizes_without_reordering_or_splitting_a_mark() {
+        let width = |s: &str| s.chars().count() as f32 * 10.0;
+        assert_eq!(fit_tab_title("Desktop", 70.0, width), "Desktop");
+        assert_eq!(fit_tab_title("Desktop", 40.0, width), "Des…");
+        assert_eq!(fit_tab_title("١٧٥", 100.0, width), "١٧٥");
+        assert_eq!(fit_tab_title("", 40.0, width), "");
+        let arabic = fit_tab_title("بيان-سطح-المكتب", 50.0, width);
+        assert!(arabic.ends_with('…'), "{arabic}");
+        let body: String = arabic.chars().filter(|c| *c != '…').collect();
+        assert!(
+            "بيان-سطح-المكتب".starts_with(&body),
+            "ellipsis reordered {arabic}"
+        );
+        // the fatha belongs to the alef; a cut that fits the cluster keeps it
+        let marked = fit_tab_title("a\u{064e}bcdefghij", 30.0, width);
+        assert!(marked.contains('\u{064e}'), "{marked}");
+        assert!(marked.ends_with('…'));
+        // too narrow for the cluster: the mark is not left on a cut base
+        assert_eq!(fit_tab_title("a\u{064e}bcdef", 20.0, width), "…");
+    }
+
+    #[test]
+    fn tab_title_font_is_two_points_under_the_chrome_and_the_bar_does_not_grow() {
+        for dpi in [1.0, 2.0] {
+            let mut r = Renderer::new(dpi, &crate::config::UserConfig::default(), 0.0);
+            let terminal = r.terminal_metrics.font_size;
+            let bar = r.tab_bar_h();
+            r.use_ui_metrics(true);
+            assert_eq!(r.metrics.font_size, 16.0 * dpi);
+            assert_eq!(r.tab_title_px(), (16.0 + TAB_TITLE_FONT_DELTA) * dpi);
+            assert_eq!(TAB_TITLE_FONT_DELTA, -2.0);
+            let chrome = r.measure(&[Seg::plain("Desktop", FG)], true);
+            let title = r.with_tab_title_font(|r| {
+                assert_eq!(r.metrics.font_size, r.tab_title_px());
+                assert_eq!(r.metrics.line_height, r.ui_cell_h());
+                r.measure(&[Seg::plain("Desktop", FG)], true)
+            });
+            assert!(title < chrome, "title {title} chrome {chrome}");
+            assert_eq!(r.metrics.font_size, 16.0 * dpi);
+            assert_eq!(r.tab_bar_h(), bar);
+            r.use_ui_metrics(false);
+            assert_eq!(r.metrics.font_size, terminal);
+            assert_eq!(r.terminal_metrics.font_size, terminal);
+        }
+    }
+
+    #[test]
+    fn tab_close_stays_inside_the_bar_and_keeps_a_title_slot() {
+        for dpi in [1.0, 1.5, 2.0] {
+            let mut r = Renderer::new(dpi, &crate::config::UserConfig::default(), 0.0);
+            r.use_ui_metrics(true);
+            let owned = [
+                "Bayan".to_string(),
+                "Desktop".to_string(),
+                "sh".to_string(),
+                "x".repeat(80),
+            ];
+            let titles: Vec<&str> = owned.iter().map(String::as_str).collect();
+            let rects = r.tab_rects(1600, &titles, 0);
+            let bar = r.tab_bar_h().round() as i32;
+            for (i, x, w) in &rects {
+                let card = r.tab_card(*x, *w);
+                assert_eq!(card.1, TAB_TOP);
+                assert!(
+                    card.1 + card.3 <= bar,
+                    "tab card crosses into the first row"
+                );
+                if let Some(close) = r.tab_close_rect(card) {
+                    let (cx, cy, cw, ch) = close;
+                    assert!(cx >= card.0 && cy >= card.1);
+                    assert!(cx + cw <= card.0 + card.2 && cy + ch <= card.1 + card.3);
+                    let slot = r.tab_text_width(card, Some(close), 0);
+                    assert!(slot >= r.tab_text_min_px());
+                    let hit = r.tab_close_at(
+                        1600,
+                        &titles,
+                        0,
+                        cx as f64 + cw as f64 / 2.0,
+                        cy as f64 + ch as f64 / 2.0,
+                    );
+                    assert_eq!(hit, Some(*i));
+                }
+                // the leading edge of the card selects the tab, it does not close it
+                assert_ne!(
+                    r.tab_close_at(1600, &titles, 0, (card.0 + 2) as f64, (card.1 + 2) as f64),
+                    Some(*i)
+                );
+            }
+            assert!(r.tab_close_rect(r.tab_card(0, 20)).is_none());
+            for title in ["Bayan", "Desktop"] {
+                let one = [title];
+                let (_, x, w) = r.tab_rects(1200, &one, 0)[0];
+                let card = r.tab_card(x, w);
+                let close = r.tab_close_rect(card);
+                assert!(close.is_some(), "{title} should show a close control");
+                let slot = r.tab_text_width(card, close, 0) as f32;
+                let fitted = r.with_tab_title_font(|r| {
+                    fit_tab_title(title, slot, |s| r.measure(&[Seg::plain(s, FG)], true))
+                });
+                assert_eq!(fitted, title, "{title} became {fitted} in {slot}px");
+            }
+            // Wider than TAB_CELLS even at the smaller title face, so a long
+            // directory still ellipsizes instead of being clipped mid-glyph.
+            let long = format!(r"C:\Users\Admin\{}", "Desktop".repeat(12));
+            let one = [long.as_str()];
+            let (_, x, w) = r.tab_rects(1200, &one, 0)[0];
+            let card = r.tab_card(x, w);
+            let close = r.tab_close_rect(card);
+            let slot = r.tab_text_width(card, close, 0) as f32;
+            let fitted = r.with_tab_title_font(|r| {
+                fit_tab_title(&long, slot, |s| r.measure(&[Seg::plain(s, FG)], true))
+            });
+            assert!(fitted.ends_with('…'), "{fitted}");
+            assert!(fitted.chars().count() < long.chars().count());
+            let body: String = fitted.chars().filter(|c| *c != '…').collect();
+            assert!(long.starts_with(&body), "{fitted}");
+            let measured = r.with_tab_title_font(|r| r.measure(&[Seg::plain(&fitted, FG)], true));
+            assert!(measured <= slot + 0.5, "{measured} > {slot}");
+        }
+    }
+
+    #[test]
+    fn drawing_a_tab_does_not_keep_the_title_font() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let terminal = r.terminal_metrics.font_size;
+        r.use_ui_metrics(true);
+        let tabs = [TabInfo {
+            title: "Desktop".into(),
+            busy: true,
+            attention: false,
+            active: true,
+            progress: None,
+        }];
+        let mut out = Vec::new();
+        r.draw_chrome(&mut out, 800, 400, &tabs, None, false);
+        assert_eq!(r.metrics.font_size, 16.0);
+        r.hover_tab = Some(0);
+        r.draw_chrome(&mut out, 800, 400, &tabs, None, false);
+        assert_eq!(r.metrics.font_size, 16.0);
+        r.use_ui_metrics(false);
+        assert_eq!(r.metrics.font_size, terminal);
     }
 
     /// Same content -> same cached run (no re-shape); different colors or

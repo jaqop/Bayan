@@ -153,6 +153,9 @@ pub(crate) struct Hits {
     pub cockpit_open: bool,
     pub cockpit_row: Option<usize>,
     pub divider: Option<usize>,
+    /// The tab close control (×). Inside the tab span, so it is tested
+    /// before [`Hits::tab`] or the click would only select.
+    pub tab_close: Option<usize>,
     pub tab: Option<usize>,
     pub drag_strip: bool,
 }
@@ -175,6 +178,8 @@ pub(crate) enum LeftPress {
     /// The cockpit swallows the click: pick a row or dismiss.
     Cockpit(Option<usize>),
     Divider(usize),
+    /// The × on a tab. Narrow tabs omit it; middle-click still closes.
+    TabClose(usize),
     Tab(usize),
     /// Empty title strip: double-click maximises, drag moves.
     DragStrip,
@@ -213,6 +218,9 @@ pub(crate) fn left_press(h: &Hits) -> LeftPress {
     if let Some(i) = h.divider {
         return LeftPress::Divider(i);
     }
+    if let Some(i) = h.tab_close {
+        return LeftPress::TabClose(i);
+    }
     if let Some(i) = h.tab {
         return LeftPress::Tab(i);
     }
@@ -220,6 +228,22 @@ pub(crate) fn left_press(h: &Hits) -> LeftPress {
         return LeftPress::DragStrip;
     }
     LeftPress::Terminal
+}
+
+/// A paste or link card is not bound to a pane. While one is open, a
+/// tab-bar click must not switch tabs, open another, or close one — the
+/// card would otherwise confirm against whichever tab became active.
+pub(crate) fn tab_bar_action(card_open: bool, press: LeftPress) -> Option<LeftPress> {
+    let blocked = card_open
+        && matches!(
+            press,
+            LeftPress::Tab(_) | LeftPress::TabClose(_) | LeftPress::TabControl(_)
+        );
+    if blocked {
+        None
+    } else {
+        Some(press)
+    }
 }
 
 impl App {
@@ -280,6 +304,18 @@ impl App {
         tab_index_at(&r.tab_rects(width, &titles, self.active), pos.x)
     }
 
+    /// Tab whose close control is under the pointer. Absent when the tab
+    /// is too narrow to draw one, and absent outside the glyph's rect.
+    pub(crate) fn tab_close_at(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
+        let r = self.renderer.as_ref()?;
+        if r.tab_bar_h() == 0.0 || pos.y >= r.tab_bar_h() as f64 {
+            return None;
+        }
+        let width = self.window.as_ref()?.inner_size().width as usize;
+        let titles: Vec<_> = self.tabs.iter().map(|t| t.title.as_str()).collect();
+        r.tab_close_at(width, &titles, self.active, pos.x, pos.y)
+    }
+
     /// Divider index under the pointer (between pane i and i+1), if any.
     pub(crate) fn divider_at(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
         let t = self.tabs.get(self.active)?;
@@ -314,6 +350,7 @@ impl App {
             cockpit_open: self.cockpit,
             cockpit_row: self.cockpit_row_hit(pos),
             divider: self.divider_at(pos),
+            tab_close: self.tab_close_at(pos),
             tab: self.tab_at(pos),
             drag_strip: self.in_drag_strip(pos),
         }
@@ -479,10 +516,47 @@ mod tests {
             ..h
         };
         assert_eq!(left_press(&h), LeftPress::Divider(0));
-        let h = Hits { divider: None, ..h };
+        let h = Hits {
+            divider: None,
+            tab_close: Some(2),
+            ..h
+        };
+        assert_eq!(left_press(&h), LeftPress::TabClose(2));
+        let h = Hits {
+            tab_close: None,
+            ..h
+        };
         assert_eq!(left_press(&h), LeftPress::Tab(2));
         let h = Hits { tab: None, ..h };
         assert_eq!(left_press(&h), LeftPress::DragStrip);
         assert_eq!(left_press(&Hits::default()), LeftPress::Terminal);
+    }
+
+    #[test]
+    fn a_paste_or_link_card_blocks_tab_switches_and_closes() {
+        let tab = LeftPress::Tab(1);
+        let close = LeftPress::TabClose(1);
+        let arrows = LeftPress::TabControl(0);
+        assert_eq!(tab_bar_action(true, tab), None);
+        assert_eq!(tab_bar_action(true, close), None);
+        assert_eq!(tab_bar_action(true, arrows), None);
+        assert_eq!(tab_bar_action(false, close), Some(close));
+        assert_eq!(tab_bar_action(false, tab), Some(tab));
+        assert_eq!(
+            tab_bar_action(true, LeftPress::Divider(0)),
+            Some(LeftPress::Divider(0))
+        );
+        assert_eq!(
+            tab_bar_action(true, LeftPress::Terminal),
+            Some(LeftPress::Terminal)
+        );
+        assert_eq!(
+            tab_bar_action(true, LeftPress::OpenSettings),
+            Some(LeftPress::OpenSettings)
+        );
+        assert_eq!(
+            tab_bar_action(true, LeftPress::Caption(Caption::Close)),
+            Some(LeftPress::Caption(Caption::Close))
+        );
     }
 }

@@ -71,8 +71,44 @@ struct ShortcutsState {
 enum CloseTarget {
     /// the focused pane of tab .0 (Ctrl+Shift+W)
     Pane(usize, usize),
+    /// the whole tab (its ×, or a middle-click)
+    Tab(usize),
     /// the whole window (the titlebar X)
     Window,
+}
+
+/// Copy for the tab close guard. One running command is named; several
+/// are counted, the same way the window guard counts them.
+fn tab_close_prompt(commands: &[String]) -> String {
+    match commands {
+        [cmd] => format!("الأمر «{cmd}» ما يزال يعمل — إغلاق التبويب؟"),
+        cmds => format!("{} أمر ما يزال يعمل — إغلاق التبويب؟", cmds.len()),
+    }
+}
+
+/// Pane indices shift when a pane leaves, and tab indices shift when a
+/// tab leaves. Drop a confirmation that would land on the neighbour.
+/// A window confirmation is not an index, so it stays.
+fn drop_indexed_close(pending: &mut Option<CloseTarget>, tab_removed: bool) {
+    match pending {
+        Some(CloseTarget::Pane(..)) => *pending = None,
+        Some(CloseTarget::Tab(_)) if tab_removed => *pending = None,
+        _ => {}
+    }
+}
+
+/// The paste and link cards are not bound to a pane. Removing the active
+/// tab (the one they were about) drops them; a background tab leaving
+/// does not.
+fn forget_unbound_cards(
+    active_removed: bool,
+    paste: &mut Option<PendingPaste>,
+    link: &mut Option<BlockedLink>,
+) {
+    if active_removed {
+        *paste = None;
+        *link = None;
+    }
 }
 
 /// Return true when the window may close; otherwise retain a confirmation.
@@ -1068,6 +1104,7 @@ impl App {
         if let Some(target) = self.pending_close.take().filter(|_| confirm) {
             match target {
                 CloseTarget::Pane(ti, pi) => self.remove_pane(ti, pi, el),
+                CloseTarget::Tab(ti) => self.remove_tab(ti, el),
                 CloseTarget::Window => self.quit(el),
             }
         }
@@ -1999,15 +2036,20 @@ impl App {
         }
         // Pane indices can shift when a background shell exits. Dismiss an
         // index-based confirmation rather than letting it target a neighbour.
-        if matches!(self.pending_close, Some(CloseTarget::Pane(..))) {
-            self.pending_close = None;
-        }
+        drop_indexed_close(&mut self.pending_close, false);
         let mut pane = t.panes.remove(pi);
         if pi < t.weights.len() {
             t.weights.remove(pi);
         }
         pane.session.kill();
         if t.panes.is_empty() {
+            let active_removed = ti == self.active;
+            forget_unbound_cards(
+                active_removed,
+                &mut self.pending_paste,
+                &mut self.blocked_link,
+            );
+            drop_indexed_close(&mut self.pending_close, true);
             self.tabs.remove(ti);
             if self.tabs.is_empty() {
                 self.quit(el);
@@ -2019,6 +2061,68 @@ impl App {
         } else if t.focused >= t.panes.len() {
             t.focused = t.panes.len() - 1;
         }
+        self.relayout_active();
+        self.update_title();
+        self.sync_focus(None);
+        self.request_redraw();
+    }
+
+    /// Close tab `ti`. A running command asks first when confirm-close is on.
+    fn request_close_tab(&mut self, ti: usize, el: &ActiveEventLoop) {
+        if self.tabs.get(ti).is_none() {
+            return;
+        }
+        let running = self.tab_running_commands(ti);
+        if self.config.confirm_close_on() && !running.is_empty() {
+            self.pending_close = Some(CloseTarget::Tab(ti));
+            self.request_redraw();
+            return;
+        }
+        self.remove_tab(ti, el);
+    }
+
+    /// Commands still running in any pane of tab `ti`.
+    fn tab_running_commands(&self, ti: usize) -> Vec<String> {
+        self.tabs
+            .get(ti)
+            .map(|t| {
+                t.panes
+                    .iter()
+                    .filter_map(|p| {
+                        let cmd = p.session.meta.lock().unwrap().running_cmd.clone();
+                        (!cmd.is_empty()).then_some(cmd)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Remove a tab and every pane in it. The last tab closes Bayan.
+    fn remove_tab(&mut self, ti: usize, el: &ActiveEventLoop) {
+        self.abandon_mouse();
+        if self.tabs.get(ti).is_none() {
+            return;
+        }
+        let active_removed = ti == self.active;
+        drop_indexed_close(&mut self.pending_close, true);
+        forget_unbound_cards(
+            active_removed,
+            &mut self.pending_paste,
+            &mut self.blocked_link,
+        );
+        if let Some(tab) = self.tabs.get_mut(ti) {
+            for pane in &mut tab.panes {
+                pane.session.kill();
+            }
+        }
+        self.tabs.remove(ti);
+        if self.tabs.is_empty() {
+            self.quit(el);
+            return;
+        }
+        self.mru.removed(ti);
+        self.active = active_after_remove(self.active, ti, self.tabs.len());
+        self.mru.touch(self.active);
         self.relayout_active();
         self.update_title();
         self.sync_focus(None);
@@ -3047,6 +3151,7 @@ impl App {
                 let cmd = self.running_command(ti, pi).unwrap_or_default();
                 format!("الأمر «{cmd}» ما يزال يعمل — إغلاق اللوحة؟")
             }
+            CloseTarget::Tab(ti) => tab_close_prompt(&self.tab_running_commands(ti)),
             CloseTarget::Window => {
                 format!("{} أمر ما يزال يعمل — إغلاق بيان؟", self.running_count())
             }
@@ -3763,7 +3868,10 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Moved(_) => self.track_geometry(),
             WindowEvent::Resized(px) => self.resized(px),
             WindowEvent::CursorMoved { position, .. } => self.cursor_moved(position),
-            WindowEvent::CursorLeft { .. } => self.clear_link_hover(),
+            WindowEvent::CursorLeft { .. } => {
+                self.clear_link_hover();
+                self.clear_tab_hover();
+            }
             WindowEvent::MouseInput { state, button, .. } => self.mouse_input(state, button, el),
             WindowEvent::MouseWheel { delta, .. } => self.mouse_wheel(delta),
             WindowEvent::KeyboardInput { event, .. } => self.key_input(&event, el),
@@ -4116,6 +4224,55 @@ mod tests {
             assert!(prepare_window_close(&mut pending, confirm, running));
             assert!(pending.is_none());
         }
+
+        let mut pending = Some(CloseTarget::Tab(1));
+        assert!(!prepare_window_close(&mut pending, true, 1));
+        assert!(matches!(pending, Some(CloseTarget::Window)));
+    }
+
+    #[test]
+    fn tab_close_names_one_command_and_counts_several() {
+        assert_eq!(
+            tab_close_prompt(&["vim".into()]),
+            "الأمر «vim» ما يزال يعمل — إغلاق التبويب؟"
+        );
+        assert_eq!(
+            tab_close_prompt(&["vim".into(), "ssh".into()]),
+            "2 أمر ما يزال يعمل — إغلاق التبويب؟"
+        );
+    }
+
+    #[test]
+    fn removing_a_tab_drops_indexed_confirms_and_the_active_cards() {
+        let mut pending = Some(CloseTarget::Pane(1, 0));
+        drop_indexed_close(&mut pending, false);
+        assert!(pending.is_none());
+
+        let mut pending = Some(CloseTarget::Tab(1));
+        drop_indexed_close(&mut pending, false);
+        assert!(matches!(pending, Some(CloseTarget::Tab(1))));
+        drop_indexed_close(&mut pending, true);
+        assert!(pending.is_none());
+
+        let mut pending = Some(CloseTarget::Window);
+        drop_indexed_close(&mut pending, true);
+        assert!(matches!(pending, Some(CloseTarget::Window)));
+
+        let mut paste = Some(PendingPaste {
+            text: "echo hi".into(),
+            lines: 1,
+            chars: 7,
+            reason: "لصق".into(),
+        });
+        let mut link = Some(BlockedLink {
+            reason: "مرفوض".into(),
+            shown: "javascript:alert(1)".into(),
+            confirm_uri: None,
+        });
+        forget_unbound_cards(false, &mut paste, &mut link);
+        assert!(paste.is_some() && link.is_some());
+        forget_unbound_cards(true, &mut paste, &mut link);
+        assert!(paste.is_none() && link.is_none());
     }
 
     #[test]
