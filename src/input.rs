@@ -8,6 +8,7 @@
 //! left-press order live in `chrome.rs`; link, program and selection
 //! ownership in `link::click_owner` and `mouse::right_click`.
 
+use crate::term::LockExt;
 use std::time::Instant;
 
 use alacritty_terminal::grid::Scroll;
@@ -497,7 +498,7 @@ impl App {
             };
             // term, then meta — the lock order the reader uses too.
             let mode = *session.term.lock().mode();
-            let at_prompt = session.meta.lock().unwrap().at_prompt;
+            let at_prompt = session.meta.lock_or_recover().at_prompt;
             (arg, mode, at_prompt)
         };
         let alt = mode.contains(TermMode::ALT_SCREEN);

@@ -62,9 +62,25 @@ pub fn available() -> Vec<String> {
         .filter_map(|e| e.ok())
         .filter_map(|e| e.file_name().into_string().ok())
         .filter_map(|f| f.strip_suffix(".omp.json").map(str::to_string))
+        .filter(|n| is_safe_theme_name(n))
         .collect();
     names.sort();
     order_featured_first(names)
+}
+
+/// BAYAN-005: a theme stem is spliced into the `--config "..."` line of
+/// `$PROFILE`, inside PowerShell DOUBLE quotes (they must stay double: the
+/// managed line keeps `$env:USERPROFILE` portable). Double quotes expand
+/// `$x`, `$(...)` and backtick escapes, so a file NAME carrying them would
+/// become code in every profile-loading PowerShell. Only `[A-Za-z0-9._-]`
+/// is accepted — none of `$`, backtick, quotes, spaces or path separators
+/// can be written that way — and a name may not start with `-` or `.`.
+pub fn is_safe_theme_name(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= 64
+        && !n.starts_with(['-', '.'])
+        && n.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// Featured names (in FEATURED order) that exist, then everything else as
@@ -104,6 +120,9 @@ fn current_from(txt: &str) -> Option<String> {
 /// Rewrite the managed line's `--config` path, leaving every other line alone.
 /// Returns the new text, or None if there is no managed line to update.
 fn rewrite_config(txt: &str, theme: &str) -> Option<String> {
+    if !is_safe_theme_name(theme) {
+        return None;
+    }
     let i = txt.find("oh-my-posh init pwsh --config")?;
     let rest = &txt[i..];
     let a = rest.find('"')? + 1;
@@ -122,6 +141,11 @@ fn rewrite_config(txt: &str, theme: &str) -> Option<String> {
 
 /// Point `$PROFILE`'s managed line at `theme`. New shells pick it up.
 pub fn set_theme(theme: &str) -> Result<(), String> {
+    if !is_safe_theme_name(theme) {
+        return Err(format!(
+            "refusing theme name {theme:?}: only A-Z a-z 0-9 . _ -"
+        ));
+    }
     let p = profile_path();
     let txt = std::fs::read_to_string(&p).map_err(|e| format!("read profile: {e}"))?;
     let new = rewrite_config(&txt, theme).ok_or("no managed oh-my-posh line in the profile")?;
@@ -132,6 +156,9 @@ pub fn set_theme(theme: &str) -> Result<(), String> {
 /// primary prompt and hand back its raw ANSI. None when the binary is absent,
 /// which the picker shows as a plain name rather than a fake preview.
 pub fn preview(theme: &str) -> Option<Vec<u8>> {
+    if !is_safe_theme_name(theme) {
+        return None;
+    }
     let cfg = themes_dir().join(format!("{theme}.omp.json"));
     if !cfg.is_file() {
         return None;
@@ -252,6 +279,43 @@ mod tests {
             out.contains("$env:USERPROFILE"),
             "absolute path was injected: {out}"
         );
+    }
+
+    #[test]
+    fn theme_names_that_powershell_would_expand_are_refused() {
+        // BAYAN-005: nothing that double-quoted PowerShell expands survives
+        for bad in [
+            "x$(calc)",
+            "a$env:PATH",
+            "tick`n",
+            "quote\"",
+            "single'q",
+            "sp ace",
+            "back\\slash",
+            "fwd/slash",
+            "-flag",
+            ".hidden",
+            "",
+            "\u{202E}rlo",
+        ] {
+            assert!(!is_safe_theme_name(bad), "{bad:?} must be refused");
+            assert_eq!(
+                rewrite_config(PROFILE, bad),
+                None,
+                "{bad:?} reached the profile"
+            );
+        }
+        for good in [
+            "night-owl",
+            "powerlevel10k_rainbow",
+            "1_shell",
+            "M365Princess",
+            "the-unnamed.v2",
+        ] {
+            assert!(is_safe_theme_name(good), "{good:?} is a real theme name");
+        }
+        assert!(set_theme("x$(calc)").is_err());
+        assert_eq!(preview("x$(calc)"), None);
     }
 
     #[test]

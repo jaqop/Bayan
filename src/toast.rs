@@ -43,6 +43,35 @@ fn visual_order(s: &str) -> String {
     s.split(' ').rev().collect::<Vec<_>>().join(" ")
 }
 
+/// The (title, body) for a toast a PROGRAM asked for (OSC 9 / 777 / 99).
+/// The title is always Bayan's own — "بيان · <tab>" — so output can never
+/// pose as Windows Security or another app; whatever title the program
+/// sent is folded into the body. Both inputs are expected to be sanitized
+/// already (`term::notify_text`); the tab label is sanitized here.
+pub fn pty_toast(tab_label: &str, prog_title: &str, prog_body: &str) -> (String, String) {
+    let tab = crate::term::notify_text(tab_label.as_bytes(), 32);
+    // The title holds Arabic, so `show` hands the balloon its words in
+    // reverse (`visual_order`). A Latin tab name must survive that as ONE
+    // word, or "my api" would read "api my": join its words with NBSP.
+    let tab = if has_arabic(&tab) {
+        tab
+    } else {
+        tab.replace(' ', "\u{00A0}")
+    };
+    let title = if tab.is_empty() {
+        "بيان".to_string()
+    } else {
+        format!("بيان · {tab}")
+    };
+    let body = match (prog_title.is_empty(), prog_body.is_empty()) {
+        (false, false) => format!("{prog_title}: {prog_body}"),
+        (false, true) => prog_title.to_string(),
+        (true, false) => prog_body.to_string(),
+        (true, true) => "تنبيه من البرنامج".to_string(),
+    };
+    (title, body)
+}
+
 /// &str -> fixed UTF-16 buffer, truncated with a NUL guaranteed.
 fn wstr<const N: usize>(s: &str) -> [u16; N] {
     let mut out = [0u16; N];
@@ -119,6 +148,24 @@ mod tests {
         assert_eq!(visual_order("cargo build"), "cargo build");
         // and the reversal is an involution on the Arabic strings we send
         assert_eq!(visual_order(&visual_order("اكتمل الأمر")), "اكتمل الأمر");
+    }
+
+    #[test]
+    fn program_toasts_carry_bayans_title() {
+        // NEW-01: the program's title can never be the toast title
+        let (t, b) = pty_toast("pwsh", "Windows Security", "verify your password");
+        assert_eq!(t, "بيان · pwsh");
+        assert_eq!(b, "Windows Security: verify your password");
+        let (t, b) = pty_toast("", "", "Build done");
+        assert_eq!((t.as_str(), b.as_str()), ("بيان", "Build done"));
+        let (_, b) = pty_toast("x", "", "");
+        assert_eq!(b, "تنبيه من البرنامج");
+        // a hostile tab label is cleaned too
+        let (t, _) = pty_toast("a\u{202E}b", "", "x");
+        assert_eq!(t, "بيان · a\u{00A0}b");
+        // a multi-word Latin tab name keeps its order through visual_order
+        let (t, _) = pty_toast("my api", "", "x");
+        assert_eq!(visual_order(&t), "my\u{00A0}api · بيان");
     }
 
     #[test]

@@ -86,6 +86,14 @@ pub struct UserConfig {
     /// (default on). Windows quiet hours are respected regardless.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notifications: Option<bool>,
+    /// Toasts that a PROGRAM asks for through OSC 9 / 777 / 99 (default
+    /// OFF). Any output can carry these — a remote host over ssh, a `cat`'d
+    /// file, an install script — so they are opt-in. When on, the toast
+    /// title is always "بيان · <tab>" and the program text is sanitized.
+    /// Bayan's own toasts (a long command finished, the bell) follow
+    /// `notifications` and do not need this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub osc_notify: Option<bool>,
     /// Editor for Ctrl+click on `path:line`. `{file}` `{line}` `{col}` are
     /// replaced after the template is split into arguments — never a shell
     /// command. Example: `code -g {file}:{line}:{col}`. Absent: `code -g`
@@ -317,6 +325,12 @@ impl UserConfig {
         self.notifications.unwrap_or(true)
     }
 
+    /// Program-requested (OSC 9 / 777 / 99) toasts: opt-in, and only ever
+    /// while notifications as a whole are on.
+    pub fn osc_notify_on(&self) -> bool {
+        self.osc_notify.unwrap_or(false) && self.notifications_on()
+    }
+
     /// Ctrl+Tab walks the most-recently-used history unless the config says
     /// "order" (anything else, including a typo, keeps the default).
     pub fn tab_switch_recent(&self) -> bool {
@@ -444,6 +458,12 @@ mod tests {
         let d = UserConfig::default();
         assert_eq!(d.opacity_level(), 1.0);
         assert!(d.notifications_on());
+        assert!(!d.osc_notify_on(), "program toasts are opt-in (NEW-01)");
+        let c: UserConfig = serde_json::from_str(r#"{"osc_notify":true}"#).unwrap();
+        assert!(c.osc_notify_on());
+        let c: UserConfig =
+            serde_json::from_str(r#"{"osc_notify":true,"notifications":false}"#).unwrap();
+        assert!(!c.osc_notify_on());
         assert_eq!(d.shell_program(), "powershell.exe");
         assert!(!d.hide_single_tab_on());
         assert!(d.confirm_close_on());

@@ -126,7 +126,10 @@ session wins deliberately — restoring a tab in the wrong folder is worse than
 ignoring a shortcut — but it is also why a shortcut change appears to do
 nothing: `~/.bayan/session.json` is answering first. Delete it when testing
 start-directory behaviour. The launcher directory is honoured EXCEPT under `%SystemRoot%`,
-because Explorer and the Start menu often hand a process `System32`.
+because Explorer and the Start menu often hand a process `System32`, and
+except when it is Bayan's own folder (Explorer's default cwd — a pane opened
+in Downloads would let cmd run a planted `git.bat`). It passes the same
+`accept_local_cwd` + `usable_spawn_dir` gate as every other start directory.
 
 **Two performance properties are load-bearing.** The shaped-run cache reshapes
 only changed lines (~1.5ms → ~4µs on a cached frame). Differential redraw skips
@@ -164,7 +167,12 @@ already happened once and nearly buried a real fix as a no-op.
 Being a GUI app, most behavior isn't unit-testable. The established loop is
 build → launch → screenshot → inspect → kill. Every debug hook below exists so
 a feature can be reached **without injecting keyboard input** — honour that
-principle when adding new ones:
+principle when adding new ones. The hooks are read through `dev_hook()` in
+`main.rs`: they are live in debug builds and compiled out of release builds
+unless you build with `--features dev-hooks` (BAYAN-010 — `BAYAN_TYPE` types
+into a shell and `BAYAN_PROFILE` writes to `%TEMP%`, so a shipped binary must
+not honour them). Read any new hook through `dev_hook()` too, and never log
+key identity or typed text:
 
 | Env var | Effect |
 |---|---|
@@ -181,7 +189,7 @@ principle when adding new ones:
 | `BAYAN_POSH=1` | open the oh-my-posh prompt picker at startup |
 | `BAYAN_TOAST=<title\|1>` | fire a sample toast at startup (M19 A/B loops without rebuilding) |
 | `BAYAN_ATLAS_STRESS=1` | shape a large spread of unique glyphs to force page-1 atlas growth |
-| `BAYAN_PROFILE=1` | startup timeline marks to `%TEMP%\bayan_profile.log` (EasyTer's `EASYTER_PROFILE` pattern), zero cost when unset |
+| `BAYAN_PROFILE=1` | startup timeline marks to `%TEMP%\bayan_profile.log` (EasyTer's `EASYTER_PROFILE` pattern), zero cost when unset. Key presses log modifiers only, never the key |
 
 Start with `Start-Process -PassThru`, sleep ~6s for GPU init, capture the
 screen with `System.Drawing`, then `Stop-Process` the pid. Pre-approved
