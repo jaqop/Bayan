@@ -1673,6 +1673,11 @@ pub(crate) fn capture_command_core<T: EventListener>(t: &Term<T>, meta: &mut Ses
 
 /// Pull the oh-my-posh theme path out of a PowerShell profile line like
 ///   oh-my-posh init pwsh --config "C:\...\night-owl.omp.json" | Invoke-Expression
+///
+/// Also accepts the single-quoted form and `($env:NAME + '\tail')`, which is
+/// how `posh::rewrite_config` writes the line. The returned path is the
+/// logical text (`$env:USERPROFILE\...` still unexpanded) so the caller can
+/// expand it the same way as a double-quoted profile.
 pub fn parse_posh_config(profile_text: &str) -> Option<String> {
     for line in profile_text.lines() {
         let l = line.trim();
@@ -1680,14 +1685,15 @@ pub fn parse_posh_config(profile_text: &str) -> Option<String> {
             continue;
         }
         let rest = l[l.find("--config")? + "--config".len()..].trim_start();
-        let path = if let Some(q) = rest.strip_prefix('"') {
-            q.split('"').next()
-        } else if let Some(q) = rest.strip_prefix('\'') {
-            q.split('\'').next()
-        } else {
-            rest.split_whitespace().next()
-        };
-        if let Some(p) = path {
+        if rest.starts_with(['"', '\'', '(']) {
+            if let Some((p, _)) = crate::posh::parse_config_argument(rest) {
+                if !p.is_empty() {
+                    return Some(p);
+                }
+            }
+            continue;
+        }
+        if let Some(p) = rest.split_whitespace().next() {
             if !p.is_empty() {
                 return Some(p.to_string());
             }
@@ -2217,13 +2223,14 @@ fn shell_family(shell: &str) -> ShellFamily {
 
 /// PowerShell single-quote characters. U+2018..=U+201B are quotes too: a
 /// dropped file named `a’;calc;’.txt` otherwise runs `calc`.
-fn is_powershell_single_quote(c: char) -> bool {
+pub(crate) fn is_powershell_single_quote(c: char) -> bool {
     matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}')
 }
 
 /// Double every PowerShell single quote, ASCII and smart. Shared by drop
-/// quoting and the oh-my-posh `--config '…'` argument, which is the same literal.
-fn powershell_escape_single(s: &str) -> String {
+/// quoting, the oh-my-posh `--config '…'` argument at spawn, and the
+/// `$PROFILE` rewrite in `posh::rewrite_config`.
+pub(crate) fn powershell_escape_single(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if is_powershell_single_quote(c) {
@@ -3641,6 +3648,19 @@ mod tests {
         assert_eq!(
             parse_posh_config("oh-my-posh init pwsh --config C:\\plain\\path.omp.json | iex"),
             Some(r"C:\plain\path.omp.json".to_string())
+        );
+        // the profile rewriter's portable form: the variable stays outside
+        // the single-quoted tail, and the logical path is what expand_env sees
+        assert_eq!(
+            parse_posh_config(
+                "oh-my-posh init pwsh --config ($env:USERPROFILE + '\\.poshthemes\\kali.omp.json') | Invoke-Expression",
+            ),
+            Some(r"$env:USERPROFILE\.poshthemes\kali.omp.json".to_string())
+        );
+        // a doubled apostrophe inside single quotes is one apostrophe
+        assert_eq!(
+            parse_posh_config("oh-my-posh init pwsh --config 'C:\\o''brien\\kali.omp.json' | iex"),
+            Some(r"C:\o'brien\kali.omp.json".to_string())
         );
         // commented-out lines and unrelated profiles yield nothing
         assert_eq!(
