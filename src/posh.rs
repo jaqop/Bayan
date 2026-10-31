@@ -31,15 +31,111 @@ const FEATURED: &[&str] = &[
 ];
 
 /// Where the `.omp.json` files live. `POSH_THEMES_PATH` wins, as oh-my-posh
-/// itself honours it; otherwise the default install location.
+/// itself honours it — but only when it is a LOCAL directory (R-04): the
+/// same `accept_local_cwd` + `usable_spawn_dir` gate as a shell's start
+/// directory, so a UNC or mapped-network themes path is never listed (that
+/// would open SMB and leak NTLM) and never has its files run. Otherwise
+/// the default install location.
 pub fn themes_dir() -> PathBuf {
-    if let Some(p) = std::env::var_os("POSH_THEMES_PATH") {
-        return PathBuf::from(p);
+    let env = std::env::var_os("POSH_THEMES_PATH").and_then(|p| p.into_string().ok());
+    themes_dir_from(env.as_deref(), crate::term::usable_spawn_dir)
+}
+
+fn themes_dir_from(env: Option<&str>, usable: impl Fn(&str) -> bool) -> PathBuf {
+    if let Some(dir) = env
+        .and_then(crate::term::accept_local_cwd)
+        .filter(|d| usable(d))
+    {
+        return PathBuf::from(dir);
     }
     match std::env::var_os("USERPROFILE") {
         Some(h) => PathBuf::from(h).join(".poshthemes"),
         None => PathBuf::from(".poshthemes"),
     }
+}
+
+/// R-05: the oh-my-posh binary by absolute path. A bare `oh-my-posh` lets
+/// Windows look in Bayan's own folder first, so a planted `oh-my-posh.exe`
+/// beside `bayan.exe` (Downloads, `target\release`) would run when the
+/// picker opens. Its default install location wins, then PATH — skipping
+/// relative entries, non-local directories and Bayan's own folder.
+pub fn posh_exe() -> Option<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA").map(|l| {
+        PathBuf::from(l)
+            .join("Programs")
+            .join("oh-my-posh")
+            .join("bin")
+    });
+    let own = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()));
+    let path: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    posh_exe_in(local, &path, own.as_deref(), |p| p.is_file())
+}
+
+fn posh_exe_in(
+    local: Option<PathBuf>,
+    path: &[PathBuf],
+    own_dir: Option<&std::path::Path>,
+    is_file: impl Fn(&std::path::Path) -> bool,
+) -> Option<PathBuf> {
+    let same = |a: &std::path::Path, b: &std::path::Path| {
+        a.to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .eq_ignore_ascii_case(b.to_string_lossy().trim_end_matches(['\\', '/']))
+    };
+    local
+        .into_iter()
+        .chain(path.iter().cloned())
+        .filter(|d| d.is_absolute())
+        .filter(|d| {
+            d.to_str()
+                .is_some_and(|s| crate::term::accept_local_cwd(s).is_some())
+        })
+        .filter(|d| !own_dir.is_some_and(|o| same(d, o)))
+        .map(|d| d.join("oh-my-posh.exe"))
+        .find(|p| is_file(p))
+}
+
+/// R-04: does a theme run commands when it renders? oh-my-posh's `command`
+/// segment executes a shell command for its text, so previewing such a theme
+/// would run it the moment the picker opened. Those themes are listed and
+/// can still be chosen, but are not previewed. An unreadable or invalid file
+/// counts as unsafe.
+fn runs_commands(theme_json: &str) -> bool {
+    fn walk(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Object(m) => {
+                m.get("type")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| t.eq_ignore_ascii_case("command"))
+                    || m.values().any(walk)
+            }
+            serde_json::Value::Array(a) => a.iter().any(walk),
+            _ => false,
+        }
+    }
+    match serde_json::from_str::<serde_json::Value>(theme_json) {
+        Ok(v) => walk(&v),
+        Err(_) => true,
+    }
+}
+
+/// Themes rendered as soon as the picker opens (R-04): the featured ones
+/// that exist, and the selected one. The rest render when highlighted.
+pub fn eager_previews(names: &[String], sel: usize) -> Vec<usize> {
+    let mut out = vec![sel.min(names.len().saturating_sub(1))];
+    for (i, n) in names.iter().enumerate() {
+        if FEATURED.contains(&n.as_str()) && !out.contains(&i) {
+            out.push(i);
+        }
+    }
+    if names.is_empty() {
+        out.clear();
+    }
+    out
 }
 
 /// The PowerShell 5 profile Bayan's default shell reads.
@@ -163,7 +259,12 @@ pub fn preview(theme: &str) -> Option<Vec<u8>> {
     if !cfg.is_file() {
         return None;
     }
-    let mut cmd = std::process::Command::new("oh-my-posh");
+    let json = std::fs::read_to_string(&cfg).ok()?;
+    if runs_commands(&json) {
+        return None; // R-04: shown by name only, never executed by a preview
+    }
+    let exe = posh_exe()?; // R-05: never a bare name
+    let mut cmd = std::process::Command::new(exe);
     cmd.args(["print", "primary", "--shell", "pwsh", "--config"])
         .arg(&cfg);
     #[cfg(windows)]
@@ -387,6 +488,74 @@ mod tests {
             "drain outlived the deadline: {:?}",
             t0.elapsed()
         );
+    }
+
+    #[test]
+    fn themes_path_must_be_local() {
+        // R-04: UNC, device and verbatim themes paths fall back to the default
+        let yes = |_: &str| true;
+        let default = themes_dir_from(None, yes);
+        for bad in [r"\\server\themes", r"\\?\C:\t", r"\\.\x"] {
+            assert_eq!(themes_dir_from(Some(bad), yes), default, "{bad}");
+        }
+        // a local dir that the probe refuses (remote drive, reparse point)
+        assert_eq!(themes_dir_from(Some(r"Z:\t"), |_| false), default);
+        assert_eq!(
+            themes_dir_from(Some(r"D:\themes"), yes),
+            PathBuf::from(r"D:\themes")
+        );
+    }
+
+    #[test]
+    fn oh_my_posh_is_resolved_to_an_absolute_path_outside_bayans_folder() {
+        // R-05
+        let own = PathBuf::from(r"C:\Users\a\Downloads");
+        let path = vec![
+            PathBuf::from("."),
+            PathBuf::from(r"relative\bin"),
+            own.clone(),
+            PathBuf::from(r"\\server\tools"),
+            PathBuf::from(r"C:\Tools\posh"),
+        ];
+        let everywhere = |_: &std::path::Path| true;
+        assert_eq!(
+            posh_exe_in(None, &path, Some(&own), everywhere),
+            Some(PathBuf::from(r"C:\Tools\posh\oh-my-posh.exe"))
+        );
+        // the install location wins over PATH
+        let local = PathBuf::from(r"C:\Users\a\AppData\Local\Programs\oh-my-posh\bin");
+        assert_eq!(
+            posh_exe_in(Some(local.clone()), &path, Some(&own), everywhere),
+            Some(local.join("oh-my-posh.exe"))
+        );
+        // nothing found: no preview, not a bare-name spawn
+        assert_eq!(posh_exe_in(None, &path, Some(&own), |_| false), None);
+    }
+
+    #[test]
+    fn themes_that_run_commands_are_not_previewed() {
+        // R-04
+        let cmd = r#"{"blocks":[{"segments":[{"type":"path"},{"type":"command","properties":{"command":"x"}}]}]}"#;
+        assert!(runs_commands(cmd));
+        assert!(runs_commands(
+            r#"{"blocks":[{"segments":[{"type":"Command"}]}]}"#
+        ));
+        assert!(!runs_commands(
+            r#"{"blocks":[{"segments":[{"type":"path"},{"type":"git"}]}]}"#
+        ));
+        assert!(runs_commands("not json"), "unreadable counts as unsafe");
+    }
+
+    #[test]
+    fn only_featured_and_selected_themes_render_on_open() {
+        // R-04
+        let names: Vec<String> = ["aaa", "kali", "zzz", "pure", "mmm"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(eager_previews(&names, 4), vec![4, 1, 3]);
+        assert_eq!(eager_previews(&names, 1), vec![1, 3]);
+        assert!(eager_previews(&[], 0).is_empty());
     }
 
     #[test]

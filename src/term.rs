@@ -206,6 +206,8 @@ const PS_END: &str = "$([char]7)\"}}}; __by_wrap";
 /// nonce keeps the old "any A/D" rule for tests. cmd/clink has no 133 marks;
 /// its OSC 7 is still accepted while the pane is already idle.
 pub(crate) fn shell_integration_ps(nonce: &str) -> String {
+    // `nonce` is spliced in as text: the live session passes NONCE_PS_EXPR,
+    // tests pass a literal
     let mut s = String::with_capacity(
         PS_HEAD.len() + PS_MID.len() + PS_TAIL.len() + PS_END.len() + nonce.len() * 3,
     );
@@ -217,6 +219,25 @@ pub(crate) fn shell_integration_ps(nonce: &str) -> String {
     s.push_str(nonce);
     s.push_str(PS_END);
     s
+}
+
+/// R-08: the environment variable the nonce travels in. The setup script
+/// copies it into `$global:__BY_N` FIRST and removes it from the process
+/// environment, so the nonce is never on the PowerShell command line (which
+/// the process list shows to every same-user process) and no program the
+/// shell later starts inherits it. The prompt reads it from the variable.
+pub(crate) const NONCE_ENV: &str = "BAYAN_PROMPT_NONCE";
+
+/// What the prompt wrapper splices in where the nonce goes: expanded inside
+/// its double-quoted strings at every prompt.
+pub(crate) const NONCE_PS_EXPR: &str = "$($global:__BY_N)";
+
+/// The first statement of the setup script: take the nonce, drop the env var.
+pub(crate) fn nonce_capture_ps() -> String {
+    format!(
+        "$global:__BY_N=$env:{NONCE_ENV};\
+         Remove-Item Env:{NONCE_ENV} -ErrorAction SilentlyContinue;"
+    )
 }
 
 #[link(name = "advapi32")]
@@ -500,13 +521,8 @@ pub(crate) fn notify_text(b: &[u8], max: usize) -> String {
     let raw = String::from_utf8_lossy(b);
     let cleaned: String = raw
         .chars()
-        .map(|c| {
-            if crate::link::is_forbidden_in_path(c) {
-                ' '
-            } else {
-                c
-            }
-        })
+        // the full set: a toast is not a path, so no joiner exception (R-06)
+        .map(|c| if crate::link::is_forbidden(c) { ' ' } else { c })
         .collect();
     let joined = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     if joined.chars().count() <= max {
@@ -2091,7 +2107,16 @@ impl Session {
             // re-runs oh-my-posh, chcp, modules). Self-provide what it gave
             // us: UTF-8 (Arabic!) and the user's prompt theme, auto-detected.
             cmd.args(["-NoProfile", "-NoExit", "-Command"]);
-            let mut setup = String::from(
+            // R-08: the nonce rides in the environment, is taken before
+            // anything else runs (oh-my-posh init spawns a process), and is
+            // then removed, so it is in neither the command line nor any
+            // child's environment
+            let mut setup = String::new();
+            if prompt_nonce != NONCE_OFF {
+                cmd.env(NONCE_ENV, &prompt_nonce);
+                setup.push_str(&nonce_capture_ps());
+            }
+            setup.push_str(
                 "$OutputEncoding=[Console]::InputEncoding=[Console]::OutputEncoding=\
                  [Text.UTF8Encoding]::new();",
             );
@@ -2108,7 +2133,7 @@ impl Session {
             // marks anyone could forge
             if prompt_nonce != NONCE_OFF {
                 setup.push(' ');
-                setup.push_str(&shell_integration_ps(&prompt_nonce));
+                setup.push_str(&shell_integration_ps(NONCE_PS_EXPR));
             }
             cmd.arg(setup);
         } else if shell_family(shell) == ShellFamily::Cmd {
@@ -4031,6 +4056,11 @@ mod tests {
         assert_eq!(t.chars().count(), NOTIFY_TITLE_MAX);
         assert_eq!(b.chars().count(), NOTIFY_BODY_MAX);
         assert!(t.ends_with('…') && b.ends_with('…'));
+        // R-06: invisible fillers and variation selectors are gone too
+        assert_eq!(
+            scan_notify("\x1b]9;a\u{3164}b\u{FE0F}c\u{E0100}d\x07".as_bytes()),
+            Some((String::new(), "a b c d".into()))
+        );
         // whitespace-only after cleaning: nothing to show
         assert_eq!(scan_notify("\x1b]9;\u{200B}\u{200B}\x07".as_bytes()), None);
     }
@@ -4317,6 +4347,20 @@ mod tests {
         );
         assert!(!meta.at_prompt);
         // the wrapper really does send B with the nonce
+        // R-08: the live wrapper reads the nonce from a variable set from
+        // the environment, never a literal on the command line
+        let live = shell_integration_ps(NONCE_PS_EXPR);
+        assert_eq!(live.matches(NONCE_PS_EXPR).count(), 3);
+        assert!(
+            live.contains("]133;B;$($global:__BY_N)$([char]7)"),
+            "{live}"
+        );
+        let cap = nonce_capture_ps();
+        assert!(
+            cap.starts_with("$global:__BY_N=$env:BAYAN_PROMPT_NONCE;"),
+            "{cap}"
+        );
+        assert!(cap.contains("Remove-Item Env:BAYAN_PROMPT_NONCE"), "{cap}");
         let ps = shell_integration_ps("n0nce");
         assert!(ps.contains("]133;B;n0nce$([char]7)"), "{ps}");
         assert_eq!(ps.matches("n0nce").count(), 3, "D, A and B each carry it");

@@ -289,6 +289,11 @@ pub fn is_forbidden(c: char) -> bool {
                 | '\u{FEFF}'
         )
         || ('\u{2061}'..='\u{2064}').contains(&c)
+        // R-06: invisible Hangul fillers and variation selectors pad text
+        // without showing anything
+        || matches!(c, '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}')
+        || ('\u{FE00}'..='\u{FE0F}').contains(&c)
+        || ('\u{E0100}'..='\u{E01EF}').contains(&c)
         || ('\u{FFF9}'..='\u{FFFB}').contains(&c)
         || ('\u{E0000}'..='\u{E007F}').contains(&c)
 }

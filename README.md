@@ -599,19 +599,35 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       drawn outside the span is not seen.
       An independent review of the patch found the plugin-send semantics,
       the static-import gap and the NEW-07 bypasses above; all three were
-      fixed or recorded before this landed. Proven: 18 new unit tests,
-      `cargo clippy --all-targets -D warnings`
-      (debug and release) and `cargo fmt --check` against
-      `x86_64-pc-windows-gnu`, and `cargo test` of that target under Wine
-      (357 pass; the 5 that fail there fail identically on the unpatched
-      tree, from Wine's fonts and process model). Not proven here: a live
-      window on Windows. Owed: `cargo test` on Windows, a GPU start with
-      the DLL pre-map, a PowerShell prompt showing the nonce'd `133;B`, and
-      a picker open with the full theme set. Behaviour changes to know
-      about: program toasts are off until `osc_notify` is set; plugin
-      actions ask before typing and can no longer send ESC sequences or
-      Ctrl keys; only PowerShell's nonce'd `133;B` marks the prompt now, so
-      drops into cmd, bash and WSL panes always show the confirm card
+      fixed or recorded before this landed. Proven: `cargo test` on
+      Windows, 363 passed; a release build launched with the tab × showing;
+      CI on PR #24 green (build + test, MSRV, fmt + clippy, audit) with the
+      SHA-pinned actions and `permissions: contents: read`.
+      **Re-verification, same evening (R-01…R-08).** A second static review
+      of the fixed tree found 4 Low and 4 Info items, mostly where M38/M39
+      (broadcast, tab ×, middle-click close) meet the confirm cards. A
+      confirm card now remembers its pane and sends nothing if that pane
+      is no longer focused, and tab-bar clicks and middle-click close are
+      swallowed while one is up. A dropped path goes to the focused pane
+      only, never to broadcast panes, and a paste card says how many panes
+      Enter reaches. The plugin card shows the whole payload, wrapped, with
+      every CR visible, and plugin sends cap at 512 chars. The prompt picker
+      renders only the featured themes and the selected one on open, the
+      rest on highlight, never a theme with a `command` segment, never from
+      a non-local `POSH_THEMES_PATH`, and runs oh-my-posh by absolute path,
+      skipping Bayan's own folder. The forbidden set covers the invisible
+      Hangul fillers and variation selectors, and toasts use the full set.
+      The prompt nonce travels in `BAYAN_PROMPT_NONCE`, is copied into
+      `$global:__BY_N` and removed before anything else runs, so it is not
+      on the PowerShell command line or in any child's environment. Tab
+      titles are fitted by measured width: the cell-count version still cut
+      "Desktop" to "Deskto" on a real Windows font after the first fix.
+      Behaviour changes to know about: program toasts are off until
+      `osc_notify` is set; plugin actions ask before typing and can no
+      longer send ESC sequences or Ctrl keys; only PowerShell's nonce'd
+      `133;B` marks the prompt, so drops into cmd, bash and WSL panes
+      always show the confirm card; picker previews of non-featured themes
+      appear when highlighted
 
 ## Settings
 

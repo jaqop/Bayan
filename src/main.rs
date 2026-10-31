@@ -1073,16 +1073,24 @@ struct PoshPicker {
     sel: usize,
     /// which open this is: a preview from an earlier, closed picker is dropped
     generation: u64,
+    /// the worker's queue: (row, theme, eager)
+    work: std::sync::mpsc::Sender<(usize, String, bool)>,
 }
 
 /// Bumped on every picker open and close; the preview worker stops as soon
 /// as it no longer matches its own generation (BAYAN-006).
 static POSH_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Preview render order: the selected theme first, then outward in list
-/// order, so what the user is looking at fills in first.
-fn posh_preview_order(n: usize, sel: usize) -> Vec<usize> {
-    (0..n).map(|k| (sel + k) % n.max(1)).collect()
+/// One burst of preview requests, as the worker runs it (R-04): every eager
+/// row (featured + selected on open), then only the NEWEST highlight request.
+fn collapse_posh_requests(burst: Vec<(usize, String, bool)>) -> Vec<(usize, String, bool)> {
+    let last_hl = burst.iter().rposition(|r| !r.2);
+    burst
+        .into_iter()
+        .enumerate()
+        .filter(|(k, r)| r.2 || Some(*k) == last_hl)
+        .map(|(_, r)| r)
+        .collect()
 }
 
 struct App {
@@ -1479,12 +1487,13 @@ impl App {
         self.request_redraw();
     }
 
-    /// Open the prompt picker. The previews are one oh-my-posh subprocess per
-    /// theme (up to 3 s each), and the full theme set is ~100 files, so they
-    /// render on a `bayan-posh` worker and stream in through
-    /// `UserEvent::PoshPreview` (BAYAN-006): the picker opens at once with
-    /// plain names and fills in, selected theme first. One worker, one
-    /// subprocess at a time; closing or reopening the picker stops it.
+    /// Open the prompt picker. Each preview is one oh-my-posh subprocess (up
+    /// to 3 s), so they render on a `bayan-posh` worker and stream in through
+    /// `UserEvent::PoshPreview` (BAYAN-006). Only the featured themes and the
+    /// selected one render on open (R-04): rendering a theme runs it, and a
+    /// downloaded pack is ~100 files nobody asked to run. The rest render
+    /// when highlighted; the worker takes the newest request and drops the
+    /// ones the arrow keys already left. Closing or reopening stops it.
     fn open_posh(&mut self) {
         use std::sync::atomic::Ordering;
         let names = posh::available();
@@ -1496,32 +1505,53 @@ impl App {
             .and_then(|c| names.iter().position(|n| *n == c))
             .unwrap_or(0);
         let generation = POSH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-        let order = posh_preview_order(names.len(), sel);
-        let work: Vec<(usize, String)> = order.into_iter().map(|i| (i, names[i].clone())).collect();
+        // (row, theme, eager). Eager rows all render; highlight requests
+        // collapse to the newest, so holding an arrow key does not queue a
+        // subprocess per row passed over.
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, String, bool)>();
         let proxy = self.proxy.clone();
         let _ = std::thread::Builder::new()
             .name("bayan-posh".into())
             .spawn(move || {
-                for (i, name) in work {
-                    if POSH_GENERATION.load(Ordering::SeqCst) != generation {
-                        return; // the picker closed or reopened
+                while let Ok(first) = rx.recv() {
+                    let mut burst = vec![first];
+                    while let Ok(next) = rx.try_recv() {
+                        burst.push(next);
                     }
-                    let preview = posh::preview(&name);
-                    if proxy
-                        .send_event(UserEvent::PoshPreview(generation, i, preview))
-                        .is_err()
-                    {
-                        return; // the event loop is gone
+                    for (i, name, _) in collapse_posh_requests(burst) {
+                        if POSH_GENERATION.load(Ordering::SeqCst) != generation {
+                            return; // the picker closed or reopened
+                        }
+                        let preview = posh::preview(&name);
+                        if proxy
+                            .send_event(UserEvent::PoshPreview(generation, i, preview))
+                            .is_err()
+                        {
+                            return; // the event loop is gone
+                        }
                     }
                 }
             });
+        for i in posh::eager_previews(&names, sel) {
+            let _ = tx.send((i, names[i].clone(), true));
+        }
         self.posh = Some(PoshPicker {
             previews: vec![None; names.len()],
             names,
             sel,
             generation,
+            work: tx,
         });
         self.request_redraw();
+    }
+
+    /// Ask the worker for the highlighted theme's preview, if it has none.
+    fn request_posh_preview(&mut self) {
+        let Some(p) = self.posh.as_mut() else { return };
+        let i = p.sel;
+        if p.previews.get(i).is_some_and(Option::is_none) {
+            let _ = p.work.send((i, p.names[i].clone(), false));
+        }
     }
 
     /// Close the picker and stop its preview worker.
@@ -1536,8 +1566,14 @@ impl App {
         let n = p.names.len();
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => self.close_posh(),
-            Key::Named(NamedKey::ArrowDown) => p.sel = (p.sel + 1) % n,
-            Key::Named(NamedKey::ArrowUp) => p.sel = (p.sel + n - 1) % n,
+            Key::Named(NamedKey::ArrowDown) => {
+                p.sel = (p.sel + 1) % n;
+                self.request_posh_preview();
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                p.sel = (p.sel + n - 1) % n;
+                self.request_posh_preview();
+            }
             Key::Named(NamedKey::Enter) => {
                 let name = p.names[p.sel].clone();
                 self.close_posh();
@@ -4717,9 +4753,20 @@ mod tests {
     #[test]
     fn posh_previews_render_the_selected_theme_first() {
         // BAYAN-006
-        assert_eq!(posh_preview_order(5, 3), vec![3, 4, 0, 1, 2]);
-        assert_eq!(posh_preview_order(3, 0), vec![0, 1, 2]);
-        assert!(posh_preview_order(0, 0).is_empty());
+        // R-04: eager rows all run; a burst of highlights runs only the last
+        let r = |i: usize, eager: bool| (i, format!("t{i}"), eager);
+        let got: Vec<usize> = collapse_posh_requests(vec![
+            r(3, true),
+            r(1, true),
+            r(4, false),
+            r(5, false),
+            r(6, false),
+        ])
+        .into_iter()
+        .map(|x| x.0)
+        .collect();
+        assert_eq!(got, vec![3, 1, 6]);
+        assert!(collapse_posh_requests(Vec::new()).is_empty());
     }
 
     #[test]
