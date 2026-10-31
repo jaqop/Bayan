@@ -83,6 +83,12 @@ pub struct UserConfig {
     /// (default on). Windows quiet hours are respected regardless.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notifications: Option<bool>,
+    /// PTY desktop notifications (OSC 9, OSC 777, OSC 99). Off unless this
+    /// is true: terminal output must not raise a Bayan toast. The balloon
+    /// title is always `بيان · <tab>`. Does not affect command-finished
+    /// toasts ([`Self::notifications`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub osc_notify: Option<bool>,
     /// Editor for Ctrl+click on `path:line`. `{file}` `{line}` `{col}` are
     /// replaced after the template is split into arguments — never a shell
     /// command. Example: `code -g {file}:{line}:{col}`. Absent: `code -g`
@@ -308,6 +314,12 @@ impl UserConfig {
         self.notifications.unwrap_or(true)
     }
 
+    /// True only for an explicit `true`. Missing and `false` stay off, the
+    /// same posture as OSC 52: a typo must not open a toast channel.
+    pub fn osc_notify_on(&self) -> bool {
+        self.osc_notify.unwrap_or(false)
+    }
+
     /// Ctrl+Tab walks the most-recently-used history unless the config says
     /// "order" (anything else, including a typo, keeps the default).
     pub fn tab_switch_recent(&self) -> bool {
@@ -515,6 +527,22 @@ mod tests {
         assert_eq!(parse_hex("#fff"), None);
         assert_eq!(parse_hex("#zzzzzz"), None);
         assert_eq!(parse_hex(""), None);
+    }
+
+    /// NEW-01: PTY toasts default off. Command-finished toasts stay on.
+    #[test]
+    fn osc_notify_is_off_unless_explicitly_enabled() {
+        assert!(!UserConfig::default().osc_notify_on());
+        assert!(UserConfig::default().notifications_on());
+        let missing: UserConfig = serde_json::from_str("{}").unwrap();
+        assert!(!missing.osc_notify_on());
+        let off: UserConfig = serde_json::from_str(r#"{"osc_notify":false}"#).unwrap();
+        assert!(!off.osc_notify_on());
+        let on: UserConfig = serde_json::from_str(r#"{"osc_notify":true}"#).unwrap();
+        assert!(on.osc_notify_on());
+        // an untouched config still serializes to nothing
+        let json = serde_json::to_string(&UserConfig::default()).unwrap();
+        assert_eq!(json, "{}");
     }
 
     /// BAYAN-001: OSC 52 writes default off, and no value enables a read.

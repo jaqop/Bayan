@@ -42,7 +42,9 @@ There is no Critical finding. Nothing here is unauthenticated remote code execut
 
 ## Remediation status
 
-The four High findings are fixed on top of this audit. Medium and below are unchanged. The original finding text is kept as the record of what was wrong.
+The four High findings are fixed on top of this audit. Medium and below in this document are unchanged. The original finding text is kept as the record of what was wrong.
+
+NEW-01 from the 2026-10-31 review (OSC 9 / 777 / 99 native toasts) is fixed separately: the sequence must end in BEL or ST, title and body are stripped of C0/C1, bidi, and zero-width characters and capped to the balloon buffers, the balloon title is always `بيان · <tab>`, and the feature is off unless `osc_notify` is true. BAYAN-005, BAYAN-007, BAYAN-008, and BAYAN-009 stay open.
 
 | ID | Status |
 |---|---|
