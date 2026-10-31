@@ -324,6 +324,16 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       with a bidi mark or override asks first.
       Proven by the unit tests named in the audit; not exercised here as a
       live window
+- [x] **Security (NEW-01)** — OSC 9 / 777 / 99 no longer raise a native
+      toast unless `osc_notify` is true. The sequence has to end in BEL or
+      ST; an ESC that only starts the next sequence does not count, and a
+      split sequence stays in the carry until the terminator arrives. Title
+      and body lose C0/C1, bidi, and zero-width characters and are capped
+      to the balloon buffers. The balloon title is always `بيان · <tab>`
+      (or just `بيان`); the program's text is the body. Command-finished
+      toasts still follow `notifications`. Proven by
+      `osc_notify_needs_a_terminator_and_cannot_set_the_toast_title` and
+      `osc_notify_is_off_unless_explicitly_enabled`.
 - [x] **M30** — mouse reporting. Clicks, drags and motion reach the program
       when it asks: xterm 1000 (press/release), 1002 (drag), 1003 (any
       motion), encoded as SGR 1006 or the legacy X10 byte form when 1006
@@ -435,9 +445,10 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       Desktop-notification escapes in all three dialects — OSC 9;message
       (iTerm2/ConEmu), OSC 777;notify (rxvt, what Ghostty and WezTerm speak),
       OSC 99 (kitty) — raise a native toast when the window is unfocused or the
-      tab is in the background; a BEL from an unfocused window does too, so
-      `preferredNotifChannel: terminal_bell` in Claude Code lands somewhere you
-      can see. The shell gets `TERM_PROGRAM=Bayan`, `TERM_PROGRAM_VERSION` and
+      tab is in the background (opt-in `osc_notify` since NEW-01; the balloon
+      title is Bayan's, not the program's). A BEL from an unfocused window
+      does too, so `preferredNotifChannel: terminal_bell` in Claude Code
+      lands somewhere you can see. The shell gets `TERM_PROGRAM=Bayan`, `TERM_PROGRAM_VERSION` and
       `COLORTERM=truecolor`. Verified live: a 60% report typed through the real
       ConPTY path draws the bar under the tab (PrintWindow capture,
       pixel-sampled). Learned again on the way: `cargo test` does not relink
@@ -519,6 +530,7 @@ key falls back to a sane default:
   "copy_on_select": true, "ligatures": true, "bell": "attention",
   "shell": "pwsh.exe", "padding": 8, "opacity": 0.9,
   "hide_single_tab": true, "confirm_close": true, "osc52": "off",
+  "osc_notify": false,
   "editor": "code -g {file}:{line}:{col}", "tab_switch": "recent",
   "keybinds": { "new-tab": "ctrl+shift+n" },
   "keyboard": { "kitty_protocol": false, "kitty_base_layout_fallback": true }
@@ -530,7 +542,11 @@ session); everything else applies immediately. `osc52` is config-file
 only (there is no settings-panel row). Leave it out or set `"off"`.
 `"copy"` lets a focused window accept OSC 52 clipboard writes from the
 focused pane; no value enables a clipboard read. The decode backstop is
-64 KiB, and one scan sees about 48–51 KiB.
+64 KiB, and one scan sees about 48–51 KiB. `osc_notify` is config-file
+only too. Leave it out or set `false`. `true` lets OSC 9, OSC 777, and
+OSC 99 raise a toast while the window is unfocused or the tab is in the
+background; the title is always `بيان · <tab>`. It does not change
+command-finished toasts (`notifications`, on by default).
 
 ## BiDi controls and the current directory
 

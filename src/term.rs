@@ -294,8 +294,10 @@ pub(crate) struct ChunkEvents {
     /// parser's `kitty_keyboard` flag is false, so `CSI ? u` is answered
     /// here with `CSI ?0u` and the reader writes it to the PTY.
     pub pty_replies: Vec<String>,
-    /// the program asked for a desktop notification (title, body): OSC 9,
-    /// OSC 777 or OSC 99 — what Claude Code, ntfy, zellij and friends emit
+    /// the program asked for a desktop notification (program title, body):
+    /// OSC 9, OSC 777 or OSC 99. Neither string is the balloon title —
+    /// [`pty_toast_title`] is. Empty when the sequence is unterminated,
+    /// a ConEmu subcommand, or nothing but stripped controls.
     pub notify: Option<(String, String)>,
     /// OSC 9;4 progress: Some(None) clears, Some(Some(p)) sets
     pub progress: Option<Option<Progress>>,
@@ -360,80 +362,164 @@ fn scan_progress(data: &[u8]) -> Option<Option<Progress>> {
     parse_progress(payload)
 }
 
+/// UTF-16 units in a balloon title, excluding the NUL `wstr` reserves.
+/// `NOTIFYICONDATAW::szInfoTitle` is 64 units.
+const NOTIFY_TITLE_UNITS: usize = 63;
+/// UTF-16 units in a balloon body, excluding the NUL. `szInfo` is 256.
+const NOTIFY_BODY_UNITS: usize = 255;
+/// Logical balloon title. `toast::show` reverses Arabic word order for the
+/// renderer; this string stays logical. The program never supplies it.
+const PTY_TOAST_MARK: &str = "بيان · ";
+
+/// Drop C0/C1, bidi controls, and zero-width characters (`link::is_forbidden`),
+/// then keep at most `max_units` UTF-16 code units. What remains is safe to
+/// put in a balloon that wears Bayan's tray icon.
+fn sanitize_notify(raw: &str, max_units: usize) -> String {
+    let mut out = String::new();
+    let mut units = 0usize;
+    for c in raw.trim().chars() {
+        if crate::link::is_forbidden(c) {
+            continue;
+        }
+        let n = c.len_utf16();
+        if units + n > max_units {
+            break;
+        }
+        out.push(c);
+        units += n;
+    }
+    out.trim().to_string()
+}
+
+/// Fixed toast title: `بيان · <tab>`. A long or hostile tab label is cut
+/// to the balloon title buffer; an empty label is just `بيان`.
+pub(crate) fn pty_toast_title(tab_label: &str) -> String {
+    let room = NOTIFY_TITLE_UNITS.saturating_sub(PTY_TOAST_MARK.encode_utf16().count());
+    let label = sanitize_notify(tab_label, room);
+    if label.is_empty() {
+        return "بيان".to_string();
+    }
+    format!("{PTY_TOAST_MARK}{label}")
+}
+
+/// Program text for the balloon body. Title and body from the OSC are both
+/// body copy — neither becomes the balloon title. Joined text is capped again.
+pub(crate) fn pty_toast_body(program_title: &str, program_body: &str) -> String {
+    let title = sanitize_notify(program_title, NOTIFY_BODY_UNITS);
+    let body = sanitize_notify(program_body, NOTIFY_BODY_UNITS);
+    let joined = if title.is_empty() {
+        body
+    } else if body.is_empty() {
+        title
+    } else {
+        format!("{title} — {body}")
+    };
+    sanitize_notify(&joined, NOTIFY_BODY_UNITS)
+}
+
 /// Desktop-notification requests, three dialects, last one in the chunk wins:
 /// - OSC 9;<message> — iTerm2 / ConEmu (digit-prefixed ConEmu subcommands
 ///   like 9;4; and 9;9; are NOT messages)
 /// - OSC 777;notify;<title>;<body> — rxvt-unicode, what Ghostty and WezTerm speak
 /// - OSC 99;<meta>;<payload> — kitty: `p=title`/`p=body` in the metadata
+///
+/// BEL or ST is required, the same rule as [`last_osc_payload`]. An ESC that
+/// only starts the next sequence does not finish one. The returned strings
+/// are sanitized program text; [`pty_toast_title`] chooses the balloon title.
 fn scan_notify(data: &[u8]) -> Option<(String, String)> {
     let mut best: Option<(usize, (String, String))> = None;
     let mut consider = |pos: usize, n: (String, String)| {
+        if n.0.is_empty() && n.1.is_empty() {
+            return;
+        }
         if best.as_ref().is_none_or(|(p, _)| pos > *p) {
             best = Some((pos, n));
         }
     };
-    let text = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
-    // OSC 9;<message>
+    let text = |b: &[u8]| sanitize_notify(&String::from_utf8_lossy(b), NOTIFY_BODY_UNITS);
+    // OSC 9;<message> — the dialect has no title of its own
     let mut i = 0;
     while let Some(rel) = find(&data[i..], b"\x1b]9;") {
         let s = i + rel + 4;
-        let e = osc_end(data, s);
+        let Some(e) = osc_terminated_at(data, s) else {
+            i = s;
+            continue;
+        };
         let payload = &data[s..e];
         // ConEmu subcommand (9;4;progress, 9;9;cwd, 9;12;...): not a message
         let is_subcommand = payload
             .iter()
             .position(|&b| b == b';')
             .is_some_and(|k| k > 0 && payload[..k].iter().all(u8::is_ascii_digit));
-        if !is_subcommand && !payload.is_empty() {
-            consider(s, ("Bayan".to_string(), text(payload)));
+        if !is_subcommand {
+            consider(s, (String::new(), text(payload)));
         }
-        i = e.max(s);
+        i = osc_resume(data, e);
     }
     // OSC 777;notify;title;body
     let mut i = 0;
     while let Some(rel) = find(&data[i..], b"\x1b]777;notify;") {
         let s = i + rel + 13;
-        let e = osc_end(data, s);
+        let Some(e) = osc_terminated_at(data, s) else {
+            i = s;
+            continue;
+        };
         let payload = &data[s..e];
         let (title, body) = match payload.iter().position(|&b| b == b';') {
             Some(k) => (text(&payload[..k]), text(&payload[k + 1..])),
-            None => ("Bayan".to_string(), text(payload)),
+            None => (String::new(), text(payload)),
         };
         consider(s, (title, body));
-        i = e.max(s);
+        i = osc_resume(data, e);
     }
     // OSC 99;<k=v:k=v>;<payload>
     let mut i = 0;
     while let Some(rel) = find(&data[i..], b"\x1b]99;") {
         let s = i + rel + 5;
-        let e = osc_end(data, s);
+        let Some(e) = osc_terminated_at(data, s) else {
+            i = s;
+            continue;
+        };
         let payload = &data[s..e];
         if let Some(k) = payload.iter().position(|&b| b == b';') {
             let meta = String::from_utf8_lossy(&payload[..k]);
             let is_title = meta.split(':').any(|kv| kv == "p=title");
-            let body = text(&payload[k + 1..]);
-            if !body.is_empty() {
-                consider(
-                    s,
-                    if is_title {
-                        (body, String::new())
-                    } else {
-                        ("Bayan".to_string(), body)
-                    },
-                );
+            let msg = text(&payload[k + 1..]);
+            if is_title {
+                consider(s, (msg, String::new()));
+            } else {
+                consider(s, (String::new(), msg));
             }
         }
-        i = e.max(s);
+        i = osc_resume(data, e);
     }
     best.map(|(_, n)| n)
 }
 
-/// End of an OSC payload that starts at `s`: the BEL / ESC, or the data end.
-fn osc_end(data: &[u8], s: usize) -> usize {
-    data[s..]
-        .iter()
-        .position(|&b| b == 0x07 || b == 0x1b)
-        .map_or(data.len(), |p| s + p)
+/// Index of the BEL, or of the ESC in an ST (`ESC \`), that ends an OSC
+/// whose payload starts at `s`. Anything else — including an ESC that
+/// starts the next sequence, or the end of the buffer — is unfinished.
+fn osc_terminated_at(data: &[u8], s: usize) -> Option<usize> {
+    let mut j = s;
+    while j < data.len() && data[j] != 0x07 && data[j] != 0x1b {
+        j += 1;
+    }
+    if data.get(j) == Some(&0x07) {
+        return Some(j);
+    }
+    if data.get(j) == Some(&0x1b) && data.get(j + 1) == Some(&b'\\') {
+        return Some(j);
+    }
+    None
+}
+
+/// First byte after a terminator `osc_terminated_at` returned.
+fn osc_resume(data: &[u8], e: usize) -> usize {
+    if data.get(e) == Some(&0x1b) {
+        e + 2
+    } else {
+        e + 1
+    }
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -3599,7 +3685,7 @@ mod tests {
         // iTerm2 / ConEmu message form
         assert_eq!(
             scan_notify(b"\x1b]9;Build done\x07"),
-            Some(("Bayan".into(), "Build done".into()))
+            Some((String::new(), "Build done".into()))
         );
         // ConEmu subcommands are not messages
         assert_eq!(scan_notify(b"\x1b]9;4;1;50\x07"), None);
@@ -3616,7 +3702,7 @@ mod tests {
         );
         assert_eq!(
             scan_notify(b"\x1b]99;i=1:d=1;all green\x07"),
-            Some(("Bayan".into(), "all green".into()))
+            Some((String::new(), "all green".into()))
         );
         // several in one read: the LAST one is what the user sees
         assert_eq!(
@@ -3624,6 +3710,82 @@ mod tests {
             Some(("T".into(), "second".into()))
         );
         assert_eq!(scan_notify(b"plain text"), None);
+    }
+
+    /// NEW-01: an OSC notification is a toast only when it is finished, and
+    /// the balloon title is Bayan's, not the program's.
+    #[test]
+    fn osc_notify_needs_a_terminator_and_cannot_set_the_toast_title() {
+        // no BEL/ST: not a notification, even when the bytes run to the end
+        assert_eq!(scan_notify(b"\x1b]9;Build done"), None);
+        assert_eq!(scan_notify(b"\x1b]777;notify;T;body"), None);
+        assert_eq!(scan_notify(b"\x1b]99;i=1:p=title;Tests"), None);
+        // an ESC that starts the next sequence is not ST
+        assert_eq!(scan_notify(b"\x1b]9;Build done\x1b[0m"), None);
+        // a later terminated request still counts; the open one does not
+        assert_eq!(
+            scan_notify(b"\x1b]9;open\x1b]9;closed\x07"),
+            Some((String::new(), "closed".into()))
+        );
+
+        // split across reads: the carry holds it until the terminator arrives
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]9;Build done");
+        assert_eq!(ev.notify, None);
+        assert!(!carry.is_empty(), "an unfinished OSC stays in the carry");
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x07");
+        assert_eq!(ev.notify, Some((String::new(), "Build done".into())));
+
+        // the ESC of ST alone is not enough — the backslash has to arrive
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        let ev = process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]777;notify;Claude;needs your approval\x1b",
+        );
+        assert_eq!(ev.notify, None);
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\\");
+        assert_eq!(
+            ev.notify,
+            Some(("Claude".into(), "needs your approval".into()))
+        );
+
+        // C0/C1, bidi overrides, and zero-width characters are stripped
+        assert_eq!(
+            scan_notify("\x1b]9;ok\u{202e}\u{200b}\u{0001}\u{009b}pw\x07".as_bytes()),
+            Some((String::new(), "okpw".into()))
+        );
+        assert_eq!(scan_notify("\x1b]9;\u{202e}\u{200b}\x07".as_bytes()), None);
+
+        let long = "a".repeat(400);
+        let (_, body) = scan_notify(format!("\x1b]9;{long}\x07").as_bytes()).unwrap();
+        assert_eq!(body.encode_utf16().count(), NOTIFY_BODY_UNITS);
+
+        let wide = "t".repeat(400);
+        let (title, body) =
+            scan_notify(format!("\x1b]777;notify;{wide};body\x07").as_bytes()).unwrap();
+        assert_eq!(title.encode_utf16().count(), NOTIFY_BODY_UNITS);
+        assert_eq!(body, "body");
+
+        // the balloon title is the tab, prefixed; the program's words are body
+        assert_eq!(pty_toast_title("src"), "بيان · src");
+        assert_eq!(pty_toast_title("المشاريع"), "بيان · المشاريع");
+        assert_eq!(pty_toast_title(""), "بيان");
+        assert_eq!(pty_toast_title("a\u{202e}b"), "بيان · ab");
+        let capped = pty_toast_title(&"x".repeat(200));
+        assert!(capped.starts_with("بيان · "));
+        assert!(capped.encode_utf16().count() <= NOTIFY_TITLE_UNITS);
+        assert_eq!(
+            pty_toast_body("Windows Security", "confirm"),
+            "Windows Security — confirm"
+        );
+        assert_eq!(pty_toast_body("", "Build done"), "Build done");
+        assert_eq!(pty_toast_body("Tests", ""), "Tests");
+        let joined = pty_toast_body(&"t".repeat(300), &"b".repeat(300));
+        assert!(joined.encode_utf16().count() <= NOTIFY_BODY_UNITS);
+        assert!(!pty_toast_title("src").contains("Windows"));
     }
 
     #[test]

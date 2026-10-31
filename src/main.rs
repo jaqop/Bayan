@@ -3584,27 +3584,30 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
-            UserEvent::Notify(id, title, body) => {
-                // an explicit ask (OSC 9 / 777 / 99): the program decided
-                // this deserves attention, so the only question is whether
-                // the user is already looking — same rule as the bell
+            UserEvent::Notify(id, program_title, program_body) => {
+                // OSC 9 / 777 / 99. Off unless osc_notify is set: the bytes
+                // are untrusted terminal output, and the balloon wears
+                // Bayan's tray icon. Command-finished toasts are separate
+                // (`notifications`) and do not come through this arm.
+                if !self.config.osc_notify_on() {
+                    return;
+                }
                 if let Some((ti, _)) = self.find_pane(id) {
                     let background = ti != self.active;
                     if background {
                         self.tabs[ti].attention = true;
                     }
-                    if (background || !self.focused) && self.config.notifications_on() {
-                        let body = if body.is_empty() {
-                            self.tabs[ti].title.clone()
-                        } else {
-                            body
-                        };
-                        self.toast_from_pty(&title, &body);
-                        if !self.focused {
-                            if let Some(w) = &self.window {
-                                w.request_user_attention(Some(
-                                    winit::window::UserAttentionType::Informational,
-                                ));
+                    if background || !self.focused {
+                        let title = term::pty_toast_title(&self.tabs[ti].title);
+                        let body = term::pty_toast_body(&program_title, &program_body);
+                        if !body.is_empty() {
+                            self.toast_from_pty(&title, &body);
+                            if !self.focused {
+                                if let Some(w) = &self.window {
+                                    w.request_user_attention(Some(
+                                        winit::window::UserAttentionType::Informational,
+                                    ));
+                                }
                             }
                         }
                     }
