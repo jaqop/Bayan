@@ -2041,7 +2041,7 @@ pub enum PasteRisk {
     /// A control, a C1 byte, or a bidi / zero-width spoof.
     Control,
     EnterAndControl,
-    /// More than 2000 characters.
+    /// More than [`PASTE_GUARD_MAX_CHARS`] characters.
     TooLong,
     /// The shell has not reported OSC 133 B. Used by drag-drop, not by the guard.
     NotAtPrompt,
@@ -2071,6 +2071,11 @@ pub struct PasteGuard {
     pub risk: PasteRisk,
 }
 
+/// Character count above which a paste asks before it is sent. Unicode
+/// scalars, not bytes. Plugin `send` strings are rejected at load past
+/// this same limit.
+pub const PASTE_GUARD_MAX_CHARS: usize = 2000;
+
 /// Multi-line / huge pastes can execute commands on arrival (EasyTer's paste
 /// protection). `Some` when confirmation is due.
 ///
@@ -2084,11 +2089,16 @@ pub struct PasteGuard {
 /// `is_control`, and a raw RLO in the card would spoof the preview. LRM
 /// (U+200E), RLM (U+200F), and ALM (U+061C) do not confirm: Arabic copied
 /// from the web is full of them. The size cap counts characters: a line of
-/// Arabic is not "huge" because UTF-8 uses two bytes.
+/// Arabic is not "huge" because UTF-8 uses two bytes. The cap is
+/// [`PASTE_GUARD_MAX_CHARS`].
 ///
 /// Bracketed paste is intentionally not forced from our side. The guard runs
 /// first either way; injecting `\x1b[?2004h` into a host that does not
 /// understand the wrappers would type the wrappers into the prompt.
+///
+/// Plugin palette `send` strings are rejected at load when this returns
+/// `Some`. A row that still carries one is armed through the same confirm
+/// path as a clipboard paste.
 pub fn needs_paste_guard(text: &str) -> Option<PasteGuard> {
     let mut breaks = 0usize;
     let mut ends_with_break = false;
@@ -2119,7 +2129,7 @@ pub fn needs_paste_guard(text: &str) -> Option<PasteGuard> {
             saw_control = true;
         }
     }
-    if saw_break || saw_control || chars > 2000 {
+    if saw_break || saw_control || chars > PASTE_GUARD_MAX_CHARS {
         let lines = breaks + usize::from(!ends_with_break);
         let risk = if saw_break && saw_control {
             PasteRisk::EnterAndControl

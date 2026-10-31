@@ -31,7 +31,24 @@ pub struct PluginTheme {
     pub palette: [(u8, u8, u8); 16],
 }
 
+/// Section heading above plugin rows in the command palette.
+pub const PALETTE_SECTION: &str = "إضافات";
+
+/// Badge on every plugin palette row. Built-in rows do not carry it, so a
+/// plugin cannot wear the same face as «لصق».
+pub const PALETTE_BADGE: &str = "«إضافة»";
+
+/// The label drawn for a plugin row: the badge, then the plugin's own words.
+pub fn palette_label(label: &str) -> String {
+    format!("{PALETTE_BADGE} {label}")
+}
+
 /// A command-palette entry: a label, and text sent to the active shell.
+///
+/// `send` is capped at [`crate::term::PASTE_GUARD_MAX_CHARS`] and is refused
+/// when it contains a line break or any other character the paste guard
+/// would stop for. The palette still arms whatever was accepted through that
+/// guard. The label is refused when it copies a built-in command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaletteAction {
     pub label: String,
@@ -163,10 +180,60 @@ fn parse_action(v: &serde_json::Value) -> Result<PaletteAction, String> {
         .get("send")
         .and_then(|x| x.as_str())
         .ok_or("action needs a string 'send'")?;
+    let label = label.trim();
+    if label.is_empty() {
+        return Err("action needs a non-empty 'label'".into());
+    }
+    // A newline or a bidi override in the label would paint outside the row
+    // or reorder the badge. The paste guard's set is the one the rest of
+    // the UI already treats as unsafe to draw raw.
+    if crate::term::needs_paste_guard(label).is_some() {
+        return Err("label contains a line break or a control character".into());
+    }
+    if label_collides_with_builtin(label) {
+        return Err(format!(
+            "label collides with a built-in command: {}",
+            label_match_key(label)
+        ));
+    }
+    validate_send(send)?;
     Ok(PaletteAction {
         label: label.to_string(),
         send: send.to_string(),
     })
+}
+
+/// Built-in palette commands (`لصق`, `تبويب جديد`, …). Compared after trim
+/// and after dropping LRM / RLM / ALM, which are not controls: `لصق` plus
+/// U+200F still reads as لصق.
+fn label_collides_with_builtin(label: &str) -> bool {
+    let key = label_match_key(label);
+    crate::keybinds::Action::ALL
+        .iter()
+        .any(|action| label_match_key(action.label()) == key)
+}
+
+fn label_match_key(label: &str) -> String {
+    label
+        .trim()
+        .chars()
+        .filter(|c| !matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}'))
+        .collect()
+}
+
+/// Refuse a payload the paste guard would have to stop: a line break (CR is
+/// Enter on ConPTY), any other control except tab, a bidi / zero-width
+/// spoof, or more than [`crate::term::PASTE_GUARD_MAX_CHARS`] scalars.
+fn validate_send(send: &str) -> Result<(), String> {
+    let n = send.chars().count();
+    let cap = crate::term::PASTE_GUARD_MAX_CHARS;
+    if n > cap {
+        return Err(format!("send is {n} characters; the limit is {cap}"));
+    }
+    if crate::term::needs_paste_guard(send).is_some() {
+        return Err("send contains a line break or a control character".into());
+    }
+    Ok(())
 }
 
 /// Parse one plugin file into a staging area. Any error rejects the WHOLE
@@ -377,9 +444,73 @@ mod tests {
 
     #[test]
     fn actions_carry_label_and_payload() {
-        let src = "{\"actions\":[{\"label\":\"Build\",\"send\":\"cargo build\\r\"}]}";
+        let src = "{\"actions\":[{\"label\":\"  بناء  \",\"send\":\"cargo build\"}]}";
         let st = parse_plugin(src).unwrap();
-        assert_eq!(st.actions[0].label, "Build");
-        assert_eq!(st.actions[0].send, "cargo build\r");
+        assert_eq!(st.actions[0].label, "بناء");
+        assert_eq!(st.actions[0].send, "cargo build");
+        assert_eq!(palette_label(&st.actions[0].label), "«إضافة» بناء");
+    }
+
+    #[test]
+    fn send_rejects_line_breaks_controls_and_overlong_text() {
+        let cr = "{\"actions\":[{\"label\":\"Build\",\"send\":\"cargo build\\r\"}]}";
+        assert!(
+            parse_plugin(cr)
+                .unwrap_err()
+                .contains("line break or a control"),
+            "a trailing CR would submit on ConPTY"
+        );
+        let lf = "{\"actions\":[{\"label\":\"Build\",\"send\":\"echo a\\necho b\"}]}";
+        assert!(parse_plugin(lf).is_err());
+        let esc = "{\"actions\":[{\"label\":\"Build\",\"send\":\"echo \\u001b[2J\"}]}";
+        assert!(parse_plugin(esc).is_err(), "ESC must not reach the PTY");
+        let line_sep = "{\"actions\":[{\"label\":\"Build\",\"send\":\"a\\u2028b\"}]}";
+        assert!(parse_plugin(line_sep).is_err());
+        let rlo = "{\"actions\":[{\"label\":\"Build\",\"send\":\"echo \\u202ehi\"}]}";
+        assert!(parse_plugin(rlo).is_err());
+        let del = "{\"actions\":[{\"label\":\"Build\",\"send\":\"del\\u007fx\"}]}";
+        assert!(parse_plugin(del).is_err());
+
+        let cap = crate::term::PASTE_GUARD_MAX_CHARS;
+        let at_cap = "م".repeat(cap);
+        let ok = format!("{{\"actions\":[{{\"label\":\"بناء\",\"send\":\"{at_cap}\"}}]}}");
+        let st = parse_plugin(&ok).unwrap();
+        assert_eq!(st.actions[0].send.chars().count(), cap);
+        // Arabic is two UTF-8 bytes; the cap counts scalars, and one more is refused.
+        let over = "م".repeat(cap + 1);
+        let too_long = format!("{{\"actions\":[{{\"label\":\"بناء\",\"send\":\"{over}\"}}]}}");
+        let err = parse_plugin(&too_long).unwrap_err();
+        assert!(
+            err.contains(&cap.to_string()),
+            "expected the character cap in: {err}"
+        );
+
+        // Tab is the one control the paste guard lets through.
+        let tab = "{\"actions\":[{\"label\":\"بناء\",\"send\":\"echo\\thi\"}]}";
+        assert_eq!(parse_plugin(tab).unwrap().actions[0].send, "echo\thi");
+    }
+
+    #[test]
+    fn a_label_that_copies_a_builtin_rejects_the_whole_plugin() {
+        let src = concat!(
+            "{\"themes\":[{\"name\":\"Good\",\"bg\":\"#101010\",\"fg\":\"#ffffff\",\"ansi\":{}}],",
+            "\"actions\":[{\"label\":\"لصق\",\"send\":\"echo hi\"}]}"
+        );
+        let err = parse_plugin(src).unwrap_err();
+        assert!(err.contains("collides"), "{err}");
+        assert!(err.contains("لصق"), "{err}");
+
+        let padded = "{\"actions\":[{\"label\":\"  لصق  \",\"send\":\"echo hi\"}]}";
+        assert!(parse_plugin(padded).is_err(), "trim still collides");
+        // RLM is not a control, and it does not change what the row reads as.
+        let marked = "{\"actions\":[{\"label\":\"لصق\\u200f\",\"send\":\"echo hi\"}]}";
+        assert!(
+            parse_plugin(marked).unwrap_err().contains("collides"),
+            "a directional mark must not hide a built-in label"
+        );
+        let distinct = "{\"actions\":[{\"label\":\"لصق الملف\",\"send\":\"echo hi\"}]}";
+        assert!(parse_plugin(distinct).is_ok());
+        let broken_row = "{\"actions\":[{\"label\":\"بناء\\nلصق\",\"send\":\"echo hi\"}]}";
+        assert!(parse_plugin(broken_row).is_err());
     }
 }
