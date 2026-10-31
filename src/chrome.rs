@@ -14,7 +14,7 @@ use winit::dpi::PhysicalPosition;
 use winit::window::ResizeDirection;
 
 use crate::render::Rect;
-use crate::{App, Orientation};
+use crate::App;
 
 /// The smallest edge band that stays grabbable without stealing clicks
 /// from the content.
@@ -68,34 +68,6 @@ pub(crate) fn tab_index_at(spans: &[(usize, i32, i32)], x: f64) -> Option<usize>
         .iter()
         .find(|&&(_, sx, sw)| x >= sx as f64 && x < (sx + sw) as f64)
         .map(|&(i, ..)| i)
-}
-
-/// The divider between pane `i` and `i + 1` under `(x, y)`. The last
-/// pane has no divider after it.
-pub(crate) fn divider_index(
-    rects: &[Rect],
-    orientation: Orientation,
-    x: f64,
-    y: f64,
-) -> Option<usize> {
-    if rects.len() < 2 {
-        return None;
-    }
-    rects
-        .iter()
-        .take(rects.len() - 1)
-        .position(|&(rx, ry, rw, rh)| match orientation {
-            Orientation::Row => {
-                (x - (rx + rw) as f64).abs() <= DIVIDER_GRAB
-                    && y >= ry as f64
-                    && y < (ry + rh) as f64
-            }
-            Orientation::Column => {
-                (y - (ry + rh) as f64).abs() <= DIVIDER_GRAB
-                    && x >= rx as f64
-                    && x < (rx + rw) as f64
-            }
-        })
 }
 
 /// A second press on the empty title strip within the window maximises
@@ -323,7 +295,7 @@ impl App {
         if t.panes.len() < 2 || t.zoomed {
             return None;
         }
-        divider_index(&self.pane_rects(), t.orientation, pos.x, pos.y)
+        crate::layout::divider_at(&self.dividers(), pos.x, pos.y, DIVIDER_GRAB)
     }
 
     /// The tab-bar arrow or plus under the pointer, and whether the gear is.
@@ -453,27 +425,6 @@ mod tests {
         assert_eq!(tab_index_at(&spans, 99.5), Some(3));
         assert_eq!(tab_index_at(&spans, 100.0), Some(4));
         assert_eq!(tab_index_at(&spans, 160.0), None);
-    }
-
-    #[test]
-    fn dividers_follow_orientation_and_skip_the_last_pane() {
-        let row = [(0, 0, 100, 50), (100, 0, 100, 50)];
-        assert_eq!(divider_index(&row, Orientation::Row, 96.0, 10.0), Some(0));
-        assert_eq!(divider_index(&row, Orientation::Row, 104.0, 49.0), Some(0));
-        assert_eq!(divider_index(&row, Orientation::Row, 105.0, 10.0), None);
-        assert_eq!(divider_index(&row, Orientation::Row, 100.0, 50.0), None);
-        // the right edge of the last pane is the window, not a divider
-        assert_eq!(divider_index(&row, Orientation::Row, 200.0, 10.0), None);
-        let col = [(0, 0, 100, 50), (0, 50, 100, 50)];
-        assert_eq!(
-            divider_index(&col, Orientation::Column, 10.0, 53.0),
-            Some(0)
-        );
-        assert_eq!(divider_index(&col, Orientation::Column, 10.0, 100.0), None);
-        assert_eq!(
-            divider_index(&row[..1], Orientation::Row, 100.0, 10.0),
-            None
-        );
     }
 
     #[test]

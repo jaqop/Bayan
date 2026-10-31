@@ -17,6 +17,7 @@ mod keybinds;
 mod keyroute;
 mod keys;
 mod kitty;
+mod layout;
 mod link;
 mod mouse;
 mod mru;
@@ -484,19 +485,19 @@ struct Pane {
     progress: Option<term::Progress>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Orientation {
     Row,    // side by side (Ctrl+Shift+E)
     Column, // stacked (Ctrl+Shift+O)
 }
 
-/// One tab: a set of panes split along one axis (v1 of EasyTer's tree).
+/// One tab: a set of panes and the split tree that lays them out.
 struct Tab {
     panes: Vec<Pane>,
-    /// relative pane sizes along the axis (dragging a divider edits these)
-    weights: Vec<f32>,
+    /// where each pane goes: side-by-side and stacked splits, nested in any
+    /// mix (`layout.rs`); leaves are indices into `panes`
+    layout: layout::Node,
     focused: usize,
-    orientation: Orientation,
     /// cwd basename of the focused pane (falls back to a plain name)
     title: String,
     /// a name the user gave the tab; wins over `title` until cleared
@@ -626,47 +627,21 @@ fn clean_tab_name(raw: &str) -> Option<String> {
 }
 
 /// Weighted split of a content rect along one axis, 1px gaps between panes.
-/// The axis a tab uses after a split that asked for `asked`: always the one
-/// asked for — the split the user picked is the layout they see.
-fn split_axis(_current: Orientation, asked: Orientation) -> Orientation {
-    asked
-}
-
-fn split_rects(
-    content: render::Rect,
-    weights: &[f32],
-    orientation: Orientation,
-) -> Vec<render::Rect> {
-    let (x, y, w, h) = content;
-    let n = weights.len().max(1) as i32;
-    let gap = 1;
-    let total: f32 = weights.iter().sum::<f32>().max(f32::EPSILON);
-    let avail = match orientation {
-        Orientation::Row => w - gap * (n - 1),
-        Orientation::Column => h - gap * (n - 1),
-    } as f32;
-    let mut out = Vec::with_capacity(weights.len());
-    let mut cursor = match orientation {
-        Orientation::Row => x,
-        Orientation::Column => y,
-    };
-    for (i, wt) in weights.iter().enumerate() {
-        let len = if i as i32 == n - 1 {
-            // the last pane absorbs all rounding remainders
-            match orientation {
-                Orientation::Row => x + w - cursor,
-                Orientation::Column => y + h - cursor,
-            }
-        } else {
-            (avail * wt / total) as i32
-        };
-        out.push(match orientation {
-            Orientation::Row => (cursor, y, len, h),
-            Orientation::Column => (x, cursor, w, len),
-        });
-        cursor += len + gap;
+/// A saved tab's layout for the `n` panes that actually came back: its tree
+/// when it holds exactly those panes, else the old one-axis form (files from
+/// before nested splits, or a tab where a pane failed to respawn).
+fn restored_layout(st: &SavedTab, n: usize) -> layout::Node {
+    match &st.layout {
+        Some(tree) if tree.valid_for(n) => tree.clone(),
+        _ => {
+            let axis = if st.orientation == 1 {
+                Orientation::Column
+            } else {
+                Orientation::Row
+            };
+            layout::Node::flat(axis, &st.weights, n)
+        }
     }
-    out
 }
 
 /// What survives a restart: every tab's FULL layout — each pane's cwd, the
@@ -681,6 +656,10 @@ struct SavedTab {
     orientation: u8,
     #[serde(default)]
     focused: usize,
+    /// the split tree; absent in files from before nested splits, which
+    /// restore from `orientation` + `weights` as one row or column
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    layout: Option<layout::Node>,
     /// the user's tab name; absent in files from before M38
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
@@ -761,6 +740,7 @@ fn parse_state(json: &str) -> Option<SavedState> {
                 weights: vec![1.0],
                 orientation: 0,
                 focused: 0,
+                layout: None,
                 name: None,
             })
             .collect(),
@@ -2297,9 +2277,8 @@ impl App {
             self.abandon_mouse();
             self.tabs.push(Tab {
                 panes: vec![pane],
-                weights: vec![1.0],
+                layout: layout::Node::single(),
                 focused: 0,
-                orientation: Orientation::Row,
                 title,
                 name: None,
                 attention: false,
@@ -2313,55 +2292,60 @@ impl App {
         }
     }
 
-    /// Pane rects for the active tab within the window's content area.
-    fn pane_rects(&self) -> Vec<render::Rect> {
-        let (Some(r), Some(w), Some(t)) = (
-            self.renderer.as_ref(),
-            self.window.as_ref(),
-            self.tabs.get(self.active),
-        ) else {
-            return Vec::new();
-        };
+    /// The window's content area: below the tab bar, inside the padding.
+    pub(crate) fn content_rect(&self) -> Option<render::Rect> {
+        let (r, w) = (self.renderer.as_ref()?, self.window.as_ref()?);
         let px = w.inner_size();
         let bar = r.tab_bar_h().round() as i32;
         // the padding setting insets the whole content area evenly
         let pad = self.config.padding_px();
-        let content = (
+        Some((
             pad,
             bar + pad,
             (px.width as i32 - pad * 2).max(1),
             (px.height as i32 - bar - pad * 2).max(1),
-        );
+        ))
+    }
+
+    /// Pane rects for the active tab within the window's content area.
+    fn pane_rects(&self) -> Vec<render::Rect> {
+        let (Some(content), Some(t)) = (self.content_rect(), self.tabs.get(self.active)) else {
+            return Vec::new();
+        };
         if t.zoomed && t.panes.len() > 1 {
             zoom_rects(content, t.panes.len(), t.focused)
         } else {
-            split_rects(content, &t.weights, t.orientation)
+            t.layout.rects(content, t.panes.len())
         }
     }
 
-    /// Drag divider `i` to the pointer: redistribute the PAIR's weight.
+    /// The active tab's dividers (none while zoomed: one pane shows).
+    pub(crate) fn dividers(&self) -> Vec<layout::Divider> {
+        match (self.content_rect(), self.tabs.get(self.active)) {
+            (Some(content), Some(t)) if t.panes.len() > 1 && !t.zoomed => {
+                t.layout.dividers(content)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Drag divider `i` (an index into `dividers()`) to the pointer: the two
+    /// sides of that one split trade size.
     fn drag_divider_to(&mut self, i: usize, pos: PhysicalPosition<f64>) {
-        let rects = self.pane_rects();
+        let Some(d) = self.dividers().get(i).cloned() else {
+            return;
+        };
+        let Some(content) = self.content_rect() else {
+            return;
+        };
         let Some(t) = self.tabs.get_mut(self.active) else {
             return;
         };
-        if i + 1 >= rects.len() {
-            return;
-        }
-        let (a, b) = (rects[i], rects[i + 1]);
-        let (start, span, p) = match t.orientation {
-            Orientation::Row => (a.0 as f64, (b.0 + b.2 - a.0) as f64, pos.x),
-            Orientation::Column => (a.1 as f64, (b.1 + b.3 - a.1) as f64, pos.y),
+        let p = match d.axis {
+            Orientation::Row => pos.x,
+            Orientation::Column => pos.y,
         };
-        if span <= 0.0 {
-            return;
-        }
-        // keep both panes usable: at least ~80px each
-        let min = (80.0 / span).min(0.45);
-        let rel = ((p - start) / span).clamp(min, 1.0 - min) as f32;
-        let pair = t.weights[i] + t.weights[i + 1];
-        t.weights[i] = pair * rel;
-        t.weights[i + 1] = pair - t.weights[i];
+        t.layout.drag(&d, content, p);
         self.relayout_active();
         self.request_redraw();
     }
@@ -2412,14 +2396,11 @@ impl App {
             return;
         };
         if let Some(t) = self.tabs.get_mut(self.active) {
-            // A tab splits along ONE axis (v1 of EasyTer's tree). It used to
-            // take the axis from the first split only, so after that both
-            // split actions did the same thing. Now the asked-for axis
-            // always wins: the whole tab lines up that way, the new pane
-            // included.
-            t.orientation = split_axis(t.orientation, orientation);
+            // the FOCUSED pane splits the way that was asked, and only it:
+            // side by side and stacked mix freely in one tab
+            let new = t.panes.len();
+            t.layout.split(t.focused, orientation, new);
             t.panes.push(pane);
-            t.weights.push(1.0);
             t.focused = t.panes.len() - 1;
             // the new pane has to be seen: a split ends the zoom
             t.zoomed = false;
@@ -2492,9 +2473,7 @@ impl App {
             self.pending_close = None;
         }
         let mut pane = t.panes.remove(pi);
-        if pi < t.weights.len() {
-            t.weights.remove(pi);
-        }
+        t.layout.remove(pi);
         pane.session.kill();
         if t.panes.is_empty() {
             self.tabs.remove(ti);
@@ -2574,12 +2553,10 @@ impl App {
                                 .and_then(term::accept_local_cwd)
                         })
                         .collect(),
-                    weights: t.weights.clone(),
-                    orientation: match t.orientation {
-                        Orientation::Row => 0,
-                        Orientation::Column => 1,
-                    },
+                    weights: Vec::new(),
+                    orientation: 0,
                     focused: t.focused,
+                    layout: Some(t.layout.clone()),
                     name: t.name.clone(),
                 })
                 .collect(),
@@ -2628,30 +2605,19 @@ impl App {
             Some(state) if !state.tabs.is_empty() => {
                 // BAYAN-014: a session.json with hundreds of tabs (a bug, a
                 // hand edit, a planted file) must not spawn hundreds of shells
-                for st in state.tabs.into_iter().take(MAX_RESTORED_TABS) {
-                    let mut cwds = st.cwds.into_iter();
+                for mut st in state.tabs.into_iter().take(MAX_RESTORED_TABS) {
+                    let mut cwds = std::mem::take(&mut st.cwds).into_iter();
                     self.spawn_tab(cwds.next().flatten());
                     for cwd in cwds.take(3) {
                         // re-split with the saved axis; weights come after
                         if let Some(pane) = self.spawn_pane(cwd.as_deref()) {
                             if let Some(t) = self.tabs.last_mut() {
                                 t.panes.push(pane);
-                                t.weights.push(1.0);
                             }
                         }
                     }
                     if let Some(t) = self.tabs.last_mut() {
-                        t.orientation = if st.orientation == 1 {
-                            Orientation::Column
-                        } else {
-                            Orientation::Row
-                        };
-                        if st.weights.len() == t.panes.len() {
-                            let sane = st.weights.iter().all(|w| w.is_finite() && *w > 0.0);
-                            if sane {
-                                t.weights = st.weights;
-                            }
-                        }
+                        t.layout = restored_layout(&st, t.panes.len());
                         t.focused = st.focused.min(t.panes.len() - 1);
                         t.name = st.name.as_deref().and_then(clean_tab_name);
                     }
@@ -5004,36 +4970,37 @@ mod tests {
     }
 
     #[test]
-    fn the_split_you_pick_is_the_layout_you_get() {
-        // both actions used to do the same thing once a tab was split
-        assert!(split_axis(Orientation::Row, Orientation::Column) == Orientation::Column);
-        assert!(split_axis(Orientation::Column, Orientation::Row) == Orientation::Row);
-        assert!(split_axis(Orientation::Row, Orientation::Row) == Orientation::Row);
-        // and their labels say which way they go
+    fn a_saved_tree_restores_and_an_old_file_still_reads() {
+        let mut tree = layout::Node::single();
+        tree.split(0, Orientation::Row, 1);
+        tree.split(1, Orientation::Column, 2);
+        let st = SavedTab {
+            cwds: vec![None, None, None],
+            weights: Vec::new(),
+            orientation: 0,
+            focused: 0,
+            layout: Some(tree.clone()),
+            name: None,
+        };
+        assert_eq!(restored_layout(&st, 3), tree);
+        // a pane failed to respawn: the tree no longer fits, use one axis
+        assert_eq!(
+            restored_layout(&st, 2),
+            layout::Node::flat(Orientation::Row, &[], 2)
+        );
+        // a file from before nested splits: orientation + weights
+        let old: SavedTab =
+            serde_json::from_str(r#"{"cwds":[null,null],"weights":[3.0,1.0],"orientation":1}"#)
+                .unwrap();
+        assert_eq!(
+            restored_layout(&old, 2),
+            layout::Node::flat(Orientation::Column, &[3.0, 1.0], 2)
+        );
+        // and the split labels say which way they go
         assert_ne!(
             keybinds::Action::SplitH.label(),
             keybinds::Action::SplitV.label()
         );
-    }
-
-    #[test]
-    fn split_rects_divide_by_weight() {
-        let content = (0, 30, 1000, 700);
-        let one = split_rects(content, &[1.0], Orientation::Row);
-        assert_eq!(one, vec![(0, 30, 1000, 700)]);
-        let two = split_rects(content, &[1.0, 1.0], Orientation::Row);
-        assert_eq!(two[0], (0, 30, 499, 700));
-        assert_eq!(two[1], (500, 30, 500, 700)); // absorbs the rounding
-        assert_eq!(two[0].0 + two[0].2 + 1, two[1].0); // 1px divider gap
-                                                       // a dragged divider: 3:1 weights give a 3:1 width split
-        let uneven = split_rects(content, &[3.0, 1.0], Orientation::Row);
-        assert_eq!(uneven[0].2, 749); // 999 * 0.75
-        assert_eq!(uneven[1].0 + uneven[1].2, 1000); // flush right
-        let stacked = split_rects(content, &[1.0, 1.0, 1.0], Orientation::Column);
-        assert_eq!(stacked.len(), 3);
-        assert_eq!(stacked[2].1 + stacked[2].3, 30 + 700); // flush bottom
-                                                           // widths untouched in a column split
-        assert!(stacked.iter().all(|r| r.2 == 1000));
     }
 
     #[test]
@@ -5133,6 +5100,7 @@ mod tests {
                 weights: vec![3.0, 1.0],
                 orientation: 1,
                 focused: 1,
+                layout: None,
                 name: Some("خادم".into()),
             }],
             active: 0,
@@ -5493,6 +5461,7 @@ mod m38_tests {
                 weights: vec![1.0],
                 orientation: 0,
                 focused: 0,
+                layout: None,
                 name: Some("سجلات".into()),
             }],
             active: 0,

@@ -628,6 +628,20 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       `133;B` marks the prompt, so drops into cmd, bash and WSL panes
       always show the confirm card; picker previews of non-featured themes
       appear when highlighted
+- [x] **Nested splits** — a tab's panes are a tree of splits (`layout.rs`),
+      so «تقسيم: جنبًا إلى جنب» and «تقسيم: فوق بعضها» split the FOCUSED pane
+      the way they say and mix freely: two side by side, then the right one
+      stacked. Before, a tab had one axis taken from its first split, so
+      after that both actions did the same thing. Splitting along the axis
+      a pane already sits in adds a sibling that shares its size. Closing a
+      pane collapses its split; dividers drag at every level and the cursor
+      follows the divider under it. Panes stay one flat list, so focus,
+      broadcast, zoom and the close guard are unchanged. The session file
+      saves the tree; a file from before restores as one row or column.
+      Proven by six unit tests on the pure tree (rects, split, remove,
+      dividers and drags, session round trip). Chrome Arabic (menus,
+      settings, cards) now shapes in Segoe UI: Cascadia Code's monospaced
+      Arabic stretched every letter to a full cell
 
 ## Settings
 

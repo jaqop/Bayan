@@ -409,8 +409,10 @@ impl App {
         let cell = self.refresh_link_hover(position);
         if let Some(w) = &self.window {
             let edge = self.resize_edge_at(position);
-            let on_divider = edge.is_none() && self.divider_at(position).is_some();
-            let orientation = self.tabs.get(self.active).map(|t| t.orientation);
+            let divider = edge.is_none().then(|| self.divider_at(position)).flatten();
+            let on_divider = divider.is_some();
+            // the cursor follows the divider under it: nested splits mix both
+            let orientation = divider.and_then(|d| self.dividers().get(d).map(|d| d.axis));
             w.set_cursor(hover_cursor(
                 edge,
                 on_divider,
