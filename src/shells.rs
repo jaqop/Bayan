@@ -13,17 +13,88 @@ use std::path::Path;
 pub struct Shell {
     /// Label for the settings list.
     pub name: String,
-    /// Command line handed to ConPTY.
-    pub command: String,
+    /// Program passed to `CommandBuilder::new`. Not a command line.
+    pub program: String,
+    /// Arguments, each one `CommandBuilder::arg`. A WSL distro is one entry.
+    pub args: Vec<String>,
 }
 
 impl Shell {
-    fn new(name: &str, command: impl Into<String>) -> Self {
+    fn new(name: &str, program: &str, args: &[&str]) -> Self {
         Self {
             name: name.to_string(),
-            command: command.into(),
+            program: program.to_string(),
+            args: args.iter().copied().map(str::to_string).collect(),
         }
     }
+
+    /// Command line stored in config and shown in the shell cycler.
+    ///
+    /// This is a persistence token. Spawn does not recover a WSL distro by
+    /// splitting it: `wsl_spawn_argv` keeps the name as one argument, and
+    /// `wsl_shell` refuses a name that would not round-trip that way.
+    pub fn command(&self) -> String {
+        let mut s = self.program.clone();
+        for a in &self.args {
+            s.push(' ');
+            s.push_str(a);
+        }
+        s
+    }
+}
+
+/// A distro name safe to pass as the single argument after `wsl.exe -d`.
+///
+/// Empty, a leading `-` (another flag), whitespace, and control characters
+/// are refused. Whitespace is not an argument separator on this path.
+fn accept_wsl_distro(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first == '-' || first.is_whitespace() || first.is_control() {
+        return false;
+    }
+    chars.all(|c| !c.is_whitespace() && !c.is_control())
+}
+
+/// One WSL distro, or `None` when the name must not be launched.
+fn wsl_shell(distro: &str) -> Option<Shell> {
+    if !accept_wsl_distro(distro) {
+        return None;
+    }
+    Some(Shell::new(
+        &format!("WSL · {distro}"),
+        "wsl.exe",
+        &["-d", distro],
+    ))
+}
+
+fn wsl_shells_from(names: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<Shell> {
+    names
+        .into_iter()
+        .filter_map(|n| wsl_shell(n.as_ref()))
+        .collect()
+}
+
+/// Argv for a stored `wsl.exe -d <distro>` command line.
+///
+/// `Ok(None)` when `command` is not that form (the caller uses
+/// `split_command`). `Ok(Some)` is `wsl.exe` plus one `-d` and the distro
+/// as a single argument — the remainder is never whitespace-split.
+/// `Err` when the line is that form but the distro name is rejected, so the
+/// caller must not fall back to splitting it into further arguments.
+pub(crate) fn wsl_spawn_argv(command: &str) -> Result<Option<(String, Vec<String>)>, &'static str> {
+    let Some(distro) = command.strip_prefix("wsl.exe -d ") else {
+        return Ok(None);
+    };
+    if !accept_wsl_distro(distro) {
+        return Err("rejected WSL distro name");
+    }
+    Ok(Some((
+        "wsl.exe".to_string(),
+        vec!["-d".to_string(), distro.to_string()],
+    )))
 }
 
 /// Git Bash candidates, in priority order. The first two are the REAL bash.
@@ -128,25 +199,28 @@ pub fn detect() -> Vec<Shell> {
     let mut v = Vec::new();
 
     // $PROFILE is loaded, so the user's chosen oh-my-posh prompt shows up.
-    v.push(Shell::new("PowerShell", "powershell.exe"));
-    v.push(Shell::new("PowerShell سريع", "powershell.exe -NoProfile"));
+    v.push(Shell::new("PowerShell", "powershell.exe", &[]));
+    v.push(Shell::new(
+        "PowerShell سريع",
+        "powershell.exe",
+        &["-NoProfile"],
+    ));
 
     if on_path("pwsh") {
-        v.push(Shell::new("PowerShell 7", "pwsh.exe -NoLogo"));
+        v.push(Shell::new("PowerShell 7", "pwsh.exe", &["-NoLogo"]));
     }
 
-    v.push(Shell::new("Command Prompt", "cmd.exe"));
+    v.push(Shell::new("Command Prompt", "cmd.exe", &[]));
 
     if let Some(p) = pick_git_bash(|p| Path::new(p).exists()) {
-        v.push(Shell::new(
-            "Git Bash",
-            format!("{} --login -i", short_path(p)),
-        ));
+        let prog = short_path(p);
+        v.push(Shell::new("Git Bash", &prog, &["--login", "-i"]));
     }
 
-    for d in wsl_distros() {
-        v.push(Shell::new(&format!("WSL · {d}"), format!("wsl.exe -d {d}")));
-    }
+    // Distro names stay one argv entry. A name that is empty, flag-like,
+    // or contains whitespace or controls is dropped, not formatted into a
+    // command line and split later.
+    v.extend(wsl_shells_from(wsl_distros()));
 
     v
 }
@@ -156,7 +230,7 @@ pub fn detect() -> Vec<Shell> {
 pub fn label_for(command: &str) -> String {
     detect()
         .into_iter()
-        .find(|s| s.command == command)
+        .find(|s| s.command() == command)
         .map(|s| s.name)
         .unwrap_or_else(|| command.trim_end_matches(".exe").to_string())
 }
@@ -241,16 +315,85 @@ mod tests {
     fn detection_always_offers_a_working_shell() {
         let found = detect();
         // powershell.exe and cmd.exe ship with Windows: never an empty list
-        assert!(found.iter().any(|s| s.command == "powershell.exe"));
-        assert!(found.iter().any(|s| s.command == "cmd.exe"));
+        assert!(found.iter().any(|s| s.command() == "powershell.exe"));
+        assert!(found.iter().any(|s| s.command() == "cmd.exe"));
         // EasyTer's order: the $PROFILE-loading entry comes first
-        assert_eq!(found[0].command, "powershell.exe");
-        assert_eq!(found[1].command, "powershell.exe -NoProfile");
+        assert_eq!(found[0].command(), "powershell.exe");
+        assert_eq!(found[1].command(), "powershell.exe -NoProfile");
+        assert_eq!(found[0].args, Vec::<String>::new());
+        assert_eq!(found[1].program, "powershell.exe");
+        assert_eq!(found[1].args, vec!["-NoProfile".to_string()]);
         // no duplicate command lines
-        let mut cmds: Vec<&str> = found.iter().map(|s| s.command.as_str()).collect();
+        let mut cmds: Vec<String> = found.iter().map(|s| s.command()).collect();
         cmds.sort_unstable();
         let before = cmds.len();
         cmds.dedup();
         assert_eq!(cmds.len(), before, "duplicate shell commands: {found:?}");
+    }
+
+    #[test]
+    fn wsl_distro_is_one_argv_entry_after_a_single_dash_d() {
+        let shells = wsl_shells_from(["Ubuntu-22.04", "Debian"]);
+        assert_eq!(shells.len(), 2);
+        for s in &shells {
+            assert_eq!(s.program, "wsl.exe");
+            assert_eq!(s.args.len(), 2, "{s:?}");
+            assert_eq!(s.args[0], "-d");
+            assert_eq!(
+                s.args.iter().filter(|a| *a == "-d").count(),
+                1,
+                "exactly one -d: {s:?}"
+            );
+            let (prog, args) = wsl_spawn_argv(&s.command())
+                .unwrap()
+                .expect("a stored WSL shell is structured argv");
+            assert_eq!(prog, s.program);
+            assert_eq!(args, s.args);
+        }
+        assert_eq!(shells[0].args[1], "Ubuntu-22.04");
+        assert_eq!(shells[0].command(), "wsl.exe -d Ubuntu-22.04");
+        assert_eq!(shells[1].args[1], "Debian");
+        // not a WSL line: the caller keeps its own splitter
+        assert_eq!(wsl_spawn_argv("powershell.exe -NoProfile"), Ok(None));
+        assert_eq!(wsl_spawn_argv("cmd.exe"), Ok(None));
+    }
+
+    #[test]
+    fn wsl_distro_names_empty_dash_whitespace_or_control_are_rejected() {
+        let rejected = [
+            "",
+            "-",
+            "-d",
+            "--exec",
+            "-Ubuntu",
+            "My Distro",
+            "Ubuntu 22.04",
+            " leading",
+            "trailing ",
+            "a\tb",
+            "a\nb",
+            "a\rb",
+            "a\u{0000}b",
+            "a\u{0001}b",
+            "a\u{001b}b",
+            "a\u{007f}b",
+            " ",
+            "Ubuntu -e calc.exe",
+        ];
+        let mut names = vec!["Ubuntu".to_string(), "kali-linux".to_string()];
+        names.extend(rejected.iter().map(|s| (*s).to_string()));
+        let shells = wsl_shells_from(&names);
+        assert_eq!(shells.len(), 2, "{shells:?}");
+        assert!(shells
+            .iter()
+            .all(|s| s.args[1] == "Ubuntu" || s.args[1] == "kali-linux"));
+        for bad in rejected {
+            assert!(wsl_shell(bad).is_none(), "accepted {bad:?}");
+            let stored = format!("wsl.exe -d {bad}");
+            assert!(
+                wsl_spawn_argv(&stored).is_err(),
+                "whitespace-split or launched {bad:?}: {stored:?}"
+            );
+        }
     }
 }

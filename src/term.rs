@@ -31,7 +31,7 @@ const PTY_READ: usize = 64 * 1024;
 pub fn shell_choices() -> Vec<String> {
     crate::shells::detect()
         .into_iter()
-        .map(|s| s.command)
+        .map(|s| s.command())
         .collect()
 }
 
@@ -84,6 +84,9 @@ fn is_powershell(shell: &str) -> bool {
 /// `C:\Program Files\PowerShell\7\pwsh.exe`, whose program name contains two
 /// spaces. So find the program by its `.exe` boundary (or an explicit quote),
 /// and only then treat the remainder as arguments.
+///
+/// WSL distros do not come through here. `spawn_argv` uses
+/// `shells::wsl_spawn_argv`, which keeps the distro as one argument.
 pub fn split_command(cmd: &str) -> (String, Vec<String>) {
     let c = cmd.trim();
     let split_args = |s: &str| s.split_whitespace().map(str::to_string).collect();
@@ -103,6 +106,19 @@ pub fn split_command(cmd: &str) -> (String, Vec<String>) {
         it.next().unwrap_or(c).to_string(),
         it.map(str::to_string).collect(),
     )
+}
+
+/// Program and arguments for [`Session::spawn`].
+///
+/// WSL comes from [`crate::shells::wsl_spawn_argv`]: the distro is one
+/// argument, and a rejected name is an error rather than further argv.
+/// Every other stored command line still goes through [`split_command`].
+fn spawn_argv(shell: &str) -> Result<(String, Vec<String>), std::io::Error> {
+    match crate::shells::wsl_spawn_argv(shell) {
+        Ok(Some(argv)) => Ok(argv),
+        Ok(None) => Ok(split_command(shell)),
+        Err(msg) => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg)),
+    }
 }
 
 /// OSC 133 prompt wrapper injected into PowerShell (EasyTer's __et_wrap,
@@ -1819,6 +1835,12 @@ impl Session {
         shell: &str,
         kitty_protocol: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // program + args, or a shell with switches would be spawned as one
+        // absurd filename ("powershell.exe -NoProfile" is not a program).
+        // A WSL distro is one argument here: `spawn_argv` does not recover
+        // it by splitting `wsl.exe -d {name}` on whitespace. A rejected name
+        // fails before a console is opened.
+        let (prog, args) = spawn_argv(shell)?;
         let prompt_nonce = fresh_prompt_nonce();
         let pty = native_pty_system();
         let pair = pty.openpty(PtySize {
@@ -1827,9 +1849,6 @@ impl Session {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        // program + args, or a shell with switches would be spawned as one
-        // absurd filename ("powershell.exe -NoProfile" is not a program)
-        let (prog, args) = split_command(shell);
         let mut cmd = CommandBuilder::new(prog);
         for a in &args {
             cmd.arg(a);
@@ -2878,7 +2897,7 @@ mod tests {
             c,
             crate::shells::detect()
                 .into_iter()
-                .map(|s| s.command)
+                .map(|s| s.command())
                 .collect::<Vec<_>>()
         );
         let mut sorted = c.clone();
@@ -2961,6 +2980,9 @@ mod tests {
                 vec!["--login".to_string(), "-i".to_string()]
             )
         );
+        // What this splitter does with a simple distro. Spawn does not use
+        // it for WSL — a space or a leading `-` must not become more argv.
+        // See `wsl_spawn_argv_keeps_the_distro_as_one_argument`.
         assert_eq!(
             split_command("wsl.exe -d Ubuntu"),
             (
@@ -2982,6 +3004,30 @@ mod tests {
                 "bad program in {c:?}"
             );
         }
+    }
+
+    #[test]
+    fn wsl_spawn_argv_keeps_the_distro_as_one_argument() {
+        let (prog, args) = spawn_argv("wsl.exe -d Ubuntu-22.04").unwrap();
+        assert_eq!(prog, "wsl.exe");
+        assert_eq!(args, vec!["-d".to_string(), "Ubuntu-22.04".to_string()]);
+        assert_eq!(args.iter().filter(|a| *a == "-d").count(), 1);
+
+        // A name detection refuses must not be whitespace-split into flags.
+        assert!(spawn_argv("wsl.exe -d My Distro").is_err());
+        assert!(spawn_argv("wsl.exe -d -e").is_err());
+        assert!(spawn_argv("wsl.exe -d Ubuntu\u{0001}x").is_err());
+        assert!(spawn_argv("wsl.exe -d ").is_err());
+
+        // Other shells still use the command-line splitter.
+        assert_eq!(
+            spawn_argv("powershell.exe -NoProfile").unwrap(),
+            ("powershell.exe".into(), vec!["-NoProfile".into()])
+        );
+        assert_eq!(
+            spawn_argv("cmd.exe").unwrap(),
+            ("cmd.exe".into(), Vec::<String>::new())
+        );
     }
 
     #[test]

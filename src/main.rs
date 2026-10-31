@@ -719,7 +719,7 @@ fn palette_extras(
         .iter()
         .map(|shell| {
             (
-                PaletteRow::Shell(shell.command.clone()),
+                PaletteRow::Shell(shell.command()),
                 format!("تبويب جديد — {}", shell.name),
             )
         })
@@ -3498,7 +3498,7 @@ impl ApplicationHandler<UserEvent> for App {
                         .retain(|(row, _)| !matches!(row, PaletteRow::Shell(_)));
                     palette.extras.extend(profiles.iter().map(|shell| {
                         (
-                            PaletteRow::Shell(shell.command.clone()),
+                            PaletteRow::Shell(shell.command()),
                             format!("تبويب جديد — {}", shell.name),
                         )
                     }));
@@ -4004,7 +4004,8 @@ mod tests {
     fn palette_profiles_and_copy_targets_keep_exact_payloads() {
         let shells = vec![shells::Shell {
             name: "طرفية تجريبية".into(),
-            command: "cmd.exe".into(),
+            program: "cmd.exe".into(),
+            args: Vec::new(),
         }];
         let spans = vec![link::LinkSpan {
             start_col: 2,
