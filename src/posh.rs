@@ -9,7 +9,11 @@
 //! it in a different rendering engine.
 //!
 //! Applying only ever rewrites the ONE managed line in `$PROFILE`. Every other
-//! line the user has written is left untouched.
+//! line the user has written is left untouched. The theme stem has to match
+//! `[A-Za-z0-9._-]`: PowerShell expands `$` and `$(...)` inside the double
+//! quotes that line used to carry, so a theme filename would otherwise become
+//! code on every profile load. The path is written with
+//! `term::powershell_escape_single`, the same literal escape spawn already uses.
 
 use std::path::PathBuf;
 
@@ -53,7 +57,25 @@ pub fn profile_path() -> PathBuf {
     }
 }
 
+/// Theme stems that may be written into `$PROFILE`. Anything outside
+/// `[A-Za-z0-9._-]` is rejected, including empty, so `$`, `(`, quotes, and
+/// backticks never reach the profile. The picker uses the same rule.
+fn theme_stem_allowed(theme: &str) -> bool {
+    !theme.is_empty()
+        && theme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// `kali.omp.json` → `kali`, when the stem is allowlisted. Other names are
+/// hidden: the picker must not offer a file `set_theme` would refuse.
+fn theme_from_filename(file: &str) -> Option<String> {
+    let stem = file.strip_suffix(".omp.json")?;
+    theme_stem_allowed(stem).then(|| stem.to_string())
+}
+
 /// Theme names present on disk: featured ones first, then the rest sorted.
+/// Stems outside `[A-Za-z0-9._-]` are omitted.
 pub fn available() -> Vec<String> {
     let Ok(rd) = std::fs::read_dir(themes_dir()) else {
         return Vec::new(); // oh-my-posh not installed is not an error here
@@ -61,7 +83,7 @@ pub fn available() -> Vec<String> {
     let mut names: Vec<String> = rd
         .filter_map(|e| e.ok())
         .filter_map(|e| e.file_name().into_string().ok())
-        .filter_map(|f| f.strip_suffix(".omp.json").map(str::to_string))
+        .filter_map(|f| theme_from_filename(&f))
         .collect();
     names.sort();
     order_featured_first(names)
@@ -89,42 +111,202 @@ pub fn current() -> Option<String> {
     current_from(&txt)
 }
 
+/// The marker of the one line `rewrite_config` is allowed to change.
+const MANAGED_CONFIG: &str = "oh-my-posh init pwsh --config";
+
 /// Pull the theme name out of profile text. Separated from I/O so the parsing
 /// — the part that can be wrong — is testable.
 fn current_from(txt: &str) -> Option<String> {
-    let i = txt.find("oh-my-posh init pwsh --config")?;
-    let rest = &txt[i..];
-    let a = rest.find('"')? + 1;
-    let b = rest[a..].find('"')? + a;
-    let path = &rest[a..b];
+    let (_at, arg) = managed_arg(txt)?;
+    let (path, _) = parse_config_argument(arg)?;
     let file = path.rsplit(['\\', '/']).next()?;
     file.strip_suffix(".omp.json").map(str::to_string)
 }
 
+/// Byte offset of the `--config` argument, and the text starting there.
+/// A line whose first non-whitespace character is `#` is a comment, same as
+/// `parse_posh_config`, so a commented-out copy of the marker is not rewritten.
+fn managed_arg(txt: &str) -> Option<(usize, &str)> {
+    let mut offset = 0;
+    for line in txt.split_inclusive('\n') {
+        if line.trim().starts_with('#') {
+            offset += line.len();
+            continue;
+        }
+        if let Some(rel) = line.find(MANAGED_CONFIG) {
+            let rest = &line[rel + MANAGED_CONFIG.len()..];
+            let at = offset + rel + MANAGED_CONFIG.len() + leading_ws(rest);
+            return Some((at, &txt[at..]));
+        }
+        offset += line.len();
+    }
+    None
+}
+
+fn leading_ws(s: &str) -> usize {
+    s.len() - s.trim_start().len()
+}
+
+/// One `--config` argument: a double-quoted path, a single-quoted path
+/// (doubled quotes unescaped), or `($env:NAME + '\tail')` / `($HOME + '\tail')`.
+/// The path is the logical text, with `$env:USERPROFILE` still unexpanded.
+/// The `usize` is how many bytes of `s` the argument occupied.
+pub(crate) fn parse_config_argument(s: &str) -> Option<(String, usize)> {
+    if let Some(rest) = s.strip_prefix('"') {
+        let end = rest.find('"')?;
+        Some((rest[..end].to_string(), end + 2))
+    } else if s.starts_with('\'') {
+        parse_ps_single_quoted(s)
+    } else if s.starts_with('(') {
+        parse_ps_concat_arg(s)
+    } else {
+        None
+    }
+}
+
+/// `'...'` with PowerShell's doubled single quotes (ASCII and smart) collapsed.
+fn parse_ps_single_quoted(s: &str) -> Option<(String, usize)> {
+    let mut chars = s.char_indices().peekable();
+    let (_, open) = chars.next()?;
+    if open != '\'' {
+        return None;
+    }
+    let mut path = String::new();
+    while let Some((i, c)) = chars.next() {
+        if crate::term::is_powershell_single_quote(c) {
+            if chars.peek().is_some_and(|(_, n)| *n == c) {
+                path.push(c);
+                chars.next();
+                continue;
+            }
+            if c == '\'' {
+                return Some((path, i + c.len_utf8()));
+            }
+        }
+        path.push(c);
+    }
+    None
+}
+
+/// `($env:NAME + '\tail')` → logical path `$env:NAME\tail`.
+fn parse_ps_concat_arg(s: &str) -> Option<(String, usize)> {
+    if !s.starts_with('(') {
+        return None;
+    }
+    let mut i = 1;
+    i += leading_ws(&s[i..]);
+    let (var, var_len) = split_env_token(&s[i..])?;
+    i += var_len;
+    i += leading_ws(&s[i..]);
+    if !s[i..].starts_with('+') {
+        return None;
+    }
+    i += 1;
+    i += leading_ws(&s[i..]);
+    let (literal, lit_len) = parse_ps_single_quoted(&s[i..])?;
+    i += lit_len;
+    i += leading_ws(&s[i..]);
+    if !s[i..].starts_with(')') {
+        return None;
+    }
+    i += 1;
+    Some((format!("{var}{literal}"), i))
+}
+
+/// `$env:Identifier` or `$HOME` at the start of `s`. Not `$(...)` and not
+/// `${...}`: those stay inside a single-quoted literal, where they cannot run.
+fn split_env_token(s: &str) -> Option<(&str, usize)> {
+    if let Some(rest) = s.strip_prefix("$env:") {
+        let name_len = env_name_len(rest)?;
+        let n = "$env:".len() + name_len;
+        Some((&s[..n], n))
+    } else if let Some(rest) = s.strip_prefix("$HOME") {
+        if rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+        Some((&s[.."$HOME".len()], "$HOME".len()))
+    } else {
+        None
+    }
+}
+
+fn env_name_len(s: &str) -> Option<usize> {
+    let mut len = 0;
+    for (i, c) in s.char_indices() {
+        if i == 0 && !(c.is_ascii_alphabetic() || c == '_') {
+            return None;
+        }
+        if c.is_ascii_alphanumeric() || c == '_' {
+            len = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    (len > 0).then_some(len)
+}
+
+/// The `--config` argument to write. A plain path is one single-quoted
+/// literal. A leading `$env:NAME` or `$HOME` that the profile already used
+/// stays outside the quotes and is joined to the single-quoted tail:
+/// quoting `$env:USERPROFILE\...` would make the variable literal text, and
+/// the prompt would not resolve in any other PowerShell. The tail, which
+/// holds the theme filename, always goes through `powershell_escape_single`.
+fn powershell_config_arg(path: &str) -> String {
+    if let Some((var, var_len)) = split_env_token(path) {
+        let rest = &path[var_len..];
+        if rest.starts_with(['\\', '/']) {
+            let escaped = crate::term::powershell_escape_single(rest);
+            return format!("({var} + '{escaped}')");
+        }
+    }
+    let escaped = crate::term::powershell_escape_single(path);
+    format!("'{escaped}'")
+}
+
 /// Rewrite the managed line's `--config` path, leaving every other line alone.
-/// Returns the new text, or None if there is no managed line to update.
+/// Returns None when that line is absent or `theme` is outside `[A-Za-z0-9._-]`.
+///
+/// The directory form is preserved, so a profile written with
+/// `$env:USERPROFILE` stays portable. Only the filename changes.
 fn rewrite_config(txt: &str, theme: &str) -> Option<String> {
-    let i = txt.find("oh-my-posh init pwsh --config")?;
-    let rest = &txt[i..];
-    let a = rest.find('"')? + 1;
-    let b = rest[a..].find('"')? + a;
-    let old = &rest[a..b];
-    // keep whatever directory form the user already had, swap only the file —
-    // a profile written with $env:USERPROFILE must stay portable
-    let dir_end = old.rfind(['\\', '/']).map(|p| p + 1).unwrap_or(0);
-    let new_path = format!("{}{}.omp.json", &old[..dir_end], theme);
-    let mut out = String::with_capacity(txt.len() + 16);
-    out.push_str(&txt[..i + a]);
-    out.push_str(&new_path);
-    out.push_str(&txt[i + b..]);
+    if !theme_stem_allowed(theme) {
+        return None;
+    }
+    let (arg_at, arg_txt) = managed_arg(txt)?;
+    let (path, arg_len) = parse_config_argument(arg_txt)?;
+    let dir_end = path.rfind(['\\', '/']).map(|p| p + 1).unwrap_or(0);
+    let new_path = format!("{}{}.omp.json", &path[..dir_end], theme);
+    let arg = powershell_config_arg(&new_path);
+    let mut out = String::with_capacity(txt.len() + arg.len());
+    out.push_str(&txt[..arg_at]);
+    out.push_str(&arg);
+    out.push_str(&txt[arg_at + arg_len..]);
     Some(out)
+}
+
+/// Why `rewrite_config` returned None. A line with no quotes is not the same
+/// failure as a profile that has no managed line at all.
+fn profile_rewrite_error(txt: &str) -> &'static str {
+    match managed_arg(txt) {
+        Some((_, arg)) if parse_config_argument(arg).is_none() => {
+            "managed oh-my-posh line has no quoted config path"
+        }
+        _ => "no managed oh-my-posh line in the profile",
+    }
 }
 
 /// Point `$PROFILE`'s managed line at `theme`. New shells pick it up.
 pub fn set_theme(theme: &str) -> Result<(), String> {
+    if !theme_stem_allowed(theme) {
+        return Err("theme name rejected".into());
+    }
     let p = profile_path();
     let txt = std::fs::read_to_string(&p).map_err(|e| format!("read profile: {e}"))?;
-    let new = rewrite_config(&txt, theme).ok_or("no managed oh-my-posh line in the profile")?;
+    let new = rewrite_config(&txt, theme).ok_or_else(|| profile_rewrite_error(&txt).to_string())?;
     std::fs::write(&p, new).map_err(|e| format!("write profile: {e}"))
 }
 
@@ -242,21 +424,200 @@ mod tests {
     fn applying_touches_only_the_managed_line() {
         let out = rewrite_config(PROFILE, "kali").unwrap();
         assert_eq!(current_from(&out).as_deref(), Some("kali"));
-        // every other line survives byte for byte — this is the whole promise
-        assert!(out.contains("chcp 65001 > $null"));
-        assert!(out.contains("a line the user wrote and we must never touch"));
-        assert!(out.contains("if (Get-Command oh-my-posh"));
-        assert_eq!(out.lines().count(), PROFILE.lines().count());
-        // the directory form is preserved, so a portable profile stays portable
-        assert!(
-            out.contains("$env:USERPROFILE"),
-            "absolute path was injected: {out}"
+        // the directory form is preserved and the tail is a single-quoted
+        // literal. Quoting `$env:USERPROFILE` itself would stop it expanding.
+        let expected = PROFILE.replace(
+            "\"$env:USERPROFILE\\.poshthemes\\night-owl.omp.json\"",
+            "($env:USERPROFILE + '\\.poshthemes\\kali.omp.json')",
+        );
+        assert_eq!(out, expected);
+        // spawn reads the same line back as the expandable path
+        assert_eq!(
+            crate::term::parse_posh_config(&out).as_deref(),
+            Some(r"$env:USERPROFILE\.poshthemes\kali.omp.json")
         );
     }
 
     #[test]
     fn a_profile_without_the_managed_line_is_refused_not_mangled() {
         assert!(rewrite_config("# nothing here\n", "kali").is_none());
+        assert_eq!(
+            profile_rewrite_error("# nothing here\n"),
+            "no managed oh-my-posh line in the profile"
+        );
+    }
+
+    #[test]
+    fn a_commented_marker_is_skipped_and_an_unquoted_path_says_so() {
+        let src = concat!(
+            "# oh-my-posh init pwsh --config \"C:/themes/ignored.omp.json\"\n",
+            "oh-my-posh init pwsh --config \"C:/themes/pure.omp.json\" | Invoke-Expression\n",
+        );
+        assert_eq!(current_from(src).as_deref(), Some("pure"));
+        let out = rewrite_config(src, "kali").unwrap();
+        let comment = out.lines().next().unwrap();
+        assert!(comment.starts_with("# "), "{comment}");
+        assert!(comment.contains("ignored.omp.json"), "{comment}");
+        assert!(out.contains("--config 'C:/themes/kali.omp.json'"), "{out}");
+        // a comment is the only marker: there is no managed line to update
+        let only = "# oh-my-posh init pwsh --config \"C:/themes/ignored.omp.json\"\n";
+        assert!(rewrite_config(only, "kali").is_none());
+        assert_eq!(
+            profile_rewrite_error(only),
+            "no managed oh-my-posh line in the profile"
+        );
+        // the line is there, but the path is not quoted, so the error says that
+        let bare = "oh-my-posh init pwsh --config C:/themes/pure.omp.json | iex\n";
+        assert!(rewrite_config(bare, "kali").is_none());
+        assert_eq!(
+            profile_rewrite_error(bare),
+            "managed oh-my-posh line has no quoted config path"
+        );
+    }
+
+    #[test]
+    fn rewrite_refuses_stems_outside_the_allowlist() {
+        // the fixture really does have a managed line, so None below is the
+        // allowlist and not a missing marker
+        assert!(rewrite_config(PROFILE, "kali").is_some());
+        for good in [
+            "night-owl",
+            "powerlevel10k_rainbow",
+            "clean-detailed",
+            "v1.2",
+            "A_B",
+        ] {
+            assert!(rewrite_config(PROFILE, good).is_some(), "rejected {good}");
+        }
+        for bad in [
+            "$(calc)",
+            "a$b",
+            "a(b)",
+            "a)b",
+            "night`ncalc",
+            "a b",
+            "a'b",
+            "a\"b",
+            "a;b",
+            "a&b",
+            "a\\b",
+            "a/b",
+            "عربي",
+            "",
+            "kali\n",
+            "a\u{2019}b",
+        ] {
+            assert!(rewrite_config(PROFILE, bad).is_none(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn theme_filenames_outside_the_allowlist_are_hidden() {
+        assert_eq!(
+            theme_from_filename("kali.omp.json").as_deref(),
+            Some("kali")
+        );
+        assert_eq!(
+            theme_from_filename("night-owl.omp.json").as_deref(),
+            Some("night-owl")
+        );
+        assert!(theme_from_filename("$(calc).omp.json").is_none());
+        assert!(theme_from_filename("a(b).omp.json").is_none());
+        assert!(theme_from_filename("a$b.omp.json").is_none());
+        assert!(theme_from_filename("a`b.omp.json").is_none());
+        assert!(theme_from_filename(".omp.json").is_none());
+        assert!(theme_from_filename("kali.json").is_none());
+    }
+
+    #[test]
+    fn an_absolute_config_path_is_one_single_quoted_literal() {
+        let src = "oh-my-posh init pwsh --config \"C:/themes/pure.omp.json\" | Invoke-Expression\n";
+        let out = rewrite_config(src, "kali").unwrap();
+        let escaped = crate::term::powershell_escape_single("C:/themes/kali.omp.json");
+        assert!(out.contains(&format!("--config '{escaped}'")), "{out}");
+        assert!(!out.contains('"'), "double quotes remained: {out}");
+        assert_eq!(current_from(&out).as_deref(), Some("kali"));
+        assert_eq!(
+            crate::term::parse_posh_config(&out).as_deref(),
+            Some("C:/themes/kali.omp.json")
+        );
+    }
+
+    #[test]
+    fn a_quote_in_the_directory_is_escaped_with_powershell_escape_single() {
+        let src = "oh-my-posh init pwsh --config \"C:\\o'brien\\pure.omp.json\" | iex\n";
+        let out = rewrite_config(src, "kali").unwrap();
+        let escaped = crate::term::powershell_escape_single("C:\\o'brien\\kali.omp.json");
+        assert!(out.contains(&format!("--config '{escaped}'")), "{out}");
+        assert_eq!(
+            crate::term::parse_posh_config(&out).as_deref(),
+            Some(r"C:\o'brien\kali.omp.json")
+        );
+        // applying again must not double the apostrophe a second time
+        let again = rewrite_config(&out, "pure").unwrap();
+        let escaped = crate::term::powershell_escape_single("C:\\o'brien\\pure.omp.json");
+        assert!(again.contains(&format!("--config '{escaped}'")), "{again}");
+        // a smart quote is a PowerShell quote too, so it is doubled the same way
+        let smart = format!(
+            "oh-my-posh init pwsh --config \"C:\\o{}brien\\pure.omp.json\" | iex\n",
+            '\u{2019}'
+        );
+        let out = rewrite_config(&smart, "kali").unwrap();
+        let path = format!("C:\\o{}brien\\kali.omp.json", '\u{2019}');
+        let escaped = crate::term::powershell_escape_single(&path);
+        assert!(out.contains(&format!("'{escaped}'")), "{out}");
+        assert_eq!(
+            crate::term::parse_posh_config(&out).as_deref(),
+            Some(path.as_str())
+        );
+    }
+
+    #[test]
+    fn a_portable_profile_stays_expandable_and_a_second_apply_only_swaps_the_file() {
+        let once = rewrite_config(PROFILE, "kali").unwrap();
+        let twice = rewrite_config(&once, "pure").unwrap();
+        assert!(
+            twice.contains("($env:USERPROFILE + '\\.poshthemes\\pure.omp.json')"),
+            "{twice}"
+        );
+        assert!(!twice.contains('"'), "{twice}");
+        assert_eq!(current_from(&twice).as_deref(), Some("pure"));
+        assert_eq!(
+            crate::term::parse_posh_config(&twice).as_deref(),
+            Some(r"$env:USERPROFILE\.poshthemes\pure.omp.json")
+        );
+        // $HOME and $env:POSH_THEMES_PATH are the other forms a profile uses
+        let home =
+            "oh-my-posh init pwsh --config \"$HOME\\.poshthemes\\night-owl.omp.json\" | iex\n";
+        let out = rewrite_config(home, "kali").unwrap();
+        assert!(
+            out.contains("($HOME + '\\.poshthemes\\kali.omp.json')"),
+            "{out}"
+        );
+        let themes =
+            "oh-my-posh init pwsh --config \"$env:POSH_THEMES_PATH\\night-owl.omp.json\" | iex\n";
+        let out = rewrite_config(themes, "kali").unwrap();
+        assert!(
+            out.contains("($env:POSH_THEMES_PATH + '\\kali.omp.json')"),
+            "{out}"
+        );
+        assert_eq!(
+            crate::term::parse_posh_config(&out).as_deref(),
+            Some(r"$env:POSH_THEMES_PATH\kali.omp.json")
+        );
+    }
+
+    #[test]
+    fn a_subexpression_already_in_the_path_is_quoted_literal() {
+        // the directory was already code. Rewriting must not leave it in
+        // double quotes, and must not treat `$(...)` as a variable to keep.
+        let src = "oh-my-posh init pwsh --config \"$($env:USERPROFILE)\\.poshthemes\\night-owl.omp.json\" | iex\n";
+        let out = rewrite_config(src, "kali").unwrap();
+        let escaped = crate::term::powershell_escape_single(
+            "$($env:USERPROFILE)\\.poshthemes\\kali.omp.json",
+        );
+        assert!(out.contains(&format!("--config '{escaped}'")), "{out}");
+        assert!(!out.contains("\"$("), "{out}");
     }
 
     #[test]
