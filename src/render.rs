@@ -701,6 +701,41 @@ pub const TAB_CELLS: f32 = 24.0;
 /// A tab never shrinks below this: "sh" must still be a clickable target.
 pub const TAB_MIN_CELLS: f32 = 9.0;
 
+/// The proportional font window chrome uses for Arabic. Inbox on every
+/// Windows since Vista; where it is missing, cosmic-text falls back to a
+/// font that has the glyphs (the bundled Amiri).
+const UI_ARABIC_FAMILY: &str = "Segoe UI";
+
+fn is_arabic_script(c: char) -> bool {
+    matches!(c as u32,
+        0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF
+        | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF)
+}
+
+/// Byte ranges of `text` and whether each is Arabic, for the chrome's font
+/// split. Spaces and punctuation stay with the run before them, so the
+/// space between two Arabic words is the UI font's space, and a label like
+/// "حجم الخط" is one run.
+fn ui_font_runs(text: &str) -> Vec<(std::ops::Range<usize>, bool)> {
+    let mut runs: Vec<(std::ops::Range<usize>, bool)> = Vec::new();
+    for (i, c) in text.char_indices() {
+        let end = i + c.len_utf8();
+        let class = if is_arabic_script(c) {
+            Some(true)
+        } else if c.is_alphanumeric() {
+            Some(false)
+        } else {
+            None // neutral: joins the current run
+        };
+        match (runs.last_mut(), class) {
+            (Some(last), None) => last.0.end = end,
+            (Some(last), Some(a)) if last.1 == a => last.0.end = end,
+            (_, a) => runs.push((i..end, a.unwrap_or(false))),
+        }
+    }
+    runs
+}
+
 /// A rect in frame pixels: (x, y, w, h).
 pub type Rect = (i32, i32, i32, i32);
 
@@ -1288,7 +1323,7 @@ struct ShapedRun {
 }
 
 /// Cache key: the exact rich-text content (text + color + style) + alignment.
-type RunKey = (Vec<Seg>, bool, bool, u32);
+type RunKey = (Vec<Seg>, bool, bool, u32, bool);
 type CellGeometry = Vec<(i32, i32, bool)>; // visual x, width, logical RTL
 type RowHit = (i32, i32, usize, bool); // x, width, column, logical RTL
 
@@ -1315,6 +1350,9 @@ pub struct Renderer {
     cache_cold: std::collections::HashMap<RunKey, ShapedRun>,
     pub atlas: Atlas,
     family: String,
+    /// Window chrome is being drawn (between `use_ui_metrics(true)` and
+    /// `(false)`): Arabic in it uses the proportional UI font.
+    ui_text: bool,
     // theme (config-overridable; defaults are EasyTer's heritage colors)
     pub bg: (u8, u8, u8),
     fg: (u8, u8, u8),
@@ -1437,6 +1475,7 @@ impl Renderer {
             palette,
             ligatures,
             bar_hidden: false,
+            ui_text: false,
             cell_w,
             cell_h: metrics.line_height,
         }
@@ -1473,6 +1512,7 @@ impl Renderer {
             self.terminal_cell_w
         };
         self.cell_h = self.metrics.line_height;
+        self.ui_text = active;
     }
 
     fn finish_pane_layout(&mut self, pane_rect: Rect) {
@@ -1602,6 +1642,7 @@ impl Renderer {
             align_left,
             force_ltr,
             self.metrics.font_size.to_bits(),
+            self.ui_text,
         );
         if self.cache_hot.contains_key(&key) {
             return key;
@@ -1611,18 +1652,41 @@ impl Renderer {
             return key;
         }
         let base = Attrs::new().family(Family::Name(self.family.as_str()));
+        let ui_arabic = Attrs::new().family(Family::Name(UI_ARABIC_FAMILY));
+        let ui_text = self.ui_text;
         let rich: Vec<(&str, Attrs)> = segs
             .iter()
-            .map(|s| {
+            .flat_map(|s| {
                 // 0.19 Attrs is no longer Copy — clone the base per span
-                let mut a = base.clone().color(Color::rgb(s.fg.0, s.fg.1, s.fg.2));
-                if s.style & ST_BOLD != 0 {
-                    a = a.weight(Weight::BOLD);
+                fn style<'a>(b: &Attrs<'a>, s: &Seg) -> Attrs<'a> {
+                    let mut a = b.clone().color(Color::rgb(s.fg.0, s.fg.1, s.fg.2));
+                    if s.style & ST_BOLD != 0 {
+                        a = a.weight(Weight::BOLD);
+                    }
+                    if s.style & ST_ITALIC != 0 {
+                        a = a.style(Style::Italic);
+                    }
+                    a
                 }
-                if s.style & ST_ITALIC != 0 {
-                    a = a.style(Style::Italic);
-                }
-                (s.text.as_str(), a)
+                // Window chrome: Arabic runs in the proportional UI font.
+                // The terminal font's Arabic (Cascadia Code) is monospaced,
+                // so every letter is stretched to a full cell — fine on the
+                // grid, ugly in a menu. Terminal rows never take this path.
+                let runs = if ui_text {
+                    ui_font_runs(&s.text)
+                } else {
+                    vec![(0..s.text.len(), false)]
+                };
+                runs.into_iter()
+                    .map(|(r, arabic)| {
+                        let a = if arabic {
+                            style(&ui_arabic, s)
+                        } else {
+                            style(&base, s)
+                        };
+                        (&s.text[r], a)
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect();
         let mut buffer = Buffer::new(&mut self.font_system, self.metrics);
@@ -5650,6 +5714,35 @@ mod cache_tests {
         assert_eq!(arabic_chars(2), "حرفين");
         assert_eq!(arabic_chars(7), "7 أحرف");
         assert_eq!(arabic_chars(293), "293 حرفاً");
+    }
+
+    #[test]
+    fn chrome_arabic_gets_its_own_font_runs() {
+        let runs = |t: &str| -> Vec<(String, bool)> {
+            ui_font_runs(t)
+                .into_iter()
+                .map(|(r, a)| (t[r].to_string(), a))
+                .collect()
+        };
+        assert_eq!(runs("البحث"), vec![("البحث".into(), true)]);
+        assert_eq!(runs("حجم الخط"), vec![("حجم الخط".into(), true)]);
+        assert_eq!(
+            runs("Cascadia Code NF"),
+            vec![("Cascadia Code NF".into(), false)]
+        );
+        assert_eq!(
+            runs("سجلّ التمرير (التبويبات الجديدة)"),
+            vec![("سجلّ التمرير (التبويبات الجديدة)".into(), true)]
+        );
+        assert_eq!(
+            runs("Enter تأكيد"),
+            vec![("Enter ".into(), false), ("تأكيد".into(), true)]
+        );
+        assert!(runs("").is_empty());
+        // every byte is covered exactly once
+        let t = "إضافة — Build 2";
+        let covered: usize = ui_font_runs(t).iter().map(|(r, _)| r.len()).sum();
+        assert_eq!(covered, t.len());
     }
 
     #[test]

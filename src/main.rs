@@ -626,6 +626,12 @@ fn clean_tab_name(raw: &str) -> Option<String> {
 }
 
 /// Weighted split of a content rect along one axis, 1px gaps between panes.
+/// The axis a tab uses after a split that asked for `asked`: always the one
+/// asked for — the split the user picked is the layout they see.
+fn split_axis(_current: Orientation, asked: Orientation) -> Orientation {
+    asked
+}
+
 fn split_rects(
     content: render::Rect,
     weights: &[f32],
@@ -890,8 +896,8 @@ fn context_menu_rows(
     add(Paste, "لصق");
     add(CopyLastOutput, "نسخ ناتج آخر أمر");
     add(Search, "البحث");
-    add(SplitH, "تقسيم جانبي");
-    add(SplitV, "تقسيم عمودي");
+    add(SplitH, "تقسيم: جنبًا إلى جنب");
+    add(SplitV, "تقسيم: فوق بعضها");
     if panes > 1 {
         add(
             ZoomPane,
@@ -2406,9 +2412,12 @@ impl App {
             return;
         };
         if let Some(t) = self.tabs.get_mut(self.active) {
-            if t.panes.len() == 1 {
-                t.orientation = orientation;
-            }
+            // A tab splits along ONE axis (v1 of EasyTer's tree). It used to
+            // take the axis from the first split only, so after that both
+            // split actions did the same thing. Now the asked-for axis
+            // always wins: the whole tab lines up that way, the new pane
+            // included.
+            t.orientation = split_axis(t.orientation, orientation);
             t.panes.push(pane);
             t.weights.push(1.0);
             t.focused = t.panes.len() - 1;
@@ -4991,6 +5000,19 @@ mod tests {
         assert!(
             !super::osc52_pane_is_focused(&past_end, 0, 1),
             "focused index past the end"
+        );
+    }
+
+    #[test]
+    fn the_split_you_pick_is_the_layout_you_get() {
+        // both actions used to do the same thing once a tab was split
+        assert!(split_axis(Orientation::Row, Orientation::Column) == Orientation::Column);
+        assert!(split_axis(Orientation::Column, Orientation::Row) == Orientation::Row);
+        assert!(split_axis(Orientation::Row, Orientation::Row) == Orientation::Row);
+        // and their labels say which way they go
+        assert_ne!(
+            keybinds::Action::SplitH.label(),
+            keybinds::Action::SplitV.label()
         );
     }
 
