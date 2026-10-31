@@ -280,6 +280,11 @@ impl App {
                     p.pressed = None;
                     (p.sel, p.wheel) = palette_scroll(p.sel, p.wheel, step, count);
                 }
+                if step != 0.0 {
+                    // A positive wheel moves toward row 0. The plugin heading
+                    // is not a command, so the selection does not stop on it.
+                    self.leave_palette_heading(if step > 0.0 { -1 } else { 1 });
+                }
                 self.request_redraw();
                 true
             }

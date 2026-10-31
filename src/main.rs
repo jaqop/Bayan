@@ -423,6 +423,35 @@ struct PendingPaste {
     reason: String,
 }
 
+/// What `arm_pending_paste` does with a clipboard paste or a plugin `send`.
+/// `Send` is only the quiet case: the caller still runs `normalize_paste`.
+enum PasteArm {
+    Hold(PendingPaste),
+    Send(String),
+}
+
+/// The paste guard wins over `fallback`. `fallback` holds a quiet payload
+/// (a drop that is not at a prompt). Neither arm writes the raw string.
+fn paste_arm(txt: String, fallback: Option<term::PasteRisk>) -> PasteArm {
+    if let Some(g) = term::needs_paste_guard(&txt) {
+        PasteArm::Hold(PendingPaste {
+            text: txt,
+            lines: g.lines,
+            chars: g.chars,
+            reason: g.risk.label().to_string(),
+        })
+    } else if let Some(risk) = fallback {
+        PasteArm::Hold(PendingPaste {
+            text: txt,
+            lines: 1,
+            chars: txt.chars().count(),
+            reason: risk.label().to_string(),
+        })
+    } else {
+        PasteArm::Send(txt)
+    }
+}
+
 /// One terminal pane (a tab holds one or more).
 struct Pane {
     id: u64,
@@ -706,9 +735,32 @@ enum PaletteRow {
     Builtin(keybinds::Action),
     /// index into `plugins::registry().actions`
     Plugin(usize),
+    /// Heading for the plugin section. Not an action.
+    Section,
     Shell(String),
     CopyText(String),
     InsertCommand(&'static str),
+}
+
+fn is_palette_section(row: &PaletteRow) -> bool {
+    matches!(row, PaletteRow::Section)
+}
+
+/// One arrow step, wrapping, skipping the plugin heading.
+fn step_palette(sel: usize, dir: isize, rows: &[(PaletteRow, String)]) -> usize {
+    let n = rows.len();
+    if n == 0 || dir == 0 {
+        return sel.min(n.saturating_sub(1));
+    }
+    let step = if dir > 0 { 1 } else { n - 1 };
+    let mut i = sel % n;
+    for _ in 0..n {
+        i = (i + step) % n;
+        if !is_palette_section(&rows[i].0) {
+            return i;
+        }
+    }
+    sel.min(n - 1)
 }
 
 fn palette_extras(
@@ -748,6 +800,53 @@ fn palette_extras(
         }
     }
     rows
+}
+
+/// Built-ins, then the plugin section (heading plus badged rows), then extras.
+/// An empty plugin match contributes no heading.
+fn assemble_palette_rows(
+    query: &str,
+    actions: &[plugins::PaletteAction],
+    extras: &[(PaletteRow, String)],
+) -> Vec<(PaletteRow, String)> {
+    let q = query.trim().to_lowercase();
+    let hit = |label: &str| q.is_empty() || label.to_lowercase().contains(&q);
+    let mut rows = Vec::new();
+    for action in keybinds::Action::ALL {
+        if hit(action.label()) {
+            rows.push((PaletteRow::Builtin(action), action.label().to_string()));
+        }
+    }
+    rows.extend(plugin_section_rows(actions, &q));
+    rows.extend(extras.iter().filter(|(_, label)| hit(label)).cloned());
+    rows
+}
+
+/// `query_lower` is already trimmed and lowercased. The heading is included
+/// only when at least one plugin row matches, including a search for the
+/// section title itself.
+fn plugin_section_rows(
+    actions: &[plugins::PaletteAction],
+    query_lower: &str,
+) -> Vec<(PaletteRow, String)> {
+    let hit = |label: &str| query_lower.is_empty() || label.to_lowercase().contains(query_lower);
+    let section_hit = hit(plugins::PALETTE_SECTION);
+    let matched: Vec<(PaletteRow, String)> = actions
+        .iter()
+        .enumerate()
+        .filter(|(_, act)| {
+            section_hit || hit(&act.label) || hit(&plugins::palette_label(&act.label))
+        })
+        .map(|(i, act)| (PaletteRow::Plugin(i), plugins::palette_label(&act.label)))
+        .collect();
+    if matched.is_empty() {
+        Vec::new()
+    } else {
+        let mut rows = Vec::with_capacity(matched.len() + 1);
+        rows.push((PaletteRow::Section, plugins::PALETTE_SECTION.to_string()));
+        rows.extend(matched);
+        rows
+    }
 }
 
 /// Ctrl+Shift+P: type to filter, arrows to move, Enter to run.
@@ -1241,17 +1340,22 @@ impl App {
                     p.sel = 0;
                 }
             }
+            self.leave_palette_heading(1);
             self.request_redraw();
             return;
         }
         let Some(p) = self.palette.as_mut() else {
             return;
         };
+        // Set when this key moved the selection, so a landing on the plugin
+        // heading can step off in the same direction.
+        let mut heading_dir = None;
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => self.palette = None,
             Key::Named(NamedKey::Backspace) => {
                 p.query.pop();
                 p.sel = 0;
+                heading_dir = Some(1);
             }
             Key::Named(NamedKey::ArrowDown) => {
                 let n = self
@@ -1260,6 +1364,7 @@ impl App {
                 if n > 0 {
                     let p = self.palette.as_mut().unwrap();
                     p.sel = (p.sel + 1) % n;
+                    heading_dir = Some(1);
                 }
             }
             Key::Named(NamedKey::ArrowUp) => {
@@ -1269,56 +1374,70 @@ impl App {
                 if n > 0 {
                     let p = self.palette.as_mut().unwrap();
                     p.sel = (p.sel + n - 1) % n;
+                    heading_dir = Some(-1);
                 }
             }
             Key::Named(NamedKey::Enter) => {
                 let q = p.query.clone();
                 let sel = p.sel;
                 if let Some((row, _)) = self.palette_rows(&q).into_iter().nth(sel) {
-                    self.palette_run(row, el);
-                    return;
+                    if !matches!(row, PaletteRow::Section) {
+                        self.palette_run(row, el);
+                        return;
+                    }
+                } else {
+                    self.palette = None;
                 }
-                self.palette = None;
             }
             Key::Character(c) => {
                 p.query.push_str(c);
                 p.sel = 0; // a new filter invalidates the old position
+                heading_dir = Some(1);
             }
             _ => {}
+        }
+        if let Some(dir) = heading_dir {
+            self.leave_palette_heading(dir);
         }
         self.request_redraw();
     }
 
-    /// Palette rows matching the query, built-ins first then plugin actions.
-    /// Matching is case-insensitive and substring, on the label the user
-    /// actually sees — searching a hidden id would be a guessing game.
+    /// Palette rows matching the query: built-ins, then the plugin section,
+    /// then shells and copies. Matching is case-insensitive and substring,
+    /// on the label the user actually sees.
     fn palette_rows(&self, query: &str) -> Vec<(PaletteRow, String)> {
-        let q = query.trim().to_lowercase();
-        let hit = |label: &str| q.is_empty() || label.to_lowercase().contains(&q);
-        let mut rows: Vec<(PaletteRow, String)> = Vec::new();
-        for a in keybinds::Action::ALL {
-            if hit(a.label()) {
-                rows.push((PaletteRow::Builtin(a), a.label().to_string()));
+        let extras = self
+            .palette
+            .as_ref()
+            .map(|p| p.extras.as_slice())
+            .unwrap_or(&[]);
+        assemble_palette_rows(query, &plugins::registry().actions, extras)
+    }
+
+    /// If the selection landed on the plugin heading, step off it. `dir` is
+    /// the direction the selection just moved (+1 down, -1 up).
+    fn leave_palette_heading(&mut self, dir: isize) {
+        let Some(query) = self.palette.as_ref().map(|p| p.query.clone()) else {
+            return;
+        };
+        let sel = self.palette.as_ref().map(|p| p.sel).unwrap_or(0);
+        let rows = self.palette_rows(&query);
+        if rows
+            .get(sel)
+            .is_some_and(|(row, _)| is_palette_section(row))
+        {
+            let sel = step_palette(sel, if dir == 0 { 1 } else { dir }, &rows);
+            if let Some(p) = self.palette.as_mut() {
+                p.sel = sel;
             }
         }
-        for (i, act) in plugins::registry().actions.iter().enumerate() {
-            if hit(&act.label) {
-                rows.push((PaletteRow::Plugin(i), act.label.clone()));
-            }
-        }
-        if let Some(palette) = &self.palette {
-            rows.extend(
-                palette
-                    .extras
-                    .iter()
-                    .filter(|(_, label)| hit(label))
-                    .cloned(),
-            );
-        }
-        rows
     }
 
     fn palette_run(&mut self, row: PaletteRow, el: &ActiveEventLoop) {
+        // The heading is not a command. Leave the palette open.
+        if matches!(row, PaletteRow::Section) {
+            return;
+        }
         self.palette = None;
         match row {
             // the SAME dispatch a keybinding uses, not a parallel copy
@@ -1349,12 +1468,13 @@ impl App {
             }
             PaletteRow::Plugin(i) => {
                 if let Some(act) = plugins::registry().actions.get(i) {
-                    let text = act.send.clone();
-                    if let Some(s) = self.session_mut() {
-                        s.write(text.as_bytes());
-                    }
+                    // Clipboard paste with no extra reason: a line break or a
+                    // control raises the card, and a quiet payload is still
+                    // normalize_paste'd inside send_paste. Never a raw write.
+                    self.arm_pending_paste(act.send.clone(), None);
                 }
             }
+            PaletteRow::Section => {}
         }
         self.request_redraw();
     }
@@ -2879,23 +2999,16 @@ impl App {
     /// Hold `txt` for the confirm card. `fallback` is the reason when the
     /// guard itself is quiet — a quoted drop onto vim, or onto a shell that
     /// is not at its prompt. The card draws whenever this is set, including
-    /// when the text has no control characters.
+    /// when the text has no control characters. A plugin palette `send`
+    /// passes `None`, so it takes this same branch and never a raw PTY write.
     fn arm_pending_paste(&mut self, txt: String, fallback: Option<term::PasteRisk>) {
-        let (lines, chars, reason) = if let Some(g) = term::needs_paste_guard(&txt) {
-            (g.lines, g.chars, g.risk.label().to_string())
-        } else if let Some(risk) = fallback {
-            (1, txt.chars().count(), risk.label().to_string())
-        } else {
-            self.send_paste(&txt);
-            return;
-        };
-        self.pending_paste = Some(PendingPaste {
-            text: txt,
-            lines,
-            chars,
-            reason,
-        });
-        self.request_redraw();
+        match paste_arm(txt, fallback) {
+            PasteArm::Hold(pending) => {
+                self.pending_paste = Some(pending);
+                self.request_redraw();
+            }
+            PasteArm::Send(txt) => self.send_paste(&txt),
+        }
     }
 
     fn send_paste(&mut self, txt: &str) {
@@ -4461,5 +4574,137 @@ mod palette_tests {
             format!("{extra} نتيجة · Enter تشغيل · ↑↓ تنقّل · Esc إغلاق"),
         );
         assert_eq!(render::palette_hint(0), "لا نتائج · Esc إغلاق");
+    }
+
+    #[test]
+    fn a_plugin_send_is_armed_like_a_paste() {
+        match paste_arm("whoami\r".into(), None) {
+            PasteArm::Hold(pending) => {
+                assert_eq!(pending.reason, term::PasteRisk::Enter.label());
+                assert_eq!(pending.text, "whoami\r");
+                assert!(pending.lines >= 1);
+                // Confirm still goes through normalize_paste: CR stays.
+                assert_eq!(term::normalize_paste(&pending.text, false), "whoami\r");
+            }
+            PasteArm::Send(text) => panic!("CR must be held for the paste card, got {text:?}"),
+        }
+        match paste_arm("echo \u{1b}[2J".into(), None) {
+            PasteArm::Hold(pending) => {
+                assert_eq!(pending.reason, term::PasteRisk::Control.label());
+                // The bytes a confirm writes: ESC is stripped, the rest stays.
+                assert_eq!(term::normalize_paste(&pending.text, false), "echo [2J");
+            }
+            PasteArm::Send(text) => panic!("a control must not be sent raw, got {text:?}"),
+        }
+        match paste_arm("cargo build".into(), None) {
+            PasteArm::Send(text) => {
+                assert_eq!(text, "cargo build");
+                assert_eq!(term::normalize_paste(&text, false), "cargo build");
+                assert_eq!(
+                    term::normalize_paste(&text, true),
+                    "\u{1b}[200~cargo build\u{1b}[201~"
+                );
+            }
+            PasteArm::Hold(_) => panic!("a quiet plugin send is typed, after normalize_paste"),
+        }
+        let long = "x".repeat(term::PASTE_GUARD_MAX_CHARS + 1);
+        assert!(
+            matches!(paste_arm(long, None), PasteArm::Hold(_)),
+            "over-long text is held, not written"
+        );
+        // A drop's fallback reason applies only when the guard is quiet.
+        match paste_arm("safe".into(), Some(term::PasteRisk::NotAtPrompt)) {
+            PasteArm::Hold(pending) => {
+                assert_eq!(pending.reason, term::PasteRisk::NotAtPrompt.label());
+            }
+            PasteArm::Send(_) => panic!("fallback must still hold a quiet drop"),
+        }
+        match paste_arm("safe\r".into(), Some(term::PasteRisk::NotAtPrompt)) {
+            PasteArm::Hold(pending) => {
+                assert_eq!(pending.reason, term::PasteRisk::Enter.label());
+            }
+            PasteArm::Send(_) => panic!("the paste guard wins over the drop reason"),
+        }
+    }
+
+    #[test]
+    fn plugin_rows_are_a_badged_section_after_builtins() {
+        let actions = vec![
+            plugins::PaletteAction {
+                label: "بناء".into(),
+                send: "cargo build".into(),
+            },
+            plugins::PaletteAction {
+                label: "اختبار".into(),
+                send: "cargo test".into(),
+            },
+        ];
+        let extras = vec![(
+            PaletteRow::InsertCommand("claude"),
+            "إدراج أمر كلاود — claude".into(),
+        )];
+        let rows = assemble_palette_rows("", &actions, &extras);
+        let section = rows
+            .iter()
+            .position(|(row, label)| {
+                matches!(row, PaletteRow::Section) && label == plugins::PALETTE_SECTION
+            })
+            .expect("plugin heading");
+        assert!(section > 0, "built-ins come before the plugin section");
+        assert!(matches!(rows[section - 1].0, PaletteRow::Builtin(_)));
+        assert!(matches!(rows[section + 1].0, PaletteRow::Plugin(0)));
+        assert_eq!(rows[section + 1].1, "«إضافة» بناء");
+        assert!(matches!(rows[section + 2].0, PaletteRow::Plugin(1)));
+        assert_eq!(rows[section + 2].1, "«إضافة» اختبار");
+        assert!(matches!(rows[section + 3].0, PaletteRow::InsertCommand(_)));
+        assert!(
+            rows.iter()
+                .take(section)
+                .all(|(_, label)| !label.contains('«')),
+            "built-in rows have no plugin badge"
+        );
+        // Arrows skip the heading in both directions.
+        assert_eq!(step_palette(section - 1, 1, &rows), section + 1);
+        assert_eq!(step_palette(section + 1, -1, &rows), section - 1);
+
+        let filtered = assemble_palette_rows("لصق", &actions, &extras);
+        assert!(filtered
+            .iter()
+            .any(|(row, label)| { matches!(row, PaletteRow::Builtin(_)) && label == "لصق" }));
+        assert!(filtered
+            .iter()
+            .all(|(row, _)| { !matches!(row, PaletteRow::Section | PaletteRow::Plugin(_)) }));
+
+        let one = assemble_palette_rows("بناء", &actions, &[]);
+        assert!(one
+            .iter()
+            .any(|(row, _)| matches!(row, PaletteRow::Section)));
+        let plugins_shown: Vec<_> = one
+            .iter()
+            .filter(|(row, _)| matches!(row, PaletteRow::Plugin(_)))
+            .collect();
+        assert_eq!(plugins_shown.len(), 1);
+        assert_eq!(plugins_shown[0].1, "«إضافة» بناء");
+
+        let by_badge = assemble_palette_rows("إضافة", &actions, &[]);
+        assert_eq!(
+            by_badge
+                .iter()
+                .filter(|(row, _)| matches!(row, PaletteRow::Plugin(_)))
+                .count(),
+            2
+        );
+        let by_section = assemble_palette_rows(plugins::PALETTE_SECTION, &actions, &[]);
+        assert_eq!(
+            by_section
+                .iter()
+                .filter(|(row, _)| matches!(row, PaletteRow::Plugin(_)))
+                .count(),
+            2,
+            "searching the section title lists every plugin row"
+        );
+        assert!(assemble_palette_rows("", &[], &[])
+            .iter()
+            .all(|(row, _)| !matches!(row, PaletteRow::Section)));
     }
 }
