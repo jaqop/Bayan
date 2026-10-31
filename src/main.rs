@@ -447,11 +447,27 @@ struct BlockedLink {
     confirm_uri: Option<String>,
 }
 
+/// What a confirm card is holding, which decides where Enter sends it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingKind {
+    /// A clipboard paste (or a palette insert): goes where a paste goes,
+    /// broadcast panes included.
+    Paste,
+    /// A dropped path, quoted for the focused pane's shell: that pane only
+    /// (R-01) — another pane's shell would parse the quoting differently.
+    Drop,
+    /// A plugin action's command (BAYAN-007): the focused pane only,
+    /// unbracketed, so a trailing CR still runs it.
+    Command,
+}
+
 /// Text held for the confirm card: the bytes to send, and why the card is up.
 struct PendingPaste {
-    /// A plugin action's command (BAYAN-007): on Enter it goes to the
-    /// focused pane only, unbracketed, so a trailing CR still runs it.
-    command: bool,
+    kind: PendingKind,
+    /// The pane the card was raised for (R-02). Enter sends nothing unless
+    /// that pane is still the focused one: a card must never land in a
+    /// different shell than the one it described.
+    pane: Option<u64>,
     text: String,
     lines: usize,
     chars: usize,
@@ -930,6 +946,40 @@ fn chrome_text(raw: &str) -> String {
     link::preview_with(raw, CHROME_TEXT_MAX, link::is_forbidden_in_path)
 }
 
+/// The card's note when Enter will also type into `others` broadcast panes.
+fn broadcast_note(others: usize) -> Option<String> {
+    (others > 0).then(|| format!(" — يُرسل إلى {} لوحات", others + 1))
+}
+
+/// Whether a card raised for `raised_for` may still send (R-02): only into
+/// the same pane. A card with no pane (no tab was open) sends nowhere.
+fn card_still_targets(raised_for: Option<u64>, focused: Option<u64>) -> bool {
+    raised_for.is_some() && raised_for == focused
+}
+
+/// Chars of preview per card row; the card is 62 cells wide.
+const CARD_ROW_CHARS: usize = 56;
+
+/// The card's preview rows. A paste shows one elided row, as before. A
+/// plugin command shows ALL of what Enter will type (R-03), wrapped into
+/// rows, with CR as ␍ — a plugin's 512-char cap keeps that to ≤ 10 rows.
+fn card_preview(kind: PendingKind, text: &str) -> Vec<String> {
+    if kind != PendingKind::Command {
+        return vec![term::paste_preview(text, 48)];
+    }
+    let full = term::paste_preview(text, usize::MAX);
+    let chars: Vec<char> = full.chars().collect();
+    let rows: Vec<String> = chars
+        .chunks(CARD_ROW_CHARS)
+        .map(|c| c.iter().collect())
+        .collect();
+    if rows.is_empty() {
+        vec![String::new()]
+    } else {
+        rows
+    }
+}
+
 /// The palette text for a plugin action: always badged «إضافة», so a plugin
 /// row is told apart from Bayan's own at a glance (BAYAN-007).
 fn plugin_row_label(label: &str) -> String {
@@ -938,13 +988,14 @@ fn plugin_row_label(label: &str) -> String {
 
 /// What a plugin action holds for the confirm card: its text is never typed
 /// without one (BAYAN-007).
-fn plugin_pending(label: &str, send: &str) -> PendingPaste {
+fn plugin_pending(label: &str, send: &str, pane: Option<u64>) -> PendingPaste {
     let (lines, chars) = match term::needs_paste_guard(send) {
         Some(g) => (g.lines, g.chars),
         None => (1, send.chars().count()),
     };
     PendingPaste {
-        command: true,
+        kind: PendingKind::Command,
+        pane,
         text: send.to_string(),
         lines,
         chars,
@@ -1665,7 +1716,8 @@ impl App {
             PaletteRow::RenameTab(name) => self.rename_tab(name),
             PaletteRow::InsertCommand(text) => {
                 self.pending_paste = Some(PendingPaste {
-                    command: false,
+                    kind: PendingKind::Paste,
+                    pane: self.focused_pane_id(),
                     text: text.into(),
                     lines: 1,
                     chars: text.chars().count(),
@@ -1678,7 +1730,8 @@ impl App {
                 // send_paste → normalize_paste, Esc drops it), and the card
                 // names the plugin action that asked.
                 if let Some(act) = plugins::registry().actions.get(i) {
-                    self.pending_paste = Some(plugin_pending(&act.label, &act.send));
+                    let pane = self.focused_pane_id();
+                    self.pending_paste = Some(plugin_pending(&act.label, &act.send, pane));
                 }
             }
         }
@@ -2903,6 +2956,11 @@ impl App {
         Some((row, col))
     }
 
+    /// A confirm card is up: the paste/drop/plugin card or the link card.
+    pub(crate) fn card_open(&self) -> bool {
+        self.pending_paste.is_some() || self.blocked_link.is_some()
+    }
+
     fn overlay_blocks_mouse(&self) -> bool {
         self.shortcuts.is_some()
             || self.settings.is_some()
@@ -3408,16 +3466,36 @@ impl App {
     /// is not at its prompt. The card draws whenever this is set, including
     /// when the text has no control characters.
     fn arm_pending_paste(&mut self, txt: String, fallback: Option<term::PasteRisk>) {
-        let (lines, chars, reason) = if let Some(g) = term::needs_paste_guard(&txt) {
+        self.arm_pending(PendingKind::Paste, txt, fallback);
+    }
+
+    /// `arm_pending_paste` for a dropped path (R-01): if it needs a card, the
+    /// card sends to the focused pane only; if not, it is typed there now.
+    pub(crate) fn arm_pending_drop(&mut self, txt: String, fallback: Option<term::PasteRisk>) {
+        self.arm_pending(PendingKind::Drop, txt, fallback);
+    }
+
+    fn arm_pending(&mut self, kind: PendingKind, txt: String, fallback: Option<term::PasteRisk>) {
+        let (lines, chars, mut reason) = if let Some(g) = term::needs_paste_guard(&txt) {
             (g.lines, g.chars, g.risk.label().to_string())
         } else if let Some(risk) = fallback {
             (1, txt.chars().count(), risk.label().to_string())
         } else {
-            self.send_paste(&txt);
+            match kind {
+                PendingKind::Paste => self.send_paste(&txt),
+                PendingKind::Drop | PendingKind::Command => self.send_focused(kind, &txt),
+            }
             return;
         };
+        // R-01: say so when Enter will type this into more than one pane
+        if kind == PendingKind::Paste {
+            if let Some(note) = broadcast_note(self.broadcast_targets().len()) {
+                reason.push_str(&note);
+            }
+        }
         self.pending_paste = Some(PendingPaste {
-            command: false,
+            kind,
+            pane: self.focused_pane_id(),
             text: txt,
             lines,
             chars,
@@ -3426,15 +3504,30 @@ impl App {
         self.request_redraw();
     }
 
-    /// A confirmed plugin action (BAYAN-007): typed into the FOCUSED pane
-    /// as keystrokes, not a bracketed paste, so its trailing CR runs the
-    /// command and the command capture sees the Enter — what a plugin's
-    /// `send` meant before it gained the card. The card showed the text, so
-    /// only what it showed is sent: `normalize_paste` still removes every
-    /// control but CR and Tab (no ESC sequences, no Ctrl+C), and no other
-    /// pane receives it.
-    fn send_plugin_command(&mut self, txt: &str) {
-        let body = term::normalize_paste(txt, false);
+    /// Enter on the confirm card (R-02): send it where its kind says, but
+    /// only if the pane it was raised for is still the focused one.
+    pub(crate) fn confirm_pending(&mut self) {
+        let Some(p) = self.pending_paste.take() else {
+            return;
+        };
+        if !card_still_targets(p.pane, self.focused_pane_id()) {
+            self.request_redraw();
+            return;
+        }
+        match p.kind {
+            PendingKind::Paste => self.send_paste(&p.text),
+            PendingKind::Drop | PendingKind::Command => self.send_focused(p.kind, &p.text),
+        }
+        self.request_redraw();
+    }
+
+    /// A drop or a plugin command into the FOCUSED pane only. A drop keeps
+    /// the pane's own bracketed-paste mode; a plugin command is typed
+    /// unbracketed so its CR runs it.
+    fn send_focused(&mut self, kind: PendingKind, txt: &str) {
+        let bracketed =
+            kind == PendingKind::Drop && self.term_mode().contains(TermMode::BRACKETED_PASTE);
+        let body = term::normalize_paste(txt, bracketed);
         self.last_input = Instant::now();
         if let Some(s) = self.session_mut() {
             s.write(body.as_bytes());
@@ -3777,7 +3870,7 @@ impl App {
                     );
                 }
                 if let Some(p) = &self.pending_paste {
-                    let preview = term::paste_preview(&p.text, 48);
+                    let preview = card_preview(p.kind, &p.text);
                     renderer.draw_paste_guard(
                         &mut verts,
                         px.width as usize,
@@ -4561,13 +4654,51 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn confirm_cards_send_only_into_the_pane_they_were_raised_for() {
+        // R-02
+        assert!(card_still_targets(Some(7), Some(7)));
+        assert!(!card_still_targets(Some(7), Some(8)), "tab switched");
+        assert!(!card_still_targets(Some(7), None), "pane gone");
+        assert!(!card_still_targets(None, None));
+        // R-01: the card says when a paste fans out
+        assert_eq!(broadcast_note(0), None);
+        assert_eq!(broadcast_note(2).as_deref(), Some(" — يُرسل إلى 3 لوحات"));
+    }
+
+    #[test]
+    fn a_plugin_card_shows_every_char_it_will_type() {
+        // R-03: the whole payload, CRs visible, wrapped into card rows
+        let send = format!("echo safe\r{}\rrm -rf x\r", "x".repeat(120));
+        let rows = card_preview(PendingKind::Command, &send);
+        let shown: String = rows.concat();
+        assert!(shown.contains("rm -rf x"), "{shown}");
+        assert_eq!(
+            shown.matches('\u{240D}').count(),
+            3,
+            "every CR is shown as ␍"
+        );
+        assert!(rows.iter().all(|r| r.chars().count() <= CARD_ROW_CHARS));
+        assert!(!shown.contains('…'), "nothing elided");
+        // the cap keeps it to ten rows
+        let max = "y".repeat(plugins::ACTION_SEND_MAX);
+        assert!(card_preview(PendingKind::Command, &max).len() <= 10);
+        // a paste keeps its one elided row
+        assert_eq!(card_preview(PendingKind::Paste, &max).len(), 1);
+    }
+
+    #[test]
     fn plugin_actions_always_wait_for_the_confirm_card() {
         // BAYAN-007: even a one-word payload is held, and the card names it
-        let p = plugin_pending("Build", "cargo build\r");
+        let p = plugin_pending("Build", "cargo build\r", Some(1));
         assert_eq!(p.text, "cargo build\r");
-        assert!(p.command, "sent as a command, not a bracketed paste");
+        assert_eq!(
+            p.kind,
+            PendingKind::Command,
+            "a command, not a bracketed paste"
+        );
+        assert_eq!(p.pane, Some(1));
         assert!(p.reason.contains("Build"), "{}", p.reason);
-        let p = plugin_pending("ls", "ls");
+        let p = plugin_pending("ls", "ls", Some(1));
         assert_eq!((p.lines, p.chars), (1, 2));
         // and its palette row is badged
         assert!(plugin_row_label("لصق").starts_with("إضافة — "));

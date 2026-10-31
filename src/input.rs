@@ -508,7 +508,9 @@ impl App {
             } else {
                 term::PasteRisk::NotAtPrompt
             };
-            self.arm_pending_paste(arg, Some(why));
+            // R-01: quoted for THIS pane's shell, so it goes to this pane
+            // only, even with broadcast on
+            self.arm_pending_drop(arg, Some(why));
         } else if let Some(s) = self.session_mut() {
             let body = term::normalize_paste(&arg, mode.contains(TermMode::BRACKETED_PASTE));
             s.write(body.as_bytes());
@@ -569,7 +571,9 @@ impl App {
                 Press::Report(b) => {
                     // middle-click on a tab closes it (browser convention);
                     // otherwise report to the program when it asked
-                    if b == mouse::Btn::Middle {
+                    // R-02: not while a confirm card is up — closing a tab
+                    // under it would hand the card to another pane
+                    if b == mouse::Btn::Middle && !self.card_open() {
                         if let Some(i) = self.tab_at(self.cursor_pos) {
                             self.request_close_tab(i, el);
                             return;
@@ -678,6 +682,7 @@ impl App {
             LeftPress::Divider(i) => self.drag_divider = Some(i),
             LeftPress::Tab(i) => self.switch_tab(i),
             LeftPress::CloseTab(i) => self.request_close_tab(i, el),
+            LeftPress::Blocked => {}
             LeftPress::DragStrip => {
                 // the two gestures a real title bar owes the user
                 if let Some(w) = self.window.as_ref() {

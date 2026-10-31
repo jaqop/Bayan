@@ -701,20 +701,6 @@ pub const TAB_CELLS: f32 = 24.0;
 /// A tab never shrinks below this: "sh" must still be a clickable target.
 pub const TAB_MIN_CELLS: f32 = 9.0;
 
-/// How many title characters a tab of `tw` pixels draws, after `reserve`
-/// cells for the padding, the status dot and the close control.
-///
-/// `tab_width` sizes a tab as `(title + 6) * cell_w` and then truncates to
-/// whole pixels, so `tw / cell_w` comes out a hair under the cell count it
-/// was built from (10.98, not 11). Flooring that dropped the last letter of
-/// every title that fit exactly: "Bayan" drew as "Baya". Round instead.
-fn tab_title_chars(tw: i32, cell_w: f32, reserve: usize) -> usize {
-    if cell_w <= 0.0 {
-        return 0;
-    }
-    ((tw.max(0) as f32 / cell_w).round() as usize).saturating_sub(reserve)
-}
-
 /// A rect in frame pixels: (x, y, w, h).
 pub type Rect = (i32, i32, i32, i32);
 
@@ -1349,7 +1335,9 @@ pub struct PasteCard<'a> {
     pub lines: usize,
     pub chars: usize,
     pub reason: &'a str,
-    pub preview: &'a str,
+    /// One row per entry. A paste shows one elided row; a plugin command
+    /// shows its whole payload, wrapped (R-03).
+    pub preview: &'a [String],
 }
 
 /// Hint under the command palette. The number is the filtered list the
@@ -1663,7 +1651,10 @@ impl Renderer {
     /// in chars rather than measured, because the tab bar is grid-aligned and
     /// measuring here would cost a shape on every frame.
     pub fn tab_width(&self, title: &str) -> i32 {
-        let cells = (title.chars().count() as f32 + 6.0).clamp(TAB_MIN_CELLS, TAB_CELLS);
+        // +7: 12px before the title, the close control and the status dot
+        // after it, and the gap between tabs — with room to spare at any
+        // DPI, so a title the tab was sized for is never cut
+        let cells = (title.chars().count() as f32 + 7.0).clamp(TAB_MIN_CELLS, TAB_CELLS);
         (self.ui_cell_w() * cells) as i32
     }
 
@@ -4348,9 +4339,10 @@ impl Renderer {
         push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 165));
         let w = ((self.cell_w * 62.0) as i32).min(fw as i32 - 80);
         let pad = 18;
-        let h = (self.cell_h * 4.0) as i32 + pad * 2 + 10;
+        let rows = card.preview.len().max(1);
+        let h = (self.cell_h * (3 + rows) as f32) as i32 + pad * 2 + 10;
         let x = (fw as i32 - w) / 2;
-        let y = self.tab_bar_h() as i32 + (fh as i32 - h) / 3;
+        let y = self.tab_bar_h() as i32 + ((fh as i32 - h) / 3).max(0);
         // a ring of background around the card separates it from the text
         push_rect(
             out,
@@ -4384,16 +4376,18 @@ impl Renderer {
             y + pad + self.cell_h as i32,
             1.0,
         );
-        let shown = [Seg::plain(card.preview, (0xc5, 0xcd, 0xd6))];
-        self.draw_run(
-            &shown,
-            true,
-            out,
-            whole,
-            (x + pad) as f32,
-            y + pad + (self.cell_h * 2.0) as i32,
-            1.0,
-        );
+        for (i, line) in card.preview.iter().enumerate() {
+            let shown = [Seg::plain(line.clone(), (0xc5, 0xcd, 0xd6))];
+            self.draw_run(
+                &shown,
+                true,
+                out,
+                whole,
+                (x + pad) as f32,
+                y + pad + (self.cell_h * (2 + i) as f32) as i32,
+                1.0,
+            );
+        }
         let keys = [Seg::plain(
             "Enter تأكيد   ·   Esc إلغاء",
             (0x9a, 0xa4, 0xb2),
@@ -4404,7 +4398,7 @@ impl Renderer {
             out,
             whole,
             (x + pad) as f32,
-            y + pad + (self.cell_h * 3.0) as i32 + 6,
+            y + pad + (self.cell_h * (2 + rows) as f32) as i32 + 6,
             1.0,
         );
     }
@@ -4516,10 +4510,21 @@ impl Renderer {
             }
             let close_w = self.tab_close_size();
             let has_close = tabw >= close_w + 20;
-            // leave room for the close control (and the status dot left of it)
-            let reserve = if has_close { 6 } else { 4 };
-            let max_chars = tab_title_chars(tw, self.cell_w, reserve);
-            let title: String = tab.title.chars().take(max_chars).collect();
+            // The title gets the pixels between its start and the status
+            // dot / close control, and is fitted by MEASURING the shaped
+            // text. Counting cells (tw / cell_w minus a reserve) dropped the
+            // last letter on real fonts — "Bayan" → "Baya", "Desktop" →
+            // "Deskto" — because the tab's width and the glyphs' advances
+            // came from different numbers.
+            let has_dot = (tab.attention || tab.busy) && tw >= 28;
+            let dot_room = if has_dot { 14 } else { 4 };
+            let right = if has_close {
+                tx + tabw - close_w - 4 - dot_room
+            } else {
+                tx + tabw - 4 - dot_room
+            };
+            let avail = (right - (tx + 12)) as f32;
+            let title = self.fit_title(&tab.title, fg, avail);
             let segs = [Seg::plain(title, fg)];
             self.draw_run(
                 &segs,
@@ -4697,6 +4702,22 @@ impl Renderer {
         self.tab_controls(width).iter().position(|&(x, y, w, h)| {
             px >= x as f64 && px < (x + w) as f64 && py >= y as f64 && py < (y + h) as f64
         })
+    }
+
+    /// The longest prefix of `title` (with "…" when cut) whose shaped width
+    /// fits `avail` pixels. Measured, not counted, so it holds for any font.
+    fn fit_title(&mut self, title: &str, fg: (u8, u8, u8), avail: f32) -> String {
+        if self.measure(&[Seg::plain(title, fg)], true) <= avail {
+            return title.to_string();
+        }
+        let chars: Vec<char> = title.chars().collect();
+        for k in (1..chars.len()).rev() {
+            let cut: String = chars[..k].iter().chain(std::iter::once(&'…')).collect();
+            if self.measure(&[Seg::plain(cut.clone(), fg)], true) <= avail {
+                return cut;
+            }
+        }
+        String::new()
     }
 
     /// Pixel size of the \u{00d7}-style close control on a tab.
@@ -5633,21 +5654,28 @@ mod cache_tests {
 
     #[test]
     fn a_tab_sized_for_its_title_draws_all_of_it() {
-        // "Bayan" lost its "n": the width is truncated to whole pixels, and
-        // flooring tw / cell_w then came out one cell short
-        let r = test_renderer();
-        for title in ["Bayan", "sh", "Desktop", "Admin", "projects-2026"] {
-            let tw = r.tab_width(title);
-            assert!(
-                tab_title_chars(tw, r.ui_cell_w(), 6) >= title.chars().count(),
-                "{title:?} would be cut in a {tw}px tab"
-            );
+        // "Bayan" drew as "Baya" and "Desktop" as "Deskto": the title is now
+        // fitted by its measured width, so a tab sized for it shows all of it
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            let mut r = Renderer::new(scale, &crate::config::UserConfig::default(), 0.0);
+            r.use_ui_metrics(true);
+            for title in ["Bayan", "sh", "Desktop", "Admin", "projects-2026", "مشروع"] {
+                let tw = r.tab_width(title);
+                let tabw = tw - 10;
+                let close_w = r.tab_close_size();
+                let avail = (tabw - close_w - 4 - 14 - 12) as f32;
+                assert_eq!(
+                    r.fit_title(title, (255, 255, 255), avail),
+                    title,
+                    "{title:?} cut at scale {scale} in a {tw}px tab"
+                );
+            }
+            // a title longer than its tab is cut with an ellipsis that fits
+            let long = "a-very-long-directory-name-that-cannot-fit";
+            let fitted = r.fit_title(long, (255, 255, 255), 120.0);
+            assert!(fitted.ends_with('…') && fitted.chars().count() < long.chars().count());
+            assert!(r.measure(&[Seg::plain(fitted, (255, 255, 255))], true) <= 120.0);
         }
-        for cw in [7.3_f32, 8.4, 9.6, 10.8, 12.15] {
-            let tw = (cw * 11.0) as i32;
-            assert_eq!(tab_title_chars(tw, cw, 6), 5, "cell {cw}");
-        }
-        assert_eq!(tab_title_chars(100, 0.0, 6), 0);
     }
 
     #[test]

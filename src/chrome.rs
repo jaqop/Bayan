@@ -157,6 +157,8 @@ pub(crate) struct Hits {
     /// The × on a tab: closing that tab, not switching to it.
     pub tab_close: Option<usize>,
     pub drag_strip: bool,
+    /// A confirm card (paste, drop, plugin, link) is up.
+    pub card_open: bool,
 }
 
 /// Who owns a left press, before the terminal gets a say.
@@ -182,6 +184,9 @@ pub(crate) enum LeftPress {
     CloseTab(usize),
     /// Empty title strip: double-click maximises, drag moves.
     DragStrip,
+    /// Tab-bar chrome under a confirm card: swallowed (R-02). Switching or
+    /// closing a tab would hand the card to a pane it was not raised for.
+    Blocked,
     /// Nothing chrome-side. Link, program or local selection decide next.
     Terminal,
 }
@@ -204,6 +209,15 @@ pub(crate) fn left_press(h: &Hits) -> LeftPress {
     }
     if h.settings_open {
         return LeftPress::Settings;
+    }
+    if h.card_open
+        && (h.tab_control.is_some()
+            || h.gear
+            || h.divider.is_some()
+            || h.tab.is_some()
+            || h.tab_close.is_some())
+    {
+        return LeftPress::Blocked;
     }
     if let Some(control) = h.tab_control {
         return LeftPress::TabControl(control);
@@ -340,6 +354,7 @@ impl App {
             tab: self.tab_at(pos),
             tab_close: self.tab_close_at(pos),
             drag_strip: self.in_drag_strip(pos),
+            card_open: self.card_open(),
         }
     }
 }
@@ -348,6 +363,60 @@ impl App {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn a_confirm_card_swallows_tab_bar_clicks() {
+        // R-02: no tab switch, ×, arrows, gear or divider under a card
+        let card = Hits {
+            card_open: true,
+            ..Hits::default()
+        };
+        for h in [
+            Hits {
+                tab: Some(1),
+                ..card
+            },
+            Hits {
+                tab_close: Some(1),
+                tab: Some(1),
+                ..card
+            },
+            Hits {
+                tab_control: Some(2),
+                ..card
+            },
+            Hits { gear: true, ..card },
+            Hits {
+                divider: Some(0),
+                ..card
+            },
+        ] {
+            assert_eq!(left_press(&h), LeftPress::Blocked, "{h:?}");
+        }
+        // moving or resizing the window, and the window caption, still work
+        assert_eq!(
+            left_press(&Hits {
+                drag_strip: true,
+                ..card
+            }),
+            LeftPress::DragStrip
+        );
+        assert_eq!(
+            left_press(&Hits {
+                caption: Some(2),
+                ..card
+            }),
+            LeftPress::Caption(Caption::from_index(2))
+        );
+        // and without a card the tab is just a tab
+        assert_eq!(
+            left_press(&Hits {
+                tab: Some(1),
+                ..Hits::default()
+            }),
+            LeftPress::Tab(1)
+        );
+    }
 
     #[test]
     fn edges_and_corners_resolve_and_a_maximized_window_has_none() {

@@ -248,15 +248,7 @@ impl App {
             }
             KeyOwner::PasteGuard => {
                 match enter_or_escape(&event.logical_key) {
-                    Some(true) => {
-                        if let Some(pending) = self.pending_paste.take() {
-                            if pending.command {
-                                self.send_plugin_command(&pending.text);
-                            } else {
-                                self.send_paste(&pending.text);
-                            }
-                        }
-                    }
+                    Some(true) => self.confirm_pending(),
                     Some(false) => self.pending_paste = None,
                     None => {}
                 }

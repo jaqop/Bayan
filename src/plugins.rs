@@ -156,8 +156,10 @@ fn parse_theme(v: &serde_json::Value) -> Result<PluginTheme, String> {
 
 /// Longest label a plugin action may carry, in chars.
 pub const ACTION_LABEL_MAX: usize = 80;
-/// Longest text a plugin action may send, in chars.
-pub const ACTION_SEND_MAX: usize = 4096;
+/// Longest text a plugin action may send, in chars. The confirm card shows
+/// all of it (R-03), so the cap is what fits there: 512 chars is at most
+/// ten card rows.
+pub const ACTION_SEND_MAX: usize = 512;
 
 /// BAYAN-007: a plugin action is shown in the palette and its `send` text
 /// goes to the shell, so the file is checked before it is trusted with
