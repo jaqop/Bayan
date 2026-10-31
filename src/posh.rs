@@ -124,11 +124,23 @@ fn current_from(txt: &str) -> Option<String> {
 }
 
 /// Byte offset of the `--config` argument, and the text starting there.
+/// A line whose first non-whitespace character is `#` is a comment, same as
+/// `parse_posh_config`, so a commented-out copy of the marker is not rewritten.
 fn managed_arg(txt: &str) -> Option<(usize, &str)> {
-    let i = txt.find(MANAGED_CONFIG)?;
-    let rest = &txt[i + MANAGED_CONFIG.len()..];
-    let at = i + MANAGED_CONFIG.len() + leading_ws(rest);
-    Some((at, &txt[at..]))
+    let mut offset = 0;
+    for line in txt.split_inclusive('\n') {
+        if line.trim().starts_with('#') {
+            offset += line.len();
+            continue;
+        }
+        if let Some(rel) = line.find(MANAGED_CONFIG) {
+            let rest = &line[rel + MANAGED_CONFIG.len()..];
+            let at = offset + rel + MANAGED_CONFIG.len() + leading_ws(rest);
+            return Some((at, &txt[at..]));
+        }
+        offset += line.len();
+    }
+    None
 }
 
 fn leading_ws(s: &str) -> usize {
@@ -140,8 +152,7 @@ fn leading_ws(s: &str) -> usize {
 /// The path is the logical text, with `$env:USERPROFILE` still unexpanded.
 /// The `usize` is how many bytes of `s` the argument occupied.
 pub(crate) fn parse_config_argument(s: &str) -> Option<(String, usize)> {
-    if s.starts_with('"') {
-        let rest = &s[1..];
+    if let Some(rest) = s.strip_prefix('"') {
         let end = rest.find('"')?;
         Some((rest[..end].to_string(), end + 2))
     } else if s.starts_with('\'') {
@@ -277,6 +288,17 @@ fn rewrite_config(txt: &str, theme: &str) -> Option<String> {
     Some(out)
 }
 
+/// Why `rewrite_config` returned None. A line with no quotes is not the same
+/// failure as a profile that has no managed line at all.
+fn profile_rewrite_error(txt: &str) -> &'static str {
+    match managed_arg(txt) {
+        Some((_, arg)) if parse_config_argument(arg).is_none() => {
+            "managed oh-my-posh line has no quoted config path"
+        }
+        _ => "no managed oh-my-posh line in the profile",
+    }
+}
+
 /// Point `$PROFILE`'s managed line at `theme`. New shells pick it up.
 pub fn set_theme(theme: &str) -> Result<(), String> {
     if !theme_stem_allowed(theme) {
@@ -284,7 +306,7 @@ pub fn set_theme(theme: &str) -> Result<(), String> {
     }
     let p = profile_path();
     let txt = std::fs::read_to_string(&p).map_err(|e| format!("read profile: {e}"))?;
-    let new = rewrite_config(&txt, theme).ok_or("no managed oh-my-posh line in the profile")?;
+    let new = rewrite_config(&txt, theme).ok_or_else(|| profile_rewrite_error(&txt).to_string())?;
     std::fs::write(&p, new).map_err(|e| format!("write profile: {e}"))
 }
 
@@ -419,6 +441,38 @@ mod tests {
     #[test]
     fn a_profile_without_the_managed_line_is_refused_not_mangled() {
         assert!(rewrite_config("# nothing here\n", "kali").is_none());
+        assert_eq!(
+            profile_rewrite_error("# nothing here\n"),
+            "no managed oh-my-posh line in the profile"
+        );
+    }
+
+    #[test]
+    fn a_commented_marker_is_skipped_and_an_unquoted_path_says_so() {
+        let src = concat!(
+            "# oh-my-posh init pwsh --config \"C:/themes/ignored.omp.json\"\n",
+            "oh-my-posh init pwsh --config \"C:/themes/pure.omp.json\" | Invoke-Expression\n",
+        );
+        assert_eq!(current_from(src).as_deref(), Some("pure"));
+        let out = rewrite_config(src, "kali").unwrap();
+        let comment = out.lines().next().unwrap();
+        assert!(comment.starts_with("# "), "{comment}");
+        assert!(comment.contains("ignored.omp.json"), "{comment}");
+        assert!(out.contains("--config 'C:/themes/kali.omp.json'"), "{out}");
+        // a comment is the only marker: there is no managed line to update
+        let only = "# oh-my-posh init pwsh --config \"C:/themes/ignored.omp.json\"\n";
+        assert!(rewrite_config(only, "kali").is_none());
+        assert_eq!(
+            profile_rewrite_error(only),
+            "no managed oh-my-posh line in the profile"
+        );
+        // the line is there, but the path is not quoted, so the error says that
+        let bare = "oh-my-posh init pwsh --config C:/themes/pure.omp.json | iex\n";
+        assert!(rewrite_config(bare, "kali").is_none());
+        assert_eq!(
+            profile_rewrite_error(bare),
+            "managed oh-my-posh line has no quoted config path"
+        );
     }
 
     #[test]
