@@ -441,10 +441,11 @@ fn paste_arm(txt: String, fallback: Option<term::PasteRisk>) -> PasteArm {
             reason: g.risk.label().to_string(),
         })
     } else if let Some(risk) = fallback {
+        let chars = txt.chars().count();
         PasteArm::Hold(PendingPaste {
             text: txt,
             lines: 1,
-            chars: txt.chars().count(),
+            chars,
             reason: risk.label().to_string(),
         })
     } else {
