@@ -966,6 +966,19 @@ fn card_preview(kind: PendingKind, text: &str) -> Vec<String> {
     }
 }
 
+/// The shortcut shown beside a palette or menu row: the live chord of a
+/// built-in action, nothing for anything else.
+fn row_shortcut(keymap: &[(keybinds::Action, keybinds::Chord)], row: &PaletteRow) -> String {
+    match row {
+        PaletteRow::Builtin(a) => keymap
+            .iter()
+            .find(|(act, _)| act == a)
+            .map(|(_, c)| c.display())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 /// The palette text for a plugin action: always badged «إضافة», so a plugin
 /// row is told apart from Bayan's own at a glance (BAYAN-007).
 fn plugin_row_label(label: &str) -> String {
@@ -1044,7 +1057,7 @@ struct Palette {
 
 /// A frame's snapshot of the palette: (query, row labels, selected row,
 /// the right-click anchor when it is the menu).
-type PaletteView = (String, Vec<String>, usize, Option<(f64, f64)>);
+type PaletteView = (String, Vec<render::MenuRow>, usize, Option<(f64, f64)>);
 
 /// A frame's snapshot of the picker: (names, previews, selected row).
 type PoshView = (Vec<String>, Vec<Option<Vec<u8>>>, usize);
@@ -3692,10 +3705,15 @@ impl App {
             .map(|p| (p.names.clone(), p.previews.clone(), p.sel));
         // computed before the renderer is borrowed, like close_msg above
         let palette_view: Option<PaletteView> = self.palette.as_ref().map(|p| {
-            let rows: Vec<String> = self
+            // every built-in row shows its live shortcut, so the menu and the
+            // palette teach the keys (a rebinding shows up here too)
+            let rows: Vec<render::MenuRow> = self
                 .palette_rows(&p.query)
                 .into_iter()
-                .map(|(_, l)| l)
+                .map(|(row, label)| render::MenuRow {
+                    hint: row_shortcut(&self.keymap, &row),
+                    label,
+                })
                 .collect();
             let sel = p.sel.min(rows.len().saturating_sub(1));
             (p.query.clone(), rows, sel, p.menu)
@@ -4966,6 +4984,29 @@ mod tests {
         assert!(
             !super::osc52_pane_is_focused(&past_end, 0, 1),
             "focused index past the end"
+        );
+    }
+
+    #[test]
+    fn menu_rows_show_their_live_shortcut() {
+        let cfg = config::UserConfig::default();
+        let map = keybinds::effective_map(&cfg);
+        let split = row_shortcut(&map, &PaletteRow::Builtin(keybinds::Action::SplitH));
+        assert_eq!(split, keybinds::Action::SplitH.default_chord().display());
+        assert!(split.contains("Ctrl"), "{split}");
+        // rows that are not actions have no shortcut
+        assert_eq!(row_shortcut(&map, &PaletteRow::CopyText("x".into())), "");
+        // a rebinding shows up in the menu
+        let mut binds = std::collections::HashMap::new();
+        binds.insert("split-h".to_string(), "ctrl+alt+h".to_string());
+        let cfg = config::UserConfig {
+            keybinds: Some(binds),
+            ..Default::default()
+        };
+        let map = keybinds::effective_map(&cfg);
+        assert_eq!(
+            row_shortcut(&map, &PaletteRow::Builtin(keybinds::Action::SplitH)),
+            keybinds::Chord::parse("ctrl+alt+h").unwrap().display()
         );
     }
 

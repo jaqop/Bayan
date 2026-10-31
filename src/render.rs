@@ -1369,6 +1369,13 @@ pub struct Renderer {
 
 /// Copy for the paste-confirm card. Grouped so `draw_paste_guard` stays
 /// under clippy's argument limit.
+/// One row of the palette or the right-click menu: what it does, and the
+/// shortcut that does the same (empty when there is none).
+pub struct MenuRow {
+    pub label: String,
+    pub hint: String,
+}
+
 pub struct PasteCard<'a> {
     pub lines: usize,
     pub chars: usize,
@@ -3699,7 +3706,8 @@ impl Renderer {
         let dpi = self.dpi_scale;
         let pad = (6.0 * dpi).round() as i32;
         let row_h = (self.ui_cell_h() + 14.0 * dpi).round() as i32;
-        let width = ((self.ui_cell_w() * 26.0).round() as i32)
+        // wide enough for a label and its shortcut side by side
+        let width = ((self.ui_cell_w() * 36.0).round() as i32)
             .max((220.0 * dpi) as i32)
             .min((fw as i32 - 8).max(0));
         let fit = ((fh as i32 - pad * 2 - 8).max(0) / row_h.max(1)) as usize;
@@ -3724,6 +3732,49 @@ impl Renderer {
         }
     }
 
+    /// Pixel width a row's shortcut takes, gap included (0 for none).
+    fn hint_width(&mut self, hint: &str) -> i32 {
+        if hint.is_empty() {
+            return 0;
+        }
+        let seg = [Seg::plain(hint, (0, 0, 0))];
+        self.measure(&seg, true).ceil() as i32 + (16.0 * self.dpi_scale) as i32
+    }
+
+    /// Draw a row's shortcut ("Ctrl+Shift+E") at `x`, muted; returns the
+    /// width it took including the gap before the label.
+    fn draw_row_hint(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        hint: &str,
+        rect: Rect,
+        x: i32,
+        picked: bool,
+    ) -> i32 {
+        if hint.is_empty() {
+            return 0;
+        }
+        let w = self.hint_width(hint);
+        let seg = [Seg::plain(
+            hint,
+            if picked {
+                (0xa8, 0xb8, 0xc8)
+            } else {
+                (0x76, 0x82, 0x90)
+            },
+        )];
+        self.draw_run(
+            &seg,
+            true,
+            out,
+            rect,
+            x as f32,
+            rect.1 + (rect.3 - self.cell_h as i32) / 2,
+            1.0,
+        );
+        w
+    }
+
     /// The right-click menu. No backdrop: the terminal stays readable around
     /// it, as under any native popup. Labels are right-aligned (the UI is
     /// Arabic); a typed filter shows as an accent line under the card.
@@ -3733,7 +3784,7 @@ impl Renderer {
         out: &mut Vec<Vertex>,
         fw: usize,
         fh: usize,
-        rows: &[String],
+        rows: &[MenuRow],
         sel: usize,
         anchor: (f64, f64),
         query: &str,
@@ -3773,7 +3824,11 @@ impl Renderer {
                 );
                 push_rect(out, layout.card, rx + rw - 3, ry, 3, rh, c4(accent, 255));
             }
-            let label = self.guard_label(&rows[idx], (rw - inset * 2).max(0) as f32);
+            // the shortcut sits at the far (left) end, muted, in reading
+            // order; the label keeps the rest of the row
+            let hint_w = self.draw_row_hint(out, &rows[idx].hint, rect, rx + inset, picked);
+            let room = (rw - inset * 2 - hint_w).max(0) as f32;
+            let label = self.guard_label(&rows[idx].label, room);
             let seg = [Seg {
                 text: label,
                 fg: if picked {
@@ -3810,7 +3865,7 @@ impl Renderer {
         fw: usize,
         fh: usize,
         query: &str,
-        rows: &[String],
+        rows: &[MenuRow],
         sel: usize,
     ) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
@@ -3914,7 +3969,17 @@ impl Renderer {
                 );
                 push_rect(out, layout.card, rx, ry + 1, 3, rh - 2, c4(accent, 255));
             }
-            let text = self.guard_label(&rows[idx], (rw - inset * 2).max(0) as f32);
+            // the palette lists left to right: its shortcut goes at the right
+            let gap = (16.0 * self.dpi_scale) as i32;
+            let hw = self.hint_width(&rows[idx].hint);
+            let hint_w = self.draw_row_hint(
+                out,
+                &rows[idx].hint,
+                rect,
+                rx + rw - inset - hw + gap,
+                picked,
+            );
+            let text = self.guard_label(&rows[idx].label, (rw - inset * 2 - hint_w).max(0) as f32);
             self.draw_run(
                 &[Seg {
                     text,
