@@ -2746,9 +2746,11 @@ impl Renderer {
         }
     }
 
-    /// Debug (BAYAN_ATLAS_STRESS): draw a big grid of large distinct glyphs
-    /// to force the atlas past one page, then a line of ASCII whose glyphs
-    /// were rasterized into page 0 first — if paging is correct both render.
+    /// Debug (`BAYAN_ATLAS_STRESS`, debug builds only): draw a big grid of
+    /// large distinct glyphs to force the atlas past one page, then a line
+    /// of ASCII whose glyphs were rasterized into page 0 first — if paging
+    /// is correct both render.
+    #[cfg(debug_assertions)]
     pub fn stress_atlas(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
         let mut y = self.tab_bar_h() as i32 + 4;

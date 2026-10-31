@@ -164,7 +164,9 @@ already happened once and nearly buried a real fix as a no-op.
 Being a GUI app, most behavior isn't unit-testable. The established loop is
 build → launch → screenshot → inspect → kill. Every debug hook below exists so
 a feature can be reached **without injecting keyboard input** — honour that
-principle when adding new ones:
+principle when adding new ones. They are `#[cfg(debug_assertions)]` only
+(BAYAN-010): a release binary does not read `BAYAN_*`. `BAYAN_PROFILE` records
+key kind, logical key, and physical key, and never `KeyEvent::text`.
 
 | Env var | Effect |
 |---|---|
@@ -181,7 +183,7 @@ principle when adding new ones:
 | `BAYAN_POSH=1` | open the oh-my-posh prompt picker at startup |
 | `BAYAN_TOAST=<title\|1>` | fire a sample toast at startup (M19 A/B loops without rebuilding) |
 | `BAYAN_ATLAS_STRESS=1` | shape a large spread of unique glyphs to force page-1 atlas growth |
-| `BAYAN_PROFILE=1` | startup timeline marks to `%TEMP%\bayan_profile.log` (EasyTer's `EASYTER_PROFILE` pattern), zero cost when unset |
+| `BAYAN_PROFILE=1` | debug builds only: startup timeline marks to `%TEMP%\bayan_profile.log` (EasyTer's `EASYTER_PROFILE` pattern). The key line is kind / logical / physical — never `KeyEvent::text`. Unset, or any release build, writes nothing |
 
 Start with `Start-Process -PassThru`, sleep ~6s for GPU init, capture the
 screen with `System.Drawing`, then `Stop-Process` the pid. Pre-approved

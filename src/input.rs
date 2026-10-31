@@ -562,9 +562,11 @@ impl App {
         }
     }
 
-    /// BAYAN_PASTE: put `text` on the clipboard and right-click the centre
-    /// of the focused pane, through the same `right_press` a real click
-    /// takes. A pane whose program tracks the mouse hears the click instead.
+    /// `BAYAN_PASTE` (debug builds only): put `text` on the clipboard and
+    /// right-click the centre of the focused pane, through the same
+    /// `right_press` a real click takes. A pane whose program tracks the
+    /// mouse hears the click instead.
+    #[cfg(debug_assertions)]
     pub(crate) fn debug_right_click_paste(&mut self, text: String) {
         let Some(focused) = self.tabs.get(self.active).map(|t| t.focused) else {
             return;

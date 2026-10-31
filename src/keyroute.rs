@@ -152,6 +152,25 @@ pub(crate) fn page_direction(key: &Key) -> Option<i32> {
     }
 }
 
+/// Profiler line for one key press. Kind, logical key, and physical key
+/// only. `KeyEvent::text` — the characters the key would insert — is not
+/// an argument, so `BAYAN_PROFILE` cannot record it.
+#[cfg(any(debug_assertions, test))]
+pub(crate) fn profile_key_label(
+    logical: &Key,
+    physical: &PhysicalKey,
+    ctrl: bool,
+    shift: bool,
+) -> String {
+    let kind = match logical {
+        Key::Named(_) => "named",
+        Key::Character(_) => "character",
+        Key::Unidentified(_) => "unidentified",
+        Key::Dead(_) => "dead",
+    };
+    format!("key kind={kind} logical={logical:?} physical={physical:?} ctrl={ctrl} shift={shift}")
+}
+
 impl App {
     /// `WindowEvent::KeyboardInput`.
     pub(crate) fn key_input(&mut self, event: &KeyEvent, el: &ActiveEventLoop) {
@@ -182,9 +201,12 @@ impl App {
         self.note_held_away(event);
         let m = self.modifiers;
         let (ctrl, shift, alt) = (m.control_key(), m.shift_key(), m.alt_key());
-        crate::prof::mark(&format!(
-            "key logical={:?} physical={:?} text={:?} ctrl={ctrl} shift={shift}",
-            event.logical_key, event.physical_key, event.text
+        // Kind, logical, and physical only — not the characters the key inserts.
+        crate::prof_mark!(&profile_key_label(
+            &event.logical_key,
+            &event.physical_key,
+            ctrl,
+            shift,
         ));
         if let Some(owner) = key_owner(&self.open_overlays()) {
             self.overlay_key(owner, event, shift, el);
@@ -545,5 +567,63 @@ mod tests {
         assert_eq!(page_direction(&Key::Named(NamedKey::PageUp)), Some(1));
         assert_eq!(page_direction(&Key::Named(NamedKey::PageDown)), Some(-1));
         assert_eq!(page_direction(&Key::Named(NamedKey::End)), None);
+    }
+
+    #[test]
+    fn profile_key_label_records_kind_logical_and_physical_without_inserted_text() {
+        let inserted = "hunter2";
+        let label = profile_key_label(
+            &Key::Character(SmolStr::new("a")),
+            &PhysicalKey::Code(KeyCode::KeyA),
+            false,
+            false,
+        );
+        assert!(label.contains("kind=character"), "{label}");
+        assert!(label.contains("logical="), "{label}");
+        assert!(label.contains("physical="), "{label}");
+        assert!(label.contains("ctrl=false"), "{label}");
+        assert!(label.contains("shift=false"), "{label}");
+        assert!(!label.contains("text="), "{label}");
+        assert!(!label.contains(inserted), "{label}");
+
+        let named = profile_key_label(
+            &Key::Named(NamedKey::Enter),
+            &PhysicalKey::Code(KeyCode::Enter),
+            true,
+            false,
+        );
+        assert!(named.contains("kind=named"), "{named}");
+        assert!(named.contains("ctrl=true"), "{named}");
+        assert!(!named.contains("text="), "{named}");
+        assert!(!named.contains(inserted), "{named}");
+
+        let dead = profile_key_label(
+            &Key::Dead(None),
+            &PhysicalKey::Code(KeyCode::KeyA),
+            false,
+            true,
+        );
+        assert!(dead.contains("kind=dead"), "{dead}");
+        assert!(dead.contains("shift=true"), "{dead}");
+        assert!(!dead.contains("text="), "{dead}");
+    }
+
+    /// The press handler's profiler call must not grow a `text` argument
+    /// again. Startup hooks that open a window or write a PTY are not
+    /// covered here — this file has no window.
+    #[test]
+    fn key_pressed_profiler_does_not_pass_event_text() {
+        let src = include_str!("keyroute.rs");
+        let start = src.find("fn key_pressed").expect("key_pressed");
+        let end = src.find("fn key_released").expect("key_released");
+        let body = &src[start..end];
+        assert!(
+            !body.contains("event.text"),
+            "profiler must not record KeyEvent::text"
+        );
+        assert!(
+            body.contains("profile_key_label"),
+            "key press must mark through profile_key_label"
+        );
     }
 }

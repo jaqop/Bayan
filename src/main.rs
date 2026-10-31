@@ -310,25 +310,36 @@ fn step_point(p: Point, cols: usize, top: i32, bottom: i32, dir: Direction) -> P
     }
 }
 
-/// Startup timeline profiling (EasyTer's `EASYTER_PROFILE` pattern): set
-/// BAYAN_PROFILE=1 and marks land in %TEMP%\bayan_profile.log. Zero cost
-/// when unset; a file because release builds have no console.
+/// Startup timeline (EasyTer's `EASYTER_PROFILE` pattern).
+///
+/// The writer is `debug_assertions` only. `BAYAN_PROFILE=1` appends marks to
+/// `%TEMP%\bayan_profile.log`. Release builds do not read that variable:
+/// `init` is empty and `prof_mark!` expands to nothing, so key text is
+/// never formatted into the binary's profiler.
+#[cfg(debug_assertions)]
 mod prof {
     use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::OnceLock;
     use std::time::Instant;
 
     static T0: OnceLock<Instant> = OnceLock::new();
+    static ON: AtomicBool = AtomicBool::new(false);
 
     pub fn init() {
         T0.get_or_init(Instant::now);
         if std::env::var_os("BAYAN_PROFILE").is_some() {
+            ON.store(true, Ordering::Relaxed);
             let _ = std::fs::write(std::env::temp_dir().join("bayan_profile.log"), "");
         }
     }
 
+    pub fn enabled() -> bool {
+        ON.load(Ordering::Relaxed)
+    }
+
     pub fn mark(label: &str) {
-        if std::env::var_os("BAYAN_PROFILE").is_none() {
+        if !enabled() {
             return;
         }
         let t0 = *T0.get_or_init(Instant::now);
@@ -345,6 +356,25 @@ mod prof {
             let _ = f.write_all(line.as_bytes());
         }
     }
+}
+
+/// Release builds keep the `prof::init` call in `main` and do nothing with it.
+#[cfg(not(debug_assertions))]
+mod prof {
+    #[inline]
+    pub fn init() {}
+}
+
+/// One profiler mark. The argument is evaluated only in a debug build when
+/// `BAYAN_PROFILE` is set. Release builds drop the call before type-checking.
+#[macro_export]
+macro_rules! prof_mark {
+    ($label:expr) => {
+        #[cfg(debug_assertions)]
+        if $crate::prof::enabled() {
+            $crate::prof::mark($label);
+        }
+    };
 }
 
 use std::sync::Arc;
@@ -857,8 +887,9 @@ struct App {
     /// before the key comes up, and a chord can open a panel, so this is
     /// recorded at press time rather than re-derived when the key is released.
     keys_held_away: Vec<winit::keyboard::PhysicalKey>,
-    /// BAYAN_PASTE's text, waiting for the first renderer: a right click
-    /// needs cell metrics to land on a pane.
+    /// `BAYAN_PASTE` text, waiting for the first renderer: a right click
+    /// needs cell metrics to land on a pane. Debug builds only.
+    #[cfg(debug_assertions)]
     debug_paste: Option<String>,
 }
 
@@ -3287,9 +3318,10 @@ impl App {
             heal = renderer.atlas.generation != self.atlas_generation;
             self.atlas_generation = renderer.atlas.generation;
         }
-        // BAYAN_ATLAS_STRESS: shape a big spread of unique glyphs before the
-        // first present, forcing a page grow — proves the array texture path
-        // draws page-1 glyphs without corrupting page 0 (no input injection).
+        // BAYAN_ATLAS_STRESS (debug builds only): shape a big spread of unique
+        // glyphs before the first present, forcing a page grow — proves the
+        // array texture path draws page-1 glyphs without corrupting page 0.
+        #[cfg(debug_assertions)]
         if std::env::var_os("BAYAN_ATLAS_STRESS").is_some() {
             if let Some(r) = self.renderer.as_mut() {
                 // persistent overlay (re-emitted every frame) so the second
@@ -3323,82 +3355,18 @@ impl App {
             // winit reapplies ITS OWN style flags on visibility changes,
             // wiping the layered bit — restore the configured alpha after
             self.apply_opacity();
-            crate::prof::mark("first frame presented");
+            crate::prof_mark!("first frame presented");
         }
     }
 }
 
-impl ApplicationHandler<UserEvent> for App {
-    fn resumed(&mut self, el: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-        // hidden until the GPU presents the first dark frame (~0.4s): a
-        // fully-drawn window appearing beats a white flash while DX12 warms up.
-        // BAYAN_SHOW_NOW forces it visible at creation (for on-screen capture).
-        let visible = std::env::var_os("BAYAN_SHOW_NOW").is_some();
-        // The exe's embedded resource covers Explorer and the taskbar, but the
-        // title bar and Alt-Tab read the WINDOW icon, which winit only sets if
-        // we hand it pixels. Raw RGBA rather than a decoder: 16KB, no new crate,
-        // and generated from assets/bayan.ico so the two can't drift apart.
-        const ICON_RGBA: &[u8] = include_bytes!("../assets/icon_64.rgba");
-        let icon = winit::window::Icon::from_rgba(ICON_RGBA.to_vec(), 64, 64).ok();
-        use winit::platform::windows::WindowAttributesExtWindows;
-        let mut attrs = Window::default_attributes()
-            // M24: no OS title bar. The tab strip IS the title bar, so the
-            // window carries one row of chrome instead of two. We draw the
-            // caption buttons and handle drag/resize ourselves below.
-            .with_decorations(false)
-            .with_undecorated_shadow(true)
-            .with_title("Bayan — بيان")
-            .with_window_icon(icon)
-            .with_visible(visible)
-            .with_inner_size(LogicalSize::new(1100.0, 700.0));
-        // yesterday's rectangle, if it is still on a connected monitor
-        let monitors: Vec<(i32, i32, u32, u32)> = el
-            .available_monitors()
-            .map(|m| {
-                let (p, s) = (m.position(), m.size());
-                (p.x, p.y, s.width, s.height)
-            })
-            .collect();
-        if let Some(g) = load_saved_state().and_then(|s| s.window) {
-            if geometry_on_screen(g, &monitors) {
-                attrs = attrs
-                    .with_position(winit::dpi::PhysicalPosition::new(g.x, g.y))
-                    .with_inner_size(winit::dpi::PhysicalSize::new(g.w, g.h))
-                    .with_maximized(g.maximized);
-                self.normal_geom = Some(WindowGeom {
-                    maximized: false,
-                    ..g
-                });
-            }
-        }
-        let window = Arc::new(el.create_window(attrs).expect("create window"));
-        crate::prof::mark("window created");
-        let px = window.inner_size();
-        let gpu = gpu::Gpu::new(window.clone(), px.width, px.height, render::ATLAS_SIZE)
-            .expect("gpu init (DX12/Vulkan/GL via wgpu)");
-        crate::prof::mark("gpu ready");
-        self.gpu = Some(gpu);
-        self.window = Some(window.clone());
-        self.apply_opacity(); // the configured window alpha, from frame one
-        self.apply_window_frame();
-        if let Some(h) = self.hwnd() {
-            // the tray icon: toast anchor + summon target
-            if !toast::init(h) {
-                eprintln!("bayan: tray icon registration failed — no toasts");
-            }
-        }
-        // first frame NOW: a dark window on screen beats a frozen launcher.
-        // The shell and the font system warm up behind it, in parallel.
-        self.redraw();
-        // the PTY + conhost + PowerShell chain is the slowest dependency:
-        // start it immediately with a default grid; the exact grid follows
-        // once cell metrics exist (EasyTer starts 110x32 the same way).
-        // Start one fresh tab unless saved-tab restoration is explicitly enabled.
-        self.restore_state();
-        // debug hook: BAYAN_SPLIT=1 opens the first tab pre-split, so the
+#[cfg(debug_assertions)]
+impl App {
+    /// Developer startup hooks. Not compiled into release builds, so a
+    /// parent process cannot inject PTY input, open overlays, or raise a
+    /// toast by setting `BAYAN_*`.
+    fn apply_debug_hooks(&mut self) {
+        // BAYAN_SPLIT=1 opens the first tab pre-split, so the
         // pane machinery can be verified without injecting any input
         if std::env::var_os("BAYAN_SPLIT").is_some() {
             self.split(Orientation::Row);
@@ -3462,7 +3430,93 @@ impl ApplicationHandler<UserEvent> for App {
                 self.apply_theme(n);
             }
         }
-        crate::prof::mark("session spawned");
+    }
+}
+
+impl ApplicationHandler<UserEvent> for App {
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+        // hidden until the GPU presents the first dark frame (~0.4s): a
+        // fully-drawn window appearing beats a white flash while DX12 warms up.
+        // Debug builds may set BAYAN_SHOW_NOW to show it at creation (capture).
+        // Release builds do not read that variable.
+        let visible = {
+            #[cfg(debug_assertions)]
+            {
+                std::env::var_os("BAYAN_SHOW_NOW").is_some()
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                false
+            }
+        };
+        // The exe's embedded resource covers Explorer and the taskbar, but the
+        // title bar and Alt-Tab read the WINDOW icon, which winit only sets if
+        // we hand it pixels. Raw RGBA rather than a decoder: 16KB, no new crate,
+        // and generated from assets/bayan.ico so the two can't drift apart.
+        const ICON_RGBA: &[u8] = include_bytes!("../assets/icon_64.rgba");
+        let icon = winit::window::Icon::from_rgba(ICON_RGBA.to_vec(), 64, 64).ok();
+        use winit::platform::windows::WindowAttributesExtWindows;
+        let mut attrs = Window::default_attributes()
+            // M24: no OS title bar. The tab strip IS the title bar, so the
+            // window carries one row of chrome instead of two. We draw the
+            // caption buttons and handle drag/resize ourselves below.
+            .with_decorations(false)
+            .with_undecorated_shadow(true)
+            .with_title("Bayan — بيان")
+            .with_window_icon(icon)
+            .with_visible(visible)
+            .with_inner_size(LogicalSize::new(1100.0, 700.0));
+        // yesterday's rectangle, if it is still on a connected monitor
+        let monitors: Vec<(i32, i32, u32, u32)> = el
+            .available_monitors()
+            .map(|m| {
+                let (p, s) = (m.position(), m.size());
+                (p.x, p.y, s.width, s.height)
+            })
+            .collect();
+        if let Some(g) = load_saved_state().and_then(|s| s.window) {
+            if geometry_on_screen(g, &monitors) {
+                attrs = attrs
+                    .with_position(winit::dpi::PhysicalPosition::new(g.x, g.y))
+                    .with_inner_size(winit::dpi::PhysicalSize::new(g.w, g.h))
+                    .with_maximized(g.maximized);
+                self.normal_geom = Some(WindowGeom {
+                    maximized: false,
+                    ..g
+                });
+            }
+        }
+        let window = Arc::new(el.create_window(attrs).expect("create window"));
+        crate::prof_mark!("window created");
+        let px = window.inner_size();
+        let gpu = gpu::Gpu::new(window.clone(), px.width, px.height, render::ATLAS_SIZE)
+            .expect("gpu init (DX12/Vulkan/GL via wgpu)");
+        crate::prof_mark!("gpu ready");
+        self.gpu = Some(gpu);
+        self.window = Some(window.clone());
+        self.apply_opacity(); // the configured window alpha, from frame one
+        self.apply_window_frame();
+        if let Some(h) = self.hwnd() {
+            // the tray icon: toast anchor + summon target
+            if !toast::init(h) {
+                eprintln!("bayan: tray icon registration failed — no toasts");
+            }
+        }
+        // first frame NOW: a dark window on screen beats a frozen launcher.
+        // The shell and the font system warm up behind it, in parallel.
+        self.redraw();
+        // the PTY + conhost + PowerShell chain is the slowest dependency:
+        // start it immediately with a default grid; the exact grid follows
+        // once cell metrics exist (EasyTer starts 110x32 the same way).
+        // Start one fresh tab unless saved-tab restoration is explicitly enabled.
+        self.restore_state();
+        // Debug startup hooks. The method is omitted from release builds.
+        #[cfg(debug_assertions)]
+        self.apply_debug_hooks();
+        crate::prof_mark!("session spawned");
         // the window exists now; if it is already focused and a pane has
         // 1004, say so. has_focus is the same check a later rebase uses.
         self.sync_focus(None);
@@ -3515,7 +3569,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if !self.first_output {
                     self.first_output = true;
-                    crate::prof::mark("first pty output");
+                    crate::prof_mark!("first pty output");
                 }
                 if let Some((ti, pi)) = self.find_pane(id) {
                     self.tabs[ti].panes[pi].last_output = Some(Instant::now());
@@ -3662,7 +3716,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_redraw(); // tab titles live in the frame
             }
             UserEvent::RendererReady(r) => {
-                crate::prof::mark("renderer ready");
+                crate::prof_mark!("renderer ready");
                 self.renderer = Some(*r);
                 self.renderer_building = false;
                 // now that cell metrics exist, snap every pane to its rect
@@ -3671,6 +3725,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if (self.font_delta - self.inflight_delta).abs() > f32::EPSILON {
                     self.rebuild_renderer();
                 }
+                #[cfg(debug_assertions)]
                 if let Some(text) = self.debug_paste.take() {
                     self.debug_right_click_paste(text);
                 }
@@ -3817,7 +3872,7 @@ pub(crate) fn harden_dll_search() {
 fn main() {
     harden_dll_search();
     prof::init();
-    prof::mark("main start");
+    crate::prof_mark!("main start");
     use winit::platform::windows::EventLoopBuilderExtWindows;
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .with_msg_hook(|msg| {
@@ -3842,7 +3897,7 @@ fn main() {
         .build()
         .expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
-    prof::mark("event loop built");
+    crate::prof_mark!("event loop built");
     let proxy = event_loop.create_proxy();
     let profiles_proxy = proxy.clone();
     std::thread::spawn(move || {
@@ -3913,6 +3968,7 @@ fn main() {
         inflight_delta: 0.0,
         normal_geom: None,
         keys_held_away: Vec::new(),
+        #[cfg(debug_assertions)]
         debug_paste: None,
     };
     event_loop.run_app(&mut app).expect("run event loop");
