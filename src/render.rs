@@ -701,6 +701,20 @@ pub const TAB_CELLS: f32 = 24.0;
 /// A tab never shrinks below this: "sh" must still be a clickable target.
 pub const TAB_MIN_CELLS: f32 = 9.0;
 
+/// How many title characters a tab of `tw` pixels draws, after `reserve`
+/// cells for the padding, the status dot and the close control.
+///
+/// `tab_width` sizes a tab as `(title + 6) * cell_w` and then truncates to
+/// whole pixels, so `tw / cell_w` comes out a hair under the cell count it
+/// was built from (10.98, not 11). Flooring that dropped the last letter of
+/// every title that fit exactly: "Bayan" drew as "Baya". Round instead.
+fn tab_title_chars(tw: i32, cell_w: f32, reserve: usize) -> usize {
+    if cell_w <= 0.0 {
+        return 0;
+    }
+    ((tw.max(0) as f32 / cell_w).round() as usize).saturating_sub(reserve)
+}
+
 /// A rect in frame pixels: (x, y, w, h).
 pub type Rect = (i32, i32, i32, i32);
 
@@ -4504,7 +4518,7 @@ impl Renderer {
             let has_close = tabw >= close_w + 20;
             // leave room for the close control (and the status dot left of it)
             let reserve = if has_close { 6 } else { 4 };
-            let max_chars = ((tw as f32 / self.cell_w) as usize).saturating_sub(reserve);
+            let max_chars = tab_title_chars(tw, self.cell_w, reserve);
             let title: String = tab.title.chars().take(max_chars).collect();
             let segs = [Seg::plain(title, fg)];
             self.draw_run(
@@ -4548,15 +4562,7 @@ impl Renderer {
                 } else {
                     tx + tabw - 14
                 };
-                push_rect(
-                    out,
-                    whole,
-                    dx,
-                    (oy + 3) / 2 - d / 2,
-                    d,
-                    d,
-                    c4(c, 255),
-                );
+                push_rect(out, whole, dx, (oy + 3) / 2 - d / 2, d, d, c4(c, 255));
             }
             // progress: a 3px bar along the bottom edge, its track dimmed and
             // its fill at the reported percent (full-width dim = indeterminate)
@@ -5623,6 +5629,25 @@ mod cache_tests {
         assert_eq!(arabic_chars(2), "حرفين");
         assert_eq!(arabic_chars(7), "7 أحرف");
         assert_eq!(arabic_chars(293), "293 حرفاً");
+    }
+
+    #[test]
+    fn a_tab_sized_for_its_title_draws_all_of_it() {
+        // "Bayan" lost its "n": the width is truncated to whole pixels, and
+        // flooring tw / cell_w then came out one cell short
+        let r = test_renderer();
+        for title in ["Bayan", "sh", "Desktop", "Admin", "projects-2026"] {
+            let tw = r.tab_width(title);
+            assert!(
+                tab_title_chars(tw, r.ui_cell_w(), 6) >= title.chars().count(),
+                "{title:?} would be cut in a {tw}px tab"
+            );
+        }
+        for cw in [7.3_f32, 8.4, 9.6, 10.8, 12.15] {
+            let tw = (cw * 11.0) as i32;
+            assert_eq!(tab_title_chars(tw, cw, 6), 5, "cell {cw}");
+        }
+        assert_eq!(tab_title_chars(100, 0.0, 6), 0);
     }
 
     #[test]
