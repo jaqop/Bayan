@@ -73,8 +73,10 @@ impl Action {
             Action::Settings => "الإعدادات",
             Action::Copy => "نسخ التحديد",
             Action::Paste => "لصق",
-            Action::SplitH => "تقسيم جانبي",
-            Action::SplitV => "تقسيم عمودي",
+            // Where the new pane lands. SplitH is a row (side by side):
+            // the pane is on the right. SplitV is a column (stacked): below.
+            Action::SplitH => "لوحة يمين",
+            Action::SplitV => "لوحة أسفل",
             Action::Cockpit => "مقصورة الوكلاء",
             Action::PromptPrev => "الأمر السابق",
             Action::PromptNext => "الأمر التالي",
@@ -499,6 +501,15 @@ mod tests {
             lookup(&defaults, Action::ResetKeyboard.default_chord()),
             Some(Action::ResetKeyboard)
         );
+    }
+
+    #[test]
+    fn split_labels_name_the_pane_they_add() {
+        // Side-by-side (split-h → Row) puts a pane on the right. Stacked
+        // (split-v → Column) puts one below. Shortcuts and the palette
+        // both show Action::label.
+        assert_eq!(Action::SplitH.label(), "لوحة يمين");
+        assert_eq!(Action::SplitV.label(), "لوحة أسفل");
     }
 
     #[test]

@@ -471,6 +471,32 @@ impl Tab {
     }
 }
 
+/// Whether a menu should offer this split. Independent of the four-pane cap:
+/// at the cap the current axis stays listed, and [`split_action_applies`]
+/// still refuses to add a pane.
+///
+/// A single pane offers both axes. Once the tab has two or more, only the
+/// axis already in use is offered — the other row is hidden, and dispatch
+/// no-ops, instead of appending another pane on that same axis.
+fn split_axis_offered(panes: usize, axis: Orientation, requested: Orientation) -> bool {
+    panes <= 1 || axis == requested
+}
+
+/// Whether a split may add a pane. v1 is one axis per tab, four panes max.
+fn split_action_applies(panes: usize, axis: Orientation, requested: Orientation) -> bool {
+    panes < 4 && split_axis_offered(panes, axis, requested)
+}
+
+/// Built-in palette / menu rows. Split actions follow [`split_axis_offered`];
+/// every other action stays listed.
+fn builtin_offered(action: keybinds::Action, panes: usize, axis: Orientation) -> bool {
+    match action {
+        keybinds::Action::SplitH => split_axis_offered(panes, axis, Orientation::Row),
+        keybinds::Action::SplitV => split_axis_offered(panes, axis, Orientation::Column),
+        _ => true,
+    }
+}
+
 /// Weighted split of a content rect along one axis, 1px gaps between panes.
 fn split_rects(
     content: render::Rect,
@@ -1295,8 +1321,17 @@ impl App {
     fn palette_rows(&self, query: &str) -> Vec<(PaletteRow, String)> {
         let q = query.trim().to_lowercase();
         let hit = |label: &str| q.is_empty() || label.to_lowercase().contains(&q);
+        let (panes, axis) = self
+            .tabs
+            .get(self.active)
+            .map(|t| (t.panes.len(), t.orientation))
+            .unwrap_or((1, Orientation::Row));
         let mut rows: Vec<(PaletteRow, String)> = Vec::new();
         for a in keybinds::Action::ALL {
+            // The locked-out split is not a row, so it cannot be run from here.
+            if !builtin_offered(a, panes, axis) {
+                continue;
+            }
             if hit(a.label()) {
                 rows.push((PaletteRow::Builtin(a), a.label().to_string()));
             }
@@ -1959,12 +1994,14 @@ impl App {
     }
 
     /// Split the active tab (EasyTer: Ctrl+Shift+E side-by-side, O stacked).
+    ///
+    /// The first split sets the axis. A later request for the other axis
+    /// is ignored — see [`split_action_applies`].
     fn split(&mut self, orientation: Orientation) {
-        // four panes per tab is the v1 cap (one axis, equal sizes)
         if self
             .tabs
             .get(self.active)
-            .is_none_or(|t| t.panes.len() >= 4)
+            .is_none_or(|t| !split_action_applies(t.panes.len(), t.orientation, orientation))
         {
             return;
         }
@@ -4169,6 +4206,104 @@ mod tests {
         assert_eq!(stacked[2].1 + stacked[2].3, 30 + 700); // flush bottom
                                                            // widths untouched in a column split
         assert!(stacked.iter().all(|r| r.2 == 1000));
+    }
+
+    #[test]
+    fn orientation_locks_after_the_first_split() {
+        // one pane: either result is still available, and it becomes the axis
+        assert!(split_action_applies(1, Orientation::Row, Orientation::Row));
+        assert!(split_action_applies(
+            1,
+            Orientation::Row,
+            Orientation::Column
+        ));
+        assert!(split_action_applies(
+            1,
+            Orientation::Column,
+            Orientation::Row
+        ));
+        // side-by-side stays side-by-side. «لوحة أسفل» must not add a pane.
+        assert!(split_action_applies(2, Orientation::Row, Orientation::Row));
+        assert!(!split_action_applies(
+            2,
+            Orientation::Row,
+            Orientation::Column
+        ));
+        assert!(!split_action_applies(
+            3,
+            Orientation::Row,
+            Orientation::Column
+        ));
+        // stacked stays stacked. «لوحة يمين» must not add a pane.
+        assert!(split_action_applies(
+            2,
+            Orientation::Column,
+            Orientation::Column
+        ));
+        assert!(!split_action_applies(
+            2,
+            Orientation::Column,
+            Orientation::Row
+        ));
+        assert!(!split_action_applies(
+            3,
+            Orientation::Column,
+            Orientation::Row
+        ));
+        // four panes is still the cap, including on the open axis
+        assert!(!split_action_applies(4, Orientation::Row, Orientation::Row));
+        assert!(!split_action_applies(
+            4,
+            Orientation::Column,
+            Orientation::Column
+        ));
+        // the menu hides the unused axis and keeps every other action.
+        // At the cap the open axis stays listed; split() itself no-ops.
+        assert!(builtin_offered(
+            keybinds::Action::SplitH,
+            2,
+            Orientation::Row
+        ));
+        assert!(!builtin_offered(
+            keybinds::Action::SplitV,
+            2,
+            Orientation::Row
+        ));
+        assert!(!builtin_offered(
+            keybinds::Action::SplitH,
+            3,
+            Orientation::Column
+        ));
+        assert!(builtin_offered(
+            keybinds::Action::SplitV,
+            3,
+            Orientation::Column
+        ));
+        assert!(builtin_offered(
+            keybinds::Action::Paste,
+            2,
+            Orientation::Row
+        ));
+        assert!(builtin_offered(
+            keybinds::Action::SplitH,
+            4,
+            Orientation::Row
+        ));
+        assert!(!builtin_offered(
+            keybinds::Action::SplitV,
+            4,
+            Orientation::Row
+        ));
+        assert!(builtin_offered(
+            keybinds::Action::SplitH,
+            1,
+            Orientation::Row
+        ));
+        assert!(builtin_offered(
+            keybinds::Action::SplitV,
+            1,
+            Orientation::Row
+        ));
     }
 
     #[test]
