@@ -158,15 +158,32 @@ fn parse_theme(v: &serde_json::Value) -> Result<PluginTheme, String> {
 pub const ACTION_LABEL_MAX: usize = 80;
 /// Longest text a plugin action may send, in chars. The confirm card shows
 /// all of it (R-03), so the cap is what fits there: 512 chars is at most
-/// ten card rows.
+/// ten card rows. That only holds because [`send_char_forbidden`] rejects
+/// every character the preview would expand (`<ZWSP>` is six, `<U+0085>`
+/// is eight). CR and tab stay; they draw as the single cells ␍ and ␉.
 pub const ACTION_SEND_MAX: usize = 512;
+
+/// A character the confirm card cannot show as one cell, so a plugin `send`
+/// may not carry it (R-03).
+///
+/// CR and tab are the exceptions: the card draws them as ␍ and ␉, and they
+/// are how a plugin submits a line or aligns text. Everything else
+/// [`crate::link::is_forbidden`] covers — other controls, bidi overrides,
+/// zero-width and hidden characters — is rejected at load. Counting the cap
+/// before that expansion let 512 ZWSP stay under the limit and then paint
+/// dozens of rows, with the tail and the Enter hint off-screen, while Enter
+/// still typed the whole payload.
+fn send_char_forbidden(c: char) -> bool {
+    !matches!(c, '\r' | '\t') && crate::link::is_forbidden(c)
+}
 
 /// BAYAN-007: a plugin action is shown in the palette and its `send` text
 /// goes to the shell, so the file is checked before it is trusted with
 /// either. The label must be plain text (no control, bidi or zero-width
 /// characters), short, and not one of Bayan's own built-in labels — a plugin
-/// cannot pose as «لصق». The payload is capped; it is never written raw:
-/// the palette holds it for the paste-guard card (`main.rs`).
+/// cannot pose as «لصق». The payload is capped and may not carry a character
+/// the confirm card would expand; it is never written raw: the palette holds
+/// it for the paste-guard card (`main.rs`).
 fn parse_action(v: &serde_json::Value) -> Result<PaletteAction, String> {
     let label = v
         .get("label")
@@ -196,6 +213,14 @@ fn parse_action(v: &serde_json::Value) -> Result<PaletteAction, String> {
     }
     if send.is_empty() {
         return Err("action 'send' is empty".into());
+    }
+    // R-03: before the length cap. A string of ZWSP is short here and huge
+    // once the card spells each one out.
+    if send.chars().any(send_char_forbidden) {
+        return Err(
+            "action 'send' carries control or hidden characters; only CR and tab are allowed"
+                .into(),
+        );
     }
     if send.chars().count() > ACTION_SEND_MAX {
         return Err(format!("action 'send' longer than {ACTION_SEND_MAX} chars"));
@@ -439,5 +464,30 @@ mod tests {
         let long = "L".repeat(ACTION_LABEL_MAX + 1);
         let src = format!("{{\"actions\":[{{\"label\":\"{long}\",\"send\":\"x\"}}]}}");
         assert!(parse_plugin(&src).is_err());
+    }
+
+    #[test]
+    fn a_send_full_of_zero_width_spaces_is_rejected() {
+        // R-03: exactly the char cap, so the length check alone would accept
+        // it. Each ZWSP becomes `<ZWSP>` on the card.
+        let payload = "\u{200B}".repeat(ACTION_SEND_MAX);
+        let send = serde_json::to_string(&payload).unwrap();
+        let src = format!(r#"{{"actions":[{{"label":"L","send":{send}}}]}}"#);
+        let err = parse_plugin(&src).unwrap_err();
+        assert!(err.contains("control or hidden"), "{err}");
+        // the same cap of ordinary text still loads
+        let plain = serde_json::to_string(&"y".repeat(ACTION_SEND_MAX)).unwrap();
+        let src = format!(r#"{{"actions":[{{"label":"L","send":{plain}}}]}}"#);
+        assert!(parse_plugin(&src).is_ok());
+        // CR and tab stay: one cell each (␍ ␉), and how a plugin submits
+        let ok = r#"{"actions":[{"label":"Build","send":"cargo\tbuild\r"}]}"#;
+        let st = parse_plugin(ok).unwrap();
+        assert_eq!(st.actions[0].send, "cargo\tbuild\r");
+        // a newline, a C1 byte, and an override are not those two exceptions
+        for bad in ["\n", "\u{0085}", "\u{202E}", "\u{200B}"] {
+            let send = serde_json::to_string(&format!("echo {bad}")).unwrap();
+            let src = format!(r#"{{"actions":[{{"label":"L","send":{send}}}]}}"#);
+            assert!(parse_plugin(&src).is_err(), "{bad:?} accepted");
+        }
     }
 }

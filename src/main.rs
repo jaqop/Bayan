@@ -316,6 +316,10 @@ fn step_point(p: Point, cols: usize, top: i32, bottom: i32, dir: Direction) -> P
 /// Most tabs a restored session brings back (each one is a shell process).
 const MAX_RESTORED_TABS: usize = 16;
 
+/// Panes in one tab. `split` and session restore both stop here, so a
+/// saved tab whose shells come back cannot grow past the live cap.
+const MAX_PANES_PER_TAB: usize = 4;
+
 /// A `BAYAN_*` debug hook from the environment (BAYAN-010). The hooks can
 /// type into the shell (`BAYAN_TYPE`), drive the clipboard (`BAYAN_PASTE`)
 /// and log to `%TEMP%` (`BAYAN_PROFILE`), so anything that could set
@@ -418,6 +422,9 @@ pub enum UserEvent {
     /// The prompt picker's worker rendered one preview: (generation, row,
     /// ANSI). Dropped when the picker that asked is no longer open.
     PoshPreview(u64, usize, Option<Vec<u8>>),
+    /// Highlight rows a burst did not run: (generation, rows). The picker
+    /// clears those claims so a later visit can ask again.
+    PoshDropped(u64, Vec<usize>),
     /// Pane `id`'s shell exited.
     Exit(u64),
     /// A link open failed, or `settle` refused it, off the UI thread.
@@ -626,7 +633,18 @@ fn clean_tab_name(raw: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// Weighted split of a content rect along one axis, 1px gaps between panes.
+/// Top-level axis and weights of a tree, for the one-axis fallback and for
+/// readers that predate the nested `layout` field. A leaf has no split.
+fn saved_split(layout: &layout::Node) -> (u8, Vec<f32>) {
+    match layout {
+        layout::Node::Split { axis, weights, .. } => {
+            let orientation = u8::from(*axis == Orientation::Column);
+            (orientation, weights.clone())
+        }
+        layout::Node::Leaf(_) => (0, Vec::new()),
+    }
+}
+
 /// A saved tab's layout for the `n` panes that actually came back: its tree
 /// when it holds exactly those panes, else the old one-axis form (files from
 /// before nested splits, or a tab where a pane failed to respawn).
@@ -641,6 +659,34 @@ fn restored_layout(st: &SavedTab, n: usize) -> layout::Node {
             };
             layout::Node::flat(axis, &st.weights, n)
         }
+    }
+}
+
+/// How a saved tab may attach after its first shell is spawned.
+///
+/// `apply` is false when that shell never started: the extra directories,
+/// the layout, the focus and the name stay with the saved tab and are not
+/// written onto whichever tab happens to be last (N-05). `extra` is how
+/// many further panes may be spawned without passing `MAX_PANES_PER_TAB`.
+struct RestoredTabPlan {
+    extra: usize,
+    apply: bool,
+}
+
+fn plan_restored_tab(
+    first_shell_started: bool,
+    panes_now: usize,
+    extra_cwds: usize,
+) -> RestoredTabPlan {
+    if !first_shell_started {
+        return RestoredTabPlan {
+            extra: 0,
+            apply: false,
+        };
+    }
+    RestoredTabPlan {
+        extra: extra_cwds.min(MAX_PANES_PER_TAB.saturating_sub(panes_now)),
+        apply: true,
     }
 }
 
@@ -867,39 +913,36 @@ fn context_menu_rows(
 ) -> Vec<(PaletteRow, String)> {
     use keybinds::Action::*;
     let mut rows = Vec::new();
-    let mut add = |a: keybinds::Action, label: &str| {
-        rows.push((PaletteRow::Builtin(a), label.to_string()));
-    };
-    if has_selection {
-        add(Copy, "نسخ");
+    {
+        let mut add = |a: keybinds::Action| {
+            rows.push((PaletteRow::Builtin(a), a.label().to_string()));
+        };
+        if has_selection {
+            add(Copy);
+        }
+        add(Paste);
+        add(CopyLastOutput);
+        add(Search);
+        add(SplitH);
+        add(SplitV);
     }
-    add(Paste, "لصق");
-    add(CopyLastOutput, "نسخ ناتج آخر أمر");
-    add(Search, "البحث");
-    add(SplitH, "تقسيم: جنبًا إلى جنب");
-    add(SplitV, "تقسيم: فوق بعضها");
     if panes > 1 {
-        add(
-            ZoomPane,
-            if zoomed {
-                "إلغاء تكبير اللوحة"
-            } else {
-                "تكبير اللوحة"
-            },
-        );
-        add(
-            Broadcast,
-            if broadcast {
-                "إيقاف الكتابة في كل اللوحات"
-            } else {
-                "الكتابة في كل اللوحات"
-            },
-        );
+        let zoom = if zoomed {
+            format!("إلغاء {}", ZoomPane.label())
+        } else {
+            ZoomPane.label().to_string()
+        };
+        rows.push((PaletteRow::Builtin(ZoomPane), zoom));
+        let cast = if broadcast {
+            format!("إيقاف {}", Broadcast.label())
+        } else {
+            Broadcast.label().to_string()
+        };
+        rows.push((PaletteRow::Builtin(Broadcast), cast));
     }
-    add(NewTab, "تبويب جديد");
-    add(RenameTab, "تسمية التبويب");
-    add(ClosePane, "إغلاق اللوحة");
-    add(Settings, "الإعدادات");
+    for a in [NewTab, RenameTab, ClosePane, Settings] {
+        rows.push((PaletteRow::Builtin(a), a.label().to_string()));
+    }
     rows
 }
 
@@ -932,9 +975,20 @@ fn chrome_text(raw: &str) -> String {
     link::preview_with(raw, CHROME_TEXT_MAX, link::is_forbidden_in_path)
 }
 
+/// Counted form of «لوحة», the same agreement as the paste card's lines.
+fn arabic_panes(n: usize) -> String {
+    match n {
+        2 => "لوحتين".to_string(),
+        3..=10 => format!("{n} لوحات"),
+        _ => format!("{n} لوحة"),
+    }
+}
+
 /// The card's note when Enter will also type into `others` broadcast panes.
+/// `others` is the extra panes, so the note counts the focused one too.
 fn broadcast_note(others: usize) -> Option<String> {
-    (others > 0).then(|| format!(" — يُرسل إلى {} لوحات", others + 1))
+    let n = others + 1;
+    (n >= 2).then(|| format!(" — يُرسل إلى {}", arabic_panes(n)))
 }
 
 /// Whether a card raised for `raised_for` may still send (R-02): only into
@@ -943,12 +997,33 @@ fn card_still_targets(raised_for: Option<u64>, focused: Option<u64>) -> bool {
     raised_for.is_some() && raised_for == focused
 }
 
+/// Drop a confirm card whose pane is one of `removed`.
+///
+/// The card is painted over the whole window. Closing that pane, closing
+/// its tab, or the shell exiting otherwise leaves it up on top of a
+/// different tab, where Enter does nothing (`card_still_targets` already
+/// refuses the send). A card for a pane that is still open stays. A card
+/// with no pane id matches nothing.
+///
+/// `blocked_link` is not cleared here. It is not keyed by a pane: it is a
+/// window-level refuse or confirm for a URL, and closing a shell must not
+/// dismiss it.
+fn dismiss_paste_for(pending: &mut Option<PendingPaste>, removed: &[u64]) {
+    if pending
+        .as_ref()
+        .is_some_and(|p| p.pane.is_some_and(|id| removed.contains(&id)))
+    {
+        *pending = None;
+    }
+}
+
 /// Chars of preview per card row; the card is 62 cells wide.
 const CARD_ROW_CHARS: usize = 56;
 
 /// The card's preview rows. A paste shows one elided row, as before. A
 /// plugin command shows ALL of what Enter will type (R-03), wrapped into
-/// rows, with CR as ␍ — a plugin's 512-char cap keeps that to ≤ 10 rows.
+/// rows, with CR as ␍. The 512-char cap stays within ten rows because
+/// plugin load rejects every character this preview would expand.
 fn card_preview(kind: PendingKind, text: &str) -> Vec<String> {
     if kind != PendingKind::Command {
         return vec![term::paste_preview(text, 48)];
@@ -1069,6 +1144,10 @@ struct PoshPicker {
     /// preview ANSI per name, filled in by the `bayan-posh` worker as each
     /// subprocess finishes (None = not rendered yet, or no preview)
     previews: Vec<Option<Vec<u8>>>,
+    /// a row already handed to the worker. `previews` stays None both while
+    /// that run is in flight and when the theme has no preview, so without
+    /// this a second highlight starts oh-my-posh again.
+    asked: Vec<bool>,
     sel: usize,
     /// which open this is: a preview from an earlier, closed picker is dropped
     generation: u64,
@@ -1080,16 +1159,62 @@ struct PoshPicker {
 /// as it no longer matches its own generation (BAYAN-006).
 static POSH_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether highlight `i` still needs a preview subprocess. A row that was
+/// already asked, or that already has ANSI, does not.
+fn claim_posh_preview(asked: &mut [bool], have_preview: bool, i: usize) -> bool {
+    if have_preview || asked.get(i).copied().unwrap_or(true) {
+        return false;
+    }
+    asked[i] = true;
+    true
+}
+
 /// One burst of preview requests, as the worker runs it (R-04): every eager
 /// row (featured + selected on open), then only the NEWEST highlight request.
-fn collapse_posh_requests(burst: Vec<(usize, String, bool)>) -> Vec<(usize, String, bool)> {
+/// The second list is highlight rows that will not run. The picker clears
+/// their claims, so coming back asks again instead of leaving the row blank.
+fn collapse_posh_requests(
+    burst: Vec<(usize, String, bool)>,
+) -> (Vec<(usize, String, bool)>, Vec<usize>) {
     let last_hl = burst.iter().rposition(|r| !r.2);
-    burst
-        .into_iter()
-        .enumerate()
-        .filter(|(k, r)| r.2 || Some(*k) == last_hl)
-        .map(|(_, r)| r)
-        .collect()
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for (k, row) in burst.into_iter().enumerate() {
+        if row.2 || Some(k) == last_hl {
+            kept.push(row);
+        } else {
+            dropped.push(row.0);
+        }
+    }
+    // A row that also runs (the newest highlight, or an eager copy of it)
+    // is not dropped: clearing that claim would start oh-my-posh twice.
+    dropped.retain(|i| !kept.iter().any(|row| row.0 == *i));
+    (kept, dropped)
+}
+
+/// Clear claims the worker did not run. A row whose preview already arrived
+/// stays claimed. Returns whether `sel` was released and still has nothing
+/// to show, so the picker can ask again without another key.
+fn release_dropped_posh(
+    asked: &mut [bool],
+    arrived: &[bool],
+    dropped: &[usize],
+    sel: usize,
+) -> bool {
+    let mut again = false;
+    for &j in dropped {
+        if arrived.get(j).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(slot) = asked.get_mut(j) else {
+            continue;
+        };
+        if *slot && j == sel {
+            again = true;
+        }
+        *slot = false;
+    }
+    again
 }
 
 struct App {
@@ -1491,8 +1616,9 @@ impl App {
     /// `UserEvent::PoshPreview` (BAYAN-006). Only the featured themes and the
     /// selected one render on open (R-04): rendering a theme runs it, and a
     /// downloaded pack is ~100 files nobody asked to run. The rest render
-    /// when highlighted; the worker takes the newest request and drops the
-    /// ones the arrow keys already left. Closing or reopening stops it.
+    /// when highlighted. A burst keeps the newest highlight and reports the
+    /// ones it skipped, so coming back asks again. Closing or reopening
+    /// stops the worker.
     fn open_posh(&mut self) {
         use std::sync::atomic::Ordering;
         let names = posh::available();
@@ -1506,7 +1632,8 @@ impl App {
         let generation = POSH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
         // (row, theme, eager). Eager rows all render; highlight requests
         // collapse to the newest, so holding an arrow key does not queue a
-        // subprocess per row passed over.
+        // subprocess per row passed over. Skipped highlights come back as
+        // PoshDropped and their claims are cleared.
         let (tx, rx) = std::sync::mpsc::channel::<(usize, String, bool)>();
         let proxy = self.proxy.clone();
         let _ = std::thread::Builder::new()
@@ -1517,7 +1644,18 @@ impl App {
                     while let Ok(next) = rx.try_recv() {
                         burst.push(next);
                     }
-                    for (i, name, _) in collapse_posh_requests(burst) {
+                    let (run, dropped) = collapse_posh_requests(burst);
+                    if POSH_GENERATION.load(Ordering::SeqCst) != generation {
+                        return; // the picker closed or reopened
+                    }
+                    if !dropped.is_empty()
+                        && proxy
+                            .send_event(UserEvent::PoshDropped(generation, dropped))
+                            .is_err()
+                    {
+                        return; // the event loop is gone
+                    }
+                    for (i, name, _) in run {
                         if POSH_GENERATION.load(Ordering::SeqCst) != generation {
                             return; // the picker closed or reopened
                         }
@@ -1531,11 +1669,14 @@ impl App {
                     }
                 }
             });
+        let mut asked = vec![false; names.len()];
         for i in posh::eager_previews(&names, sel) {
+            asked[i] = true;
             let _ = tx.send((i, names[i].clone(), true));
         }
         self.posh = Some(PoshPicker {
             previews: vec![None; names.len()],
+            asked,
             names,
             sel,
             generation,
@@ -1544,13 +1685,15 @@ impl App {
         self.request_redraw();
     }
 
-    /// Ask the worker for the highlighted theme's preview, if it has none.
+    /// Ask the worker for the highlighted theme's preview, once.
     fn request_posh_preview(&mut self) {
         let Some(p) = self.posh.as_mut() else { return };
         let i = p.sel;
-        if p.previews.get(i).is_some_and(Option::is_none) {
-            let _ = p.work.send((i, p.names[i].clone(), false));
+        let have = p.previews.get(i).is_some_and(Option::is_some);
+        if !claim_posh_preview(&mut p.asked, have, i) {
+            return;
         }
+        let _ = p.work.send((i, p.names[i].clone(), false));
     }
 
     /// Close the picker and stop its preview worker.
@@ -2394,11 +2537,11 @@ impl App {
 
     /// Split the active tab (EasyTer: Ctrl+Shift+E side-by-side, O stacked).
     fn split(&mut self, orientation: Orientation) {
-        // four panes per tab is the v1 cap (one axis, equal sizes)
+        // side-by-side and stacked nest, up to MAX_PANES_PER_TAB
         if self
             .tabs
             .get(self.active)
-            .is_none_or(|t| t.panes.len() >= 4)
+            .is_none_or(|t| t.panes.len() >= MAX_PANES_PER_TAB)
         {
             return;
         }
@@ -2451,6 +2594,8 @@ impl App {
         {
             self.pending_close = None;
         }
+        let removed: Vec<u64> = t.panes.iter().map(|p| p.id).collect();
+        dismiss_paste_for(&mut self.pending_paste, &removed);
         for mut pane in t.panes.drain(..) {
             pane.session.kill();
         }
@@ -2485,6 +2630,8 @@ impl App {
         ) {
             self.pending_close = None;
         }
+        let removed = t.panes[pi].id;
+        dismiss_paste_for(&mut self.pending_paste, &[removed]);
         let mut pane = t.panes.remove(pi);
         t.layout.remove(pi);
         pane.session.kill();
@@ -2551,26 +2698,30 @@ impl App {
             tabs: self
                 .tabs
                 .iter()
-                .map(|t| SavedTab {
-                    cwds: t
-                        .panes
-                        .iter()
-                        .map(|p| {
-                            // don't persist a path we would refuse to start in
-                            p.session
-                                .meta
-                                .lock()
-                                .unwrap()
-                                .cwd
-                                .as_deref()
-                                .and_then(term::accept_local_cwd)
-                        })
-                        .collect(),
-                    weights: Vec::new(),
-                    orientation: 0,
-                    focused: t.focused,
-                    layout: Some(t.layout.clone()),
-                    name: t.name.clone(),
+                .map(|t| {
+                    let (orientation, weights) = saved_split(&t.layout);
+                    SavedTab {
+                        cwds: t
+                            .panes
+                            .iter()
+                            .map(|p| {
+                                // don't persist a path we would refuse to start in.
+                                // BAYAN-015: a poisoned meta lock is this pane's
+                                // state, not a reason to abort the save.
+                                p.session
+                                    .meta
+                                    .lock_or_recover()
+                                    .cwd
+                                    .as_deref()
+                                    .and_then(term::accept_local_cwd)
+                            })
+                            .collect(),
+                        weights,
+                        orientation,
+                        focused: t.focused,
+                        layout: Some(t.layout.clone()),
+                        name: t.name.clone(),
+                    }
                 })
                 .collect(),
             active: self.active,
@@ -2583,7 +2734,9 @@ impl App {
             let _ = std::fs::create_dir_all(dir);
         }
         if let Ok(json) = serde_json::to_string_pretty(&state) {
-            let _ = std::fs::write(path, json);
+            // same-directory temp then replace, so a crash cannot leave a
+            // truncated session.json that the next launch treats as empty
+            let _ = config::write_atomic(&path, json.as_bytes());
         }
     }
 
@@ -2619,21 +2772,43 @@ impl App {
                 // BAYAN-014: a session.json with hundreds of tabs (a bug, a
                 // hand edit, a planted file) must not spawn hundreds of shells
                 for mut st in state.tabs.into_iter().take(MAX_RESTORED_TABS) {
+                    let before = self.tabs.len();
                     let mut cwds = std::mem::take(&mut st.cwds).into_iter();
                     self.spawn_tab(cwds.next().flatten());
-                    for cwd in cwds.take(3) {
-                        // re-split with the saved axis; weights come after
-                        if let Some(pane) = self.spawn_pane(cwd.as_deref()) {
-                            if let Some(t) = self.tabs.last_mut() {
-                                t.panes.push(pane);
+                    // N-05: the first shell of this saved tab is what creates
+                    // it. If that spawn fails, its extra panes, layout, focus
+                    // and name must not land on the previous tab.
+                    let started = self.tabs.len() == before + 1;
+                    let panes_now = self.tabs.last().map(|t| t.panes.len()).unwrap_or(0);
+                    let extra: Vec<Option<String>> = cwds.collect();
+                    let plan = plan_restored_tab(started, panes_now, extra.len());
+                    if plan.apply {
+                        for cwd in extra.into_iter().take(plan.extra) {
+                            if self
+                                .tabs
+                                .last()
+                                .is_some_and(|t| t.panes.len() >= MAX_PANES_PER_TAB)
+                            {
+                                break;
+                            }
+                            if let Some(pane) = self.spawn_pane(cwd.as_deref()) {
+                                if let Some(t) = self.tabs.last_mut() {
+                                    if t.panes.len() < MAX_PANES_PER_TAB {
+                                        t.panes.push(pane);
+                                    }
+                                }
                             }
                         }
+                        if let Some(t) = self.tabs.last_mut() {
+                            t.layout = restored_layout(&st, t.panes.len());
+                            t.focused = st.focused.min(t.panes.len().saturating_sub(1));
+                            t.name = st.name.as_deref().and_then(clean_tab_name);
+                        }
                     }
-                    if let Some(t) = self.tabs.last_mut() {
-                        t.layout = restored_layout(&st, t.panes.len());
-                        t.focused = st.focused.min(t.panes.len() - 1);
-                        t.name = st.name.as_deref().and_then(clean_tab_name);
-                    }
+                }
+                // every saved tab failed to spawn: still open one shell
+                if self.tabs.is_empty() {
+                    self.spawn_tab(None);
                 }
                 self.active = state.active.min(self.tabs.len().saturating_sub(1));
                 self.relayout_active();
@@ -3011,8 +3186,7 @@ impl App {
         let raw = self.tabs[ti].panes[pi]
             .session
             .meta
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .cwd
             .clone();
         link::cwd_hook(raw.as_deref())
@@ -4391,6 +4565,20 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
+            UserEvent::PoshDropped(generation, dropped) => {
+                let again = self.posh.as_mut().is_some_and(|p| {
+                    if p.generation != generation {
+                        return false;
+                    }
+                    let sel = p.sel;
+                    let arrived: Vec<bool> = p.previews.iter().map(Option::is_some).collect();
+                    release_dropped_posh(&mut p.asked, &arrived, &dropped, sel)
+                });
+                if again {
+                    // the arrow is already on a row this burst did not run
+                    self.request_posh_preview();
+                }
+            }
             UserEvent::LinkFailed { reason, shown } => {
                 self.blocked_link = Some(BlockedLink {
                     reason,
@@ -4471,7 +4659,14 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Moved(_) => self.track_geometry(),
             WindowEvent::Resized(px) => self.resized(px),
             WindowEvent::CursorMoved { position, .. } => self.cursor_moved(position),
-            WindowEvent::CursorLeft { .. } => self.clear_link_hover(),
+            WindowEvent::CursorLeft { .. } => {
+                self.clear_link_hover();
+                if let Some(r) = self.renderer.as_mut() {
+                    if r.hover_tab.take().is_some() {
+                        self.request_redraw();
+                    }
+                }
+            }
             WindowEvent::MouseInput { state, button, .. } => self.mouse_input(state, button, el),
             WindowEvent::MouseWheel { delta, .. } => self.mouse_wheel(delta),
             WindowEvent::KeyboardInput { event, .. } => self.key_input(&event, el),
@@ -4691,7 +4886,44 @@ mod tests {
         assert!(!card_still_targets(None, None));
         // R-01: the card says when a paste fans out
         assert_eq!(broadcast_note(0), None);
+        assert_eq!(broadcast_note(1).as_deref(), Some(" — يُرسل إلى لوحتين"));
         assert_eq!(broadcast_note(2).as_deref(), Some(" — يُرسل إلى 3 لوحات"));
+        assert_eq!(broadcast_note(10).as_deref(), Some(" — يُرسل إلى 11 لوحة"));
+    }
+
+    #[test]
+    fn a_confirm_card_goes_away_with_its_pane() {
+        // The card is keyed by pane id (R-02 keeps the send safe). When that
+        // pane is removed — shell exit, pane close, or the whole tab — the
+        // card itself has to go, or it stays painted over another tab and
+        // Enter does nothing.
+        let card = |pane| {
+            Some(PendingPaste {
+                kind: PendingKind::Command,
+                pane,
+                text: "echo hi\r".into(),
+                lines: 1,
+                chars: 8,
+                reason: "test".into(),
+            })
+        };
+        let mut pending = card(Some(7));
+        dismiss_paste_for(&mut pending, &[7]);
+        assert!(pending.is_none(), "the pane the card was raised for");
+        let mut pending = card(Some(7));
+        dismiss_paste_for(&mut pending, &[7, 8]);
+        assert!(pending.is_none(), "a tab close removes every pane in it");
+        let mut pending = card(Some(7));
+        dismiss_paste_for(&mut pending, &[8]);
+        assert!(pending.is_some(), "a neighbour closing leaves this card up");
+        let mut pending = card(None);
+        dismiss_paste_for(&mut pending, &[7]);
+        assert!(pending.is_some(), "a card with no pane id matches nothing");
+        // a paste card is the same map: the pane id, not the kind
+        let mut pending = card(Some(3));
+        pending.as_mut().unwrap().kind = PendingKind::Paste;
+        dismiss_paste_for(&mut pending, &[3]);
+        assert!(pending.is_none());
     }
 
     #[test]
@@ -4748,24 +4980,124 @@ mod tests {
         // BAYAN-006
         // R-04: eager rows all run; a burst of highlights runs only the last
         let r = |i: usize, eager: bool| (i, format!("t{i}"), eager);
-        let got: Vec<usize> = collapse_posh_requests(vec![
+        let (got, dropped) = collapse_posh_requests(vec![
             r(3, true),
             r(1, true),
             r(4, false),
             r(5, false),
             r(6, false),
-        ])
-        .into_iter()
-        .map(|x| x.0)
-        .collect();
+        ]);
+        let got: Vec<usize> = got.into_iter().map(|x| x.0).collect();
         assert_eq!(got, vec![3, 1, 6]);
-        assert!(collapse_posh_requests(Vec::new()).is_empty());
+        assert_eq!(dropped, vec![4, 5]);
+        let (empty, none) = collapse_posh_requests(Vec::new());
+        assert!(empty.is_empty());
+        assert!(none.is_empty());
+        // the same row kept later in the burst is not reported as dropped
+        let (kept, dropped) = collapse_posh_requests(vec![
+            (1, "t1".into(), false),
+            (2, "t2".into(), false),
+            (1, "t1".into(), false),
+        ]);
+        assert_eq!(
+            kept.into_iter().map(|row| row.0).collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(dropped, vec![2]);
+        // a highlight asks once; a second pass while it is in flight does not
+        let mut asked = vec![false, false];
+        assert!(claim_posh_preview(&mut asked, false, 1));
+        assert!(!claim_posh_preview(&mut asked, false, 1));
+        assert!(claim_posh_preview(&mut asked, false, 0));
+        assert!(!claim_posh_preview(&mut asked, true, 0));
+    }
+
+    #[test]
+    fn a_skipped_highlight_can_be_asked_again() {
+        // B-1: highlight 1, then 2, then 3 in one burst. Collapse keeps only
+        // 3. Coming back to 1 must request a preview; 3 stays in flight.
+        let mut asked = vec![false; 4];
+        let mut burst = Vec::new();
+        for i in 1..=3 {
+            assert!(claim_posh_preview(&mut asked, false, i), "highlight {i}");
+            burst.push((i, format!("t{i}"), false));
+        }
+        assert!(
+            !claim_posh_preview(&mut asked, false, 1),
+            "the claim is held until the worker says the row did not run"
+        );
+        let (kept, dropped) = collapse_posh_requests(burst);
+        assert_eq!(
+            kept.into_iter().map(|row| row.0).collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(dropped, vec![1, 2]);
+        let arrived = vec![false; asked.len()];
+        assert!(
+            !release_dropped_posh(&mut asked, &arrived, &dropped, 3),
+            "the row the burst kept needs nothing new"
+        );
+        assert!(
+            claim_posh_preview(&mut asked, false, 1),
+            "returning to a skipped row requests its preview"
+        );
+        assert!(
+            !claim_posh_preview(&mut asked, false, 3),
+            "the highlight still in flight is not started again"
+        );
+        // already back on the skipped row when the notice arrives
+        let mut asked = vec![false, true, true, true];
+        assert!(release_dropped_posh(&mut asked, &arrived, &dropped, 1));
+        assert!(!asked[1]);
+        assert!(asked[3]);
+        // a preview that did arrive is not forgotten
+        let mut asked = vec![true];
+        assert!(!release_dropped_posh(&mut asked, &[true], &[0], 0));
+        assert!(asked[0]);
     }
 
     #[test]
     fn restored_sessions_are_capped() {
         // BAYAN-014: a sane bound, not "every tab in the file"
         const { assert!(MAX_RESTORED_TABS >= 4 && MAX_RESTORED_TABS <= 32) };
+        const { assert!(MAX_PANES_PER_TAB == 4) };
+    }
+
+    #[test]
+    fn a_failed_first_shell_does_not_rewrite_the_previous_tab() {
+        // N-05: spawn failure must not lend this saved tab to the one before it
+        let failed = plan_restored_tab(false, 4, 3);
+        assert!(!failed.apply);
+        assert_eq!(failed.extra, 0);
+        // and a tab that did start still stops at the same cap as split()
+        let full = plan_restored_tab(true, MAX_PANES_PER_TAB, 5);
+        assert!(full.apply);
+        assert_eq!(full.extra, 0);
+        let fresh = plan_restored_tab(true, 1, 100);
+        assert!(fresh.apply);
+        assert_eq!(fresh.extra, MAX_PANES_PER_TAB - 1);
+        assert_eq!(plan_restored_tab(true, 2, 3).extra, 2);
+        assert_eq!(plan_restored_tab(true, 0, 2).extra, 2);
+    }
+
+    #[test]
+    fn meta_locks_are_not_unwrapped() {
+        // BAYAN-015: `.lock()` then `.unwrap()` panics the UI when the
+        // reader thread poisoned the mutex. The call is often split across
+        // lines, which a single-line search misses.
+        let files = [
+            ("main.rs", include_str!("main.rs")),
+            ("term.rs", include_str!("term.rs")),
+            ("input.rs", include_str!("input.rs")),
+            ("keyroute.rs", include_str!("keyroute.rs")),
+        ];
+        for (name, src) in files {
+            let hits = unwrap_after_lock(&strip_line_comments(src));
+            assert!(
+                hits.is_empty(),
+                "{name}: lock().unwrap at lines {hits:?} — use lock_or_recover"
+            );
+        }
     }
 
     #[test]
@@ -5011,6 +5343,47 @@ mod tests {
     }
 
     #[test]
+    fn the_context_menu_uses_the_action_labels() {
+        let rows = context_menu_rows(true, 2, false, false);
+        let label = |a: keybinds::Action| {
+            rows.iter()
+                .find(|(r, _)| r == &PaletteRow::Builtin(a))
+                .map(|(_, s)| s.as_str())
+                .unwrap()
+        };
+        assert_eq!(
+            label(keybinds::Action::Paste),
+            keybinds::Action::Paste.label()
+        );
+        assert_eq!(
+            label(keybinds::Action::Copy),
+            keybinds::Action::Copy.label()
+        );
+        assert_eq!(
+            label(keybinds::Action::SplitV),
+            keybinds::Action::SplitV.label()
+        );
+        assert_eq!(label(keybinds::Action::SplitV), "لوحة أسفل");
+        assert_eq!(
+            label(keybinds::Action::ZoomPane),
+            keybinds::Action::ZoomPane.label()
+        );
+        let zoomed = context_menu_rows(false, 2, true, true);
+        let zoom = zoomed
+            .iter()
+            .find(|(r, _)| r == &PaletteRow::Builtin(keybinds::Action::ZoomPane))
+            .map(|(_, s)| s.as_str())
+            .unwrap();
+        assert!(zoom.starts_with("إلغاء "), "{zoom}");
+        let cast = zoomed
+            .iter()
+            .find(|(r, _)| r == &PaletteRow::Builtin(keybinds::Action::Broadcast))
+            .map(|(_, s)| s.as_str())
+            .unwrap();
+        assert!(cast.starts_with("إيقاف "), "{cast}");
+    }
+
+    #[test]
     fn a_saved_tree_restores_and_an_old_file_still_reads() {
         let mut tree = layout::Node::single();
         tree.split(0, Orientation::Row, 1);
@@ -5024,7 +5397,24 @@ mod tests {
             name: None,
         };
         assert_eq!(restored_layout(&st, 3), tree);
-        // a pane failed to respawn: the tree no longer fits, use one axis
+        let (orientation, weights) = saved_split(&tree);
+        assert_eq!(orientation, 0, "the root split is side by side");
+        assert_eq!(weights.len(), 2);
+        // a pane failed to respawn and the file kept the root axis: that
+        // axis is the fallback, not a hard-coded row of equal panes
+        let fallback = SavedTab {
+            cwds: st.cwds.clone(),
+            weights: weights.clone(),
+            orientation,
+            focused: st.focused,
+            layout: Some(tree.clone()),
+            name: st.name.clone(),
+        };
+        assert_eq!(
+            restored_layout(&fallback, 2),
+            layout::Node::flat(Orientation::Row, &weights, 2)
+        );
+        // a save that dropped the axis (the old writer) still reads as a row
         assert_eq!(
             restored_layout(&st, 2),
             layout::Node::flat(Orientation::Row, &[], 2)
@@ -5069,7 +5459,10 @@ mod tests {
         let size = TermSize { cols: 20, rows: 4 };
         let mut t = Term::new(Config::default(), &size, VoidListener);
         let mut p: Processor = Processor::new();
-        let mut meta = term::SessionMeta::default();
+        let mut meta = term::SessionMeta {
+            prompt_nonce: "n0nce".into(),
+            ..term::SessionMeta::default()
+        };
         let mut carry = Vec::new();
         let feed = |p: &mut Processor,
                     t: &mut Term<VoidListener>,
@@ -5083,17 +5476,29 @@ mod tests {
             &mut t,
             &mut meta,
             &mut carry,
-            b"\x1b]133;A\x07> ok\r\n",
+            b"\x1b]133;A;n0nce\x07> ok\r\n",
         );
-        feed(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;D;0\x07");
         feed(
             &mut p,
             &mut t,
             &mut meta,
             &mut carry,
-            b"\x1b]133;A\x07> bad\r\n",
+            b"\x1b]133;D;0;n0nce\x07",
         );
-        feed(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;D;1\x07");
+        feed(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;A;n0nce\x07> bad\r\n",
+        );
+        feed(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;D;1;n0nce\x07",
+        );
         assert_eq!(meta.marks.len(), 2);
         assert_eq!(meta.marks[0].exit, Some(0));
         assert_eq!(meta.marks[1].exit, Some(1));
@@ -5316,6 +5721,45 @@ mod tests {
     }
 }
 
+/// Drop `//` comments so a doc line that names the old call does not look
+/// like a live one. Strings are left as they are; none of the scanned files
+/// put this call inside a string.
+#[cfg(test)]
+fn strip_line_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    for line in src.lines() {
+        match line.find("//") {
+            Some(i) => out.push_str(&line[..i]),
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Lines where `.lock()` is followed only by whitespace and then `.unwrap()`.
+/// The needles are built in pieces so this scanner does not flag itself.
+#[cfg(test)]
+fn unwrap_after_lock(src: &str) -> Vec<usize> {
+    let lock = concat!(".", "lock()");
+    let unwrap = concat!(".", "unwrap()");
+    let mut hits = Vec::new();
+    let mut offset = 0;
+    let mut line = 1usize;
+    while let Some(rel) = src[offset..].find(lock) {
+        let at = offset + rel;
+        line += src[offset..at].bytes().filter(|&b| b == b'\n').count();
+        let after = &src[at + lock.len()..];
+        if after.trim_start().starts_with(unwrap) {
+            hits.push(line);
+        }
+        let next = at + lock.len();
+        line += src[at..next].bytes().filter(|&b| b == b'\n').count();
+        offset = next;
+    }
+    hits
+}
+
 #[cfg(test)]
 mod palette_tests {
     use super::*;
@@ -5476,15 +5920,29 @@ mod m38_tests {
             rows.into_iter().map(|(_, l)| l).collect()
         };
         let one = labels(context_menu_rows(false, 1, false, false));
+        assert_eq!(
+            keybinds::Action::Copy.label(),
+            "نسخ التحديد",
+            "the menu and the keymap share one label"
+        );
         assert_eq!(one[0], "لصق", "paste first when nothing is selected");
-        assert!(!one.iter().any(|l| l == "نسخ"));
+        assert!(
+            !one.iter().any(|l| l == keybinds::Action::Copy.label()),
+            "copy stays off the menu until something is selected"
+        );
         assert!(
             !one.iter().any(|l| l.contains("تكبير")),
             "no zoom with one pane"
         );
         assert!(one.iter().any(|l| l == "الإعدادات"));
         let sel = labels(context_menu_rows(true, 1, false, false));
-        assert_eq!(&sel[..2], ["نسخ", "لصق"]);
+        assert_eq!(
+            &sel[..2],
+            [
+                keybinds::Action::Copy.label(),
+                keybinds::Action::Paste.label(),
+            ]
+        );
         let split = labels(context_menu_rows(false, 2, true, true));
         assert!(split.iter().any(|l| l == "إلغاء تكبير اللوحة"));
         assert!(split.iter().any(|l| l == "إيقاف الكتابة في كل اللوحات"));

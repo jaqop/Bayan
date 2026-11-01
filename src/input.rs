@@ -426,10 +426,16 @@ impl App {
                 .renderer
                 .as_ref()
                 .is_some_and(|r| r.settings_button_hit(pw, position.x, position.y));
+            let tab = if edge.is_none() && !on_divider {
+                self.tab_at(position)
+            } else {
+                None
+            };
             if let Some(r) = self.renderer.as_mut() {
-                if r.hover_caption != cap || r.hover_gear != gear {
+                if r.hover_caption != cap || r.hover_gear != gear || r.hover_tab != tab {
                     r.hover_caption = cap;
                     r.hover_gear = gear;
+                    r.hover_tab = tab;
                     self.request_redraw();
                 }
             }

@@ -86,7 +86,7 @@ impl Action {
             Action::Copy => "نسخ التحديد",
             Action::Paste => "لصق",
             Action::SplitH => "تقسيم: جنبًا إلى جنب",
-            Action::SplitV => "تقسيم: فوق بعضها",
+            Action::SplitV => "لوحة أسفل",
             Action::Cockpit => "مقصورة الوكلاء",
             Action::PromptPrev => "الأمر السابق",
             Action::PromptNext => "الأمر التالي",

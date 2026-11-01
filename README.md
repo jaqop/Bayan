@@ -543,7 +543,7 @@ specification; `src/keys.rs` carries the same key-encoding tests.
 - [x] **M39** — a right-click menu. M36 made right-click paste, and that was
       all it did: there was no menu, so nothing in Bayan could be found by
       right-clicking. Now a right-click on a pane opens a popup at the
-      pointer: نسخ (only with a selection), لصق, copy last output, search,
+      pointer: نسخ التحديد (only with a selection), لصق, copy last output, search,
       both splits, zoom and broadcast (only with a split, each labelled with
       the way it will flip), new tab, rename tab, close pane and settings.
       Every row is a keymap action, so a row does exactly what its shortcut
@@ -628,6 +628,31 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       `133;B` marks the prompt, so drops into cmd, bash and WSL panes
       always show the confirm card; picker previews of non-featured themes
       appear when highlighted
+- [x] **QA follow-up, spawn and restore** — the context menu's copy row is
+      «نسخ التحديد», the same string `Action::Copy` carries, so the menu
+      stays on the keymap. `wsl.exe` is the `GetSystemDirectoryW` copy.
+      Discovery skips WSL when that file is absent, and a saved shell line
+      that still says `wsl.exe` is rewritten to that path. Save and a
+      relative link take `meta` with `lock_or_recover`, and a scan rejects
+      `.lock()` followed by `.unwrap()` even across lines. A restored tab
+      is updated only when its first shell started, so its extra panes,
+      layout, focus and name stay with that tab. Restore stops at four
+      panes, the same cap as a live split. If every saved tab fails to
+      start, one new shell still opens. `config.json`, `session.json` and
+      `$PROFILE` are flushed to a temp file in the same directory and then
+      replaced. The profile also keeps a one-time `.bayan.bak` from before
+      the first rewrite. The orphaned "weighted split" doc line above
+      `saved_split` is gone. Proven here: `cargo fmt`, `cargo clippy
+      --all-targets --target x86_64-pc-windows-gnu -- -D warnings`, and the
+      unit tests under wine. Four render tests that measure Windows font
+      metrics failed in that environment
+      (`cosmic_ligates_batched_ascii_runs`,
+      `arabic_tui_text_does_not_move_an_anchored_status`,
+      `tab_close_hits_the_drawn_control_and_misses_the_title`,
+      `tui_fields_respect_pane_edges_and_leave_vertical_room_for_marks`);
+      `render.rs` was not changed. The ConPTY loader tests and the
+      PowerShell preview timeouts were not run here. The Windows CI suite
+      covers them.
 - [x] **Nested splits** — a tab's panes are a tree of splits (`layout.rs`),
       so «تقسيم: جنبًا إلى جنب» and «تقسيم: فوق بعضها» split the FOCUSED pane
       the way they say and mix freely: two side by side, then the right one
