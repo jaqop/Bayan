@@ -199,8 +199,11 @@ key identity or typed text:
 | `BAYAN_PROFILE=1` | startup timeline marks to `%TEMP%\bayan_profile.log` (EasyTer's `EASYTER_PROFILE` pattern), zero cost when unset. Key presses log modifiers only, never the key |
 
 Start with `Start-Process -PassThru`, sleep ~6s for GPU init, capture the
-screen with `System.Drawing`, then `Stop-Process` the pid. Pre-approved
-variants of this are already in `.claude/settings.local.json`.
+screen with `System.Drawing`, then `Stop-Process` the pid. Any cleanup in
+a capture script deletes one named temp file, never a variable that could
+come out empty and fall back to a parent folder: one such script once
+issued `Remove-Item` on the user profile root, and only the permission
+guard stopped it.
 
 ## Conventions
 
@@ -226,6 +229,8 @@ hotkey. Prefer that over pulling in WinRT/COM.
 
 ## Project skills
 
-`.claude/skills/` carries `rust-best-practices`, `rust-testing`,
+`skills-lock.json` pins `rust-best-practices`, `rust-testing`,
 `m15-anti-pattern`, `windows-desktop-e2e`, and `webgpu-specs` (first-party from
-the wgpu repo — use it to pull WebGPU/WGSL spec text when touching `gpu.rs`).
+the wgpu repo — WebGPU/WGSL spec text for work on `gpu.rs`). The skill trees
+themselves are not in the repo (`.gitignore`); `.claude/skills/` exists only
+after `skills experimental_install` restores them.
