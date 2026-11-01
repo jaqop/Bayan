@@ -751,6 +751,17 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       (`BAYAN_ARABIC_FONT`, `BAYAN_TYPE`) show three different Arabic
       letterforms beside unchanged Latin, and the settings row reading
       Kawkab Mono. Not verified on screen: clicking the cycler arrows
+- [x] **Kawkab Mono bundled** — `fonts/KawkabMono-Regular.ttf` (SIL OFL
+      1.1, unmodified; notice and licence in `fonts/OFL-KawkabMono.txt`)
+      loads beside Amiri, so the Arabic-font row offers a monospaced
+      Arabic font on every PC, not only on one that has it installed. It
+      is a choice, not a new default: Auto is unchanged. Regular weight
+      only (~260 KB); upstream publishes no compiled fonts in its git
+      tree, and this file is the one Ghostty redistributes. `fonts/OFL.txt`
+      had a header copied from EasyTer that named Vazirmatn and Noto Naskh,
+      which Bayan never shipped; it now lists what is in the folder.
+      Proven: `font_lists_find_arabic_fonts_and_every_installed_monospace`
+      requires Kawkab Mono in the Arabic list from a bare renderer
 
 ## Settings
 
@@ -928,4 +939,5 @@ cargo run --release
 ```
 
 Requires Rust (MSVC toolchain on Windows). The Amiri font (SIL OFL, see
-`fonts/OFL.txt`) is bundled so connected Arabic works from a fresh clone.
+`fonts/OFL.txt`) is bundled so connected Arabic works from a fresh clone,
+and Kawkab Mono so a monospaced Arabic font is always on offer.

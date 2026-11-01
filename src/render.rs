@@ -1280,6 +1280,10 @@ pub const DEFAULT_FONT_SIZE: f32 = 18.0;
 // ships) — bold included, so Arabic bold is a real weight, not a fake
 const AMIRI: &[u8] = include_bytes!("../fonts/Amiri-Regular.ttf");
 const AMIRI_BOLD: &[u8] = include_bytes!("../fonts/Amiri-Bold.ttf");
+// a MONOSPACED Arabic font, so the Arabic-font setting has a terminal-fit
+// choice on any PC. Loaded, never imposed: Auto stays the default. Only the
+// regular weight ships (~260 KB); bold Arabic in it uses the regular face.
+const KAWKAB_MONO: &[u8] = include_bytes!("../fonts/KawkabMono-Regular.ttf");
 
 /// Primary-font preference order. Nerd Font variants first: oh-my-posh
 /// prompts are built from their private-use icons and powerline separators,
@@ -1577,6 +1581,7 @@ impl Renderer {
         let mut font_system = FontSystem::new();
         font_system.db_mut().load_font_data(AMIRI.to_vec());
         font_system.db_mut().load_font_data(AMIRI_BOLD.to_vec());
+        font_system.db_mut().load_font_data(KAWKAB_MONO.to_vec());
         let ligatures = cfg.ligatures.unwrap_or(true);
         let family = pick_family(font_system.db(), cfg.font_family.as_deref(), ligatures);
         // only a family that is installed and draws Arabic; a stale name in
@@ -6351,11 +6356,14 @@ mod cache_tests {
     fn font_lists_find_arabic_fonts_and_every_installed_monospace() {
         let r = test_renderer();
         let db = r.font_system.db();
-        // the bundled Amiri is always an Arabic choice; nonsense never is
+        // the bundled Amiri and Kawkab Mono are always Arabic choices;
+        // nonsense never is
         assert!(face_covers_arabic(db, "Amiri"));
+        assert!(face_covers_arabic(db, "Kawkab Mono"));
         assert!(!face_covers_arabic(db, "No Such Font 123"));
         let arabic = r.arabic_font_choices();
         assert!(arabic.iter().any(|f| f == "Amiri"));
+        assert!(arabic.iter().any(|f| f == "Kawkab Mono"));
         assert!(arabic.iter().all(|f| listable_family(f)));
         let mut sorted = arabic.clone();
         sorted.dedup();
