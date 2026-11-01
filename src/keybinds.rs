@@ -26,10 +26,14 @@ pub enum Action {
     PromptNext,
     ClaudeToggle,
     ResetKeyboard,
+    RenameTab,
+    Broadcast,
+    ZoomPane,
+    CopyLastOutput,
 }
 
 impl Action {
-    pub const ALL: [Action; 13] = [
+    pub const ALL: [Action; 17] = [
         Action::NewTab,
         Action::ClosePane,
         Action::Search,
@@ -43,6 +47,10 @@ impl Action {
         Action::PromptNext,
         Action::ClaudeToggle,
         Action::ResetKeyboard,
+        Action::RenameTab,
+        Action::Broadcast,
+        Action::ZoomPane,
+        Action::CopyLastOutput,
     ];
 
     /// The config.json key.
@@ -61,6 +69,10 @@ impl Action {
             Action::PromptNext => "prompt-next",
             Action::ClaudeToggle => "claude-toggle",
             Action::ResetKeyboard => "reset-keyboard",
+            Action::RenameTab => "rename-tab",
+            Action::Broadcast => "broadcast",
+            Action::ZoomPane => "zoom-pane",
+            Action::CopyLastOutput => "copy-last-output",
         }
     }
 
@@ -73,13 +85,17 @@ impl Action {
             Action::Settings => "الإعدادات",
             Action::Copy => "نسخ التحديد",
             Action::Paste => "لصق",
-            Action::SplitH => "تقسيم جانبي",
-            Action::SplitV => "تقسيم عمودي",
+            Action::SplitH => "تقسيم: جنبًا إلى جنب",
+            Action::SplitV => "تقسيم: فوق بعضها",
             Action::Cockpit => "مقصورة الوكلاء",
             Action::PromptPrev => "الأمر السابق",
             Action::PromptNext => "الأمر التالي",
             Action::ClaudeToggle => "وضع كلود",
             Action::ResetKeyboard => "إعادة ضبط لوحة المفاتيح",
+            Action::RenameTab => "تسمية التبويب",
+            Action::Broadcast => "الكتابة في كل اللوحات",
+            Action::ZoomPane => "تكبير اللوحة",
+            Action::CopyLastOutput => "نسخ ناتج آخر أمر",
         }
     }
 
@@ -107,6 +123,12 @@ impl Action {
             // Ctrl+Shift+K: the leaked-flags escape hatch. Physical K, so an
             // Arabic layout still reaches it.
             Action::ResetKeyboard => c(true, true, Letter('k')),
+            // R for rename, B for broadcast, Z for zoom (WezTerm's
+            // TogglePaneZoomState chord), L for the last command's lines
+            Action::RenameTab => c(true, true, Letter('r')),
+            Action::Broadcast => c(true, true, Letter('b')),
+            Action::ZoomPane => c(true, true, Letter('z')),
+            Action::CopyLastOutput => c(true, true, Letter('l')),
         }
     }
 }
@@ -316,7 +338,7 @@ pub fn chord_from(physical: PhysicalKey, ctrl: bool, shift: bool, alt: bool) -> 
 
 /// Every action's effective chord: the default unless config overrides it.
 /// Unparseable overrides fall back to the default (a typo must not
-/// brick a shortcut).
+/// brick a shortcut), and so do unbindable ones (no Ctrl, Alt or F-key).
 pub fn effective_map(cfg: &crate::config::UserConfig) -> Vec<(Action, Chord)> {
     Action::ALL
         .iter()
@@ -326,6 +348,9 @@ pub fn effective_map(cfg: &crate::config::UserConfig) -> Vec<(Action, Chord)> {
                 .as_ref()
                 .and_then(|m| m.get(a.id()))
                 .and_then(|s| Chord::parse(s))
+                // BAYAN-011: the same rule the shortcut editor enforces — a
+                // bare letter or Shift+key would swallow ordinary typing
+                .filter(Chord::is_bindable)
                 .unwrap_or_else(|| a.default_chord());
             (a, chord)
         })
@@ -507,5 +532,32 @@ mod tests {
         assert!(!Chord::parse("ctrl+shift+t").unwrap().is_plain_ctrl_letter());
         assert!(!Chord::parse("ctrl+,").unwrap().is_plain_ctrl_letter());
         assert!(!Chord::parse("f2").unwrap().is_plain_ctrl_letter());
+    }
+
+    #[test]
+    fn config_cannot_bind_an_action_to_plain_typing() {
+        // BAYAN-011: "a" or "shift+v" from config.json falls back to default
+        let a = Action::ALL[0];
+        for bad in ["a", "shift+v", "enter", "space"] {
+            let mut map = std::collections::HashMap::new();
+            map.insert(a.id().to_string(), bad.to_string());
+            let cfg = crate::config::UserConfig {
+                keybinds: Some(map),
+                ..Default::default()
+            };
+            let (_, chord) = effective_map(&cfg)[0];
+            assert_eq!(chord, a.default_chord(), "{bad:?} was bound");
+        }
+        // a real chord still overrides
+        let mut map = std::collections::HashMap::new();
+        map.insert(a.id().to_string(), "ctrl+alt+q".to_string());
+        let cfg = crate::config::UserConfig {
+            keybinds: Some(map),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_map(&cfg)[0].1,
+            Chord::parse("ctrl+alt+q").unwrap()
+        );
     }
 }

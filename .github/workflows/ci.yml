@@ -6,8 +6,18 @@ on:
   pull_request:
   workflow_dispatch:
 
+# BAYAN-009: the token gets read access to the repository and nothing else.
+# No job pushes, comments, or publishes.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
+
+# Every third-party action is pinned to a full commit SHA (the tag it was
+# taken from is in the trailing comment), so a moved or hijacked tag cannot
+# change what runs here. Bump them deliberately: resolve the new tag to its
+# commit and update both the SHA and the comment.
 
 jobs:
   # Windows only, deliberately. Bayan is bound to the platform: ConPTY via
@@ -18,9 +28,14 @@ jobs:
     name: build + test (stable, windows)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (v5.1.0)
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        # pinned by SHA, the action cannot read the toolchain from its ref
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Build
         run: cargo build --all-targets
       # The tests are pure unit tests — no GPU, no window, no PTY spawn —
@@ -36,9 +51,13 @@ jobs:
     name: msrv 1.89
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.89
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (v5.1.0)
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@599c45df1a24c1c63ae1129a7e59f46654b8fb66 # 1.89
+        with:
+          toolchain: "1.89"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Check against the declared minimum
         run: cargo check --all-targets
 
@@ -51,11 +70,14 @@ jobs:
     name: fmt + clippy
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (v5.1.0)
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Format
         run: cargo fmt --check
       - name: Clippy
@@ -70,8 +92,10 @@ jobs:
     name: cargo audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (v5.1.0)
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
         with:
           tool: cargo-audit
       - name: Audit

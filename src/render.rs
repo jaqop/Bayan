@@ -701,6 +701,41 @@ pub const TAB_CELLS: f32 = 24.0;
 /// A tab never shrinks below this: "sh" must still be a clickable target.
 pub const TAB_MIN_CELLS: f32 = 9.0;
 
+/// The proportional font window chrome uses for Arabic. Inbox on every
+/// Windows since Vista; where it is missing, cosmic-text falls back to a
+/// font that has the glyphs (the bundled Amiri).
+const UI_ARABIC_FAMILY: &str = "Segoe UI";
+
+fn is_arabic_script(c: char) -> bool {
+    matches!(c as u32,
+        0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF
+        | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF)
+}
+
+/// Byte ranges of `text` and whether each is Arabic, for the chrome's font
+/// split. Spaces and punctuation stay with the run before them, so the
+/// space between two Arabic words is the UI font's space, and a label like
+/// "حجم الخط" is one run.
+fn ui_font_runs(text: &str) -> Vec<(std::ops::Range<usize>, bool)> {
+    let mut runs: Vec<(std::ops::Range<usize>, bool)> = Vec::new();
+    for (i, c) in text.char_indices() {
+        let end = i + c.len_utf8();
+        let class = if is_arabic_script(c) {
+            Some(true)
+        } else if c.is_alphanumeric() {
+            Some(false)
+        } else {
+            None // neutral: joins the current run
+        };
+        match (runs.last_mut(), class) {
+            (Some(last), None) => last.0.end = end,
+            (Some(last), Some(a)) if last.1 == a => last.0.end = end,
+            (_, a) => runs.push((i..end, a.unwrap_or(false))),
+        }
+    }
+    runs
+}
+
 /// A rect in frame pixels: (x, y, w, h).
 pub type Rect = (i32, i32, i32, i32);
 
@@ -1288,7 +1323,7 @@ struct ShapedRun {
 }
 
 /// Cache key: the exact rich-text content (text + color + style) + alignment.
-type RunKey = (Vec<Seg>, bool, bool, u32);
+type RunKey = (Vec<Seg>, bool, bool, u32, bool);
 type CellGeometry = Vec<(i32, i32, bool)>; // visual x, width, logical RTL
 type RowHit = (i32, i32, usize, bool); // x, width, column, logical RTL
 
@@ -1315,6 +1350,9 @@ pub struct Renderer {
     cache_cold: std::collections::HashMap<RunKey, ShapedRun>,
     pub atlas: Atlas,
     family: String,
+    /// Window chrome is being drawn (between `use_ui_metrics(true)` and
+    /// `(false)`): Arabic in it uses the proportional UI font.
+    ui_text: bool,
     // theme (config-overridable; defaults are EasyTer's heritage colors)
     pub bg: (u8, u8, u8),
     fg: (u8, u8, u8),
@@ -1331,15 +1369,37 @@ pub struct Renderer {
 
 /// Copy for the paste-confirm card. Grouped so `draw_paste_guard` stays
 /// under clippy's argument limit.
+/// One row of the palette or the right-click menu: what it does, and the
+/// shortcut that does the same (empty when there is none).
+pub struct MenuRow {
+    pub label: String,
+    pub hint: String,
+}
+
 pub struct PasteCard<'a> {
     pub lines: usize,
     pub chars: usize,
     pub reason: &'a str,
-    pub preview: &'a str,
+    /// One row per entry. A paste shows one elided row; a plugin command
+    /// shows its whole payload, wrapped (R-03).
+    pub preview: &'a [String],
 }
 
 /// Hint under the command palette. The number is the filtered list the
 /// caller is about to draw and index, not a fixed action count.
+/// Top-left of a popup of `size` opened at `anchor` inside `frame`. The
+/// UI reads right to left, so the menu opens to the LEFT of the pointer and
+/// below it, flips right when there is no room on the left, flips up when
+/// there is none below, and is finally clamped inside the window.
+pub fn menu_origin(anchor: (f64, f64), size: (i32, i32), frame: (i32, i32)) -> (i32, i32) {
+    let (ax, ay) = (anchor.0.round() as i32, anchor.1.round() as i32);
+    let (w, h) = size;
+    let (fw, fh) = frame;
+    let x = if ax - w >= 0 { ax - w } else { ax };
+    let y = if ay + h <= fh { ay } else { ay - h };
+    (x.clamp(0, (fw - w).max(0)), y.clamp(0, (fh - h).max(0)))
+}
+
 pub(crate) fn palette_hint(count: usize) -> String {
     if count == 0 {
         "لا نتائج · Esc إغلاق".to_string()
@@ -1422,6 +1482,7 @@ impl Renderer {
             palette,
             ligatures,
             bar_hidden: false,
+            ui_text: false,
             cell_w,
             cell_h: metrics.line_height,
         }
@@ -1458,6 +1519,7 @@ impl Renderer {
             self.terminal_cell_w
         };
         self.cell_h = self.metrics.line_height;
+        self.ui_text = active;
     }
 
     fn finish_pane_layout(&mut self, pane_rect: Rect) {
@@ -1587,6 +1649,7 @@ impl Renderer {
             align_left,
             force_ltr,
             self.metrics.font_size.to_bits(),
+            self.ui_text,
         );
         if self.cache_hot.contains_key(&key) {
             return key;
@@ -1596,18 +1659,41 @@ impl Renderer {
             return key;
         }
         let base = Attrs::new().family(Family::Name(self.family.as_str()));
+        let ui_arabic = Attrs::new().family(Family::Name(UI_ARABIC_FAMILY));
+        let ui_text = self.ui_text;
         let rich: Vec<(&str, Attrs)> = segs
             .iter()
-            .map(|s| {
+            .flat_map(|s| {
                 // 0.19 Attrs is no longer Copy — clone the base per span
-                let mut a = base.clone().color(Color::rgb(s.fg.0, s.fg.1, s.fg.2));
-                if s.style & ST_BOLD != 0 {
-                    a = a.weight(Weight::BOLD);
+                fn style<'a>(b: &Attrs<'a>, s: &Seg) -> Attrs<'a> {
+                    let mut a = b.clone().color(Color::rgb(s.fg.0, s.fg.1, s.fg.2));
+                    if s.style & ST_BOLD != 0 {
+                        a = a.weight(Weight::BOLD);
+                    }
+                    if s.style & ST_ITALIC != 0 {
+                        a = a.style(Style::Italic);
+                    }
+                    a
                 }
-                if s.style & ST_ITALIC != 0 {
-                    a = a.style(Style::Italic);
-                }
-                (s.text.as_str(), a)
+                // Window chrome: Arabic runs in the proportional UI font.
+                // The terminal font's Arabic (Cascadia Code) is monospaced,
+                // so every letter is stretched to a full cell — fine on the
+                // grid, ugly in a menu. Terminal rows never take this path.
+                let runs = if ui_text {
+                    ui_font_runs(&s.text)
+                } else {
+                    vec![(0..s.text.len(), false)]
+                };
+                runs.into_iter()
+                    .map(|(r, arabic)| {
+                        let a = if arabic {
+                            style(&ui_arabic, s)
+                        } else {
+                            style(&base, s)
+                        };
+                        (&s.text[r], a)
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect();
         let mut buffer = Buffer::new(&mut self.font_system, self.metrics);
@@ -1636,7 +1722,10 @@ impl Renderer {
     /// in chars rather than measured, because the tab bar is grid-aligned and
     /// measuring here would cost a shape on every frame.
     pub fn tab_width(&self, title: &str) -> i32 {
-        let cells = (title.chars().count() as f32 + 6.0).clamp(TAB_MIN_CELLS, TAB_CELLS);
+        // +7: 12px before the title, the close control and the status dot
+        // after it, and the gap between tabs — with room to spare at any
+        // DPI, so a title the tab was sized for is never cut
+        let cells = (title.chars().count() as f32 + 7.0).clamp(TAB_MIN_CELLS, TAB_CELLS);
         (self.ui_cell_w() * cells) as i32
     }
 
@@ -3602,6 +3691,171 @@ impl Renderer {
         }
     }
 
+    /// The right-click menu: a narrow card at the pointer. Only `card` and
+    /// `rows` mean anything; the title, query and footer are empty, so the
+    /// palette's hit-testing works on it unchanged. Every row is shown (the
+    /// list is short) unless the window is too short, and then the rows
+    /// that fit.
+    pub fn menu_layout(
+        &self,
+        fw: usize,
+        fh: usize,
+        count: usize,
+        anchor: (f64, f64),
+    ) -> PaletteLayout {
+        let dpi = self.dpi_scale;
+        let pad = (6.0 * dpi).round() as i32;
+        let row_h = (self.ui_cell_h() + 14.0 * dpi).round() as i32;
+        // wide enough for a label and its shortcut side by side
+        let width = ((self.ui_cell_w() * 36.0).round() as i32)
+            .max((220.0 * dpi) as i32)
+            .min((fw as i32 - 8).max(0));
+        let fit = ((fh as i32 - pad * 2 - 8).max(0) / row_h.max(1)) as usize;
+        let shown = count.min(fit);
+        let height = pad * 2 + row_h * shown as i32;
+        let (x, y) = menu_origin(anchor, (width, height), (fw as i32, fh as i32));
+        let rows = (0..shown)
+            .map(|i| {
+                (
+                    i,
+                    (x + pad, y + pad + i as i32 * row_h, width - pad * 2, row_h),
+                )
+            })
+            .collect();
+        PaletteLayout {
+            card: (x, y, width, height),
+            title: (x, y, 0, 0),
+            query: (x, y, 0, 0),
+            rows,
+            footer: (x, y + height, 0, 0),
+            text_scale: 1.0,
+        }
+    }
+
+    /// Pixel width a row's shortcut takes, gap included (0 for none).
+    fn hint_width(&mut self, hint: &str) -> i32 {
+        if hint.is_empty() {
+            return 0;
+        }
+        let seg = [Seg::plain(hint, (0, 0, 0))];
+        self.measure(&seg, true).ceil() as i32 + (16.0 * self.dpi_scale) as i32
+    }
+
+    /// Draw a row's shortcut ("Ctrl+Shift+E") at `x`, muted; returns the
+    /// width it took including the gap before the label.
+    fn draw_row_hint(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        hint: &str,
+        rect: Rect,
+        x: i32,
+        picked: bool,
+    ) -> i32 {
+        if hint.is_empty() {
+            return 0;
+        }
+        let w = self.hint_width(hint);
+        let seg = [Seg::plain(
+            hint,
+            if picked {
+                (0xa8, 0xb8, 0xc8)
+            } else {
+                (0x76, 0x82, 0x90)
+            },
+        )];
+        self.draw_run(
+            &seg,
+            true,
+            out,
+            rect,
+            x as f32,
+            rect.1 + (rect.3 - self.cell_h as i32) / 2,
+            1.0,
+        );
+        w
+    }
+
+    /// The right-click menu. No backdrop: the terminal stays readable around
+    /// it, as under any native popup. Labels are right-aligned (the UI is
+    /// Arabic); a typed filter shows as an accent line under the card.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_menu(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        fw: usize,
+        fh: usize,
+        rows: &[MenuRow],
+        sel: usize,
+        anchor: (f64, f64),
+        query: &str,
+    ) {
+        let whole: Rect = (0, 0, fw as i32, fh as i32);
+        let layout = self.menu_layout(fw, fh, rows.len(), anchor);
+        let saved_metrics = self.metrics;
+        let saved_cells = (self.cell_w, self.cell_h);
+        self.metrics = Metrics::new(15.0 * self.dpi_scale, self.ui_cell_h());
+        self.cell_w = self.ui_cell_w();
+        self.cell_h = self.metrics.line_height;
+        let (x, y, w, h) = layout.card;
+        let accent = (0x58, 0xa6, 0xff);
+        let inset = (12.0 * self.dpi_scale).round() as i32;
+        push_rect(out, whole, x + 3, y + 4, w, h, c4((0, 0, 0), 90));
+        push_rect(out, whole, x, y, w, h, c4((0x3d, 0x44, 0x4d), 255));
+        push_rect(
+            out,
+            whole,
+            x + 1,
+            y + 1,
+            w - 2,
+            h - 2,
+            c4((0x16, 0x1b, 0x22), 255),
+        );
+        for &(idx, rect @ (rx, ry, rw, rh)) in &layout.rows {
+            let picked = idx == sel;
+            if picked {
+                push_rect(
+                    out,
+                    layout.card,
+                    rx,
+                    ry,
+                    rw,
+                    rh,
+                    c4((0x21, 0x36, 0x50), 255),
+                );
+                push_rect(out, layout.card, rx + rw - 3, ry, 3, rh, c4(accent, 255));
+            }
+            // the shortcut sits at the far (left) end, muted, in reading
+            // order; the label keeps the rest of the row
+            let hint_w = self.draw_row_hint(out, &rows[idx].hint, rect, rx + inset, picked);
+            let room = (rw - inset * 2 - hint_w).max(0) as f32;
+            let label = self.guard_label(&rows[idx].label, room);
+            let seg = [Seg {
+                text: label,
+                fg: if picked {
+                    (0xf0, 0xf6, 0xfc)
+                } else {
+                    (0xc9, 0xd1, 0xd9)
+                },
+                style: 0,
+            }];
+            let tw = self.measure(&seg, true);
+            self.draw_run(
+                &seg,
+                true,
+                out,
+                rect,
+                (rx + rw - inset) as f32 - tw,
+                ry + (rh - self.cell_h as i32) / 2,
+                1.0,
+            );
+        }
+        if !query.is_empty() {
+            push_rect(out, whole, x, y + h, w, 2, c4(accent, 255));
+        }
+        self.metrics = saved_metrics;
+        (self.cell_w, self.cell_h) = saved_cells;
+    }
+
     /// The command palette (Ctrl+Shift+P). Query line, filtered rows, hint.
     /// `rows` is already filtered by the caller — the renderer never decides
     /// what matches, so the list drawn and the list Enter runs cannot differ.
@@ -3611,7 +3865,7 @@ impl Renderer {
         fw: usize,
         fh: usize,
         query: &str,
-        rows: &[String],
+        rows: &[MenuRow],
         sel: usize,
     ) {
         let whole: Rect = (0, 0, fw as i32, fh as i32);
@@ -3715,7 +3969,17 @@ impl Renderer {
                 );
                 push_rect(out, layout.card, rx, ry + 1, 3, rh - 2, c4(accent, 255));
             }
-            let text = self.guard_label(&rows[idx], (rw - inset * 2).max(0) as f32);
+            // the palette lists left to right: its shortcut goes at the right
+            let gap = (16.0 * self.dpi_scale) as i32;
+            let hw = self.hint_width(&rows[idx].hint);
+            let hint_w = self.draw_row_hint(
+                out,
+                &rows[idx].hint,
+                rect,
+                rx + rw - inset - hw + gap,
+                picked,
+            );
+            let text = self.guard_label(&rows[idx].label, (rw - inset * 2 - hint_w).max(0) as f32);
             self.draw_run(
                 &[Seg {
                     text,
@@ -4204,9 +4468,10 @@ impl Renderer {
         push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 165));
         let w = ((self.cell_w * 62.0) as i32).min(fw as i32 - 80);
         let pad = 18;
-        let h = (self.cell_h * 4.0) as i32 + pad * 2 + 10;
+        let rows = card.preview.len().max(1);
+        let h = (self.cell_h * (3 + rows) as f32) as i32 + pad * 2 + 10;
         let x = (fw as i32 - w) / 2;
-        let y = self.tab_bar_h() as i32 + (fh as i32 - h) / 3;
+        let y = self.tab_bar_h() as i32 + ((fh as i32 - h) / 3).max(0);
         // a ring of background around the card separates it from the text
         push_rect(
             out,
@@ -4240,16 +4505,18 @@ impl Renderer {
             y + pad + self.cell_h as i32,
             1.0,
         );
-        let shown = [Seg::plain(card.preview, (0xc5, 0xcd, 0xd6))];
-        self.draw_run(
-            &shown,
-            true,
-            out,
-            whole,
-            (x + pad) as f32,
-            y + pad + (self.cell_h * 2.0) as i32,
-            1.0,
-        );
+        for (i, line) in card.preview.iter().enumerate() {
+            let shown = [Seg::plain(line.clone(), (0xc5, 0xcd, 0xd6))];
+            self.draw_run(
+                &shown,
+                true,
+                out,
+                whole,
+                (x + pad) as f32,
+                y + pad + (self.cell_h * (2 + i) as f32) as i32,
+                1.0,
+            );
+        }
         let keys = [Seg::plain(
             "Enter تأكيد   ·   Esc إلغاء",
             (0x9a, 0xa4, 0xb2),
@@ -4260,7 +4527,7 @@ impl Renderer {
             out,
             whole,
             (x + pad) as f32,
-            y + pad + (self.cell_h * 3.0) as i32 + 6,
+            y + pad + (self.cell_h * (2 + rows) as f32) as i32 + 6,
             1.0,
         );
     }
@@ -4370,8 +4637,23 @@ impl Renderer {
                     );
                 }
             }
-            let max_chars = ((tw as f32 / self.cell_w) as usize).saturating_sub(4);
-            let title: String = tab.title.chars().take(max_chars).collect();
+            let close_w = self.tab_close_size();
+            let has_close = tabw >= close_w + 20;
+            // The title gets the pixels between its start and the status
+            // dot / close control, and is fitted by MEASURING the shaped
+            // text. Counting cells (tw / cell_w minus a reserve) dropped the
+            // last letter on real fonts — "Bayan" → "Baya", "Desktop" →
+            // "Deskto" — because the tab's width and the glyphs' advances
+            // came from different numbers.
+            let has_dot = (tab.attention || tab.busy) && tw >= 28;
+            let dot_room = if has_dot { 14 } else { 4 };
+            let right = if has_close {
+                tx + tabw - close_w - 4 - dot_room
+            } else {
+                tx + tabw - 4 - dot_room
+            };
+            let avail = (right - (tx + 12)) as f32;
+            let title = self.fit_title(&tab.title, fg, avail);
             let segs = [Seg::plain(title, fg)];
             self.draw_run(
                 &segs,
@@ -4382,6 +4664,23 @@ impl Renderer {
                 (oy - self.cell_h.ceil() as i32) / 2,
                 1.0,
             );
+            // close control: same glyph as the window caption close
+            if has_close {
+                let ch = (oy - TAB_TOP - 4).min(close_w + 4).max(close_w);
+                let cx = tx + tabw - close_w - 4;
+                let cy = TAB_TOP + ((oy - TAB_TOP - 4) - ch).max(0) / 2;
+                let xseg = [Seg::plain("✕", dim(self.fg, 0.55))];
+                let gw = self.measure(&xseg, false);
+                self.draw_run(
+                    &xseg,
+                    false,
+                    out,
+                    whole,
+                    cx as f32 + (close_w as f32 - gw) / 2.0,
+                    cy + (ch - self.cell_h.ceil() as i32) / 2,
+                    1.0,
+                );
+            }
             // dots: amber attention (a Claude waiting on you) beats green busy
             let dot = if tab.attention {
                 Some((0xf2, 0xcc, 0x60))
@@ -4392,15 +4691,12 @@ impl Renderer {
             };
             if let Some(c) = dot.filter(|_| tw >= 28) {
                 let d = 6;
-                push_rect(
-                    out,
-                    whole,
-                    tx + tabw - 14,
-                    (oy + 3) / 2 - d / 2,
-                    d,
-                    d,
-                    c4(c, 255),
-                );
+                let dx = if has_close {
+                    tx + tabw - close_w - 4 - 12
+                } else {
+                    tx + tabw - 14
+                };
+                push_rect(out, whole, dx, (oy + 3) / 2 - d / 2, d, d, c4(c, 255));
             }
             // progress: a 3px bar along the bottom edge, its track dimmed and
             // its fill at the reported percent (full-width dim = indeterminate)
@@ -4535,6 +4831,72 @@ impl Renderer {
         self.tab_controls(width).iter().position(|&(x, y, w, h)| {
             px >= x as f64 && px < (x + w) as f64 && py >= y as f64 && py < (y + h) as f64
         })
+    }
+
+    /// The longest prefix of `title` (with "…" when cut) whose shaped width
+    /// fits `avail` pixels. Measured, not counted, so it holds for any font.
+    fn fit_title(&mut self, title: &str, fg: (u8, u8, u8), avail: f32) -> String {
+        if self.measure(&[Seg::plain(title, fg)], true) <= avail {
+            return title.to_string();
+        }
+        let chars: Vec<char> = title.chars().collect();
+        for k in (1..chars.len()).rev() {
+            let cut: String = chars[..k].iter().chain(std::iter::once(&'…')).collect();
+            if self.measure(&[Seg::plain(cut.clone(), fg)], true) <= avail {
+                return cut;
+            }
+        }
+        String::new()
+    }
+
+    /// Pixel size of the \u{00d7}-style close control on a tab.
+    fn tab_close_size(&self) -> i32 {
+        (self.ui_cell_w() * 1.6).max(16.0 * self.dpi_scale) as i32
+    }
+
+    /// Close-button rects for each visible tab (same geometry as the draw loop).
+    pub fn tab_close_rects(
+        &self,
+        width: usize,
+        titles: &[&str],
+        active: usize,
+    ) -> Vec<(usize, Rect)> {
+        if self.bar_hidden {
+            return Vec::new();
+        }
+        const TAB_GAP: i32 = 10;
+        const TAB_TOP: i32 = 7;
+        let oy = self.tab_bar_h().round() as i32;
+        let cw = self.tab_close_size();
+        let mut out = Vec::new();
+        for (i, x0, tw) in self.tab_rects(width, titles, active) {
+            let gap = TAB_GAP.min(tw.saturating_sub(1));
+            let tx = x0 + gap / 2;
+            let tabw = tw - gap;
+            // too narrow for a usable close control — keyboard ClosePane still works
+            if tabw < cw + 20 {
+                continue;
+            }
+            let ch = (oy - TAB_TOP - 4).min(cw + 4).max(cw);
+            let cx = tx + tabw - cw - 4;
+            let cy = TAB_TOP + ((oy - TAB_TOP - 4) - ch).max(0) / 2;
+            out.push((i, (cx, cy, cw, ch)));
+        }
+        out
+    }
+
+    /// Tab index whose close control contains (px, py).
+    pub fn tab_close_at(
+        &self,
+        width: usize,
+        titles: &[&str],
+        active: usize,
+        px: f64,
+        py: f64,
+    ) -> Option<usize> {
+        self.tab_close_rects(width, titles, active)
+            .into_iter()
+            .find_map(|(i, r)| rect_hit(r, px, py).then_some(i))
     }
 
     /// A shared viewport for rendering and hit testing. Keep the active tab
@@ -5045,6 +5407,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tab_close_hits_the_drawn_control_and_misses_the_title() {
+        let r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let titles = ["shell-one", "shell-two", "shell-three"];
+        let closes = r.tab_close_rects(900, &titles, 1);
+        assert_eq!(closes.len(), 3, "each tab gets a close control");
+        for &(i, (x, y, w, h)) in &closes {
+            assert_eq!(
+                r.tab_close_at(900, &titles, 1, (x + w / 2) as f64, (y + h / 2) as f64),
+                Some(i)
+            );
+        }
+        // title area of the active tab is not the close control
+        let rects = r.tab_rects(900, &titles, 1);
+        let (_, tx, tw) = rects.iter().find(|(i, _, _)| *i == 1).copied().unwrap();
+        assert_eq!(
+            r.tab_close_at(900, &titles, 1, (tx + 16) as f64, 20.0),
+            None
+        );
+        let _ = tw;
+    }
+
     /// Arabic must shape to real glyphs (no .notdef) through the fallback
     /// chain — this is Bayan's reason to exist. If this fails, the renderer
     /// is drawing blank lines for Arabic output.
@@ -5398,6 +5782,61 @@ mod cache_tests {
     }
 
     #[test]
+    fn chrome_arabic_gets_its_own_font_runs() {
+        let runs = |t: &str| -> Vec<(String, bool)> {
+            ui_font_runs(t)
+                .into_iter()
+                .map(|(r, a)| (t[r].to_string(), a))
+                .collect()
+        };
+        assert_eq!(runs("البحث"), vec![("البحث".into(), true)]);
+        assert_eq!(runs("حجم الخط"), vec![("حجم الخط".into(), true)]);
+        assert_eq!(
+            runs("Cascadia Code NF"),
+            vec![("Cascadia Code NF".into(), false)]
+        );
+        assert_eq!(
+            runs("سجلّ التمرير (التبويبات الجديدة)"),
+            vec![("سجلّ التمرير (التبويبات الجديدة)".into(), true)]
+        );
+        assert_eq!(
+            runs("Enter تأكيد"),
+            vec![("Enter ".into(), false), ("تأكيد".into(), true)]
+        );
+        assert!(runs("").is_empty());
+        // every byte is covered exactly once
+        let t = "إضافة — Build 2";
+        let covered: usize = ui_font_runs(t).iter().map(|(r, _)| r.len()).sum();
+        assert_eq!(covered, t.len());
+    }
+
+    #[test]
+    fn a_tab_sized_for_its_title_draws_all_of_it() {
+        // "Bayan" drew as "Baya" and "Desktop" as "Deskto": the title is now
+        // fitted by its measured width, so a tab sized for it shows all of it
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            let mut r = Renderer::new(scale, &crate::config::UserConfig::default(), 0.0);
+            r.use_ui_metrics(true);
+            for title in ["Bayan", "sh", "Desktop", "Admin", "projects-2026", "مشروع"] {
+                let tw = r.tab_width(title);
+                let tabw = tw - 10;
+                let close_w = r.tab_close_size();
+                let avail = (tabw - close_w - 4 - 14 - 12) as f32;
+                assert_eq!(
+                    r.fit_title(title, (255, 255, 255), avail),
+                    title,
+                    "{title:?} cut at scale {scale} in a {tw}px tab"
+                );
+            }
+            // a title longer than its tab is cut with an ellipsis that fits
+            let long = "a-very-long-directory-name-that-cannot-fit";
+            let fitted = r.fit_title(long, (255, 255, 255), 120.0);
+            assert!(fitted.ends_with('…') && fitted.chars().count() < long.chars().count());
+            assert!(r.measure(&[Seg::plain(fitted, (255, 255, 255))], true) <= 120.0);
+        }
+    }
+
+    #[test]
     fn tab_width_follows_the_title_within_bounds() {
         let r = test_renderer();
         let short = r.tab_width("sh");
@@ -5738,6 +6177,26 @@ mod cache_tests {
             sb.card.1 + sb.card.3 <= fh as i32,
             "the editor runs off-screen"
         );
+    }
+
+    /// The right-click menu: every row inside the card, hit-testable, and
+    /// a short window shows the rows that fit.
+    #[test]
+    fn the_menu_layout_lists_every_row_inside_its_card() {
+        let r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let lay = r.menu_layout(1400, 900, 12, (700.0, 200.0));
+        assert_eq!(lay.rows.len(), 12);
+        let (cx, cy, cw, ch) = lay.card;
+        assert!(cx >= 0 && cy >= 0 && cx + cw <= 1400 && cy + ch <= 900);
+        for &(_, (x, y, w, h)) in &lay.rows {
+            assert!(x >= cx && y >= cy && x + w <= cx + cw && y + h <= cy + ch);
+        }
+        // the row under a point inside it is that row
+        let (_, (x, y, w, h)) = lay.rows[3];
+        assert_eq!(lay.row_at((x + w / 2) as f64, (y + h / 2) as f64), Some(3));
+        // a window too short for all of them shows the ones that fit
+        let short = r.menu_layout(1400, 160, 12, (700.0, 10.0));
+        assert!(short.rows.len() < 12 && !short.rows.is_empty());
     }
 
     /// The shortcuts editor layout: one clickable strip per action, all

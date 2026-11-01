@@ -14,7 +14,7 @@ use winit::dpi::PhysicalPosition;
 use winit::window::ResizeDirection;
 
 use crate::render::Rect;
-use crate::{App, Orientation};
+use crate::App;
 
 /// The smallest edge band that stays grabbable without stealing clicks
 /// from the content.
@@ -68,34 +68,6 @@ pub(crate) fn tab_index_at(spans: &[(usize, i32, i32)], x: f64) -> Option<usize>
         .iter()
         .find(|&&(_, sx, sw)| x >= sx as f64 && x < (sx + sw) as f64)
         .map(|&(i, ..)| i)
-}
-
-/// The divider between pane `i` and `i + 1` under `(x, y)`. The last
-/// pane has no divider after it.
-pub(crate) fn divider_index(
-    rects: &[Rect],
-    orientation: Orientation,
-    x: f64,
-    y: f64,
-) -> Option<usize> {
-    if rects.len() < 2 {
-        return None;
-    }
-    rects
-        .iter()
-        .take(rects.len() - 1)
-        .position(|&(rx, ry, rw, rh)| match orientation {
-            Orientation::Row => {
-                (x - (rx + rw) as f64).abs() <= DIVIDER_GRAB
-                    && y >= ry as f64
-                    && y < (ry + rh) as f64
-            }
-            Orientation::Column => {
-                (y - (ry + rh) as f64).abs() <= DIVIDER_GRAB
-                    && x >= rx as f64
-                    && x < (rx + rw) as f64
-            }
-        })
 }
 
 /// A second press on the empty title strip within the window maximises
@@ -154,7 +126,11 @@ pub(crate) struct Hits {
     pub cockpit_row: Option<usize>,
     pub divider: Option<usize>,
     pub tab: Option<usize>,
+    /// The × on a tab: closing that tab, not switching to it.
+    pub tab_close: Option<usize>,
     pub drag_strip: bool,
+    /// A confirm card (paste, drop, plugin, link) is up.
+    pub card_open: bool,
 }
 
 /// Who owns a left press, before the terminal gets a say.
@@ -176,8 +152,13 @@ pub(crate) enum LeftPress {
     Cockpit(Option<usize>),
     Divider(usize),
     Tab(usize),
+    /// The × on a tab closes that tab (EasyTer's tabCloseRequested).
+    CloseTab(usize),
     /// Empty title strip: double-click maximises, drag moves.
     DragStrip,
+    /// Tab-bar chrome under a confirm card: swallowed (R-02). Switching or
+    /// closing a tab would hand the card to a pane it was not raised for.
+    Blocked,
     /// Nothing chrome-side. Link, program or local selection decide next.
     Terminal,
 }
@@ -201,6 +182,15 @@ pub(crate) fn left_press(h: &Hits) -> LeftPress {
     if h.settings_open {
         return LeftPress::Settings;
     }
+    if h.card_open
+        && (h.tab_control.is_some()
+            || h.gear
+            || h.divider.is_some()
+            || h.tab.is_some()
+            || h.tab_close.is_some())
+    {
+        return LeftPress::Blocked;
+    }
     if let Some(control) = h.tab_control {
         return LeftPress::TabControl(control);
     }
@@ -212,6 +202,9 @@ pub(crate) fn left_press(h: &Hits) -> LeftPress {
     }
     if let Some(i) = h.divider {
         return LeftPress::Divider(i);
+    }
+    if let Some(i) = h.tab_close {
+        return LeftPress::CloseTab(i);
     }
     if let Some(i) = h.tab {
         return LeftPress::Tab(i);
@@ -276,17 +269,33 @@ impl App {
             return None;
         }
         let width = self.window.as_ref()?.inner_size().width as usize;
-        let titles: Vec<_> = self.tabs.iter().map(|t| t.title.as_str()).collect();
+        // the labels the renderer measured, user names and the broadcast
+        // mark included, or a click would land on the neighbour
+        let labels: Vec<String> = self.tabs.iter().map(|t| t.label()).collect();
+        let titles: Vec<&str> = labels.iter().map(String::as_str).collect();
         tab_index_at(&r.tab_rects(width, &titles, self.active), pos.x)
+    }
+
+    /// Tab whose close × is under the pointer, if any.
+    pub(crate) fn tab_close_at(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
+        let r = self.renderer.as_ref()?;
+        if r.tab_bar_h() == 0.0 || pos.y >= r.tab_bar_h() as f64 {
+            return None;
+        }
+        let width = self.window.as_ref()?.inner_size().width as usize;
+        let labels: Vec<String> = self.tabs.iter().map(|t| t.label()).collect();
+        let titles: Vec<&str> = labels.iter().map(String::as_str).collect();
+        r.tab_close_at(width, &titles, self.active, pos.x, pos.y)
     }
 
     /// Divider index under the pointer (between pane i and i+1), if any.
     pub(crate) fn divider_at(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
         let t = self.tabs.get(self.active)?;
-        if t.panes.len() < 2 {
+        // a zoomed tab shows one pane: there is no divider to grab
+        if t.panes.len() < 2 || t.zoomed {
             return None;
         }
-        divider_index(&self.pane_rects(), t.orientation, pos.x, pos.y)
+        crate::layout::divider_at(&self.dividers(), pos.x, pos.y, DIVIDER_GRAB)
     }
 
     /// The tab-bar arrow or plus under the pointer, and whether the gear is.
@@ -315,7 +324,9 @@ impl App {
             cockpit_row: self.cockpit_row_hit(pos),
             divider: self.divider_at(pos),
             tab: self.tab_at(pos),
+            tab_close: self.tab_close_at(pos),
             drag_strip: self.in_drag_strip(pos),
+            card_open: self.card_open(),
         }
     }
 }
@@ -324,6 +335,60 @@ impl App {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn a_confirm_card_swallows_tab_bar_clicks() {
+        // R-02: no tab switch, ×, arrows, gear or divider under a card
+        let card = Hits {
+            card_open: true,
+            ..Hits::default()
+        };
+        for h in [
+            Hits {
+                tab: Some(1),
+                ..card
+            },
+            Hits {
+                tab_close: Some(1),
+                tab: Some(1),
+                ..card
+            },
+            Hits {
+                tab_control: Some(2),
+                ..card
+            },
+            Hits { gear: true, ..card },
+            Hits {
+                divider: Some(0),
+                ..card
+            },
+        ] {
+            assert_eq!(left_press(&h), LeftPress::Blocked, "{h:?}");
+        }
+        // moving or resizing the window, and the window caption, still work
+        assert_eq!(
+            left_press(&Hits {
+                drag_strip: true,
+                ..card
+            }),
+            LeftPress::DragStrip
+        );
+        assert_eq!(
+            left_press(&Hits {
+                caption: Some(2),
+                ..card
+            }),
+            LeftPress::Caption(Caption::from_index(2))
+        );
+        // and without a card the tab is just a tab
+        assert_eq!(
+            left_press(&Hits {
+                tab: Some(1),
+                ..Hits::default()
+            }),
+            LeftPress::Tab(1)
+        );
+    }
 
     #[test]
     fn edges_and_corners_resolve_and_a_maximized_window_has_none() {
@@ -360,27 +425,6 @@ mod tests {
         assert_eq!(tab_index_at(&spans, 99.5), Some(3));
         assert_eq!(tab_index_at(&spans, 100.0), Some(4));
         assert_eq!(tab_index_at(&spans, 160.0), None);
-    }
-
-    #[test]
-    fn dividers_follow_orientation_and_skip_the_last_pane() {
-        let row = [(0, 0, 100, 50), (100, 0, 100, 50)];
-        assert_eq!(divider_index(&row, Orientation::Row, 96.0, 10.0), Some(0));
-        assert_eq!(divider_index(&row, Orientation::Row, 104.0, 49.0), Some(0));
-        assert_eq!(divider_index(&row, Orientation::Row, 105.0, 10.0), None);
-        assert_eq!(divider_index(&row, Orientation::Row, 100.0, 50.0), None);
-        // the right edge of the last pane is the window, not a divider
-        assert_eq!(divider_index(&row, Orientation::Row, 200.0, 10.0), None);
-        let col = [(0, 0, 100, 50), (0, 50, 100, 50)];
-        assert_eq!(
-            divider_index(&col, Orientation::Column, 10.0, 53.0),
-            Some(0)
-        );
-        assert_eq!(divider_index(&col, Orientation::Column, 10.0, 100.0), None);
-        assert_eq!(
-            divider_index(&row[..1], Orientation::Row, 100.0, 10.0),
-            None
-        );
     }
 
     #[test]
@@ -481,7 +525,16 @@ mod tests {
         assert_eq!(left_press(&h), LeftPress::Divider(0));
         let h = Hits { divider: None, ..h };
         assert_eq!(left_press(&h), LeftPress::Tab(2));
-        let h = Hits { tab: None, ..h };
+        let h = Hits {
+            tab_close: Some(2),
+            ..h
+        };
+        assert_eq!(left_press(&h), LeftPress::CloseTab(2));
+        let h = Hits {
+            tab_close: None,
+            tab: None,
+            ..h
+        };
         assert_eq!(left_press(&h), LeftPress::DragStrip);
         assert_eq!(left_press(&Hits::default()), LeftPress::Terminal);
     }

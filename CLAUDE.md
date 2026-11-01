@@ -21,10 +21,11 @@ selection and BiDi paths must do.
 | `bidi_ctl.rs` | BDSM / SCP (terminal-wg BiDi controls), filtered out of the PTY stream before the parser |
 | `link.rs` | hyperlinks: OSC 8 spans, detected URLs and `path:line`, the narrow open policy |
 | `osc7.rs` | OSC 7 cwd reports, parsed then gated by `term::accept_local_cwd` |
-| `mouse.rs` | mouse tracking modes 1000/1002/1003, SGR vs X10, focus events (1004), right-click paste |
+| `mouse.rs` | mouse tracking modes 1000/1002/1003, SGR vs X10, focus events (1004), who owns a right-click (menu, paste, program) |
 | `keybinds.rs` | action registry + chord map |
 | `keys.rs` | keyboard → VT byte sequences (ported from EasyTer) |
 | `kitty.rs` | kitty keyboard protocol encoder, layout-aware alternate keys |
+| `layout.rs` | a tab's split tree: side-by-side and stacked splits nest in any mix; leaves index the tab's flat pane list |
 | `mru.rs` | most-recently-used tab order for Ctrl+Tab |
 | `shells.rs` | installed-shell detection (ported from EasyTer's `profiles.py`) |
 | `posh.rs` | oh-my-posh theme picker with a live ANSI preview |
@@ -33,7 +34,7 @@ selection and BiDi paths must do.
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-331 tests across the tree. `term.rs` (60), `link.rs` (59) and `render.rs` (42)
+343 tests across the tree. `term.rs` (60), `link.rs` (59) and `render.rs` (42)
 carry the most.
 
 ## Invariants — do not "simplify" these
@@ -126,7 +127,10 @@ session wins deliberately — restoring a tab in the wrong folder is worse than
 ignoring a shortcut — but it is also why a shortcut change appears to do
 nothing: `~/.bayan/session.json` is answering first. Delete it when testing
 start-directory behaviour. The launcher directory is honoured EXCEPT under `%SystemRoot%`,
-because Explorer and the Start menu often hand a process `System32`.
+because Explorer and the Start menu often hand a process `System32`, and
+except when it is Bayan's own folder (Explorer's default cwd — a pane opened
+in Downloads would let cmd run a planted `git.bat`). It passes the same
+`accept_local_cwd` + `usable_spawn_dir` gate as every other start directory.
 
 **Two performance properties are load-bearing.** The shaped-run cache reshapes
 only changed lines (~1.5ms → ~4µs on a cached frame). Differential redraw skips
@@ -164,7 +168,12 @@ already happened once and nearly buried a real fix as a no-op.
 Being a GUI app, most behavior isn't unit-testable. The established loop is
 build → launch → screenshot → inspect → kill. Every debug hook below exists so
 a feature can be reached **without injecting keyboard input** — honour that
-principle when adding new ones:
+principle when adding new ones. The hooks are read through `dev_hook()` in
+`main.rs`: they are live in debug builds and compiled out of release builds
+unless you build with `--features dev-hooks` (BAYAN-010 — `BAYAN_TYPE` types
+into a shell and `BAYAN_PROFILE` writes to `%TEMP%`, so a shipped binary must
+not honour them). Read any new hook through `dev_hook()` too, and never log
+key identity or typed text:
 
 | Env var | Effect |
 |---|---|
@@ -181,7 +190,7 @@ principle when adding new ones:
 | `BAYAN_POSH=1` | open the oh-my-posh prompt picker at startup |
 | `BAYAN_TOAST=<title\|1>` | fire a sample toast at startup (M19 A/B loops without rebuilding) |
 | `BAYAN_ATLAS_STRESS=1` | shape a large spread of unique glyphs to force page-1 atlas growth |
-| `BAYAN_PROFILE=1` | startup timeline marks to `%TEMP%\bayan_profile.log` (EasyTer's `EASYTER_PROFILE` pattern), zero cost when unset |
+| `BAYAN_PROFILE=1` | startup timeline marks to `%TEMP%\bayan_profile.log` (EasyTer's `EASYTER_PROFILE` pattern), zero cost when unset. Key presses log modifiers only, never the key |
 
 Start with `Start-Process -PassThru`, sleep ~6s for GPU init, capture the
 screen with `System.Drawing`, then `Stop-Process` the pid. Pre-approved

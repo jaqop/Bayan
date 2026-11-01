@@ -46,6 +46,12 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_SystemInformation", # GetSystemDirectoryW: loaded kernel32 must sit under System32
 ] }
 
+[features]
+# BAYAN_* environment debug hooks (BAYAN_TYPE, BAYAN_PASTE, BAYAN_PROFILE, …)
+# are always on in debug builds and compiled out of release builds unless
+# this feature is enabled: `cargo build --release --features dev-hooks`.
+dev-hooks = []
+
 [target."cfg(windows)".build-dependencies]
 winresource = "0.1"
 

@@ -8,6 +8,7 @@
 //! left-press order live in `chrome.rs`; link, program and selection
 //! ownership in `link::click_owner` and `mouse::right_click`.
 
+use crate::term::LockExt;
 use std::time::Instant;
 
 use alacritty_terminal::grid::Scroll;
@@ -23,7 +24,7 @@ use winit::window::{CursorIcon, ResizeDirection};
 use crate::chrome::{self, Caption, LeftPress, TabControl};
 use crate::{
     blur_forgets_held_keys, consume_guard_release, keybinds, link, mouse, prepare_window_close,
-    term, App, Orientation,
+    render, term, App, Orientation,
 };
 
 /// The font zoom range, in points on top of the configured size.
@@ -262,11 +263,21 @@ impl App {
         match event {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = *position;
+                self.menu_hover();
                 true
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if *button == MouseButton::Left {
                     self.palette_click(*state, el);
+                } else if *button == MouseButton::Right
+                    && *state == ElementState::Pressed
+                    && self.palette.as_ref().is_some_and(|p| p.menu.is_some())
+                {
+                    // a second right-click moves the menu to the new spot,
+                    // on whichever pane is under it now
+                    self.palette = None;
+                    self.right_press();
+                    self.request_redraw();
                 }
                 true
             }
@@ -301,14 +312,7 @@ impl App {
             return;
         };
         let rows = self.palette_rows(&p.query);
-        let layout = self
-            .renderer
-            .as_ref()
-            .zip(self.window.as_ref())
-            .map(|(r, w)| {
-                let size = w.inner_size();
-                r.palette_layout(size.width as usize, size.height as usize, rows.len(), p.sel)
-            });
+        let layout = self.palette_geometry(rows.len(), p.sel);
         let (x, y) = (self.cursor_pos.x, self.cursor_pos.y);
         let hit = layout.as_ref().and_then(|l| l.row_at(x, y));
         if state == ElementState::Pressed {
@@ -326,6 +330,37 @@ impl App {
             }
         }
         self.request_redraw();
+    }
+
+    /// Where the palette is on screen: centred, or as the right-click
+    /// popup at its anchor. Painting and hit-testing both ask here.
+    fn palette_geometry(&self, count: usize, sel: usize) -> Option<render::PaletteLayout> {
+        let p = self.palette.as_ref()?;
+        let (r, w) = self.renderer.as_ref().zip(self.window.as_ref())?;
+        let size = w.inner_size();
+        let (fw, fh) = (size.width as usize, size.height as usize);
+        Some(match p.menu {
+            Some(anchor) => r.menu_layout(fw, fh, count, anchor),
+            None => r.palette_layout(fw, fh, count, sel),
+        })
+    }
+
+    /// In the menu the row under the pointer is the selected one, like any
+    /// native popup. A redraw only when it changed.
+    fn menu_hover(&mut self) {
+        let Some(p) = self.palette.as_ref().filter(|p| p.menu.is_some()) else {
+            return;
+        };
+        let count = self.palette_rows(&p.query).len();
+        let hit = self
+            .palette_geometry(count, p.sel)
+            .and_then(|l| l.row_at(self.cursor_pos.x, self.cursor_pos.y));
+        if let (Some(i), Some(p)) = (hit, self.palette.as_mut()) {
+            if p.sel != i {
+                p.sel = i;
+                self.request_redraw();
+            }
+        }
     }
 
     /// `WindowEvent::CursorMoved`, after the modals.
@@ -374,8 +409,10 @@ impl App {
         let cell = self.refresh_link_hover(position);
         if let Some(w) = &self.window {
             let edge = self.resize_edge_at(position);
-            let on_divider = edge.is_none() && self.divider_at(position).is_some();
-            let orientation = self.tabs.get(self.active).map(|t| t.orientation);
+            let divider = edge.is_none().then(|| self.divider_at(position)).flatten();
+            let on_divider = divider.is_some();
+            // the cursor follows the divider under it: nested splits mix both
+            let orientation = divider.and_then(|d| self.dividers().get(d).map(|d| d.axis));
             w.set_cursor(hover_cursor(
                 edge,
                 on_divider,
@@ -463,7 +500,7 @@ impl App {
             };
             // term, then meta — the lock order the reader uses too.
             let mode = *session.term.lock().mode();
-            let at_prompt = session.meta.lock().unwrap().at_prompt;
+            let at_prompt = session.meta.lock_or_recover().at_prompt;
             (arg, mode, at_prompt)
         };
         let alt = mode.contains(TermMode::ALT_SCREEN);
@@ -473,7 +510,9 @@ impl App {
             } else {
                 term::PasteRisk::NotAtPrompt
             };
-            self.arm_pending_paste(arg, Some(why));
+            // R-01: quoted for THIS pane's shell, so it goes to this pane
+            // only, even with broadcast on
+            self.arm_pending_drop(arg, Some(why));
         } else if let Some(s) = self.session_mut() {
             let body = term::normalize_paste(&arg, mode.contains(TermMode::BRACKETED_PASTE));
             s.write(body.as_bytes());
@@ -532,6 +571,16 @@ impl App {
             ElementState::Pressed => match press_route(button) {
                 Press::Right => self.right_press(),
                 Press::Report(b) => {
+                    // middle-click on a tab closes it (browser convention);
+                    // otherwise report to the program when it asked
+                    // R-02: not while a confirm card is up — closing a tab
+                    // under it would hand the card to another pane
+                    if b == mouse::Btn::Middle && !self.card_open() {
+                        if let Some(i) = self.tab_at(self.cursor_pos) {
+                            self.request_close_tab(i, el);
+                            return;
+                        }
+                    }
                     let _ = self.try_report_press(b);
                 }
                 Press::Left => self.left_press(el),
@@ -558,6 +607,12 @@ impl App {
                 self.sync_focus(None);
                 self.paste();
             }
+            Some((pane, mouse::RightClick::Menu)) => {
+                // the menu acts on the pane that was clicked
+                self.focus_pane_at(pane);
+                self.sync_focus(None);
+                self.open_context_menu();
+            }
             Some((_, mouse::RightClick::Blocked)) | None => {}
         }
     }
@@ -576,6 +631,12 @@ impl App {
         self.cursor_pos =
             PhysicalPosition::new(x as f64 + w as f64 / 2.0, y as f64 + h as f64 / 2.0);
         self.right_press();
+        // With the menu on (the default), the click opened it: take its
+        // لصق row, which is what the user would click next.
+        if self.palette.as_ref().is_some_and(|p| p.menu.is_some()) {
+            self.palette = None;
+            self.paste();
+        }
     }
 
     /// The chrome first, in `chrome::left_press` order, then the terminal.
@@ -622,6 +683,8 @@ impl App {
             }
             LeftPress::Divider(i) => self.drag_divider = Some(i),
             LeftPress::Tab(i) => self.switch_tab(i),
+            LeftPress::CloseTab(i) => self.request_close_tab(i, el),
+            LeftPress::Blocked => {}
             LeftPress::DragStrip => {
                 // the two gestures a real title bar owes the user
                 if let Some(w) = self.window.as_ref() {

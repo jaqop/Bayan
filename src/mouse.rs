@@ -138,6 +138,20 @@ pub enum RightClick {
     Program,
     /// A card or panel is up. Nothing is copied, pasted or reported.
     Blocked,
+    /// Open the context menu at the pointer (`right_click = "menu"`, the
+    /// default). Paste and copy are its first rows.
+    Menu,
+}
+
+/// The menu takes the clicks that would have copied or pasted. A program
+/// that tracks the mouse still hears the click, Shift still keeps it local,
+/// and an overlay still blocks it, so the menu changes nothing about who
+/// owns the click, only what a local one does.
+pub fn with_menu(decision: RightClick, menu: bool) -> RightClick {
+    match decision {
+        RightClick::Copy | RightClick::Paste if menu => RightClick::Menu,
+        other => other,
+    }
 }
 
 /// `overlay` wins, then the program (unless Shift keeps the click local),
@@ -1428,5 +1442,25 @@ mod tests {
         let off = route.sync_focus(false, Some(1), wants);
         assert_eq!(off[0].bytes, b"\x1b[O");
         assert_eq!(route.focus_sent(), None);
+    }
+
+    #[test]
+    fn the_menu_replaces_local_copy_and_paste_only() {
+        use RightClick::*;
+        assert_eq!(with_menu(Paste, true), Menu);
+        assert_eq!(with_menu(Copy, true), Menu);
+        assert_eq!(with_menu(Program, true), Program, "vim still hears it");
+        assert_eq!(with_menu(Blocked, true), Blocked);
+        assert_eq!(
+            with_menu(Paste, false),
+            Paste,
+            "right_click = paste keeps M36"
+        );
+        assert_eq!(with_menu(Copy, false), Copy);
+        // Shift on a tracking program is local, so it opens the menu
+        assert_eq!(
+            with_menu(right_click(false, true, true, false, true), true),
+            Menu
+        );
     }
 }
