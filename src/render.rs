@@ -328,6 +328,15 @@ fn arabic_lines(n: usize) -> String {
     }
 }
 
+/// "1 line", "3 lines": the English counted noun.
+fn english_count(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
 /// Same rule, for characters.
 fn arabic_chars(n: usize) -> String {
     match n {
@@ -810,6 +819,9 @@ pub struct SettingsLayout {
     pub rowh: i32,
     /// header button that opens the shortcuts editor
     pub shortcuts_btn: Rect,
+    /// the interface-language switch, beside the shortcuts button; it
+    /// names the OTHER language in that language
+    pub lang_btn: Rect,
     pub theme_tiles: Vec<Rect>,
     pub font_label_y: i32,
     pub font_prev: Rect,
@@ -817,6 +829,9 @@ pub struct SettingsLayout {
     pub size_label_y: i32,
     pub size_minus: Rect,
     pub size_plus: Rect,
+    pub arabic_label_y: i32,
+    pub arabic_prev: Rect,
+    pub arabic_next: Rect,
     pub cursor_label_y: i32,
     pub cursor_btns: [Rect; 3],
     pub blink_label_y: i32,
@@ -848,6 +863,55 @@ pub struct SettingsLayout {
     pub close_toggle: Rect,
 }
 
+/// Move a group of rects to the mirror-image position across the card
+/// `(x, w)`, keeping their order: "− 16 +" stays "− 16 +", it just moves
+/// to the other side. Flipping each rect alone would put "›" left of "‹".
+fn mirror_group(rects: &mut [Rect], x: i32, w: i32) {
+    let lo = rects.iter().map(|r| r.0).min().unwrap_or(x);
+    let hi = rects.iter().map(|r| r.0 + r.2).max().unwrap_or(x);
+    // [lo, hi] maps to [2x + w - hi, 2x + w - lo]
+    let dx = 2 * x + w - hi - lo;
+    for r in rects {
+        r.0 += dx;
+    }
+}
+
+impl SettingsLayout {
+    /// English: the ledger mirrored, labels left and controls right. Every
+    /// hit test reads this same layout, so clicks follow the drawing.
+    fn mirror(&mut self, x: i32, w: i32) {
+        let mut head = [self.shortcuts_btn, self.lang_btn];
+        mirror_group(&mut head, x, w);
+        [self.shortcuts_btn, self.lang_btn] = head;
+        mirror_group(&mut self.theme_tiles, x, w);
+        for pair in [
+            (&mut self.font_prev, &mut self.font_next),
+            (&mut self.size_minus, &mut self.size_plus),
+            (&mut self.arabic_prev, &mut self.arabic_next),
+            (&mut self.scroll_minus, &mut self.scroll_plus),
+            (&mut self.pad_minus, &mut self.pad_plus),
+            (&mut self.opacity_minus, &mut self.opacity_plus),
+            (&mut self.shell_prev, &mut self.shell_next),
+        ] {
+            let mut g = [*pair.0, *pair.1];
+            mirror_group(&mut g, x, w);
+            (*pair.0, *pair.1) = (g[0], g[1]);
+        }
+        mirror_group(&mut self.cursor_btns, x, w);
+        mirror_group(&mut self.bell_btns, x, w);
+        for t in [
+            &mut self.blink_toggle,
+            &mut self.copy_toggle,
+            &mut self.liga_toggle,
+            &mut self.notif_toggle,
+            &mut self.bar_toggle,
+            &mut self.close_toggle,
+        ] {
+            mirror_group(std::slice::from_mut(t), x, w);
+        }
+    }
+}
+
 /// The bell segments' modes in bell_btns order (left→right on screen, so
 /// the RTL-first default تنبيه sits rightmost, beside the label).
 pub const BELL_SEGMENTS: [crate::config::BellMode; 3] = [
@@ -861,6 +925,8 @@ pub struct SettingsView<'a> {
     pub theme: usize,
     pub font_family: &'a str,
     pub font_size: i32,
+    /// the Arabic font's name, or the "Auto" label
+    pub arabic_font: &'a str,
     pub cursor: crate::config::CursorStyle,
     pub cursor_blink: bool,
     pub scrollback: usize,
@@ -1289,6 +1355,83 @@ fn base_attrs<'a>() -> Attrs<'a> {
     Attrs::new().family(Family::Name("Consolas"))
 }
 
+/// Letters a font must map to count as an Arabic font: beh, ain, heh, yeh
+/// and lam-alef's lam. A font with one stray Arabic glyph (a symbol font,
+/// a Latin font with a currency sign) does not pass.
+const ARABIC_PROBE: [char; 5] = ['ب', 'ع', 'ه', 'ي', 'ل'];
+
+/// Does `face` (raw data + collection index) map every probe letter?
+fn data_covers_arabic(data: &[u8], index: u32) -> bool {
+    use cosmic_text::skrifa::{FontRef, MetadataProvider};
+    FontRef::from_index(data, index).is_ok_and(|f| {
+        let cmap = f.charmap();
+        ARABIC_PROBE.iter().all(|&c| cmap.map(c).is_some())
+    })
+}
+
+/// Is `family` installed with at least one face that draws Arabic?
+fn face_covers_arabic(db: &cosmic_text::fontdb::Database, family: &str) -> bool {
+    db.faces()
+        .filter(|f| f.families.iter().any(|(n, _)| n == family))
+        .any(|f| db.with_face_data(f.id, data_covers_arabic).unwrap_or(false))
+}
+
+/// A family name worth listing: not a vertical-writing alias ("@MS Gothic")
+/// and not empty.
+fn listable_family(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('@')
+}
+
+/// Every installed family that draws Arabic, sorted, the bundled Amiri
+/// included. One cmap lookup per face, across every face on the system,
+/// so it runs once per process: fonts installed while Bayan runs appear
+/// after a restart, as in other Windows apps.
+fn arabic_families(db: &cosmic_text::fontdb::Database) -> Vec<String> {
+    static CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let mut out: Vec<String> = db
+                .faces()
+                .filter(|f| db.with_face_data(f.id, data_covers_arabic).unwrap_or(false))
+                .filter_map(|f| f.families.first().map(|(n, _)| n.clone()))
+                .filter(|n| listable_family(n))
+                .collect();
+            out.sort_by_key(|n| n.to_lowercase());
+            out.dedup();
+            out
+        })
+        .clone()
+}
+
+/// The font cycler's list: the known programming fonts first, in their
+/// preference order, then every other installed MONOSPACED family
+/// alphabetically — so a font the user installs (Ubuntu Mono, Kawkab Mono,
+/// Noto Sans Mono…) shows up without Bayan having heard of it.
+fn monospace_choices(db: &cosmic_text::fontdb::Database, current: &str) -> Vec<String> {
+    let has = |name: &str| {
+        db.faces()
+            .any(|f| f.families.iter().any(|(n, _)| n == name))
+    };
+    let mut out: Vec<String> = FONT_CANDIDATES
+        .iter()
+        .filter(|c| has(c))
+        .map(|c| c.to_string())
+        .collect();
+    let mut rest: Vec<String> = db
+        .faces()
+        .filter(|f| f.monospaced)
+        .filter_map(|f| f.families.first().map(|(n, _)| n.clone()))
+        .filter(|n| listable_family(n) && !out.contains(n))
+        .collect();
+    rest.sort_by_key(|n| n.to_lowercase());
+    rest.dedup();
+    out.extend(rest);
+    if !out.iter().any(|c| c == current) {
+        out.insert(0, current.to_string());
+    }
+    out
+}
+
 // text style bits carried per segment (baked into the shaped run)
 pub(crate) const ST_BOLD: u8 = 1;
 pub(crate) const ST_ITALIC: u8 = 2;
@@ -1350,6 +1493,9 @@ pub struct Renderer {
     cache_cold: std::collections::HashMap<RunKey, ShapedRun>,
     pub atlas: Atlas,
     family: String,
+    /// the family Arabic runs in the terminal use; `None` keeps the
+    /// terminal font's own Arabic (the behaviour before this setting)
+    arabic_family: Option<String>,
     /// Window chrome is being drawn (between `use_ui_metrics(true)` and
     /// `(false)`): Arabic in it uses the proportional UI font.
     ui_text: bool,
@@ -1363,6 +1509,8 @@ pub struct Renderer {
     /// hide-tab-bar-with-one-tab, resolved per frame by the app (the
     /// renderer can't know the tab count)
     bar_hidden: bool,
+    /// the active group's chip at the bar's leading edge (`set_group_chip`)
+    group_chip: Option<(String, bool)>,
     pub cell_w: f32,
     pub cell_h: f32,
 }
@@ -1395,16 +1543,30 @@ pub fn menu_origin(anchor: (f64, f64), size: (i32, i32), frame: (i32, i32)) -> (
     let (ax, ay) = (anchor.0.round() as i32, anchor.1.round() as i32);
     let (w, h) = size;
     let (fw, fh) = frame;
-    let x = if ax - w >= 0 { ax - w } else { ax };
+    // Arabic opens to the LEFT of the pointer, English to the right; each
+    // flips when there is no room on its side
+    let x = if crate::lang::rtl() {
+        if ax - w >= 0 {
+            ax - w
+        } else {
+            ax
+        }
+    } else if ax + w <= fw {
+        ax
+    } else {
+        ax - w
+    };
     let y = if ay + h <= fh { ay } else { ay - h };
     (x.clamp(0, (fw - w).max(0)), y.clamp(0, (fh - h).max(0)))
 }
 
 pub(crate) fn palette_hint(count: usize) -> String {
     if count == 0 {
-        "لا نتائج · Esc إغلاق".to_string()
-    } else {
+        crate::lang::tr("لا نتائج · Esc إغلاق", "No results · Esc close").to_string()
+    } else if crate::lang::rtl() {
         format!("{count} نتيجة · Enter تشغيل · ↑↓ تنقّل · Esc إغلاق")
+    } else {
+        format!("{count} results · Enter run · ↑↓ move · Esc close")
     }
 }
 
@@ -1417,6 +1579,12 @@ impl Renderer {
         font_system.db_mut().load_font_data(AMIRI_BOLD.to_vec());
         let ligatures = cfg.ligatures.unwrap_or(true);
         let family = pick_family(font_system.db(), cfg.font_family.as_deref(), ligatures);
+        // only a family that is installed and draws Arabic; a stale name in
+        // config.json falls back to Auto instead of to a font without it
+        let arabic_family = cfg
+            .arabic_font
+            .clone()
+            .filter(|f| face_covers_arabic(font_system.db(), f));
         let size =
             (cfg.font_size.unwrap_or(DEFAULT_FONT_SIZE) + extra_pts).clamp(8.0, 40.0) * scale;
         let metrics = Metrics::new(size, (size * 1.4).ceil());
@@ -1477,11 +1645,13 @@ impl Renderer {
             cache_cold: std::collections::HashMap::new(),
             atlas: Atlas::new(),
             family,
+            arabic_family,
             bg,
             fg,
             palette,
             ligatures,
             bar_hidden: false,
+            group_chip: None,
             ui_text: false,
             cell_w,
             cell_h: metrics.line_height,
@@ -1491,6 +1661,41 @@ impl Renderer {
     /// The app resolves "hide the bar with a single tab" each layout pass.
     pub fn set_bar_hidden(&mut self, hidden: bool) {
         self.bar_hidden = hidden;
+    }
+
+    /// The active group's chip (label, another group wants attention), or
+    /// `None` with one group — then the bar is exactly the old bar. Set
+    /// each frame, like `set_bar_hidden`; the tab rects start after it,
+    /// so drawing and hit-testing share one geometry.
+    pub fn set_group_chip(&mut self, chip: Option<(String, bool)>) {
+        self.group_chip = chip;
+    }
+
+    /// Where the group chip is drawn, when there is one.
+    fn group_chip_rect(&self) -> Option<Rect> {
+        if self.bar_hidden {
+            return None;
+        }
+        let (label, _) = self.group_chip.as_ref()?;
+        let oy = self.tab_bar_h().round() as i32;
+        // counted, not measured, for the reason `tab_width` gives; +5 is
+        // the padding, the step mark and the attention dot
+        let cells = (label.chars().count() as f32 + 5.0).clamp(6.0, 22.0);
+        let w = (self.ui_cell_w() * cells) as i32;
+        Some((4, 7, w, oy - 7 - 4))
+    }
+
+    /// Is (px, py) on the group chip? The whole bar height counts, so the
+    /// chip is as easy to hit as a tab.
+    pub fn group_chip_hit(&self, px: f64, py: f64) -> bool {
+        let oy = self.tab_bar_h() as f64;
+        self.group_chip_rect()
+            .is_some_and(|(x, _, w, _)| px >= x as f64 && px < (x + w) as f64 && py < oy)
+    }
+
+    /// Where the first tab starts: after the chip and a gap, else at 0.
+    fn tabs_x0(&self) -> i32 {
+        self.group_chip_rect().map_or(0, |(x, _, w, _)| x + w + 6)
     }
 
     pub fn begin_frame(&mut self) {
@@ -1574,20 +1779,17 @@ impl Renderer {
     /// Installed candidates for the settings panel's font cycler. Always
     /// contains the current family so the cycle has a starting point.
     pub fn font_choices(&self) -> Vec<String> {
-        let db = self.font_system.db();
-        let has = |name: &str| {
-            db.faces()
-                .any(|f| f.families.iter().any(|(n, _)| n == name))
-        };
-        let mut out: Vec<String> = FONT_CANDIDATES
-            .iter()
-            .filter(|c| has(c))
-            .map(|c| c.to_string())
-            .collect();
-        if !out.contains(&self.family) {
-            out.insert(0, self.family.clone());
-        }
-        out
+        monospace_choices(self.font_system.db(), &self.family)
+    }
+
+    /// Installed families that draw Arabic, for the Arabic-font cycler.
+    pub fn arabic_font_choices(&self) -> Vec<String> {
+        arabic_families(self.font_system.db())
+    }
+
+    /// The Arabic font in use, or `None` for Auto.
+    pub fn arabic_family(&self) -> Option<&str> {
+        self.arabic_family.as_deref()
     }
 
     fn named_rgb(&self, name: NamedColor) -> (u8, u8, u8) {
@@ -1661,6 +1863,12 @@ impl Renderer {
         let base = Attrs::new().family(Family::Name(self.family.as_str()));
         let ui_arabic = Attrs::new().family(Family::Name(UI_ARABIC_FAMILY));
         let ui_text = self.ui_text;
+        // terminal rows: Arabic runs in the chosen Arabic font, if any
+        let term_arabic = self
+            .arabic_family
+            .as_deref()
+            .filter(|_| !ui_text)
+            .map(|f| Attrs::new().family(Family::Name(f)));
         let rich: Vec<(&str, Attrs)> = segs
             .iter()
             .flat_map(|s| {
@@ -1679,15 +1887,17 @@ impl Renderer {
                 // The terminal font's Arabic (Cascadia Code) is monospaced,
                 // so every letter is stretched to a full cell — fine on the
                 // grid, ugly in a menu. Terminal rows never take this path.
-                let runs = if ui_text {
+                let runs = if ui_text || term_arabic.is_some() {
                     ui_font_runs(&s.text)
                 } else {
                     vec![(0..s.text.len(), false)]
                 };
                 runs.into_iter()
                     .map(|(r, arabic)| {
-                        let a = if arabic {
+                        let a = if arabic && ui_text {
                             style(&ui_arabic, s)
+                        } else if let (true, Some(t)) = (arabic, term_arabic.as_ref()) {
+                            style(t, s)
                         } else {
                             style(&base, s)
                         };
@@ -2772,7 +2982,7 @@ impl Renderer {
         let row_h = self.cockpit_row_h();
         // header (bold — and a live proof the style pipeline works)
         let head = [Seg {
-            text: "مقصورة الوكلاء".into(),
+            text: crate::lang::tr("مقصورة الوكلاء", "Agent cockpit").into(),
             fg: self.fg,
             style: ST_BOLD,
         }];
@@ -2873,10 +3083,18 @@ impl Renderer {
         // controls left, labels right (RTL), one shared control height.
         let pad = 24;
         let w = ((self.ui_cell_w() * 52.0) as i32).clamp(430, fw as i32 - 60);
-        let rowh = (self.ui_cell_h() + 12.0 * self.dpi_scale) as i32;
-        let ctl = rowh - 4;
         let head_h = (self.ui_cell_h() + 18.0 * self.dpi_scale) as i32;
         let foot_h = (self.ui_cell_h() + 18.0 * self.dpi_scale) as i32;
+        // 15 rows since the Arabic-font row: at the roomy height the card
+        // ran past a 700px window's bottom edge, so rows tighten to fit the
+        // window, down to a floor that still holds a control around text
+        let bar = self.tab_bar_h() as i32;
+        let theme_h = (self.ui_cell_h() * 1.3) as i32 + 14;
+        let roomy = (self.ui_cell_h() + 12.0 * self.dpi_scale) as i32;
+        let tight = (self.ui_cell_h() + 6.0 * self.dpi_scale) as i32;
+        let room = fh as i32 - bar - 24 - head_h - 6 - theme_h - foot_h;
+        let rowh = (room / 15).clamp(tight, roomy);
+        let ctl = rowh - 4;
         // the theme row obeys the same grammar: tiles left, label right,
         // so the strip leaves room for the "المظهر" label
         let label_reserve = (self.ui_cell_w() * 6.0) as i32;
@@ -2886,13 +3104,18 @@ impl Renderer {
         let tile_w = ((w - pad * 2 - label_reserve - 6 * (n_tiles - 1)) / n_tiles).max(30);
         let tile_h = (self.ui_cell_h() * 1.3) as i32;
         let theme_rowh = tile_h + 14;
-        let h = head_h + 6 + theme_rowh + rowh * 14 + foot_h;
+        let h = head_h + 6 + theme_rowh + rowh * 15 + foot_h;
         let x = (fw as i32 - w) / 2;
-        let y = (self.tab_bar_h() as i32 + (fh as i32 - h) / 3).max(self.tab_bar_h() as i32 + 12);
+        // a third of the spare height above, but never past the bottom
+        let y = (bar + (fh as i32 - h) / 3)
+            .min(fh as i32 - h - 12)
+            .max(bar + 12);
 
         // the shortcuts-editor button lives in the header, left side
         let sb_w = (self.ui_cell_w() * 12.0) as i32;
         let shortcuts_btn = (x + pad, y + 10, sb_w, (self.ui_cell_h() + 8.0) as i32);
+        let lb_w = (self.ui_cell_w() * 9.0) as i32;
+        let lang_btn = (x + pad + sb_w + 8, y + 10, lb_w, shortcuts_btn.3);
 
         let theme_y = y + head_h + 6 + (theme_rowh - tile_h) / 2;
         let theme_tiles: Vec<Rect> = (0..gallery().len() as i32)
@@ -2915,64 +3138,74 @@ impl Renderer {
         let size_minus = (x + pad, cy(size_y), ctl, ctl);
         let size_plus = (x + pad + ctl + size_slot, cy(size_y), ctl, ctl);
 
+        // Arabic font: [‹] name [›] — which installed font draws Arabic
+        // in the terminal ("Auto" keeps the terminal font's own Arabic)
+        let arabic_y = row_y(2);
+        let arabic_prev = (x + pad, cy(arabic_y), ctl, ctl);
+        let arabic_next = (x + pad + ctl + name_w, cy(arabic_y), ctl, ctl);
+
         // cursor style: three shape swatches, then its blink toggle
-        let cursor_y = row_y(2);
+        let cursor_y = row_y(3);
         let cursor_btns = [0, 1, 2].map(|i| (x + pad + i * (ctl + 8), cy(cursor_y), ctl, ctl));
 
         // toggle pills (wide and shallow, so the track reads as a switch)
         let pill_w = (self.ui_cell_w() * 4.2) as i32;
         let pill_h = ctl - 8;
         let pcy = |ry: i32| ry + (rowh - pill_h) / 2;
-        let blink_y = row_y(3);
+        let blink_y = row_y(4);
         let blink_toggle = (x + pad, pcy(blink_y), pill_w, pill_h);
 
         // scrollback: [−  10k  +]
-        let scroll_y = row_y(4);
+        let scroll_y = row_y(5);
         let scroll_slot = (self.ui_cell_w() * 5.0) as i32;
         let scroll_minus = (x + pad, cy(scroll_y), ctl, ctl);
         let scroll_plus = (x + pad + ctl + scroll_slot, cy(scroll_y), ctl, ctl);
 
         // padding / opacity: the same stepper shape
-        let pad_y = row_y(5);
+        let pad_y = row_y(6);
         let pad_slot = (self.ui_cell_w() * 4.0) as i32;
         let pad_minus = (x + pad, cy(pad_y), ctl, ctl);
         let pad_plus = (x + pad + ctl + pad_slot, cy(pad_y), ctl, ctl);
-        let opacity_y = row_y(6);
+        let opacity_y = row_y(7);
         let op_slot = (self.ui_cell_w() * 5.0) as i32;
         let opacity_minus = (x + pad, cy(opacity_y), ctl, ctl);
         let opacity_plus = (x + pad + ctl + op_slot, cy(opacity_y), ctl, ctl);
 
-        let copy_y = row_y(7);
+        let copy_y = row_y(8);
         let copy_toggle = (x + pad, pcy(copy_y), pill_w, pill_h);
-        let liga_y = row_y(8);
+        let liga_y = row_y(9);
         let liga_toggle = (x + pad, pcy(liga_y), pill_w, pill_h);
 
         // bell: a three-segment control (all options visible, one active)
-        let bell_y = row_y(9);
-        let seg_w = (self.ui_cell_w() * 4.6) as i32;
+        let bell_y = row_y(10);
+        // «صامت / صوت / تنبيه» fit 4.6 cells; "Silent / Sound / Alert"
+        // overran each other at that width, so English gets more room
+        let seg_cells = if crate::lang::rtl() { 4.6 } else { 7.2 };
+        let seg_w = (self.ui_cell_w() * seg_cells) as i32;
         let bell_btns = [0, 1, 2].map(|i| (x + pad + i * (seg_w + 6), cy(bell_y), seg_w, ctl));
 
         // native-toast toggle (M19)
-        let notif_y = row_y(10);
+        let notif_y = row_y(11);
         let notif_toggle = (x + pad, pcy(notif_y), pill_w, pill_h);
 
         // shell cycler (new tabs only) — same shape as the font cycler
-        let shell_y = row_y(11);
+        let shell_y = row_y(12);
         let shell_w = (self.ui_cell_w() * 12.0) as i32;
         let shell_prev = (x + pad, cy(shell_y), ctl, ctl);
         let shell_next = (x + pad + ctl + shell_w, cy(shell_y), ctl, ctl);
 
         // hide-bar / confirm-close toggles
-        let bar_y = row_y(12);
+        let bar_y = row_y(13);
         let bar_toggle = (x + pad, pcy(bar_y), pill_w, pill_h);
-        let close_y = row_y(13);
+        let close_y = row_y(14);
         let close_toggle = (x + pad, pcy(close_y), pill_w, pill_h);
 
-        SettingsLayout {
+        let mut lay = SettingsLayout {
             card: (x, y, w, h),
             head_h,
             rowh,
             shortcuts_btn,
+            lang_btn,
             theme_tiles,
             font_label_y: font_y,
             font_prev,
@@ -2980,6 +3213,9 @@ impl Renderer {
             size_label_y: size_y,
             size_minus,
             size_plus,
+            arabic_label_y: arabic_y,
+            arabic_prev,
+            arabic_next,
             cursor_label_y: cursor_y,
             cursor_btns,
             blink_label_y: blink_y,
@@ -3008,7 +3244,11 @@ impl Renderer {
             bar_toggle,
             close_label_y: close_y,
             close_toggle,
+        };
+        if !crate::lang::rtl() {
+            lay.mirror(x, w);
         }
+        lay
     }
 
     /// The settings ledger: every row reads [control] ··· [label], leader
@@ -3039,7 +3279,7 @@ impl Renderer {
 
         // title + hairline under it
         let head = [Seg {
-            text: "الإعدادات".into(),
+            text: crate::lang::tr("الإعدادات", "Settings").into(),
             fg: self.fg,
             style: ST_BOLD,
         }];
@@ -3049,7 +3289,7 @@ impl Renderer {
             true,
             out,
             whole,
-            (x + w - pad) as f32 - hw,
+            crate::lang::lead_x(x, w, pad, hw.ceil() as i32) as f32,
             y + 14,
             1.0,
         );
@@ -3063,12 +3303,21 @@ impl Renderer {
             c4(EDGE, 255),
         );
 
-        // the shortcuts-editor button (header, left)
-        {
-            let (bx, by, bw, bh) = lay.shortcuts_btn;
+        // the shortcuts-editor and language buttons (header, far edge). The
+        // language button is written in the language it switches TO, so a
+        // reader of either one can find the way back.
+        let other = crate::lang::get().other().native_name();
+        for (rect, text) in [
+            (
+                lay.shortcuts_btn,
+                crate::lang::tr("الاختصارات ‹", "Shortcuts ›"),
+            ),
+            (lay.lang_btn, other),
+        ] {
+            let (bx, by, bw, bh) = rect;
             push_rect(out, whole, bx - 1, by - 1, bw + 2, bh + 2, c4(EDGE, 255));
             push_rect(out, whole, bx, by, bw, bh, c4(CTL_BG, 255));
-            let seg = [Seg::plain("الاختصارات ‹", MUTED)];
+            let seg = [Seg::plain(text, MUTED)];
             let lw = self.measure(&seg, true);
             self.draw_run(
                 &seg,
@@ -3081,16 +3330,28 @@ impl Renderer {
             );
         }
 
-        // right-aligned row label; returns where the leader dots must stop
+        // row label at the reading edge; returns its INNER edge, where the
+        // leader dots must stop (its left in Arabic, its right in English)
         let label = |r: &mut Self, out: &mut Vec<Vertex>, text: &str, row_top: i32| -> i32 {
             let seg = [Seg::plain(text, MUTED)];
-            let lw = r.measure(&seg, true);
-            let lx = (x + w - pad) as f32 - lw;
-            r.draw_run(&seg, true, out, whole, lx, row_top + tc, 1.0);
-            lx as i32
+            let lw = r.measure(&seg, true).ceil() as i32;
+            let lx = crate::lang::lead_x(x, w, pad, lw);
+            r.draw_run(&seg, true, out, whole, lx as f32, row_top + tc, 1.0);
+            if crate::lang::rtl() {
+                lx
+            } else {
+                lx + lw
+            }
         };
-        // the ledger dots: from a control's right edge to its label
-        let leader = |out: &mut Vec<Vertex>, from_x: i32, to_x: i32, row_top: i32| {
+        // the ledger dots: between a row's control group and its label
+        let leader = |out: &mut Vec<Vertex>, group: &[Rect], label_edge: i32, row_top: i32| {
+            let lo = group.iter().map(|r| r.0).min().unwrap_or(x);
+            let hi = group.iter().map(|r| r.0 + r.2).max().unwrap_or(x);
+            let (from_x, to_x) = if crate::lang::rtl() {
+                (hi, label_edge)
+            } else {
+                (label_edge, lo)
+            };
             let dy = row_top + lay.rowh / 2 - 1;
             let mut dx = from_x + 16;
             while dx + 2 <= to_x - 14 {
@@ -3109,9 +3370,8 @@ impl Renderer {
         // ---- theme row (same grammar: tiles ··· label) ----
         let theme_top = lay.theme_tiles[0].1;
         let theme_row_top = theme_top - (lay.rowh - lay.theme_tiles[0].3) / 2;
-        let tl = label(self, out, "المظهر", theme_row_top);
-        let last = lay.theme_tiles[lay.theme_tiles.len() - 1];
-        leader(out, last.0 + last.2, tl, theme_row_top);
+        let tl = label(self, out, crate::lang::tr("المظهر", "Theme"), theme_row_top);
+        leader(out, &lay.theme_tiles, tl, theme_row_top);
         let all = gallery();
         for (i, tile) in lay.theme_tiles.iter().enumerate() {
             let (tx, ty, tw2, th) = *tile;
@@ -3215,8 +3475,8 @@ impl Renderer {
         };
 
         // ---- font family cycler ----
-        let ll = label(self, out, "الخطّ", lay.font_label_y);
-        leader(out, lay.font_next.0 + lay.font_next.2, ll, lay.font_label_y);
+        let ll = label(self, out, crate::lang::tr("الخطّ", "Font"), lay.font_label_y);
+        leader(out, &[lay.font_prev, lay.font_next], ll, lay.font_label_y);
         draw_btn(self, out, lay.font_prev, "‹");
         draw_btn(self, out, lay.font_next, "›");
         draw_val(
@@ -3229,8 +3489,13 @@ impl Renderer {
         );
 
         // ---- font size stepper ----
-        let ll = label(self, out, "حجم الخطّ", lay.size_label_y);
-        leader(out, lay.size_plus.0 + lay.size_plus.2, ll, lay.size_label_y);
+        let ll = label(
+            self,
+            out,
+            crate::lang::tr("حجم الخطّ", "Font size"),
+            lay.size_label_y,
+        );
+        leader(out, &[lay.size_minus, lay.size_plus], ll, lay.size_label_y);
         draw_btn(self, out, lay.size_minus, "−");
         draw_btn(self, out, lay.size_plus, "+");
         draw_val(
@@ -3242,10 +3507,38 @@ impl Renderer {
             lay.size_label_y,
         );
 
+        // ---- Arabic font cycler ----
+        let ll = label(
+            self,
+            out,
+            crate::lang::tr("خط العربية", "Arabic font"),
+            lay.arabic_label_y,
+        );
+        leader(
+            out,
+            &[lay.arabic_prev, lay.arabic_next],
+            ll,
+            lay.arabic_label_y,
+        );
+        draw_btn(self, out, lay.arabic_prev, "‹");
+        draw_btn(self, out, lay.arabic_next, "›");
+        draw_val(
+            self,
+            out,
+            v.arabic_font.to_string(),
+            lay.arabic_prev,
+            lay.arabic_next,
+            lay.arabic_label_y,
+        );
+
         // ---- cursor shape swatches (block / bar / underline) ----
-        let ll = label(self, out, "المؤشّر", lay.cursor_label_y);
-        let lastc = lay.cursor_btns[2];
-        leader(out, lastc.0 + lastc.2, ll, lay.cursor_label_y);
+        let ll = label(
+            self,
+            out,
+            crate::lang::tr("المؤشّر", "Cursor"),
+            lay.cursor_label_y,
+        );
+        leader(out, &lay.cursor_btns, ll, lay.cursor_label_y);
         for (i, &(bx, by, bw, bh)) in lay.cursor_btns.iter().enumerate() {
             let active = crate::config::CursorStyle::ALL[i] == v.cursor;
             bordered(
@@ -3270,25 +3563,25 @@ impl Renderer {
         }
 
         // ---- cursor blink toggle ----
-        let ll = label(self, out, "وميض المؤشّر", lay.blink_label_y);
-        leader(
+        let ll = label(
+            self,
             out,
-            lay.blink_toggle.0 + lay.blink_toggle.2,
-            ll,
+            crate::lang::tr("وميض المؤشّر", "Cursor blink"),
             lay.blink_label_y,
         );
+        leader(out, &[lay.blink_toggle], ll, lay.blink_label_y);
         draw_toggle(out, lay.blink_toggle, v.cursor_blink);
 
         // ---- scrollback stepper (new tabs only) ----
         let ll = label(
             self,
             out,
-            "سجلّ التمرير (التبويبات الجديدة)",
+            crate::lang::tr("سجلّ التمرير (التبويبات الجديدة)", "Scrollback (new tabs)"),
             lay.scroll_label_y,
         );
         leader(
             out,
-            lay.scroll_plus.0 + lay.scroll_plus.2,
+            &[lay.scroll_minus, lay.scroll_plus],
             ll,
             lay.scroll_label_y,
         );
@@ -3309,8 +3602,13 @@ impl Renderer {
         );
 
         // ---- padding / opacity steppers ----
-        let ll = label(self, out, "الحواشي", lay.pad_label_y);
-        leader(out, lay.pad_plus.0 + lay.pad_plus.2, ll, lay.pad_label_y);
+        let ll = label(
+            self,
+            out,
+            crate::lang::tr("الحواشي", "Padding"),
+            lay.pad_label_y,
+        );
+        leader(out, &[lay.pad_minus, lay.pad_plus], ll, lay.pad_label_y);
         draw_btn(self, out, lay.pad_minus, "−");
         draw_btn(self, out, lay.pad_plus, "+");
         draw_val(
@@ -3321,10 +3619,15 @@ impl Renderer {
             lay.pad_plus,
             lay.pad_label_y,
         );
-        let ll = label(self, out, "شفافية النافذة", lay.opacity_label_y);
+        let ll = label(
+            self,
+            out,
+            crate::lang::tr("شفافية النافذة", "Window opacity"),
+            lay.opacity_label_y,
+        );
         leader(
             out,
-            lay.opacity_plus.0 + lay.opacity_plus.2,
+            &[lay.opacity_minus, lay.opacity_plus],
             ll,
             lay.opacity_label_y,
         );
@@ -3340,28 +3643,36 @@ impl Renderer {
         );
 
         // ---- copy-on-select / ligatures toggles ----
-        let ll = label(self, out, "النسخ عند التحديد", lay.copy_label_y);
-        leader(
+        let ll = label(
+            self,
             out,
-            lay.copy_toggle.0 + lay.copy_toggle.2,
-            ll,
+            crate::lang::tr("النسخ عند التحديد", "Copy on select"),
             lay.copy_label_y,
         );
+        leader(out, &[lay.copy_toggle], ll, lay.copy_label_y);
         draw_toggle(out, lay.copy_toggle, v.copy_on_select);
-        let ll = label(self, out, "الأربطة", lay.liga_label_y);
-        leader(
+        let ll = label(
+            self,
             out,
-            lay.liga_toggle.0 + lay.liga_toggle.2,
-            ll,
+            crate::lang::tr("الأربطة", "Ligatures"),
             lay.liga_label_y,
         );
+        leader(out, &[lay.liga_toggle], ll, lay.liga_label_y);
         draw_toggle(out, lay.liga_toggle, v.ligatures);
 
         // ---- bell: segmented, all three options visible ----
-        let ll = label(self, out, "الجرس", lay.bell_label_y);
-        let lastb = lay.bell_btns[2];
-        leader(out, lastb.0 + lastb.2, ll, lay.bell_label_y);
-        let names = ["صامت", "صوت", "تنبيه"];
+        let ll = label(
+            self,
+            out,
+            crate::lang::tr("الجرس", "Bell"),
+            lay.bell_label_y,
+        );
+        leader(out, &lay.bell_btns, ll, lay.bell_label_y);
+        let names = [
+            crate::lang::tr("صامت", "Silent"),
+            crate::lang::tr("صوت", "Sound"),
+            crate::lang::tr("تنبيه", "Alert"),
+        ];
         for (i, &(bx, by, bw, bh)) in lay.bell_btns.iter().enumerate() {
             let active = BELL_SEGMENTS[i] == v.bell;
             bordered(
@@ -3390,20 +3701,25 @@ impl Renderer {
         }
 
         // ---- native-toast toggle ----
-        let ll = label(self, out, "إشعار عند اكتمال الأوامر", lay.notif_label_y);
-        leader(
+        let ll = label(
+            self,
             out,
-            lay.notif_toggle.0 + lay.notif_toggle.2,
-            ll,
+            crate::lang::tr("إشعار عند اكتمال الأوامر", "Notify when commands finish"),
             lay.notif_label_y,
         );
+        leader(out, &[lay.notif_toggle], ll, lay.notif_label_y);
         draw_toggle(out, lay.notif_toggle, v.notifications);
 
         // ---- shell cycler (new tabs only) ----
-        let ll = label(self, out, "الصدفة (التبويبات الجديدة)", lay.shell_label_y);
+        let ll = label(
+            self,
+            out,
+            crate::lang::tr("الصدفة (التبويبات الجديدة)", "Shell (new tabs)"),
+            lay.shell_label_y,
+        );
         leader(
             out,
-            lay.shell_next.0 + lay.shell_next.2,
+            &[lay.shell_prev, lay.shell_next],
             ll,
             lay.shell_label_y,
         );
@@ -3419,21 +3735,24 @@ impl Renderer {
         );
 
         // ---- hide-bar / confirm-close toggles ----
-        let ll = label(self, out, "إخفاء الشريط مع تبويب واحد", lay.bar_label_y);
-        leader(
+        let ll = label(
+            self,
             out,
-            lay.bar_toggle.0 + lay.bar_toggle.2,
-            ll,
+            crate::lang::tr("إخفاء الشريط مع تبويب واحد", "Hide the bar with one tab"),
             lay.bar_label_y,
         );
+        leader(out, &[lay.bar_toggle], ll, lay.bar_label_y);
         draw_toggle(out, lay.bar_toggle, v.hide_single_tab);
-        let ll = label(self, out, "تأكيد الإغلاق أثناء أمر جارٍ", lay.close_label_y);
-        leader(
+        let ll = label(
+            self,
             out,
-            lay.close_toggle.0 + lay.close_toggle.2,
-            ll,
+            crate::lang::tr(
+                "تأكيد الإغلاق أثناء أمر جارٍ",
+                "Confirm close while a command runs",
+            ),
             lay.close_label_y,
         );
+        leader(out, &[lay.close_toggle], ll, lay.close_label_y);
         draw_toggle(out, lay.close_toggle, v.confirm_close);
 
         // footer: hairline + hint
@@ -3447,7 +3766,10 @@ impl Renderer {
             c4(EDGE, 255),
         );
         let hint = [Seg::plain(
-            "انقر للتغيير · Esc للإغلاق والحفظ",
+            crate::lang::tr(
+                "انقر للتغيير · Esc للإغلاق والحفظ",
+                "Click to change · Esc closes and saves",
+            ),
             (0x6e, 0x78, 0x85),
         )];
         let fw2 = self.measure(&hint, true);
@@ -3456,7 +3778,7 @@ impl Renderer {
             true,
             out,
             whole,
-            (x + w - pad) as f32 - fw2,
+            crate::lang::lead_x(x, w, pad, fw2.ceil() as i32) as f32,
             y + h - (self.cell_h as i32 + 14),
             1.0,
         );
@@ -3466,12 +3788,22 @@ impl Renderer {
     /// action row (draw + hit-test agree, like the settings panel).
     pub fn shortcuts_layout(&self, fw: usize, fh: usize, n: usize) -> ShortcutsLayout {
         let w = ((self.ui_cell_w() * 44.0) as i32).clamp(380, fw as i32 - 60);
-        let rowh = (self.ui_cell_h() + 18.0) as i32;
         let head_h = (self.ui_cell_h() + 30.0) as i32;
         let foot_h = (self.ui_cell_h() + 30.0) as i32;
+        let bar = self.tab_bar_h() as i32;
+        // One column of rows. The registry outgrew a 900px window at the
+        // roomy row height (20 actions with tab groups), so rows tighten
+        // to fit the window, down to a floor that still holds the keycaps.
+        let roomy = (self.ui_cell_h() + 18.0) as i32;
+        let tight = (self.ui_cell_h() + 12.0) as i32;
+        let room = fh as i32 - bar - 24 - head_h - 6 - foot_h;
+        let rowh = (room / (n as i32).max(1)).clamp(tight, roomy);
         let h = head_h + 6 + rowh * n as i32 + foot_h;
         let x = (fw as i32 - w) / 2;
-        let y = (self.tab_bar_h() as i32 + (fh as i32 - h) / 3).max(self.tab_bar_h() as i32 + 12);
+        // a third of the spare height above, but never past the bottom
+        let y = (bar + (fh as i32 - h) / 3)
+            .min(fh as i32 - h - 12)
+            .max(bar + 12);
         let rows_top = y + head_h + 6;
         let rows = (0..n as i32)
             .map(|i| (x + 8, rows_top + rowh * i, w - 16, rowh))
@@ -3518,7 +3850,7 @@ impl Renderer {
         push_rect(out, whole, x, y, w, 3, c4(GREEN, 255));
 
         let head = [Seg {
-            text: "الاختصارات".into(),
+            text: crate::lang::tr("الاختصارات", "Shortcuts").into(),
             fg: self.fg,
             style: ST_BOLD,
         }];
@@ -3528,7 +3860,7 @@ impl Renderer {
             true,
             out,
             whole,
-            (x + w - pad) as f32 - hw,
+            crate::lang::lead_x(x, w, pad, hw.ceil() as i32) as f32,
             y + 14,
             1.0,
         );
@@ -3546,33 +3878,45 @@ impl Renderer {
             let (rx, ry, rw, rh) = lay.rows[i];
             let selected = i == sel;
             if selected {
-                // RTL accent: the highlight bar hugs the right edge
+                // the accent bar hugs the reading edge: right in Arabic
                 push_rect(out, whole, rx, ry, rw, rh, c4((0x1b, 0x21, 0x29), 255));
-                push_rect(out, whole, rx + rw - 3, ry + 2, 3, rh - 4, c4(GREEN, 255));
+                let bar_x = if crate::lang::rtl() { rx + rw - 3 } else { rx };
+                push_rect(out, whole, bar_x, ry + 2, 3, rh - 4, c4(GREEN, 255));
             }
-            // label, right-aligned
+            // label at the reading edge
             let lseg = [Seg::plain(
                 row.label.clone(),
                 if selected { self.fg } else { MUTED },
             )];
             let lw = self.measure(&lseg, true);
-            let label_x = (x + w - pad) as f32 - lw;
+            let label_x = crate::lang::lead_x(x, w, pad, lw.ceil() as i32) as f32;
             self.draw_run(&lseg, true, out, whole, label_x, ry + tc, 1.0);
 
-            let chips_end = if selected && capturing {
+            // (start, end) of the chips or the capture prompt, at the far edge
+            let (chips_start, chips_end) = if selected && capturing {
                 // amber capture prompt in place of the chips
                 let seg = [Seg {
-                    text: "اضغط الاختصار الجديد…".into(),
+                    text: crate::lang::tr("اضغط الاختصار الجديد…", "Press the new shortcut…").into(),
                     fg: AMBER,
                     style: ST_BOLD,
                 }];
-                let cw = self.measure(&seg, true);
-                self.draw_run(&seg, true, out, whole, (x + pad) as f32, ry + tc, 1.0);
-                x + pad + cw as i32
+                let cw = self.measure(&seg, true).ceil() as i32;
+                let px = crate::lang::trail_x(x, w, pad, cw);
+                self.draw_run(&seg, true, out, whole, px as f32, ry + tc, 1.0);
+                (px, px + cw)
             } else {
-                // keycap chips, one per token: Ctrl / Shift / T
+                // keycap chips, one per token: Ctrl / Shift / T. Measured
+                // first, so in English the row of chips can end at the
+                // right edge.
                 let ch = lay.rowh - 12;
-                let mut cx = x + pad;
+                let widths: Vec<i32> = row
+                    .chord
+                    .split('+')
+                    .map(|t| self.measure(&[Seg::plain(t, self.fg)], false) as i32 + 14)
+                    .collect();
+                let total = widths.iter().sum::<i32>() + 6 * (widths.len() as i32 - 1).max(0);
+                let start = crate::lang::trail_x(x, w, pad, total);
+                let mut cx = start;
                 let cy = ry + (lay.rowh - ch) / 2;
                 for token in row.chord.split('+') {
                     let fg = if row.custom { VALUE } else { self.fg };
@@ -3596,12 +3940,17 @@ impl Renderer {
                     );
                     cx += cw + 6;
                 }
-                cx - 6
+                (start, cx - 6)
             };
-            // the ledger dots tie chips to label
+            // the ledger dots tie chips to label, whichever side each is on
             let dy = ry + lay.rowh / 2 - 1;
-            let mut dx = chips_end + 16;
-            while dx + 2 <= label_x as i32 - 14 {
+            let (from, to) = if crate::lang::rtl() {
+                (chips_end, label_x as i32)
+            } else {
+                (label_x as i32 + lw as i32, chips_start)
+            };
+            let mut dx = from + 16;
+            while dx + 2 <= to - 14 {
                 push_rect(out, whole, dx, dy, 2, 2, c4(DOT, 255));
                 dx += 9;
             }
@@ -3620,7 +3969,11 @@ impl Renderer {
         let (text, color) = match flash {
             Some(f) => (f.to_string(), AMBER),
             None => (
-                "Enter تغيير · Delete افتراضي · Esc إغلاق".to_string(),
+                crate::lang::tr(
+                    "Enter تغيير · Delete افتراضي · Esc إغلاق",
+                    "Enter change · Delete default · Esc close",
+                )
+                .to_string(),
                 (0x6e, 0x78, 0x85),
             ),
         };
@@ -3631,7 +3984,7 @@ impl Renderer {
             true,
             out,
             whole,
-            (x + w - pad) as f32 - fw2,
+            crate::lang::lead_x(x, w, pad, fw2.ceil() as i32) as f32,
             y + h - (self.cell_h as i32 + 14),
             1.0,
         );
@@ -3822,11 +4175,18 @@ impl Renderer {
                     rh,
                     c4((0x21, 0x36, 0x50), 255),
                 );
-                push_rect(out, layout.card, rx + rw - 3, ry, 3, rh, c4(accent, 255));
+                let bar_x = if crate::lang::rtl() { rx + rw - 3 } else { rx };
+                push_rect(out, layout.card, bar_x, ry, 3, rh, c4(accent, 255));
             }
-            // the shortcut sits at the far (left) end, muted, in reading
-            // order; the label keeps the rest of the row
-            let hint_w = self.draw_row_hint(out, &rows[idx].hint, rect, rx + inset, picked);
+            // the shortcut sits at the far end, muted, in reading order;
+            // the label keeps the rest of the row
+            let gap = (16.0 * self.dpi_scale) as i32;
+            let hint_x = if crate::lang::rtl() {
+                rx + inset
+            } else {
+                rx + rw - inset - self.hint_width(&rows[idx].hint) + gap
+            };
+            let hint_w = self.draw_row_hint(out, &rows[idx].hint, rect, hint_x, picked);
             let room = (rw - inset * 2 - hint_w).max(0) as f32;
             let label = self.guard_label(&rows[idx].label, room);
             let seg = [Seg {
@@ -3844,7 +4204,7 @@ impl Renderer {
                 true,
                 out,
                 rect,
-                (rx + rw - inset) as f32 - tw,
+                crate::lang::lead_x(rx, rw, inset, tw.ceil() as i32) as f32,
                 ry + (rh - self.cell_h as i32) / 2,
                 1.0,
             );
@@ -3896,7 +4256,7 @@ impl Renderer {
             c4((0x16, 0x1b, 0x22), 255),
         );
         let title = [Seg {
-            text: "لوحة الأوامر".into(),
+            text: crate::lang::tr("لوحة الأوامر", "Command palette").into(),
             fg: (0xe6, 0xed, 0xf3),
             style: ST_BOLD,
         }];
@@ -3907,17 +4267,19 @@ impl Renderer {
             true,
             out,
             layout.title,
-            tx as f32 + twidth as f32 - tw,
+            crate::lang::lead_x(tx, twidth, 0, tw.ceil() as i32) as f32,
             ty + (th - self.cell_h as i32) / 2,
             1.0,
         );
         if w > (600.0 * self.dpi_scale) as i32 {
+            let keys = [Seg::plain("Ctrl + Shift + P", (0x8b, 0x94, 0x9e))];
+            let kw = self.measure(&keys, false).ceil() as i32;
             self.draw_run(
-                &[Seg::plain("Ctrl + Shift + P", (0x8b, 0x94, 0x9e))],
+                &keys,
                 false,
                 out,
                 layout.title,
-                tx as f32,
+                crate::lang::trail_x(tx, twidth, 0, kw) as f32,
                 ty + (th - self.cell_h as i32) / 2,
                 1.0,
             );
@@ -3934,7 +4296,7 @@ impl Renderer {
         );
         push_rect(out, layout.card, qx, qy + qh - 2, qw, 2, c4(accent, 255));
         let query_text = if query.is_empty() {
-            "ابحث عن أمر أو طرفية…".to_string()
+            crate::lang::tr("ابحث عن أمر أو طرفية…", "Search for a command or shell…").to_string()
         } else {
             format!("{query}│")
         };
@@ -4124,7 +4486,10 @@ impl Renderer {
         push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 250));
         push_rect(out, whole, x, y, w, 2, c4((0x2e, 0xa0, 0x43), 255));
 
-        let title = [Seg::plain("شكل الموجِّه — معاينة حيّة", self.fg)];
+        let title = [Seg::plain(
+            crate::lang::tr("شكل الموجِّه — معاينة حيّة", "Prompt style — live preview"),
+            self.fg,
+        )];
         self.draw_run(&title, true, out, whole, (x + 14) as f32, y + 8, 1.0);
 
         let first = sel
@@ -4171,7 +4536,10 @@ impl Renderer {
                     );
                 }
                 None => {
-                    let m = [Seg::plain("(تعذّر التصيير)", (0x6e, 0x78, 0x85))];
+                    let m = [Seg::plain(
+                        crate::lang::tr("(تعذّر التصيير)", "(could not render)"),
+                        (0x6e, 0x78, 0x85),
+                    )];
                     self.draw_run(
                         &m,
                         true,
@@ -4185,7 +4553,10 @@ impl Renderer {
             }
         }
         let hint = [Seg::plain(
-            "Enter تطبيق · ↑↓ تنقّل · Esc إغلاق",
+            crate::lang::tr(
+                "Enter تطبيق · ↑↓ تنقّل · Esc إغلاق",
+                "Enter apply · ↑↓ move · Esc close",
+            ),
             (0x6e, 0x78, 0x85),
         )];
         self.draw_run(
@@ -4218,8 +4589,11 @@ impl Renderer {
         push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 255));
         push_rect(out, whole, x, y, w, 3, c4((0xf2, 0xcc, 0x60), 255));
         let inner = layout.text;
-        for (text, row, bold) in [(msg, 0, true), ("الإغلاق سيوقف الأوامر الجارية.", 1, false)]
-        {
+        let note = crate::lang::tr(
+            "الإغلاق سيوقف الأوامر الجارية.",
+            "Closing stops the running commands.",
+        );
+        for (text, row, bold) in [(msg, 0, true), (note, 1, false)] {
             if row == 1 && inner.3 < (self.cell_h * 2.0).ceil() as i32 + 8 {
                 continue;
             }
@@ -4235,14 +4609,22 @@ impl Renderer {
                 true,
                 out,
                 inner,
-                (x + w - 16) as f32 - tw,
+                crate::lang::lead_x(x, w, 16, tw.ceil() as i32) as f32,
                 y + 16 + row * (self.cell_h.ceil() as i32 + 8),
                 1.0,
             );
         }
         for (rect, label, color) in [
-            (layout.close, "إغلاق · Enter", (0x9e, 0x32, 0x32)),
-            (layout.keep, "إبقاء · Esc", (0x30, 0x40, 0x50)),
+            (
+                layout.close,
+                crate::lang::tr("إغلاق · Enter", "Close · Enter"),
+                (0x9e, 0x32, 0x32),
+            ),
+            (
+                layout.keep,
+                crate::lang::tr("إبقاء · Esc", "Keep · Esc"),
+                (0x30, 0x40, 0x50),
+            ),
         ] {
             let (bx, by, bw, bh) = rect;
             push_rect(out, whole, bx, by, bw, bh, c4(color, 255));
@@ -4486,11 +4868,19 @@ impl Renderer {
         push_rect(out, whole, x, y, w, 3, c4((0xf2, 0xcc, 0x60), 255)); // warn accent
 
         let title = [Seg {
-            text: format!(
-                "لصق {} ({})؟",
-                arabic_lines(card.lines),
-                arabic_chars(card.chars)
-            ),
+            text: if crate::lang::rtl() {
+                format!(
+                    "لصق {} ({})؟",
+                    arabic_lines(card.lines),
+                    arabic_chars(card.chars)
+                )
+            } else {
+                format!(
+                    "Paste {} ({})?",
+                    english_count(card.lines, "line"),
+                    english_count(card.chars, "char")
+                )
+            },
             fg: self.fg,
             style: ST_BOLD,
         }];
@@ -4518,7 +4908,10 @@ impl Renderer {
             );
         }
         let keys = [Seg::plain(
-            "Enter تأكيد   ·   Esc إلغاء",
+            crate::lang::tr(
+                "Enter تأكيد   ·   Esc إلغاء",
+                "Enter confirm   ·   Esc cancel",
+            ),
             (0x9a, 0xa4, 0xb2),
         )];
         self.draw_run(
@@ -4569,7 +4962,10 @@ impl Renderer {
                 2,
                 c4(PALETTE[11], 200),
             ); // amber underline = search accent
-            let segs = [Seg::plain(format!("بحث: {q}_"), self.fg)];
+            let segs = [Seg::plain(
+                format!("{}: {q}_", crate::lang::tr("بحث", "Search")),
+                self.fg,
+            )];
             self.draw_run(&segs, true, out, whole, (bx + 8) as f32, by + 5, 1.0);
         }
 
@@ -4585,6 +4981,44 @@ impl Renderer {
         );
         push_rect(out, whole, 0, 0, width as i32, oy, c4(bar_bg, 255));
         push_rect(out, whole, 0, oy - 1, width as i32, 1, c4(self.fg, 28));
+        // the group chip: which group's tabs these are. Blue, so it never
+        // reads as a tab (tabs are the content background, or the bar's).
+        // A click steps to the next group; the amber dot is a tab in
+        // ANOTHER group waiting on you, which the bar cannot otherwise show.
+        if let (Some((gx, gy, gw, gh)), Some((label, elsewhere))) =
+            (self.group_chip_rect(), self.group_chip.clone())
+        {
+            push_rect_top_rounded(out, whole, gx, gy, gw, gh, c4((0x1f, 0x3a, 0x5c), 255));
+            let fg = (0xc9, 0xdc, 0xf2);
+            let dot_room = if elsewhere { 14 } else { 0 };
+            let mark = [Seg::plain("⇄", fg)];
+            let mark_w = self.measure(&mark, false).ceil() as i32;
+            let avail = (gw - 10 - mark_w - 8 - dot_room - 6) as f32;
+            let text = self.fit_title(&label, fg, avail);
+            let ty = (oy - self.cell_h.ceil() as i32) / 2;
+            self.draw_run(&mark, false, out, whole, (gx + 10) as f32, ty, 1.0);
+            self.draw_run(
+                &[Seg::plain(text, fg)],
+                true,
+                out,
+                (gx, gy, gw - dot_room, gh),
+                (gx + 10 + mark_w + 8) as f32,
+                ty,
+                1.0,
+            );
+            if elsewhere {
+                let d = 6;
+                push_rect(
+                    out,
+                    whole,
+                    gx + gw - 12,
+                    (oy + 3) / 2 - d / 2,
+                    d,
+                    d,
+                    c4((0xf2, 0xcc, 0x60), 255),
+                );
+            }
+        }
         // widths follow the titles now (M26): a fixed 24 cells left "Admin"
         // swimming in three times its own width. Clamped at both ends so a
         // long path can't eat the bar and a short name stays clickable.
@@ -4907,7 +5341,8 @@ impl Renderer {
         titles: &[&str],
         active: usize,
     ) -> Vec<(usize, i32, i32)> {
-        let available = self.tab_controls(width)[0].0.max(0);
+        let x0 = self.tabs_x0();
+        let available = (self.tab_controls(width)[0].0 - x0).max(0);
         if titles.is_empty() || available == 0 {
             return Vec::new();
         }
@@ -4925,7 +5360,7 @@ impl Renderer {
             if x + w > available {
                 break;
             }
-            rects.push((i, x, w));
+            rects.push((i, x0 + x, w));
             x += w;
         }
         rects
@@ -5429,6 +5864,93 @@ mod tests {
         let _ = tw;
     }
 
+    #[test]
+    fn english_mirrors_the_settings_ledger_and_keeps_each_groups_order() {
+        use crate::lang::{set, Lang};
+        let r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        set(Lang::Ar);
+        let ar = r.settings_layout(1400, 900);
+        set(Lang::En);
+        let en = r.settings_layout(1400, 900);
+        set(Lang::Ar);
+        let (x, _, w, _) = en.card;
+        assert_eq!(ar.card, en.card, "the card itself does not move");
+        let pad = 24;
+        // Arabic: controls start at the left padding. English: they end at
+        // the right padding, the mirror image.
+        for (a, e) in [
+            ([ar.font_prev, ar.font_next], [en.font_prev, en.font_next]),
+            ([ar.size_minus, ar.size_plus], [en.size_minus, en.size_plus]),
+            (
+                [ar.shell_prev, ar.shell_next],
+                [en.shell_prev, en.shell_next],
+            ),
+        ] {
+            assert_eq!(a[0].0, x + pad);
+            assert_eq!(e[1].0 + e[1].2, x + w - pad);
+            // order kept: ‹ before ›, − before +, same gap between
+            assert!(e[0].0 < e[1].0);
+            assert_eq!(e[1].0 - e[0].0, a[1].0 - a[0].0);
+            assert_eq!((e[0].1, e[0].2, e[0].3), (a[0].1, a[0].2, a[0].3));
+        }
+        assert_eq!(en.close_toggle.0 + en.close_toggle.2, x + w - pad);
+        assert_eq!(en.bell_btns[2].0 + en.bell_btns[2].2, x + w - pad);
+        assert!(en.bell_btns[0].0 < en.bell_btns[2].0);
+        let last_tile = en.theme_tiles[en.theme_tiles.len() - 1];
+        assert_eq!(last_tile.0 + last_tile.2, x + w - pad);
+        // the header buttons: left in Arabic, right in English, never on
+        // top of each other
+        for lay in [&ar, &en] {
+            let (s, l) = (lay.shortcuts_btn, lay.lang_btn);
+            assert!(
+                s.0 + s.2 <= l.0 || l.0 + l.2 <= s.0,
+                "header buttons overlap"
+            );
+            assert!(s.0 >= x && l.0 + l.2 <= x + w);
+        }
+        assert_eq!(ar.shortcuts_btn.0, x + pad);
+        assert_eq!(en.lang_btn.0 + en.lang_btn.2, x + w - pad);
+    }
+
+    #[test]
+    fn english_counts_and_menus_open_toward_the_reading_direction() {
+        use crate::lang::{set, Lang};
+        assert_eq!(english_count(1, "line"), "1 line");
+        assert_eq!(english_count(3, "char"), "3 chars");
+        assert_eq!(english_count(0, "line"), "0 lines");
+        let frame = (1000, 800);
+        set(Lang::En);
+        // room on the right: the menu opens right of the pointer
+        assert_eq!(menu_origin((600.0, 300.0), (250, 400), frame), (600, 300));
+        // no room on the right: it flips left
+        assert_eq!(menu_origin((900.0, 300.0), (250, 400), frame), (650, 300));
+        assert_eq!(palette_hint(0), "No results · Esc close");
+        set(Lang::Ar);
+        assert_eq!(menu_origin((600.0, 300.0), (250, 400), frame), (350, 300));
+    }
+
+    #[test]
+    fn the_group_chip_pushes_the_tabs_right_and_hits_where_it_is_drawn() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let titles = ["shell-one", "shell-two"];
+        let plain = r.tab_rects(900, &titles, 0);
+        assert_eq!(plain[0].1, 0, "one group: the bar is unchanged");
+        assert!(!r.group_chip_hit(10.0, 20.0));
+        r.set_group_chip(Some(("مجموعة 2".into(), false)));
+        let (cx, _, cw, _) = r.group_chip_rect().unwrap();
+        let rects = r.tab_rects(900, &titles, 0);
+        assert!(rects[0].1 >= cx + cw, "the first tab starts after the chip");
+        assert_eq!(rects.len(), 2);
+        assert!(r.group_chip_hit((cx + cw / 2) as f64, 20.0));
+        assert!(!r.group_chip_hit((rects[0].1 + 5) as f64, 20.0));
+        // the close controls moved with their tabs
+        let closes = r.tab_close_rects(900, &titles, 0);
+        assert!(closes.iter().all(|&(_, (x, ..))| x > cx + cw));
+        // a hidden bar has no chip to hit
+        r.set_bar_hidden(true);
+        assert!(!r.group_chip_hit((cx + cw / 2) as f64, 20.0));
+    }
+
     /// Arabic must shape to real glyphs (no .notdef) through the fallback
     /// chain — this is Bayan's reason to exist. If this fails, the renderer
     /// is drawing blank lines for Arabic output.
@@ -5779,6 +6301,83 @@ mod cache_tests {
         assert_eq!(arabic_chars(2), "حرفين");
         assert_eq!(arabic_chars(7), "7 أحرف");
         assert_eq!(arabic_chars(293), "293 حرفاً");
+    }
+
+    /// The family each glyph of a terminal run was drawn with, paired with
+    /// whether that glyph's text is Arabic.
+    fn glyph_families(r: &mut Renderer, text: &str) -> Vec<(String, bool)> {
+        let key = r.ensure_shaped(&[Seg::plain(text, (255, 255, 255))], false);
+        let run = r.cache_hot.get(&key).expect("shaped");
+        let db = r.font_system.db();
+        run.buffer
+            .layout_runs()
+            .flat_map(|lr| lr.glyphs.iter())
+            .map(|g| {
+                let fam = db
+                    .face(g.font_id)
+                    .and_then(|f| f.families.first().map(|(n, _)| n.clone()))
+                    .unwrap_or_default();
+                (fam, text[g.start..g.end].chars().any(is_arabic_script))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_arabic_font_setting_draws_terminal_arabic_and_only_arabic() {
+        let cfg = crate::config::UserConfig {
+            arabic_font: Some("Amiri".into()),
+            ..Default::default()
+        };
+        let mut r = Renderer::new(1.0, &cfg, 0.0);
+        assert_eq!(r.arabic_family(), Some("Amiri"));
+        let glyphs = glyph_families(&mut r, "echo مرحبا");
+        assert!(glyphs.iter().any(|(_, ar)| *ar), "no Arabic glyphs shaped");
+        for (fam, arabic) in &glyphs {
+            if *arabic {
+                assert_eq!(fam, "Amiri", "Arabic drawn with {fam}");
+            } else {
+                assert_ne!(fam, "Amiri", "Latin text left the terminal font");
+            }
+        }
+        // a name that is not installed is Auto, not a broken font
+        let stale = crate::config::UserConfig {
+            arabic_font: Some("No Such Font 123".into()),
+            ..Default::default()
+        };
+        assert_eq!(Renderer::new(1.0, &stale, 0.0).arabic_family(), None);
+    }
+
+    #[test]
+    fn font_lists_find_arabic_fonts_and_every_installed_monospace() {
+        let r = test_renderer();
+        let db = r.font_system.db();
+        // the bundled Amiri is always an Arabic choice; nonsense never is
+        assert!(face_covers_arabic(db, "Amiri"));
+        assert!(!face_covers_arabic(db, "No Such Font 123"));
+        let arabic = r.arabic_font_choices();
+        assert!(arabic.iter().any(|f| f == "Amiri"));
+        assert!(arabic.iter().all(|f| listable_family(f)));
+        let mut sorted = arabic.clone();
+        sorted.dedup();
+        assert_eq!(sorted.len(), arabic.len(), "duplicates in the Arabic list");
+        // the cycler: known candidates first in preference order, no
+        // duplicates, the current family always present
+        let mono = r.font_choices();
+        assert!(mono.contains(&r.family().to_string()));
+        let known: Vec<&String> = mono
+            .iter()
+            .filter(|f| FONT_CANDIDATES.contains(&f.as_str()))
+            .collect();
+        let expect: Vec<&str> = FONT_CANDIDATES
+            .iter()
+            .copied()
+            .filter(|c| known.iter().any(|k| k == c))
+            .collect();
+        assert!(known.iter().map(|s| s.as_str()).eq(expect.iter().copied()));
+        let mut uniq = mono.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), mono.len(), "duplicates in the font cycler");
     }
 
     #[test]

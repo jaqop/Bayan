@@ -128,6 +128,8 @@ pub(crate) struct Hits {
     pub tab: Option<usize>,
     /// The × on a tab: closing that tab, not switching to it.
     pub tab_close: Option<usize>,
+    /// The group chip at the bar's leading edge (2+ groups only).
+    pub group_chip: bool,
     pub drag_strip: bool,
     /// A confirm card (paste, drop, plugin, link) is up.
     pub card_open: bool,
@@ -154,6 +156,8 @@ pub(crate) enum LeftPress {
     Tab(usize),
     /// The × on a tab closes that tab (EasyTer's tabCloseRequested).
     CloseTab(usize),
+    /// The group chip steps to the next group.
+    NextGroup,
     /// Empty title strip: double-click maximises, drag moves.
     DragStrip,
     /// Tab-bar chrome under a confirm card: swallowed (R-02). Switching or
@@ -187,7 +191,8 @@ pub(crate) fn left_press(h: &Hits) -> LeftPress {
             || h.gear
             || h.divider.is_some()
             || h.tab.is_some()
-            || h.tab_close.is_some())
+            || h.tab_close.is_some()
+            || h.group_chip)
     {
         return LeftPress::Blocked;
     }
@@ -209,10 +214,46 @@ pub(crate) fn left_press(h: &Hits) -> LeftPress {
     if let Some(i) = h.tab {
         return LeftPress::Tab(i);
     }
+    if h.group_chip {
+        return LeftPress::NextGroup;
+    }
     if h.drag_strip {
         return LeftPress::DragStrip;
     }
     LeftPress::Terminal
+}
+
+/// Who owns a right press.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RightPress {
+    /// The tab bar: a menu of the installed shells, one new tab each.
+    ShellMenu,
+    /// Chrome that has no right-click meaning (caption buttons, the gear,
+    /// a resize edge) or a bar under a card or an open panel: nothing.
+    Ignore,
+    /// Not the bar. `mouse::right_click` decides (menu, paste, program).
+    Terminal,
+}
+
+/// A right press anywhere on the tab bar — a tab, its ×, the group chip,
+/// the arrows and plus, the empty strip — opens the shell menu. The
+/// caption buttons, the gear and the edges keep no right-click meaning.
+/// `overlay` is `overlay_blocks_mouse`: a panel, card or the cockpit owns
+/// the pointer, and a menu must not open over it (R-02's rule for cards).
+pub(crate) fn right_press(h: &Hits, overlay: bool) -> RightPress {
+    let on_bar = h.tab.is_some()
+        || h.tab_close.is_some()
+        || h.group_chip
+        || h.tab_control.is_some()
+        || h.drag_strip;
+    let other_chrome = h.edge.is_some() || h.caption.is_some() || h.gear;
+    if other_chrome || (on_bar && (overlay || h.card_open)) {
+        RightPress::Ignore
+    } else if on_bar {
+        RightPress::ShellMenu
+    } else {
+        RightPress::Terminal
+    }
 }
 
 impl App {
@@ -259,7 +300,7 @@ impl App {
         {
             return false;
         }
-        self.tab_at(pos).is_none()
+        self.tab_at(pos).is_none() && !self.group_chip_at(pos)
     }
 
     /// Tab index under a pixel position, if it's in the tab bar.
@@ -270,10 +311,26 @@ impl App {
         }
         let width = self.window.as_ref()?.inner_size().width as usize;
         // the labels the renderer measured, user names and the broadcast
-        // mark included, or a click would land on the neighbour
-        let labels: Vec<String> = self.tabs.iter().map(|t| t.label()).collect();
+        // mark included, or a click would land on the neighbour — and only
+        // the active group's, which are the only ones drawn
+        let (labels, pos_active) = self.visible_labels();
         let titles: Vec<&str> = labels.iter().map(String::as_str).collect();
-        tab_index_at(&r.tab_rects(width, &titles, self.active), pos.x)
+        let shown = tab_index_at(&r.tab_rects(width, &titles, pos_active), pos.x)?;
+        self.visible_tab(shown)
+    }
+
+    /// The `self.tabs` index of the bar's `shown`-th tab.
+    fn visible_tab(&self, shown: usize) -> Option<usize> {
+        let groups: Vec<u32> = self.tabs.iter().map(|t| t.group).collect();
+        let gid = self.tabs.get(self.active)?.group;
+        crate::groups::members(&groups, gid).get(shown).copied()
+    }
+
+    /// Is the pointer on the group chip (only drawn with 2+ groups)?
+    pub(crate) fn group_chip_at(&self, pos: PhysicalPosition<f64>) -> bool {
+        self.renderer
+            .as_ref()
+            .is_some_and(|r| r.group_chip_hit(pos.x, pos.y))
     }
 
     /// Tab whose close × is under the pointer, if any.
@@ -283,9 +340,10 @@ impl App {
             return None;
         }
         let width = self.window.as_ref()?.inner_size().width as usize;
-        let labels: Vec<String> = self.tabs.iter().map(|t| t.label()).collect();
+        let (labels, pos_active) = self.visible_labels();
         let titles: Vec<&str> = labels.iter().map(String::as_str).collect();
-        r.tab_close_at(width, &titles, self.active, pos.x, pos.y)
+        let shown = r.tab_close_at(width, &titles, pos_active, pos.x, pos.y)?;
+        self.visible_tab(shown)
     }
 
     /// Divider index under the pointer (between pane i and i+1), if any.
@@ -325,6 +383,7 @@ impl App {
             divider: self.divider_at(pos),
             tab: self.tab_at(pos),
             tab_close: self.tab_close_at(pos),
+            group_chip: self.group_chip_at(pos),
             drag_strip: self.in_drag_strip(pos),
             card_open: self.card_open(),
         }
@@ -494,6 +553,64 @@ mod tests {
     }
 
     #[test]
+    fn a_right_press_on_the_tab_bar_opens_the_shell_menu() {
+        let bar_spots = [
+            Hits {
+                tab: Some(1),
+                ..Hits::default()
+            },
+            Hits {
+                tab_close: Some(0),
+                tab: Some(0),
+                ..Hits::default()
+            },
+            Hits {
+                group_chip: true,
+                ..Hits::default()
+            },
+            Hits {
+                tab_control: Some(2),
+                ..Hits::default()
+            },
+            Hits {
+                drag_strip: true,
+                ..Hits::default()
+            },
+        ];
+        for h in bar_spots {
+            assert_eq!(right_press(&h, false), RightPress::ShellMenu, "{h:?}");
+            // a card, a panel or the cockpit owns the pointer: no menu
+            assert_eq!(right_press(&h, true), RightPress::Ignore, "{h:?}");
+            let carded = Hits {
+                card_open: true,
+                ..h
+            };
+            assert_eq!(right_press(&carded, false), RightPress::Ignore);
+        }
+        // the window's own controls keep no right-click meaning
+        for h in [
+            Hits {
+                caption: Some(2),
+                ..Hits::default()
+            },
+            Hits {
+                gear: true,
+                ..Hits::default()
+            },
+            Hits {
+                edge: Some(ResizeDirection::North),
+                drag_strip: true,
+                ..Hits::default()
+            },
+        ] {
+            assert_eq!(right_press(&h, false), RightPress::Ignore, "{h:?}");
+        }
+        // a pane: the pane's own right-click rules decide
+        assert_eq!(right_press(&Hits::default(), false), RightPress::Terminal);
+        assert_eq!(right_press(&Hits::default(), true), RightPress::Terminal);
+    }
+
+    #[test]
     fn tab_bar_then_cockpit_then_dividers_tabs_and_strip() {
         let all = Hits {
             tab_control: Some(1),
@@ -533,6 +650,18 @@ mod tests {
         let h = Hits {
             tab_close: None,
             tab: None,
+            group_chip: true,
+            ..h
+        };
+        assert_eq!(left_press(&h), LeftPress::NextGroup);
+        // under a confirm card the chip is swallowed like a tab (R-02)
+        let carded = Hits {
+            card_open: true,
+            ..h
+        };
+        assert_eq!(left_press(&carded), LeftPress::Blocked);
+        let h = Hits {
+            group_chip: false,
             ..h
         };
         assert_eq!(left_press(&h), LeftPress::DragStrip);

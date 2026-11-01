@@ -17,7 +17,22 @@ pub struct Shell {
     pub command: String,
 }
 
+/// PowerShell without `$PROFILE`: the one entry whose label is a word,
+/// so the one that has to follow the interface language.
+const FAST_POWERSHELL: &str = "powershell.exe -NoProfile";
+
 impl Shell {
+    /// The name to show, in the interface language. Detection runs once,
+    /// on a background thread, so a translated `name` would be frozen in
+    /// whatever language was on screen then; this reads it at draw time.
+    pub fn label(&self) -> String {
+        if self.command == FAST_POWERSHELL {
+            crate::lang::tr("PowerShell سريع", "PowerShell (fast)").to_string()
+        } else {
+            self.name.clone()
+        }
+    }
+
     fn new(name: &str, command: impl Into<String>) -> Self {
         Self {
             name: name.to_string(),
@@ -143,7 +158,7 @@ pub fn detect() -> Vec<Shell> {
 
     // $PROFILE is loaded, so the user's chosen oh-my-posh prompt shows up.
     v.push(Shell::new("PowerShell", "powershell.exe"));
-    v.push(Shell::new("PowerShell سريع", "powershell.exe -NoProfile"));
+    v.push(Shell::new("PowerShell سريع", FAST_POWERSHELL));
 
     if on_path("pwsh") {
         v.push(Shell::new("PowerShell 7", "pwsh.exe -NoLogo"));
@@ -171,7 +186,7 @@ pub fn label_for(command: &str) -> String {
     detect()
         .into_iter()
         .find(|s| s.command == command)
-        .map(|s| s.name)
+        .map(|s| s.label())
         .unwrap_or_else(|| command.trim_end_matches(".exe").to_string())
 }
 
@@ -262,6 +277,10 @@ mod tests {
         // overflow it and collide with the row title. The renderer truncates
         // now, but a name that ALWAYS truncates is a name nobody can read.
         for s in detect() {
+            crate::lang::set(crate::lang::Lang::En);
+            let en = s.label();
+            crate::lang::set(crate::lang::Lang::Ar);
+            assert!(en.chars().count() <= 20, "English label too long: {en:?}");
             assert!(
                 s.name.chars().count() <= 20,
                 "shell label too long for the cycler: {:?} ({} chars)",

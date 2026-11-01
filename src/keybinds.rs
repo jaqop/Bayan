@@ -30,10 +30,13 @@ pub enum Action {
     Broadcast,
     ZoomPane,
     CopyLastOutput,
+    NewGroup,
+    NextGroup,
+    PrevGroup,
 }
 
 impl Action {
-    pub const ALL: [Action; 17] = [
+    pub const ALL: [Action; 20] = [
         Action::NewTab,
         Action::ClosePane,
         Action::Search,
@@ -51,6 +54,9 @@ impl Action {
         Action::Broadcast,
         Action::ZoomPane,
         Action::CopyLastOutput,
+        Action::NewGroup,
+        Action::NextGroup,
+        Action::PrevGroup,
     ];
 
     /// The config.json key.
@@ -73,29 +79,48 @@ impl Action {
             Action::Broadcast => "broadcast",
             Action::ZoomPane => "zoom-pane",
             Action::CopyLastOutput => "copy-last-output",
+            Action::NewGroup => "new-group",
+            Action::NextGroup => "next-group",
+            Action::PrevGroup => "prev-group",
         }
     }
 
     /// The editor row label.
+    /// The action's name in the interface language.
     pub fn label(self) -> &'static str {
+        self.label_in(crate::lang::get())
+    }
+
+    /// The action's name in `lang` — what the plugin check compares
+    /// against in BOTH languages.
+    pub fn label_in(self, lang: crate::lang::Lang) -> &'static str {
         match self {
-            Action::NewTab => "تبويب جديد",
-            Action::ClosePane => "إغلاق اللوحة",
-            Action::Search => "البحث",
-            Action::Settings => "الإعدادات",
-            Action::Copy => "نسخ التحديد",
-            Action::Paste => "لصق",
-            Action::SplitH => "تقسيم: جنبًا إلى جنب",
-            Action::SplitV => "تقسيم: فوق بعضها",
-            Action::Cockpit => "مقصورة الوكلاء",
-            Action::PromptPrev => "الأمر السابق",
-            Action::PromptNext => "الأمر التالي",
-            Action::ClaudeToggle => "وضع كلود",
-            Action::ResetKeyboard => "إعادة ضبط لوحة المفاتيح",
-            Action::RenameTab => "تسمية التبويب",
-            Action::Broadcast => "الكتابة في كل اللوحات",
-            Action::ZoomPane => "تكبير اللوحة",
-            Action::CopyLastOutput => "نسخ ناتج آخر أمر",
+            Action::NewTab => crate::lang::pick(lang, "تبويب جديد", "New tab"),
+            Action::ClosePane => crate::lang::pick(lang, "إغلاق اللوحة", "Close pane"),
+            Action::Search => crate::lang::pick(lang, "البحث", "Search"),
+            Action::Settings => crate::lang::pick(lang, "الإعدادات", "Settings"),
+            Action::Copy => crate::lang::pick(lang, "نسخ التحديد", "Copy selection"),
+            Action::Paste => crate::lang::pick(lang, "لصق", "Paste"),
+            Action::SplitH => crate::lang::pick(lang, "تقسيم: جنبًا إلى جنب", "Split: side by side"),
+            Action::SplitV => crate::lang::pick(lang, "تقسيم: فوق بعضها", "Split: stacked"),
+            Action::Cockpit => crate::lang::pick(lang, "مقصورة الوكلاء", "Agent cockpit"),
+            Action::PromptPrev => crate::lang::pick(lang, "الأمر السابق", "Previous command"),
+            Action::PromptNext => crate::lang::pick(lang, "الأمر التالي", "Next command"),
+            Action::ClaudeToggle => crate::lang::pick(lang, "وضع كلود", "Claude mode"),
+            Action::ResetKeyboard => {
+                crate::lang::pick(lang, "إعادة ضبط لوحة المفاتيح", "Reset keyboard")
+            }
+            Action::RenameTab => crate::lang::pick(lang, "تسمية التبويب", "Rename tab"),
+            Action::Broadcast => {
+                crate::lang::pick(lang, "الكتابة في كل اللوحات", "Type to all panes")
+            }
+            Action::ZoomPane => crate::lang::pick(lang, "تكبير اللوحة", "Zoom pane"),
+            Action::CopyLastOutput => {
+                crate::lang::pick(lang, "نسخ ناتج آخر أمر", "Copy last output")
+            }
+            Action::NewGroup => crate::lang::pick(lang, "مجموعة جديدة", "New group"),
+            Action::NextGroup => crate::lang::pick(lang, "المجموعة التالية", "Next group"),
+            Action::PrevGroup => crate::lang::pick(lang, "المجموعة السابقة", "Previous group"),
         }
     }
 
@@ -129,6 +154,13 @@ impl Action {
             Action::Broadcast => c(true, true, Letter('b')),
             Action::ZoomPane => c(true, true, Letter('z')),
             Action::CopyLastOutput => c(true, true, Letter('l')),
+            // G for group. Groups step on PageDown/PageUp, the browsers'
+            // tab-strip keys: Alt+arrows already move pane focus and
+            // Ctrl+Shift+arrows are the shell's word selection. The group
+            // chip in the tab bar is the click target for the same step.
+            Action::NewGroup => c(true, true, Letter('g')),
+            Action::NextGroup => c(true, true, PageDown),
+            Action::PrevGroup => c(true, true, PageUp),
         }
     }
 }
@@ -144,6 +176,8 @@ pub enum ChordKey {
     Down,
     Left,
     Right,
+    PageUp,
+    PageDown,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -188,6 +222,8 @@ impl Chord {
             ChordKey::Down => "down".into(),
             ChordKey::Left => "left".into(),
             ChordKey::Right => "right".into(),
+            ChordKey::PageUp => "pageup".into(),
+            ChordKey::PageDown => "pagedown".into(),
         });
         parts.join("+")
     }
@@ -204,6 +240,8 @@ impl Chord {
                 "down" => key = Some(ChordKey::Down),
                 "left" => key = Some(ChordKey::Left),
                 "right" => key = Some(ChordKey::Right),
+                "pageup" => key = Some(ChordKey::PageUp),
+                "pagedown" => key = Some(ChordKey::PageDown),
                 p => {
                     let mut chars = p.chars();
                     match (chars.next(), chars.as_str()) {
@@ -260,6 +298,8 @@ impl Chord {
             ChordKey::Down => "↓",
             ChordKey::Left => "←",
             ChordKey::Right => "→",
+            ChordKey::PageUp => "PgUp",
+            ChordKey::PageDown => "PgDn",
         });
         parts.join("+")
     }
@@ -326,6 +366,8 @@ pub fn chord_from(physical: PhysicalKey, ctrl: bool, shift: bool, alt: bool) -> 
         ArrowDown => ChordKey::Down,
         ArrowLeft => ChordKey::Left,
         ArrowRight => ChordKey::Right,
+        PageUp => ChordKey::PageUp,
+        PageDown => ChordKey::PageDown,
         _ => return None,
     };
     Some(Chord {
@@ -468,6 +510,18 @@ mod tests {
         // punctuation and F-keys included
         assert_eq!(Chord::parse("ctrl+,").unwrap().key, ChordKey::Comma);
         assert_eq!(Chord::parse("f2").unwrap().key, ChordKey::F(2));
+        assert_eq!(
+            Chord::parse("ctrl+shift+pagedown"),
+            Some(Action::NextGroup.default_chord())
+        );
+        assert_eq!(
+            chord_from(PhysicalKey::Code(KeyCode::PageUp), true, true, false),
+            Some(Action::PrevGroup.default_chord())
+        );
+        assert_eq!(
+            Action::NextGroup.default_chord().display(),
+            "Ctrl+Shift+PgDn"
+        );
         // garbage is None, not a panic
         assert_eq!(Chord::parse(""), None);
         assert_eq!(Chord::parse("ctrl+banana"), None);

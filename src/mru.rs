@@ -43,8 +43,17 @@ impl Mru {
     /// One Ctrl+Tab (forward) or Ctrl+Shift+Tab (back) with Ctrl held:
     /// the tab to show next. `len` is the live tab count; indices the
     /// order has not seen yet (restored tabs, say) count as least recent.
+    #[cfg(test)]
     pub fn step(&mut self, forward: bool, len: usize) -> Option<usize> {
-        if len < 2 {
+        let all: Vec<usize> = (0..len).collect();
+        self.step_among(forward, len, &all)
+    }
+
+    /// `step`, with the walk confined to `members` — the active group's
+    /// tabs — so Ctrl+Tab never lands in another group. The history of
+    /// the other groups is kept, just not walked.
+    pub fn step_among(&mut self, forward: bool, len: usize, members: &[usize]) -> Option<usize> {
+        if members.iter().filter(|&&i| i < len).count() < 2 {
             return None;
         }
         // make sure every live tab is in the ring, oldest last
@@ -54,13 +63,25 @@ impl Mru {
             }
         }
         self.order.retain(|&i| i < len);
-        let n = self.order.len();
+        let ring: Vec<usize> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|i| members.contains(i))
+            .collect();
+        let n = ring.len();
         self.walk = if forward {
             (self.walk + 1) % n
         } else {
             (self.walk + n - 1) % n
         };
-        Some(self.order[self.walk])
+        Some(ring[self.walk])
+    }
+
+    /// The most recently active of `members`, if the history has seen one
+    /// — where switching back to a group lands.
+    pub fn most_recent(&self, members: &[usize]) -> Option<usize> {
+        self.order.iter().copied().find(|i| members.contains(i))
     }
 
     pub fn walking(&self) -> bool {
@@ -140,5 +161,25 @@ mod tests {
         single.touch(0);
         assert_eq!(single.step(true, 1), None);
         assert!(!single.walking());
+    }
+
+    #[test]
+    fn a_group_walk_skips_tabs_of_other_groups() {
+        let mut m = Mru::new();
+        for i in 0..5 {
+            m.touch(i);
+        } // 4, 3, 2, 1, 0 — say 0, 2, 4 are one group
+        let group = [0, 2, 4];
+        assert_eq!(m.step_among(true, 5, &group), Some(2));
+        assert_eq!(m.step_among(true, 5, &group), Some(0));
+        assert_eq!(m.step_among(true, 5, &group), Some(4), "wraps in the group");
+        m.release(4);
+        // a group of one tab never steps, even with other tabs open
+        assert_eq!(m.step_among(true, 5, &[3]), None);
+        assert!(!m.walking());
+        // the group's most recent, ignoring newer tabs elsewhere
+        m.touch(1);
+        assert_eq!(m.most_recent(&group), Some(4));
+        assert_eq!(m.most_recent(&[]), None);
     }
 }

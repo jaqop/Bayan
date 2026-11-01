@@ -23,10 +23,12 @@ selection and BiDi paths must do.
 | `osc7.rs` | OSC 7 cwd reports, parsed then gated by `term::accept_local_cwd` |
 | `mouse.rs` | mouse tracking modes 1000/1002/1003, SGR vs X10, focus events (1004), who owns a right-click (menu, paste, program) |
 | `keybinds.rs` | action registry + chord map |
+| `lang.rs` | interface language (Arabic default, English): `tr("عربي", "English")` pairs at the point of use, `rtl()`, `lead_x`/`trail_x` for which edge text starts from |
 | `keys.rs` | keyboard → VT byte sequences (ported from EasyTer) |
 | `kitty.rs` | kitty keyboard protocol encoder, layout-aware alternate keys |
 | `layout.rs` | a tab's split tree: side-by-side and stacked splits nest in any mix; leaves index the tab's flat pane list |
-| `mru.rs` | most-recently-used tab order for Ctrl+Tab |
+| `groups.rs` | tab groups: a group id TAG on each tab (tabs never move in the flat list), the group order and labels, the stay-in-group close rule |
+| `mru.rs` | most-recently-used tab order for Ctrl+Tab, walkable within one group |
 | `shells.rs` | installed-shell detection (ported from EasyTer's `profiles.py`) |
 | `posh.rs` | oh-my-posh theme picker with a live ANSI preview |
 | `plugins.rs` | declarative JSON plugin host (`~/.bayan/plugins/`) |
@@ -34,7 +36,7 @@ selection and BiDi paths must do.
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-343 tests across the tree. `term.rs` (60), `link.rs` (59) and `render.rs` (42)
+398 tests across the tree. `term.rs` (60), `link.rs` (59) and `render.rs` (42)
 carry the most.
 
 ## Invariants — do not "simplify" these
@@ -182,6 +184,10 @@ key identity or typed text:
 | `BAYAN_SHORTCUTS=1` | open the keybinding editor |
 | `BAYAN_PICK_THEME=<n>` | open settings and apply theme *n*, so a click's live effect is screenshot-verifiable |
 | `BAYAN_SPLIT=1` | start with the first tab pre-split (pane machinery) |
+| `BAYAN_ARABIC_FONT=<family>` | draw terminal Arabic in that font for this run (config.json untouched) — with `BAYAN_TYPE`, compare Arabic fonts side by side |
+| `BAYAN_LANG=en` | start in English without touching `config.json` (the English, left-to-right layout) |
+| `BAYAN_SHELLS=1` | open the tab bar's shell menu at startup, as a right-click on the bar would (it fills in when shell detection reports) |
+| `BAYAN_GROUPS=1` | add a second tab to the first group, then open a second group of one tab: the group chip and the per-group tab bar |
 | `BAYAN_COCKPIT=1` | open the agent cockpit |
 | `BAYAN_GUARD=1` | arm the PASTE guard with a 3-line sample (not the close guard — the name misleads) |
 | `BAYAN_TYPE=<text>` | feed text into the first pane's PTY — the hook for ligature and shaping checks |

@@ -344,15 +344,16 @@ impl App {
         // Ctrl+Tab / Ctrl+Shift+Tab cycle tabs (shift handled here because
         // winit reports Tab+shift with the shift modifier)
         if matches!(event.logical_key, Key::Named(NamedKey::Tab)) && !self.tabs.is_empty() {
-            let n = self.tabs.len();
+            // both orders stay inside the group on screen
+            let (vis, pos) = self.visible_tabs();
             if self.config.tab_switch_recent() {
                 // stack-like: the previous tab first, deeper while Ctrl
                 // stays down; ModifiersChanged commits the stop
-                if let Some(next) = self.mru.step(!shift, n) {
+                if let Some(next) = self.mru.step_among(!shift, self.tabs.len(), &vis) {
                     self.show_tab(next);
                 }
-            } else {
-                self.switch_tab(next_tab(self.active, n, shift));
+            } else if !vis.is_empty() {
+                self.switch_tab(vis[next_tab(pos, vis.len(), shift)]);
             }
             return true;
         }

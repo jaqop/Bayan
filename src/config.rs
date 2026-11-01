@@ -8,6 +8,10 @@
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct UserConfig {
+    /// Interface language: `"en"` for English (left to right); anything
+    /// else, or nothing, is Arabic. The settings header switches it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     /// Restore saved tabs and panes on launch. Default off: start one fresh tab.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restore_tabs: Option<bool>,
@@ -19,6 +23,12 @@ pub struct UserConfig {
     /// Nerd-Font-first candidate list when absent or not found.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_family: Option<String>,
+    /// The font Arabic text in the terminal is drawn with (e.g. "Kawkab
+    /// Mono", "Cairo"). Absent: the terminal font's own Arabic, with
+    /// fallback when it has none. A name that is not installed, or cannot
+    /// draw Arabic, counts as absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arabic_font: Option<String>,
     /// Base font size in points (default 18).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_size: Option<f32>,
@@ -274,6 +284,10 @@ impl UserConfig {
 
     pub fn copy_on_select_on(&self) -> bool {
         self.copy_on_select.unwrap_or(true)
+    }
+
+    pub fn lang(&self) -> crate::lang::Lang {
+        crate::lang::Lang::from_config(self.language.as_deref())
     }
 
     /// Right-click outside a mouse-tracking program opens the context menu.

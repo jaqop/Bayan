@@ -308,9 +308,9 @@ impl CmdOutcome {
     /// The toast title for this outcome.
     pub fn title(self) -> &'static str {
         match self {
-            Self::Ok => "اكتمل الأمر",
-            Self::Failed => "فشل الأمر",
-            Self::Unknown => "انتهى الأمر",
+            Self::Ok => crate::lang::tr("اكتمل الأمر", "Command finished"),
+            Self::Failed => crate::lang::tr("فشل الأمر", "Command failed"),
+            Self::Unknown => crate::lang::tr("انتهى الأمر", "Command ended"),
         }
     }
 }
@@ -2317,12 +2317,20 @@ impl PasteRisk {
     /// Card copy. Arabic, matching the rest of the confirm UI.
     pub fn label(self) -> &'static str {
         match self {
-            PasteRisk::Enter => "يحتوي على Enter",
-            PasteRisk::Control => "يحتوي على أحرف تحكم",
-            PasteRisk::EnterAndControl => "يحتوي على Enter وأحرف تحكم",
-            PasteRisk::TooLong => "النص أطول من الحد",
-            PasteRisk::NotAtPrompt => "ليس في موجّه الأوامر",
-            PasteRisk::AltScreen => "البرنامج في وضع الشاشة الكاملة",
+            PasteRisk::Enter => crate::lang::tr("يحتوي على Enter", "Contains Enter"),
+            PasteRisk::Control => {
+                crate::lang::tr("يحتوي على أحرف تحكم", "Contains control characters")
+            }
+            PasteRisk::EnterAndControl => crate::lang::tr(
+                "يحتوي على Enter وأحرف تحكم",
+                "Contains Enter and control characters",
+            ),
+            PasteRisk::TooLong => crate::lang::tr("النص أطول من الحد", "Text is over the limit"),
+            PasteRisk::NotAtPrompt => crate::lang::tr("ليس في موجّه الأوامر", "Not at the prompt"),
+            PasteRisk::AltScreen => crate::lang::tr(
+                "البرنامج في وضع الشاشة الكاملة",
+                "A full-screen program is running",
+            ),
         }
     }
 }
