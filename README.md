@@ -461,11 +461,12 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       character. And an untouched config serialized `"keyboard"` out of
       nothing, so saving one minted settings the user never set.
 
-      Two limits that applied to `links.rs` apply to `link.rs` too and are
-      NOT fixed: a mapped network drive is still stat'd, and a junction or
-      symlink aimed at a UNC share defeats any gate that reads the path as
-      text. Closing that needs resolution off the UI thread, gating on the
-      canonical path.
+      Two limits that applied to `links.rs` applied to `link.rs` too: a
+      mapped network drive was still stat'd, and a junction or symlink
+      aimed at a UNC share defeated any gate that reads the path as text.
+      Both are closed by `localpath.rs` («Local all the way down», below).
+      Gating on the canonical path, as first planned, would have been too
+      late: the open that produces it has already connected to the share.
 - [x] **M34** — the window comes back where you left it: session.json carries
       the last non-maximized rectangle plus the maximized flag, restored only
       if enough of the title strip lands on a monitor that is still connected
@@ -642,6 +643,34 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       dividers and drags, session round trip). Chrome Arabic (menus,
       settings, cards) now shapes in Segoe UI: Cascadia Code's monospaced
       Arabic stretched every letter to a full cell
+- [x] **Local all the way down** — closes the two M33 limits. A Ctrl+clicked
+      file and a new tab's directory both pass `localpath::walk_live` before
+      anything stats them: the drive must not be `DRIVE_REMOTE`, and each
+      component's attributes are read without following it, root first, so
+      every read sits under directories already known to be local. A
+      symlink or junction is not refused outright (pnpm's `node_modules` is
+      made of them): its target is read from the reparse data
+      (`FSCTL_GET_REPARSE_POINT` on a handle opened with
+      `FILE_FLAG_OPEN_REPARSE_POINT`), and the walk restarts on that target
+      when it is a local drive path, through the same `accept_local_cwd`
+      gate. A UNC or volume target, a link type it does not decode, a loop
+      past 32 hops, or a read that fails for any reason but "not found" is
+      refused with «الملف ليس على قرص محلي», never revealed, since Explorer
+      would follow the link too. Cloud placeholders (OneDrive) are reparse
+      points that are not name redirects, so they pass. The old new-tab
+      check read only the LAST component, so a junction in a parent
+      (`C:\proj` → `\\server\share`) still reached the share; that is
+      closed too. Ghostty's kitty-graphics path check
+      (`GetFinalPathNameByHandleW` after the open) was the prior art and
+      the reason not to copy it: it checks after the open has already
+      connected. Proven by 19 tests on the pure walk and reparse-buffer
+      decoder (a fake volume with junctions, relative and rooted symlinks,
+      loops, a mapped drive, cloud and WSL tags, truncated buffers), and
+      a `link.rs` test that every action refuses rather than reveals. Not
+      proven here: the live Win32 probes against a real junction to a
+      share; this tree was type-checked and linted for Windows, not run
+      there. A link swapped between the walk and the open (TOCTOU) is not
+      covered.
 
 ## Settings
 

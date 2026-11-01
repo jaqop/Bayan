@@ -19,6 +19,7 @@ mod keys;
 mod kitty;
 mod layout;
 mod link;
+mod localpath;
 mod mouse;
 mod mru;
 mod osc7;
