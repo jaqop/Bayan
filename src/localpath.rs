@@ -122,10 +122,9 @@ pub fn parse_reparse(buf: &[u8]) -> Option<Reparse> {
     if len % 2 != 0 {
         return None;
     }
-    let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
+    // `len` is even (checked above), so there is no odd byte left over.
+    let (pairs, _) = bytes.as_chunks::<2>();
+    let units: Vec<u16> = pairs.iter().map(|p| u16::from_le_bytes(*p)).collect();
     let target = String::from_utf16(&units).ok()?;
     Some(Reparse::Link { target, relative })
 }
