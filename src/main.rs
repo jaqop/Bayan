@@ -316,6 +316,10 @@ fn step_point(p: Point, cols: usize, top: i32, bottom: i32, dir: Direction) -> P
 /// Most tabs a restored session brings back (each one is a shell process).
 const MAX_RESTORED_TABS: usize = 16;
 
+/// Panes in one tab. `split` and session restore both stop here, so a
+/// saved tab whose shells come back cannot grow past the live cap.
+const MAX_PANES_PER_TAB: usize = 4;
+
 /// A `BAYAN_*` debug hook from the environment (BAYAN-010). The hooks can
 /// type into the shell (`BAYAN_TYPE`), drive the clipboard (`BAYAN_PASTE`)
 /// and log to `%TEMP%` (`BAYAN_PROFILE`), so anything that could set
@@ -626,7 +630,6 @@ fn clean_tab_name(raw: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// Weighted split of a content rect along one axis, 1px gaps between panes.
 /// Top-level axis and weights of a tree, for the one-axis fallback and for
 /// readers that predate the nested `layout` field. A leaf has no split.
 fn saved_split(layout: &layout::Node) -> (u8, Vec<f32>) {
@@ -653,6 +656,34 @@ fn restored_layout(st: &SavedTab, n: usize) -> layout::Node {
             };
             layout::Node::flat(axis, &st.weights, n)
         }
+    }
+}
+
+/// How a saved tab may attach after its first shell is spawned.
+///
+/// `apply` is false when that shell never started: the extra directories,
+/// the layout, the focus and the name stay with the saved tab and are not
+/// written onto whichever tab happens to be last (N-05). `extra` is how
+/// many further panes may be spawned without passing `MAX_PANES_PER_TAB`.
+struct RestoredTabPlan {
+    extra: usize,
+    apply: bool,
+}
+
+fn plan_restored_tab(
+    first_shell_started: bool,
+    panes_now: usize,
+    extra_cwds: usize,
+) -> RestoredTabPlan {
+    if !first_shell_started {
+        return RestoredTabPlan {
+            extra: 0,
+            apply: false,
+        };
+    }
+    RestoredTabPlan {
+        extra: extra_cwds.min(MAX_PANES_PER_TAB.saturating_sub(panes_now)),
+        apply: true,
     }
 }
 
@@ -2454,11 +2485,11 @@ impl App {
 
     /// Split the active tab (EasyTer: Ctrl+Shift+E side-by-side, O stacked).
     fn split(&mut self, orientation: Orientation) {
-        // four panes per tab is the cap; side-by-side and stacked nest
+        // side-by-side and stacked nest, up to MAX_PANES_PER_TAB
         if self
             .tabs
             .get(self.active)
-            .is_none_or(|t| t.panes.len() >= 4)
+            .is_none_or(|t| t.panes.len() >= MAX_PANES_PER_TAB)
         {
             return;
         }
@@ -2622,11 +2653,12 @@ impl App {
                             .panes
                             .iter()
                             .map(|p| {
-                                // don't persist a path we would refuse to start in
+                                // don't persist a path we would refuse to start in.
+                                // BAYAN-015: a poisoned meta lock is this pane's
+                                // state, not a reason to abort the save.
                                 p.session
                                     .meta
-                                    .lock()
-                                    .unwrap()
+                                    .lock_or_recover()
                                     .cwd
                                     .as_deref()
                                     .and_then(term::accept_local_cwd)
@@ -2650,7 +2682,9 @@ impl App {
             let _ = std::fs::create_dir_all(dir);
         }
         if let Ok(json) = serde_json::to_string_pretty(&state) {
-            let _ = std::fs::write(path, json);
+            // same-directory temp then replace, so a crash cannot leave a
+            // truncated session.json that the next launch treats as empty
+            let _ = config::write_atomic(&path, json.as_bytes());
         }
     }
 
@@ -2686,21 +2720,43 @@ impl App {
                 // BAYAN-014: a session.json with hundreds of tabs (a bug, a
                 // hand edit, a planted file) must not spawn hundreds of shells
                 for mut st in state.tabs.into_iter().take(MAX_RESTORED_TABS) {
+                    let before = self.tabs.len();
                     let mut cwds = std::mem::take(&mut st.cwds).into_iter();
                     self.spawn_tab(cwds.next().flatten());
-                    for cwd in cwds.take(3) {
-                        // re-split with the saved axis; weights come after
-                        if let Some(pane) = self.spawn_pane(cwd.as_deref()) {
-                            if let Some(t) = self.tabs.last_mut() {
-                                t.panes.push(pane);
+                    // N-05: the first shell of this saved tab is what creates
+                    // it. If that spawn fails, its extra panes, layout, focus
+                    // and name must not land on the previous tab.
+                    let started = self.tabs.len() == before + 1;
+                    let panes_now = self.tabs.last().map(|t| t.panes.len()).unwrap_or(0);
+                    let extra: Vec<Option<String>> = cwds.collect();
+                    let plan = plan_restored_tab(started, panes_now, extra.len());
+                    if plan.apply {
+                        for cwd in extra.into_iter().take(plan.extra) {
+                            if self
+                                .tabs
+                                .last()
+                                .is_some_and(|t| t.panes.len() >= MAX_PANES_PER_TAB)
+                            {
+                                break;
+                            }
+                            if let Some(pane) = self.spawn_pane(cwd.as_deref()) {
+                                if let Some(t) = self.tabs.last_mut() {
+                                    if t.panes.len() < MAX_PANES_PER_TAB {
+                                        t.panes.push(pane);
+                                    }
+                                }
                             }
                         }
+                        if let Some(t) = self.tabs.last_mut() {
+                            t.layout = restored_layout(&st, t.panes.len());
+                            t.focused = st.focused.min(t.panes.len().saturating_sub(1));
+                            t.name = st.name.as_deref().and_then(clean_tab_name);
+                        }
                     }
-                    if let Some(t) = self.tabs.last_mut() {
-                        t.layout = restored_layout(&st, t.panes.len());
-                        t.focused = st.focused.min(t.panes.len() - 1);
-                        t.name = st.name.as_deref().and_then(clean_tab_name);
-                    }
+                }
+                // every saved tab failed to spawn: still open one shell
+                if self.tabs.is_empty() {
+                    self.spawn_tab(None);
                 }
                 self.active = state.active.min(self.tabs.len().saturating_sub(1));
                 self.relayout_active();
@@ -3078,8 +3134,7 @@ impl App {
         let raw = self.tabs[ti].panes[pi]
             .session
             .meta
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .cwd
             .clone();
         link::cwd_hook(raw.as_deref())
@@ -4883,6 +4938,44 @@ mod tests {
     fn restored_sessions_are_capped() {
         // BAYAN-014: a sane bound, not "every tab in the file"
         const { assert!(MAX_RESTORED_TABS >= 4 && MAX_RESTORED_TABS <= 32) };
+        const { assert!(MAX_PANES_PER_TAB == 4) };
+    }
+
+    #[test]
+    fn a_failed_first_shell_does_not_rewrite_the_previous_tab() {
+        // N-05: spawn failure must not lend this saved tab to the one before it
+        let failed = plan_restored_tab(false, 4, 3);
+        assert!(!failed.apply);
+        assert_eq!(failed.extra, 0);
+        // and a tab that did start still stops at the same cap as split()
+        let full = plan_restored_tab(true, MAX_PANES_PER_TAB, 5);
+        assert!(full.apply);
+        assert_eq!(full.extra, 0);
+        let fresh = plan_restored_tab(true, 1, 100);
+        assert!(fresh.apply);
+        assert_eq!(fresh.extra, MAX_PANES_PER_TAB - 1);
+        assert_eq!(plan_restored_tab(true, 2, 3).extra, 2);
+        assert_eq!(plan_restored_tab(true, 0, 2).extra, 2);
+    }
+
+    #[test]
+    fn meta_locks_are_not_unwrapped() {
+        // BAYAN-015: `.lock()` then `.unwrap()` panics the UI when the
+        // reader thread poisoned the mutex. The call is often split across
+        // lines, which a single-line search misses.
+        let files = [
+            ("main.rs", include_str!("main.rs")),
+            ("term.rs", include_str!("term.rs")),
+            ("input.rs", include_str!("input.rs")),
+            ("keyroute.rs", include_str!("keyroute.rs")),
+        ];
+        for (name, src) in files {
+            let hits = unwrap_after_lock(&strip_line_comments(src));
+            assert!(
+                hits.is_empty(),
+                "{name}: lock().unwrap at lines {hits:?} — use lock_or_recover"
+            );
+        }
     }
 
     #[test]
@@ -5506,6 +5599,45 @@ mod tests {
     }
 }
 
+/// Drop `//` comments so a doc line that names the old call does not look
+/// like a live one. Strings are left as they are; none of the scanned files
+/// put this call inside a string.
+#[cfg(test)]
+fn strip_line_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    for line in src.lines() {
+        match line.find("//") {
+            Some(i) => out.push_str(&line[..i]),
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Lines where `.lock()` is followed only by whitespace and then `.unwrap()`.
+/// The needles are built in pieces so this scanner does not flag itself.
+#[cfg(test)]
+fn unwrap_after_lock(src: &str) -> Vec<usize> {
+    let lock = concat!(".", "lock()");
+    let unwrap = concat!(".", "unwrap()");
+    let mut hits = Vec::new();
+    let mut offset = 0;
+    let mut line = 1usize;
+    while let Some(rel) = src[offset..].find(lock) {
+        let at = offset + rel;
+        line += src[offset..at].bytes().filter(|&b| b == b'\n').count();
+        let after = &src[at + lock.len()..];
+        if after.trim_start().starts_with(unwrap) {
+            hits.push(line);
+        }
+        let next = at + lock.len();
+        line += src[at..next].bytes().filter(|&b| b == b'\n').count();
+        offset = next;
+    }
+    hits
+}
+
 #[cfg(test)]
 mod palette_tests {
     use super::*;
@@ -5666,15 +5798,29 @@ mod m38_tests {
             rows.into_iter().map(|(_, l)| l).collect()
         };
         let one = labels(context_menu_rows(false, 1, false, false));
+        assert_eq!(
+            keybinds::Action::Copy.label(),
+            "نسخ التحديد",
+            "the menu and the keymap share one label"
+        );
         assert_eq!(one[0], "لصق", "paste first when nothing is selected");
-        assert!(!one.iter().any(|l| l == "نسخ"));
+        assert!(
+            !one.iter().any(|l| l == keybinds::Action::Copy.label()),
+            "copy stays off the menu until something is selected"
+        );
         assert!(
             !one.iter().any(|l| l.contains("تكبير")),
             "no zoom with one pane"
         );
         assert!(one.iter().any(|l| l == "الإعدادات"));
         let sel = labels(context_menu_rows(true, 1, false, false));
-        assert_eq!(&sel[..2], ["نسخ", "لصق"]);
+        assert_eq!(
+            &sel[..2],
+            [
+                keybinds::Action::Copy.label(),
+                keybinds::Action::Paste.label(),
+            ]
+        );
         let split = labels(context_menu_rows(false, 2, true, true));
         assert!(split.iter().any(|l| l == "إلغاء تكبير اللوحة"));
         assert!(split.iter().any(|l| l == "إيقاف الكتابة في كل اللوحات"));

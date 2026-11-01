@@ -396,7 +396,111 @@ pub fn save(cfg: &UserConfig) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(json) = serde_json::to_string_pretty(cfg) {
-        let _ = std::fs::write(path, json);
+        let _ = write_atomic(&path, json.as_bytes());
+    }
+}
+
+/// Write `bytes` to `path` by flushing a sibling temp file and then
+/// replacing `path`. A crash mid-write leaves the previous file intact
+/// (N-06). The temp lives in the same directory so the replace does not
+/// cross a volume.
+pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = sibling_tmp(path);
+    let result = (|| {
+        write_synced(&tmp, bytes)?;
+        replace_file(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Copy `path` to `path` + `.bayan.bak` the first time, and never again.
+/// `$PROFILE` is the user's file; the backup is the copy from before Bayan
+/// rewrote the managed line.
+pub(crate) fn backup_once(path: &std::path::Path) -> std::io::Result<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let Some(name) = path.file_name() else {
+        return Ok(());
+    };
+    let mut bak_name = name.to_os_string();
+    bak_name.push(".bayan.bak");
+    let bak = match path.parent() {
+        Some(dir) => dir.join(bak_name),
+        None => std::path::PathBuf::from(bak_name),
+    };
+    if bak.exists() {
+        return Ok(());
+    }
+    let bytes = std::fs::read(path)?;
+    write_atomic(&bak, &bytes)
+}
+
+fn sibling_tmp(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("bayan"));
+    name.push(".");
+    name.push(std::process::id().to_string());
+    name.push(".tmp");
+    match path.parent() {
+        Some(dir) => dir.join(name),
+        None => std::path::PathBuf::from(name),
+    }
+}
+
+fn write_synced(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn replace_file(tmp: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::rename(tmp, dest) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            #[cfg(windows)]
+            if dest.exists() {
+                return replace_existing(dest, tmp);
+            }
+            Err(err)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn replace_existing(dest: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACEFILE_WRITE_THROUGH};
+
+    fn wide(p: &std::path::Path) -> Vec<u16> {
+        p.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+    let replaced = wide(dest);
+    let replacement = wide(tmp);
+    // SAFETY: both buffers are NUL-terminated and live for the call.
+    // Backup, exclude, and reserved stay null. WRITE_THROUGH flushes the
+    // directory update before the call returns.
+    let ok = unsafe {
+        ReplaceFileW(
+            replaced.as_ptr(),
+            replacement.as_ptr(),
+            std::ptr::null(),
+            REPLACEFILE_WRITE_THROUGH,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -561,5 +665,45 @@ mod tests {
         }
         let on: UserConfig = serde_json::from_str(r#"{"osc52":"copy"}"#).unwrap();
         assert!(on.osc52_copy_enabled());
+    }
+
+    #[test]
+    fn atomic_replace_keeps_a_finished_file_and_backs_up_once() {
+        // N-06: temp dir, never ~/.bayan
+        let dir = std::env::temp_dir().join(format!("bayan-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.json");
+        write_atomic(&path, b"{\"a\":1}").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":1}");
+        // the second write is the one that has to replace, not truncate
+        write_atomic(&path, b"{\"a\":2}").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":2}");
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.ends_with(".tmp")),
+            "temp left behind: {names:?}"
+        );
+
+        let profile = dir.join("Microsoft.PowerShell_profile.ps1");
+        backup_once(&profile).unwrap();
+        assert!(!dir
+            .join("Microsoft.PowerShell_profile.ps1.bayan.bak")
+            .exists());
+        std::fs::write(&profile, b"user-line\n").unwrap();
+        backup_once(&profile).unwrap();
+        let bak = dir.join("Microsoft.PowerShell_profile.ps1.bayan.bak");
+        assert_eq!(std::fs::read(&bak).unwrap(), b"user-line\n");
+        std::fs::write(&profile, b"changed\n").unwrap();
+        backup_once(&profile).unwrap();
+        assert_eq!(
+            std::fs::read(&bak).unwrap(),
+            b"user-line\n",
+            "the backup is taken once"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

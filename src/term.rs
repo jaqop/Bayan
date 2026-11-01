@@ -2083,6 +2083,12 @@ impl Session {
         // program + args, or a shell with switches would be spawned as one
         // absurd filename ("powershell.exe -NoProfile" is not a program)
         let (prog, args) = split_command(shell);
+        // N-03: a saved `wsl.exe -d Ubuntu` must not search Bayan's folder.
+        let Some(prog) = crate::shells::resolve_spawn_program(prog) else {
+            return Err(
+                "refusing to spawn wsl.exe by a bare name; System32\\wsl.exe is not there".into(),
+            );
+        };
         let mut cmd = CommandBuilder::new(prog);
         for a in &args {
             cmd.arg(a);

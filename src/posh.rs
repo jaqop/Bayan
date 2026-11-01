@@ -328,7 +328,10 @@ pub fn set_theme(theme: &str) -> Result<(), String> {
     let p = profile_path();
     let txt = std::fs::read_to_string(&p).map_err(|e| format!("read profile: {e}"))?;
     let new = rewrite_config(&txt, theme).ok_or("no managed oh-my-posh line in the profile")?;
-    std::fs::write(&p, new).map_err(|e| format!("write profile: {e}"))
+    // N-06: one backup of the profile as it was, then an atomic replace so
+    // a crash cannot truncate the lines Bayan does not own.
+    crate::config::backup_once(&p).map_err(|e| format!("backup profile: {e}"))?;
+    crate::config::write_atomic(&p, new.as_bytes()).map_err(|e| format!("write profile: {e}"))
 }
 
 /// Render a theme the way it will actually appear: ask oh-my-posh for the
