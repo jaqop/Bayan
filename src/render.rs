@@ -700,6 +700,58 @@ pub fn progress_label(p: crate::term::Progress) -> String {
 pub const TAB_CELLS: f32 = 24.0;
 /// A tab never shrinks below this: "sh" must still be a clickable target.
 pub const TAB_MIN_CELLS: f32 = 9.0;
+/// Gap between tab cards, and the insets the title is fitted inside.
+const TAB_GAP: i32 = 10;
+const TAB_TOP: i32 = 7;
+const TITLE_LEFT: i32 = 12;
+const TITLE_RIGHT: i32 = 4;
+/// Room kept for the attention/busy dot, and the plain right inset when
+/// there is no dot.
+const DOT_ROOM: i32 = 14;
+const EDGE_ROOM: i32 = 4;
+
+/// Pixels the title may occupy inside a tab card of width `tabw`.
+/// `has_close` reserves the ×; `has_dot` reserves the status dot. The draw
+/// loop and the tab-title test both go through here, so the numbers cannot
+/// drift apart.
+pub(crate) fn title_avail(tabw: i32, close_w: i32, has_close: bool, has_dot: bool) -> i32 {
+    let right = if has_close {
+        close_w + TITLE_RIGHT
+    } else {
+        TITLE_RIGHT
+    };
+    let dot = if has_dot { DOT_ROOM } else { EDGE_ROOM };
+    (tabw - right - dot - TITLE_LEFT).max(0)
+}
+
+/// A combining mark must not be cut off its base when a title is ellipsized.
+fn is_combining_mark(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x0300..=0x036F
+            | 0x064B..=0x065F
+            | 0x0670
+            | 0x06D6..=0x06DC
+            | 0x06DF..=0x06E4
+            | 0x06E7..=0x06E8
+            | 0x06EA..=0x06ED
+            | 0xFE20..=0xFE2F
+    )
+}
+
+/// Exclusive ends of grapheme clusters: a base plus the marks that sit on it.
+fn cluster_ends(chars: &[char]) -> Vec<usize> {
+    let mut ends = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        i += 1;
+        while i < chars.len() && is_combining_mark(chars[i]) {
+            i += 1;
+        }
+        ends.push(i);
+    }
+    ends
+}
 
 /// The proportional font window chrome uses for Arabic. Inbox on every
 /// Windows since Vista; where it is missing, cosmic-text falls back to a
@@ -707,9 +759,12 @@ pub const TAB_MIN_CELLS: f32 = 9.0;
 const UI_ARABIC_FAMILY: &str = "Segoe UI";
 
 fn is_arabic_script(c: char) -> bool {
+    // Extended-B is U+0870..=U+089F. Extended-C (Unicode 15) is
+    // U+10EC0..=U+10EFF. Both are Arabic letters the chrome font split
+    // and the terminal's Arabic-row test have to see.
     matches!(c as u32,
-        0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF
-        | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF)
+        0x0600..=0x06FF | 0x0750..=0x077F | 0x0870..=0x089F | 0x08A0..=0x08FF
+        | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF | 0x10EC0..=0x10EFF)
 }
 
 /// Byte ranges of `text` and whether each is Arabic, for the chrome's font
@@ -947,9 +1002,7 @@ fn status_line_text(parts: &crate::link::StatusParts, columns: usize) -> String 
 }
 
 pub(crate) fn is_arabic(c: char) -> bool {
-    matches!(c as u32,
-        0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF
-        | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF)
+    is_arabic_script(c)
 }
 
 /// One visible grid cell (wide chars own their spacer's width).
@@ -1365,6 +1418,11 @@ pub struct Renderer {
     bar_hidden: bool,
     pub cell_w: f32,
     pub cell_h: f32,
+    /// tab under the pointer, so a truncated title can show the rest
+    pub hover_tab: Option<usize>,
+    /// fitted tab titles, keyed by (title, avail bits). A still frame must
+    /// not re-measure prefixes into the shaped-run cache.
+    title_fit: std::collections::HashMap<(String, u32), String>,
 }
 
 /// Copy for the paste-confirm card. Grouped so `draw_paste_guard` stays
@@ -1485,6 +1543,8 @@ impl Renderer {
             ui_text: false,
             cell_w,
             cell_h: metrics.line_height,
+            hover_tab: None,
+            title_fit: std::collections::HashMap::new(),
         }
     }
 
@@ -4590,6 +4650,7 @@ impl Renderer {
         // long path can't eat the bar and a short name stays clickable.
         let titles: Vec<_> = tabs.iter().map(|t| t.title.as_str()).collect();
         let active = tabs.iter().position(|t| t.active).unwrap_or(0);
+        let mut tip: Option<(i32, String)> = None;
         for (i, x0, tw) in self.tab_rects(width, &titles, active) {
             let tab = &tabs[i];
             // The active tab takes the CONTENT background, so it reads as the
@@ -4614,10 +4675,8 @@ impl Renderer {
             } else {
                 (bar_bg, dim(self.fg, 0.75))
             };
-            // tabs sit IN the bar rather than filling it: a 3px gutter above
+            // tabs sit IN the bar rather than filling it: a gutter above
             // and a real gap between them, so they read as separate cards
-            const TAB_GAP: i32 = 10;
-            const TAB_TOP: i32 = 7;
             let gap = TAB_GAP.min(tw.saturating_sub(1));
             let tx = x0 + gap / 2;
             let tabw = tw - gap;
@@ -4646,21 +4705,18 @@ impl Renderer {
             // "Deskto" — because the tab's width and the glyphs' advances
             // came from different numbers.
             let has_dot = (tab.attention || tab.busy) && tw >= 28;
-            let dot_room = if has_dot { 14 } else { 4 };
-            let right = if has_close {
-                tx + tabw - close_w - 4 - dot_room
-            } else {
-                tx + tabw - 4 - dot_room
-            };
-            let avail = (right - (tx + 12)) as f32;
+            let avail = title_avail(tabw, close_w, has_close, has_dot) as f32;
             let title = self.fit_title(&tab.title, fg, avail);
+            if self.hover_tab == Some(i) && title != tab.title {
+                tip = Some((tx, tab.title.clone()));
+            }
             let segs = [Seg::plain(title, fg)];
             self.draw_run(
                 &segs,
                 true,
                 out,
                 (tx, TAB_TOP, tabw, oy - TAB_TOP),
-                (tx + 12) as f32,
+                (tx + TITLE_LEFT) as f32,
                 (oy - self.cell_h.ceil() as i32) / 2,
                 1.0,
             );
@@ -4715,6 +4771,10 @@ impl Renderer {
                 };
                 push_rect(out, whole, bx, by, fill, bh, c4(c, alpha));
             }
+        }
+
+        if let Some((tx, full)) = tip {
+            self.draw_title_tip(out, whole, width, tx, &full);
         }
 
         if claude {
@@ -4835,18 +4895,80 @@ impl Renderer {
 
     /// The longest prefix of `title` (with "…" when cut) whose shaped width
     /// fits `avail` pixels. Measured, not counted, so it holds for any font.
+    ///
+    /// The cut is on a grapheme boundary: a tashkeel or other combining mark
+    /// stays with its letter, or the whole cluster is dropped. The result is
+    /// cached by `(title, avail)` so a still frame does not walk prefixes
+    /// back into the shaped-run cache. The search itself is binary over
+    /// those clusters.
     fn fit_title(&mut self, title: &str, fg: (u8, u8, u8), avail: f32) -> String {
+        let key = (title.to_string(), avail.to_bits());
+        if let Some(hit) = self.title_fit.get(&key) {
+            return hit.clone();
+        }
+        let fitted = self.fit_title_uncached(title, fg, avail);
+        if self.title_fit.len() >= 64 {
+            self.title_fit.clear();
+        }
+        self.title_fit.insert(key, fitted.clone());
+        fitted
+    }
+
+    fn fit_title_uncached(&mut self, title: &str, fg: (u8, u8, u8), avail: f32) -> String {
+        if title.is_empty() {
+            return String::new();
+        }
         if self.measure(&[Seg::plain(title, fg)], true) <= avail {
             return title.to_string();
         }
         let chars: Vec<char> = title.chars().collect();
-        for k in (1..chars.len()).rev() {
+        let ends = cluster_ends(&chars);
+        // the full string already failed, so the last cluster (the whole
+        // title) is not a candidate
+        let last = ends.len().saturating_sub(1);
+        let mut lo = 0usize;
+        let mut hi = last;
+        let mut best: Option<usize> = None;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let k = ends[mid];
             let cut: String = chars[..k].iter().chain(std::iter::once(&'…')).collect();
-            if self.measure(&[Seg::plain(cut.clone(), fg)], true) <= avail {
-                return cut;
+            if self.measure(&[Seg::plain(cut, fg)], true) <= avail {
+                best = Some(mid);
+                lo = mid + 1;
+            } else {
+                hi = mid;
             }
         }
-        String::new()
+        match best {
+            Some(i) => chars[..ends[i]]
+                .iter()
+                .chain(std::iter::once(&'…'))
+                .collect(),
+            None => String::new(),
+        }
+    }
+
+    /// Full title under a truncated tab. One line, kept inside the window.
+    fn draw_title_tip(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        whole: Rect,
+        width: usize,
+        tx: i32,
+        full: &str,
+    ) {
+        let avail = (width as f32 - 24.0).max(40.0);
+        let shown = self.fit_title(full, self.fg, avail);
+        let segs = [Seg::plain(shown, self.fg)];
+        let tw = self.measure(&segs, true);
+        let pad = 8;
+        let w = tw.ceil() as i32 + pad * 2;
+        let h = self.cell_h.ceil() as i32 + 10;
+        let x = tx.min((width as i32 - w).max(0));
+        let y = self.tab_bar_h().round() as i32 + 2;
+        push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 245));
+        self.draw_run(&segs, true, out, whole, (x + pad) as f32, y + 4, 1.0);
     }
 
     /// Pixel size of the \u{00d7}-style close control on a tab.
@@ -4864,8 +4986,6 @@ impl Renderer {
         if self.bar_hidden {
             return Vec::new();
         }
-        const TAB_GAP: i32 = 10;
-        const TAB_TOP: i32 = 7;
         let oy = self.tab_bar_h().round() as i32;
         let cw = self.tab_close_size();
         let mut out = Vec::new();
@@ -5725,6 +5845,8 @@ mod tests {
     fn arabic_detection_ranges() {
         assert!(is_arabic('م'));
         assert!(is_arabic('ﻻ')); // presentation form
+        assert!(is_arabic('\u{0870}'), "Arabic Extended-B");
+        assert!(is_arabic('\u{10EC0}'), "Arabic Extended-C");
         assert!(!is_arabic('a'));
         assert!(!is_arabic('\u{e0b0}')); // powerline triangle -> grid path
         assert!(!is_arabic('─')); // box drawing -> grid path
@@ -5819,21 +5941,63 @@ mod cache_tests {
             r.use_ui_metrics(true);
             for title in ["Bayan", "sh", "Desktop", "Admin", "projects-2026", "مشروع"] {
                 let tw = r.tab_width(title);
-                let tabw = tw - 10;
+                let gap = TAB_GAP.min(tw.saturating_sub(1));
+                let tabw = tw - gap;
                 let close_w = r.tab_close_size();
-                let avail = (tabw - close_w - 4 - 14 - 12) as f32;
+                let has_close = tabw >= close_w + 20;
+                let avail = title_avail(tabw, close_w, has_close, false) as f32;
                 assert_eq!(
                     r.fit_title(title, (255, 255, 255), avail),
                     title,
                     "{title:?} cut at scale {scale} in a {tw}px tab"
+                );
+                // the busy-dot budget is the same helper, just tighter
+                assert!(
+                    title_avail(tabw, close_w, has_close, true)
+                        <= title_avail(tabw, close_w, has_close, false)
                 );
             }
             // a title longer than its tab is cut with an ellipsis that fits
             let long = "a-very-long-directory-name-that-cannot-fit";
             let fitted = r.fit_title(long, (255, 255, 255), 120.0);
             assert!(fitted.ends_with('…') && fitted.chars().count() < long.chars().count());
-            assert!(r.measure(&[Seg::plain(fitted, (255, 255, 255))], true) <= 120.0);
+            assert!(r.measure(&[Seg::plain(&fitted, (255, 255, 255))], true) <= 120.0);
+            // a second fit must not walk prefixes back into the shaped cache
+            let hot = r.cache_hot.len();
+            assert_eq!(r.fit_title(long, (255, 255, 255), 120.0), fitted);
+            assert_eq!(r.cache_hot.len(), hot, "the (title, avail) cache hit");
         }
+    }
+
+    #[test]
+    fn a_fitted_title_does_not_split_a_combining_mark_from_its_letter() {
+        let mut r = test_renderer();
+        r.use_ui_metrics(true);
+        // beh + fatha, then ASCII. The cut has to land on a cluster boundary.
+        let title = "ب\u{064E}cdefghijklmnopqrstuvwxyz";
+        let fg = (255, 255, 255);
+        let chars: Vec<char> = title.chars().collect();
+        let full_w = r.measure(&[Seg::plain(title, fg)], true);
+        let check = |fitted: &str| {
+            if fitted.is_empty() {
+                return;
+            }
+            if let Some(prefix) = fitted.strip_suffix('…') {
+                assert!(title.starts_with(prefix), "{fitted}");
+                let k = prefix.chars().count();
+                assert!(
+                    k > 0 && !is_combining_mark(chars[k]),
+                    "cut before a mark: {fitted:?}"
+                );
+            } else {
+                assert_eq!(fitted, title);
+            }
+        };
+        check(&r.fit_title(title, fg, full_w));
+        let cut = r.fit_title(title, fg, (full_w * 0.45).max(1.0));
+        assert!(cut.ends_with('…') || cut.is_empty(), "{cut}");
+        check(&cut);
+        assert_eq!(cluster_ends(&['ب', '\u{064E}', 'x']), vec![2, 3]);
     }
 
     #[test]

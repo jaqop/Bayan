@@ -627,6 +627,18 @@ fn clean_tab_name(raw: &str) -> Option<String> {
 }
 
 /// Weighted split of a content rect along one axis, 1px gaps between panes.
+/// Top-level axis and weights of a tree, for the one-axis fallback and for
+/// readers that predate the nested `layout` field. A leaf has no split.
+fn saved_split(layout: &layout::Node) -> (u8, Vec<f32>) {
+    match layout {
+        layout::Node::Split { axis, weights, .. } => {
+            let orientation = u8::from(*axis == Orientation::Column);
+            (orientation, weights.clone())
+        }
+        layout::Node::Leaf(_) => (0, Vec::new()),
+    }
+}
+
 /// A saved tab's layout for the `n` panes that actually came back: its tree
 /// when it holds exactly those panes, else the old one-axis form (files from
 /// before nested splits, or a tab where a pane failed to respawn).
@@ -867,39 +879,36 @@ fn context_menu_rows(
 ) -> Vec<(PaletteRow, String)> {
     use keybinds::Action::*;
     let mut rows = Vec::new();
-    let mut add = |a: keybinds::Action, label: &str| {
-        rows.push((PaletteRow::Builtin(a), label.to_string()));
-    };
-    if has_selection {
-        add(Copy, "نسخ");
+    {
+        let mut add = |a: keybinds::Action| {
+            rows.push((PaletteRow::Builtin(a), a.label().to_string()));
+        };
+        if has_selection {
+            add(Copy);
+        }
+        add(Paste);
+        add(CopyLastOutput);
+        add(Search);
+        add(SplitH);
+        add(SplitV);
     }
-    add(Paste, "لصق");
-    add(CopyLastOutput, "نسخ ناتج آخر أمر");
-    add(Search, "البحث");
-    add(SplitH, "تقسيم: جنبًا إلى جنب");
-    add(SplitV, "تقسيم: فوق بعضها");
     if panes > 1 {
-        add(
-            ZoomPane,
-            if zoomed {
-                "إلغاء تكبير اللوحة"
-            } else {
-                "تكبير اللوحة"
-            },
-        );
-        add(
-            Broadcast,
-            if broadcast {
-                "إيقاف الكتابة في كل اللوحات"
-            } else {
-                "الكتابة في كل اللوحات"
-            },
-        );
+        let zoom = if zoomed {
+            format!("إلغاء {}", ZoomPane.label())
+        } else {
+            ZoomPane.label().to_string()
+        };
+        rows.push((PaletteRow::Builtin(ZoomPane), zoom));
+        let cast = if broadcast {
+            format!("إيقاف {}", Broadcast.label())
+        } else {
+            Broadcast.label().to_string()
+        };
+        rows.push((PaletteRow::Builtin(Broadcast), cast));
     }
-    add(NewTab, "تبويب جديد");
-    add(RenameTab, "تسمية التبويب");
-    add(ClosePane, "إغلاق اللوحة");
-    add(Settings, "الإعدادات");
+    for a in [NewTab, RenameTab, ClosePane, Settings] {
+        rows.push((PaletteRow::Builtin(a), a.label().to_string()));
+    }
     rows
 }
 
@@ -932,9 +941,20 @@ fn chrome_text(raw: &str) -> String {
     link::preview_with(raw, CHROME_TEXT_MAX, link::is_forbidden_in_path)
 }
 
+/// Counted form of «لوحة», the same agreement as the paste card's lines.
+fn arabic_panes(n: usize) -> String {
+    match n {
+        2 => "لوحتين".to_string(),
+        3..=10 => format!("{n} لوحات"),
+        _ => format!("{n} لوحة"),
+    }
+}
+
 /// The card's note when Enter will also type into `others` broadcast panes.
+/// `others` is the extra panes, so the note counts the focused one too.
 fn broadcast_note(others: usize) -> Option<String> {
-    (others > 0).then(|| format!(" — يُرسل إلى {} لوحات", others + 1))
+    let n = others + 1;
+    (n >= 2).then(|| format!(" — يُرسل إلى {}", arabic_panes(n)))
 }
 
 /// Whether a card raised for `raised_for` may still send (R-02): only into
@@ -943,12 +963,33 @@ fn card_still_targets(raised_for: Option<u64>, focused: Option<u64>) -> bool {
     raised_for.is_some() && raised_for == focused
 }
 
+/// Drop a confirm card whose pane is one of `removed`.
+///
+/// The card is painted over the whole window. Closing that pane, closing
+/// its tab, or the shell exiting otherwise leaves it up on top of a
+/// different tab, where Enter does nothing (`card_still_targets` already
+/// refuses the send). A card for a pane that is still open stays. A card
+/// with no pane id matches nothing.
+///
+/// `blocked_link` is not cleared here. It is not keyed by a pane: it is a
+/// window-level refuse or confirm for a URL, and closing a shell must not
+/// dismiss it.
+fn dismiss_paste_for(pending: &mut Option<PendingPaste>, removed: &[u64]) {
+    if pending
+        .as_ref()
+        .is_some_and(|p| p.pane.is_some_and(|id| removed.contains(&id)))
+    {
+        *pending = None;
+    }
+}
+
 /// Chars of preview per card row; the card is 62 cells wide.
 const CARD_ROW_CHARS: usize = 56;
 
 /// The card's preview rows. A paste shows one elided row, as before. A
 /// plugin command shows ALL of what Enter will type (R-03), wrapped into
-/// rows, with CR as ␍ — a plugin's 512-char cap keeps that to ≤ 10 rows.
+/// rows, with CR as ␍. The 512-char cap stays within ten rows because
+/// plugin load rejects every character this preview would expand.
 fn card_preview(kind: PendingKind, text: &str) -> Vec<String> {
     if kind != PendingKind::Command {
         return vec![term::paste_preview(text, 48)];
@@ -1069,6 +1110,10 @@ struct PoshPicker {
     /// preview ANSI per name, filled in by the `bayan-posh` worker as each
     /// subprocess finishes (None = not rendered yet, or no preview)
     previews: Vec<Option<Vec<u8>>>,
+    /// a row already handed to the worker. `previews` stays None both while
+    /// that run is in flight and when the theme has no preview, so without
+    /// this a second highlight starts oh-my-posh again.
+    asked: Vec<bool>,
     sel: usize,
     /// which open this is: a preview from an earlier, closed picker is dropped
     generation: u64,
@@ -1082,6 +1127,16 @@ static POSH_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 
 /// One burst of preview requests, as the worker runs it (R-04): every eager
 /// row (featured + selected on open), then only the NEWEST highlight request.
+/// Whether highlight `i` still needs a preview subprocess. A row that was
+/// already asked, or that already has ANSI, does not.
+fn claim_posh_preview(asked: &mut [bool], have_preview: bool, i: usize) -> bool {
+    if have_preview || asked.get(i).copied().unwrap_or(true) {
+        return false;
+    }
+    asked[i] = true;
+    true
+}
+
 fn collapse_posh_requests(burst: Vec<(usize, String, bool)>) -> Vec<(usize, String, bool)> {
     let last_hl = burst.iter().rposition(|r| !r.2);
     burst
@@ -1531,11 +1586,14 @@ impl App {
                     }
                 }
             });
+        let mut asked = vec![false; names.len()];
         for i in posh::eager_previews(&names, sel) {
+            asked[i] = true;
             let _ = tx.send((i, names[i].clone(), true));
         }
         self.posh = Some(PoshPicker {
             previews: vec![None; names.len()],
+            asked,
             names,
             sel,
             generation,
@@ -1544,13 +1602,15 @@ impl App {
         self.request_redraw();
     }
 
-    /// Ask the worker for the highlighted theme's preview, if it has none.
+    /// Ask the worker for the highlighted theme's preview, once.
     fn request_posh_preview(&mut self) {
         let Some(p) = self.posh.as_mut() else { return };
         let i = p.sel;
-        if p.previews.get(i).is_some_and(Option::is_none) {
-            let _ = p.work.send((i, p.names[i].clone(), false));
+        let have = p.previews.get(i).is_some_and(Option::is_some);
+        if !claim_posh_preview(&mut p.asked, have, i) {
+            return;
         }
+        let _ = p.work.send((i, p.names[i].clone(), false));
     }
 
     /// Close the picker and stop its preview worker.
@@ -2394,7 +2454,7 @@ impl App {
 
     /// Split the active tab (EasyTer: Ctrl+Shift+E side-by-side, O stacked).
     fn split(&mut self, orientation: Orientation) {
-        // four panes per tab is the v1 cap (one axis, equal sizes)
+        // four panes per tab is the cap; side-by-side and stacked nest
         if self
             .tabs
             .get(self.active)
@@ -2451,6 +2511,8 @@ impl App {
         {
             self.pending_close = None;
         }
+        let removed: Vec<u64> = t.panes.iter().map(|p| p.id).collect();
+        dismiss_paste_for(&mut self.pending_paste, &removed);
         for mut pane in t.panes.drain(..) {
             pane.session.kill();
         }
@@ -2485,6 +2547,8 @@ impl App {
         ) {
             self.pending_close = None;
         }
+        let removed = t.panes[pi].id;
+        dismiss_paste_for(&mut self.pending_paste, &[removed]);
         let mut pane = t.panes.remove(pi);
         t.layout.remove(pi);
         pane.session.kill();
@@ -2551,26 +2615,29 @@ impl App {
             tabs: self
                 .tabs
                 .iter()
-                .map(|t| SavedTab {
-                    cwds: t
-                        .panes
-                        .iter()
-                        .map(|p| {
-                            // don't persist a path we would refuse to start in
-                            p.session
-                                .meta
-                                .lock()
-                                .unwrap()
-                                .cwd
-                                .as_deref()
-                                .and_then(term::accept_local_cwd)
-                        })
-                        .collect(),
-                    weights: Vec::new(),
-                    orientation: 0,
-                    focused: t.focused,
-                    layout: Some(t.layout.clone()),
-                    name: t.name.clone(),
+                .map(|t| {
+                    let (orientation, weights) = saved_split(&t.layout);
+                    SavedTab {
+                        cwds: t
+                            .panes
+                            .iter()
+                            .map(|p| {
+                                // don't persist a path we would refuse to start in
+                                p.session
+                                    .meta
+                                    .lock()
+                                    .unwrap()
+                                    .cwd
+                                    .as_deref()
+                                    .and_then(term::accept_local_cwd)
+                            })
+                            .collect(),
+                        weights,
+                        orientation,
+                        focused: t.focused,
+                        layout: Some(t.layout.clone()),
+                        name: t.name.clone(),
+                    }
                 })
                 .collect(),
             active: self.active,
@@ -4471,7 +4538,14 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Moved(_) => self.track_geometry(),
             WindowEvent::Resized(px) => self.resized(px),
             WindowEvent::CursorMoved { position, .. } => self.cursor_moved(position),
-            WindowEvent::CursorLeft { .. } => self.clear_link_hover(),
+            WindowEvent::CursorLeft { .. } => {
+                self.clear_link_hover();
+                if let Some(r) = self.renderer.as_mut() {
+                    if r.hover_tab.take().is_some() {
+                        self.request_redraw();
+                    }
+                }
+            }
             WindowEvent::MouseInput { state, button, .. } => self.mouse_input(state, button, el),
             WindowEvent::MouseWheel { delta, .. } => self.mouse_wheel(delta),
             WindowEvent::KeyboardInput { event, .. } => self.key_input(&event, el),
@@ -4691,7 +4765,44 @@ mod tests {
         assert!(!card_still_targets(None, None));
         // R-01: the card says when a paste fans out
         assert_eq!(broadcast_note(0), None);
+        assert_eq!(broadcast_note(1).as_deref(), Some(" — يُرسل إلى لوحتين"));
         assert_eq!(broadcast_note(2).as_deref(), Some(" — يُرسل إلى 3 لوحات"));
+        assert_eq!(broadcast_note(10).as_deref(), Some(" — يُرسل إلى 11 لوحة"));
+    }
+
+    #[test]
+    fn a_confirm_card_goes_away_with_its_pane() {
+        // The card is keyed by pane id (R-02 keeps the send safe). When that
+        // pane is removed — shell exit, pane close, or the whole tab — the
+        // card itself has to go, or it stays painted over another tab and
+        // Enter does nothing.
+        let card = |pane| {
+            Some(PendingPaste {
+                kind: PendingKind::Command,
+                pane,
+                text: "echo hi\r".into(),
+                lines: 1,
+                chars: 8,
+                reason: "test".into(),
+            })
+        };
+        let mut pending = card(Some(7));
+        dismiss_paste_for(&mut pending, &[7]);
+        assert!(pending.is_none(), "the pane the card was raised for");
+        let mut pending = card(Some(7));
+        dismiss_paste_for(&mut pending, &[7, 8]);
+        assert!(pending.is_none(), "a tab close removes every pane in it");
+        let mut pending = card(Some(7));
+        dismiss_paste_for(&mut pending, &[8]);
+        assert!(pending.is_some(), "a neighbour closing leaves this card up");
+        let mut pending = card(None);
+        dismiss_paste_for(&mut pending, &[7]);
+        assert!(pending.is_some(), "a card with no pane id matches nothing");
+        // a paste card is the same map: the pane id, not the kind
+        let mut pending = card(Some(3));
+        pending.as_mut().unwrap().kind = PendingKind::Paste;
+        dismiss_paste_for(&mut pending, &[3]);
+        assert!(pending.is_none());
     }
 
     #[test]
@@ -4760,6 +4871,12 @@ mod tests {
         .collect();
         assert_eq!(got, vec![3, 1, 6]);
         assert!(collapse_posh_requests(Vec::new()).is_empty());
+        // a highlight asks once; a second pass while it is in flight does not
+        let mut asked = vec![false, false];
+        assert!(claim_posh_preview(&mut asked, false, 1));
+        assert!(!claim_posh_preview(&mut asked, false, 1));
+        assert!(claim_posh_preview(&mut asked, false, 0));
+        assert!(!claim_posh_preview(&mut asked, true, 0));
     }
 
     #[test]
@@ -5011,6 +5128,47 @@ mod tests {
     }
 
     #[test]
+    fn the_context_menu_uses_the_action_labels() {
+        let rows = context_menu_rows(true, 2, false, false);
+        let label = |a: keybinds::Action| {
+            rows.iter()
+                .find(|(r, _)| r == &PaletteRow::Builtin(a))
+                .map(|(_, s)| s.as_str())
+                .unwrap()
+        };
+        assert_eq!(
+            label(keybinds::Action::Paste),
+            keybinds::Action::Paste.label()
+        );
+        assert_eq!(
+            label(keybinds::Action::Copy),
+            keybinds::Action::Copy.label()
+        );
+        assert_eq!(
+            label(keybinds::Action::SplitV),
+            keybinds::Action::SplitV.label()
+        );
+        assert_eq!(label(keybinds::Action::SplitV), "لوحة أسفل");
+        assert_eq!(
+            label(keybinds::Action::ZoomPane),
+            keybinds::Action::ZoomPane.label()
+        );
+        let zoomed = context_menu_rows(false, 2, true, true);
+        let zoom = zoomed
+            .iter()
+            .find(|(r, _)| r == &PaletteRow::Builtin(keybinds::Action::ZoomPane))
+            .map(|(_, s)| s.as_str())
+            .unwrap();
+        assert!(zoom.starts_with("إلغاء "), "{zoom}");
+        let cast = zoomed
+            .iter()
+            .find(|(r, _)| r == &PaletteRow::Builtin(keybinds::Action::Broadcast))
+            .map(|(_, s)| s.as_str())
+            .unwrap();
+        assert!(cast.starts_with("إيقاف "), "{cast}");
+    }
+
+    #[test]
     fn a_saved_tree_restores_and_an_old_file_still_reads() {
         let mut tree = layout::Node::single();
         tree.split(0, Orientation::Row, 1);
@@ -5024,7 +5182,24 @@ mod tests {
             name: None,
         };
         assert_eq!(restored_layout(&st, 3), tree);
-        // a pane failed to respawn: the tree no longer fits, use one axis
+        let (orientation, weights) = saved_split(&tree);
+        assert_eq!(orientation, 0, "the root split is side by side");
+        assert_eq!(weights.len(), 2);
+        // a pane failed to respawn and the file kept the root axis: that
+        // axis is the fallback, not a hard-coded row of equal panes
+        let fallback = SavedTab {
+            cwds: st.cwds.clone(),
+            weights: weights.clone(),
+            orientation,
+            focused: st.focused,
+            layout: Some(tree.clone()),
+            name: st.name.clone(),
+        };
+        assert_eq!(
+            restored_layout(&fallback, 2),
+            layout::Node::flat(Orientation::Row, &weights, 2)
+        );
+        // a save that dropped the axis (the old writer) still reads as a row
         assert_eq!(
             restored_layout(&st, 2),
             layout::Node::flat(Orientation::Row, &[], 2)
@@ -5069,7 +5244,10 @@ mod tests {
         let size = TermSize { cols: 20, rows: 4 };
         let mut t = Term::new(Config::default(), &size, VoidListener);
         let mut p: Processor = Processor::new();
-        let mut meta = term::SessionMeta::default();
+        let mut meta = term::SessionMeta {
+            prompt_nonce: "n0nce".into(),
+            ..term::SessionMeta::default()
+        };
         let mut carry = Vec::new();
         let feed = |p: &mut Processor,
                     t: &mut Term<VoidListener>,
@@ -5083,17 +5261,29 @@ mod tests {
             &mut t,
             &mut meta,
             &mut carry,
-            b"\x1b]133;A\x07> ok\r\n",
+            b"\x1b]133;A;n0nce\x07> ok\r\n",
         );
-        feed(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;D;0\x07");
         feed(
             &mut p,
             &mut t,
             &mut meta,
             &mut carry,
-            b"\x1b]133;A\x07> bad\r\n",
+            b"\x1b]133;D;0;n0nce\x07",
         );
-        feed(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;D;1\x07");
+        feed(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;A;n0nce\x07> bad\r\n",
+        );
+        feed(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;D;1;n0nce\x07",
+        );
         assert_eq!(meta.marks.len(), 2);
         assert_eq!(meta.marks[0].exit, Some(0));
         assert_eq!(meta.marks[1].exit, Some(1));

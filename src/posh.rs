@@ -72,7 +72,36 @@ pub fn posh_exe() -> Option<PathBuf> {
     let path: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    posh_exe_in(local, &path, own.as_deref(), |p| p.is_file())
+    posh_exe_in(
+        local,
+        &path,
+        own.as_deref(),
+        |p| p.is_file(),
+        expand_existing,
+    )
+}
+
+/// A directory reduced to one comparable key: slashes agree, `.` and `..`
+/// are collapsed, and ASCII case does not count. `expand` turns an 8.3
+/// name into the long path when the caller can; a missing expansion keeps
+/// the lexical form.
+fn dir_key(p: &std::path::Path, expand: &impl Fn(&std::path::Path) -> PathBuf) -> String {
+    let expanded = expand(p);
+    let raw = expanded.to_string_lossy().replace('/', "\\");
+    let mut parts: Vec<String> = Vec::new();
+    for part in raw.split('\\') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            if parts.last().is_some_and(|p| p != ".." && !p.ends_with(':')) {
+                parts.pop();
+            }
+            continue;
+        }
+        parts.push(part.to_ascii_lowercase());
+    }
+    parts.join("\\")
 }
 
 fn posh_exe_in(
@@ -80,12 +109,9 @@ fn posh_exe_in(
     path: &[PathBuf],
     own_dir: Option<&std::path::Path>,
     is_file: impl Fn(&std::path::Path) -> bool,
+    expand: impl Fn(&std::path::Path) -> PathBuf,
 ) -> Option<PathBuf> {
-    let same = |a: &std::path::Path, b: &std::path::Path| {
-        a.to_string_lossy()
-            .trim_end_matches(['\\', '/'])
-            .eq_ignore_ascii_case(b.to_string_lossy().trim_end_matches(['\\', '/']))
-    };
+    let own = own_dir.map(|o| dir_key(o, &expand));
     local
         .into_iter()
         .chain(path.iter().cloned())
@@ -94,9 +120,46 @@ fn posh_exe_in(
             d.to_str()
                 .is_some_and(|s| crate::term::accept_local_cwd(s).is_some())
         })
-        .filter(|d| !own_dir.is_some_and(|o| same(d, o)))
+        .filter(|d| own.as_ref().is_none_or(|o| dir_key(d, &expand) != *o))
         .map(|d| d.join("oh-my-posh.exe"))
         .find(|p| is_file(p))
+}
+
+/// Long path when Windows can resolve one. An 8.3 name of Bayan's own
+/// folder (`DOWNLO~1`) then compares equal to `current_exe`'s directory.
+fn expand_existing(p: &std::path::Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(long) = long_path(p) {
+            return long;
+        }
+    }
+    p.to_path_buf()
+}
+
+#[cfg(windows)]
+fn long_path(p: &std::path::Path) -> Option<PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let wide: Vec<u16> = p
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut buf = vec![0u16; 1024];
+    // SAFETY: `wide` is NUL-terminated and outlives the call. `buf` is
+    // writable for `buf.len()` wide characters. A zero return is failure.
+    let n = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetLongPathNameW(
+            wide.as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+        )
+    };
+    if n == 0 || n as usize >= buf.len() {
+        return None;
+    }
+    buf.truncate(n as usize);
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&buf)))
 }
 
 /// R-04: does a theme run commands when it renders? oh-my-posh's `command`
@@ -104,15 +167,35 @@ fn posh_exe_in(
 /// would run it the moment the picker opened. Those themes are listed and
 /// can still be chosen, but are not previewed. An unreadable or invalid file
 /// counts as unsafe.
+///
+/// Keys are compared without regard to ASCII case. oh-my-posh decodes with
+/// Go's `encoding/json`, which matches a struct field that way
+/// (`Unmarshal` prefers an exact match, then a case-insensitive one), so
+/// `"Type"` is the same field as `"type"`. The segment type value oh-my-posh
+/// executes is the lowercase literal `command`; other casings are refused
+/// here too, so a preview never depends on that comparison staying exact.
+/// Any `extends` key is unsafe on its own: `Parse` follows a non-empty
+/// `Extends` to a local path, a built-in theme name, or an `https://` URL
+/// (`read` downloads it) and merges that base in before drawing. A
+/// `command` segment there never appears in this file. We do not load it.
+/// Empty and JSON null do not extend (`cfg.Extends != ""`), and the key is
+/// still refused — the theme is shown by name, not previewed.
 fn runs_commands(theme_json: &str) -> bool {
     fn walk(v: &serde_json::Value) -> bool {
         match v {
-            serde_json::Value::Object(m) => {
-                m.get("type")
-                    .and_then(|t| t.as_str())
-                    .is_some_and(|t| t.eq_ignore_ascii_case("command"))
-                    || m.values().any(walk)
-            }
+            serde_json::Value::Object(m) => m.iter().any(|(k, val)| {
+                if k.eq_ignore_ascii_case("extends") {
+                    return true;
+                }
+                if k.eq_ignore_ascii_case("type")
+                    && val
+                        .as_str()
+                        .is_some_and(|t| t.eq_ignore_ascii_case("command"))
+                {
+                    return true;
+                }
+                walk(val)
+            }),
             serde_json::Value::Array(a) => a.iter().any(walk),
             _ => false,
         }
@@ -518,18 +601,48 @@ mod tests {
             PathBuf::from(r"C:\Tools\posh"),
         ];
         let everywhere = |_: &std::path::Path| true;
+        let plain = |p: &std::path::Path| p.to_path_buf();
         assert_eq!(
-            posh_exe_in(None, &path, Some(&own), everywhere),
+            posh_exe_in(None, &path, Some(&own), everywhere, plain),
             Some(PathBuf::from(r"C:\Tools\posh\oh-my-posh.exe"))
         );
         // the install location wins over PATH
         let local = PathBuf::from(r"C:\Users\a\AppData\Local\Programs\oh-my-posh\bin");
         assert_eq!(
-            posh_exe_in(Some(local.clone()), &path, Some(&own), everywhere),
+            posh_exe_in(Some(local.clone()), &path, Some(&own), everywhere, plain),
             Some(local.join("oh-my-posh.exe"))
         );
         // nothing found: no preview, not a bare-name spawn
-        assert_eq!(posh_exe_in(None, &path, Some(&own), |_| false), None);
+        assert_eq!(posh_exe_in(None, &path, Some(&own), |_| false, plain), None);
+        // `.\` and `..` are the same folder, not a different string
+        let dotted = vec![
+            PathBuf::from(r"C:\Users\a\Downloads\."),
+            PathBuf::from(r"C:\Users\a\Downloads\sub\.."),
+            PathBuf::from(r"C:/Users/a/Downloads"),
+            PathBuf::from(r"C:\Tools\posh"),
+        ];
+        assert_eq!(
+            posh_exe_in(None, &dotted, Some(&own), everywhere, plain),
+            Some(PathBuf::from(r"C:\Tools\posh\oh-my-posh.exe"))
+        );
+        // an 8.3 name of Bayan's folder is the same directory once expanded
+        let short = vec![
+            PathBuf::from(r"C:\Users\a\DOWNLO~1"),
+            PathBuf::from(r"C:\Tools\posh"),
+        ];
+        let expand = |p: &std::path::Path| {
+            if p.to_string_lossy()
+                .eq_ignore_ascii_case(r"C:\Users\a\DOWNLO~1")
+            {
+                PathBuf::from(r"C:\Users\a\Downloads")
+            } else {
+                p.to_path_buf()
+            }
+        };
+        assert_eq!(
+            posh_exe_in(None, &short, Some(&own), everywhere, expand),
+            Some(PathBuf::from(r"C:\Tools\posh\oh-my-posh.exe"))
+        );
     }
 
     #[test]
@@ -544,6 +657,38 @@ mod tests {
             r#"{"blocks":[{"segments":[{"type":"path"},{"type":"git"}]}]}"#
         ));
         assert!(runs_commands("not json"), "unreadable counts as unsafe");
+    }
+
+    #[test]
+    fn a_command_segment_whose_key_is_not_lowercase_still_blocks_preview() {
+        // R-04: encoding/json matches "Type" to the `type` field. serde_json
+        // keeps "type" and "Type" as two keys, so both have to be read.
+        assert!(runs_commands(
+            r#"{"blocks":[{"segments":[{"Type":"command","properties":{"command":"calc"}}]}]}"#
+        ));
+        assert!(runs_commands(
+            r#"{"blocks":[{"segments":[{"TYPE":"Command"}]}]}"#
+        ));
+        assert!(runs_commands(
+            r#"{"blocks":[{"segments":[{"type":"path","Type":"command"}]}]}"#
+        ));
+    }
+
+    #[test]
+    fn a_theme_that_extends_another_is_not_previewed() {
+        // R-04: the base may be a local file or a remote theme, and it is
+        // not in this document. A path segment here says nothing about the
+        // base. The word "extends" inside a template is not the key.
+        assert!(runs_commands(
+            r#"{"extends":"base.omp.json","blocks":[{"segments":[{"type":"path"}]}]}"#
+        ));
+        assert!(runs_commands(
+            r#"{"Extends":"https://example.invalid/p.omp.json","blocks":[{"segments":[{"type":"path"}]}]}"#
+        ));
+        assert!(runs_commands(r#"{"extends":""}"#));
+        assert!(!runs_commands(
+            r#"{"blocks":[{"segments":[{"type":"text","template":"extends"}]}]}"#
+        ));
     }
 
     #[test]
