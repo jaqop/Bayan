@@ -558,6 +558,90 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       `"right_click": "paste"` in config.json brings back M36's paste on
       right-click; anything else, or nothing, is the menu. `BAYAN_PASTE`
       still pastes: with the menu on it takes the menu's لصق row
+- [x] **Security pass, 2026-10-31** — every open item of that day's
+      defensive review (NEW-01…07, BAYAN-005…017) addressed in one change.
+      Program toasts (OSC 9 / 777 / 99) are opt-in (`"osc_notify": true`),
+      need a BEL/ST terminator, have control/bidi/zero-width characters
+      stripped and length caps, and always carry Bayan's own title
+      («بيان · tab»); the program's title goes in the body. OSC 133 `B`
+      carries the session nonce like `A` and `D`, and a bare `B` clears
+      "at prompt" instead of setting it. oh-my-posh theme names outside
+      `[A-Za-z0-9._-]` are never listed, previewed or written to `$PROFILE`.
+      Plugin palette actions are badged «إضافة», may not reuse a built-in
+      label, are capped, and wait on the paste-guard card instead of being
+      written raw; Enter then types them into the focused pane only,
+      unbracketed (so a trailing CR still runs the command), with every
+      control but CR and Tab removed. WSL distro names that would split into extra `wsl.exe`
+      arguments are skipped; `split_command` only ends the program at a
+      `.exe` that ends a word, preferring one that exists. CI has
+      `permissions: contents: read` and every action pinned to a commit
+      SHA. `BAYAN_*` hooks compile only into debug builds or
+      `--features dev-hooks`, and the profile log no longer records which
+      key was pressed. Prompt-picker previews render on a `bayan-posh`
+      worker, selected theme first. The cockpit and close guard show
+      PTY-shaped text through `link::preview`. Config keybinds must pass
+      `is_bindable`. A `D` without an exit code says «انتهى الأمر», not
+      success. Restore is capped at 16 tabs, quit kills every shell, and
+      `Session` kills its child on drop. `meta`/`parser` locks recover from
+      poisoning. The launcher directory goes through `accept_local_cwd` +
+      `usable_spawn_dir`, Bayan's own folder is skipped, `is_under`
+      understands `\\?\`. A failed `RtlGenRandom` turns
+      shell integration off instead of using time+PID. cwd and links share
+      `link::is_forbidden` (the cwd form keeps ZWNJ/ZWJ, which Persian folder
+      names need). `d3d12`, `dcomp` and `d3dcompiler_47`, which wgpu loads
+      dynamically by bare name, are pre-mapped from System32. NEW-04 is only
+      partly closed: `dxgi.dll` and `opengl32.dll` are static imports,
+      resolved before `main`; closing that needs `/DEPENDENTLOADFLAG:0x800`
+      at link time, untested, so install Bayan somewhere only you can
+      write. An OSC 8 span whose visible text names a web address for a
+      different host (any word of it, punctuation stripped, bare
+      `paypal.com` included) waits for the host card — a heuristic: text
+      drawn outside the span is not seen.
+      An independent review of the patch found the plugin-send semantics,
+      the static-import gap and the NEW-07 bypasses above; all three were
+      fixed or recorded before this landed. Proven: `cargo test` on
+      Windows, 363 passed; a release build launched with the tab × showing;
+      CI on PR #24 green (build + test, MSRV, fmt + clippy, audit) with the
+      SHA-pinned actions and `permissions: contents: read`.
+      **Re-verification, same evening (R-01…R-08).** A second static review
+      of the fixed tree found 4 Low and 4 Info items, mostly where M38/M39
+      (broadcast, tab ×, middle-click close) meet the confirm cards. A
+      confirm card now remembers its pane and sends nothing if that pane
+      is no longer focused, and tab-bar clicks and middle-click close are
+      swallowed while one is up. A dropped path goes to the focused pane
+      only, never to broadcast panes, and a paste card says how many panes
+      Enter reaches. The plugin card shows the whole payload, wrapped, with
+      every CR visible, and plugin sends cap at 512 chars. The prompt picker
+      renders only the featured themes and the selected one on open, the
+      rest on highlight, never a theme with a `command` segment, never from
+      a non-local `POSH_THEMES_PATH`, and runs oh-my-posh by absolute path,
+      skipping Bayan's own folder. The forbidden set covers the invisible
+      Hangul fillers and variation selectors, and toasts use the full set.
+      The prompt nonce travels in `BAYAN_PROMPT_NONCE`, is copied into
+      `$global:__BY_N` and removed before anything else runs, so it is not
+      on the PowerShell command line or in any child's environment. Tab
+      titles are fitted by measured width: the cell-count version still cut
+      "Desktop" to "Deskto" on a real Windows font after the first fix.
+      Behaviour changes to know about: program toasts are off until
+      `osc_notify` is set; plugin actions ask before typing and can no
+      longer send ESC sequences or Ctrl keys; only PowerShell's nonce'd
+      `133;B` marks the prompt, so drops into cmd, bash and WSL panes
+      always show the confirm card; picker previews of non-featured themes
+      appear when highlighted
+- [x] **Nested splits** — a tab's panes are a tree of splits (`layout.rs`),
+      so «تقسيم: جنبًا إلى جنب» and «تقسيم: فوق بعضها» split the FOCUSED pane
+      the way they say and mix freely: two side by side, then the right one
+      stacked. Before, a tab had one axis taken from its first split, so
+      after that both actions did the same thing. Splitting along the axis
+      a pane already sits in adds a sibling that shares its size. Closing a
+      pane collapses its split; dividers drag at every level and the cursor
+      follows the divider under it. Panes stay one flat list, so focus,
+      broadcast, zoom and the close guard are unchanged. The session file
+      saves the tree; a file from before restores as one row or column.
+      Proven by six unit tests on the pure tree (rects, split, remove,
+      dividers and drags, session round trip). Chrome Arabic (menus,
+      settings, cards) now shapes in Segoe UI: Cascadia Code's monospaced
+      Arabic stretched every letter to a full cell
 
 ## Settings
 
@@ -578,6 +662,13 @@ key falls back to a sane default:
   "keyboard": { "kitty_protocol": false, "kitty_base_layout_fallback": true }
 }
 ```
+
+`"osc_notify": true` lets programs raise desktop toasts through OSC 9,
+OSC 777 and OSC 99. It is off by default because any output can carry
+those sequences (an ssh host, a `cat`'d file, an install script). When on,
+the toast's title is always «بيان · tab» and the program's text is cleaned
+and capped. Bayan's own toasts (a long command finished, the bell) follow
+`notifications` and need no opt-in.
 
 Shell and scrollback apply to new tabs (no terminal restarts a live
 session); everything else applies immediately. `osc52` is config-file

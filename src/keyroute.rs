@@ -182,10 +182,13 @@ impl App {
         self.note_held_away(event);
         let m = self.modifiers;
         let (ctrl, shift, alt) = (m.control_key(), m.shift_key(), m.alt_key());
-        crate::prof::mark(&format!(
-            "key logical={:?} physical={:?} text={:?} ctrl={ctrl} shift={shift}",
-            event.logical_key, event.physical_key, event.text
-        ));
+        // BAYAN-010: that a key went down, and its modifiers — never which
+        // key. The logical key, `text` and even the physical key code
+        // (KeyA, KeyP…) spell out what was TYPED, passwords at an ssh or
+        // sudo prompt included, and must not reach a log file.
+        if crate::prof::on() {
+            crate::prof::mark(&format!("key ctrl={ctrl} shift={shift} alt={alt}"));
+        }
         if let Some(owner) = key_owner(&self.open_overlays()) {
             self.overlay_key(owner, event, shift, el);
             return;
@@ -245,11 +248,7 @@ impl App {
             }
             KeyOwner::PasteGuard => {
                 match enter_or_escape(&event.logical_key) {
-                    Some(true) => {
-                        if let Some(pending) = self.pending_paste.take() {
-                            self.send_paste(&pending.text);
-                        }
-                    }
+                    Some(true) => self.confirm_pending(),
                     Some(false) => self.pending_paste = None,
                     None => {}
                 }

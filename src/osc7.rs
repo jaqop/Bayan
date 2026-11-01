@@ -14,15 +14,6 @@
 /// oversized report.
 pub const OSC7_MAX_PAYLOAD: usize = 4096;
 
-/// BiDi controls that can spoof a path when a UI draws it. Overrides,
-/// embeddings, isolates, plus the implicit marks (LRM/RLM/ALM).
-pub fn is_bidi_control(c: char) -> bool {
-    matches!(
-        c as u32,
-        0x061C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069
-    )
-}
-
 /// Names that count as "this machine" besides `localhost` and the loopback
 /// addresses, which are always accepted. Windows sets `COMPUTERNAME`.
 pub fn local_host_names() -> Vec<String> {
@@ -38,8 +29,9 @@ pub fn cached_local_names() -> &'static [String] {
     NAMES.get_or_init(local_host_names)
 }
 
+/// The link path's forbidden set, in its cwd form (NEW-06).
 fn forbidden_char(c: char) -> bool {
-    c.is_control() || is_bidi_control(c)
+    crate::link::is_forbidden_in_path(c)
 }
 
 /// Parse one OSC 7 payload (no `ESC ] 7 ;` prefix, no BEL/ST) into a

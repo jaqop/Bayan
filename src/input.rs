@@ -8,6 +8,7 @@
 //! left-press order live in `chrome.rs`; link, program and selection
 //! ownership in `link::click_owner` and `mouse::right_click`.
 
+use crate::term::LockExt;
 use std::time::Instant;
 
 use alacritty_terminal::grid::Scroll;
@@ -408,8 +409,10 @@ impl App {
         let cell = self.refresh_link_hover(position);
         if let Some(w) = &self.window {
             let edge = self.resize_edge_at(position);
-            let on_divider = edge.is_none() && self.divider_at(position).is_some();
-            let orientation = self.tabs.get(self.active).map(|t| t.orientation);
+            let divider = edge.is_none().then(|| self.divider_at(position)).flatten();
+            let on_divider = divider.is_some();
+            // the cursor follows the divider under it: nested splits mix both
+            let orientation = divider.and_then(|d| self.dividers().get(d).map(|d| d.axis));
             w.set_cursor(hover_cursor(
                 edge,
                 on_divider,
@@ -497,7 +500,7 @@ impl App {
             };
             // term, then meta — the lock order the reader uses too.
             let mode = *session.term.lock().mode();
-            let at_prompt = session.meta.lock().unwrap().at_prompt;
+            let at_prompt = session.meta.lock_or_recover().at_prompt;
             (arg, mode, at_prompt)
         };
         let alt = mode.contains(TermMode::ALT_SCREEN);
@@ -507,7 +510,9 @@ impl App {
             } else {
                 term::PasteRisk::NotAtPrompt
             };
-            self.arm_pending_paste(arg, Some(why));
+            // R-01: quoted for THIS pane's shell, so it goes to this pane
+            // only, even with broadcast on
+            self.arm_pending_drop(arg, Some(why));
         } else if let Some(s) = self.session_mut() {
             let body = term::normalize_paste(&arg, mode.contains(TermMode::BRACKETED_PASTE));
             s.write(body.as_bytes());
@@ -566,6 +571,16 @@ impl App {
             ElementState::Pressed => match press_route(button) {
                 Press::Right => self.right_press(),
                 Press::Report(b) => {
+                    // middle-click on a tab closes it (browser convention);
+                    // otherwise report to the program when it asked
+                    // R-02: not while a confirm card is up — closing a tab
+                    // under it would hand the card to another pane
+                    if b == mouse::Btn::Middle && !self.card_open() {
+                        if let Some(i) = self.tab_at(self.cursor_pos) {
+                            self.request_close_tab(i, el);
+                            return;
+                        }
+                    }
                     let _ = self.try_report_press(b);
                 }
                 Press::Left => self.left_press(el),
@@ -668,6 +683,8 @@ impl App {
             }
             LeftPress::Divider(i) => self.drag_divider = Some(i),
             LeftPress::Tab(i) => self.switch_tab(i),
+            LeftPress::CloseTab(i) => self.request_close_tab(i, el),
+            LeftPress::Blocked => {}
             LeftPress::DragStrip => {
                 // the two gestures a real title bar owes the user
                 if let Some(w) = self.window.as_ref() {

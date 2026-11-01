@@ -174,6 +174,9 @@ pub enum LinkKind {
     /// the cells' text — the hover status shows `uri`.
     Osc {
         uri: String,
+        /// The cells' own text (capped). Used only to notice a span whose
+        /// visible text is itself a URL for a DIFFERENT host (NEW-07).
+        shown: String,
     },
     Url {
         uri: String,
@@ -221,7 +224,7 @@ impl LinkSpan {
     /// LTR paragraph and isolates `rest`, so that letter cannot move the host.
     pub fn tooltip(&self, cwd: Option<&str>) -> StatusParts {
         match &self.kind {
-            LinkKind::Osc { uri } | LinkKind::Url { uri } => host_tooltip(uri),
+            LinkKind::Osc { uri, .. } | LinkKind::Url { uri } => host_tooltip(uri),
             LinkKind::File { path, line, col } => {
                 let full = resolve_against_cwd(path, cwd).unwrap_or_else(|| path.clone());
                 StatusParts {
@@ -239,7 +242,8 @@ impl LinkSpan {
         code_exe: Option<&str>,
     ) -> Action {
         match &self.kind {
-            LinkKind::Osc { uri } | LinkKind::Url { uri } => plan_uri(uri),
+            LinkKind::Osc { uri, shown } => plan_osc(uri, shown),
+            LinkKind::Url { uri } => plan_uri(uri),
             LinkKind::File { path, line, col } => {
                 plan_file(path, *line, *col, cwd, editor, code_exe)
             }
@@ -285,8 +289,23 @@ pub fn is_forbidden(c: char) -> bool {
                 | '\u{FEFF}'
         )
         || ('\u{2061}'..='\u{2064}').contains(&c)
+        // R-06: invisible Hangul fillers and variation selectors pad text
+        // without showing anything
+        || matches!(c, '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}')
+        || ('\u{FE00}'..='\u{FE0F}').contains(&c)
+        || ('\u{E0100}'..='\u{E01EF}').contains(&c)
         || ('\u{FFF9}'..='\u{FFFB}').contains(&c)
         || ('\u{E0000}'..='\u{E007F}').contains(&c)
+}
+
+/// The cwd form of [`is_forbidden`] (NEW-06): the same set, except ZWNJ and
+/// ZWJ (U+200C, U+200D). Those two are ordinary spelling in Persian, Urdu and
+/// Kurdish folder names (می‌خواهم), so refusing them would refuse real
+/// directories; in a path drawn as a tab title they cannot reorder text or
+/// hide a separator. Links keep the full set: there a joiner can split a
+/// host that looks whole.
+pub fn is_forbidden_in_path(c: char) -> bool {
+    is_forbidden(c) && !matches!(c, '\u{200C}' | '\u{200D}')
 }
 
 fn marker(c: char) -> String {
@@ -315,10 +334,16 @@ fn marker(c: char) -> String {
 
 /// Visible copy of a target. Forbidden characters become ASCII markers.
 pub fn preview(raw: &str, max_chars: usize) -> String {
+    preview_with(raw, max_chars, is_forbidden)
+}
+
+/// [`preview`] with the forbidden set chosen by the caller (the window chrome
+/// passes [`is_forbidden_in_path`], which keeps the Persian joiners).
+pub fn preview_with(raw: &str, max_chars: usize, forbidden: fn(char) -> bool) -> String {
     let mut out = String::new();
     let mut n = 0usize;
     for c in raw.chars() {
-        let rep = if is_forbidden(c) {
+        let rep = if forbidden(c) {
             marker(c)
         } else {
             c.to_string()
@@ -1276,6 +1301,123 @@ pub fn plan_uri(uri: &str) -> Action {
     }
 }
 
+/// Bytes of an OSC 8 span's visible text kept for the host comparison.
+const OSC_SHOWN_MAX: usize = 512;
+
+/// NEW-07: an OSC 8 link whose VISIBLE text names a web address for a
+/// different host than the one it opens (`https://bank.example` drawn,
+/// `https://evil.example` attached) waits for the host card instead of
+/// opening on Ctrl+click. The card shows the real host. Every
+/// whitespace-separated word of the text is checked (`Login: paypal.com`),
+/// with wrapping punctuation stripped. Text that names no address ("click
+/// here", a file name) changes nothing: that is ordinary hyperlinking, and
+/// the hover status already names the target. This is a heuristic — text
+/// drawn OUTSIDE the span is not seen — not a guarantee.
+pub fn plan_osc(uri: &str, shown: &str) -> Action {
+    let action = plan_uri(uri);
+    let Action::Browse(opened) = &action else {
+        return action;
+    };
+    let Some(target) = http_authority(opened).and_then(|a| display_host(&a.host)) else {
+        return action;
+    };
+    let mismatch = shown
+        .split_whitespace()
+        .filter_map(visible_url_host)
+        .any(|visible| !same_site_host(&visible, &target));
+    if !mismatch {
+        return action;
+    }
+    Action::Confirm {
+        uri: opened.clone(),
+        host: target,
+    }
+}
+
+/// Top-level domains read as a web address even with no `www.` and no path
+/// (`paypal.com`). Kept to names that are not also common file extensions,
+/// so `README.md`, `setup.py` or `notes.sh` never count.
+const WEB_TLDS: &[&str] = &[
+    "com", "net", "org", "edu", "gov", "mil", "int", "io", "co", "ai", "app", "dev", "info", "biz",
+    "xyz", "online", "site", "shop", "store", "tech", "cloud", "me", "tv", "uk", "us", "ca", "au",
+    "de", "fr", "nl", "ru", "cn", "jp", "in", "br", "sa", "ae", "eg", "qa", "kw", "om", "bh", "jo",
+    "ma", "dz", "tn", "iq", "tr", "ir", "pk",
+];
+
+/// The host of one visible word when it reads as a web address: an
+/// `http(s)://` URL, a `www.` name, a `name.tld/path`, or a bare
+/// `name.tld` with a well-known web TLD. Wrapping punctuation is ignored.
+fn visible_url_host(word: &str) -> Option<String> {
+    let t = word.trim_matches(|c: char| {
+        matches!(
+            c,
+            '(' | ')'
+                | '<'
+                | '>'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '"'
+                | '\''
+                | '`'
+                | ','
+                | ';'
+                | '!'
+                | '«'
+                | '»'
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+                | '،'
+                | '؛'
+        )
+    });
+    let t = t.strip_suffix(['.', ':', '?']).unwrap_or(t);
+    if t.is_empty() {
+        return None;
+    }
+    let lower = t.to_ascii_lowercase();
+    let candidate = if lower.starts_with("http://") || lower.starts_with("https://") {
+        t.to_string()
+    } else {
+        let host_part = t.split(['/', '?', '#']).next().unwrap_or(t);
+        let host_only = host_part.rsplit_once(':').map_or(host_part, |(h, _)| h);
+        let labels: Vec<&str> = host_only.split('.').collect();
+        let tld = labels
+            .last()
+            .map(|l| l.to_ascii_lowercase())
+            .unwrap_or_default();
+        let tld_ok = tld.len() >= 2 && tld.chars().all(|c| c.is_alphabetic());
+        let labels_ok = labels.len() >= 2
+            && labels
+                .iter()
+                .all(|l| !l.is_empty() && l.chars().all(|c| c.is_alphanumeric() || c == '-'));
+        // a bare `name.ext` is too often a file name (README.md is also a
+        // Moldovan domain), so it reads as an address only with a `www.`
+        // prefix, a path after the host, or a well-known web TLD
+        let addressy = lower.starts_with("www.")
+            || t.len() > host_part.len()
+            || WEB_TLDS.contains(&tld.as_str());
+        if !(tld_ok && labels_ok && addressy) {
+            return None;
+        }
+        format!("https://{t}")
+    };
+    http_authority(&candidate).and_then(|a| display_host(&a.host))
+}
+
+/// Hosts compared the way a reader would: case, a trailing dot and a
+/// leading `www.` do not count as a difference.
+fn same_site_host(a: &str, b: &str) -> bool {
+    let norm = |h: &str| {
+        let h = h.trim_end_matches('.').to_ascii_lowercase();
+        h.strip_prefix("www.").map(str::to_string).unwrap_or(h)
+    };
+    norm(a) == norm(b)
+}
+
 /// Association-open of a local file URI, as an intent. `exists` and 8.3
 /// expansion run later in [`settle`], on the link thread. Only the
 /// document/media allowlist may become [`Action::OpenPath`]; every other
@@ -2065,6 +2207,8 @@ fn osc_spans(cells: &[RowCell]) -> Vec<LinkSpan> {
         let id = cells[i].osc_id.clone();
         let start = cells[i].col;
         let mut end = cells[i].col + cells[i].width;
+        let mut shown = String::new();
+        shown.push(cells[i].ch);
         i += 1;
         while i < cells.len()
             && !cells[i].hidden
@@ -2073,12 +2217,15 @@ fn osc_spans(cells: &[RowCell]) -> Vec<LinkSpan> {
             && cells[i].col <= end
         {
             end = cells[i].col + cells[i].width;
+            if shown.len() < OSC_SHOWN_MAX {
+                shown.push(cells[i].ch);
+            }
             i += 1;
         }
         out.push(LinkSpan {
             start_col: start,
             end_col: end,
-            kind: LinkKind::Osc { uri },
+            kind: LinkKind::Osc { uri, shown },
         });
     }
     out
@@ -2548,13 +2695,62 @@ mod tests {
         assert_eq!(spans.len(), 1, "{spans:?}");
         assert_eq!((spans[0].start_col, spans[0].end_col), (0, 5));
         match &spans[0].kind {
-            LinkKind::Osc { uri } => assert_eq!(uri, "https://example.com/a"),
+            LinkKind::Osc { uri, shown } => {
+                assert_eq!(uri, "https://example.com/a");
+                assert_eq!(shown, "click");
+            }
             other => panic!("{other:?}"),
         }
         // ST (ESC \) is the other terminator and yields the same span.
         let spans = osc_row(b"\x1b]8;;https://example.com/a\x1b\\click\x1b]8;;\x1b\\");
         assert_eq!(spans.len(), 1);
         assert_eq!((spans[0].start_col, spans[0].end_col), (0, 5));
+    }
+
+    #[test]
+    fn osc8_visible_url_for_another_host_waits_for_the_card() {
+        // NEW-07: drawn as one host, opens another → the host card
+        match plan_osc("https://evil.example/login", "https://bank.example") {
+            Action::Confirm { uri, host } => {
+                assert_eq!(uri, "https://evil.example/login");
+                assert_eq!(host, "evil.example");
+            }
+            other => panic!("{other:?}"),
+        }
+        // bare domain text counts too
+        assert!(matches!(
+            plan_osc("https://evil.example/", "bank.example/account"),
+            Action::Confirm { .. }
+        ));
+        // same host (case, www, trailing dot) opens directly
+        assert_eq!(
+            plan_osc("https://www.Example.com/a", "https://example.com"),
+            Action::Browse("https://www.Example.com/a".into())
+        );
+        assert_eq!(
+            plan_osc("https://example.com/a", "example.com."),
+            Action::Browse("https://example.com/a".into())
+        );
+        // ordinary link text is not a claim about the host
+        for text in [
+            "click here",
+            "README.md",
+            "build log",
+            "v1.2",
+            "PR #42",
+            "src/main.rs",
+        ] {
+            assert_eq!(
+                plan_osc("https://example.com/a", text),
+                Action::Browse("https://example.com/a".into()),
+                "{text:?}"
+            );
+        }
+        // a refusal stays a refusal
+        assert!(matches!(
+            plan_osc("javascript:alert(1)", "https://bank.example"),
+            Action::Refuse { .. }
+        ));
     }
 
     #[test]
@@ -2565,7 +2761,7 @@ mod tests {
         assert_eq!((spans[0].start_col, spans[0].end_col), (0, 2));
         assert_eq!((spans[1].start_col, spans[1].end_col), (3, 6));
         match (&spans[0].kind, &spans[1].kind) {
-            (LinkKind::Osc { uri: a }, LinkKind::Osc { uri: b }) => {
+            (LinkKind::Osc { uri: a, .. }, LinkKind::Osc { uri: b, .. }) => {
                 assert_eq!(a, "https://a.example");
                 assert_eq!(b, "https://b.example");
             }

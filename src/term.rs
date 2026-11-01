@@ -43,25 +43,67 @@ pub fn shell_choices() -> Vec<String> {
 /// True, but throwing away every launcher directory to dodge that one case
 /// silently broke the shortcut field. So: honour it, unless it sits under the
 /// Windows directory.
+///
+/// NEW-03: the launcher directory goes through the same gate as every other
+/// start directory — `accept_local_cwd` (no UNC, device or `\\?\` form) and
+/// `usable_spawn_dir` (local drive, not a reparse point, exists) — before it
+/// is used. Bayan's own folder is skipped too: Explorer hands a process the
+/// exe's directory, and a shell opened in Downloads would let cmd.exe run a
+/// planted `git.bat` there when the user types `git`.
 fn launcher_dir() -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
-    if !cwd.is_dir() {
-        return None;
-    }
-    let s = cwd.to_str()?.to_string();
+    let cwd = cwd.to_str()?.to_string();
     let win = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-    if is_under(&s, &win) {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().and_then(|p| p.to_str()).map(str::to_string));
+    launcher_dir_from(&cwd, &win, exe_dir.as_deref(), usable_spawn_dir)
+}
+
+/// The pure decision behind `launcher_dir`, with the filesystem probe
+/// injected so it is testable without the directories.
+fn launcher_dir_from(
+    cwd: &str,
+    win: &str,
+    exe_dir: Option<&str>,
+    usable: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let dir = accept_local_cwd(cwd)?;
+    if is_under(&dir, win) {
         return None;
     }
-    Some(s)
+    if exe_dir.is_some_and(|e| same_dir(&dir, e)) {
+        return None;
+    }
+    usable(&dir).then_some(dir)
+}
+
+/// Same directory, compared the Windows way (case, separators, a trailing
+/// backslash, the `\\?\` prefix).
+fn same_dir(a: &str, b: &str) -> bool {
+    let norm = |p: &str| {
+        let p = strip_verbatim(p).to_lowercase().replace('/', "\\");
+        p.trim_end_matches('\\').to_string()
+    };
+    norm(a) == norm(b)
+}
+
+/// `\\?\C:\x` → `C:\x`. Only the drive form; `\\?\UNC\…` is left as it is
+/// (and `accept_local_cwd` refuses it anyway).
+fn strip_verbatim(p: &str) -> &str {
+    match p.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest,
+        _ => p,
+    }
 }
 
 /// Case-insensitive "is `path` inside `root`" — Windows paths are not
 /// case-sensitive, so a plain starts_with would miss `c:\windows\system32`.
+/// The verbatim `\\?\C:\…` form is understood (NEW-03).
 fn is_under(path: &str, root: &str) -> bool {
     let (p, r) = (
-        path.to_lowercase().replace('/', "\\"),
-        root.to_lowercase().replace('/', "\\"),
+        strip_verbatim(path).to_lowercase().replace('/', "\\"),
+        strip_verbatim(root).to_lowercase().replace('/', "\\"),
     );
     let r = r.trim_end_matches('\\');
     p == r || p.starts_with(&format!("{r}\\"))
@@ -84,7 +126,20 @@ fn is_powershell(shell: &str) -> bool {
 /// `C:\Program Files\PowerShell\7\pwsh.exe`, whose program name contains two
 /// spaces. So find the program by its `.exe` boundary (or an explicit quote),
 /// and only then treat the remainder as arguments.
+///
+/// BAYAN-016: the boundary is a `.exe` followed by whitespace or the end of
+/// the line — `C:\tools\app.exe.d\run.exe` is not cut inside a directory
+/// name — and when there are several, the first one whose prefix is a real
+/// program wins: a bare name (`wsl.exe`), or a path that exists. An argument
+/// that itself ends in `.exe` (`pwsh.exe -File C:\x\setup.exe`) therefore
+/// stays an argument.
 pub fn split_command(cmd: &str) -> (String, Vec<String>) {
+    split_command_with(cmd, |p| std::path::Path::new(p).is_file())
+}
+
+/// `split_command` with the existence probe injected, so the boundary rule
+/// is testable without the files.
+fn split_command_with(cmd: &str, exists: impl Fn(&str) -> bool) -> (String, Vec<String>) {
     let c = cmd.trim();
     let split_args = |s: &str| s.split_whitespace().map(str::to_string).collect();
     // "quoted program" args…
@@ -93,9 +148,22 @@ pub fn split_command(cmd: &str) -> (String, Vec<String>) {
             return (rest[..i].to_string(), split_args(&rest[i + 1..]));
         }
     }
-    // …otherwise the program ends at the first ".exe"
-    if let Some(i) = c.to_lowercase().find(".exe") {
-        let end = i + 4;
+    // …otherwise the program ends at a ".exe" that ends a word
+    let lower = c.to_ascii_lowercase();
+    let boundaries: Vec<usize> = lower
+        .match_indices(".exe")
+        .map(|(i, _)| i + 4)
+        .filter(|&end| c[end..].chars().next().is_none_or(char::is_whitespace))
+        .collect();
+    let pick = boundaries
+        .iter()
+        .copied()
+        .find(|&end| {
+            let prog = &c[..end];
+            !prog.contains(['\\', '/']) || exists(prog)
+        })
+        .or_else(|| boundaries.first().copied());
+    if let Some(end) = pick {
         return (c[..end].to_string(), split_args(&c[end..]));
     }
     let mut it = c.split_whitespace();
@@ -123,25 +191,53 @@ const PS_MID: &str = "$([char]7)$([char]27)]133;A;";
 
 const PS_TAIL: &str = "$([char]7)\
 $([char]27)]9;9;$($PWD.ProviderPath)$([char]7)$(__by_osc7)\"\
-+(& $global:__BY_OP)+\"$([char]27)]133;B$([char]7)\"}}}; __by_wrap";
++(& $global:__BY_OP)+\"$([char]27)]133;B;";
+
+const PS_END: &str = "$([char]7)\"}}}; __by_wrap";
 
 /// The PowerShell prompt wrapper injected at spawn.
 ///
-/// `nonce` is embedded in OSC 133 D and A (`D;<exit>;<nonce>`, `A;<nonce>`).
+/// `nonce` is embedded in OSC 133 D, A and B (`D;<exit>;<nonce>`,
+/// `A;<nonce>`, `B;<nonce>`). B carries it since NEW-02: "at prompt" decides
+/// whether a dropped path is typed straight in, so output must not set it.
 /// A report from a running command is stored only after an A that carries
 /// the same nonce, so a spoofed `133;D` cannot authorize the OSC 7 that
 /// follows it. Hex is safe inside the double-quoted prompt string. An empty
 /// nonce keeps the old "any A/D" rule for tests. cmd/clink has no 133 marks;
 /// its OSC 7 is still accepted while the pane is already idle.
 pub(crate) fn shell_integration_ps(nonce: &str) -> String {
-    let mut s =
-        String::with_capacity(PS_HEAD.len() + PS_MID.len() + PS_TAIL.len() + nonce.len() * 2);
+    // `nonce` is spliced in as text: the live session passes NONCE_PS_EXPR,
+    // tests pass a literal
+    let mut s = String::with_capacity(
+        PS_HEAD.len() + PS_MID.len() + PS_TAIL.len() + PS_END.len() + nonce.len() * 3,
+    );
     s.push_str(PS_HEAD);
     s.push_str(nonce);
     s.push_str(PS_MID);
     s.push_str(nonce);
     s.push_str(PS_TAIL);
+    s.push_str(nonce);
+    s.push_str(PS_END);
     s
+}
+
+/// R-08: the environment variable the nonce travels in. The setup script
+/// copies it into `$global:__BY_N` FIRST and removes it from the process
+/// environment, so the nonce is never on the PowerShell command line (which
+/// the process list shows to every same-user process) and no program the
+/// shell later starts inherits it. The prompt reads it from the variable.
+pub(crate) const NONCE_ENV: &str = "BAYAN_PROMPT_NONCE";
+
+/// What the prompt wrapper splices in where the nonce goes: expanded inside
+/// its double-quoted strings at every prompt.
+pub(crate) const NONCE_PS_EXPR: &str = "$($global:__BY_N)";
+
+/// The first statement of the setup script: take the nonce, drop the env var.
+pub(crate) fn nonce_capture_ps() -> String {
+    format!(
+        "$global:__BY_N=$env:{NONCE_ENV};\
+         Remove-Item Env:{NONCE_ENV} -ErrorAction SilentlyContinue;"
+    )
 }
 
 #[link(name = "advapi32")]
@@ -151,18 +247,26 @@ extern "system" {
     fn SystemFunction036(randombuffer: *mut core::ffi::c_void, randombufferlength: u32) -> i32;
 }
 
+/// A session nonce that no OSC 133 field can ever equal: payload fields are
+/// split on `;`, so a value containing one never matches, and it is not
+/// empty (empty means "trust every mark", the unit-test mode). Used when the
+/// OS RNG fails — shell integration is then off for the pane (NEW-05).
+pub(crate) const NONCE_OFF: &str = ";integration-off";
+
+/// 32 hex characters from `RtlGenRandom`, or `NONCE_OFF` when it fails.
+/// There is deliberately no time/PID fallback: a predictable nonce would let
+/// output mint "trusted" prompt marks, which is worse than having none.
 fn fresh_prompt_nonce() -> String {
     let mut bytes = [0u8; 16];
     // SAFETY: the length passed is `bytes`'s own, so the write stays in bounds.
     let ok = unsafe { SystemFunction036(bytes.as_mut_ptr().cast(), bytes.len() as u32) != 0 };
-    if !ok {
-        let tick = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        bytes[..8].copy_from_slice(&tick.to_le_bytes());
-        bytes[8..].copy_from_slice(&(std::process::id() as u64).to_le_bytes());
-    }
+    nonce_hex(ok.then_some(bytes))
+}
+
+fn nonce_hex(bytes: Option<[u8; 16]>) -> String {
+    let Some(bytes) = bytes else {
+        return NONCE_OFF.to_string();
+    };
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         s.push(char::from(b"0123456789abcdef"[(b >> 4) as usize]));
@@ -181,6 +285,34 @@ pub struct CmdMark {
     /// First row of the command's output: the row below the cursor when
     /// Enter was sent at this prompt. `None` until a command is submitted.
     pub out: Option<u64>,
+}
+
+/// How a command ended, from its OSC 133 D exit code. A D without a code is
+/// `Unknown` — reporting it as success would be a guess (BAYAN-013).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmdOutcome {
+    Ok,
+    Failed,
+    Unknown,
+}
+
+impl CmdOutcome {
+    pub fn from_exit(exit: Option<i32>) -> Self {
+        match exit {
+            Some(0) => Self::Ok,
+            Some(_) => Self::Failed,
+            None => Self::Unknown,
+        }
+    }
+
+    /// The toast title for this outcome.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Ok => "اكتمل الأمر",
+            Self::Failed => "فشل الأمر",
+            Self::Unknown => "انتهى الأمر",
+        }
+    }
 }
 
 /// Global rows `[start, end)` of the most recent finished command's
@@ -303,8 +435,8 @@ pub(crate) struct ChunkEvents {
     pub clean_claude: bool,
     pub clipboard: Option<String>,
     pub cwd: Option<String>,
-    /// a LONG command just ended (ok?) — worth a notification if unfocused
-    pub finished: Option<bool>,
+    /// a LONG command just ended — worth a notification if unfocused
+    pub finished: Option<CmdOutcome>,
     /// Replies alacritty did not emit. With the kitty protocol off the
     /// parser's `kitty_keyboard` flag is false, so `CSI ? u` is answered
     /// here with `CSI ?0u` and the reader writes it to the PTY.
@@ -375,11 +507,45 @@ fn scan_progress(data: &[u8]) -> Option<Option<Progress>> {
     parse_progress(payload)
 }
 
+/// Longest program-supplied toast title / body Bayan will show, in chars.
+/// The balloon itself truncates at 63 / 255 UTF-16 units; these caps keep a
+/// flood of text from being the whole notification.
+pub(crate) const NOTIFY_TITLE_MAX: usize = 48;
+pub(crate) const NOTIFY_BODY_MAX: usize = 200;
+
+/// Text a program asked to put in a toast, made display-safe: lossy UTF-8,
+/// every control / bidi / zero-width character (`link::is_forbidden`)
+/// replaced by a space, runs of whitespace collapsed, trimmed, and capped
+/// at `max` chars (with an ellipsis when cut).
+pub(crate) fn notify_text(b: &[u8], max: usize) -> String {
+    let raw = String::from_utf8_lossy(b);
+    let cleaned: String = raw
+        .chars()
+        // the full set: a toast is not a path, so no joiner exception (R-06)
+        .map(|c| if crate::link::is_forbidden(c) { ' ' } else { c })
+        .collect();
+    let joined = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if joined.chars().count() <= max {
+        joined
+    } else {
+        let mut cut: String = joined.chars().take(max.saturating_sub(1)).collect();
+        cut.push('…');
+        cut
+    }
+}
+
 /// Desktop-notification requests, three dialects, last one in the chunk wins:
 /// - OSC 9;<message> — iTerm2 / ConEmu (digit-prefixed ConEmu subcommands
 ///   like 9;4; and 9;9; are NOT messages)
 /// - OSC 777;notify;<title>;<body> — rxvt-unicode, what Ghostty and WezTerm speak
 /// - OSC 99;<meta>;<payload> — kitty: `p=title`/`p=body` in the metadata
+///
+/// Only TERMINATED sequences (BEL or ESC \) count, the same rule as OSC 52
+/// and the cwd reports: a split marker is carried to the next read by
+/// `incomplete_tail_start`, so a missing terminator means garbage, not a
+/// notification. The returned (title, body) is program text, already passed
+/// through `notify_text`; the caller decides whether it may be shown at all
+/// (`osc_notify`) and puts it under Bayan's own fixed title.
 fn scan_notify(data: &[u8]) -> Option<(String, String)> {
     let mut best: Option<(usize, (String, String))> = None;
     let mut consider = |pos: usize, n: (String, String)| {
@@ -387,68 +553,86 @@ fn scan_notify(data: &[u8]) -> Option<(String, String)> {
             best = Some((pos, n));
         }
     };
-    let text = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
+    let title = |b: &[u8]| notify_text(b, NOTIFY_TITLE_MAX);
+    let body = |b: &[u8]| notify_text(b, NOTIFY_BODY_MAX);
     // OSC 9;<message>
     let mut i = 0;
     while let Some(rel) = find(&data[i..], b"\x1b]9;") {
         let s = i + rel + 4;
-        let e = osc_end(data, s);
+        let Some((e, next)) = osc_terminated_end(data, s) else {
+            i = s;
+            continue;
+        };
         let payload = &data[s..e];
         // ConEmu subcommand (9;4;progress, 9;9;cwd, 9;12;...): not a message
         let is_subcommand = payload
             .iter()
             .position(|&b| b == b';')
             .is_some_and(|k| k > 0 && payload[..k].iter().all(u8::is_ascii_digit));
-        if !is_subcommand && !payload.is_empty() {
-            consider(s, ("Bayan".to_string(), text(payload)));
+        if !is_subcommand {
+            let msg = body(payload);
+            if !msg.is_empty() {
+                consider(s, (String::new(), msg));
+            }
         }
-        i = e.max(s);
+        i = next;
     }
     // OSC 777;notify;title;body
     let mut i = 0;
     while let Some(rel) = find(&data[i..], b"\x1b]777;notify;") {
         let s = i + rel + 13;
-        let e = osc_end(data, s);
-        let payload = &data[s..e];
-        let (title, body) = match payload.iter().position(|&b| b == b';') {
-            Some(k) => (text(&payload[..k]), text(&payload[k + 1..])),
-            None => ("Bayan".to_string(), text(payload)),
+        let Some((e, next)) = osc_terminated_end(data, s) else {
+            i = s;
+            continue;
         };
-        consider(s, (title, body));
-        i = e.max(s);
+        let payload = &data[s..e];
+        let (t, b) = match payload.iter().position(|&b| b == b';') {
+            Some(k) => (title(&payload[..k]), body(&payload[k + 1..])),
+            None => (String::new(), body(payload)),
+        };
+        if !t.is_empty() || !b.is_empty() {
+            consider(s, (t, b));
+        }
+        i = next;
     }
     // OSC 99;<k=v:k=v>;<payload>
     let mut i = 0;
     while let Some(rel) = find(&data[i..], b"\x1b]99;") {
         let s = i + rel + 5;
-        let e = osc_end(data, s);
+        let Some((e, next)) = osc_terminated_end(data, s) else {
+            i = s;
+            continue;
+        };
         let payload = &data[s..e];
         if let Some(k) = payload.iter().position(|&b| b == b';') {
             let meta = String::from_utf8_lossy(&payload[..k]);
             let is_title = meta.split(':').any(|kv| kv == "p=title");
-            let body = text(&payload[k + 1..]);
-            if !body.is_empty() {
-                consider(
-                    s,
-                    if is_title {
-                        (body, String::new())
-                    } else {
-                        ("Bayan".to_string(), body)
-                    },
-                );
+            let text = &payload[k + 1..];
+            let n = if is_title {
+                (title(text), String::new())
+            } else {
+                (String::new(), body(text))
+            };
+            if !n.0.is_empty() || !n.1.is_empty() {
+                consider(s, n);
             }
         }
-        i = e.max(s);
+        i = next;
     }
     best.map(|(_, n)| n)
 }
 
-/// End of an OSC payload that starts at `s`: the BEL / ESC, or the data end.
-fn osc_end(data: &[u8], s: usize) -> usize {
-    data[s..]
-        .iter()
-        .position(|&b| b == 0x07 || b == 0x1b)
-        .map_or(data.len(), |p| s + p)
+/// End of a TERMINATED OSC payload that starts at `s`, and the index just
+/// past its terminator. BEL ends it; so does ESC \ (ST). An ESC that is not
+/// ST, or the end of the data, means the sequence is not terminated: None.
+fn osc_terminated_end(data: &[u8], s: usize) -> Option<(usize, usize)> {
+    let p = data[s..].iter().position(|&b| b == 0x07 || b == 0x1b)?;
+    let e = s + p;
+    match data[e] {
+        0x07 => Some((e, e + 1)),
+        _ if data.get(e + 1) == Some(&b'\\') => Some((e, e + 2)),
+        _ => None,
+    }
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -669,9 +853,10 @@ pub fn accept_local_cwd(raw: &str) -> Option<String> {
     if s.is_empty() || s.chars().count() > MAX_CWD_CHARS {
         return None;
     }
-    if s.chars()
-        .any(|c| c.is_control() || crate::osc7::is_bidi_control(c))
-    {
+    // NEW-06: the link path's predicate (in its path form, which keeps the
+    // Persian joiners), so a cwd and the tab title made from it cannot carry
+    // a zero-width space, line separator, BOM or tag character.
+    if s.chars().any(crate::link::is_forbidden_in_path) {
         return None;
     }
     // A comma or a quote breaks out of `explorer /select,"<path>"`.
@@ -912,15 +1097,15 @@ fn cwd_from_osc7(payload: &[u8]) -> Option<String> {
     crate::osc7::parse_osc7(text, crate::osc7::cached_local_names())
 }
 
-/// `A` or `D` whose `;`-separated fields contain `nonce`.
+/// `A`, `B` or `D` whose `;`-separated fields contain `nonce`.
 ///
-/// An empty nonce trusts every A and D, which is what the unit tests send.
+/// An empty nonce trusts every A, B and D, which is what the unit tests send.
 /// A live nonce is 32 hex characters from [`fresh_prompt_nonce`].
 fn osc133_trusted(payload: &[u8], nonce: &str) -> bool {
     let Some(&kind) = payload.first() else {
         return false;
     };
-    if kind != b'A' && kind != b'D' {
+    if !matches!(kind, b'A' | b'B' | b'D') {
         return false;
     }
     if nonce.is_empty() {
@@ -992,7 +1177,12 @@ fn trusted_cwd(data: &[u8], running: bool, alt: bool, nonce: &str) -> Option<Str
                     best = Some(cwd);
                 }
             }
-            if osc.number == b"133" && osc133_trusted(osc.payload, nonce) {
+            // A or D only: B carries the nonce too (NEW-02), but it is not
+            // a command boundary
+            if osc.number == b"133"
+                && matches!(osc.payload.first(), Some(b'A' | b'D'))
+                && osc133_trusted(osc.payload, nonce)
+            {
                 running = false;
                 if osc.payload.first() == Some(&b'A') {
                     armed = true;
@@ -1072,11 +1262,23 @@ fn handle_osc133<T: EventListener>(
             // a long-running command finished: notify if nobody's watching
             if let Some(t0) = meta.cmd_started.take() {
                 if t0.elapsed() >= NOTIFY_AFTER {
-                    ev.finished = Some(exit.unwrap_or(0) == 0);
+                    ev.finished = Some(CmdOutcome::from_exit(exit));
                 }
             }
         }
         b'B' => {
+            // NEW-02: input begins. Only the wrapper's own B (with the
+            // session nonce) may say "at prompt" — a bare `133;B` from a
+            // nested program, a `cat`'d file or an ssh host would otherwise
+            // let a dropped path be typed with the spawn shell's quoting
+            // into whatever is really reading input, with no confirm card,
+            // and would move the prompt column `running_cmd` reads from.
+            // An untrusted B clears the state instead: something other
+            // than our prompt is talking.
+            if !trusted {
+                meta.at_prompt = false;
+                return;
+            }
             meta.at_prompt = true;
             meta.prompt_col = Some(t.grid().cursor.point.column.0);
             meta.prompt_abs = Some(
@@ -1833,6 +2035,30 @@ pub struct Session {
     parser: Arc<Mutex<Processor>>,
 }
 
+/// BAYAN-015: `meta` and `parser` are shared between the reader thread and
+/// the UI. A panic on one side while holding the lock poisons it, and a
+/// plain `.lock().unwrap()` on the other side would then abort the whole
+/// window — every tab — over one bad pane. The data is plain state, so the
+/// poisoned guard is taken over and used as-is.
+pub(crate) trait LockExt<T> {
+    fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockExt<T> for Mutex<T> {
+    fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// BAYAN-014: a Session that goes away for any reason takes its shell with
+/// it. Killing a child that already exited is a harmless error.
+impl Drop for Session {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
 impl Session {
     pub fn spawn(
         size: TermSize,
@@ -1881,7 +2107,16 @@ impl Session {
             // re-runs oh-my-posh, chcp, modules). Self-provide what it gave
             // us: UTF-8 (Arabic!) and the user's prompt theme, auto-detected.
             cmd.args(["-NoProfile", "-NoExit", "-Command"]);
-            let mut setup = String::from(
+            // R-08: the nonce rides in the environment, is taken before
+            // anything else runs (oh-my-posh init spawns a process), and is
+            // then removed, so it is in neither the command line nor any
+            // child's environment
+            let mut setup = String::new();
+            if prompt_nonce != NONCE_OFF {
+                cmd.env(NONCE_ENV, &prompt_nonce);
+                setup.push_str(&nonce_capture_ps());
+            }
+            setup.push_str(
                 "$OutputEncoding=[Console]::InputEncoding=[Console]::OutputEncoding=\
                  [Text.UTF8Encoding]::new();",
             );
@@ -1893,8 +2128,13 @@ impl Session {
                     powershell_escape_single(&theme)
                 ));
             }
-            setup.push(' ');
-            setup.push_str(&shell_integration_ps(&prompt_nonce));
+            // NEW-05: with no random nonce the wrapper is left out, so the
+            // pane runs without prompt marks (like cmd) instead of trusting
+            // marks anyone could forge
+            if prompt_nonce != NONCE_OFF {
+                setup.push(' ');
+                setup.push_str(&shell_integration_ps(NONCE_PS_EXPR));
+            }
             cmd.arg(setup);
         } else if shell_family(shell) == ShellFamily::Cmd {
             // UTF-8 code page so Arabic paths survive; no OSC 133 marks
@@ -1941,8 +2181,8 @@ impl Session {
                             // term, then meta, then parser. reset_keyboard
                             // on the UI thread takes the same order.
                             let mut t = term2.lock();
-                            let mut m = meta2.lock().unwrap();
-                            let mut p = parser2.lock().unwrap();
+                            let mut m = meta2.lock_or_recover();
+                            let mut p = parser2.lock_or_recover();
                             process_chunk(&mut p, &mut t, &mut m, &mut carry, &buf[..n])
                         };
                         if let Some(txt) = ev.clipboard {
@@ -1984,8 +2224,8 @@ impl Session {
             // already started has to be the machine that sees the pop.
             {
                 let mut t = term2.lock();
-                let mut m = meta2.lock().unwrap();
-                let mut p = parser2.lock().unwrap();
+                let mut m = meta2.lock_or_recover();
+                let mut p = parser2.lock_or_recover();
                 reset_keyboard_modes(&mut p, &mut t, &mut m);
             }
             let _ = proxy.send_event(UserEvent::Exit(id));
@@ -2017,8 +2257,8 @@ impl Session {
     /// [`reset_keyboard_modes`] on the reader thread, with this same parser.
     pub fn reset_keyboard(&mut self) {
         let mut t = self.term.lock();
-        let mut m = self.meta.lock().unwrap();
-        let mut parser = self.parser.lock().unwrap();
+        let mut m = self.meta.lock_or_recover();
+        let mut parser = self.parser.lock_or_recover();
         reset_keyboard_modes(&mut parser, &mut t, &mut m);
     }
 
@@ -2027,7 +2267,7 @@ impl Session {
         // before the shell reacts (Claude mode auto-enable needs the name)
         if submits_a_command(bytes) {
             let t = self.term.lock();
-            let mut m = self.meta.lock().unwrap();
+            let mut m = self.meta.lock_or_recover();
             capture_command_core(&t, &mut m);
         }
         let _ = self.writer.write_all(bytes);
@@ -2044,7 +2284,7 @@ impl Session {
         // Drop the term lock before meta. A resize reflows rows, so SCP
         // stamps no longer name the text they were written on.
         self.term.lock().resize(size);
-        self.meta.lock().unwrap().bidi_mut().on_resize();
+        self.meta.lock_or_recover().bidi_mut().on_resize();
     }
 }
 
@@ -2998,6 +3238,36 @@ mod tests {
             split_command(r"C:\Program Files\PowerShell\7\pwsh.exe"),
             (r"C:\Program Files\PowerShell\7\pwsh.exe".into(), vec![])
         );
+        // BAYAN-016: ".exe" inside a directory name is not the boundary
+        let none = |_: &str| false;
+        assert_eq!(
+            split_command_with(r"C:\tools\app.exe.d\run.exe -x", none),
+            (r"C:\tools\app.exe.d\run.exe".into(), vec!["-x".to_string()])
+        );
+        // an argument ending in .exe stays an argument for a bare program…
+        assert_eq!(
+            split_command_with(r"pwsh.exe -File C:\x\setup.exe", none),
+            (
+                "pwsh.exe".into(),
+                vec!["-File".to_string(), r"C:\x\setup.exe".to_string()]
+            )
+        );
+        // …and for a path program that exists
+        let only = |p: &str| p == r"C:\Program Files\A B\run.exe";
+        assert_eq!(
+            split_command_with(r"C:\Program Files\A B\run.exe C:\y\z.exe", only),
+            (
+                r"C:\Program Files\A B\run.exe".into(),
+                vec![r"C:\y\z.exe".to_string()]
+            )
+        );
+        // a spaced path whose first ".exe word" does not exist: the later
+        // existing one is the program
+        let later = |p: &str| p == r"C:\My.exe Tools\real.exe";
+        assert_eq!(
+            split_command_with(r"C:\My.exe Tools\real.exe --go", later),
+            (r"C:\My.exe Tools\real.exe".into(), vec!["--go".to_string()])
+        );
         // every detected shell splits to a real program
         for c in shell_choices() {
             let (prog, _) = split_command(&c);
@@ -3479,6 +3749,113 @@ mod tests {
     /// Comma, quote, a `\\` anywhere, an ADS colon, and `..` that escapes
     /// the drive are not a cwd and not an `explorer /select` argument.
     #[test]
+    fn local_cwd_uses_the_link_forbidden_set() {
+        // NEW-06: what a link refuses, a cwd refuses too
+        for c in [
+            '\u{200B}',
+            '\u{2028}',
+            '\u{FEFF}',
+            '\u{E0041}',
+            '\u{202E}',
+            '\u{7}',
+        ] {
+            let p = format!(r"C:\work{c}dir");
+            assert!(crate::link::is_forbidden(c));
+            assert_eq!(accept_local_cwd(&p), None, "{c:?}");
+        }
+        assert_eq!(
+            accept_local_cwd(r"C:\work\مشروع").as_deref(),
+            Some(r"C:\work\مشروع")
+        );
+        // a Persian name spelled with ZWNJ is a real folder, not a spoof
+        let fa = "C:\\work\\می\u{200C}خواهم";
+        assert_eq!(accept_local_cwd(fa).as_deref(), Some(fa));
+    }
+
+    #[test]
+    fn launcher_dir_goes_through_the_cwd_gate() {
+        // NEW-03
+        let yes = |_: &str| true;
+        let win = r"C:\Windows";
+        assert_eq!(
+            launcher_dir_from(r"C:\Users\a\proj", win, Some(r"C:\Apps\Bayan"), yes).as_deref(),
+            Some(r"C:\Users\a\proj")
+        );
+        // UNC, device and verbatim forms never get as far as the probe
+        let never = |_: &str| -> bool { panic!("probed a refused path") };
+        for bad in [
+            r"\\server\share",
+            r"\\?\C:\Users",
+            r"\\.\pipe\x",
+            r"\??\C:\x",
+        ] {
+            assert_eq!(launcher_dir_from(bad, win, None, never), None, "{bad}");
+        }
+        // the Windows directory, in any spelling
+        assert_eq!(
+            launcher_dir_from(r"c:\windows\system32", win, None, yes),
+            None
+        );
+        assert!(is_under(r"\\?\C:\Windows\System32", win));
+        // Bayan's own folder (Explorer's default cwd) falls through to home
+        assert_eq!(
+            launcher_dir_from(
+                r"C:\Users\a\Downloads",
+                win,
+                Some(r"c:\users\a\downloads\"),
+                yes
+            ),
+            None
+        );
+        // a remote drive / reparse point / missing dir: the probe says no
+        assert_eq!(launcher_dir_from(r"Z:\x", win, None, |_| false), None);
+    }
+
+    #[test]
+    fn prompt_nonce_never_falls_back_to_something_guessable() {
+        // NEW-05
+        assert_eq!(nonce_hex(None), NONCE_OFF);
+        assert_eq!(nonce_hex(Some([0xab; 16])), "ab".repeat(16));
+        // NONCE_OFF trusts nothing: no ;-split field can equal it, and it
+        // is not the empty "trust everything" test nonce
+        assert!(!NONCE_OFF.is_empty());
+        for payload in [
+            "A".to_string(),
+            format!("A;{NONCE_OFF}"),
+            "A;integration-off".into(),
+            format!("D;0;{NONCE_OFF}"),
+            format!("B{NONCE_OFF}"),
+        ] {
+            assert!(!osc133_trusted(payload.as_bytes(), NONCE_OFF), "{payload}");
+        }
+        assert!(osc133_trusted(b"A;n0nce", "n0nce"));
+        assert!(osc133_trusted(b"B;n0nce", "n0nce"));
+    }
+
+    #[test]
+    fn a_missing_exit_code_is_not_reported_as_success() {
+        // BAYAN-013
+        assert_eq!(CmdOutcome::from_exit(Some(0)), CmdOutcome::Ok);
+        assert_eq!(CmdOutcome::from_exit(Some(2)), CmdOutcome::Failed);
+        assert_eq!(CmdOutcome::from_exit(None), CmdOutcome::Unknown);
+        assert_ne!(CmdOutcome::Unknown.title(), CmdOutcome::Ok.title());
+    }
+
+    #[test]
+    fn a_poisoned_lock_is_recovered_not_fatal() {
+        // BAYAN-015
+        let m = Arc::new(Mutex::new(5));
+        let m2 = Arc::clone(&m);
+        let _ = std::thread::spawn(move || {
+            let _g = m2.lock_or_recover();
+            panic!("reader thread dies holding the lock");
+        })
+        .join();
+        assert!(m.is_poisoned());
+        assert_eq!(*m.lock_or_recover(), 5);
+    }
+
+    #[test]
     fn local_cwd_rejects_select_injection_and_ads() {
         for bad in [
             r"C:\x,/root,\\evil\share",
@@ -3620,10 +3997,10 @@ mod tests {
 
     #[test]
     fn notification_sequences_in_three_dialects() {
-        // iTerm2 / ConEmu message form
+        // iTerm2 / ConEmu message form: no program title
         assert_eq!(
             scan_notify(b"\x1b]9;Build done\x07"),
-            Some(("Bayan".into(), "Build done".into()))
+            Some((String::new(), "Build done".into()))
         );
         // ConEmu subcommands are not messages
         assert_eq!(scan_notify(b"\x1b]9;4;1;50\x07"), None);
@@ -3640,7 +4017,7 @@ mod tests {
         );
         assert_eq!(
             scan_notify(b"\x1b]99;i=1:d=1;all green\x07"),
-            Some(("Bayan".into(), "all green".into()))
+            Some((String::new(), "all green".into()))
         );
         // several in one read: the LAST one is what the user sees
         assert_eq!(
@@ -3648,6 +4025,44 @@ mod tests {
             Some(("T".into(), "second".into()))
         );
         assert_eq!(scan_notify(b"plain text"), None);
+    }
+
+    #[test]
+    fn notification_requires_a_terminator() {
+        // NEW-01: an unterminated request is not a notification, in any dialect
+        assert_eq!(scan_notify(b"\x1b]9;Build done"), None);
+        assert_eq!(scan_notify(b"\x1b]777;notify;T;body"), None);
+        assert_eq!(scan_notify(b"\x1b]99;i=1:p=title;Tests"), None);
+        // an ESC that is not ST does not terminate it either
+        assert_eq!(scan_notify(b"\x1b]9;Build done\x1b[0m"), None);
+        // a terminated request after an unterminated one still counts
+        assert_eq!(
+            scan_notify(b"\x1b]9;half \x1b]9;whole\x07"),
+            Some((String::new(), "whole".into()))
+        );
+    }
+
+    #[test]
+    fn notification_text_is_sanitized_and_capped() {
+        // controls, bidi overrides and zero-width characters are gone
+        assert_eq!(
+            scan_notify("\x1b]777;notify;Win\u{202E}dows\u{200B};a\tb\u{2028}c\x07".as_bytes()),
+            Some(("Win dows".into(), "a b c".into()))
+        );
+        // long text is cut, with an ellipsis, at the caps
+        let long = "x".repeat(1000);
+        let seq = format!("\x1b]777;notify;{long};{long}\x07");
+        let (t, b) = scan_notify(seq.as_bytes()).unwrap();
+        assert_eq!(t.chars().count(), NOTIFY_TITLE_MAX);
+        assert_eq!(b.chars().count(), NOTIFY_BODY_MAX);
+        assert!(t.ends_with('…') && b.ends_with('…'));
+        // R-06: invisible fillers and variation selectors are gone too
+        assert_eq!(
+            scan_notify("\x1b]9;a\u{3164}b\u{FE0F}c\u{E0100}d\x07".as_bytes()),
+            Some((String::new(), "a b c d".into()))
+        );
+        // whitespace-only after cleaning: nothing to show
+        assert_eq!(scan_notify("\x1b]9;\u{200B}\u{200B}\x07".as_bytes()), None);
     }
 
     #[test]
@@ -3678,7 +4093,7 @@ mod tests {
     impl EventListener for PtyLog {
         fn send_event(&self, event: Event) {
             if let Event::PtyWrite(text) = event {
-                self.0.lock().unwrap().push(text);
+                self.0.lock_or_recover().push(text);
             }
         }
     }
@@ -3713,7 +4128,7 @@ mod tests {
     }
 
     fn take_writes(log: &Mutex<Vec<String>>) -> Vec<String> {
-        std::mem::take(&mut *log.lock().unwrap())
+        std::mem::take(&mut *log.lock_or_recover())
     }
 
     #[test]
@@ -3902,6 +4317,53 @@ mod tests {
         let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &prompt);
         assert_eq!(ev.cwd.as_deref(), Some(r"C:\from7"));
         assert!(meta.running_cmd.is_empty());
+    }
+
+    /// NEW-02: with a session nonce, only the wrapper's B (carrying it)
+    /// arms "at prompt"; a bare `133;B` from output clears it instead.
+    #[test]
+    fn osc133_b_needs_the_session_nonce() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.prompt_nonce = "n0nce".into();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"PS> \x1b]133;B\x07");
+        assert!(!meta.at_prompt, "a bare B must not arm at_prompt");
+        assert_eq!(meta.prompt_col, None, "nor move the prompt column");
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\r\nPS> \x1b]133;B;n0nce\x07",
+        );
+        assert!(meta.at_prompt);
+        assert_eq!(meta.prompt_col, Some(4));
+        // a nested program prints a spoofed B: back to "not at prompt"
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;B;other\x07",
+        );
+        assert!(!meta.at_prompt);
+        // the wrapper really does send B with the nonce
+        // R-08: the live wrapper reads the nonce from a variable set from
+        // the environment, never a literal on the command line
+        let live = shell_integration_ps(NONCE_PS_EXPR);
+        assert_eq!(live.matches(NONCE_PS_EXPR).count(), 3);
+        assert!(
+            live.contains("]133;B;$($global:__BY_N)$([char]7)"),
+            "{live}"
+        );
+        let cap = nonce_capture_ps();
+        assert!(
+            cap.starts_with("$global:__BY_N=$env:BAYAN_PROMPT_NONCE;"),
+            "{cap}"
+        );
+        assert!(cap.contains("Remove-Item Env:BAYAN_PROMPT_NONCE"), "{cap}");
+        let ps = shell_integration_ps("n0nce");
+        assert!(ps.contains("]133;B;n0nce$([char]7)"), "{ps}");
+        assert_eq!(ps.matches("n0nce").count(), 3, "D, A and B each carry it");
     }
 
     fn osc7_of(url: &str) -> Vec<u8> {

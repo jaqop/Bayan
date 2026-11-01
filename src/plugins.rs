@@ -154,6 +154,19 @@ fn parse_theme(v: &serde_json::Value) -> Result<PluginTheme, String> {
     })
 }
 
+/// Longest label a plugin action may carry, in chars.
+pub const ACTION_LABEL_MAX: usize = 80;
+/// Longest text a plugin action may send, in chars. The confirm card shows
+/// all of it (R-03), so the cap is what fits there: 512 chars is at most
+/// ten card rows.
+pub const ACTION_SEND_MAX: usize = 512;
+
+/// BAYAN-007: a plugin action is shown in the palette and its `send` text
+/// goes to the shell, so the file is checked before it is trusted with
+/// either. The label must be plain text (no control, bidi or zero-width
+/// characters), short, and not one of Bayan's own built-in labels — a plugin
+/// cannot pose as «لصق». The payload is capped; it is never written raw:
+/// the palette holds it for the paste-guard card (`main.rs`).
 fn parse_action(v: &serde_json::Value) -> Result<PaletteAction, String> {
     let label = v
         .get("label")
@@ -163,6 +176,30 @@ fn parse_action(v: &serde_json::Value) -> Result<PaletteAction, String> {
         .get("send")
         .and_then(|x| x.as_str())
         .ok_or("action needs a string 'send'")?;
+    let label = label.trim();
+    if label.is_empty() {
+        return Err("action label is empty".into());
+    }
+    if label.chars().count() > ACTION_LABEL_MAX {
+        return Err(format!("action label longer than {ACTION_LABEL_MAX} chars"));
+    }
+    if label.chars().any(crate::link::is_forbidden) {
+        return Err(format!(
+            "action label {label:?} carries control or bidi characters"
+        ));
+    }
+    if crate::keybinds::Action::ALL
+        .iter()
+        .any(|a| a.label() == label)
+    {
+        return Err(format!("action label {label:?} is a built-in Bayan label"));
+    }
+    if send.is_empty() {
+        return Err("action 'send' is empty".into());
+    }
+    if send.chars().count() > ACTION_SEND_MAX {
+        return Err(format!("action 'send' longer than {ACTION_SEND_MAX} chars"));
+    }
     Ok(PaletteAction {
         label: label.to_string(),
         send: send.to_string(),
@@ -381,5 +418,26 @@ mod tests {
         let st = parse_plugin(src).unwrap();
         assert_eq!(st.actions[0].label, "Build");
         assert_eq!(st.actions[0].send, "cargo build\r");
+    }
+
+    #[test]
+    fn actions_cannot_pose_as_built_ins_or_hide_text() {
+        // BAYAN-007: a built-in label is refused, and the whole file with it
+        let builtin = crate::keybinds::Action::ALL[0].label();
+        let src = format!("{{\"actions\":[{{\"label\":\"{builtin}\",\"send\":\"x\"}}]}}");
+        assert!(parse_plugin(&src).is_err());
+        // bidi / zero-width / control characters in a label
+        for bad in ["a\\u202Eb", "a\\u200Bb", "a\\nb"] {
+            let src = format!("{{\"actions\":[{{\"label\":\"{bad}\",\"send\":\"x\"}}]}}");
+            assert!(parse_plugin(&src).is_err(), "{bad} label accepted");
+        }
+        // empty and oversized payloads
+        assert!(parse_plugin("{\"actions\":[{\"label\":\"L\",\"send\":\"\"}]}").is_err());
+        let big = "x".repeat(ACTION_SEND_MAX + 1);
+        let src = format!("{{\"actions\":[{{\"label\":\"L\",\"send\":\"{big}\"}}]}}");
+        assert!(parse_plugin(&src).is_err());
+        let long = "L".repeat(ACTION_LABEL_MAX + 1);
+        let src = format!("{{\"actions\":[{{\"label\":\"{long}\",\"send\":\"x\"}}]}}");
+        assert!(parse_plugin(&src).is_err());
     }
 }

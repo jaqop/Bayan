@@ -17,6 +17,7 @@ mod keybinds;
 mod keyroute;
 mod keys;
 mod kitty;
+mod layout;
 mod link;
 mod mouse;
 mod mru;
@@ -71,6 +72,8 @@ struct ShortcutsState {
 enum CloseTarget {
     /// the focused pane of tab .0 (Ctrl+Shift+W)
     Pane(usize, usize),
+    /// every pane in tab .0 (the tab-bar close control)
+    Tab(usize),
     /// the whole window (the titlebar X)
     Window,
 }
@@ -310,6 +313,27 @@ fn step_point(p: Point, cols: usize, top: i32, bottom: i32, dir: Direction) -> P
     }
 }
 
+/// Most tabs a restored session brings back (each one is a shell process).
+const MAX_RESTORED_TABS: usize = 16;
+
+/// A `BAYAN_*` debug hook from the environment (BAYAN-010). The hooks can
+/// type into the shell (`BAYAN_TYPE`), drive the clipboard (`BAYAN_PASTE`)
+/// and log to `%TEMP%` (`BAYAN_PROFILE`), so anything that could set
+/// Bayan's environment — a shortcut, a parent process — would get those
+/// powers. They exist for the build → launch → screenshot loop, so they are
+/// compiled into debug builds and into a release build only on request:
+/// `cargo build --release --features dev-hooks`. Everywhere else every hook
+/// reads as unset.
+#[cfg(any(debug_assertions, feature = "dev-hooks"))]
+fn dev_hook(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name)
+}
+
+#[cfg(not(any(debug_assertions, feature = "dev-hooks")))]
+fn dev_hook(_name: &str) -> Option<std::ffi::OsString> {
+    None
+}
+
 /// Startup timeline profiling (EasyTer's `EASYTER_PROFILE` pattern): set
 /// BAYAN_PROFILE=1 and marks land in %TEMP%\bayan_profile.log. Zero cost
 /// when unset; a file because release builds have no console.
@@ -322,13 +346,18 @@ mod prof {
 
     pub fn init() {
         T0.get_or_init(Instant::now);
-        if std::env::var_os("BAYAN_PROFILE").is_some() {
+        if super::dev_hook("BAYAN_PROFILE").is_some() {
             let _ = std::fs::write(std::env::temp_dir().join("bayan_profile.log"), "");
         }
     }
 
+    /// Whether marks are being recorded; lets a caller skip building one.
+    pub fn on() -> bool {
+        super::dev_hook("BAYAN_PROFILE").is_some()
+    }
+
     pub fn mark(label: &str) {
-        if std::env::var_os("BAYAN_PROFILE").is_none() {
+        if !on() {
             return;
         }
         let t0 = *T0.get_or_init(Instant::now);
@@ -362,7 +391,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
-use term::{Session, TermSize};
+use term::{LockExt, Session, TermSize};
 
 pub enum UserEvent {
     ShellProfiles(Vec<shells::Shell>),
@@ -381,11 +410,14 @@ pub enum UserEvent {
     /// Pane `id` rang the bell (Claude waiting for an approval).
     Bell(u64),
     /// A command that ran ≥6s in pane `id` just finished (ok?).
-    CommandFinished(u64, bool),
+    CommandFinished(u64, term::CmdOutcome),
     /// Pane `id`'s program asked for a desktop notification (title, body).
     Notify(u64, String, String),
     /// Pane `id` reported OSC 9;4 progress (None clears it).
     Progress(u64, Option<term::Progress>),
+    /// The prompt picker's worker rendered one preview: (generation, row,
+    /// ANSI). Dropped when the picker that asked is no longer open.
+    PoshPreview(u64, usize, Option<Vec<u8>>),
     /// Pane `id`'s shell exited.
     Exit(u64),
     /// A link open failed, or `settle` refused it, off the UI thread.
@@ -416,8 +448,27 @@ struct BlockedLink {
     confirm_uri: Option<String>,
 }
 
+/// What a confirm card is holding, which decides where Enter sends it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingKind {
+    /// A clipboard paste (or a palette insert): goes where a paste goes,
+    /// broadcast panes included.
+    Paste,
+    /// A dropped path, quoted for the focused pane's shell: that pane only
+    /// (R-01) — another pane's shell would parse the quoting differently.
+    Drop,
+    /// A plugin action's command (BAYAN-007): the focused pane only,
+    /// unbracketed, so a trailing CR still runs it.
+    Command,
+}
+
 /// Text held for the confirm card: the bytes to send, and why the card is up.
 struct PendingPaste {
+    kind: PendingKind,
+    /// The pane the card was raised for (R-02). Enter sends nothing unless
+    /// that pane is still the focused one: a card must never land in a
+    /// different shell than the one it described.
+    pane: Option<u64>,
     text: String,
     lines: usize,
     chars: usize,
@@ -434,19 +485,19 @@ struct Pane {
     progress: Option<term::Progress>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Orientation {
     Row,    // side by side (Ctrl+Shift+E)
     Column, // stacked (Ctrl+Shift+O)
 }
 
-/// One tab: a set of panes split along one axis (v1 of EasyTer's tree).
+/// One tab: a set of panes and the split tree that lays them out.
 struct Tab {
     panes: Vec<Pane>,
-    /// relative pane sizes along the axis (dragging a divider edits these)
-    weights: Vec<f32>,
+    /// where each pane goes: side-by-side and stacked splits, nested in any
+    /// mix (`layout.rs`); leaves are indices into `panes`
+    layout: layout::Node,
     focused: usize,
-    orientation: Orientation,
     /// cwd basename of the focused pane (falls back to a plain name)
     title: String,
     /// a name the user gave the tab; wins over `title` until cleared
@@ -576,41 +627,21 @@ fn clean_tab_name(raw: &str) -> Option<String> {
 }
 
 /// Weighted split of a content rect along one axis, 1px gaps between panes.
-fn split_rects(
-    content: render::Rect,
-    weights: &[f32],
-    orientation: Orientation,
-) -> Vec<render::Rect> {
-    let (x, y, w, h) = content;
-    let n = weights.len().max(1) as i32;
-    let gap = 1;
-    let total: f32 = weights.iter().sum::<f32>().max(f32::EPSILON);
-    let avail = match orientation {
-        Orientation::Row => w - gap * (n - 1),
-        Orientation::Column => h - gap * (n - 1),
-    } as f32;
-    let mut out = Vec::with_capacity(weights.len());
-    let mut cursor = match orientation {
-        Orientation::Row => x,
-        Orientation::Column => y,
-    };
-    for (i, wt) in weights.iter().enumerate() {
-        let len = if i as i32 == n - 1 {
-            // the last pane absorbs all rounding remainders
-            match orientation {
-                Orientation::Row => x + w - cursor,
-                Orientation::Column => y + h - cursor,
-            }
-        } else {
-            (avail * wt / total) as i32
-        };
-        out.push(match orientation {
-            Orientation::Row => (cursor, y, len, h),
-            Orientation::Column => (x, cursor, w, len),
-        });
-        cursor += len + gap;
+/// A saved tab's layout for the `n` panes that actually came back: its tree
+/// when it holds exactly those panes, else the old one-axis form (files from
+/// before nested splits, or a tab where a pane failed to respawn).
+fn restored_layout(st: &SavedTab, n: usize) -> layout::Node {
+    match &st.layout {
+        Some(tree) if tree.valid_for(n) => tree.clone(),
+        _ => {
+            let axis = if st.orientation == 1 {
+                Orientation::Column
+            } else {
+                Orientation::Row
+            };
+            layout::Node::flat(axis, &st.weights, n)
+        }
     }
-    out
 }
 
 /// What survives a restart: every tab's FULL layout — each pane's cwd, the
@@ -625,6 +656,10 @@ struct SavedTab {
     orientation: u8,
     #[serde(default)]
     focused: usize,
+    /// the split tree; absent in files from before nested splits, which
+    /// restore from `orientation` + `weights` as one row or column
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    layout: Option<layout::Node>,
     /// the user's tab name; absent in files from before M38
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
@@ -705,6 +740,7 @@ fn parse_state(json: &str) -> Option<SavedState> {
                 weights: vec![1.0],
                 orientation: 0,
                 focused: 0,
+                layout: None,
                 name: None,
             })
             .collect(),
@@ -840,8 +876,8 @@ fn context_menu_rows(
     add(Paste, "لصق");
     add(CopyLastOutput, "نسخ ناتج آخر أمر");
     add(Search, "البحث");
-    add(SplitH, "تقسيم جانبي");
-    add(SplitV, "تقسيم عمودي");
+    add(SplitH, "تقسيم: جنبًا إلى جنب");
+    add(SplitV, "تقسيم: فوق بعضها");
     if panes > 1 {
         add(
             ZoomPane,
@@ -881,6 +917,91 @@ fn rename_rows(query: &str) -> Vec<(PaletteRow, String)> {
     rows
 }
 
+/// Longest PTY-influenced string the window chrome draws, in chars.
+const CHROME_TEXT_MAX: usize = 120;
+
+/// BAYAN-012: one sanitizer for every string the chrome draws that a program
+/// can shape (the cockpit's `▶ cmd`, its idle cwd, the close guard's command).
+/// Control, bidi and zero-width characters (bar the Persian joiners) become
+/// visible markers (`<RLO>`)
+/// via `link::preview`, the same treatment the link cards give, and the text
+/// is capped. A spoofed RLO can no longer make the row say something else.
+fn chrome_text(raw: &str) -> String {
+    // the path form keeps ZWNJ/ZWJ: a Persian folder or command name is
+    // spelled with them, and they cannot reorder the row
+    link::preview_with(raw, CHROME_TEXT_MAX, link::is_forbidden_in_path)
+}
+
+/// The card's note when Enter will also type into `others` broadcast panes.
+fn broadcast_note(others: usize) -> Option<String> {
+    (others > 0).then(|| format!(" — يُرسل إلى {} لوحات", others + 1))
+}
+
+/// Whether a card raised for `raised_for` may still send (R-02): only into
+/// the same pane. A card with no pane (no tab was open) sends nowhere.
+fn card_still_targets(raised_for: Option<u64>, focused: Option<u64>) -> bool {
+    raised_for.is_some() && raised_for == focused
+}
+
+/// Chars of preview per card row; the card is 62 cells wide.
+const CARD_ROW_CHARS: usize = 56;
+
+/// The card's preview rows. A paste shows one elided row, as before. A
+/// plugin command shows ALL of what Enter will type (R-03), wrapped into
+/// rows, with CR as ␍ — a plugin's 512-char cap keeps that to ≤ 10 rows.
+fn card_preview(kind: PendingKind, text: &str) -> Vec<String> {
+    if kind != PendingKind::Command {
+        return vec![term::paste_preview(text, 48)];
+    }
+    let full = term::paste_preview(text, usize::MAX);
+    let chars: Vec<char> = full.chars().collect();
+    let rows: Vec<String> = chars
+        .chunks(CARD_ROW_CHARS)
+        .map(|c| c.iter().collect())
+        .collect();
+    if rows.is_empty() {
+        vec![String::new()]
+    } else {
+        rows
+    }
+}
+
+/// The shortcut shown beside a palette or menu row: the live chord of a
+/// built-in action, nothing for anything else.
+fn row_shortcut(keymap: &[(keybinds::Action, keybinds::Chord)], row: &PaletteRow) -> String {
+    match row {
+        PaletteRow::Builtin(a) => keymap
+            .iter()
+            .find(|(act, _)| act == a)
+            .map(|(_, c)| c.display())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// The palette text for a plugin action: always badged «إضافة», so a plugin
+/// row is told apart from Bayan's own at a glance (BAYAN-007).
+fn plugin_row_label(label: &str) -> String {
+    format!("إضافة — {label}")
+}
+
+/// What a plugin action holds for the confirm card: its text is never typed
+/// without one (BAYAN-007).
+fn plugin_pending(label: &str, send: &str, pane: Option<u64>) -> PendingPaste {
+    let (lines, chars) = match term::needs_paste_guard(send) {
+        Some(g) => (g.lines, g.chars),
+        None => (1, send.chars().count()),
+    };
+    PendingPaste {
+        kind: PendingKind::Command,
+        pane,
+        text: send.to_string(),
+        lines,
+        chars,
+        reason: format!("إضافة تريد كتابة نص — {label}"),
+    }
+}
+
 fn palette_extras(
     profiles: &[shells::Shell],
     links: &[link::LinkSpan],
@@ -905,7 +1026,7 @@ fn palette_extras(
     let mut seen = std::collections::HashSet::new();
     for span in links {
         let text = match &span.kind {
-            link::LinkKind::Osc { uri } | link::LinkKind::Url { uri } => uri,
+            link::LinkKind::Osc { uri, .. } | link::LinkKind::Url { uri } => uri,
             link::LinkKind::File { path, .. } => path,
         };
         if text.is_empty() || !seen.insert(text.clone()) {
@@ -936,7 +1057,7 @@ struct Palette {
 
 /// A frame's snapshot of the palette: (query, row labels, selected row,
 /// the right-click anchor when it is the menu).
-type PaletteView = (String, Vec<String>, usize, Option<(f64, f64)>);
+type PaletteView = (String, Vec<render::MenuRow>, usize, Option<(f64, f64)>);
 
 /// A frame's snapshot of the picker: (names, previews, selected row).
 type PoshView = (Vec<String>, Vec<Option<Vec<u8>>>, usize);
@@ -945,9 +1066,30 @@ type PoshView = (Vec<String>, Vec<Option<Vec<u8>>>, usize);
 /// itself, so what you see is the prompt you get.
 struct PoshPicker {
     names: Vec<String>,
-    /// preview ANSI per name, fetched once on open (a subprocess per row)
+    /// preview ANSI per name, filled in by the `bayan-posh` worker as each
+    /// subprocess finishes (None = not rendered yet, or no preview)
     previews: Vec<Option<Vec<u8>>>,
     sel: usize,
+    /// which open this is: a preview from an earlier, closed picker is dropped
+    generation: u64,
+    /// the worker's queue: (row, theme, eager)
+    work: std::sync::mpsc::Sender<(usize, String, bool)>,
+}
+
+/// Bumped on every picker open and close; the preview worker stops as soon
+/// as it no longer matches its own generation (BAYAN-006).
+static POSH_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One burst of preview requests, as the worker runs it (R-04): every eager
+/// row (featured + selected on open), then only the NEWEST highlight request.
+fn collapse_posh_requests(burst: Vec<(usize, String, bool)>) -> Vec<(usize, String, bool)> {
+    let last_hl = burst.iter().rposition(|r| !r.2);
+    burst
+        .into_iter()
+        .enumerate()
+        .filter(|(k, r)| r.2 || Some(*k) == last_hl)
+        .map(|(_, r)| r)
+        .collect()
 }
 
 struct App {
@@ -1239,7 +1381,15 @@ impl App {
         if let Some(h) = self.hwnd() {
             toast::remove(h);
         }
-        self.save_state(); // tabs + cwds greet you tomorrow
+        // tabs + cwds greet you tomorrow
+        self.save_state();
+        // BAYAN-014: end every shell (and, through ConPTY, its console) now,
+        // not whenever the process teardown gets to it
+        for t in &mut self.tabs {
+            for p in &mut t.panes {
+                p.session.kill();
+            }
+        }
         el.exit();
     }
 
@@ -1247,6 +1397,7 @@ impl App {
         if let Some(target) = self.pending_close.take().filter(|_| confirm) {
             match target {
                 CloseTarget::Pane(ti, pi) => self.remove_pane(ti, pi, el),
+                CloseTarget::Tab(ti) => self.remove_tab(ti, el),
                 CloseTarget::Window => self.quit(el),
             }
         }
@@ -1335,25 +1486,77 @@ impl App {
         self.request_redraw();
     }
 
-    /// Open the prompt picker, rendering every theme once up front. One
-    /// subprocess per theme is fine at ~11 themes and keeps scrolling instant;
-    /// rendering lazily would stutter exactly while the user is browsing.
+    /// Open the prompt picker. Each preview is one oh-my-posh subprocess (up
+    /// to 3 s), so they render on a `bayan-posh` worker and stream in through
+    /// `UserEvent::PoshPreview` (BAYAN-006). Only the featured themes and the
+    /// selected one render on open (R-04): rendering a theme runs it, and a
+    /// downloaded pack is ~100 files nobody asked to run. The rest render
+    /// when highlighted; the worker takes the newest request and drops the
+    /// ones the arrow keys already left. Closing or reopening stops it.
     fn open_posh(&mut self) {
+        use std::sync::atomic::Ordering;
         let names = posh::available();
         if names.is_empty() {
             return; // no oh-my-posh themes: nothing to pick from
         }
-        let previews = names.iter().map(|n| posh::preview(n)).collect();
         let cur = posh::current();
         let sel = cur
             .and_then(|c| names.iter().position(|n| *n == c))
             .unwrap_or(0);
+        let generation = POSH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        // (row, theme, eager). Eager rows all render; highlight requests
+        // collapse to the newest, so holding an arrow key does not queue a
+        // subprocess per row passed over.
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, String, bool)>();
+        let proxy = self.proxy.clone();
+        let _ = std::thread::Builder::new()
+            .name("bayan-posh".into())
+            .spawn(move || {
+                while let Ok(first) = rx.recv() {
+                    let mut burst = vec![first];
+                    while let Ok(next) = rx.try_recv() {
+                        burst.push(next);
+                    }
+                    for (i, name, _) in collapse_posh_requests(burst) {
+                        if POSH_GENERATION.load(Ordering::SeqCst) != generation {
+                            return; // the picker closed or reopened
+                        }
+                        let preview = posh::preview(&name);
+                        if proxy
+                            .send_event(UserEvent::PoshPreview(generation, i, preview))
+                            .is_err()
+                        {
+                            return; // the event loop is gone
+                        }
+                    }
+                }
+            });
+        for i in posh::eager_previews(&names, sel) {
+            let _ = tx.send((i, names[i].clone(), true));
+        }
         self.posh = Some(PoshPicker {
+            previews: vec![None; names.len()],
             names,
-            previews,
             sel,
+            generation,
+            work: tx,
         });
         self.request_redraw();
+    }
+
+    /// Ask the worker for the highlighted theme's preview, if it has none.
+    fn request_posh_preview(&mut self) {
+        let Some(p) = self.posh.as_mut() else { return };
+        let i = p.sel;
+        if p.previews.get(i).is_some_and(Option::is_none) {
+            let _ = p.work.send((i, p.names[i].clone(), false));
+        }
+    }
+
+    /// Close the picker and stop its preview worker.
+    fn close_posh(&mut self) {
+        POSH_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.posh = None;
     }
 
     fn posh_input(&mut self, event: &KeyEvent) {
@@ -1361,12 +1564,18 @@ impl App {
         let Some(p) = self.posh.as_mut() else { return };
         let n = p.names.len();
         match &event.logical_key {
-            Key::Named(NamedKey::Escape) => self.posh = None,
-            Key::Named(NamedKey::ArrowDown) => p.sel = (p.sel + 1) % n,
-            Key::Named(NamedKey::ArrowUp) => p.sel = (p.sel + n - 1) % n,
+            Key::Named(NamedKey::Escape) => self.close_posh(),
+            Key::Named(NamedKey::ArrowDown) => {
+                p.sel = (p.sel + 1) % n;
+                self.request_posh_preview();
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                p.sel = (p.sel + n - 1) % n;
+                self.request_posh_preview();
+            }
             Key::Named(NamedKey::Enter) => {
                 let name = p.names[p.sel].clone();
-                self.posh = None;
+                self.close_posh();
                 match posh::set_theme(&name) {
                     Ok(()) => eprintln!("bayan: prompt theme set to {name} (new tabs)"),
                     Err(e) => eprintln!("bayan: prompt theme failed: {e}"),
@@ -1501,8 +1710,9 @@ impl App {
             }
         }
         for (i, act) in plugins::registry().actions.iter().enumerate() {
-            if hit(&act.label) {
-                rows.push((PaletteRow::Plugin(i), act.label.clone()));
+            if hit(&plugin_row_label(&act.label)) {
+                // BAYAN-007: badged, so a plugin row never reads as built-in
+                rows.push((PaletteRow::Plugin(i), plugin_row_label(&act.label)));
             }
         }
         if let Some(palette) = &self.palette {
@@ -1525,7 +1735,7 @@ impl App {
             PaletteRow::Shell(command) => {
                 let cwd = self
                     .session()
-                    .and_then(|s| s.meta.lock().unwrap().spawn_cwd());
+                    .and_then(|s| s.meta.lock_or_recover().spawn_cwd());
                 let before = self.tabs.len();
                 self.spawn_tab_command(cwd, &command);
                 if self.tabs.len() == before && self.blocked_link.is_none() {
@@ -1541,6 +1751,8 @@ impl App {
             PaletteRow::RenameTab(name) => self.rename_tab(name),
             PaletteRow::InsertCommand(text) => {
                 self.pending_paste = Some(PendingPaste {
+                    kind: PendingKind::Paste,
+                    pane: self.focused_pane_id(),
                     text: text.into(),
                     lines: 1,
                     chars: text.chars().count(),
@@ -1548,11 +1760,13 @@ impl App {
                 });
             }
             PaletteRow::Plugin(i) => {
+                // BAYAN-007: never a raw PTY write. Like InsertCommand, the
+                // text waits on the paste-guard card (Enter sends it through
+                // send_paste → normalize_paste, Esc drops it), and the card
+                // names the plugin action that asked.
                 if let Some(act) = plugins::registry().actions.get(i) {
-                    let text = act.send.clone();
-                    if let Some(s) = self.session_mut() {
-                        s.write(text.as_bytes());
-                    }
+                    let pane = self.focused_pane_id();
+                    self.pending_paste = Some(plugin_pending(&act.label, &act.send, pane));
                 }
             }
         }
@@ -1568,7 +1782,7 @@ impl App {
                 // that directory exists — a stale OSC 7 must not become the cwd
                 let cwd = self
                     .session()
-                    .and_then(|s| s.meta.lock().unwrap().spawn_cwd());
+                    .and_then(|s| s.meta.lock_or_recover().spawn_cwd());
                 self.spawn_tab(cwd);
                 self.update_title();
                 self.request_redraw();
@@ -1789,7 +2003,7 @@ impl App {
     /// The focused pane's running command, if any (drives the close guard).
     fn running_command(&self, ti: usize, pi: usize) -> Option<String> {
         let pane = self.tabs.get(ti)?.panes.get(pi)?;
-        let cmd = pane.session.meta.lock().unwrap().running_cmd.clone();
+        let cmd = pane.session.meta.lock_or_recover().running_cmd.clone();
         (!cmd.is_empty()).then_some(cmd)
     }
 
@@ -1798,7 +2012,7 @@ impl App {
         self.tabs
             .iter()
             .flat_map(|t| &t.panes)
-            .filter(|p| !p.session.meta.lock().unwrap().running_cmd.is_empty())
+            .filter(|p| !p.session.meta.lock_or_recover().running_cmd.is_empty())
             .count()
     }
 
@@ -1925,11 +2139,13 @@ impl App {
                     .panes
                     .get(t.focused)
                     .map(|p| {
-                        let m = p.session.meta.lock().unwrap();
+                        let m = p.session.meta.lock_or_recover();
+                        // BAYAN-012: running_cmd is screen text and the cwd
+                        // a program report; both go through chrome_text
                         if !m.running_cmd.is_empty() {
-                            format!("▶ {}", m.running_cmd)
+                            format!("▶ {}", chrome_text(&m.running_cmd))
                         } else if let Some(cwd) = &m.cwd {
-                            format!("خامل · {cwd}")
+                            format!("خامل · {}", chrome_text(cwd))
                         } else {
                             "خامل".to_string()
                         }
@@ -1981,7 +2197,7 @@ impl App {
             let hist = t.grid().history_size();
             let off = t.grid().display_offset();
             let marks: Vec<usize> = {
-                let m = s.meta.lock().unwrap();
+                let m = s.meta.lock_or_recover();
                 m.marks
                     .iter()
                     .filter(|c| c.abs >= m.evicted)
@@ -2074,9 +2290,8 @@ impl App {
             self.abandon_mouse();
             self.tabs.push(Tab {
                 panes: vec![pane],
-                weights: vec![1.0],
+                layout: layout::Node::single(),
                 focused: 0,
-                orientation: Orientation::Row,
                 title,
                 name: None,
                 attention: false,
@@ -2090,55 +2305,60 @@ impl App {
         }
     }
 
-    /// Pane rects for the active tab within the window's content area.
-    fn pane_rects(&self) -> Vec<render::Rect> {
-        let (Some(r), Some(w), Some(t)) = (
-            self.renderer.as_ref(),
-            self.window.as_ref(),
-            self.tabs.get(self.active),
-        ) else {
-            return Vec::new();
-        };
+    /// The window's content area: below the tab bar, inside the padding.
+    pub(crate) fn content_rect(&self) -> Option<render::Rect> {
+        let (r, w) = (self.renderer.as_ref()?, self.window.as_ref()?);
         let px = w.inner_size();
         let bar = r.tab_bar_h().round() as i32;
         // the padding setting insets the whole content area evenly
         let pad = self.config.padding_px();
-        let content = (
+        Some((
             pad,
             bar + pad,
             (px.width as i32 - pad * 2).max(1),
             (px.height as i32 - bar - pad * 2).max(1),
-        );
+        ))
+    }
+
+    /// Pane rects for the active tab within the window's content area.
+    fn pane_rects(&self) -> Vec<render::Rect> {
+        let (Some(content), Some(t)) = (self.content_rect(), self.tabs.get(self.active)) else {
+            return Vec::new();
+        };
         if t.zoomed && t.panes.len() > 1 {
             zoom_rects(content, t.panes.len(), t.focused)
         } else {
-            split_rects(content, &t.weights, t.orientation)
+            t.layout.rects(content, t.panes.len())
         }
     }
 
-    /// Drag divider `i` to the pointer: redistribute the PAIR's weight.
+    /// The active tab's dividers (none while zoomed: one pane shows).
+    pub(crate) fn dividers(&self) -> Vec<layout::Divider> {
+        match (self.content_rect(), self.tabs.get(self.active)) {
+            (Some(content), Some(t)) if t.panes.len() > 1 && !t.zoomed => {
+                t.layout.dividers(content)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Drag divider `i` (an index into `dividers()`) to the pointer: the two
+    /// sides of that one split trade size.
     fn drag_divider_to(&mut self, i: usize, pos: PhysicalPosition<f64>) {
-        let rects = self.pane_rects();
+        let Some(d) = self.dividers().get(i).cloned() else {
+            return;
+        };
+        let Some(content) = self.content_rect() else {
+            return;
+        };
         let Some(t) = self.tabs.get_mut(self.active) else {
             return;
         };
-        if i + 1 >= rects.len() {
-            return;
-        }
-        let (a, b) = (rects[i], rects[i + 1]);
-        let (start, span, p) = match t.orientation {
-            Orientation::Row => (a.0 as f64, (b.0 + b.2 - a.0) as f64, pos.x),
-            Orientation::Column => (a.1 as f64, (b.1 + b.3 - a.1) as f64, pos.y),
+        let p = match d.axis {
+            Orientation::Row => pos.x,
+            Orientation::Column => pos.y,
         };
-        if span <= 0.0 {
-            return;
-        }
-        // keep both panes usable: at least ~80px each
-        let min = (80.0 / span).min(0.45);
-        let rel = ((p - start) / span).clamp(min, 1.0 - min) as f32;
-        let pair = t.weights[i] + t.weights[i + 1];
-        t.weights[i] = pair * rel;
-        t.weights[i + 1] = pair - t.weights[i];
+        t.layout.drag(&d, content, p);
         self.relayout_active();
         self.request_redraw();
     }
@@ -2184,21 +2404,65 @@ impl App {
         }
         let cwd = self
             .session()
-            .and_then(|s| s.meta.lock().unwrap().spawn_cwd());
+            .and_then(|s| s.meta.lock_or_recover().spawn_cwd());
         let Some(pane) = self.spawn_pane(cwd.as_deref()) else {
             return;
         };
         if let Some(t) = self.tabs.get_mut(self.active) {
-            if t.panes.len() == 1 {
-                t.orientation = orientation;
-            }
+            // the FOCUSED pane splits the way that was asked, and only it:
+            // side by side and stacked mix freely in one tab
+            let new = t.panes.len();
+            t.layout.split(t.focused, orientation, new);
             t.panes.push(pane);
-            t.weights.push(1.0);
             t.focused = t.panes.len() - 1;
             // the new pane has to be seen: a split ends the zoom
             t.zoomed = false;
         }
         self.relayout_active();
+        self.sync_focus(None);
+        self.request_redraw();
+    }
+
+    /// Close a whole tab (the tab-bar ×). Confirms when any pane still runs.
+    fn request_close_tab(&mut self, ti: usize, el: &ActiveEventLoop) {
+        let Some(t) = self.tabs.get(ti) else {
+            return;
+        };
+        let running = t
+            .panes
+            .iter()
+            .any(|p| !p.session.meta.lock_or_recover().running_cmd.is_empty());
+        if self.config.confirm_close_on() && running {
+            self.pending_close = Some(CloseTarget::Tab(ti));
+            self.request_redraw();
+            return;
+        }
+        self.remove_tab(ti, el);
+    }
+
+    /// Kill every pane in a tab and drop the tab; the last tab closes Bayan.
+    fn remove_tab(&mut self, ti: usize, el: &ActiveEventLoop) {
+        self.abandon_mouse();
+        let Some(mut t) = (ti < self.tabs.len()).then(|| self.tabs.remove(ti)) else {
+            return;
+        };
+        if matches!(self.pending_close, Some(CloseTarget::Tab(i)) if i == ti)
+            || matches!(self.pending_close, Some(CloseTarget::Pane(i, _)) if i == ti)
+        {
+            self.pending_close = None;
+        }
+        for mut pane in t.panes.drain(..) {
+            pane.session.kill();
+        }
+        if self.tabs.is_empty() {
+            self.quit(el);
+            return;
+        }
+        self.mru.removed(ti);
+        self.active = active_after_remove(self.active, ti, self.tabs.len());
+        self.mru.touch(self.active);
+        self.relayout_active();
+        self.update_title();
         self.sync_focus(None);
         self.request_redraw();
     }
@@ -2215,13 +2479,14 @@ impl App {
         }
         // Pane indices can shift when a background shell exits. Dismiss an
         // index-based confirmation rather than letting it target a neighbour.
-        if matches!(self.pending_close, Some(CloseTarget::Pane(..))) {
+        if matches!(
+            self.pending_close,
+            Some(CloseTarget::Pane(..)) | Some(CloseTarget::Tab(_))
+        ) {
             self.pending_close = None;
         }
         let mut pane = t.panes.remove(pi);
-        if pi < t.weights.len() {
-            t.weights.remove(pi);
-        }
+        t.layout.remove(pi);
         pane.session.kill();
         if t.panes.is_empty() {
             self.tabs.remove(ti);
@@ -2301,12 +2566,10 @@ impl App {
                                 .and_then(term::accept_local_cwd)
                         })
                         .collect(),
-                    weights: t.weights.clone(),
-                    orientation: match t.orientation {
-                        Orientation::Row => 0,
-                        Orientation::Column => 1,
-                    },
+                    weights: Vec::new(),
+                    orientation: 0,
                     focused: t.focused,
+                    layout: Some(t.layout.clone()),
                     name: t.name.clone(),
                 })
                 .collect(),
@@ -2353,30 +2616,21 @@ impl App {
         let saved = load_saved_state();
         match saved {
             Some(state) if !state.tabs.is_empty() => {
-                for st in state.tabs {
-                    let mut cwds = st.cwds.into_iter();
+                // BAYAN-014: a session.json with hundreds of tabs (a bug, a
+                // hand edit, a planted file) must not spawn hundreds of shells
+                for mut st in state.tabs.into_iter().take(MAX_RESTORED_TABS) {
+                    let mut cwds = std::mem::take(&mut st.cwds).into_iter();
                     self.spawn_tab(cwds.next().flatten());
                     for cwd in cwds.take(3) {
                         // re-split with the saved axis; weights come after
                         if let Some(pane) = self.spawn_pane(cwd.as_deref()) {
                             if let Some(t) = self.tabs.last_mut() {
                                 t.panes.push(pane);
-                                t.weights.push(1.0);
                             }
                         }
                     }
                     if let Some(t) = self.tabs.last_mut() {
-                        t.orientation = if st.orientation == 1 {
-                            Orientation::Column
-                        } else {
-                            Orientation::Row
-                        };
-                        if st.weights.len() == t.panes.len() {
-                            let sane = st.weights.iter().all(|w| w.is_finite() && *w > 0.0);
-                            if sane {
-                                t.weights = st.weights;
-                            }
-                        }
+                        t.layout = restored_layout(&st, t.panes.len());
                         t.focused = st.focused.min(t.panes.len() - 1);
                         t.name = st.name.as_deref().and_then(clean_tab_name);
                     }
@@ -2464,7 +2718,7 @@ impl App {
         // term first, then meta — the crate's lock order
         let alt = s.term.lock().mode().contains(TermMode::ALT_SCREEN);
         let (bidi_state, running) = {
-            let m = s.meta.lock().unwrap();
+            let m = s.meta.lock_or_recover();
             (m.bidi.clone(), m.running_cmd.clone())
         };
         // Idle explicit mode (a command that forgot to reset) must not
@@ -2607,7 +2861,7 @@ impl App {
         // lock below can re-borrow the tab
         let (pane_id, running, bidi_state, evicted, claude_from) = {
             let pane = self.tabs.get(self.active)?.panes.get(hit.pane)?;
-            let m = pane.session.meta.lock().unwrap();
+            let m = pane.session.meta.lock_or_recover();
             (
                 pane.id,
                 m.running_cmd.clone(),
@@ -2724,6 +2978,11 @@ impl App {
         let hit = mouse::CellHit { pane: pi, ..hit };
         let (_, row, col) = self.finish_locate(hit, PhysicalPosition::new(cx, cy), &rects)?;
         Some((row, col))
+    }
+
+    /// A confirm card is up: the paste/drop/plugin card or the link card.
+    pub(crate) fn card_open(&self) -> bool {
+        self.pending_paste.is_some() || self.blocked_link.is_some()
     }
 
     fn overlay_blocks_mouse(&self) -> bool {
@@ -3189,7 +3448,7 @@ impl App {
             return;
         };
         let range = {
-            let m = s.meta.lock().unwrap();
+            let m = s.meta.lock_or_recover();
             term::last_output_range(&m.marks).map(|r| (r, m.evicted))
         };
         let Some(((start, end), evicted)) = range else {
@@ -3231,21 +3490,72 @@ impl App {
     /// is not at its prompt. The card draws whenever this is set, including
     /// when the text has no control characters.
     fn arm_pending_paste(&mut self, txt: String, fallback: Option<term::PasteRisk>) {
-        let (lines, chars, reason) = if let Some(g) = term::needs_paste_guard(&txt) {
+        self.arm_pending(PendingKind::Paste, txt, fallback);
+    }
+
+    /// `arm_pending_paste` for a dropped path (R-01): if it needs a card, the
+    /// card sends to the focused pane only; if not, it is typed there now.
+    pub(crate) fn arm_pending_drop(&mut self, txt: String, fallback: Option<term::PasteRisk>) {
+        self.arm_pending(PendingKind::Drop, txt, fallback);
+    }
+
+    fn arm_pending(&mut self, kind: PendingKind, txt: String, fallback: Option<term::PasteRisk>) {
+        let (lines, chars, mut reason) = if let Some(g) = term::needs_paste_guard(&txt) {
             (g.lines, g.chars, g.risk.label().to_string())
         } else if let Some(risk) = fallback {
             (1, txt.chars().count(), risk.label().to_string())
         } else {
-            self.send_paste(&txt);
+            match kind {
+                PendingKind::Paste => self.send_paste(&txt),
+                PendingKind::Drop | PendingKind::Command => self.send_focused(kind, &txt),
+            }
             return;
         };
+        // R-01: say so when Enter will type this into more than one pane
+        if kind == PendingKind::Paste {
+            if let Some(note) = broadcast_note(self.broadcast_targets().len()) {
+                reason.push_str(&note);
+            }
+        }
         self.pending_paste = Some(PendingPaste {
+            kind,
+            pane: self.focused_pane_id(),
             text: txt,
             lines,
             chars,
             reason,
         });
         self.request_redraw();
+    }
+
+    /// Enter on the confirm card (R-02): send it where its kind says, but
+    /// only if the pane it was raised for is still the focused one.
+    pub(crate) fn confirm_pending(&mut self) {
+        let Some(p) = self.pending_paste.take() else {
+            return;
+        };
+        if !card_still_targets(p.pane, self.focused_pane_id()) {
+            self.request_redraw();
+            return;
+        }
+        match p.kind {
+            PendingKind::Paste => self.send_paste(&p.text),
+            PendingKind::Drop | PendingKind::Command => self.send_focused(p.kind, &p.text),
+        }
+        self.request_redraw();
+    }
+
+    /// A drop or a plugin command into the FOCUSED pane only. A drop keeps
+    /// the pane's own bracketed-paste mode; a plugin command is typed
+    /// unbracketed so its CR runs it.
+    fn send_focused(&mut self, kind: PendingKind, txt: &str) {
+        let bracketed =
+            kind == PendingKind::Drop && self.term_mode().contains(TermMode::BRACKETED_PASTE);
+        let body = term::normalize_paste(txt, bracketed);
+        self.last_input = Instant::now();
+        if let Some(s) = self.session_mut() {
+            s.write(body.as_bytes());
+        }
     }
 
     fn send_paste(&mut self, txt: &str) {
@@ -3395,18 +3705,36 @@ impl App {
             .map(|p| (p.names.clone(), p.previews.clone(), p.sel));
         // computed before the renderer is borrowed, like close_msg above
         let palette_view: Option<PaletteView> = self.palette.as_ref().map(|p| {
-            let rows: Vec<String> = self
+            // every built-in row shows its live shortcut, so the menu and the
+            // palette teach the keys (a rebinding shows up here too)
+            let rows: Vec<render::MenuRow> = self
                 .palette_rows(&p.query)
                 .into_iter()
-                .map(|(_, l)| l)
+                .map(|(row, label)| render::MenuRow {
+                    hint: row_shortcut(&self.keymap, &row),
+                    label,
+                })
                 .collect();
             let sel = p.sel.min(rows.len().saturating_sub(1));
             (p.query.clone(), rows, sel, p.menu)
         });
         let close_msg: Option<String> = self.pending_close.map(|target| match target {
             CloseTarget::Pane(ti, pi) => {
-                let cmd = self.running_command(ti, pi).unwrap_or_default();
+                let cmd = chrome_text(&self.running_command(ti, pi).unwrap_or_default());
                 format!("الأمر «{cmd}» ما يزال يعمل — إغلاق اللوحة؟")
+            }
+            CloseTarget::Tab(ti) => {
+                let n = self
+                    .tabs
+                    .get(ti)
+                    .map(|t| {
+                        t.panes
+                            .iter()
+                            .filter(|p| !p.session.meta.lock_or_recover().running_cmd.is_empty())
+                            .count()
+                    })
+                    .unwrap_or(0);
+                format!("{n} أمر ما يزال يعمل — إغلاق التبويب؟")
             }
             CloseTarget::Window => {
                 format!("{} أمر ما يزال يعمل — إغلاق بيان؟", self.running_count())
@@ -3447,7 +3775,7 @@ impl App {
                     // meta snapshot BEFORE the term lock (lock order term>meta
                     // only applies when holding both; here they don't overlap)
                     let (marks, running_cmd, bidi_state, evicted, claude_from): PaneSnap = {
-                        let m = pane.session.meta.lock().unwrap();
+                        let m = pane.session.meta.lock_or_recover();
                         (
                             // global -> grid space: subtract the evictions
                             m.marks
@@ -3571,7 +3899,7 @@ impl App {
                     );
                 }
                 if let Some(p) = &self.pending_paste {
-                    let preview = term::paste_preview(&p.text, 48);
+                    let preview = card_preview(p.kind, &p.text);
                     renderer.draw_paste_guard(
                         &mut verts,
                         px.width as usize,
@@ -3666,7 +3994,7 @@ impl App {
         // BAYAN_ATLAS_STRESS: shape a big spread of unique glyphs before the
         // first present, forcing a page grow — proves the array texture path
         // draws page-1 glyphs without corrupting page 0 (no input injection).
-        if std::env::var_os("BAYAN_ATLAS_STRESS").is_some() {
+        if dev_hook("BAYAN_ATLAS_STRESS").is_some() {
             if let Some(r) = self.renderer.as_mut() {
                 // persistent overlay (re-emitted every frame) so the second
                 // atlas page's glyphs stay on screen for verification
@@ -3712,7 +4040,7 @@ impl ApplicationHandler<UserEvent> for App {
         // hidden until the GPU presents the first dark frame (~0.4s): a
         // fully-drawn window appearing beats a white flash while DX12 warms up.
         // BAYAN_SHOW_NOW forces it visible at creation (for on-screen capture).
-        let visible = std::env::var_os("BAYAN_SHOW_NOW").is_some();
+        let visible = dev_hook("BAYAN_SHOW_NOW").is_some();
         // The exe's embedded resource covers Explorer and the taskbar, but the
         // title bar and Alt-Tab read the WINDOW icon, which winit only sets if
         // we hand it pixels. Raw RGBA rather than a decoder: 16KB, no new crate,
@@ -3776,25 +4104,25 @@ impl ApplicationHandler<UserEvent> for App {
         self.restore_state();
         // debug hook: BAYAN_SPLIT=1 opens the first tab pre-split, so the
         // pane machinery can be verified without injecting any input
-        if std::env::var_os("BAYAN_SPLIT").is_some() {
+        if dev_hook("BAYAN_SPLIT").is_some() {
             self.split(Orientation::Row);
         }
-        if std::env::var_os("BAYAN_COCKPIT").is_some() {
+        if dev_hook("BAYAN_COCKPIT").is_some() {
             self.cockpit = true;
             self.cockpit_sel = self.active;
         }
-        if std::env::var_os("BAYAN_GUARD").is_some() {
+        if dev_hook("BAYAN_GUARD").is_some() {
             self.arm_pending_paste("echo one\necho two\necho three\n".into(), None);
         }
-        if std::env::var_os("BAYAN_SETTINGS").is_some() {
+        if dev_hook("BAYAN_SETTINGS").is_some() {
             self.settings = Some(0);
         }
-        if std::env::var_os("BAYAN_SHORTCUTS").is_some() {
+        if dev_hook("BAYAN_SHORTCUTS").is_some() {
             self.shortcuts = Some(ShortcutsState::default());
         }
         // BAYAN_TYPE=<text>: feed text into the first pane's PTY — the
         // visual-verification hook (ligatures, shaping) with no keyboard
-        if let Some(v) = std::env::var_os("BAYAN_TYPE") {
+        if let Some(v) = dev_hook("BAYAN_TYPE") {
             if let Some(t) = v.to_str() {
                 let t = t.to_string();
                 if let Some(s) = self.session_mut() {
@@ -3806,23 +4134,23 @@ impl ApplicationHandler<UserEvent> for App {
         // focused pane once the renderer exists, so right-click paste can
         // be verified without injecting mouse input. It replaces whatever
         // was on the clipboard.
-        if let Some(v) = std::env::var_os("BAYAN_PASTE") {
+        if let Some(v) = dev_hook("BAYAN_PASTE") {
             self.debug_paste = v.to_str().map(str::to_string);
         }
         // BAYAN_POSH=1: open the prompt picker at startup (capture without keys)
-        if std::env::var_os("BAYAN_POSH").is_some() {
+        if dev_hook("BAYAN_POSH").is_some() {
             self.open_posh();
         }
         // BAYAN_PALETTE=<query|1>: open the palette at startup, so it can be
         // captured without injecting keystrokes (the debug-hook rule)
-        if let Some(v) = std::env::var_os("BAYAN_PALETTE") {
+        if let Some(v) = dev_hook("BAYAN_PALETTE") {
             let q = v.to_str().unwrap_or("").to_string();
             self.open_palette(if q == "1" { String::new() } else { q });
         }
         // BAYAN_TOAST=<title|1>: fire a sample toast at startup (M19
         // verification; a custom value becomes the title, so direction
         // experiments run without rebuilding)
-        if let Some(v) = std::env::var_os("BAYAN_TOAST") {
+        if let Some(v) = dev_hook("BAYAN_TOAST") {
             if let Some(h) = self.hwnd() {
                 let t = v.to_str().unwrap_or("1");
                 let title = if t == "1" { "اكتمل الأمر" } else { t };
@@ -3832,7 +4160,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
         // BAYAN_PICK_THEME=<n>: open settings and apply theme n, so a click's
         // live effect can be verified in a screenshot without input injection
-        if let Some(v) = std::env::var_os("BAYAN_PICK_THEME") {
+        if let Some(v) = dev_hook("BAYAN_PICK_THEME") {
             self.settings = Some(0);
             if let Some(n) = v.to_str().and_then(|s| s.parse::<usize>().ok()) {
                 self.apply_theme(n);
@@ -3896,7 +4224,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some((ti, pi)) = self.find_pane(id) {
                     self.tabs[ti].panes[pi].last_output = Some(Instant::now());
                     let ris = {
-                        let mut meta = self.tabs[ti].panes[pi].session.meta.lock().unwrap();
+                        let mut meta = self.tabs[ti].panes[pi].session.meta.lock_or_recover();
                         let ris = meta.saw_ris;
                         meta.saw_ris = false;
                         ris
@@ -3969,12 +4297,12 @@ impl ApplicationHandler<UserEvent> for App {
                     if background {
                         self.tabs[ti].attention = true;
                     }
-                    if (background || !self.focused) && self.config.notifications_on() {
-                        let body = if body.is_empty() {
-                            self.tabs[ti].label()
-                        } else {
-                            body
-                        };
+                    // NEW-01: any output can carry these (ssh, `cat`, an
+                    // install script), so the toast is opt-in, and its
+                    // title is always Bayan's own — the program's text is
+                    // sanitized by the scanner and lives in the body only
+                    if (background || !self.focused) && self.config.osc_notify_on() {
+                        let (title, body) = toast::pty_toast(&self.tabs[ti].label(), &title, &body);
                         self.toast_from_pty(&title, &body);
                         if !self.focused {
                             if let Some(w) = &self.window {
@@ -4012,11 +4340,7 @@ impl ApplicationHandler<UserEvent> for App {
                             ));
                         }
                         if self.config.notifications_on() && !self.focused {
-                            let title = if ok {
-                                "اكتمل الأمر"
-                            } else {
-                                "فشل الأمر"
-                            };
+                            let title = ok.title();
                             let body = self.tabs[ti].label();
                             self.toast_from_pty(title, &body);
                         }
@@ -4057,6 +4381,14 @@ impl ApplicationHandler<UserEvent> for App {
                 // last tab closes Bayan
                 if let Some((ti, pi)) = self.find_pane(id) {
                     self.remove_pane(ti, pi, el);
+                }
+            }
+            UserEvent::PoshPreview(generation, i, preview) => {
+                if let Some(p) = self.posh.as_mut() {
+                    if p.generation == generation && i < p.previews.len() {
+                        p.previews[i] = preview;
+                        self.request_redraw();
+                    }
                 }
             }
             UserEvent::LinkFailed { reason, shown } => {
@@ -4180,15 +4512,56 @@ fn blur_forgets_held_keys(focused: bool, held: &mut Vec<winit::keyboard::Physica
 /// `ResizePseudoConsole`, and `ClosePseudoConsole` come from `kernel32.dll`
 /// opened with `LoadLibraryExW(L"kernel32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32)`.
 /// `conpty.dll` is never passed to the loader.
+///
+/// NEW-04 (partly): the application directory still precedes System32 for a
+/// bare name, so a `d3d12.dll` planted beside `bayan.exe` (a Downloads
+/// folder, a writable `target\release`) would load. Without touching the
+/// search order above, the graphics DLLs wgpu loads DYNAMICALLY by bare name
+/// are mapped first from System32 only (`LOAD_LIBRARY_SEARCH_SYSTEM32`); a
+/// later `LoadLibraryW("d3d12.dll")` returns the module already in memory.
+/// Their own dependencies (D3D12Core, the DriverStore ICDs) resolve as before.
+///
+/// NOT covered: `dxgi.dll` and `opengl32.dll` are STATIC imports of the exe
+/// (wgpu-hal's `windows` raw-dylib calls), resolved by the loader before
+/// `main` runs, so nothing here can reach them. Closing that needs
+/// `/DEPENDENTLOADFLAG:0x800` at link time, which also restricts every other
+/// static import (the VC runtime among them) to System32 — untested, so not
+/// done. Until then: install Bayan in a folder only you can write
+/// (`%LOCALAPPDATA%\Programs\Bayan`), not run it from Downloads.
 pub(crate) fn harden_dll_search() {
+    use windows_sys::Win32::System::LibraryLoader::{
+        LoadLibraryExW, SetDllDirectoryW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
     // An empty string removes the CWD. NULL would put it back.
     let empty = [0u16];
     // SAFETY: `empty` is a NUL-terminated UTF-16 string that outlives the
     // call, and SetDllDirectoryW copies it rather than keeping the pointer.
     unsafe {
-        let _ = windows_sys::Win32::System::LibraryLoader::SetDllDirectoryW(empty.as_ptr());
+        let _ = SetDllDirectoryW(empty.as_ptr());
+    }
+    for name in GPU_SYSTEM_DLLS {
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: `wide` is NUL-terminated and outlives the call; the file
+        // handle argument must be null, and the flag restricts the search to
+        // System32. The module stays loaded for the life of the process on
+        // purpose, so the returned handle is not freed.
+        unsafe {
+            let _ = LoadLibraryExW(
+                wide.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            );
+        }
     }
 }
+
+/// Graphics DLLs wgpu-hal loads dynamically by bare name on Windows (DX12
+/// path; `gpu.rs` asks for DX12 | GL), pre-mapped from System32 by
+/// `harden_dll_search` (NEW-04). Not listed: `dxgi.dll` / `opengl32.dll`
+/// (static imports, already loaded before `main`), and `dxcompiler.dll` /
+/// `libEGL.dll`, which are not inbox System32 components (pinning an old
+/// inbox copy could break the DXC path).
+const GPU_SYSTEM_DLLS: &[&str] = &["d3d12.dll", "dcomp.dll", "d3dcompiler_47.dll"];
 
 fn main() {
     harden_dll_search();
@@ -4310,6 +4683,92 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn confirm_cards_send_only_into_the_pane_they_were_raised_for() {
+        // R-02
+        assert!(card_still_targets(Some(7), Some(7)));
+        assert!(!card_still_targets(Some(7), Some(8)), "tab switched");
+        assert!(!card_still_targets(Some(7), None), "pane gone");
+        assert!(!card_still_targets(None, None));
+        // R-01: the card says when a paste fans out
+        assert_eq!(broadcast_note(0), None);
+        assert_eq!(broadcast_note(2).as_deref(), Some(" — يُرسل إلى 3 لوحات"));
+    }
+
+    #[test]
+    fn a_plugin_card_shows_every_char_it_will_type() {
+        // R-03: the whole payload, CRs visible, wrapped into card rows
+        let send = format!("echo safe\r{}\rrm -rf x\r", "x".repeat(120));
+        let rows = card_preview(PendingKind::Command, &send);
+        let shown: String = rows.concat();
+        assert!(shown.contains("rm -rf x"), "{shown}");
+        assert_eq!(
+            shown.matches('\u{240D}').count(),
+            3,
+            "every CR is shown as ␍"
+        );
+        assert!(rows.iter().all(|r| r.chars().count() <= CARD_ROW_CHARS));
+        assert!(!shown.contains('…'), "nothing elided");
+        // the cap keeps it to ten rows
+        let max = "y".repeat(plugins::ACTION_SEND_MAX);
+        assert!(card_preview(PendingKind::Command, &max).len() <= 10);
+        // a paste keeps its one elided row
+        assert_eq!(card_preview(PendingKind::Paste, &max).len(), 1);
+    }
+
+    #[test]
+    fn plugin_actions_always_wait_for_the_confirm_card() {
+        // BAYAN-007: even a one-word payload is held, and the card names it
+        let p = plugin_pending("Build", "cargo build\r", Some(1));
+        assert_eq!(p.text, "cargo build\r");
+        assert_eq!(
+            p.kind,
+            PendingKind::Command,
+            "a command, not a bracketed paste"
+        );
+        assert_eq!(p.pane, Some(1));
+        assert!(p.reason.contains("Build"), "{}", p.reason);
+        let p = plugin_pending("ls", "ls", Some(1));
+        assert_eq!((p.lines, p.chars), (1, 2));
+        // and its palette row is badged
+        assert!(plugin_row_label("لصق").starts_with("إضافة — "));
+    }
+
+    #[test]
+    fn chrome_text_shows_spoofing_characters_as_markers() {
+        // BAYAN-012
+        let shown = chrome_text("rm -rf \u{202E}txt.exe");
+        assert!(!shown.contains('\u{202E}'), "{shown}");
+        assert!(shown.contains("<RLO>"), "{shown}");
+        let long = "x".repeat(1000);
+        assert!(chrome_text(&long).chars().count() <= CHROME_TEXT_MAX + 1);
+    }
+
+    #[test]
+    fn posh_previews_render_the_selected_theme_first() {
+        // BAYAN-006
+        // R-04: eager rows all run; a burst of highlights runs only the last
+        let r = |i: usize, eager: bool| (i, format!("t{i}"), eager);
+        let got: Vec<usize> = collapse_posh_requests(vec![
+            r(3, true),
+            r(1, true),
+            r(4, false),
+            r(5, false),
+            r(6, false),
+        ])
+        .into_iter()
+        .map(|x| x.0)
+        .collect();
+        assert_eq!(got, vec![3, 1, 6]);
+        assert!(collapse_posh_requests(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn restored_sessions_are_capped() {
+        // BAYAN-014: a sane bound, not "every tab in the file"
+        const { assert!(MAX_RESTORED_TABS >= 4 && MAX_RESTORED_TABS <= 32) };
+    }
+
+    #[test]
     fn search_seed_is_bounded_literal_and_restores_claude_arabic() {
         assert_eq!(selection_search_query(Some("a.b(c)"), false), "a.b(c)");
         assert_eq!(selection_search_query(Some("ابحرم"), true), "مرحبا");
@@ -4406,6 +4865,7 @@ mod tests {
             end_col: 9,
             kind: link::LinkKind::Osc {
                 uri: "https://example.org/\u{202e}x".into(),
+                shown: "x".into(),
             },
         };
         let rows = palette_extras(&[], &vec![span; 200]);
@@ -4528,23 +4988,60 @@ mod tests {
     }
 
     #[test]
-    fn split_rects_divide_by_weight() {
-        let content = (0, 30, 1000, 700);
-        let one = split_rects(content, &[1.0], Orientation::Row);
-        assert_eq!(one, vec![(0, 30, 1000, 700)]);
-        let two = split_rects(content, &[1.0, 1.0], Orientation::Row);
-        assert_eq!(two[0], (0, 30, 499, 700));
-        assert_eq!(two[1], (500, 30, 500, 700)); // absorbs the rounding
-        assert_eq!(two[0].0 + two[0].2 + 1, two[1].0); // 1px divider gap
-                                                       // a dragged divider: 3:1 weights give a 3:1 width split
-        let uneven = split_rects(content, &[3.0, 1.0], Orientation::Row);
-        assert_eq!(uneven[0].2, 749); // 999 * 0.75
-        assert_eq!(uneven[1].0 + uneven[1].2, 1000); // flush right
-        let stacked = split_rects(content, &[1.0, 1.0, 1.0], Orientation::Column);
-        assert_eq!(stacked.len(), 3);
-        assert_eq!(stacked[2].1 + stacked[2].3, 30 + 700); // flush bottom
-                                                           // widths untouched in a column split
-        assert!(stacked.iter().all(|r| r.2 == 1000));
+    fn menu_rows_show_their_live_shortcut() {
+        let cfg = config::UserConfig::default();
+        let map = keybinds::effective_map(&cfg);
+        let split = row_shortcut(&map, &PaletteRow::Builtin(keybinds::Action::SplitH));
+        assert_eq!(split, keybinds::Action::SplitH.default_chord().display());
+        assert!(split.contains("Ctrl"), "{split}");
+        // rows that are not actions have no shortcut
+        assert_eq!(row_shortcut(&map, &PaletteRow::CopyText("x".into())), "");
+        // a rebinding shows up in the menu
+        let mut binds = std::collections::HashMap::new();
+        binds.insert("split-h".to_string(), "ctrl+alt+h".to_string());
+        let cfg = config::UserConfig {
+            keybinds: Some(binds),
+            ..Default::default()
+        };
+        let map = keybinds::effective_map(&cfg);
+        assert_eq!(
+            row_shortcut(&map, &PaletteRow::Builtin(keybinds::Action::SplitH)),
+            keybinds::Chord::parse("ctrl+alt+h").unwrap().display()
+        );
+    }
+
+    #[test]
+    fn a_saved_tree_restores_and_an_old_file_still_reads() {
+        let mut tree = layout::Node::single();
+        tree.split(0, Orientation::Row, 1);
+        tree.split(1, Orientation::Column, 2);
+        let st = SavedTab {
+            cwds: vec![None, None, None],
+            weights: Vec::new(),
+            orientation: 0,
+            focused: 0,
+            layout: Some(tree.clone()),
+            name: None,
+        };
+        assert_eq!(restored_layout(&st, 3), tree);
+        // a pane failed to respawn: the tree no longer fits, use one axis
+        assert_eq!(
+            restored_layout(&st, 2),
+            layout::Node::flat(Orientation::Row, &[], 2)
+        );
+        // a file from before nested splits: orientation + weights
+        let old: SavedTab =
+            serde_json::from_str(r#"{"cwds":[null,null],"weights":[3.0,1.0],"orientation":1}"#)
+                .unwrap();
+        assert_eq!(
+            restored_layout(&old, 2),
+            layout::Node::flat(Orientation::Column, &[3.0, 1.0], 2)
+        );
+        // and the split labels say which way they go
+        assert_ne!(
+            keybinds::Action::SplitH.label(),
+            keybinds::Action::SplitV.label()
+        );
     }
 
     #[test]
@@ -4644,6 +5141,7 @@ mod tests {
                 weights: vec![3.0, 1.0],
                 orientation: 1,
                 focused: 1,
+                layout: None,
                 name: Some("خادم".into()),
             }],
             active: 0,
@@ -5004,6 +5502,7 @@ mod m38_tests {
                 weights: vec![1.0],
                 orientation: 0,
                 focused: 0,
+                layout: None,
                 name: Some("سجلات".into()),
             }],
             active: 0,

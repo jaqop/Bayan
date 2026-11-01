@@ -123,6 +123,20 @@ fn wsl_distros() -> Vec<String> {
     Vec::new()
 }
 
+/// BAYAN-008: the stored command line is split on whitespace at spawn, so
+/// a distro name must be exactly one argument that cannot read as a flag.
+/// WSL itself only creates names from `[A-Za-z0-9._-]`; anything else (a
+/// space, a leading `-`, a quote, a control or bidi character) is skipped
+/// rather than turned into extra `wsl.exe` arguments, so the profile the UI
+/// shows is always the command that runs.
+fn is_safe_distro_name(d: &str) -> bool {
+    !d.is_empty()
+        && d.len() <= 64
+        && !d.starts_with('-')
+        && d.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 /// Every shell present on this machine, in EasyTer's order.
 pub fn detect() -> Vec<Shell> {
     let mut v = Vec::new();
@@ -144,7 +158,7 @@ pub fn detect() -> Vec<Shell> {
         ));
     }
 
-    for d in wsl_distros() {
+    for d in wsl_distros().into_iter().filter(|d| is_safe_distro_name(d)) {
         v.push(Shell::new(&format!("WSL · {d}"), format!("wsl.exe -d {d}")));
     }
 
@@ -177,6 +191,26 @@ mod tests {
             .flat_map(u16::to_le_bytes)
             .collect();
         assert_eq!(parse_wsl_result(true, &valid), vec!["Ubuntu", "Debian"]);
+    }
+
+    #[test]
+    fn wsl_names_that_would_split_into_extra_args_are_skipped() {
+        for ok in ["Ubuntu", "Ubuntu-22.04", "kali-linux", "my_distro.v2"] {
+            assert!(is_safe_distro_name(ok), "{ok}");
+            let (prog, args) = crate::term::split_command(&format!("wsl.exe -d {ok}"));
+            assert_eq!((prog.as_str(), args.len()), ("wsl.exe", 2), "{ok}");
+        }
+        for bad in [
+            "",
+            "-u root",
+            "--exec",
+            "Ubuntu --exec calc",
+            "a\"b",
+            "a\tb",
+            "x\u{202E}y",
+        ] {
+            assert!(!is_safe_distro_name(bad), "{bad:?}");
+        }
     }
 
     #[test]
