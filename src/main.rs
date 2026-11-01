@@ -422,6 +422,9 @@ pub enum UserEvent {
     /// The prompt picker's worker rendered one preview: (generation, row,
     /// ANSI). Dropped when the picker that asked is no longer open.
     PoshPreview(u64, usize, Option<Vec<u8>>),
+    /// Highlight rows a burst did not run: (generation, rows). The picker
+    /// clears those claims so a later visit can ask again.
+    PoshDropped(u64, Vec<usize>),
     /// Pane `id`'s shell exited.
     Exit(u64),
     /// A link open failed, or `settle` refused it, off the UI thread.
@@ -1156,8 +1159,6 @@ struct PoshPicker {
 /// as it no longer matches its own generation (BAYAN-006).
 static POSH_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// One burst of preview requests, as the worker runs it (R-04): every eager
-/// row (featured + selected on open), then only the NEWEST highlight request.
 /// Whether highlight `i` still needs a preview subprocess. A row that was
 /// already asked, or that already has ANSI, does not.
 fn claim_posh_preview(asked: &mut [bool], have_preview: bool, i: usize) -> bool {
@@ -1168,14 +1169,52 @@ fn claim_posh_preview(asked: &mut [bool], have_preview: bool, i: usize) -> bool 
     true
 }
 
-fn collapse_posh_requests(burst: Vec<(usize, String, bool)>) -> Vec<(usize, String, bool)> {
+/// One burst of preview requests, as the worker runs it (R-04): every eager
+/// row (featured + selected on open), then only the NEWEST highlight request.
+/// The second list is highlight rows that will not run. The picker clears
+/// their claims, so coming back asks again instead of leaving the row blank.
+fn collapse_posh_requests(
+    burst: Vec<(usize, String, bool)>,
+) -> (Vec<(usize, String, bool)>, Vec<usize>) {
     let last_hl = burst.iter().rposition(|r| !r.2);
-    burst
-        .into_iter()
-        .enumerate()
-        .filter(|(k, r)| r.2 || Some(*k) == last_hl)
-        .map(|(_, r)| r)
-        .collect()
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for (k, row) in burst.into_iter().enumerate() {
+        if row.2 || Some(k) == last_hl {
+            kept.push(row);
+        } else {
+            dropped.push(row.0);
+        }
+    }
+    // A row that also runs (the newest highlight, or an eager copy of it)
+    // is not dropped: clearing that claim would start oh-my-posh twice.
+    dropped.retain(|i| !kept.iter().any(|row| row.0 == *i));
+    (kept, dropped)
+}
+
+/// Clear claims the worker did not run. A row whose preview already arrived
+/// stays claimed. Returns whether `sel` was released and still has nothing
+/// to show, so the picker can ask again without another key.
+fn release_dropped_posh(
+    asked: &mut [bool],
+    arrived: &[bool],
+    dropped: &[usize],
+    sel: usize,
+) -> bool {
+    let mut again = false;
+    for &j in dropped {
+        if arrived.get(j).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(slot) = asked.get_mut(j) else {
+            continue;
+        };
+        if *slot && j == sel {
+            again = true;
+        }
+        *slot = false;
+    }
+    again
 }
 
 struct App {
@@ -1577,8 +1616,9 @@ impl App {
     /// `UserEvent::PoshPreview` (BAYAN-006). Only the featured themes and the
     /// selected one render on open (R-04): rendering a theme runs it, and a
     /// downloaded pack is ~100 files nobody asked to run. The rest render
-    /// when highlighted; the worker takes the newest request and drops the
-    /// ones the arrow keys already left. Closing or reopening stops it.
+    /// when highlighted. A burst keeps the newest highlight and reports the
+    /// ones it skipped, so coming back asks again. Closing or reopening
+    /// stops the worker.
     fn open_posh(&mut self) {
         use std::sync::atomic::Ordering;
         let names = posh::available();
@@ -1592,7 +1632,8 @@ impl App {
         let generation = POSH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
         // (row, theme, eager). Eager rows all render; highlight requests
         // collapse to the newest, so holding an arrow key does not queue a
-        // subprocess per row passed over.
+        // subprocess per row passed over. Skipped highlights come back as
+        // PoshDropped and their claims are cleared.
         let (tx, rx) = std::sync::mpsc::channel::<(usize, String, bool)>();
         let proxy = self.proxy.clone();
         let _ = std::thread::Builder::new()
@@ -1603,7 +1644,18 @@ impl App {
                     while let Ok(next) = rx.try_recv() {
                         burst.push(next);
                     }
-                    for (i, name, _) in collapse_posh_requests(burst) {
+                    let (run, dropped) = collapse_posh_requests(burst);
+                    if POSH_GENERATION.load(Ordering::SeqCst) != generation {
+                        return; // the picker closed or reopened
+                    }
+                    if !dropped.is_empty()
+                        && proxy
+                            .send_event(UserEvent::PoshDropped(generation, dropped))
+                            .is_err()
+                    {
+                        return; // the event loop is gone
+                    }
+                    for (i, name, _) in run {
                         if POSH_GENERATION.load(Ordering::SeqCst) != generation {
                             return; // the picker closed or reopened
                         }
@@ -4513,6 +4565,20 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
+            UserEvent::PoshDropped(generation, dropped) => {
+                let again = self.posh.as_mut().is_some_and(|p| {
+                    if p.generation != generation {
+                        return false;
+                    }
+                    let sel = p.sel;
+                    let arrived: Vec<bool> = p.previews.iter().map(Option::is_some).collect();
+                    release_dropped_posh(&mut p.asked, &arrived, &dropped, sel)
+                });
+                if again {
+                    // the arrow is already on a row this burst did not run
+                    self.request_posh_preview();
+                }
+            }
             UserEvent::LinkFailed { reason, shown } => {
                 self.blocked_link = Some(BlockedLink {
                     reason,
@@ -4914,24 +4980,80 @@ mod tests {
         // BAYAN-006
         // R-04: eager rows all run; a burst of highlights runs only the last
         let r = |i: usize, eager: bool| (i, format!("t{i}"), eager);
-        let got: Vec<usize> = collapse_posh_requests(vec![
+        let (got, dropped) = collapse_posh_requests(vec![
             r(3, true),
             r(1, true),
             r(4, false),
             r(5, false),
             r(6, false),
-        ])
-        .into_iter()
-        .map(|x| x.0)
-        .collect();
+        ]);
+        let got: Vec<usize> = got.into_iter().map(|x| x.0).collect();
         assert_eq!(got, vec![3, 1, 6]);
-        assert!(collapse_posh_requests(Vec::new()).is_empty());
+        assert_eq!(dropped, vec![4, 5]);
+        let (empty, none) = collapse_posh_requests(Vec::new());
+        assert!(empty.is_empty());
+        assert!(none.is_empty());
+        // the same row kept later in the burst is not reported as dropped
+        let (kept, dropped) = collapse_posh_requests(vec![
+            (1, "t1".into(), false),
+            (2, "t2".into(), false),
+            (1, "t1".into(), false),
+        ]);
+        assert_eq!(
+            kept.into_iter().map(|row| row.0).collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(dropped, vec![2]);
         // a highlight asks once; a second pass while it is in flight does not
         let mut asked = vec![false, false];
         assert!(claim_posh_preview(&mut asked, false, 1));
         assert!(!claim_posh_preview(&mut asked, false, 1));
         assert!(claim_posh_preview(&mut asked, false, 0));
         assert!(!claim_posh_preview(&mut asked, true, 0));
+    }
+
+    #[test]
+    fn a_skipped_highlight_can_be_asked_again() {
+        // B-1: highlight 1, then 2, then 3 in one burst. Collapse keeps only
+        // 3. Coming back to 1 must request a preview; 3 stays in flight.
+        let mut asked = vec![false; 4];
+        let mut burst = Vec::new();
+        for i in 1..=3 {
+            assert!(claim_posh_preview(&mut asked, false, i), "highlight {i}");
+            burst.push((i, format!("t{i}"), false));
+        }
+        assert!(
+            !claim_posh_preview(&mut asked, false, 1),
+            "the claim is held until the worker says the row did not run"
+        );
+        let (kept, dropped) = collapse_posh_requests(burst);
+        assert_eq!(
+            kept.into_iter().map(|row| row.0).collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(dropped, vec![1, 2]);
+        let arrived = vec![false; asked.len()];
+        assert!(
+            !release_dropped_posh(&mut asked, &arrived, &dropped, 3),
+            "the row the burst kept needs nothing new"
+        );
+        assert!(
+            claim_posh_preview(&mut asked, false, 1),
+            "returning to a skipped row requests its preview"
+        );
+        assert!(
+            !claim_posh_preview(&mut asked, false, 3),
+            "the highlight still in flight is not started again"
+        );
+        // already back on the skipped row when the notice arrives
+        let mut asked = vec![false, true, true, true];
+        assert!(release_dropped_posh(&mut asked, &arrived, &dropped, 1));
+        assert!(!asked[1]);
+        assert!(asked[3]);
+        // a preview that did arrive is not forgotten
+        let mut asked = vec![true];
+        assert!(!release_dropped_posh(&mut asked, &[true], &[0], 0));
+        assert!(asked[0]);
     }
 
     #[test]
