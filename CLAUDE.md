@@ -26,6 +26,7 @@ selection and BiDi paths must do.
 | `keys.rs` | keyboard → VT byte sequences (ported from EasyTer) |
 | `kitty.rs` | kitty keyboard protocol encoder, layout-aware alternate keys |
 | `layout.rs` | a tab's split tree: side-by-side and stacked splits nest in any mix; leaves index the tab's flat pane list |
+| `localpath.rs` | no-follow walk: is a drive path local in every component, links read but not followed (link probe, new-tab cwd) |
 | `mru.rs` | most-recently-used tab order for Ctrl+Tab |
 | `shells.rs` | installed-shell detection (ported from EasyTer's `profiles.py`) |
 | `posh.rs` | oh-my-posh theme picker with a live ANSI preview |
@@ -34,8 +35,8 @@ selection and BiDi paths must do.
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-343 tests across the tree. `term.rs` (60), `link.rs` (59) and `render.rs` (42)
-carry the most.
+397 `#[test]` functions across the tree. `term.rs` (68), `link.rs` (61),
+`render.rs` (46) and `main.rs` (39) carry the most; `localpath.rs` has 19.
 
 ## Invariants — do not "simplify" these
 
@@ -59,7 +60,13 @@ Everything else, including no extension, is revealed in Explorer. Source
 files reach the editor only as `path:line`. UNC, `\\?\`, `\\.\`, `\??\`,
 a colon after the drive letter, a comma, a quote, and `\\` anywhere are
 rejected with `term::accept_local_cwd` / `unc_or_device` before any
-`exists` call. An existing 8.3 name is expanded with `GetLongPathNameW`
+`exists` call. Then `localpath::walk_live` must say `Local` before
+anything stats the path: no `DRIVE_REMOTE`, and every symlink or junction
+on the way resolved, without following it, to a local drive. Anything else
+is refused (`RefuseReason::NotLocal`), never revealed — Explorer would
+follow the link. Do not replace the walk with a check on the opened
+file's final path: that open has already connected to the share.
+An existing 8.3 name is expanded with `GetLongPathNameW`
 and both checks run again; a `~` component that cannot be expanded is
 revealed. `path:line` goes to the editor's `Command` argv, or to
 `%WINDIR%\explorer.exe` with raw `/select,"<path>"` when no editor is

@@ -976,48 +976,14 @@ fn dos_device_digit(c: char) -> bool {
 }
 
 /// Spawn-time probe. [`accept_local_cwd`] has already rejected UNC.
-/// `GetDriveTypeW` on the drive root rejects a mapped remote drive before
-/// `is_dir` opens it. A reparse point (symlink, junction, mount point) is
-/// rejected without following it, because the target may be a UNC path.
-/// Both calls are one syscall; nothing here canonicalizes.
+/// [`crate::localpath::walk_live`] then refuses a mapped remote drive and
+/// any component that is, or links to, something off the local drives,
+/// without following a link to find out; only then does `is_dir` open it.
+/// A junction in a parent (`C:\proj` → `\\server\share`) is caught too,
+/// which a check of the last component alone did not do.
 pub(crate) fn usable_spawn_dir(path: &str) -> bool {
-    drive_root_is_local(path) && !is_reparse_point(path) && crate::osc7::directory_exists(path)
-}
-
-fn wide_nul(path: &str) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-    std::ffi::OsStr::new(path)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
-}
-
-fn drive_root_is_local(path: &str) -> bool {
-    let mut chars = path.chars();
-    let drive = match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() => c,
-        _ => return false,
-    };
-    if chars.next() != Some(':') {
-        return false;
-    }
-    let root = format!("{drive}:\\");
-    let wide = wide_nul(&root);
-    // DRIVE_REMOTE is 4. The constant lives in Win32_System_WindowsProgramming,
-    // which this crate does not enable; the value is the Win32 one.
-    const DRIVE_REMOTE: u32 = 4;
-    // SAFETY: `wide` comes from `wide_nul`, so it is NUL-terminated.
-    unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(wide.as_ptr()) != DRIVE_REMOTE }
-}
-
-fn is_reparse_point(path: &str) -> bool {
-    use windows_sys::Win32::Storage::FileSystem::{
-        GetFileAttributesW, FILE_ATTRIBUTE_REPARSE_POINT,
-    };
-    let wide = wide_nul(path);
-    // SAFETY: `wide` comes from `wide_nul`, so it is NUL-terminated.
-    let attr = unsafe { GetFileAttributesW(wide.as_ptr()) };
-    attr != u32::MAX && attr & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    crate::localpath::walk_live(path) == crate::localpath::Walk::Local
+        && crate::osc7::directory_exists(path)
 }
 
 /// `\\…` (UNC, `\\?\`, `\\.\`) or `\??\…`. Slashes are normalized first so
