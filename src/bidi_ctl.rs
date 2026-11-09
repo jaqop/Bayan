@@ -707,13 +707,14 @@ mod tests {
     #[test]
     fn osc133_a_and_d_reset_bidi_and_idle_ignores_it() {
         let (mut t, mut p, mut meta, mut carry) = fresh();
+        meta.prompt_nonce = "n0nce".into();
         running(&mut meta);
         feed(
             &mut t,
             &mut p,
             &mut meta,
             &mut carry,
-            b"\x1b[8l\x1b[2 k\x1b]133;D;0\x07",
+            b"\x1b[8l\x1b[2 k\x1b]133;D;0;n0nce\x07",
         );
         assert!(meta.running_cmd.is_empty());
         assert_eq!(meta.bidi.mode, BidiMode::Implicit);
@@ -727,7 +728,7 @@ mod tests {
             &mut p,
             &mut meta,
             &mut carry,
-            b"\x1b[8l\x1b[2 k\x1b]133;A\x07",
+            b"\x1b[8l\x1b[2 k\x1b]133;A;n0nce\x07",
         );
         assert!(meta.running_cmd.is_empty());
         assert_eq!(meta.bidi.mode, BidiMode::Implicit);

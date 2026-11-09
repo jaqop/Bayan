@@ -18,6 +18,25 @@ pub fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     replace_with(path, |file| file.write_all(bytes))
 }
 
+/// Copy `path` to `path` + `.bayan.bak` the first time, and never again.
+/// `$PROFILE` is the user's file; the backup is the copy from before Bayan
+/// rewrote the managed line.
+pub fn backup_once(path: &Path) -> io::Result<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let Some(name) = path.file_name() else {
+        return Ok(());
+    };
+    let mut bak_name = name.to_os_string();
+    bak_name.push(".bayan.bak");
+    let bak = path.with_file_name(bak_name);
+    if bak.exists() {
+        return Ok(());
+    }
+    write(&bak, &std::fs::read(path)?)
+}
+
 fn replace_with(path: &Path, fill: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
     let parent = path
         .parent()
@@ -109,5 +128,43 @@ mod tests {
         assert!(write(&path, b"new").is_err());
         assert_eq!(std::fs::read(path.join("keep")).unwrap(), b"keep");
         assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn atomic_replace_keeps_a_finished_file_and_backs_up_once() {
+        // N-06: temp dir, never ~/.bayan
+        let fixture = Fixture::new();
+        let dir = &fixture.0;
+        let path = dir.join("session.json");
+        write(&path, b"{\"a\":1}").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":1}");
+        // the second write is the one that has to replace, not truncate
+        write(&path, b"{\"a\":2}").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":2}");
+        let names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.ends_with(".tmp")),
+            "temp left behind: {names:?}"
+        );
+
+        let profile = dir.join("Microsoft.PowerShell_profile.ps1");
+        backup_once(&profile).unwrap();
+        assert!(!dir
+            .join("Microsoft.PowerShell_profile.ps1.bayan.bak")
+            .exists());
+        std::fs::write(&profile, b"user-line\n").unwrap();
+        backup_once(&profile).unwrap();
+        let bak = dir.join("Microsoft.PowerShell_profile.ps1.bayan.bak");
+        assert_eq!(std::fs::read(&bak).unwrap(), b"user-line\n");
+        std::fs::write(&profile, b"changed\n").unwrap();
+        backup_once(&profile).unwrap();
+        assert_eq!(
+            std::fs::read(&bak).unwrap(),
+            b"user-line\n",
+            "the backup is taken once"
+        );
     }
 }

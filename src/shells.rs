@@ -119,9 +119,99 @@ fn on_path(prog: &str) -> bool {
     })
 }
 
+/// N-03: `wsl.exe` by bare name. `Command` on Windows searches the directory
+/// of `bayan.exe` before System32, so a copy planted beside the program
+/// (Downloads, `target\release`) would run at every launch. Discovery and
+/// later spawns use `GetSystemDirectoryW()\wsl.exe` or they do not run.
+pub(crate) fn wsl_program() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        resolve_wsl_exe(system32_dir().as_deref(), |p| p.is_file())
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Absolute `System32\wsl.exe` when `is_file` says it is there. A relative
+/// directory is refused: that is the app-dir search this exists to avoid.
+fn resolve_wsl_exe(
+    system32: Option<&Path>,
+    is_file: impl Fn(&Path) -> bool,
+) -> Option<std::path::PathBuf> {
+    let dir = system32.filter(|d| d.is_absolute())?;
+    let exe = dir.join("wsl.exe");
+    is_file(&exe).then_some(exe)
+}
+
+/// A saved shell line of `wsl` / `wsl.exe` with no directory. An absolute
+/// path is already decided and is left alone.
+fn is_bare_wsl(prog: &str) -> bool {
+    if prog.contains(['\\', '/', '"']) {
+        return false;
+    }
+    prog.eq_ignore_ascii_case("wsl.exe") || prog.eq_ignore_ascii_case("wsl")
+}
+
+/// Replace a bare WSL name with the System32 copy. Anything else passes
+/// through. `None` means "do not spawn": there is no System32 `wsl.exe`
+/// to run, and the bare name is not a fallback.
+pub(crate) fn resolve_spawn_program(prog: String) -> Option<String> {
+    if !is_bare_wsl(&prog) {
+        return Some(prog);
+    }
+    resolve_bare_wsl(&prog, wsl_program().as_deref())
+}
+
+fn resolve_bare_wsl(prog: &str, system_wsl: Option<&Path>) -> Option<String> {
+    if !is_bare_wsl(prog) {
+        return Some(prog.to_string());
+    }
+    let exe = system_wsl.filter(|p| p.is_absolute())?;
+    Some(exe.display().to_string())
+}
+
+/// Command line stored for a distro. A path with a space is quoted so
+/// `split_command` keeps it as one program.
+fn format_wsl_invocation(exe: &Path, distro: &str) -> String {
+    format!("{} -d {distro}", quoted_program(exe))
+}
+
+fn quoted_program(exe: &Path) -> String {
+    let p = exe.display().to_string();
+    if p.contains([' ', '\t']) {
+        format!("\"{p}\"")
+    } else {
+        p
+    }
+}
+
+#[cfg(not(windows))]
+fn system32_dir() -> Option<std::path::PathBuf> {
+    None
+}
+
 #[cfg(windows)]
-fn wsl_distros() -> Vec<String> {
-    let mut command = std::process::Command::new("wsl.exe");
+fn system32_dir() -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buf = [0u16; 260];
+    // SAFETY: the length passed is `buf`'s own, so the write stays inside it.
+    // Zero, or a length that does not fit, skips WSL instead of spawning a
+    // bare name.
+    let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
+    if n == 0 || n as usize >= buf.len() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+        &buf[..n as usize],
+    )))
+}
+
+#[cfg(windows)]
+fn wsl_distros_from(exe: &Path) -> Vec<String> {
+    let mut command = std::process::Command::new(exe);
     command.args(["-l", "-q"]);
     let out = crate::process::run_with_timeout(command, std::time::Duration::from_secs(3));
     match out {
@@ -131,8 +221,19 @@ fn wsl_distros() -> Vec<String> {
 }
 
 #[cfg(not(windows))]
-fn wsl_distros() -> Vec<String> {
+fn wsl_distros_from(_exe: &Path) -> Vec<String> {
     Vec::new()
+}
+
+fn wsl_entries() -> Vec<Shell> {
+    let Some(exe) = wsl_program() else {
+        return Vec::new();
+    };
+    wsl_distros_from(&exe)
+        .into_iter()
+        .filter(|d| is_safe_distro_name(d))
+        .map(|d| Shell::new(&format!("WSL · {d}"), format_wsl_invocation(&exe, &d)))
+        .collect()
 }
 
 /// BAYAN-008: the stored command line is split on whitespace at spawn, so
@@ -167,9 +268,7 @@ pub fn detect() -> Vec<Shell> {
         v.push(Shell::new("Git Bash", c));
     }
 
-    for d in wsl_distros().into_iter().filter(|d| is_safe_distro_name(d)) {
-        v.push(Shell::new(&format!("WSL · {d}"), format!("wsl.exe -d {d}")));
-    }
+    v.extend(wsl_entries());
 
     v
 }
@@ -190,7 +289,7 @@ pub fn is_restorable(command: &str, installed: &[Shell]) -> bool {
     match command {
         "powershell.exe" | FAST_POWERSHELL | "cmd.exe" => true,
         c => {
-            installed.iter().any(|s| s.command == c)
+            index_of(installed, c).is_some()
                 && c.strip_prefix("wsl.exe -d ")
                     .is_none_or(is_safe_distro_name)
         }
@@ -202,11 +301,40 @@ pub fn is_restorable(command: &str, installed: &[Shell]) -> bool {
 /// `found` is the app's one background `detect()`: this runs inside the frame
 /// build, so it must not probe (detection spawns `wsl.exe`).
 pub fn label_for(found: &[Shell], command: &str) -> String {
+    index_of(found, command)
+        .map(|i| found[i].label())
+        .unwrap_or_else(|| command.trim_end_matches(".exe").to_string())
+}
+
+/// Where `command` sits in `found`, the settings row's label and the shell
+/// arrow's starting point.
+pub fn index_of(found: &[Shell], command: &str) -> Option<usize> {
+    let system32 = system32_dir();
     found
         .iter()
-        .find(|s| s.command == command)
-        .map(|s| s.label())
-        .unwrap_or_else(|| command.trim_end_matches(".exe").to_string())
+        .position(|s| same_shell_in(&s.command, command, system32.as_deref()))
+}
+
+/// Whether two stored command lines start the same shell. A bare `wsl` /
+/// `wsl.exe` program reads as the System32 copy `resolve_spawn_program`
+/// spawns, so a line saved before detection stored that path still matches.
+/// Any other program, a `wsl.exe` elsewhere included, compares as written.
+fn same_shell_in(a: &str, b: &str, system32: Option<&Path>) -> bool {
+    let spawn_form = |c: &str| -> String {
+        let c = c.trim();
+        let prog = c.split(char::is_whitespace).next().unwrap_or("");
+        match system32.filter(|d| d.is_absolute()) {
+            Some(dir) if is_bare_wsl(prog) => {
+                format!(
+                    "{}{}",
+                    quoted_program(&dir.join("wsl.exe")),
+                    &c[prog.len()..]
+                )
+            }
+            _ => c.to_string(),
+        }
+    };
+    spawn_form(a) == spawn_form(b)
 }
 
 #[cfg(test)]
@@ -365,5 +493,101 @@ mod tests {
         let before = cmds.len();
         cmds.dedup();
         assert_eq!(cmds.len(), before, "duplicate shell commands: {found:?}");
+    }
+
+    #[test]
+    fn wsl_is_the_system32_copy_or_it_is_not_spawned() {
+        let sys = Path::new(r"C:\Windows\System32\wsl.exe");
+        assert_eq!(
+            resolve_wsl_exe(Some(Path::new(r"C:\Windows\System32")), |p| p == sys),
+            Some(sys.to_path_buf())
+        );
+        // a relative directory is the app-dir hole, even if a file is "there"
+        assert_eq!(resolve_wsl_exe(Some(Path::new("system32")), |_| true), None);
+        assert_eq!(resolve_wsl_exe(None, |_| true), None);
+        assert_eq!(
+            resolve_wsl_exe(Some(Path::new(r"C:\Windows\System32")), |_| false),
+            None
+        );
+
+        assert_eq!(
+            resolve_bare_wsl("wsl.exe", Some(sys)).as_deref(),
+            Some(r"C:\Windows\System32\wsl.exe")
+        );
+        assert_eq!(
+            resolve_bare_wsl("WSL.EXE", Some(sys)).as_deref(),
+            Some(r"C:\Windows\System32\wsl.exe")
+        );
+        assert_eq!(
+            resolve_bare_wsl("wsl", Some(sys)).as_deref(),
+            Some(r"C:\Windows\System32\wsl.exe")
+        );
+        // no System32 copy: refuse, do not keep the bare name
+        assert_eq!(resolve_bare_wsl("wsl.exe", None), None);
+        assert_eq!(
+            resolve_bare_wsl("wsl.exe", Some(Path::new(r"relative\wsl.exe"))),
+            None
+        );
+        // other shells, and an already-absolute wsl, are unchanged
+        assert_eq!(
+            resolve_bare_wsl("powershell.exe", None).as_deref(),
+            Some("powershell.exe")
+        );
+        assert_eq!(
+            resolve_bare_wsl(r"C:\Windows\System32\wsl.exe", None).as_deref(),
+            Some(r"C:\Windows\System32\wsl.exe")
+        );
+
+        let line = format_wsl_invocation(sys, "Ubuntu-22.04");
+        let (prog, args) = crate::term::split_command(&line);
+        assert_eq!(prog, r"C:\Windows\System32\wsl.exe");
+        assert_eq!(args, ["-d", "Ubuntu-22.04"]);
+        let spaced = format_wsl_invocation(Path::new(r"C:\Program Files\wsl.exe"), "Ubuntu");
+        let (prog, args) = crate::term::split_command(&spaced);
+        assert_eq!(prog, r"C:\Program Files\wsl.exe");
+        assert_eq!(args, ["-d", "Ubuntu"]);
+    }
+
+    #[test]
+    fn a_wsl_command_saved_before_system32_resolution_is_the_same_shell() {
+        // detection now stores the System32 path; config.json and
+        // session.json written earlier still say `wsl.exe -d <distro>`
+        let sys = Path::new(r"C:\Windows\System32");
+        let stored = r"C:\Windows\System32\wsl.exe -d Ubuntu";
+        assert!(same_shell_in("wsl.exe -d Ubuntu", stored, Some(sys)));
+        assert!(same_shell_in("wsl -d Ubuntu", stored, Some(sys)));
+        assert!(same_shell_in("WSL.EXE -d Ubuntu", stored, Some(sys)));
+        assert!(!same_shell_in("wsl.exe -d Debian", stored, Some(sys)));
+        // only the bare name resolves: a copy elsewhere is another program
+        let planted = r"C:\Users\u\Downloads\wsl.exe -d Ubuntu";
+        assert!(!same_shell_in(planted, stored, Some(sys)));
+        assert!(!same_shell_in("wsl.exe -d Ubuntu", stored, None));
+        assert!(same_shell_in("cmd.exe", "cmd.exe", None));
+
+        // the settings row, the shell arrow and session restore all look up
+        // through the same comparison
+        let dir = system32_dir().expect("GetSystemDirectoryW");
+        let found = vec![
+            Shell::new("Command Prompt", "cmd.exe"),
+            Shell::new(
+                "WSL · Ubuntu",
+                format_wsl_invocation(&dir.join("wsl.exe"), "Ubuntu"),
+            ),
+        ];
+        assert_eq!(index_of(&found, "wsl.exe -d Ubuntu"), Some(1));
+        assert_eq!(label_for(&found, "wsl.exe -d Ubuntu"), "WSL · Ubuntu");
+        assert!(is_restorable("wsl.exe -d Ubuntu", &found));
+        assert!(!is_restorable(planted, &found));
+    }
+
+    #[test]
+    fn discovery_does_not_name_wsl_as_a_bare_command() {
+        let src = include_str!("shells.rs");
+        let prod = src.split("mod tests").next().unwrap_or(src);
+        assert!(
+            !prod.contains("Command::new(\"wsl.exe\")"),
+            "wsl discovery must take the System32 path"
+        );
+        assert!(!prod.contains("Command::new(\"wsl\")"));
     }
 }

@@ -102,7 +102,7 @@ impl Action {
             Action::Copy => crate::lang::pick(lang, "نسخ التحديد", "Copy selection"),
             Action::Paste => crate::lang::pick(lang, "لصق", "Paste"),
             Action::SplitH => crate::lang::pick(lang, "تقسيم: جنبًا إلى جنب", "Split: side by side"),
-            Action::SplitV => crate::lang::pick(lang, "تقسيم: فوق بعضها", "Split: stacked"),
+            Action::SplitV => crate::lang::pick(lang, "لوحة أسفل", "Pane below"),
             Action::Cockpit => crate::lang::pick(lang, "مقصورة الوكلاء", "Agent cockpit"),
             Action::PromptPrev => crate::lang::pick(lang, "الأمر السابق", "Previous command"),
             Action::PromptNext => crate::lang::pick(lang, "الأمر التالي", "Next command"),

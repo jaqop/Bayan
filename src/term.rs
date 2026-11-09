@@ -381,10 +381,11 @@ pub struct SessionMeta {
     /// set until the UI reads it.
     pub saw_ris: bool,
     /// Secret mixed into OSC 133 A and D by the PowerShell prompt wrapper.
-    /// Empty in tests: any A or D is trusted. A live session sets 32 hex
-    /// characters at spawn. While a command is running, OSC 7 / OSC 9;9 are
-    /// stored only after an A that carries this nonce. Clink's OSC 7 has no
-    /// 133 and is still accepted when the pane is already idle.
+    /// Empty trusts nothing (fail-closed). A live session sets 32 hex
+    /// characters at spawn, or [`NONCE_OFF`] when the random source fails.
+    /// While a command is running, OSC 7 / OSC 9;9 are stored only after an
+    /// A that carries this nonce. Clink's OSC 7 has no 133 and is still
+    /// accepted when the pane is already idle.
     pub prompt_nonce: String,
 }
 
@@ -1024,17 +1025,19 @@ fn cwd_from_osc7(payload: &[u8]) -> Option<String> {
 
 /// `A`, `B` or `D` whose `;`-separated fields contain `nonce`.
 ///
-/// An empty nonce trusts every A, B and D, which is what the unit tests send.
-/// A live nonce is 32 hex characters from [`fresh_prompt_nonce`].
+/// An empty nonce trusts nothing. A live session's nonce is 32 hex
+/// characters from [`fresh_prompt_nonce`], or [`NONCE_OFF`] when that
+/// fails — never empty — but an empty string used to mean "trust every
+/// mark", which is fail-open if a pane is ever left without one.
 fn osc133_trusted(payload: &[u8], nonce: &str) -> bool {
+    if nonce.is_empty() {
+        return false;
+    }
     let Some(&kind) = payload.first() else {
         return false;
     };
     if !matches!(kind, b'A' | b'B' | b'D') {
         return false;
-    }
-    if nonce.is_empty() {
-        return true;
     }
     let Ok(text) = std::str::from_utf8(payload) else {
         return false;
@@ -1051,9 +1054,9 @@ fn osc133_trusted(payload: &[u8], nonce: &str) -> bool {
 /// in one read. A trusted A or D clears `running` for reports that follow
 /// them in this slice. With a session nonce, only an A that carries it arms
 /// the report: a spoofed `133;D` leaves the command running and does not
-/// authorize the OSC 7 after it. An empty nonce (tests) arms at the start,
-/// so any A/D is enough. A pane that is already idle stays armed, which is
-/// how clink's OSC 7 — no 133 at all — still updates the directory. A
+/// authorize the OSC 7 after it. An empty nonce arms nothing, including
+/// while a command is running. A pane that is already idle stays armed,
+/// which is how clink's OSC 7 — no 133 at all — still updates the directory. A
 /// `?1049` / `?47` /
 /// `?1047` updates `alt` for reports after that CSI. RIS (`ESC c`) leaves
 /// the alt screen.
@@ -1063,7 +1066,7 @@ fn osc133_trusted(payload: &[u8], nonce: &str) -> bool {
 fn trusted_cwd(data: &[u8], running: bool, alt: bool, nonce: &str) -> Option<String> {
     let mut running = running;
     let mut alt = alt;
-    let mut armed = nonce.is_empty() || !running;
+    let mut armed = !running;
     let mut best: Option<String> = None;
     let mut i = 0;
     while i < data.len() {
@@ -1133,10 +1136,10 @@ fn handle_osc133<T: EventListener>(
         // Prompt start (A) or command finished (D). A BDSM/SCP from the
         // command that just ended must not survive onto this line, even when
         // the mark is spoofed: `cat` of a file that contains CSI 8 l must not
-        // leave the pane in explicit mode. Only a trusted mark (the session
-        // nonce, or any mark when the nonce is empty) clears the command; an
-        // untrusted one leaves `running_cmd`, so the OSC 7 that a spoofed
-        // mark tries to authorize stays ignored.
+        // leave the pane in explicit mode. Only a trusted mark (one that
+        // carries the session nonce; an empty nonce trusts nothing) clears
+        // the command; an untrusted one leaves `running_cmd`, so the OSC 7
+        // that a spoofed mark tries to authorize stays ignored.
         meta.bidi_mut().reset();
         if !trusted {
             return;
@@ -2083,6 +2086,12 @@ impl Session {
         // program + args, or a shell with switches would be spawned as one
         // absurd filename ("powershell.exe -NoProfile" is not a program)
         let (prog, args) = split_command(shell);
+        // N-03: a saved `wsl.exe -d Ubuntu` must not search Bayan's folder.
+        let Some(prog) = crate::shells::resolve_spawn_program(prog) else {
+            return Err(
+                "refusing to spawn wsl.exe by a bare name; System32\\wsl.exe is not there".into(),
+            );
+        };
         let mut cmd = CommandBuilder::new(prog);
         for a in &args {
             cmd.arg(a);
@@ -3321,10 +3330,16 @@ mod tests {
 
     fn test_term() -> (Term<VoidListener>, Processor, SessionMeta, Vec<u8>) {
         let size = TermSize { cols: 40, rows: 6 };
+        // An empty nonce trusts nothing. Tests that want a prompt mark
+        // carry this value in the OSC 133 payload.
+        let meta = SessionMeta {
+            prompt_nonce: "n0nce".into(),
+            ..SessionMeta::default()
+        };
         (
             Term::new(Config::default(), &size, VoidListener),
             Processor::new(),
-            SessionMeta::default(),
+            meta,
             Vec::new(),
         )
     }
@@ -3362,7 +3377,7 @@ mod tests {
         let (mut t, mut p, mut meta, mut carry) = test_term();
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"PS> \x1b]133;");
         assert!(!meta.at_prompt, "marker not complete yet");
-        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"B\x07");
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"B;n0nce\x07");
         assert!(meta.at_prompt);
         assert_eq!(meta.prompt_col, Some(4)); // input begins after "PS> "
     }
@@ -3411,14 +3426,26 @@ mod tests {
     #[test]
     fn command_capture_reads_the_typed_line() {
         let (mut t, mut p, mut meta, mut carry) = test_term();
-        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"> \x1b]133;B\x07");
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"> \x1b]133;B;n0nce\x07",
+        );
         // the shell echoes what the user typed
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"claude --continue");
         capture_command_core(&t, &mut meta);
         assert_eq!(meta.running_cmd, "claude --continue");
         assert!(!meta.at_prompt);
         // OSC 133 D (command finished) clears it
-        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;D;0\x07");
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;D;0;n0nce\x07",
+        );
         assert!(meta.running_cmd.is_empty());
     }
 
@@ -3430,7 +3457,7 @@ mod tests {
             &mut t,
             &mut meta,
             &mut carry,
-            b"PS C:\\a-very-long-directory> \x1b]133;B\x07",
+            b"PS C:\\a-very-long-directory> \x1b]133;B;n0nce\x07",
         );
         let command = format!("claude --safe-mode {}", "x".repeat(90));
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, command.as_bytes());
@@ -3447,7 +3474,7 @@ mod tests {
             &mut t,
             &mut meta,
             &mut carry,
-            b"Claude Code vOLD\r\n> \x1b]133;B\x07claude",
+            b"Claude Code vOLD\r\n> \x1b]133;B;n0nce\x07claude",
         );
         capture_command_core(&t, &mut meta);
         let ev = process_chunk(
@@ -3477,7 +3504,7 @@ mod tests {
             &mut t,
             &mut meta,
             &mut carry,
-            b"> \x1b]133;B\x07claude --print hello",
+            b"> \x1b]133;B;n0nce\x07claude --print hello",
         );
         capture_command_core(&t, &mut meta);
         assert!(meta.clean_claude_after.is_none());
@@ -3491,7 +3518,7 @@ mod tests {
             &mut t,
             &mut meta,
             &mut carry,
-            b"PS> \x1b]133;B\x07claude --resume test-session",
+            b"PS> \x1b]133;B;n0nce\x07claude --resume test-session",
         );
         capture_command_core(&t, &mut meta);
         let ev = process_chunk(
@@ -3515,7 +3542,13 @@ mod tests {
     #[test]
     fn claude_pipeline_end_to_end() {
         let (mut t, mut p, mut meta, mut carry) = test_term();
-        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"> \x1b]133;B\x07");
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"> \x1b]133;B;n0nce\x07",
+        );
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"claude");
         capture_command_core(&t, &mut meta);
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?1049h");
@@ -3527,7 +3560,7 @@ mod tests {
             &mut t,
             &mut meta,
             &mut carry,
-            b"\x1b[?1049l\x1b]133;D;0\x07",
+            b"\x1b[?1049l\x1b]133;D;0;n0nce\x07",
         );
         assert!(!t.mode().contains(TermMode::ALT_SCREEN));
         assert!(meta.running_cmd.is_empty());
@@ -3544,7 +3577,10 @@ mod tests {
         };
         let mut t = Term::new(config, &size, VoidListener);
         let mut p: Processor = Processor::new();
-        let mut meta = SessionMeta::default();
+        let mut meta = SessionMeta {
+            prompt_nonce: "n0nce".into(),
+            ..SessionMeta::default()
+        };
         let mut carry = Vec::new();
         // 30 lines through a 4-row screen: 27 scroll into an 8-line history
         for i in 0..30 {
@@ -3554,7 +3590,13 @@ mod tests {
         assert_eq!(t.grid().history_size(), 8, "history is at its cap");
         assert_eq!(meta.evicted, 19, "27 scrolled - 8 kept = 19 evicted");
         // a new prompt mark lands exactly on the cursor row in grid space
-        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;A\x07");
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;A;n0nce\x07",
+        );
         let m = meta.marks.last().unwrap();
         let grid_line = (m.abs - meta.evicted) as i64 - t.grid().history_size() as i64;
         assert_eq!(grid_line, t.grid().cursor.point.line.0 as i64);
@@ -3778,7 +3820,7 @@ mod tests {
 
         // Prompt order: D, A, 9;9, 7. The command was running at the first
         // byte. The report after D is the one that sticks, and 7 wins over 9;9.
-        let mut prompt = b"\x1b]133;D;0\x07\x1b]133;A\x07".to_vec();
+        let mut prompt = b"\x1b]133;D;0;n0nce\x07\x1b]133;A;n0nce\x07".to_vec();
         prompt.extend(osc9(r"C:\from9"));
         prompt.extend(osc7("file:///C:/from7"));
         let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &prompt);
@@ -3903,6 +3945,32 @@ mod tests {
         }
         assert!(osc133_trusted(b"A;n0nce", "n0nce"));
         assert!(osc133_trusted(b"B;n0nce", "n0nce"));
+        // an empty nonce used to trust every mark. It trusts none.
+        assert!(!osc133_trusted(b"A", ""));
+        assert!(!osc133_trusted(b"B;x", ""));
+        assert!(!osc133_trusted(b"D;0", ""));
+        assert!(!osc133_trusted(b"A;n0nce", ""));
+    }
+
+    #[test]
+    fn an_empty_nonce_does_not_authorize_a_directory_change() {
+        let size = TermSize { cols: 40, rows: 4 };
+        let mut t = Term::new(Config::default(), &size, VoidListener);
+        let mut p = Processor::new();
+        let mut meta = SessionMeta::default();
+        assert!(meta.prompt_nonce.is_empty());
+        meta.running_cmd = "cat".into();
+        let mut carry = Vec::new();
+        let ev = process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;D;0\x07\x1b]133;A\x07\x1b]7;file:///C:/evil\x07",
+        );
+        assert!(ev.cwd.is_none());
+        assert_eq!(meta.running_cmd, "cat");
+        assert!(meta.marks.is_empty());
     }
 
     /// ABIMISMATCH-001: `RtlGenRandom` returns a one-byte BOOLEAN. With the
@@ -4179,10 +4247,22 @@ mod tests {
         let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]9;4;1;40\x07");
         assert_eq!(ev.progress.unwrap().unwrap().percent, 40);
         // Ctrl+C: the shell prints a fresh prompt, the program said nothing
-        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;A\x07PS> ");
+        let ev = process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;A;n0nce\x07PS> ",
+        );
         assert_eq!(ev.progress, Some(None), "a returning prompt must clear it");
         // a finished command does the same
-        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;D;0\x07");
+        let ev = process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;D;0;n0nce\x07",
+        );
         assert_eq!(ev.progress, Some(None));
         // but a report in the SAME chunk is live, not stale: it wins
         let ev = process_chunk(
@@ -4190,7 +4270,7 @@ mod tests {
             &mut t,
             &mut meta,
             &mut carry,
-            b"\x1b]133;A\x07\x1b]9;4;1;70\x07",
+            b"\x1b]133;A;n0nce\x07\x1b]9;4;1;70\x07",
         );
         assert_eq!(ev.progress.unwrap().unwrap().percent, 70);
         // and an ordinary chunk still reports nothing either way
@@ -4323,6 +4403,7 @@ mod tests {
             parser: Processor::new(),
             meta: SessionMeta {
                 kitty_protocol: protocol,
+                prompt_nonce: "n0nce".into(),
                 ..SessionMeta::default()
             },
             carry: Vec::new(),
@@ -4579,7 +4660,13 @@ mod tests {
     /// Prompt showing, nonce set, cwd already `C:\work` from an idle OSC 7.
     fn prompt_ready() -> (Term<VoidListener>, Processor, SessionMeta, Vec<u8>) {
         let (mut t, mut p, mut meta, mut carry) = test_term();
-        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"PS> \x1b]133;B\x07");
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"PS> \x1b]133;B;n0nce\x07",
+        );
         assert!(meta.at_prompt);
         assert_eq!(meta.prompt_col, Some(4));
         meta.prompt_nonce = "n0nce".into();
@@ -4755,7 +4842,7 @@ mod tests {
             &mut t,
             &mut meta,
             &mut carry,
-            b"\x1b]133;A\x07\x1b[?u",
+            b"\x1b]133;A;n0nce\x07\x1b[?u",
         );
         assert_eq!(take_writes(&log), vec!["\x1b[?0u".to_string()]);
         assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
@@ -4875,7 +4962,13 @@ mod tests {
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"Hi\x1b7\x1b[2;4H");
         let saved = t.grid().saved_cursor.point;
         t.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
-        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;A\x07");
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;A;n0nce\x07",
+        );
         assert!(t.selection.is_some(), "empty stack is a no-op");
         assert_eq!(t.grid().saved_cursor.point, saved);
         assert_eq!(cell(&t, 0), 'H');
@@ -4889,7 +4982,7 @@ mod tests {
             &mut t,
             &mut meta,
             &mut carry,
-            b"\x1b]133;A\x07\x1b[?u",
+            b"\x1b]133;A;n0nce\x07\x1b[?u",
         );
         assert!(
             t.selection.is_some(),
@@ -4981,7 +5074,7 @@ mod tests {
             &mut t,
             &mut meta,
             &mut carry,
-            b"\x1b]133;A\x07\x1b[?u",
+            b"\x1b]133;A;n0nce\x07\x1b[?u",
         );
         assert!(t.selection.is_some());
         assert_eq!(t.grid().saved_cursor.point, saved);

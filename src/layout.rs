@@ -51,7 +51,7 @@ impl Node {
         if n <= 1 {
             return Node::Leaf(0);
         }
-        let weights = if weights.len() == n && weights.iter().all(|w| w.is_finite() && *w > 0.0) {
+        let weights = if usable_weights(weights, n) {
             weights.to_vec()
         } else {
             vec![1.0; n]
@@ -80,8 +80,7 @@ impl Node {
                     children, weights, ..
                 } => {
                     children.len() >= 2
-                        && weights.len() == children.len()
-                        && weights.iter().all(|w| w.is_finite() && *w > 0.0)
+                        && usable_weights(weights, children.len())
                         && children.iter().all(|c| walk(c, seen))
                 }
             }
@@ -195,13 +194,46 @@ impl Node {
                         ws.push(*w);
                     }
                 }
-                match kids.len() {
+                // A child split on the same axis is what a collapse leaves
+                // behind (a column whose only remainder was itself a row,
+                // inside a row). Fold it in so the tree doesn't nest an
+                // axis with itself. Weights are scaled so the panes keep
+                // the share they had.
+                let mut flat_k = Vec::new();
+                let mut flat_w = Vec::new();
+                for (k, w) in kids.into_iter().zip(ws) {
+                    if let Node::Split {
+                        axis: child_axis,
+                        children: inner,
+                        weights: inner_w,
+                    } = k
+                    {
+                        if child_axis == *axis {
+                            let sum = inner_w.iter().sum::<f32>().max(f32::EPSILON);
+                            for (c, cw) in inner.into_iter().zip(inner_w) {
+                                flat_k.push(c);
+                                flat_w.push(w * cw / sum);
+                            }
+                            continue;
+                        }
+                        flat_k.push(Node::Split {
+                            axis: child_axis,
+                            children: inner,
+                            weights: inner_w,
+                        });
+                        flat_w.push(w);
+                        continue;
+                    }
+                    flat_k.push(k);
+                    flat_w.push(w);
+                }
+                match flat_k.len() {
                     0 => None,
-                    1 => kids.pop(),
+                    1 => flat_k.pop(),
                     _ => Some(Node::Split {
                         axis: *axis,
-                        children: kids,
-                        weights: ws,
+                        children: flat_k,
+                        weights: flat_w,
                     }),
                 }
             }
@@ -307,6 +339,15 @@ pub fn divider_at(dividers: &[Divider], x: f64, y: f64, grab: f64) -> Option<usi
     })
 }
 
+/// `n` positive, finite weights whose sum is finite too: each weight can
+/// pass and the total still overflow to infinity, which `split_rect` turns
+/// into NaN rects.
+fn usable_weights(weights: &[f32], n: usize) -> bool {
+    weights.len() == n
+        && weights.iter().all(|w| w.is_finite() && *w > 0.0)
+        && weights.iter().sum::<f32>().is_finite()
+}
+
 /// `rect` cut along `axis` by `weights`, GAP pixels between pieces; the last
 /// piece absorbs the rounding.
 pub fn split_rect(rect: Rect, weights: &[f32], axis: Orientation) -> Vec<Rect> {
@@ -398,6 +439,51 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_pane_merges_a_same_axis_split_left_behind() {
+        // Row [ leaf 0 | Column [ Row [1, 2] | leaf 3 ] ]. Closing 3
+        // collapses the column onto that inner row, which is the same
+        // axis as the outer split and has to become three siblings.
+        let mut t = Node::Split {
+            axis: Row,
+            weights: vec![1.0, 1.0],
+            children: vec![
+                Node::Leaf(0),
+                Node::Split {
+                    axis: Column,
+                    weights: vec![1.0, 1.0],
+                    children: vec![
+                        Node::Split {
+                            axis: Row,
+                            weights: vec![1.0, 1.0],
+                            children: vec![Node::Leaf(1), Node::Leaf(2)],
+                        },
+                        Node::Leaf(3),
+                    ],
+                },
+            ],
+        };
+        t.remove(3);
+        match t {
+            Node::Split {
+                axis,
+                children,
+                weights,
+            } => {
+                assert_eq!(axis, Row);
+                assert!(
+                    children.iter().all(|c| matches!(c, Node::Leaf(_))),
+                    "same-axis child was not folded: {children:?}"
+                );
+                assert_eq!(children, vec![Node::Leaf(0), Node::Leaf(1), Node::Leaf(2)]);
+                assert!((weights[0] - 1.0).abs() < 1e-4, "{weights:?}");
+                assert!((weights[1] - 0.5).abs() < 1e-4, "{weights:?}");
+                assert!((weights[2] - 0.5).abs() < 1e-4, "{weights:?}");
+            }
+            other => panic!("expected a row, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn dividers_are_found_and_dragged_at_every_level() {
         let mut t = Node::single();
         t.split(0, Row, 1);
@@ -462,9 +548,39 @@ mod tests {
             weights: vec![1.0],
         };
         assert!(!bad_w.valid_for(2));
+        // each weight is finite, but the sum overflows
+        let overflow = Node::Split {
+            axis: Row,
+            children: vec![Node::Leaf(0), Node::Leaf(1)],
+            weights: vec![f32::MAX, f32::MAX],
+        };
+        assert!(
+            !overflow.valid_for(2),
+            "a non-finite weight sum is unusable"
+        );
         // and it round-trips through JSON
         let json = serde_json::to_string(&t).unwrap();
         let back: Node = serde_json::from_str(&json).unwrap();
         assert_eq!(back, t);
+    }
+
+    #[test]
+    fn an_old_file_whose_weights_overflow_gets_equal_panes() {
+        // an old session.json with "weights":[3.4e38,3.4e38] and no `layout`
+        // reaches `flat`, not `valid_for`; an infinite total makes NaN rects
+        let flat = Node::flat(Row, &[f32::MAX, f32::MAX], 2);
+        assert_eq!(flat, Node::flat(Row, &[], 2));
+        for (x, y, w, h) in flat.rects(C, 2) {
+            assert!(x >= 0 && y >= 0 && w > 0 && h > 0, "{:?}", (x, y, w, h));
+        }
+        // a large but finite sum is still the user's split
+        assert_eq!(
+            Node::flat(Column, &[3.0, 1.0], 2),
+            Node::Split {
+                axis: Column,
+                children: vec![Node::Leaf(0), Node::Leaf(1)],
+                weights: vec![3.0, 1.0],
+            }
+        );
     }
 }
