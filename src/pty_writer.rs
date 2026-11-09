@@ -55,12 +55,24 @@ impl PtyWriter {
             return Ok(());
         }
         // Count the in-flight write too: a stuck pipe cannot evade the bound.
-        self.pending_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                n.checked_add(bytes.len())
-                    .filter(|&total| total <= MAX_PENDING_BYTES)
-            })
-            .map_err(|_| queue_full())?;
+        // A plain CAS loop: stable deprecates `fetch_update` for `try_update`,
+        // which the 1.89 MSRV does not have.
+        let mut current = self.pending_bytes.load(Ordering::Relaxed);
+        loop {
+            let total = current
+                .checked_add(bytes.len())
+                .filter(|&total| total <= MAX_PENDING_BYTES)
+                .ok_or_else(queue_full)?;
+            match self.pending_bytes.compare_exchange_weak(
+                current,
+                total,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(seen) => current = seen,
+            }
+        }
         let packet = PendingWrite {
             bytes: bytes.to_vec(),
             pending_bytes: self.pending_bytes.clone(),
