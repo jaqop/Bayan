@@ -21,6 +21,7 @@ mod kitty;
 mod lang;
 mod layout;
 mod link;
+mod localpath;
 mod mouse;
 mod mru;
 mod osc7;

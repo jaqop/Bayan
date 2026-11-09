@@ -99,6 +99,9 @@ pub enum RefuseReason {
     Editor,
     /// The path is local, and it is not on disk.
     Missing,
+    /// The path reads as local, but its drive is a mapped network drive or
+    /// a symlink or junction on the way leads off the local drives.
+    NotLocal,
 }
 
 impl RefuseReason {
@@ -117,6 +120,9 @@ impl RefuseReason {
             }
             RefuseReason::Editor => crate::lang::tr("تعذّر فتح المحرّر", "Could not open the editor"),
             RefuseReason::Missing => crate::lang::tr("الملف غير موجود", "File not found"),
+            RefuseReason::NotLocal => {
+                crate::lang::tr("الملف ليس على قرص محلي", "File is not on a local disk")
+            }
         }
     }
 }
@@ -1429,12 +1435,41 @@ fn plan_local_open(path: &str) -> Action {
     }
 }
 
-fn local_file_exists(path: &str) -> bool {
+/// What [`settle`] learned about a local path on disk. A plain `bool` from
+/// a test probe converts: `true` is present, `false` is missing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Probe {
+    Present,
+    Missing,
+    /// On a mapped network drive, or reached through a symlink or junction
+    /// that leaves the local drives. Refused, never revealed: Explorer would
+    /// open the share just as the file's association would.
+    NotLocal,
+}
+
+impl From<bool> for Probe {
+    fn from(present: bool) -> Self {
+        if present {
+            Probe::Present
+        } else {
+            Probe::Missing
+        }
+    }
+}
+
+fn local_file_probe(path: &str) -> Probe {
     // A UNC stat opens SMB. Refuse that even if a caller skipped the gate.
     if crate::term::unc_or_device(path) {
-        return false;
+        return Probe::NotLocal;
     }
-    Path::new(path).exists()
+    // A junction in any component can still point at a share, and `exists`
+    // would follow it. The walk reads each link's target without following
+    // it; only a path that stays local is stat'd.
+    match crate::localpath::walk_live(path) {
+        crate::localpath::Walk::NotLocal => Probe::NotLocal,
+        crate::localpath::Walk::Missing => Probe::Missing,
+        crate::localpath::Walk::Local => Probe::from(Path::new(path).exists()),
+    }
 }
 
 fn plan_file(
@@ -1588,9 +1623,10 @@ enum DiskPath {
     ForceReveal(String),
 }
 
-fn prepare_disk<E, L>(path: &str, exists: &E, long_path: &L) -> Result<DiskPath, Action>
+fn prepare_disk<E, P, L>(path: &str, exists: &E, long_path: &L) -> Result<DiskPath, Action>
 where
-    E: Fn(&str) -> bool,
+    E: Fn(&str) -> P,
+    P: Into<Probe>,
     L: Fn(&str) -> Option<String>,
 {
     let Some(path) = crate::term::accept_local_cwd(path) else {
@@ -1599,11 +1635,12 @@ where
     if crate::term::unc_or_device(&path) {
         return Err(refuse(RefuseReason::BadFile, &path));
     }
-    if !exists(&path) {
-        if has_short_component(&path) {
-            return Ok(DiskPath::ForceReveal(path));
-        }
-        return Err(refuse(RefuseReason::Missing, &path));
+    match exists(&path).into() {
+        Probe::Present => {}
+        // Not revealed either: Explorer would follow the link to the share.
+        Probe::NotLocal => return Err(refuse(RefuseReason::NotLocal, &path)),
+        Probe::Missing if has_short_component(&path) => return Ok(DiskPath::ForceReveal(path)),
+        Probe::Missing => return Err(refuse(RefuseReason::Missing, &path)),
     }
     match long_path(&path) {
         Some(long) => {
@@ -1637,7 +1674,7 @@ fn rewrite_edit_path(argv: Vec<String>, from: &str, to: &str) -> Vec<String> {
     }
 }
 
-fn settle_edit_default<E, L, C>(
+fn settle_edit_default<E, P, L, C>(
     path: String,
     line: u32,
     col: Option<u32>,
@@ -1646,7 +1683,8 @@ fn settle_edit_default<E, L, C>(
     code_exe: &C,
 ) -> Action
 where
-    E: Fn(&str) -> bool,
+    E: Fn(&str) -> P,
+    P: Into<Probe>,
     L: Fn(&str) -> Option<String>,
     C: Fn() -> Option<String>,
 {
@@ -1673,9 +1711,10 @@ where
 /// Apply `exists` and 8.3 expansion, then the allowlist, off the UI thread.
 /// `long_path` returns the expanded path (already without a `\\?\` prefix,
 /// or with one — it is stripped). `None` means expansion failed.
-pub fn settle<E, L, C>(action: Action, exists: E, long_path: L, code_exe: C) -> Action
+pub fn settle<E, P, L, C>(action: Action, exists: E, long_path: L, code_exe: C) -> Action
 where
-    E: Fn(&str) -> bool,
+    E: Fn(&str) -> P,
+    P: Into<Probe>,
     L: Fn(&str) -> Option<String>,
     C: Fn() -> Option<String>,
 {
@@ -1703,7 +1742,7 @@ where
 }
 
 pub fn settle_live(action: Action) -> Action {
-    settle(action, local_file_exists, win_long_path, || {
+    settle(action, local_file_probe, win_long_path, || {
         find_code_exe().map(|p| p.to_string_lossy().into_owned())
     })
 }
@@ -3363,7 +3402,7 @@ mod tests {
             r"\\?\C:\Windows\a.rs",
         ] {
             assert_eq!(resolve_against_cwd(path, Some(r"C:\work")), None, "{path}");
-            assert!(!local_file_exists(path), "stat of {path}");
+            assert_eq!(local_file_probe(path), Probe::NotLocal, "stat of {path}");
         }
         assert_eq!(cwd_hook(Some(r"\\evil\share")), None);
         assert_eq!(cwd_hook(Some(r"//evil/share")), None);
@@ -3592,6 +3631,41 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_path_off_the_local_drives_is_refused_not_revealed() {
+        // The probe found a junction to a share, or a mapped network drive.
+        // Every action that would touch the path refuses with NotLocal;
+        // a `~` component does not turn it into a reveal.
+        let not_local = |_: &str| Probe::NotLocal;
+        let is_not_local = |a: &Action| {
+            matches!(
+                a,
+                Action::Refuse {
+                    reason: RefuseReason::NotLocal,
+                    ..
+                }
+            )
+        };
+        for action in [
+            Action::OpenPath(r"C:\proj\notes.txt".into()),
+            Action::Reveal(r"C:\proj\tool.exe".into()),
+            Action::Reveal(r"C:\PROGRA~1\proj\a.txt".into()),
+            Action::Edit {
+                argv: vec!["code".into(), r"C:\proj\a.rs".into()],
+                path: r"C:\proj\a.rs".into(),
+            },
+            Action::EditDefault {
+                path: r"C:\proj\a.rs".into(),
+                line: 3,
+                col: None,
+            },
+        ] {
+            let settled = settle(action.clone(), not_local, |_| None, || None);
+            assert!(is_not_local(&settled), "{action:?} -> {settled:?}");
+        }
+        assert!(!RefuseReason::NotLocal.label().is_empty());
     }
 
     #[test]
