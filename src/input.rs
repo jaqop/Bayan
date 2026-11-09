@@ -727,10 +727,7 @@ impl App {
     /// kind follows the click count.
     fn start_selection(&mut self, pi: usize, row: usize, col: usize, side: Side) {
         if let Some(t) = self.tabs.get_mut(self.active) {
-            if t.focused != pi {
-                t.focused = pi;
-                self.update_title();
-            }
+            t.focused = pi;
         }
         self.sync_focus(None);
         self.sel_pane = pi;
