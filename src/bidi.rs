@@ -82,7 +82,8 @@ fn rev_clusters(s: &str) -> String {
 /// Arabic at both strong edges is RTL, Latin at both is LTR — however the
 /// letters are counted. Latin then Arabic could be either: `D:\الكتابة`
 /// (LTR) or `git status` closing an Arabic sentence (RTL). Arabic glued to
-/// the Latin before it, with no space, is a path or code, so LTR; otherwise
+/// the Latin before it by a path separator is a path, so LTR (a colon or
+/// other punctuation can end an Arabic sentence just as well); otherwise
 /// the majority of letters decides, as it always has.
 pub fn line_is_rtl_visual(text: &str) -> bool {
     let (mut ar, mut lt) = (0usize, 0usize);
@@ -91,7 +92,7 @@ pub fn line_is_rtl_visual(text: &str) -> bool {
     let mut prev = ' ';
     for ch in text.chars() {
         if is_arabic_letter(ch) {
-            if ar == 0 && first_arabic == Some(false) && !prev.is_whitespace() {
+            if ar == 0 && first_arabic == Some(false) && matches!(prev, '\\' | '/') {
                 glued = true;
             }
             ar += 1;
@@ -494,6 +495,21 @@ mod tests {
         // Arabic logical start, so this cannot be one however Arabic it is
         let cd = format!(r"$ cd D:\{}\{} && ls", rev("الكتابة"), rev("الفصول"));
         assert!(!line_is_rtl_visual(&cd));
+    }
+
+    /// Glued by punctuation, not a path separator: an Arabic sentence whose
+    /// logical end is `:config.json` is still RTL, so the colon is no glue.
+    #[test]
+    fn arabic_prose_glued_to_code_by_punctuation_stays_rtl() {
+        let logical = "افتح ملف الإعدادات:config.json";
+        let visual = format!(
+            "config.json:{} {} {}",
+            rev("الإعدادات"),
+            rev("ملف"),
+            rev("افتح")
+        );
+        assert!(line_is_rtl_visual(&visual));
+        assert_eq!(restore_bidi_line(&visual).as_deref(), Some(logical));
     }
 
     /// The other side of the rule: an Arabic sentence that ENDS with code
