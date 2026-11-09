@@ -717,9 +717,13 @@ fn find_osc133(data: &[u8], nonce: &str) -> Vec<(usize, usize, u8, Option<i32>, 
                     let payload = &data[i + P.len()..j];
                     let trusted = osc133_trusted(payload, nonce);
                     // "D;<code>" carries the exit status. A nonce field after
-                    // the code is not part of the number.
-                    let exit = data[i + P.len() + 1..j]
-                        .strip_prefix(b";")
+                    // the code is not part of the number. An empty payload
+                    // leaves `j` on the kind byte, so the range would start
+                    // past its end; `get` makes that "no code", not a panic
+                    // that kills the reader thread (OOBIDX-001).
+                    let exit = data
+                        .get(i + P.len() + 1..j)
+                        .and_then(|rest| rest.strip_prefix(b";"))
                         .and_then(|p| std::str::from_utf8(p).ok())
                         .and_then(|p| p.split(';').next())
                         .and_then(|p| p.parse().ok());
@@ -3333,6 +3337,25 @@ mod tests {
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"B\x07");
         assert!(meta.at_prompt);
         assert_eq!(meta.prompt_col, Some(4)); // input begins after "PS> "
+    }
+
+    /// OOBIDX-001: an OSC 133 with an empty payload put the terminator where
+    /// the kind byte belongs, and the exit-code slice ran `[7..6]`. That
+    /// panic killed the PTY reader thread, so any output (`cat`, ssh) could
+    /// freeze a pane with eight bytes.
+    #[test]
+    fn osc133_with_empty_payload_does_not_panic() {
+        for seq in [&b"\x1b]133;\x07x"[..], b"\x1b]133;\x1b\\x"] {
+            let marks = find_osc133(seq, "");
+            assert_eq!(marks.len(), 1, "{seq:?}");
+            assert_eq!(marks[0].3, None, "no exit code in {seq:?}");
+        }
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;\x07");
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;\x1b\\");
+        // the pane still parses what follows
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"PS> \x1b]133;B\x07");
+        assert!(meta.at_prompt);
     }
 
     #[test]
