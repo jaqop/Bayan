@@ -14,8 +14,7 @@
 //! split into side-by-side or stacked panes, each clipped to its rect.
 //! Window-level chrome (tab bar, search bar, Claude badge) draws separately.
 //!
-//! cosmic-text does shaping/BiDi/fallback; softbuffer presents the pixels.
-//! GPU (wgpu) lands in a later milestone behind this same boundary.
+//! cosmic-text does shaping/BiDi/fallback; gpu.rs presents the quads.
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::cell::Flags;
@@ -65,6 +64,7 @@ const PALETTE: [(u8, u8, u8); 16] = [
 // (color resolution lives on Renderer: bg/fg/palette are config-themable)
 
 /// A named built-in theme: bg, fg, and the 16 ANSI colors (EasyTer heritage).
+#[derive(Clone, Copy)]
 pub struct Theme {
     pub name: &'static str,
     pub bg: (u8, u8, u8),
@@ -80,49 +80,28 @@ const fn rgb(v: u32) -> (u8, u8, u8) {
 /// plugins contributed. One list, so the tiles drawn, the tile clicked and the
 /// theme applied are always the same index into the same order.
 pub fn gallery() -> Vec<Theme> {
-    let mut v: Vec<Theme> = THEMES
-        .iter()
-        .map(|t| Theme {
-            name: t.name,
-            bg: t.bg,
-            fg: t.fg,
-            palette: t.palette,
-        })
-        .collect();
-    for p in &crate::plugins::registry().themes {
-        // the &'static name field cannot hold a runtime string; the gallery
-        // identifies tiles by index and colour, not by name
-        v.push(Theme {
-            name: "",
-            bg: p.bg,
-            fg: p.fg,
-            palette: p.palette,
-        });
-    }
+    let mut v = THEMES.to_vec();
+    v.extend(crate::plugins::registry().themes.iter().map(plugin_theme));
     v
+}
+
+/// A plugin theme. The &'static name field cannot hold a runtime string;
+/// the gallery identifies tiles by index and colour, not by name.
+fn plugin_theme(p: &crate::plugins::PluginTheme) -> Theme {
+    Theme {
+        name: "",
+        bg: p.bg,
+        fg: p.fg,
+        palette: p.palette,
+    }
 }
 
 /// A theme by name (used to resolve the config's `theme` field). Built-ins
 /// win; a plugin theme is consulted only if no built-in matches, so a plugin
 /// can add but never silently replace a shipped theme.
 pub fn theme_by_name(name: &str) -> Option<Theme> {
-    if let Some(t) = THEMES.iter().find(|t| t.name == name) {
-        return Some(Theme {
-            name: t.name,
-            bg: t.bg,
-            fg: t.fg,
-            palette: t.palette,
-        });
-    }
-    crate::plugins::theme_by_name(name).map(|p| Theme {
-        // the built-in table is &'static; a plugin name is not, and the field
-        // is only used for display, so leak-free borrowing is not worth a
-        // lifetime parameter across every call site
-        name: "",
-        bg: p.bg,
-        fg: p.fg,
-        palette: p.palette,
-    })
+    let builtin = THEMES.iter().find(|t| t.name == name).copied();
+    builtin.or_else(|| crate::plugins::theme_by_name(name).map(plugin_theme))
 }
 
 /// The theme presets the settings panel cycles through.
@@ -481,9 +460,6 @@ pub struct Atlas {
     pub pages: Vec<Vec<u8>>,
     /// pixels changed since the last GPU sync (per-page dirty flag)
     pub dirty: bool,
-    /// bumps when a NEW page is added — the GPU must recreate its texture
-    /// array with more layers (rare: a handful of times per session at most)
-    pub layer_gen: u32,
     /// bumps on the wholesale reset at MAX_PAGES — one healing redraw
     pub generation: u32,
     map: std::collections::HashMap<cosmic_text::CacheKey, Option<GlyphEntry>>,
@@ -498,7 +474,6 @@ impl Atlas {
         let mut a = Atlas {
             pages: vec![vec![0; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize]],
             dirty: true,
-            layer_gen: 0,
             generation: 0,
             map: std::collections::HashMap::new(),
             cur: 0,
@@ -538,7 +513,6 @@ impl Atlas {
                 self.pages
                     .push(vec![0; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize]);
                 self.cur = self.pages.len() as u32 - 1;
-                self.layer_gen = self.layer_gen.wrapping_add(1);
             } else {
                 self.map.clear();
                 for p in &mut self.pages {
@@ -715,12 +689,6 @@ pub const TAB_MIN_CELLS: f32 = 9.0;
 /// font that has the glyphs (the bundled Amiri).
 const UI_ARABIC_FAMILY: &str = "Segoe UI";
 
-fn is_arabic_script(c: char) -> bool {
-    matches!(c as u32,
-        0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF
-        | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF)
-}
-
 /// Byte ranges of `text` and whether each is Arabic, for the chrome's font
 /// split. Spaces and punctuation stay with the run before them, so the
 /// space between two Arabic words is the UI font's space, and a label like
@@ -729,7 +697,7 @@ fn ui_font_runs(text: &str) -> Vec<(std::ops::Range<usize>, bool)> {
     let mut runs: Vec<(std::ops::Range<usize>, bool)> = Vec::new();
     for (i, c) in text.char_indices() {
         let end = i + c.len_utf8();
-        let class = if is_arabic_script(c) {
+        let class = if is_arabic(c) {
             Some(true)
         } else if c.is_alphanumeric() {
             Some(false)
@@ -759,15 +727,13 @@ pub struct PaletteLayout {
 
 impl PaletteLayout {
     pub fn contains(&self, x: f64, y: f64) -> bool {
-        let (left, top, w, h) = self.card;
-        x >= left as f64 && y >= top as f64 && x < (left + w) as f64 && y < (top + h) as f64
+        rect_hit(self.card, x, y)
     }
 
     pub fn row_at(&self, x: f64, y: f64) -> Option<usize> {
-        self.rows.iter().find_map(|&(index, (left, top, w, h))| {
-            (x >= left as f64 && y >= top as f64 && x < (left + w) as f64 && y < (top + h) as f64)
-                .then_some(index)
-        })
+        self.rows
+            .iter()
+            .find_map(|&(index, r)| rect_hit(r, x, y).then_some(index))
     }
 }
 
@@ -1173,7 +1139,7 @@ fn claude_logical_cursor_cell(cells: &[CellInfo], offset: usize) -> Option<usize
             owners.extend(marks.iter().map(|_| (cell.col, 0)));
         }
     }
-    let (_, order) = crate::bidi::restore_bidi_line_with_order(&text)?;
+    let (_, order) = crate::bidi::restore_bidi_map(&text)?;
     let mut logical = 0;
     for source in order {
         let &(col, width) = owners.get(source)?;
@@ -1604,7 +1570,7 @@ pub struct Renderer {
     pub bg: (u8, u8, u8),
     fg: (u8, u8, u8),
     palette: [(u8, u8, u8); 16],
-    /// ligatures on: ASCII shapes as one run (rustybuzz forms -> => != ...).
+    /// ligatures on: ASCII shapes as one run (harfrust forms -> => != ...).
     /// off: ASCII shapes per cell, so no substitutions can occur.
     ligatures: bool,
     /// hide-tab-bar-with-one-tab, resolved per frame by the app (the
@@ -2071,6 +2037,19 @@ impl Renderer {
         scale: f32,
     ) -> f32 {
         let key = self.ensure_shaped(segs, align_left);
+        self.draw_key(key, out, clip, x, y, scale)
+    }
+
+    /// Draw an already shaped run; returns its natural width.
+    fn draw_key(
+        &mut self,
+        key: RunKey,
+        out: &mut Vec<Vertex>,
+        clip: Rect,
+        x: f32,
+        y: i32,
+        scale: f32,
+    ) -> f32 {
         let Renderer {
             cache_hot,
             font_system,
@@ -2199,7 +2178,7 @@ impl Renderer {
         // the default FG too), and the cursor byte-mapping no longer holds.
         if claude {
             let full: String = segs.iter().map(|s| s.text.as_str()).collect();
-            if let Some((fixed, order)) = crate::bidi::restore_bidi_line_with_order(&full) {
+            if let Some((fixed, order)) = crate::bidi::restore_bidi_map(&full) {
                 let owners: Vec<_> = cells[..end]
                     .iter()
                     .flat_map(|ci| std::iter::repeat_n(ci, 1 + ci.zw.as_ref().map_or(0, Vec::len)))
@@ -2620,7 +2599,7 @@ impl Renderer {
         };
         while i < n {
             let ci = &cells[i];
-            // batch a contiguous ASCII run as ONE shaped buffer so rustybuzz
+            // batch a contiguous ASCII run as ONE shaped buffer so the shaper
             // forms programming ligatures (-> => != >= ...). Only when
             // ligatures are enabled; otherwise every cell shapes alone below.
             if self.ligatures && ci.c.is_ascii() {
@@ -2675,7 +2654,7 @@ impl Renderer {
                 }
                 i = j;
             } else {
-                // one cell, shaped alone: no adjacent context for rustybuzz
+                // one cell, shaped alone: no adjacent context for the shaper
                 // to ligate (ligatures off), and exotic glyphs (icons, box
                 // drawing, CJK) get pinned to their box, compressed if wider
                 note_deco(ci);
@@ -3085,27 +3064,7 @@ impl Renderer {
         }
         let seg = [Seg::plain(text, LINK_UNDER)];
         let key = self.ensure_shaped_dir(&seg, false, true);
-        let Renderer {
-            cache_hot,
-            font_system,
-            cache,
-            atlas,
-            fg,
-            ..
-        } = self;
-        let run = &cache_hot[&key];
-        push_shaped(
-            out,
-            font_system,
-            cache,
-            atlas,
-            &run.buffer,
-            rect,
-            (px + 8) as f32,
-            y + 2,
-            1.0,
-            *fg,
-        );
+        self.draw_key(key, out, rect, (px + 8) as f32, y + 2, 1.0);
     }
 
     /// Cockpit panel geometry (shared with the app's click hit-test).
@@ -4555,28 +4514,8 @@ impl Renderer {
         let hint = [Seg::plain(hint, (0x9a, 0xa6, 0xb5))];
         let key = self.ensure_shaped_dir(&hint, true, true);
         let hint_y = layout.footer.1 + (layout.footer.3 - self.cell_h as i32).max(0) / 2;
-        {
-            let Renderer {
-                cache_hot,
-                font_system,
-                cache,
-                atlas,
-                fg,
-                ..
-            } = self;
-            push_shaped(
-                out,
-                font_system,
-                cache,
-                atlas,
-                &cache_hot[&key].buffer,
-                layout.footer,
-                (layout.footer.0 + inset) as f32,
-                hint_y,
-                1.0,
-                *fg,
-            );
-        }
+        let hint_x = (layout.footer.0 + inset) as f32;
+        self.draw_key(key, out, layout.footer, hint_x, hint_y, 1.0);
         self.metrics = saved_metrics;
         (self.cell_w, self.cell_h) = saved_cells;
     }
@@ -5535,9 +5474,7 @@ impl Renderer {
         if self.bar_hidden {
             return None;
         }
-        self.tab_controls(width).iter().position(|&(x, y, w, h)| {
-            px >= x as f64 && px < (x + w) as f64 && py >= y as f64 && py < (y + h) as f64
-        })
+        crate::chrome::rect_at(&self.tab_controls(width), px, py)
     }
 
     /// The longest prefix of `title` (with "…" when cut) whose shaped width
@@ -5654,7 +5591,7 @@ impl Renderer {
     /// The settings-gear button rect, left of the caption buttons.
     pub fn settings_button_rect(&self, width: usize) -> Rect {
         let oy = self.tab_bar_h().round() as i32;
-        let bw = (self.cell_w * 3.0).max(28.0) as i32;
+        let bw = (self.ui_cell_w() * 3.0).max(28.0) as i32;
         (
             width as i32 - 3 * self.caption_btn_w() - bw - 4,
             3,
@@ -5669,8 +5606,7 @@ impl Renderer {
         if self.bar_hidden {
             return false;
         }
-        let (bx, by, bw, bh) = self.settings_button_rect(width);
-        px >= bx as f64 && px < (bx + bw) as f64 && py >= by as f64 && py < (by + bh) as f64
+        rect_hit(self.settings_button_rect(width), px, py)
     }
 }
 
@@ -6399,6 +6335,17 @@ mod tests {
     }
 
     #[test]
+    fn chrome_buttons_hit_where_they_were_drawn() {
+        // Drawn under UI metrics, hit-tested from event handlers under the
+        // terminal's: the geometry must not depend on which is active.
+        let mut r = Renderer::new(1.5, &crate::config::UserConfig::default(), 0.0);
+        r.use_ui_metrics(true);
+        let drawn = (r.settings_button_rect(1200), r.tab_controls(1200));
+        r.use_ui_metrics(false);
+        assert_eq!((r.settings_button_rect(1200), r.tab_controls(1200)), drawn);
+    }
+
+    #[test]
     fn tab_close_hits_the_drawn_control_and_misses_the_title() {
         let r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
         let titles = ["shell-one", "shell-two", "shell-three"];
@@ -6873,7 +6820,7 @@ mod cache_tests {
                     .face(g.font_id)
                     .and_then(|f| f.families.first().map(|(n, _)| n.clone()))
                     .unwrap_or_default();
-                (fam, text[g.start..g.end].chars().any(is_arabic_script))
+                (fam, text[g.start..g.end].chars().any(is_arabic))
             })
             .collect()
     }
@@ -7268,7 +7215,6 @@ mod cache_tests {
             a.alloc(w, h);
         }
         assert_eq!(a.pages.len(), 2, "a second page was grown");
-        assert!(a.layer_gen >= 1, "layer generation bumped for the GPU");
         assert_eq!(a.generation, 0, "no wholesale reset while under the cap");
         // page 0's white texel survived the growth (still opaque white)
         assert_eq!(&a.pages[0][0..4], &[255, 255, 255, 255]);

@@ -129,14 +129,6 @@ pub struct UserConfig {
     pub keyboard: KeyboardConfig,
 }
 
-fn default_honor_bdsm() -> bool {
-    true
-}
-
-fn default_true() -> bool {
-    true
-}
-
 /// How Bayan treats BDSM from the application.
 ///
 /// `honor_bdsm` defaults to true: an explicit BDSM (`CSI 8 l`) disables
@@ -146,10 +138,8 @@ fn default_true() -> bool {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct BidiConfig {
-    /// Serde fills a missing field from the field type's `Default`, and
-    /// `bool` defaults to false. The function keeps an empty `{"bidi":{}}`
-    /// on the same side as [`Default`].
-    #[serde(default = "default_honor_bdsm")]
+    /// The container `#[serde(default)]` fills a missing field from
+    /// [`Default`], so an empty `{"bidi":{}}` keeps this true.
     pub honor_bdsm: bool,
 }
 
@@ -174,7 +164,6 @@ pub struct KeyboardConfig {
     /// chord is reported as its PC-101 base key (`ؤ` on the C key →
     /// `CSI 99;5u` instead of `CSI 1572;5u`). Deliberate departure from the
     /// kitty spec so Claude Code can still be interrupted. Default on.
-    #[serde(default = "default_true")]
     pub kitty_base_layout_fallback: bool,
 }
 

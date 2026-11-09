@@ -122,15 +122,6 @@ pub(crate) fn cycle(index: usize, step: i32, len: usize) -> usize {
     ((index as i32 + step + n) % n) as usize
 }
 
-/// Ctrl+Tab forward, Ctrl+Shift+Tab back, in tab order. `len` > 0.
-pub(crate) fn next_tab(active: usize, len: usize, back: bool) -> usize {
-    if back {
-        (active + len - 1) % len
-    } else {
-        (active + 1) % len
-    }
-}
-
 /// Ctrl+0 resets the font zoom. The physical digit key, so it works on
 /// the Arabic layout too.
 pub(crate) fn is_zoom_reset(key: PhysicalKey, shift: bool) -> bool {
@@ -332,7 +323,6 @@ impl App {
         if zoomed {
             self.relayout_active();
         }
-        self.update_title();
         self.sync_focus(None);
         self.request_redraw();
         true
@@ -353,7 +343,7 @@ impl App {
                     self.show_tab(next);
                 }
             } else if !vis.is_empty() {
-                self.switch_tab(vis[next_tab(pos, vis.len(), shift)]);
+                self.switch_tab(vis[cycle(pos, if shift { -1 } else { 1 }, vis.len())]);
             }
             return true;
         }
@@ -548,14 +538,7 @@ mod tests {
         assert_eq!(cycle(0, -1, 3), 2);
         assert_eq!(cycle(2, 1, 3), 0);
         assert_eq!(cycle(1, 1, 3), 2);
-    }
-
-    #[test]
-    fn ctrl_tab_walks_tab_order_both_ways() {
-        assert_eq!(next_tab(0, 3, false), 1);
-        assert_eq!(next_tab(2, 3, false), 0);
-        assert_eq!(next_tab(0, 3, true), 2);
-        assert_eq!(next_tab(0, 1, true), 0);
+        assert_eq!(cycle(0, -1, 1), 0); // Ctrl+Shift+Tab with one tab
     }
 
     #[test]

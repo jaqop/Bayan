@@ -204,13 +204,9 @@ fn associated_text(input: &Input<'_>, all: bool) -> Vec<u32> {
         return Vec::new();
     };
     text.chars()
-        .filter(|c| !is_control(*c))
+        .filter(|c| !c.is_control())
         .map(u32::from)
         .collect()
-}
-
-fn is_control(c: char) -> bool {
-    c < '\u{20}' || ('\u{7f}'..='\u{9f}').contains(&c)
 }
 
 /// Enter, Tab, Backspace: unmodified press stays legacy unless every key is
@@ -355,12 +351,12 @@ fn alternates(input: &Input<'_>, primary: char) -> String {
     let shifted = if input.shift {
         input
             .shifted
-            .filter(|c| !is_control(*c) && u32::from(*c) != primary)
+            .filter(|c| !c.is_control() && u32::from(*c) != primary)
             .map(u32::from)
     } else {
         None
     };
-    let base = input.base_layout.filter(|c| !is_control(*c)).map(u32::from);
+    let base = input.base_layout.filter(|c| !c.is_control()).map(u32::from);
     let base = base.filter(|b| *b != primary && Some(*b) != shifted);
     match (shifted, base) {
         (None, None) => String::new(),

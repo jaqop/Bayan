@@ -199,8 +199,10 @@ pub fn is_restorable(command: &str, installed: &[Shell]) -> bool {
 
 /// Friendly label for a stored command line, for the settings panel. Falls
 /// back to a trimmed command so a hand-edited config.json still reads sanely.
-pub fn label_for(command: &str, installed: &[Shell]) -> String {
-    installed
+/// `found` is the app's one background `detect()`: this runs inside the frame
+/// build, so it must not probe (detection spawns `wsl.exe`).
+pub fn label_for(found: &[Shell], command: &str) -> String {
+    found
         .iter()
         .find(|s| s.command == command)
         .map(|s| s.label())
@@ -245,10 +247,11 @@ mod tests {
     }
 
     #[test]
-    fn labels_use_the_supplied_snapshot_without_detection() {
-        let installed = [Shell::new("Cached distro", "wsl.exe -d cached")];
-        assert_eq!(label_for("wsl.exe -d cached", &installed), "Cached distro");
-        assert_eq!(label_for("custom.exe", &[]), "custom");
+    fn label_comes_from_the_detected_list_without_probing() {
+        let found = [Shell::new("Git Bash", "bash.exe -l")];
+        assert_eq!(label_for(&found, "bash.exe -l"), "Git Bash");
+        assert_eq!(label_for(&found, "nu.exe"), "nu");
+        assert_eq!(label_for(&[], "cmd.exe"), "cmd");
     }
 
     #[test]

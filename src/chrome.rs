@@ -56,9 +56,7 @@ pub(crate) fn resize_edge(
 /// Index of the first rectangle containing `(x, y)`. Left and top edges
 /// are inside, right and bottom are not.
 pub(crate) fn rect_at(rects: &[Rect], x: f64, y: f64) -> Option<usize> {
-    rects.iter().position(|&(bx, by, bw, bh)| {
-        x >= bx as f64 && x < (bx + bw) as f64 && y >= by as f64 && y < (by + bh) as f64
-    })
+    rects.iter().position(|&r| crate::render::rect_hit(r, x, y))
 }
 
 /// The tab whose span `(index, x, width)` holds `x`. The spans are the

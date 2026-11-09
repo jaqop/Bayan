@@ -36,7 +36,7 @@ selection and BiDi paths must do.
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-430 tests across the tree. `term.rs` (74), `link.rs` (60) and `render.rs` (58)
+435 tests across the tree. `term.rs` (75), `link.rs` (60) and `render.rs` (59)
 carry the most.
 
 ## Invariants — do not "simplify" these

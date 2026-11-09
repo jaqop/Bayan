@@ -19,6 +19,7 @@
 //! 4. **Failures are logged, not printed.** `~/.bayan/plugins.log`, appended,
 //!    and the logger itself never fails loudly.
 
+use crate::config::parse_hex;
 use std::path::{Path, PathBuf};
 
 /// A theme contributed by a plugin. Owned, unlike the built-in `&'static`
@@ -83,17 +84,6 @@ fn log(msg: &str) {
     {
         let _ = writeln!(f, "{}", msg.trim_end());
     }
-}
-
-/// `#rrggbb` (or `rrggbb`) to a triple. None on anything else — the caller
-/// turns that into a rejected plugin rather than a panic.
-fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
-    let h = s.strip_prefix('#').unwrap_or(s);
-    if h.len() != 6 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    let v = u32::from_str_radix(h, 16).ok()?;
-    Some(((v >> 16) as u8, (v >> 8) as u8, v as u8))
 }
 
 /// The 16 ANSI slots, in the order the built-in table uses.

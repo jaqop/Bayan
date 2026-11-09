@@ -313,42 +313,6 @@ pub fn chord_from(physical: PhysicalKey, ctrl: bool, shift: bool, alt: bool) -> 
         return None;
     };
     let key = match code {
-        KeyA => ChordKey::Letter('a'),
-        KeyB => ChordKey::Letter('b'),
-        KeyC => ChordKey::Letter('c'),
-        KeyD => ChordKey::Letter('d'),
-        KeyE => ChordKey::Letter('e'),
-        KeyF => ChordKey::Letter('f'),
-        KeyG => ChordKey::Letter('g'),
-        KeyH => ChordKey::Letter('h'),
-        KeyI => ChordKey::Letter('i'),
-        KeyJ => ChordKey::Letter('j'),
-        KeyK => ChordKey::Letter('k'),
-        KeyL => ChordKey::Letter('l'),
-        KeyM => ChordKey::Letter('m'),
-        KeyN => ChordKey::Letter('n'),
-        KeyO => ChordKey::Letter('o'),
-        KeyP => ChordKey::Letter('p'),
-        KeyQ => ChordKey::Letter('q'),
-        KeyR => ChordKey::Letter('r'),
-        KeyS => ChordKey::Letter('s'),
-        KeyT => ChordKey::Letter('t'),
-        KeyU => ChordKey::Letter('u'),
-        KeyV => ChordKey::Letter('v'),
-        KeyW => ChordKey::Letter('w'),
-        KeyX => ChordKey::Letter('x'),
-        KeyY => ChordKey::Letter('y'),
-        KeyZ => ChordKey::Letter('z'),
-        Digit0 => ChordKey::Digit(0),
-        Digit1 => ChordKey::Digit(1),
-        Digit2 => ChordKey::Digit(2),
-        Digit3 => ChordKey::Digit(3),
-        Digit4 => ChordKey::Digit(4),
-        Digit5 => ChordKey::Digit(5),
-        Digit6 => ChordKey::Digit(6),
-        Digit7 => ChordKey::Digit(7),
-        Digit8 => ChordKey::Digit(8),
-        Digit9 => ChordKey::Digit(9),
         F1 => ChordKey::F(1),
         F2 => ChordKey::F(2),
         F3 => ChordKey::F(3),
@@ -368,7 +332,11 @@ pub fn chord_from(physical: PhysicalKey, ctrl: bool, shift: bool, alt: bool) -> 
         ArrowRight => ChordKey::Right,
         PageUp => ChordKey::PageUp,
         PageDown => ChordKey::PageDown,
-        _ => return None,
+        _ => match crate::keys::pc101_unshifted(code)? {
+            c @ 'a'..='z' => ChordKey::Letter(c),
+            d @ '0'..='9' => ChordKey::Digit(d as u8 - b'0'),
+            _ => return None,
+        },
     };
     Some(Chord {
         ctrl,
@@ -434,6 +402,19 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chords_come_from_the_physical_key() {
+        let key = |c| chord_from(PhysicalKey::Code(c), true, false, false).map(|ch| ch.key);
+        assert_eq!(key(KeyCode::KeyT), Some(ChordKey::Letter('t')));
+        assert_eq!(key(KeyCode::KeyZ), Some(ChordKey::Letter('z')));
+        assert_eq!(key(KeyCode::Digit0), Some(ChordKey::Digit(0)));
+        assert_eq!(key(KeyCode::Digit9), Some(ChordKey::Digit(9)));
+        assert_eq!(key(KeyCode::F12), Some(ChordKey::F(12)));
+        assert_eq!(key(KeyCode::Comma), Some(ChordKey::Comma));
+        assert_eq!(key(KeyCode::Numpad1), None);
+        assert_eq!(key(KeyCode::Semicolon), None);
+    }
 
     #[test]
     fn both_paste_chords_work_in_shells_and_full_screen_apps() {

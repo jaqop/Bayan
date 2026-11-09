@@ -130,41 +130,22 @@ const QUAKE_ID: usize = 0xB1AA;
 /// logical character is "ب" — and it also covers the Windows quirk of Ctrl
 /// composing C0 control chars into the logical key (Ctrl+F = '\u{6}').
 fn key_letter(event: &KeyEvent) -> Option<char> {
-    use winit::keyboard::{KeyCode, PhysicalKey};
-    if let PhysicalKey::Code(c) = event.physical_key {
-        use KeyCode::*;
-        let l = match c {
-            KeyA => 'a',
-            KeyB => 'b',
-            KeyC => 'c',
-            KeyD => 'd',
-            KeyE => 'e',
-            KeyF => 'f',
-            KeyG => 'g',
-            KeyH => 'h',
-            KeyI => 'i',
-            KeyJ => 'j',
-            KeyK => 'k',
-            KeyL => 'l',
-            KeyM => 'm',
-            KeyN => 'n',
-            KeyO => 'o',
-            KeyP => 'p',
-            KeyQ => 'q',
-            KeyR => 'r',
-            KeyS => 's',
-            KeyT => 't',
-            KeyU => 'u',
-            KeyV => 'v',
-            KeyW => 'w',
-            KeyX => 'x',
-            KeyY => 'y',
-            KeyZ => 'z',
-            _ => return ctrl_letter(&event.logical_key),
-        };
-        return Some(l);
+    if let winit::keyboard::PhysicalKey::Code(c) = event.physical_key {
+        if let Some(l) = keys::pc101_unshifted(c).filter(char::is_ascii_lowercase) {
+            return Some(l);
+        }
     }
     ctrl_letter(&event.logical_key)
+}
+
+/// The preset `dir` steps away from the nearest one at or above `cur`
+/// (the last preset when `cur` is past them all), clamped to the list.
+fn step_preset<T: PartialOrd + Copy>(steps: &[T], cur: T, dir: i32) -> T {
+    let i = steps
+        .iter()
+        .position(|&s| s >= cur)
+        .unwrap_or(steps.len() - 1) as i32;
+    steps[(i + dir).clamp(0, steps.len() as i32 - 1) as usize]
 }
 
 /// Fallback for events without a physical letter key (VK_PACKET injection,
@@ -259,38 +240,14 @@ fn toast_due(last: Option<Instant>, now: Instant, gap: std::time::Duration) -> b
 /// A background tab whose shell exits sits at a LOWER index than the active
 /// one often enough (the first tab is the one people leave running): the
 /// active index must slide down with it, or focus lands on the wrong tab.
-fn active_after_remove(active: usize, removed: usize, len_after: usize) -> usize {
+/// The bool is whether the tab on screen is now a different one, which needs
+/// the same resets as switching to it.
+fn active_after_remove(active: usize, removed: usize, len_after: usize) -> (usize, bool) {
     if len_after == 0 {
-        return 0;
+        return (0, false);
     }
     let a = if removed < active { active - 1 } else { active };
-    a.min(len_after - 1)
-}
-
-/// Bytes a wheel notch sends to a full-screen program (EasyTer's rule): a
-/// mouse report only when the app enabled mouse tracking — SGR encoded if it
-/// asked for that (DECSET 1006), X10 bytes otherwise — else an arrow key that
-/// honours DECCKM. `n` > 0 is a notch up. Bytes, not a String: X10 packs
-/// each value into ONE byte (32 + v), and past column 95 that byte is >= 0x80,
-/// which a String would UTF-8-encode into two.
-#[cfg(test)]
-fn wheel_seq(mode: TermMode, n: i32, row: usize, col: usize) -> Vec<u8> {
-    let btn = if n > 0 { 64 } else { 65 };
-    if mode.intersects(TermMode::MOUSE_MODE) {
-        if mode.contains(TermMode::SGR_MOUSE) {
-            format!("\x1b[<{btn};{col};{row}M").into_bytes()
-        } else {
-            let b = |v: usize| (32 + v.min(223)) as u8;
-            vec![0x1b, b'[', b'M', b(btn), b(col), b(row)]
-        }
-    } else {
-        let ch = if n > 0 { b'A' } else { b'B' };
-        if mode.contains(TermMode::APP_CURSOR) {
-            vec![0x1b, b'O', ch]
-        } else {
-            vec![0x1b, b'[', ch]
-        }
-    }
+    (a.min(len_after - 1), removed == active)
 }
 
 /// One cell step in the search direction, clamped to the buffer (used to
@@ -1497,9 +1454,8 @@ impl App {
             return;
         }
         let cur = r.family();
-        let i = choices.iter().position(|c| c == cur).unwrap_or(0) as i32;
-        let n = choices.len() as i32;
-        let next = choices[(((i + dir) % n + n) % n) as usize].clone();
+        let i = choices.iter().position(|c| c == cur).unwrap_or(0);
+        let next = choices[keyroute::cycle(i, dir, choices.len())].clone();
         self.config.font_family = Some(next);
         self.rebuild_renderer();
         self.request_redraw();
@@ -1532,14 +1488,7 @@ impl App {
     /// terminal convention — live sessions keep their buffer).
     fn change_scrollback(&mut self, dir: i32) {
         let cur = self.config.scrollback_lines();
-        let steps = config::SCROLLBACK_STEPS;
-        // nearest preset, then step
-        let i = steps
-            .iter()
-            .position(|&s| s >= cur)
-            .unwrap_or(steps.len() - 1) as i32;
-        let j = (i + dir).clamp(0, steps.len() as i32 - 1) as usize;
-        self.config.scrollback = Some(steps[j] as u32);
+        self.config.scrollback = Some(step_preset(&config::SCROLLBACK_STEPS, cur, dir) as u32);
         self.request_redraw();
     }
 
@@ -1558,43 +1507,30 @@ impl App {
 
     /// Step to the previous/next installed shell. New tabs only.
     fn cycle_shell(&mut self, dir: i32) {
-        let choices: Vec<&str> = self
-            .shell_profiles
-            .iter()
-            .map(|s| s.command.as_str())
-            .collect();
+        let choices = &self.shell_profiles;
         if choices.len() < 2 {
             return;
         }
         let cur = self.config.shell_program();
-        let i = choices.iter().position(|c| *c == cur).unwrap_or(0) as i32;
-        let n = choices.len() as i32;
-        self.config.shell = Some(choices[(((i + dir) % n + n) % n) as usize].to_string());
+        let i = choices.iter().position(|c| c.command == cur).unwrap_or(0);
+        self.config.shell = Some(
+            choices[keyroute::cycle(i, dir, choices.len())]
+                .command
+                .clone(),
+        );
         self.request_redraw();
     }
 
     fn change_padding(&mut self, dir: i32) {
         let cur = self.config.padding_px() as u32;
-        let steps = config::PADDING_STEPS;
-        let i = steps
-            .iter()
-            .position(|&s| s >= cur)
-            .unwrap_or(steps.len() - 1) as i32;
-        let j = (i + dir).clamp(0, steps.len() as i32 - 1) as usize;
-        self.config.padding = Some(steps[j]);
+        self.config.padding = Some(step_preset(&config::PADDING_STEPS, cur, dir));
         self.relayout_active(); // pane rects (and PTY sizes) follow the inset
         self.request_redraw();
     }
 
     fn change_opacity(&mut self, dir: i32) {
         let cur = (self.config.opacity_level() * 100.0).round() as u32;
-        let steps = config::OPACITY_STEPS;
-        let i = steps
-            .iter()
-            .position(|&s| s >= cur)
-            .unwrap_or(steps.len() - 1) as i32;
-        let j = (i + dir).clamp(0, steps.len() as i32 - 1) as usize;
-        self.config.opacity = Some(steps[j] as f32 / 100.0);
+        self.config.opacity = Some(step_preset(&config::OPACITY_STEPS, cur, dir) as f32 / 100.0);
         self.apply_opacity();
         self.request_redraw();
     }
@@ -1816,11 +1752,11 @@ impl App {
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => self.close_posh(),
             Key::Named(NamedKey::ArrowDown) => {
-                p.sel = (p.sel + 1) % n;
+                p.sel = keyroute::cycle(p.sel, 1, n);
                 self.request_posh_preview();
             }
             Key::Named(NamedKey::ArrowUp) => {
-                p.sel = (p.sel + n - 1) % n;
+                p.sel = keyroute::cycle(p.sel, -1, n);
                 self.request_posh_preview();
             }
             Key::Named(NamedKey::Enter) => {
@@ -1894,22 +1830,14 @@ impl App {
                 p.query.pop();
                 p.sel = 0;
             }
-            Key::Named(NamedKey::ArrowDown) => {
+            Key::Named(k @ (NamedKey::ArrowDown | NamedKey::ArrowUp)) => {
+                let step = if *k == NamedKey::ArrowUp { -1 } else { 1 };
                 let n = self
                     .palette_rows(&self.palette.as_ref().unwrap().query.clone())
                     .len();
                 if n > 0 {
                     let p = self.palette.as_mut().unwrap();
-                    p.sel = (p.sel + 1) % n;
-                }
-            }
-            Key::Named(NamedKey::ArrowUp) => {
-                let n = self
-                    .palette_rows(&self.palette.as_ref().unwrap().query.clone())
-                    .len();
-                if n > 0 {
-                    let p = self.palette.as_mut().unwrap();
-                    p.sel = (p.sel + n - 1) % n;
+                    p.sel = keyroute::cycle(p.sel, step, n);
                 }
             }
             Key::Named(NamedKey::Enter) => {
@@ -2011,7 +1939,6 @@ impl App {
                         is_app_error: false,
                     });
                 }
-                self.update_title();
             }
             PaletteRow::CopyText(text) => self.set_clipboard(text),
             PaletteRow::RenameTab(name) => self.rename_tab(name),
@@ -2059,7 +1986,6 @@ impl App {
                     .session()
                     .and_then(|s| s.meta.lock_or_recover().spawn_cwd());
                 self.spawn_tab(cwd);
-                self.update_title();
                 self.request_redraw();
             }
             ClosePane => {
@@ -2186,12 +2112,12 @@ impl App {
                 self.request_redraw();
             }
             Key::Named(NamedKey::ArrowUp) => {
-                st.sel = (st.sel + n - 1) % n;
+                st.sel = keyroute::cycle(st.sel, -1, n);
                 st.flash = None;
                 self.request_redraw();
             }
             Key::Named(NamedKey::ArrowDown) => {
-                st.sel = (st.sel + 1) % n;
+                st.sel = keyroute::cycle(st.sel, 1, n);
                 st.flash = None;
                 self.request_redraw();
             }
@@ -2660,6 +2586,7 @@ impl App {
             });
             self.active = self.tabs.len() - 1;
             self.mru.touch(self.active);
+            self.enter_tab();
             self.relayout_active();
             self.sync_focus(None);
         }
@@ -2820,9 +2747,16 @@ impl App {
         }
         self.after_tab_removed(ti, t.group);
         self.relayout_active();
-        self.update_title();
         self.sync_focus(None);
         self.request_redraw();
+    }
+
+    /// The per-tab resets for whichever tab just came on screen.
+    fn enter_tab(&mut self) {
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            t.attention = false; // you're looking at it now
+        }
+        self.search = None; // the bar belongs to the tab that opened it
     }
 
     /// Remove one pane; a tab with no panes closes, the last tab closes Bayan.
@@ -2864,7 +2798,6 @@ impl App {
             }
         }
         self.relayout_active();
-        self.update_title();
         self.sync_focus(None);
         self.request_redraw();
     }
@@ -2873,14 +2806,13 @@ impl App {
     /// empty: pick what is shown next, staying in the group while it has
     /// tabs (`groups::after_close`), and drop the group once it has none.
     fn after_tab_removed(&mut self, ti: usize, gid: u32) {
-        let was_active = ti == self.active;
         self.mru.removed(ti);
-        let shifted = active_after_remove(self.active, ti, self.tabs.len());
+        let (shifted, was_active) = active_after_remove(self.active, ti, self.tabs.len());
         self.active = groups::after_close(was_active, shifted, gid, &self.tab_groups(), &self.mru);
         self.mru.touch(self.active);
         self.groups.prune(&self.tab_groups());
-        if let Some(t) = self.tabs.get_mut(self.active) {
-            t.attention = false; // on screen now, perhaps from another group
+        if was_active {
+            self.enter_tab(); // on screen now, perhaps from another group
         }
     }
 
@@ -2951,7 +2883,6 @@ impl App {
         self.spawn_group = None;
         // a failed spawn leaves the new group empty: drop it again
         self.groups.prune(&self.tab_groups());
-        self.update_title();
         self.request_redraw();
     }
 
@@ -3006,23 +2937,10 @@ impl App {
         }
         self.abandon_mouse();
         self.active = idx;
-        if let Some(t) = self.tabs.get_mut(idx) {
-            t.attention = false; // you're looking at it now
-        }
-        self.search = None; // the bar belongs to the tab that opened it
+        self.enter_tab();
         self.relayout_active(); // this tab's layout may differ
-        self.update_title();
         self.sync_focus(None);
         self.request_redraw();
-    }
-
-    fn update_title(&self) {
-        if let (Some(w), Some(t)) = (&self.window, self.tabs.get(self.active)) {
-            // the window title stays just "Bayan"; the folder shows in the
-            // tab (no app-name-looking cwd suffix in the title bar)
-            let _ = t;
-            w.set_title("Bayan — بيان");
-        }
     }
 
     fn save_state(&mut self) -> bool {
@@ -3507,7 +3425,6 @@ impl App {
         };
         if pi < t.panes.len() && t.focused != pi {
             t.focused = pi;
-            self.update_title();
             self.request_redraw();
         }
     }
@@ -3758,7 +3675,7 @@ impl App {
         let cwd = self.pane_link_cwd(id);
         // `exists` and `find_code_exe` run on the link thread. A disconnected
         // network drive must not stall this handler.
-        match span.activate(cwd.as_deref(), self.config.editor.as_deref(), None) {
+        match span.activate(cwd.as_deref(), self.config.editor.as_deref()) {
             action @ (link::Action::Browse(_)
             | link::Action::OpenPath(_)
             | link::Action::Reveal(_)
@@ -4593,8 +4510,8 @@ impl App {
                             padding: self.config.padding_px(),
                             opacity_pct: (self.config.opacity_level() * 100.0).round() as i32,
                             shell: &shells::label_for(
-                                &self.config.shell_program(),
                                 &self.shell_profiles,
+                                &self.config.shell_program(),
                             ),
                             hide_single_tab: self.config.hide_single_tab_on(),
                             confirm_close: self.config.confirm_close_on(),
@@ -4815,7 +4732,7 @@ impl ApplicationHandler<UserEvent> for App {
         };
         crate::prof::mark("window created");
         let px = window.inner_size();
-        let gpu = match gpu::Gpu::new(window.clone(), px.width, px.height, render::ATLAS_SIZE) {
+        let gpu = match gpu::Gpu::new(window.clone(), px.width, px.height) {
             Ok(gpu) => gpu,
             Err(error) => {
                 self.startup_error = Some(format!("Could not initialize graphics: {error}"));
@@ -5032,9 +4949,6 @@ impl ApplicationHandler<UserEvent> for App {
                     // the tab is named after its FOCUSED pane's directory
                     if self.tabs[ti].focused == pi {
                         self.tabs[ti].title = base;
-                        if ti == self.active {
-                            self.update_title();
-                        }
                     }
                 }
                 self.request_redraw(); // tab titles live in the frame
@@ -5703,6 +5617,16 @@ mod tests {
     }
 
     #[test]
+    fn settings_step_from_the_nearest_preset_and_stop_at_the_ends() {
+        let steps = [0, 4, 8, 12];
+        assert_eq!(step_preset(&steps, 4, 1), 8);
+        assert_eq!(step_preset(&steps, 5, -1), 4); // 5 snaps to 8, then down
+        assert_eq!(step_preset(&steps, 12, 1), 12);
+        assert_eq!(step_preset(&steps, 0, -1), 0);
+        assert_eq!(step_preset(&steps, 99, -1), 8); // past the end: last, then down
+    }
+
+    #[test]
     fn osc52_pane_is_focused() {
         // active tab's focused pane is index 1 (id 20). Id 10 is the other split.
         let tabs: [(usize, &[u64]); 2] = [(1, &[10, 20]), (0, &[30])];
@@ -5979,33 +5903,15 @@ mod tests {
     #[test]
     fn closing_a_lower_tab_slides_the_active_index_down() {
         // 4 tabs, looking at #2, tab #0 closes -> the same tab is now #1
-        assert_eq!(active_after_remove(2, 0, 3), 1);
+        // and it is still the tab you see, so its search bar stays
+        assert_eq!(active_after_remove(2, 0, 3), (1, false));
         // closing a higher tab leaves the index alone
-        assert_eq!(active_after_remove(1, 3, 3), 1);
-        // closing the active tab itself: clamp to the last remaining
-        assert_eq!(active_after_remove(2, 2, 2), 1);
-        assert_eq!(active_after_remove(0, 0, 2), 0);
-        assert_eq!(active_after_remove(5, 0, 0), 0);
-    }
-
-    /// The wheel inside a TUI: arrows unless the app tracks the mouse, and
-    /// then the encoding IT asked for — an SGR report to a program that only
-    /// enabled X10 tracking is as much garbage as one to a program with none.
-    #[test]
-    fn wheel_sends_what_the_tui_asked_for() {
-        let none = TermMode::ALT_SCREEN;
-        assert_eq!(wheel_seq(none, 1, 5, 7), b"\x1b[A");
-        assert_eq!(wheel_seq(none, -1, 5, 7), b"\x1b[B");
-        assert_eq!(wheel_seq(none | TermMode::APP_CURSOR, 1, 5, 7), b"\x1bOA");
-        let x10 = none | TermMode::MOUSE_REPORT_CLICK;
-        assert_eq!(wheel_seq(x10, 1, 5, 7), b"\x1b[M\x60\x27\x25");
-        let sgr = x10 | TermMode::SGR_MOUSE;
-        assert_eq!(wheel_seq(sgr, -1, 5, 7), b"\x1b[<65;7;5M");
-        // X10 is ONE byte per value: column 200 is 0xE8, never a two-byte
-        // UTF-8 pair, and anything past 223 clamps rather than wrapping
-        assert_eq!(wheel_seq(x10, 1, 3, 200), b"\x1b[M\x60\xe8\x23");
-        assert_eq!(wheel_seq(x10, 1, 500, 900).len(), 6);
-        assert_eq!(wheel_seq(x10, 1, 500, 900)[4], 255);
+        assert_eq!(active_after_remove(1, 3, 3), (1, false));
+        // closing the active tab itself: clamp to the last remaining, and
+        // the tab now shown is a different one (its search bar must go)
+        assert_eq!(active_after_remove(2, 2, 2), (1, true));
+        assert_eq!(active_after_remove(0, 0, 2), (0, true));
+        assert_eq!(active_after_remove(5, 0, 0), (0, false));
     }
 
     /// The toast trigger is untrusted output: a program can ask for
