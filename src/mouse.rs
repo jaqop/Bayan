@@ -371,6 +371,34 @@ pub fn col_for_byte(spans: &[(usize, usize, usize)], byte: usize) -> Option<usiz
         .map(|&(_, _, c)| c)
 }
 
+/// Fold each zero-width LETTER into the glyph logically before it, so the
+/// two share that glyph's box. Some fonts draw «لا» as two glyphs, ل with the
+/// whole width and ا with none; dropped, the ا cell would have no box for the
+/// cursor or a click. Marks and format characters are zero-width by nature:
+/// they already travel with their base's cell and stay out of this.
+pub fn fold_empty_letters(glyphs: Vec<GlyphSpan>, text: &str) -> Vec<GlyphSpan> {
+    let is_empty_letter = |g: &GlyphSpan| {
+        g.w <= 0.0
+            && text[g.start..g.end]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic() && !crate::bidi::is_combining(c))
+    };
+    if !glyphs.iter().any(is_empty_letter) {
+        return glyphs;
+    }
+    let (empty, mut kept): (Vec<_>, Vec<_>) = glyphs.into_iter().partition(is_empty_letter);
+    for letter in empty {
+        let host = kept
+            .iter_mut()
+            .find(|g| g.end == letter.start && g.rtl == letter.rtl);
+        if let Some(host) = host {
+            host.end = letter.end;
+        }
+    }
+    kept
+}
+
 /// Glyph spans → boxes in pane-local pixels. A glyph that covers N
 /// columns is split into N equal slices; an RTL glyph's leftmost slice
 /// is the highest logical column (the end of its byte range).
@@ -837,6 +865,60 @@ impl Route {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn glyph(x: f32, w: f32, start: usize, end: usize, rtl: bool) -> GlyphSpan {
+        GlyphSpan {
+            x,
+            w,
+            start,
+            end,
+            rtl,
+        }
+    }
+
+    /// The font-independent half of the lam-alef fix: whichever order the
+    /// shaper lists the pair in, ل keeps the right half and ا gets the left.
+    #[test]
+    fn a_zero_width_letter_shares_the_box_before_it() {
+        let text = "لاب";
+        let bytes = [(0, 2, 0), (2, 4, 1), (4, 6, 2)];
+        let orders = [
+            vec![
+                glyph(0.0, 10.0, 4, 6, true),
+                glyph(10.0, 0.0, 2, 4, true),
+                glyph(10.0, 10.0, 0, 2, true),
+            ],
+            vec![
+                glyph(10.0, 10.0, 0, 2, true),
+                glyph(10.0, 0.0, 2, 4, true),
+                glyph(0.0, 10.0, 4, 6, true),
+            ],
+        ];
+        for glyphs in orders {
+            let folded = fold_empty_letters(glyphs, text);
+            assert_eq!(folded.len(), 2);
+            let boxes = boxes_for_glyphs(&folded, 1.0, |b| col_for_byte(&bytes, b));
+            let of = |col| boxes.iter().find(|b| b.col == col).unwrap();
+            assert_eq!((of(0).x0, of(0).x1), (15.0, 20.0), "ل is the right half");
+            assert_eq!((of(1).x0, of(1).x1), (10.0, 15.0), "ا is the left half");
+            assert_eq!((of(2).x0, of(2).x1), (0.0, 10.0), "ب is untouched");
+        }
+    }
+
+    /// A mark or a format character is meant to have no width. Folding it
+    /// would split its base's box in two.
+    #[test]
+    fn zero_width_marks_and_format_characters_are_not_folded() {
+        let text = "ب\u{651}\u{200f}";
+        let glyphs = vec![
+            glyph(0.0, 10.0, 0, 2, true),
+            glyph(5.0, 0.0, 2, 4, true),
+            glyph(0.0, 0.0, 4, 7, true),
+        ];
+        let folded = fold_empty_letters(glyphs, text);
+        assert_eq!(folded.len(), 3);
+        assert_eq!(folded[0].end, 2);
+    }
 
     fn mods(shift: bool, alt: bool, ctrl: bool) -> Mods {
         Mods { shift, alt, ctrl }

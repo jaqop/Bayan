@@ -553,9 +553,6 @@ impl App {
             return;
         }
         self.track_geometry();
-        if let Some(gpu) = self.gpu.as_mut() {
-            gpu.resize(px.width, px.height);
-        }
         self.relayout_active();
         self.request_redraw();
     }
@@ -594,6 +591,16 @@ impl App {
     /// off), unless the program tracks the mouse and Shift is up. The
     /// release is reported or ignored in `mouse_release`.
     fn right_press(&mut self) {
+        // the tab bar first: its right-click is the shell menu
+        let hits = self.chrome_hits(self.cursor_pos);
+        match chrome::right_press(&hits, self.overlay_blocks_mouse()) {
+            chrome::RightPress::ShellMenu => {
+                self.open_shell_menu();
+                return;
+            }
+            chrome::RightPress::Ignore => return,
+            chrome::RightPress::Terminal => {}
+        }
         match self.right_click_owner() {
             Some((_, mouse::RightClick::Program)) => {
                 let _ = self.try_report_press(mouse::Btn::Right);
@@ -663,8 +670,14 @@ impl App {
             LeftPress::Shortcuts => self.shortcuts_click(pos.x, pos.y),
             LeftPress::Settings => self.settings_click(pos.x, pos.y),
             LeftPress::TabControl(control) => {
-                match chrome::tab_control(control, self.active, self.tabs.len()) {
-                    Some(TabControl::Switch(i)) => self.switch_tab(i),
+                // the arrows walk the group on screen, as the bar shows it
+                let (vis, pos) = self.visible_tabs();
+                match chrome::tab_control(control, pos, vis.len()) {
+                    Some(TabControl::Switch(i)) => {
+                        if let Some(&ti) = vis.get(i) {
+                            self.switch_tab(ti);
+                        }
+                    }
                     Some(TabControl::NewTab) => self.perform_action(keybinds::Action::NewTab, el),
                     None => {}
                 }
@@ -684,6 +697,7 @@ impl App {
             LeftPress::Divider(i) => self.drag_divider = Some(i),
             LeftPress::Tab(i) => self.switch_tab(i),
             LeftPress::CloseTab(i) => self.request_close_tab(i, el),
+            LeftPress::NextGroup => self.perform_action(keybinds::Action::NextGroup, el),
             LeftPress::Blocked => {}
             LeftPress::DragStrip => {
                 // the two gestures a real title bar owes the user
@@ -727,10 +741,7 @@ impl App {
     /// kind follows the click count.
     fn start_selection(&mut self, pi: usize, row: usize, col: usize, side: Side) {
         if let Some(t) = self.tabs.get_mut(self.active) {
-            if t.focused != pi {
-                t.focused = pi;
-                self.update_title();
-            }
+            t.focused = pi;
         }
         self.sync_focus(None);
         self.sel_pane = pi;

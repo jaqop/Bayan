@@ -13,6 +13,10 @@ License, Version 1.1. The full license text is in fonts/OFL.txt.
 
   fonts/Amiri-Regular.ttf    Amiri
   fonts/Amiri-Bold.ttf       Amiri
+  fonts/KawkabMono-Regular.ttf  Kawkab Mono (copyright notice and licence
+                                in fonts/OFL-KawkabMono.txt)
 
 Amiri is bundled so that connected Arabic renders correctly from a fresh
-clone, with no font installation step.
+clone, with no font installation step. Kawkab Mono is bundled so every
+user has a monospaced Arabic font to pick in Settings → Arabic font, even
+on a PC that has none installed. It is redistributed unmodified.
