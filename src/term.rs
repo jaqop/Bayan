@@ -718,8 +718,12 @@ fn find_osc133(data: &[u8], nonce: &str) -> Vec<(usize, usize, u8, Option<i32>, 
                     let payload = &data[i + P.len()..j];
                     let trusted = osc133_trusted(payload, nonce);
                     // "D;<code>" carries the exit status. A nonce field after
-                    // the code is not part of the number.
-                    let exit = data[i + P.len() + 1..j]
+                    // the code is not part of the number. The payload can be
+                    // empty (`133;` then the terminator), so skip the kind
+                    // byte with `get`: a bare slice would start past `j`.
+                    let exit = payload
+                        .get(1..)
+                        .unwrap_or_default()
                         .strip_prefix(b";")
                         .and_then(|p| std::str::from_utf8(p).ok())
                         .and_then(|p| p.split(';').next())
@@ -3366,6 +3370,31 @@ mod tests {
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"B\x07");
         assert!(meta.at_prompt);
         assert_eq!(meta.prompt_col, Some(4)); // input begins after "PS> "
+    }
+
+    #[test]
+    fn osc133_with_no_payload_does_not_panic() {
+        // The terminator right after `133;` left the exit-code slice
+        // starting one past its end, and any program could kill the
+        // pane's reader thread with these bytes.
+        for seq in [
+            &b"\x1b]133;\x07"[..],
+            b"\x1b]133;\x1b\\",
+            b"x\x1b]133;\x07y",
+        ] {
+            let marks = find_osc133(seq, "");
+            assert_eq!(marks.len(), 1, "{seq:?}");
+            let (s, e, _, exit, _) = marks[0];
+            assert!(s < e && e <= seq.len(), "{seq:?}");
+            assert_eq!(exit, None, "{seq:?}");
+        }
+        // the full path a PTY read takes, with output after the mark
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;\x07ok");
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b]133;\x1b\\ok");
+        // a normal D mark still reads its exit code
+        let marks = find_osc133(b"\x1b]133;D;3\x07", "");
+        assert_eq!(marks[0].3, Some(3));
     }
 
     #[test]
