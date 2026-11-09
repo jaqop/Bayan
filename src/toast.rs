@@ -55,15 +55,15 @@ pub fn pty_toast(tab_label: &str, prog_title: &str, prog_body: &str) -> (String,
         tab.replace(' ', "\u{00A0}")
     };
     let title = if tab.is_empty() {
-        "بيان".to_string()
+        crate::lang::tr("بيان", "Bayan").to_string()
     } else {
-        format!("بيان · {tab}")
+        format!("{} · {tab}", crate::lang::tr("بيان", "Bayan"))
     };
     let body = match (prog_title.is_empty(), prog_body.is_empty()) {
         (false, false) => format!("{prog_title}: {prog_body}"),
         (false, true) => prog_title.to_string(),
         (true, false) => prog_body.to_string(),
-        (true, true) => "تنبيه من البرنامج".to_string(),
+        (true, true) => crate::lang::tr("تنبيه من البرنامج", "Alert from the program").to_string(),
     };
     (title, body)
 }

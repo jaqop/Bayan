@@ -104,20 +104,28 @@ pub enum RefuseReason {
 impl RefuseReason {
     pub fn label(self) -> &'static str {
         match self {
-            RefuseReason::Scheme => "المخطط غير مسموح",
-            RefuseReason::ControlOrBidi => "يحتوي على أحرف تحكم",
-            RefuseReason::TooLong => "الرابط أطول من الحد",
-            RefuseReason::Empty => "رابط فارغ",
-            RefuseReason::BadFile => "مسار الملف غير مقبول",
-            RefuseReason::Editor => "تعذّر فتح المحرّر",
-            RefuseReason::Missing => "الملف غير موجود",
+            RefuseReason::Scheme => crate::lang::tr("المخطط غير مسموح", "Scheme not allowed"),
+            RefuseReason::ControlOrBidi => {
+                crate::lang::tr("يحتوي على أحرف تحكم", "Contains control characters")
+            }
+            RefuseReason::TooLong => {
+                crate::lang::tr("الرابط أطول من الحد", "Link is over the limit")
+            }
+            RefuseReason::Empty => crate::lang::tr("رابط فارغ", "Empty link"),
+            RefuseReason::BadFile => {
+                crate::lang::tr("مسار الملف غير مقبول", "File path not accepted")
+            }
+            RefuseReason::Editor => crate::lang::tr("تعذّر فتح المحرّر", "Could not open the editor"),
+            RefuseReason::Missing => crate::lang::tr("الملف غير موجود", "File not found"),
         }
     }
 }
 
 /// Shown on the confirm card when a URL carries userinfo. Enter opens it;
 /// Esc dismisses. A [`RefuseReason`] card does not open on Enter.
-pub const HOST_CONFIRM: &str = "تأكد من المضيف";
+pub fn host_confirm() -> &'static str {
+    crate::lang::tr("تأكد من المضيف", "Check the host")
+}
 
 /// What a Ctrl+click should do. The window loop performs it; nothing here
 /// builds a `cmd /c` string.
@@ -1810,9 +1818,9 @@ pub fn card_decision(enter: bool, escape: bool, may_open: bool) -> CardDecision 
 /// Title prefix. The confirm card and the refuse card do not share one.
 pub fn card_title_prefix(may_open: bool) -> &'static str {
     if may_open {
-        "تأكد قبل الفتح"
+        crate::lang::tr("تأكد قبل الفتح", "Check before opening")
     } else {
-        "رابط مرفوض"
+        crate::lang::tr("رابط مرفوض", "Link refused")
     }
 }
 

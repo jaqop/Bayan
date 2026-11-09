@@ -288,13 +288,14 @@ impl Gpu {
         })
     }
 
-    pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            return;
+    pub fn resize(&mut self, width: u32, height: u32) -> bool {
+        if width == 0 || height == 0 || (width, height) == (self.config.width, self.config.height) {
+            return false;
         }
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        true
     }
 
     /// Sync the CPU atlas pages to the GPU (only on frames that rasterized a
@@ -342,7 +343,7 @@ impl Gpu {
     }
 
     /// Render one frame of quads (painter's order). BG is the clear color.
-    pub fn render(&mut self, verts: &[Vertex], bg: (u8, u8, u8)) {
+    pub fn render(&mut self, verts: &[Vertex], bg: (u8, u8, u8)) -> bool {
         use wgpu::util::DeviceExt;
         // wgpu 30 replaced Result<SurfaceTexture, SurfaceError> with an enum.
         // Suboptimal still carries a usable texture — render it rather than
@@ -354,11 +355,11 @@ impl Gpu {
                 self.surface.configure(&self.device, &self.config);
                 match self.surface.get_current_texture() {
                     Cst::Success(f) | Cst::Suboptimal(f) => f,
-                    _ => return,
+                    _ => return false,
                 }
             }
             // Timeout, Occluded (window hidden), Validation: skip this frame.
-            _ => return,
+            _ => return false,
         };
         let view = frame.texture.create_view(&Default::default());
         let globals = Globals {
@@ -409,5 +410,6 @@ impl Gpu {
         self.queue.submit([encoder.finish()]);
         // wgpu 30 moved present() from SurfaceTexture onto Queue
         self.queue.present(frame);
+        true
     }
 }

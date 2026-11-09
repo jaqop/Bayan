@@ -12,18 +12,23 @@ mod bidi_ctl;
 mod chrome;
 mod config;
 mod gpu;
+mod groups;
 mod input;
 mod keybinds;
 mod keyroute;
 mod keys;
 mod kitty;
+mod lang;
 mod layout;
 mod link;
 mod mouse;
 mod mru;
 mod osc7;
+mod persist;
 mod plugins;
 mod posh;
+mod process;
+mod pty_writer;
 mod render;
 mod shells;
 mod term;
@@ -333,6 +338,7 @@ mod prof {
     }
 }
 
+use lang::tr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -356,6 +362,8 @@ pub enum UserEvent {
     Wakeup(u64),
     /// Tab `id`'s emulator answers its child (DSR/DA replies TUIs block on).
     PtyWrite(u64, String),
+    /// Input was rejected or the background pipe writer failed.
+    PtyWriteFailed(u64, String),
     /// The font system finished loading on its background thread.
     RendererReady(Box<render::Renderer>),
     /// Pane `id` asked to set the clipboard via OSC 52. Applied only when
@@ -403,6 +411,7 @@ struct BlockedLink {
     reason: String,
     shown: String,
     confirm_uri: Option<String>,
+    is_app_error: bool,
 }
 
 /// What a confirm card is holding, which decides where Enter sends it.
@@ -436,6 +445,9 @@ struct PendingPaste {
 struct Pane {
     id: u64,
     session: Session,
+    /// the command line it was started with, so a restored session brings
+    /// a Command Prompt tab back as Command Prompt
+    command: String,
     /// when this pane last produced output — feeds the busy dot
     last_output: Option<Instant>,
     /// the program's OSC 9;4 progress report, until it clears it
@@ -467,6 +479,9 @@ struct Tab {
     /// the focused pane fills the tab; the others keep their PTY size and
     /// are not drawn (Ctrl+Shift+Z)
     zoomed: bool,
+    /// the group this tab belongs to (`groups.rs`); the tab bar shows
+    /// only the active tab's group
+    group: u32,
 }
 
 impl Tab {
@@ -620,12 +635,29 @@ struct SavedTab {
     /// the user's tab name; absent in files from before M38
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    /// index into `SavedState::groups`; absent (0, the first group) in
+    /// files from before tab groups
+    #[serde(default, skip_serializing_if = "is_zero")]
+    group: usize,
+    /// each pane's shell, beside `cwds`; `None` is the default shell (so a
+    /// changed default applies). Absent in files from before this field.
+    /// Only `shells::is_restorable` commands are started again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    shells: Vec<Option<String>>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SavedState {
     tabs: Vec<SavedTab>,
     active: usize,
+    /// each group's name (None: numbered), in order; empty in files from
+    /// before tab groups, which restore as one group
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    groups: Vec<Option<String>>,
     /// where the window was, so it comes back there (WezTerm's most-asked
     /// small thing). Physical pixels; absent in files from before M34.
     #[serde(default)]
@@ -699,11 +731,36 @@ fn parse_state(json: &str) -> Option<SavedState> {
                 focused: 0,
                 layout: None,
                 name: None,
+                group: 0,
+                shells: Vec::new(),
             })
             .collect(),
         active: legacy.active,
+        groups: Vec::new(),
         window: None,
     })
+}
+
+/// Each pane's shell for session.json: `None` where it is the default, and
+/// an empty list when every pane is, so an ordinary session file does not
+/// change shape.
+fn saved_shells<'a>(commands: impl Iterator<Item = &'a str>, default: &str) -> Vec<Option<String>> {
+    let v: Vec<Option<String>> = commands
+        .map(|c| (c != default).then(|| c.to_string()))
+        .collect();
+    if v.iter().all(Option::is_none) {
+        Vec::new()
+    } else {
+        v
+    }
+}
+
+/// The shell a restored pane starts with: its saved one if `detect` could
+/// have offered it, otherwise the default.
+fn restored_shell(saved: Option<String>, default: &str, installed: &[shells::Shell]) -> String {
+    saved
+        .filter(|c| shells::is_restorable(c, installed))
+        .unwrap_or_else(|| default.to_string())
 }
 
 fn state_path() -> Option<std::path::PathBuf> {
@@ -812,6 +869,16 @@ enum PaletteRow {
     InsertCommand(&'static str),
     /// name the active tab; `None` gives it back its folder name
     RenameTab(Option<String>),
+    /// show this group (at the tab it was last on)
+    ShowGroup(u32),
+    /// move the active tab into this group; `None` makes a new one
+    MoveToGroup(Option<u32>),
+    /// open the palette in rename-the-group mode
+    OpenRenameGroup,
+    /// open the shell menu (from the pane's right-click menu)
+    OpenShellMenu,
+    /// name the active group; `None` gives it back its number
+    RenameGroup(Option<String>),
 }
 
 /// Rows of the right-click menu, most used first. Each one is a keymap
@@ -828,49 +895,173 @@ fn context_menu_rows(
         rows.push((PaletteRow::Builtin(a), label.to_string()));
     };
     if has_selection {
-        add(Copy, "نسخ");
+        add(Copy, tr("نسخ", "Copy"));
     }
-    add(Paste, "لصق");
-    add(CopyLastOutput, "نسخ ناتج آخر أمر");
-    add(Search, "البحث");
-    add(SplitH, "تقسيم: جنبًا إلى جنب");
-    add(SplitV, "تقسيم: فوق بعضها");
+    add(Paste, tr("لصق", "Paste"));
+    add(CopyLastOutput, tr("نسخ ناتج آخر أمر", "Copy last output"));
+    add(Search, tr("البحث", "Search"));
+    add(SplitH, tr("تقسيم: جنبًا إلى جنب", "Split: side by side"));
+    add(SplitV, tr("تقسيم: فوق بعضها", "Split: stacked"));
     if panes > 1 {
         add(
             ZoomPane,
             if zoomed {
-                "إلغاء تكبير اللوحة"
+                tr("إلغاء تكبير اللوحة", "Unzoom pane")
             } else {
-                "تكبير اللوحة"
+                tr("تكبير اللوحة", "Zoom pane")
             },
         );
         add(
             Broadcast,
             if broadcast {
-                "إيقاف الكتابة في كل اللوحات"
+                tr("إيقاف الكتابة في كل اللوحات", "Stop typing to all panes")
             } else {
-                "الكتابة في كل اللوحات"
+                tr("الكتابة في كل اللوحات", "Type to all panes")
             },
         );
     }
-    add(NewTab, "تبويب جديد");
-    add(RenameTab, "تسمية التبويب");
-    add(ClosePane, "إغلاق اللوحة");
-    add(Settings, "الإعدادات");
+    add(NewTab, tr("تبويب جديد", "New tab"));
+    rows.push((
+        PaletteRow::OpenShellMenu,
+        tr("تبويب جديد بطرفية…", "New tab with shell…").to_string(),
+    ));
+    let mut add = |a: keybinds::Action, label: &str| {
+        rows.push((PaletteRow::Builtin(a), label.to_string()));
+    };
+    add(NewGroup, tr("مجموعة جديدة", "New group"));
+    add(RenameTab, tr("تسمية التبويب", "Rename tab"));
+    add(ClosePane, tr("إغلاق اللوحة", "Close pane"));
+    add(Settings, tr("الإعدادات", "Settings"));
     rows
 }
 
-/// The palette's rows while naming a tab: the typed name first, so Enter
-/// takes it, then the way back to the folder name.
-fn rename_rows(query: &str) -> Vec<(PaletteRow, String)> {
+/// The shell menu's rows: every detected shell, in detection order
+/// (PowerShell, PowerShell 7, cmd, Git Bash, each WSL distro), the default
+/// for new tabs marked. Detection runs on a background thread at startup;
+/// until it reports, the two shells every Windows has stand in.
+fn shell_menu_rows(profiles: &[shells::Shell], default: &str) -> Vec<(PaletteRow, String)> {
+    let listed: Vec<(String, String)> = if profiles.is_empty() {
+        [
+            ("PowerShell", "powershell.exe"),
+            ("Command Prompt", "cmd.exe"),
+        ]
+        .iter()
+        .map(|(name, cmd)| (name.to_string(), cmd.to_string()))
+        .collect()
+    } else {
+        profiles
+            .iter()
+            .map(|s| (s.label(), s.command.clone()))
+            .collect()
+    };
+    listed
+        .into_iter()
+        .map(|(name, command)| {
+            let label = if command == default {
+                format!("{name} · {}", tr("الافتراضية", "default"))
+            } else {
+                name
+            };
+            (PaletteRow::Shell(command), label)
+        })
+        .collect()
+}
+
+/// The Arabic-font cycler's step: the ring is Auto (`None`), then each of
+/// `choices` in order, wrapping both ways. An unknown current counts as
+/// Auto.
+fn step_arabic_font(choices: &[String], current: Option<&str>, dir: i32) -> Option<String> {
+    let n = choices.len() as i32 + 1; // + Auto at position 0
+    let at = current
+        .and_then(|c| choices.iter().position(|x| x == c))
+        .map_or(0, |i| i as i32 + 1);
+    let next = (at + dir).rem_euclid(n);
+    (next > 0).then(|| choices[next as usize - 1].clone())
+}
+
+/// What the rename palette names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenameTarget {
+    Tab,
+    Group,
+}
+
+/// The palette's rows while naming a tab or a group: the typed name first,
+/// so Enter takes it, then the way back to the default label (the folder
+/// name for a tab, the number for a group).
+fn rename_rows(target: RenameTarget, query: &str) -> Vec<(PaletteRow, String)> {
     let mut rows = Vec::new();
-    if let Some(name) = clean_tab_name(query) {
+    let name = clean_tab_name(query);
+    match target {
+        RenameTarget::Tab => {
+            if let Some(name) = name {
+                rows.push((
+                    PaletteRow::RenameTab(Some(name.clone())),
+                    if lang::rtl() {
+                        format!("تسمية التبويب «{name}»")
+                    } else {
+                        format!("Name the tab “{name}”")
+                    },
+                ));
+            }
+            rows.push((
+                PaletteRow::RenameTab(None),
+                tr("إعادة اسم المجلد", "Back to the folder name").to_string(),
+            ));
+        }
+        RenameTarget::Group => {
+            if let Some(name) = name {
+                rows.push((
+                    PaletteRow::RenameGroup(Some(name.clone())),
+                    if lang::rtl() {
+                        format!("تسمية المجموعة «{name}»")
+                    } else {
+                        format!("Name the group “{name}”")
+                    },
+                ));
+            }
+            rows.push((
+                PaletteRow::RenameGroup(None),
+                tr("إعادة رقم المجموعة", "Back to the group number").to_string(),
+            ));
+        }
+    }
+    rows
+}
+
+/// The palette's group rows: show another group, move the active tab
+/// into one (or into a new group), and name the group on screen. `groups`
+/// is (id, label) in order; nothing to switch to or move into with one
+/// group, so only the move-to-new row shows then. A move that would leave
+/// the tab where it is is not offered.
+fn group_rows(groups: &[(u32, String)], active: u32) -> Vec<(PaletteRow, String)> {
+    let mut rows = Vec::new();
+    for (id, label) in groups.iter().filter(|(id, _)| *id != active) {
         rows.push((
-            PaletteRow::RenameTab(Some(name.clone())),
-            format!("تسمية التبويب «{name}»"),
+            PaletteRow::ShowGroup(*id),
+            format!("{}: {label}", tr("المجموعة", "Group")),
         ));
     }
-    rows.push((PaletteRow::RenameTab(None), "إعادة اسم المجلد".to_string()));
+    for (id, label) in groups.iter().filter(|(id, _)| *id != active) {
+        rows.push((
+            PaletteRow::MoveToGroup(Some(*id)),
+            if lang::rtl() {
+                format!("نقل التبويب إلى «{label}»")
+            } else {
+                format!("Move tab to “{label}”")
+            },
+        ));
+    }
+    rows.push((
+        PaletteRow::MoveToGroup(None),
+        tr("نقل التبويب إلى مجموعة جديدة", "Move tab to a new group").to_string(),
+    ));
+    if groups.len() > 1 {
+        rows.push((
+            PaletteRow::OpenRenameGroup,
+            tr("تسمية المجموعة", "Rename group").to_string(),
+        ));
+    }
     rows
 }
 
@@ -891,7 +1082,13 @@ fn chrome_text(raw: &str) -> String {
 
 /// The card's note when Enter will also type into `others` broadcast panes.
 fn broadcast_note(others: usize) -> Option<String> {
-    (others > 0).then(|| format!(" — يُرسل إلى {} لوحات", others + 1))
+    (others > 0).then(|| {
+        if lang::rtl() {
+            format!(" — يُرسل إلى {} لوحات", others + 1)
+        } else {
+            format!(" — goes to {} panes", others + 1)
+        }
+    })
 }
 
 /// Whether a card raised for `raised_for` may still send (R-02): only into
@@ -939,7 +1136,7 @@ fn row_shortcut(keymap: &[(keybinds::Action, keybinds::Chord)], row: &PaletteRow
 /// The palette text for a plugin action: always badged «إضافة», so a plugin
 /// row is told apart from Bayan's own at a glance (BAYAN-007).
 fn plugin_row_label(label: &str) -> String {
-    format!("إضافة — {label}")
+    format!("{} — {label}", tr("إضافة", "Plugin"))
 }
 
 /// What a plugin action holds for the confirm card: its text is never typed
@@ -955,7 +1152,10 @@ fn plugin_pending(label: &str, send: &str, pane: Option<u64>) -> PendingPaste {
         text: send.to_string(),
         lines,
         chars,
-        reason: format!("إضافة تريد كتابة نص — {label}"),
+        reason: format!(
+            "{} — {label}",
+            tr("إضافة تريد كتابة نص", "A plugin wants to type text")
+        ),
     }
 }
 
@@ -968,17 +1168,21 @@ fn palette_extras(
         .map(|shell| {
             (
                 PaletteRow::Shell(shell.command.clone()),
-                format!("تبويب جديد — {}", shell.name),
+                format!("{} — {}", tr("تبويب جديد", "New tab"), shell.label()),
             )
         })
         .collect();
     rows.push((
         PaletteRow::InsertCommand("claude"),
-        "إدراج أمر كلاود — claude".into(),
+        tr("إدراج أمر كلاود — claude", "Insert Claude command — claude").into(),
     ));
     rows.push((
         PaletteRow::InsertCommand("claude --continue"),
-        "متابعة محادثة كلاود — claude --continue".into(),
+        tr(
+            "متابعة محادثة كلاود — claude --continue",
+            "Continue Claude conversation — claude --continue",
+        )
+        .into(),
     ));
     let mut seen = std::collections::HashSet::new();
     for span in links {
@@ -990,7 +1194,10 @@ fn palette_extras(
             continue;
         }
         let shown = link::fit_status_bar(&span.tooltip(None), 90).text();
-        rows.push((PaletteRow::CopyText(text.clone()), format!("نسخ — {shown}")));
+        rows.push((
+            PaletteRow::CopyText(text.clone()),
+            format!("{} — {shown}", tr("نسخ", "Copy")),
+        ));
         if seen.len() >= 100 {
             break;
         }
@@ -1001,11 +1208,15 @@ fn palette_extras(
 /// Ctrl+Shift+P: type to filter, arrows to move, Enter to run.
 struct Palette {
     query: String,
-    /// naming the active tab: the query is the new name, not a filter
-    rename: bool,
+    /// naming the active tab or its group: the query is the new name, not
+    /// a filter
+    rename: Option<RenameTarget>,
     /// the right-click menu: a popup at this window point instead of the
     /// centred palette, listing `context_rows`
     menu: Option<(f64, f64)>,
+    /// the menu lists the installed shells (`shell_menu_rows`) instead of
+    /// the pane actions: a right-click on the tab bar
+    shells_menu: bool,
     sel: usize,
     extras: Vec<(PaletteRow, String)>,
     pressed: Option<(usize, PaletteRow)>,
@@ -1057,9 +1268,16 @@ struct App {
     last_toast: Option<Instant>,
     /// most-recently-used tab history for Ctrl+Tab
     mru: mru::Mru,
+    /// tab groups in display order; each tab names its own (`groups.rs`)
+    groups: groups::Groups,
+    /// the group the next spawned tab joins instead of the active one —
+    /// set only for the one spawn that creates or restores a group
+    spawn_group: Option<u32>,
     /// the command palette, when open
     palette: Option<Palette>,
     shell_profiles: Vec<shells::Shell>,
+    shell_profiles_ready: bool,
+    startup_pending: bool,
     /// last click on the empty title strip — powers double-click-to-maximise
     last_strip_click: Option<std::time::Instant>,
     proxy: EventLoopProxy<UserEvent>,
@@ -1076,6 +1294,7 @@ struct App {
     /// last frame's quad bytes — an identical frame skips the GPU submit
     /// (a still terminal stops re-rendering; laptop battery thanks you)
     last_frame: Vec<u8>,
+    last_frame_size: Option<winit::dpi::PhysicalSize<u32>>,
     cursor_pos: PhysicalPosition<f64>,
     /// Grab, motion dedupe, focus-in memory, and the local selection drag.
     /// A focus loss drops all of them together.
@@ -1116,6 +1335,8 @@ struct App {
     auto_follow: bool,
     claude_manual: bool,
     config: config::UserConfig,
+    config_load_error: Option<String>,
+    startup_error: Option<String>,
     /// every rebindable action's effective chord (defaults + config)
     keymap: Vec<(keybinds::Action, keybinds::Chord)>,
     /// the shortcuts editor overlay, when open
@@ -1240,6 +1461,18 @@ impl App {
         self.request_redraw();
     }
 
+    /// Step through Auto, then every installed font that draws Arabic.
+    fn cycle_arabic_font(&mut self, dir: i32) {
+        let Some(r) = self.renderer.as_ref() else {
+            return;
+        };
+        let choices = r.arabic_font_choices();
+        let current = r.arabic_family().map(str::to_string);
+        self.config.arabic_font = step_arabic_font(&choices, current.as_deref(), dir);
+        self.rebuild_renderer();
+        self.request_redraw();
+    }
+
     fn set_cursor_style(&mut self, s: config::CursorStyle) {
         self.config.cursor_style = Some(s.as_str().to_string());
         self.request_redraw(); // read per-frame; no rebuild needed
@@ -1322,7 +1555,13 @@ impl App {
             toast::remove(h);
         }
         // tabs + cwds greet you tomorrow
-        self.save_state();
+        if !self.save_state() {
+            // The window is about to close, so its error card cannot be seen.
+            // An explicit save failure must be acknowledged before exit.
+            if let Some(error) = &self.blocked_link {
+                show_error_dialog(self.hwnd(), &error.reason, &error.shown);
+            }
+        }
         // BAYAN-014: end every shell (and, through ConPTY, its console) now,
         // not whenever the process teardown gets to it
         for t in &mut self.tabs {
@@ -1420,7 +1659,14 @@ impl App {
         if on {
             // preview the toast you just turned on
             if let Some(h) = self.hwnd() {
-                toast::show(h, "الإشعارات مفعّلة", "هكذا يبدو إشعار اكتمال الأمر");
+                toast::show(
+                    h,
+                    tr("الإشعارات مفعّلة", "Notifications on"),
+                    tr(
+                        "هكذا يبدو إشعار اكتمال الأمر",
+                        "This is how a finished-command notification looks",
+                    ),
+                );
             }
         }
         self.request_redraw();
@@ -1541,8 +1787,9 @@ impl App {
         let extras = palette_extras(&self.shell_profiles, &links);
         self.palette = Some(Palette {
             query,
-            rename: false,
+            rename: None,
             menu: None,
+            shells_menu: false,
             sel: 0,
             extras,
             pressed: None,
@@ -1622,13 +1869,17 @@ impl App {
     /// Matching is case-insensitive and substring, on the label the user
     /// actually sees — searching a hidden id would be a guessing game.
     fn palette_rows(&self, query: &str) -> Vec<(PaletteRow, String)> {
-        if self.palette.as_ref().is_some_and(|p| p.rename) {
-            return rename_rows(query);
+        if let Some(target) = self.palette.as_ref().and_then(|p| p.rename) {
+            return rename_rows(target, query);
         }
         if self.palette.as_ref().is_some_and(|p| p.menu.is_some()) {
             let q = query.trim().to_lowercase();
-            return self
-                .context_rows()
+            let rows = if self.palette.as_ref().is_some_and(|p| p.shells_menu) {
+                shell_menu_rows(&self.shell_profiles, &self.config.shell_program())
+            } else {
+                self.context_rows()
+            };
+            return rows
                 .into_iter()
                 .filter(|(_, label)| q.is_empty() || label.to_lowercase().contains(&q))
                 .collect();
@@ -1641,6 +1892,16 @@ impl App {
                 rows.push((PaletteRow::Builtin(a), a.label().to_string()));
             }
         }
+        let group_labels: Vec<(u32, String)> = self
+            .groups
+            .iter()
+            .map(|g| (g.id, self.groups.label(g.id)))
+            .collect();
+        rows.extend(
+            group_rows(&group_labels, self.active_group())
+                .into_iter()
+                .filter(|(_, label)| hit(label)),
+        );
         for (i, act) in plugins::registry().actions.iter().enumerate() {
             if hit(&plugin_row_label(&act.label)) {
                 // BAYAN-007: badged, so a plugin row never reads as built-in
@@ -1672,14 +1933,20 @@ impl App {
                 self.spawn_tab_command(cwd, &command);
                 if self.tabs.len() == before && self.blocked_link.is_none() {
                     self.blocked_link = Some(BlockedLink {
-                        reason: "تعذر تشغيل الطرفية".into(),
+                        reason: tr("تعذر تشغيل الطرفية", "Could not start the shell").into(),
                         shown: link::preview(&command, 240),
                         confirm_uri: None,
+                        is_app_error: false,
                     });
                 }
             }
             PaletteRow::CopyText(text) => self.set_clipboard(text),
             PaletteRow::RenameTab(name) => self.rename_tab(name),
+            PaletteRow::ShowGroup(g) => self.show_group(g),
+            PaletteRow::MoveToGroup(g) => self.move_tab_to_group(g),
+            PaletteRow::OpenRenameGroup => self.open_rename_group(),
+            PaletteRow::OpenShellMenu => self.open_shell_menu(),
+            PaletteRow::RenameGroup(name) => self.rename_group(name),
             PaletteRow::InsertCommand(text) => {
                 self.pending_paste = Some(PendingPaste {
                     kind: PendingKind::Paste,
@@ -1687,7 +1954,11 @@ impl App {
                     text: text.into(),
                     lines: 1,
                     chars: text.chars().count(),
-                    reason: "إدراج أمر من لوحة الأوامر".into(),
+                    reason: tr(
+                        "إدراج أمر من لوحة الأوامر",
+                        "Insert a command from the palette",
+                    )
+                    .into(),
                 });
             }
             PaletteRow::Plugin(i) => {
@@ -1775,6 +2046,9 @@ impl App {
             Broadcast => self.toggle_broadcast(),
             ZoomPane => self.toggle_zoom(),
             CopyLastOutput => self.copy_last_output(),
+            NewGroup => self.new_group(),
+            NextGroup => self.step_group(false),
+            PrevGroup => self.step_group(true),
         }
     }
 
@@ -1802,7 +2076,13 @@ impl App {
                 return; // a bare modifier — keep waiting for the real key
             };
             if !chord.is_bindable() {
-                st.flash = Some("الاختصار يحتاج Ctrl أو Alt أو مفتاح F".to_string());
+                st.flash = Some(
+                    tr(
+                        "الاختصار يحتاج Ctrl أو Alt أو مفتاح F",
+                        "A shortcut needs Ctrl, Alt or an F key",
+                    )
+                    .to_string(),
+                );
                 st.capturing = false;
                 self.request_redraw();
                 return;
@@ -1810,7 +2090,11 @@ impl App {
             let action = keybinds::Action::ALL[st.sel];
             if let Some(owner) = keybinds::lookup(&self.keymap, chord) {
                 if owner != action {
-                    st.flash = Some(format!("«{}» يستخدم هذا الاختصار", owner.label()));
+                    st.flash = Some(if lang::rtl() {
+                        format!("«{}» يستخدم هذا الاختصار", owner.label())
+                    } else {
+                        format!("“{}” already uses this shortcut", owner.label())
+                    });
                     st.capturing = false;
                     self.request_redraw();
                     return;
@@ -1824,7 +2108,7 @@ impl App {
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => {
                 self.shortcuts = None;
-                config::save(&self.config);
+                self.save_config();
                 self.request_redraw();
             }
             Key::Named(NamedKey::ArrowUp) => {
@@ -1897,7 +2181,7 @@ impl App {
         };
         if !render::rect_hit(lay.card, px, py) {
             self.shortcuts = None;
-            config::save(&self.config);
+            self.save_config();
             self.request_redraw();
             return;
         }
@@ -1946,9 +2230,62 @@ impl App {
             .count()
     }
 
+    /// The settings header's language button: Arabic ⇄ English, at once
+    /// and saved. Every label is read from `lang` each frame, so the next
+    /// frame is wholly in the new language; the settings panel stays open,
+    /// mirrored, with the button now naming the way back.
+    fn switch_language(&mut self) {
+        let next = self.config.lang().other();
+        self.config.language = Some(next.id().to_string());
+        lang::set(next);
+        self.save_config();
+        self.request_redraw();
+    }
+
+    fn report_error(&mut self, reason: &str, detail: &str) {
+        eprintln!("bayan: {reason}: {detail}");
+        self.blocked_link = Some(BlockedLink {
+            reason: reason.to_string(),
+            shown: link::preview_with(detail, 240, |c| c != '\n' && link::is_forbidden(c)),
+            confirm_uri: None,
+            is_app_error: true,
+        });
+        self.request_redraw();
+    }
+
+    fn save_config(&mut self) {
+        if self.config_load_error.is_some() {
+            self.report_config_load_error();
+            return;
+        }
+        if let Err(error) = config::save(&self.config) {
+            self.report_error(
+                tr("تعذر حفظ الإعدادات", "Could not save settings"),
+                &error.to_string(),
+            );
+        }
+    }
+
+    fn report_config_load_error(&mut self) {
+        if let Some(error) = &self.config_load_error {
+            let detail = format!(
+                "{}\n{}",
+                error,
+                tr(
+                    "أصلح ملف config.json ثم أعد تشغيل بيان لحفظ الإعدادات.",
+                    "Fix config.json and restart Bayan to save settings.",
+                )
+            );
+            self.report_error(
+                tr("تعذّر تحميل الإعدادات", "Could not load settings"),
+                &detail,
+            );
+        }
+    }
+
     fn close_settings(&mut self) {
         self.settings = None;
-        config::save(&self.config); // persist on close
+        self.save_config(); // persist on close
         self.request_redraw();
     }
 
@@ -1968,7 +2305,9 @@ impl App {
             self.close_settings();
             return;
         }
-        if render::rect_hit(lay.shortcuts_btn, px, py) {
+        if render::rect_hit(lay.lang_btn, px, py) {
+            self.switch_language();
+        } else if render::rect_hit(lay.shortcuts_btn, px, py) {
             // hand the stage to the shortcuts editor (settings saves first)
             self.close_settings();
             self.shortcuts = Some(ShortcutsState::default());
@@ -1987,6 +2326,10 @@ impl App {
             self.change_font_size(-1);
         } else if render::rect_hit(lay.size_plus, px, py) {
             self.change_font_size(1);
+        } else if render::rect_hit(lay.arabic_prev, px, py) {
+            self.cycle_arabic_font(-1);
+        } else if render::rect_hit(lay.arabic_next, px, py) {
+            self.cycle_arabic_font(1);
         } else if let Some(i) = lay
             .cursor_btns
             .iter()
@@ -2075,20 +2418,26 @@ impl App {
                         if !m.running_cmd.is_empty() {
                             format!("▶ {}", chrome_text(&m.running_cmd))
                         } else if let Some(cwd) = &m.cwd {
-                            format!("خامل · {}", chrome_text(cwd))
+                            format!("{} · {}", tr("خامل", "idle"), chrome_text(cwd))
                         } else {
-                            "خامل".to_string()
+                            tr("خامل", "idle").to_string()
                         }
                     })
                     .unwrap_or_default();
                 let n = t.panes.len();
                 let status = if n > 1 {
-                    format!("{status}   ({n} لوحات)")
+                    format!("{status}   ({n} {})", tr("لوحات", "panes"))
                 } else {
                     status
                 };
                 render::CockpitEntry {
-                    title: t.label(),
+                    // the cockpit spans every group, so with more than one
+                    // it says which group each agent's tab lives in
+                    title: if self.groups.len() > 1 {
+                        format!("{} · {}", self.groups.label(t.group), t.label())
+                    } else {
+                        t.label()
+                    },
                     status,
                     busy: t.busy(i == self.active),
                     attention: t.attention,
@@ -2192,6 +2541,7 @@ impl App {
             Ok(session) => Some(Pane {
                 id,
                 session,
+                command: command.to_string(),
                 last_output: None,
                 progress: None,
             }),
@@ -2213,12 +2563,18 @@ impl App {
         let title = cwd
             .as_deref()
             .and_then(|c| c.rsplit(['\\', '/']).next().map(str::to_string))
-            .unwrap_or_else(|| "بيان".to_string());
+            .unwrap_or_else(|| tr("بيان", "Bayan").to_string());
+        // a new tab joins the group on screen, or the one being made for it
+        let group = self
+            .spawn_group
+            .take()
+            .unwrap_or_else(|| self.active_group());
         if let Some(pane) = self.spawn_pane_command(cwd.as_deref(), command) {
             // this becomes the active tab without switch_tab, so a button
             // held on the previous tab has to go up first
             self.abandon_mouse();
             self.tabs.push(Tab {
+                group,
                 panes: vec![pane],
                 layout: layout::Node::single(),
                 focused: 0,
@@ -2389,20 +2745,10 @@ impl App {
             self.quit(el);
             return;
         }
-        self.after_tab_removed(ti);
+        self.after_tab_removed(ti, t.group);
         self.relayout_active();
         self.sync_focus(None);
         self.request_redraw();
-    }
-
-    fn after_tab_removed(&mut self, ti: usize) {
-        self.mru.removed(ti);
-        let (active, changed) = active_after_remove(self.active, ti, self.tabs.len());
-        self.active = active;
-        self.mru.touch(active);
-        if changed {
-            self.enter_tab();
-        }
     }
 
     /// The per-tab resets for whichever tab just came on screen.
@@ -2435,12 +2781,12 @@ impl App {
         t.layout.remove(pi);
         pane.session.kill();
         if t.panes.is_empty() {
-            self.tabs.remove(ti);
+            let gone = self.tabs.remove(ti);
             if self.tabs.is_empty() {
                 self.quit(el);
                 return;
             }
-            self.after_tab_removed(ti);
+            self.after_tab_removed(ti, gone.group);
         } else {
             if t.focused >= t.panes.len() {
                 t.focused = t.panes.len() - 1;
@@ -2453,6 +2799,128 @@ impl App {
         }
         self.relayout_active();
         self.sync_focus(None);
+        self.request_redraw();
+    }
+
+    /// Tab `ti` (of group `gid`) has just left `self.tabs`, which is not
+    /// empty: pick what is shown next, staying in the group while it has
+    /// tabs (`groups::after_close`), and drop the group once it has none.
+    fn after_tab_removed(&mut self, ti: usize, gid: u32) {
+        self.mru.removed(ti);
+        let (shifted, was_active) = active_after_remove(self.active, ti, self.tabs.len());
+        self.active = groups::after_close(was_active, shifted, gid, &self.tab_groups(), &self.mru);
+        self.mru.touch(self.active);
+        self.groups.prune(&self.tab_groups());
+        if was_active {
+            self.enter_tab(); // on screen now, perhaps from another group
+        }
+    }
+
+    /// Each tab's group id, in tab order.
+    fn tab_groups(&self) -> Vec<u32> {
+        self.tabs.iter().map(|t| t.group).collect()
+    }
+
+    /// The group on screen: the active tab's.
+    fn active_group(&self) -> u32 {
+        self.tabs
+            .get(self.active)
+            .map_or_else(|| self.groups.first(), |t| t.group)
+    }
+
+    /// The tabs the bar shows (the active group's), as indices into
+    /// `self.tabs`, and where the active tab sits among them.
+    fn visible_tabs(&self) -> (Vec<usize>, usize) {
+        let vis = groups::members(&self.tab_groups(), self.active_group());
+        let pos = vis.iter().position(|&i| i == self.active).unwrap_or(0);
+        (vis, pos)
+    }
+
+    /// The bar's labels, the active group's tabs only — the same list the
+    /// renderer measured, so hit tests land where the tabs were drawn.
+    pub(crate) fn visible_labels(&self) -> (Vec<String>, usize) {
+        let (vis, pos) = self.visible_tabs();
+        (vis.iter().map(|&i| self.tabs[i].label()).collect(), pos)
+    }
+
+    /// The group chip's text and its amber dot, while there is more than
+    /// one group: one group is the plain tab bar, unchanged.
+    fn group_chip(&self) -> Option<(String, bool)> {
+        if self.groups.len() < 2 {
+            return None;
+        }
+        let g = self.active_group();
+        let elsewhere = self.tabs.iter().any(|t| t.group != g && t.attention);
+        Some((self.groups.label(g), elsewhere))
+    }
+
+    /// Show group `gid` at the tab it was last on (else its first tab).
+    fn show_group(&mut self, gid: u32) {
+        let members = groups::members(&self.tab_groups(), gid);
+        let Some(&first) = members.first() else {
+            return;
+        };
+        let target = self.mru.most_recent(&members).unwrap_or(first);
+        self.switch_tab(target);
+    }
+
+    /// Ctrl+Shift+PageDown / PageUp and the chip: the next or previous group.
+    fn step_group(&mut self, back: bool) {
+        let target = self.groups.neighbor(self.active_group(), back);
+        if target != self.active_group() {
+            self.show_group(target);
+        }
+    }
+
+    /// Ctrl+Shift+G: a new group, opened on one fresh tab in the active
+    /// pane's directory (the same start NewTab gives).
+    fn new_group(&mut self) {
+        let cwd = self
+            .session()
+            .and_then(|s| s.meta.lock_or_recover().spawn_cwd());
+        self.spawn_group = Some(self.groups.add());
+        self.spawn_tab(cwd);
+        self.spawn_group = None;
+        // a failed spawn leaves the new group empty: drop it again
+        self.groups.prune(&self.tab_groups());
+        self.request_redraw();
+    }
+
+    /// Move the active tab into group `gid` (`None`: a new group). The
+    /// view follows the tab; a group it leaves empty is dropped.
+    fn move_tab_to_group(&mut self, gid: Option<u32>) {
+        let gid = match gid {
+            Some(g) if self.groups.contains(g) => g,
+            Some(_) => return,
+            None => self.groups.add(),
+        };
+        let Some(t) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        t.group = gid;
+        self.groups.prune(&self.tab_groups());
+        self.mru.touch(self.active);
+        self.save_state();
+        self.request_redraw();
+    }
+
+    fn open_rename_group(&mut self) {
+        let current = self
+            .groups
+            .name(self.active_group())
+            .unwrap_or_default()
+            .to_string();
+        self.open_palette(current);
+        if let Some(p) = self.palette.as_mut() {
+            p.rename = Some(RenameTarget::Group);
+        }
+    }
+
+    fn rename_group(&mut self, name: Option<String>) {
+        let g = self.active_group();
+        self.groups
+            .set_name(g, name.as_deref().and_then(clean_tab_name));
+        self.save_state();
         self.request_redraw();
     }
 
@@ -2475,8 +2943,15 @@ impl App {
         self.request_redraw();
     }
 
-    fn save_state(&self) {
-        let Some(path) = state_path() else { return };
+    fn save_state(&mut self) -> bool {
+        // Closing while discovery is pending must not replace the saved
+        // session with an empty window that has not restored it yet.
+        if self.startup_pending {
+            return true;
+        }
+        let Some(path) = state_path() else {
+            return true;
+        };
         let state = SavedState {
             tabs: self
                 .tabs
@@ -2489,8 +2964,7 @@ impl App {
                             // don't persist a path we would refuse to start in
                             p.session
                                 .meta
-                                .lock()
-                                .unwrap()
+                                .lock_or_recover()
                                 .cwd
                                 .as_deref()
                                 .and_then(term::accept_local_cwd)
@@ -2501,20 +2975,40 @@ impl App {
                     focused: t.focused,
                     layout: Some(t.layout.clone()),
                     name: t.name.clone(),
+                    group: self.groups.position(t.group).unwrap_or(0),
+                    shells: saved_shells(
+                        t.panes.iter().map(|p| p.command.as_str()),
+                        &self.config.shell_program(),
+                    ),
                 })
                 .collect(),
             active: self.active,
+            groups: if self.groups.len() > 1 {
+                self.groups.iter().map(|g| g.name.clone()).collect()
+            } else {
+                // one group saves as before: the file stays readable by
+                // a build without groups, and its name (if any) is kept
+                self.groups
+                    .iter()
+                    .filter_map(|g| g.name.clone().map(Some))
+                    .collect()
+            },
             window: self.normal_geom.map(|g| WindowGeom {
                 maximized: self.window.as_ref().is_some_and(|w| w.is_maximized()),
                 ..g
             }),
         };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        let result = serde_json::to_vec_pretty(&state)
+            .map_err(std::io::Error::other)
+            .and_then(|json| persist::write(&path, &json));
+        if let Err(error) = result {
+            self.report_error(
+                tr("تعذر حفظ الجلسة", "Could not save the session"),
+                &error.to_string(),
+            );
+            return false;
         }
-        if let Ok(json) = serde_json::to_string_pretty(&state) {
-            let _ = std::fs::write(path, json);
-        }
+        true
     }
 
     /// Note the window's current rectangle if it is in its normal state
@@ -2538,6 +3032,121 @@ impl App {
         }
     }
 
+    /// Restore only after the background shell inventory is available.
+    fn start_sessions(&mut self) {
+        if !self.startup_pending
+            || self.window.is_none()
+            || (self.config.restore_tabs.unwrap_or(false) && !self.shell_profiles_ready)
+        {
+            return;
+        }
+        self.startup_pending = false;
+        // the PTY + conhost + PowerShell chain is the slowest dependency:
+        // start it immediately with a default grid; the exact grid follows
+        // once cell metrics exist (EasyTer starts 110x32 the same way).
+        // Start one fresh tab unless saved-tab restoration is explicitly enabled.
+        self.restore_state();
+        // debug hook: BAYAN_SPLIT=1 opens the first tab pre-split, so the
+        // pane machinery can be verified without injecting any input
+        if dev_hook("BAYAN_SPLIT").is_some() {
+            self.split(Orientation::Row);
+        }
+        // debug hook: BAYAN_GROUPS=1 adds a second tab to the first group,
+        // then a second group of one tab, which stays on screen — the chip,
+        // the per-group bar and the group rows, reachable without input
+        if dev_hook("BAYAN_GROUPS").is_some() {
+            self.spawn_tab(None);
+            self.new_group();
+        }
+        // debug hook: BAYAN_SHELLS=1 opens the tab bar's shell menu as a
+        // right-click on the bar would, anchored inside the bar; it fills
+        // in when shell detection reports
+        if dev_hook("BAYAN_SHELLS").is_some() {
+            self.cursor_pos = PhysicalPosition::new(240.0, 20.0);
+            self.open_shell_menu();
+        }
+        if dev_hook("BAYAN_COCKPIT").is_some() {
+            self.cockpit = true;
+            self.cockpit_sel = self.active;
+        }
+        if dev_hook("BAYAN_GUARD").is_some() {
+            self.arm_pending_paste("echo one\necho two\necho three\n".into(), None);
+        }
+        if dev_hook("BAYAN_SETTINGS").is_some() {
+            self.settings = Some(0);
+        }
+        if dev_hook("BAYAN_SHORTCUTS").is_some() {
+            self.shortcuts = Some(ShortcutsState::default());
+        }
+        // BAYAN_TYPE=<text>: feed text into the first pane's PTY — the
+        // visual-verification hook (ligatures, shaping) with no keyboard
+        if let Some(v) = dev_hook("BAYAN_TYPE") {
+            if let Some(t) = v.to_str() {
+                let t = t.to_string();
+                if let Some(s) = self.session_mut() {
+                    s.write(t.as_bytes());
+                }
+            }
+        }
+        // BAYAN_PASTE=<text>: put text on the clipboard and right-click the
+        // focused pane once the renderer exists, so right-click paste can
+        // be verified without injecting mouse input. It replaces whatever
+        // was on the clipboard.
+        if let Some(v) = dev_hook("BAYAN_PASTE") {
+            self.debug_paste = v.to_str().map(str::to_string);
+        }
+        // BAYAN_POSH=1: open the prompt picker at startup (capture without keys)
+        if dev_hook("BAYAN_POSH").is_some() {
+            self.open_posh();
+        }
+        // BAYAN_PALETTE=<query|1>: open the palette at startup, so it can be
+        // captured without injecting keystrokes (the debug-hook rule)
+        if let Some(v) = dev_hook("BAYAN_PALETTE") {
+            let q = v.to_str().unwrap_or("").to_string();
+            self.open_palette(if q == "1" { String::new() } else { q });
+        }
+        // BAYAN_TOAST=<title|1>: fire a sample toast at startup (M19
+        // verification; a custom value becomes the title, so direction
+        // experiments run without rebuilding)
+        if let Some(v) = dev_hook("BAYAN_TOAST") {
+            if let Some(h) = self.hwnd() {
+                let t = v.to_str().unwrap_or("1");
+                let title = if t == "1" {
+                    tr("اكتمل الأمر", "Command finished")
+                } else {
+                    t
+                };
+                let ok = toast::show(
+                    h,
+                    title,
+                    tr(
+                        "بيان — إشعار تجريبي (M19)",
+                        "Bayan — test notification (M19)",
+                    ),
+                );
+                eprintln!("bayan: BAYAN_TOAST show accepted={ok}");
+            }
+        }
+        // BAYAN_PICK_THEME=<n>: open settings and apply theme n, so a click's
+        // live effect can be verified in a screenshot without input injection
+        if let Some(v) = dev_hook("BAYAN_PICK_THEME") {
+            self.settings = Some(0);
+            if let Some(n) = v.to_str().and_then(|s| s.parse::<usize>().ok()) {
+                self.apply_theme(n);
+            }
+        }
+        crate::prof::mark("session spawned");
+        // the window exists now; if it is already focused and a pane has
+        // 1004, say so. has_focus is the same check a later rebase uses.
+        self.sync_focus(None);
+        if self.renderer.is_some() {
+            if let Some(text) = self.debug_paste.take() {
+                self.debug_right_click_paste(text);
+            }
+        }
+        self.request_redraw();
+    }
+
     fn restore_state(&mut self) {
         if !self.config.restore_tabs.unwrap_or(false) {
             self.spawn_tab(None);
@@ -2546,14 +3155,48 @@ impl App {
         let saved = load_saved_state();
         match saved {
             Some(state) if !state.tabs.is_empty() => {
+                let group_count = state.groups.len().max(1);
+                self.groups = groups::Groups::restored(
+                    state
+                        .groups
+                        .iter()
+                        .map(|n| n.as_deref().and_then(clean_tab_name))
+                        .collect(),
+                );
                 // BAYAN-014: a session.json with hundreds of tabs (a bug, a
                 // hand edit, a planted file) must not spawn hundreds of shells
+                let default = self.config.shell_program();
+                let installed = self.shell_profiles.clone();
                 for mut st in state.tabs.into_iter().take(MAX_RESTORED_TABS) {
                     let mut cwds = std::mem::take(&mut st.cwds).into_iter();
-                    self.spawn_tab(cwds.next().flatten());
+                    let mut shells = std::mem::take(&mut st.shells).into_iter();
+                    let mut shell =
+                        || restored_shell(shells.next().flatten(), &default, &installed);
+                    // an index past the saved groups (a hand edit) joins
+                    // the first group rather than inventing one
+                    let group = if st.group < group_count { st.group } else { 0 };
+                    self.spawn_group = Some(group as u32);
+                    let before = self.tabs.len();
+                    let cwd = cwds.next().flatten();
+                    let first = shell();
+                    self.spawn_tab_command(cwd.clone(), &first);
+                    if self.tabs.len() == before && first != default {
+                        // the saved shell is gone (PowerShell 7 uninstalled,
+                        // a WSL distro removed): the tab still comes back
+                        self.spawn_group = Some(group as u32);
+                        self.spawn_tab(cwd);
+                    }
+                    self.spawn_group = None;
+                    if self.tabs.len() == before {
+                        continue; // its shell failed: no tab to fill in
+                    }
                     for cwd in cwds.take(3) {
                         // re-split with the saved axis; weights come after
-                        if let Some(pane) = self.spawn_pane(cwd.as_deref()) {
+                        let cmd = shell();
+                        let pane = self
+                            .spawn_pane_command(cwd.as_deref(), &cmd)
+                            .or_else(|| self.spawn_pane(cwd.as_deref()));
+                        if let Some(pane) = pane {
                             if let Some(t) = self.tabs.last_mut() {
                                 t.panes.push(pane);
                             }
@@ -2565,7 +3208,15 @@ impl App {
                         t.name = st.name.as_deref().and_then(clean_tab_name);
                     }
                 }
+                if self.tabs.is_empty() {
+                    self.groups = groups::Groups::new();
+                    self.spawn_tab(None);
+                    return;
+                }
+                // groups whose every tab failed to come back are dropped
+                self.groups.prune(&self.tab_groups());
                 self.active = state.active.min(self.tabs.len().saturating_sub(1));
+                self.mru.touch(self.active);
                 self.relayout_active();
             }
             _ => self.spawn_tab(None),
@@ -2940,8 +3591,7 @@ impl App {
         let raw = self.tabs[ti].panes[pi]
             .session
             .meta
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .cwd
             .clone();
         link::cwd_hook(raw.as_deref())
@@ -3033,9 +3683,10 @@ impl App {
             | link::Action::EditDefault { .. }) => self.spawn_link_open(action),
             link::Action::Confirm { uri, host } => {
                 self.blocked_link = Some(BlockedLink {
-                    reason: link::HOST_CONFIRM.to_string(),
+                    reason: link::host_confirm().to_string(),
                     shown: link::confirm_card_shown(&host, &uri),
                     confirm_uri: Some(uri),
+                    is_app_error: false,
                 });
                 self.clear_link_hover();
                 self.request_redraw();
@@ -3093,6 +3744,7 @@ impl App {
             reason: reason.label().to_string(),
             shown: link::preview(shown, 160),
             confirm_uri: None,
+            is_app_error: false,
         });
         self.clear_link_hover();
         self.request_redraw();
@@ -3344,6 +3996,18 @@ impl App {
         }
     }
 
+    /// Right-click on the tab bar, or the pane menu's «تبويب جديد بطرفية…»:
+    /// the installed shells under the pointer. A row opens a new tab with
+    /// that shell in the group on screen, through the same `PaletteRow::Shell`
+    /// path the palette's «تبويب جديد — …» rows take.
+    fn open_shell_menu(&mut self) {
+        self.open_context_menu();
+        if let Some(p) = self.palette.as_mut() {
+            p.shells_menu = true;
+        }
+        self.request_redraw();
+    }
+
     /// Ctrl+Shift+R: the palette, in naming mode. Whatever is typed becomes
     /// the tab's name on Enter; the first row restores the folder name.
     fn open_rename_tab(&mut self) {
@@ -3354,7 +4018,7 @@ impl App {
             .unwrap_or_default();
         self.open_palette(current);
         if let Some(p) = self.palette.as_mut() {
-            p.rename = true;
+            p.rename = Some(RenameTarget::Tab);
         }
     }
 
@@ -3594,8 +4258,10 @@ impl App {
         }
         // the bar's visibility is a per-frame fact (tab count × setting)
         let hide = self.config.hide_single_tab_on() && self.tabs.len() <= 1;
+        let chip = self.group_chip();
         if let Some(r) = self.renderer.as_mut() {
             r.set_bar_hidden(hide);
+            r.set_group_chip(chip);
         }
         // computed before the gpu/renderer borrows (they read &self broadly)
         let cockpit_entries = if self.cockpit {
@@ -3612,6 +4278,12 @@ impl App {
             .as_ref()
             .map(|r| r.family().to_string())
             .unwrap_or_default();
+        // likewise the Arabic font actually in use, or Auto
+        let settings_arabic = self
+            .renderer
+            .as_ref()
+            .and_then(|r| r.arabic_family().map(str::to_string))
+            .unwrap_or_else(|| tr("تلقائي", "Auto").to_string());
         let cursor_style = self.config.cursor();
         let (cursor_on, _) = self.cursor_blink_state();
         self.blink_drawn_on = cursor_on;
@@ -3650,7 +4322,11 @@ impl App {
         let close_msg: Option<String> = self.pending_close.map(|target| match target {
             CloseTarget::Pane(ti, pi) => {
                 let cmd = chrome_text(&self.running_command(ti, pi).unwrap_or_default());
-                format!("الأمر «{cmd}» ما يزال يعمل — إغلاق اللوحة؟")
+                if lang::rtl() {
+                    format!("الأمر «{cmd}» ما يزال يعمل — إغلاق اللوحة؟")
+                } else {
+                    format!("“{cmd}” is still running — close the pane?")
+                }
             }
             CloseTarget::Tab(ti) => {
                 let n = self
@@ -3663,17 +4339,28 @@ impl App {
                             .count()
                     })
                     .unwrap_or(0);
-                format!("{n} أمر ما يزال يعمل — إغلاق التبويب؟")
+                if lang::rtl() {
+                    format!("{n} أمر ما يزال يعمل — إغلاق التبويب؟")
+                } else {
+                    format!("{n} command(s) still running — close the tab?")
+                }
             }
             CloseTarget::Window => {
-                format!("{} أمر ما يزال يعمل — إغلاق بيان؟", self.running_count())
+                let n = self.running_count();
+                if lang::rtl() {
+                    format!("{n} أمر ما يزال يعمل — إغلاق بيان؟")
+                } else {
+                    format!("{n} command(s) still running — close Bayan?")
+                }
             }
         });
         let rects = self.pane_rects();
+        // the bar shows the active group's tabs only
         let tab_infos: Vec<render::TabInfo> = self
-            .tabs
-            .iter()
-            .enumerate()
+            .visible_tabs()
+            .0
+            .into_iter()
+            .map(|i| (i, &self.tabs[i]))
             .map(|(i, t)| render::TabInfo {
                 title: t.label(),
                 busy: t.busy(i == self.active),
@@ -3812,6 +4499,7 @@ impl App {
                             theme: settings_theme,
                             font_family: &settings_family,
                             font_size: settings_size,
+                            arabic_font: &settings_arabic,
                             cursor: cursor_style,
                             cursor_blink: self.config.cursor_blink_on(),
                             scrollback: self.config.scrollback_lines(),
@@ -3845,14 +4533,24 @@ impl App {
                     );
                 }
                 if let Some(block) = &self.blocked_link {
-                    renderer.draw_link_block(
-                        &mut verts,
-                        px.width as usize,
-                        px.height as usize,
-                        &block.reason,
-                        &block.shown,
-                        block.confirm_uri.is_some(),
-                    );
+                    if block.is_app_error {
+                        renderer.draw_app_error(
+                            &mut verts,
+                            px.width as i32,
+                            px.height as i32,
+                            &block.reason,
+                            &block.shown,
+                        );
+                    } else {
+                        renderer.draw_link_block(
+                            &mut verts,
+                            px.width as usize,
+                            px.height as usize,
+                            &block.reason,
+                            &block.shown,
+                            block.confirm_uri.is_some(),
+                        );
+                    }
                 }
                 if let Some((rows, sel, capturing, flash)) = &shortcuts_view {
                     renderer.draw_shortcuts(
@@ -3911,6 +4609,12 @@ impl App {
             _ => {}
         }
         let Some(gpu) = self.gpu.as_mut() else { return };
+        // During a Windows resize, the live client size can advance ahead of
+        // Resized events. Use the same size for geometry and the swapchain.
+        let surface_resized = gpu.resize(px.width, px.height);
+        if surface_resized {
+            self.last_frame_size = None;
+        }
         // new glyphs were rasterized this frame: sync the atlas texture
         let mut heal = false;
         if let Some(renderer) = self.renderer.as_mut() {
@@ -3941,15 +4645,23 @@ impl App {
         // the frame is pixel-for-pixel the last one — skip the submit. (An
         // atlas upload this frame always redraws; so does a heal.)
         let frame_bytes = bytemuck::cast_slice::<gpu::Vertex, u8>(&verts);
-        // never skip the very first present (it reveals the hidden window)
-        let unchanged = self.first_frame && !heal && frame_bytes == self.last_frame.as_slice();
+        let unchanged =
+            self.last_frame_size == Some(px) && !heal && frame_bytes == self.last_frame.as_slice();
         if unchanged {
+            return;
+        }
+        let bg = self.renderer.as_ref().map_or(render::BG, |r| r.bg);
+        if !gpu.render(&verts, bg) {
+            // Retry once after reconfiguring, without spinning on occlusion.
+            self.last_frame_size = None;
+            if surface_resized || heal {
+                window.request_redraw();
+            }
             return;
         }
         self.last_frame.clear();
         self.last_frame.extend_from_slice(frame_bytes);
-        let bg = self.renderer.as_ref().map_or(render::BG, |r| r.bg);
-        gpu.render(&verts, bg);
+        self.last_frame_size = Some(px);
         if heal {
             window.request_redraw();
         }
@@ -4010,14 +4722,28 @@ impl ApplicationHandler<UserEvent> for App {
                 });
             }
         }
-        let window = Arc::new(el.create_window(attrs).expect("create window"));
+        let window = match el.create_window(attrs) {
+            Ok(window) => Arc::new(window),
+            Err(error) => {
+                self.startup_error = Some(format!("Could not create the window: {error}"));
+                el.exit();
+                return;
+            }
+        };
         crate::prof::mark("window created");
         let px = window.inner_size();
-        let gpu = gpu::Gpu::new(window.clone(), px.width, px.height)
-            .expect("gpu init (DX12/Vulkan/GL via wgpu)");
+        let gpu = match gpu::Gpu::new(window.clone(), px.width, px.height) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                self.startup_error = Some(format!("Could not initialize graphics: {error}"));
+                el.exit();
+                return;
+            }
+        };
         crate::prof::mark("gpu ready");
         self.gpu = Some(gpu);
         self.window = Some(window.clone());
+        self.report_config_load_error();
         self.apply_opacity(); // the configured window alpha, from frame one
         self.apply_window_frame();
         if let Some(h) = self.hwnd() {
@@ -4029,79 +4755,7 @@ impl ApplicationHandler<UserEvent> for App {
         // first frame NOW: a dark window on screen beats a frozen launcher.
         // The shell and the font system warm up behind it, in parallel.
         self.redraw();
-        // the PTY + conhost + PowerShell chain is the slowest dependency:
-        // start it immediately with a default grid; the exact grid follows
-        // once cell metrics exist (EasyTer starts 110x32 the same way).
-        // Start one fresh tab unless saved-tab restoration is explicitly enabled.
-        self.restore_state();
-        // debug hook: BAYAN_SPLIT=1 opens the first tab pre-split, so the
-        // pane machinery can be verified without injecting any input
-        if dev_hook("BAYAN_SPLIT").is_some() {
-            self.split(Orientation::Row);
-        }
-        if dev_hook("BAYAN_COCKPIT").is_some() {
-            self.cockpit = true;
-            self.cockpit_sel = self.active;
-        }
-        if dev_hook("BAYAN_GUARD").is_some() {
-            self.arm_pending_paste("echo one\necho two\necho three\n".into(), None);
-        }
-        if dev_hook("BAYAN_SETTINGS").is_some() {
-            self.settings = Some(0);
-        }
-        if dev_hook("BAYAN_SHORTCUTS").is_some() {
-            self.shortcuts = Some(ShortcutsState::default());
-        }
-        // BAYAN_TYPE=<text>: feed text into the first pane's PTY — the
-        // visual-verification hook (ligatures, shaping) with no keyboard
-        if let Some(v) = dev_hook("BAYAN_TYPE") {
-            if let Some(t) = v.to_str() {
-                let t = t.to_string();
-                if let Some(s) = self.session_mut() {
-                    s.write(t.as_bytes());
-                }
-            }
-        }
-        // BAYAN_PASTE=<text>: put text on the clipboard and right-click the
-        // focused pane once the renderer exists, so right-click paste can
-        // be verified without injecting mouse input. It replaces whatever
-        // was on the clipboard.
-        if let Some(v) = dev_hook("BAYAN_PASTE") {
-            self.debug_paste = v.to_str().map(str::to_string);
-        }
-        // BAYAN_POSH=1: open the prompt picker at startup (capture without keys)
-        if dev_hook("BAYAN_POSH").is_some() {
-            self.open_posh();
-        }
-        // BAYAN_PALETTE=<query|1>: open the palette at startup, so it can be
-        // captured without injecting keystrokes (the debug-hook rule)
-        if let Some(v) = dev_hook("BAYAN_PALETTE") {
-            let q = v.to_str().unwrap_or("").to_string();
-            self.open_palette(if q == "1" { String::new() } else { q });
-        }
-        // BAYAN_TOAST=<title|1>: fire a sample toast at startup (M19
-        // verification; a custom value becomes the title, so direction
-        // experiments run without rebuilding)
-        if let Some(v) = dev_hook("BAYAN_TOAST") {
-            if let Some(h) = self.hwnd() {
-                let t = v.to_str().unwrap_or("1");
-                let title = if t == "1" { "اكتمل الأمر" } else { t };
-                let ok = toast::show(h, title, "بيان — إشعار تجريبي (M19)");
-                eprintln!("bayan: BAYAN_TOAST show accepted={ok}");
-            }
-        }
-        // BAYAN_PICK_THEME=<n>: open settings and apply theme n, so a click's
-        // live effect can be verified in a screenshot without input injection
-        if let Some(v) = dev_hook("BAYAN_PICK_THEME") {
-            self.settings = Some(0);
-            if let Some(n) = v.to_str().and_then(|s| s.parse::<usize>().ok()) {
-                self.apply_theme(n);
-            }
-        }
-        crate::prof::mark("session spawned");
-        // the window exists now; if it is already focused and a pane has
-        // 1004, say so. has_focus is the same check a later rebase uses.
-        self.sync_focus(None);
+        self.start_sessions();
         // FontSystem::new scans every installed font — the documented
         // cosmic-text startup cost (pop-os/cosmic-text#247): keep it off
         // the UI thread and swap the renderer in when it's ready
@@ -4135,11 +4789,13 @@ impl ApplicationHandler<UserEvent> for App {
                     palette.extras.extend(profiles.iter().map(|shell| {
                         (
                             PaletteRow::Shell(shell.command.clone()),
-                            format!("تبويب جديد — {}", shell.name),
+                            format!("{} — {}", tr("تبويب جديد", "New tab"), shell.label()),
                         )
                     }));
                 }
                 self.shell_profiles = profiles;
+                self.shell_profiles_ready = true;
+                self.start_sessions();
                 self.request_redraw();
             }
             UserEvent::Wakeup(id) => {
@@ -4173,6 +4829,13 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::PtyWrite(id, text) => {
                 if let Some((ti, pi)) = self.find_pane(id) {
                     self.tabs[ti].panes[pi].session.write(text.as_bytes());
+                }
+            }
+            UserEvent::PtyWriteFailed(id, error) => {
+                if let Some((ti, pi)) = self.find_pane(id) {
+                    // one report per failure burst; re-arm only once shown
+                    self.tabs[ti].panes[pi].session.write_error_shown();
+                    self.report_error(tr("تعذر إرسال الإدخال", "Could not send input"), &error);
                 }
             }
             UserEvent::ClipboardSet(id, text) => {
@@ -4211,7 +4874,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // exactly this bell when it needs an approval).
                     if !self.focused && self.config.notifications_on() {
                         let body = self.tabs[ti].label();
-                        self.toast_from_pty("بيان — تنبيه", &body);
+                        self.toast_from_pty(tr("بيان — تنبيه", "Bayan — alert"), &body);
                         if let Some(w) = &self.window {
                             w.request_user_attention(Some(
                                 winit::window::UserAttentionType::Informational,
@@ -4325,6 +4988,7 @@ impl ApplicationHandler<UserEvent> for App {
                     reason,
                     shown: link::preview(&shown, 160),
                     confirm_uri: None,
+                    is_app_error: false,
                 });
                 self.clear_link_hover();
                 self.request_redraw();
@@ -4492,7 +5156,38 @@ pub(crate) fn harden_dll_search() {
 /// inbox copy could break the DXC path).
 const GPU_SYSTEM_DLLS: &[&str] = &["d3d12.dll", "dcomp.dll", "d3dcompiler_47.dll"];
 
-fn main() {
+fn show_error_dialog(
+    owner: Option<windows_sys::Win32::Foundation::HWND>,
+    title: &str,
+    detail: &str,
+) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+    let detail: Vec<u16> = detail.encode_utf16().chain(Some(0)).collect();
+    // SAFETY: both buffers are NUL-terminated and live for the call.
+    unsafe {
+        MessageBoxW(
+            owner.unwrap_or(std::ptr::null_mut()),
+            detail.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("bayan: {error}");
+            show_error_dialog(None, tr("تعذّر بدء بيان", "Bayan could not run"), &error);
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), String> {
     harden_dll_search();
     prof::init();
     prof::mark("main start");
@@ -4518,7 +5213,7 @@ fn main() {
             false
         })
         .build()
-        .expect("event loop");
+        .map_err(|error| format!("Could not create the event loop: {error}"))?;
     event_loop.set_control_flow(ControlFlow::Wait);
     prof::mark("event loop built");
     let proxy = event_loop.create_proxy();
@@ -4526,7 +5221,16 @@ fn main() {
     std::thread::spawn(move || {
         let _ = profiles_proxy.send_event(UserEvent::ShellProfiles(shells::detect()));
     });
-    let cfg = config::load();
+    let (mut cfg, config_load_error) = match config::load() {
+        Ok(cfg) => (cfg, None),
+        Err(error) => (config::UserConfig::default(), Some(error.to_string())),
+    };
+    // debug hook: BAYAN_ARABIC_FONT=<family> draws terminal Arabic in that
+    // font for this run only (config.json is not written unless a setting
+    // is changed in the panel), so the setting is screenshot-verifiable
+    if let Some(v) = dev_hook("BAYAN_ARABIC_FONT") {
+        cfg.arabic_font = v.to_str().map(str::to_string);
+    }
     // plugins load once, before the first renderer, so a plugin theme named in
     // the config resolves on the very first frame
     let plug = plugins::init(&cfg.disabled_plugins());
@@ -4537,13 +5241,23 @@ fn main() {
             config::bayan_dir().join("plugins.log").display()
         );
     }
+    lang::set(cfg.lang());
+    // debug hook: BAYAN_LANG=en starts in English without touching
+    // config.json, so the English layout can be screenshot-verified
+    if let Some(v) = dev_hook("BAYAN_LANG") {
+        lang::set(lang::Lang::from_config(v.to_str()));
+    }
     let keymap = keybinds::effective_map(&cfg);
     let mut app = App {
         posh: None,
         last_toast: None,
         mru: mru::Mru::new(),
+        groups: groups::Groups::new(),
+        spawn_group: None,
         palette: None,
         shell_profiles: Vec::new(),
+        shell_profiles_ready: false,
+        startup_pending: true,
         last_strip_click: None,
         proxy,
         window: None,
@@ -4560,6 +5274,7 @@ fn main() {
         first_frame: false,
         first_output: false,
         last_frame: Vec::new(),
+        last_frame_size: None,
         cursor_pos: PhysicalPosition::new(0.0, 0.0),
         mouse: mouse::Route::default(),
         sel_pane: 0,
@@ -4583,6 +5298,8 @@ fn main() {
         auto_follow: true,
         claude_manual: false,
         config: cfg,
+        config_load_error,
+        startup_error: None,
         keymap,
         shortcuts: None,
         atlas_generation: 0,
@@ -4593,7 +5310,11 @@ fn main() {
         keys_held_away: Vec::new(),
         debug_paste: None,
     };
-    event_loop.run_app(&mut app).expect("run event loop");
+    let result = event_loop.run_app(&mut app);
+    if let Some(error) = app.startup_error {
+        return Err(error);
+    }
+    result.map_err(|error| format!("The event loop failed: {error}"))
 }
 
 /// OSC 52 writes only from the focused pane of the active tab.
@@ -4961,6 +5682,8 @@ mod tests {
             focused: 0,
             layout: Some(tree.clone()),
             name: None,
+            group: 0,
+            shells: Vec::new(),
         };
         assert_eq!(restored_layout(&st, 3), tree);
         // a pane failed to respawn: the tree no longer fits, use one axis
@@ -5082,8 +5805,11 @@ mod tests {
                 focused: 1,
                 layout: None,
                 name: Some("خادم".into()),
+                group: 0,
+                shells: Vec::new(),
             }],
             active: 0,
+            groups: Vec::new(),
             window: Some(WindowGeom {
                 x: 40,
                 y: 60,
@@ -5289,14 +6015,142 @@ mod m38_tests {
 
     #[test]
     fn rename_rows_put_the_typed_name_first_and_always_offer_the_reset() {
-        let rows = rename_rows(" api ");
+        let rows = rename_rows(RenameTarget::Tab, " api ");
         assert_eq!(rows.len(), 2);
         assert!(rows[0].0 == PaletteRow::RenameTab(Some("api".into())));
         assert!(rows[1].0 == PaletteRow::RenameTab(None));
         // nothing typed: Enter restores the folder name
-        let rows = rename_rows("");
+        let rows = rename_rows(RenameTarget::Tab, "");
         assert_eq!(rows.len(), 1);
         assert!(rows[0].0 == PaletteRow::RenameTab(None));
+        // the same shape for a group, through the same sanitizer
+        let rows = rename_rows(RenameTarget::Group, " back\u{202E}end ");
+        assert!(rows[0].0 == PaletteRow::RenameGroup(Some("backend".into())));
+        assert!(rows[1].0 == PaletteRow::RenameGroup(None));
+    }
+
+    #[test]
+    fn group_rows_offer_only_moves_that_change_something() {
+        // one group: nothing to show or move into, only a new group
+        let one = group_rows(&[(0, "مجموعة 1".into())], 0);
+        assert_eq!(one.len(), 1);
+        assert!(one[0].0 == PaletteRow::MoveToGroup(None));
+        // three groups, the second on screen
+        let g = [
+            (0, "a".to_string()),
+            (1, "b".to_string()),
+            (2, "c".to_string()),
+        ];
+        let rows: Vec<PaletteRow> = group_rows(&g, 1).into_iter().map(|r| r.0).collect();
+        assert!(
+            rows == vec![
+                PaletteRow::ShowGroup(0),
+                PaletteRow::ShowGroup(2),
+                PaletteRow::MoveToGroup(Some(0)),
+                PaletteRow::MoveToGroup(Some(2)),
+                PaletteRow::MoveToGroup(None),
+                PaletteRow::OpenRenameGroup,
+            ]
+        );
+    }
+
+    #[test]
+    fn each_panes_shell_round_trips_and_only_detectable_ones_come_back() {
+        let installed = vec![shells::Shell {
+            name: "PowerShell 7".into(),
+            command: "pwsh.exe -NoLogo".into(),
+        }];
+        let def = "C:\\PROGRA~1\\Git\\bin\\bash.exe --login -i";
+        // all default: the field stays out of the file
+        assert!(saved_shells([def, def].into_iter(), def).is_empty());
+        let shells = saved_shells(["cmd.exe", def, "pwsh.exe -NoLogo"].into_iter(), def);
+        assert_eq!(
+            shells,
+            vec![
+                Some("cmd.exe".into()),
+                None,
+                Some("pwsh.exe -NoLogo".into())
+            ]
+        );
+        let st = SavedState {
+            tabs: vec![SavedTab {
+                cwds: vec![None, None, None],
+                weights: Vec::new(),
+                orientation: 0,
+                focused: 0,
+                layout: None,
+                name: None,
+                group: 0,
+                shells,
+            }],
+            active: 0,
+            groups: Vec::new(),
+            window: None,
+        };
+        let back = parse_state(&serde_json::to_string(&st).unwrap()).unwrap();
+        let got: Vec<String> = back.tabs[0]
+            .shells
+            .iter()
+            .cloned()
+            .map(|s| restored_shell(s, def, &installed))
+            .collect();
+        assert_eq!(got, vec!["cmd.exe", def, "pwsh.exe -NoLogo"]);
+        // a file from before the field restores every pane on the default
+        let old = parse_state(r#"{"tabs":[{"cwds":[null]}],"active":0}"#).unwrap();
+        assert!(old.tabs[0].shells.is_empty());
+        // a planted or hand-edited command is not run: the default is
+        assert_eq!(
+            restored_shell(Some("calc.exe".into()), def, &installed),
+            def
+        );
+        assert_eq!(
+            restored_shell(Some("cmd.exe /c del x".into()), def, &installed),
+            def
+        );
+        assert_eq!(restored_shell(None, def, &installed), def);
+    }
+
+    #[test]
+    fn removed_wsl_distribution_restores_the_default_shell() {
+        assert_eq!(
+            restored_shell(
+                Some("wsl.exe -d Bayan-Removed-Distro".into()),
+                "cmd.exe",
+                &[]
+            ),
+            "cmd.exe"
+        );
+    }
+
+    #[test]
+    fn groups_round_trip_and_files_without_them_are_one_group() {
+        let tab = |group| SavedTab {
+            cwds: vec![None],
+            weights: Vec::new(),
+            orientation: 0,
+            focused: 0,
+            layout: None,
+            name: None,
+            group,
+            shells: Vec::new(),
+        };
+        let s = SavedState {
+            tabs: vec![tab(0), tab(1), tab(0)],
+            active: 1,
+            groups: vec![None, Some("docs".into())],
+            window: None,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back = parse_state(&json).unwrap();
+        let saved: Vec<usize> = back.tabs.iter().map(|t| t.group).collect();
+        assert_eq!(saved, vec![0, 1, 0]);
+        assert_eq!(back.groups, vec![None, Some("docs".to_string())]);
+        // the first group's tabs write no `group` key at all
+        assert_eq!(json.matches("\"group\"").count(), 1);
+        // a file from before groups: every tab in the one group
+        let old = parse_state(r#"{"tabs":[{"cwds":[null]},{"cwds":[null]}],"active":0}"#).unwrap();
+        assert!(old.groups.is_empty());
+        assert!(old.tabs.iter().all(|t| t.group == 0));
     }
 
     #[test]
@@ -5367,6 +6221,54 @@ mod m38_tests {
     }
 
     #[test]
+    fn the_arabic_font_cycler_rings_through_auto() {
+        let c = vec!["Amiri".to_string(), "Cairo".to_string()];
+        assert_eq!(step_arabic_font(&c, None, 1).as_deref(), Some("Amiri"));
+        assert_eq!(
+            step_arabic_font(&c, Some("Amiri"), 1).as_deref(),
+            Some("Cairo")
+        );
+        assert_eq!(
+            step_arabic_font(&c, Some("Cairo"), 1),
+            None,
+            "wraps to Auto"
+        );
+        assert_eq!(step_arabic_font(&c, None, -1).as_deref(), Some("Cairo"));
+        assert_eq!(
+            step_arabic_font(&c, Some("Gone"), 1).as_deref(),
+            Some("Amiri")
+        );
+        assert_eq!(step_arabic_font(&[], None, 1), None, "nothing but Auto");
+    }
+
+    #[test]
+    fn english_menus_and_cards_read_in_english() {
+        lang::set(lang::Lang::En);
+        let labels: Vec<String> = context_menu_rows(true, 2, false, false)
+            .into_iter()
+            .map(|(_, l)| l)
+            .collect();
+        assert_eq!(&labels[..2], ["Copy", "Paste"]);
+        assert!(labels.iter().any(|l| l == "New tab with shell…"));
+        let rows = shell_menu_rows(&[], "cmd.exe");
+        assert_eq!(rows[1].1, "Command Prompt · default");
+        assert_eq!(broadcast_note(2).as_deref(), Some(" — goes to 3 panes"));
+        assert_eq!(keybinds::Action::NextGroup.label(), "Next group");
+        // nothing in the shortcuts registry is left in Arabic
+        for a in keybinds::Action::ALL {
+            assert!(
+                !a.label()
+                    .chars()
+                    .any(|c| ('\u{0600}'..='\u{06FF}').contains(&c)),
+                "{} has no English label",
+                a.id()
+            );
+        }
+        lang::set(lang::Lang::Ar);
+        assert_eq!(keybinds::Action::NextGroup.label(), "المجموعة التالية");
+    }
+
+    #[test]
     fn the_menu_opens_left_of_the_pointer_and_stays_inside_the_window() {
         let frame = (1000, 800);
         // room on the left and below: left of the pointer, top at the pointer
@@ -5409,10 +6311,51 @@ mod m38_tests {
         let split = labels(context_menu_rows(false, 2, true, true));
         assert!(split.iter().any(|l| l == "إلغاء تكبير اللوحة"));
         assert!(split.iter().any(|l| l == "إيقاف الكتابة في كل اللوحات"));
-        // every row is a keymap action: the menu cannot drift from the keys
-        assert!(context_menu_rows(true, 3, false, false)
+        // every row is a keymap action, so the menu cannot drift from the
+        // keys — except the one row that opens the shell menu, a list of
+        // shells rather than an action
+        let rows = context_menu_rows(true, 3, false, false);
+        assert!(rows
             .iter()
-            .all(|(r, _)| matches!(r, PaletteRow::Builtin(_))));
+            .all(|(r, _)| matches!(r, PaletteRow::Builtin(_) | PaletteRow::OpenShellMenu)));
+        assert_eq!(
+            rows.iter()
+                .filter(|(r, _)| *r == PaletteRow::OpenShellMenu)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_shell_menu_lists_every_detected_shell_and_marks_the_default() {
+        let detected = vec![
+            shells::Shell {
+                name: "PowerShell".into(),
+                command: "powershell.exe".into(),
+            },
+            shells::Shell {
+                name: "Command Prompt".into(),
+                command: "cmd.exe".into(),
+            },
+            shells::Shell {
+                name: "Git Bash".into(),
+                command: r"C:\PROGRA~1\Git\bin\bash.exe --login -i".into(),
+            },
+            shells::Shell {
+                name: "WSL · Ubuntu".into(),
+                command: "wsl.exe -d Ubuntu".into(),
+            },
+        ];
+        let rows = shell_menu_rows(&detected, "cmd.exe");
+        assert_eq!(rows.len(), 4);
+        assert!(rows[2].0 == PaletteRow::Shell(detected[2].command.clone()));
+        assert_eq!(rows[1].1, "Command Prompt · الافتراضية");
+        assert_eq!(rows[3].1, "WSL · Ubuntu");
+        // detection has not reported yet: PowerShell and cmd stand in
+        let early = shell_menu_rows(&[], "powershell.exe");
+        assert_eq!(early.len(), 2);
+        assert!(early[1].0 == PaletteRow::Shell("cmd.exe".into()));
+        assert_eq!(early[0].1, "PowerShell · الافتراضية");
     }
 
     #[test]
@@ -5425,8 +6368,11 @@ mod m38_tests {
                 focused: 0,
                 layout: None,
                 name: Some("سجلات".into()),
+                group: 0,
+                shells: Vec::new(),
             }],
             active: 0,
+            groups: Vec::new(),
             window: None,
         };
         let json = serde_json::to_string(&s).unwrap();

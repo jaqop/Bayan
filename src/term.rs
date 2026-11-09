@@ -2,7 +2,8 @@
 //! alacritty_terminal. Mirrors EasyTer's proven architecture: a reader thread
 //! feeds the emulator behind a mutex and nudges the UI thread to repaint.
 
-use std::io::{Read, Write};
+use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
@@ -232,8 +233,10 @@ pub(crate) fn nonce_capture_ps() -> String {
 #[link(name = "advapi32")]
 extern "system" {
     /// `SystemFunction036` is `RtlGenRandom`. 32 hex characters from it go
-    /// into OSC 133 so a program cannot mint a prompt-end mark.
-    fn SystemFunction036(randombuffer: *mut core::ffi::c_void, randombufferlength: u32) -> i32;
+    /// into OSC 133 so a program cannot mint a prompt-end mark. It returns a
+    /// one-byte BOOLEAN: typed `i32`, the `!= 0` test would also read three
+    /// bytes of EAX the ABI leaves undefined (ABIMISMATCH-001).
+    fn SystemFunction036(randombuffer: *mut core::ffi::c_void, randombufferlength: u32) -> u8;
 }
 
 /// A session nonce that no OSC 133 field can ever equal: payload fields are
@@ -297,9 +300,9 @@ impl CmdOutcome {
     /// The toast title for this outcome.
     pub fn title(self) -> &'static str {
         match self {
-            Self::Ok => "اكتمل الأمر",
-            Self::Failed => "فشل الأمر",
-            Self::Unknown => "انتهى الأمر",
+            Self::Ok => crate::lang::tr("اكتمل الأمر", "Command finished"),
+            Self::Failed => crate::lang::tr("فشل الأمر", "Command failed"),
+            Self::Unknown => crate::lang::tr("انتهى الأمر", "Command ended"),
         }
     }
 }
@@ -1949,11 +1952,93 @@ impl Dimensions for TermSize {
 /// id. PtyWrite matters most: TUIs (Claude Code among them) send ESC[6n and
 /// block waiting for the cursor position reply — the exact lesson EasyTer's
 /// ReportingScreen taught us; the reply must reach the RIGHT tab's PTY.
+///
+/// During a PTY read, bells and replies are held in the pane's `EventBatch`
+/// and the reader posts them once for the whole read (RESEXHAUST-001).
 #[derive(Clone)]
-pub struct EventProxy(pub EventLoopProxy<UserEvent>, pub u64);
+pub struct EventProxy(
+    pub EventLoopProxy<UserEvent>,
+    pub u64,
+    pub Arc<Mutex<EventBatch>>,
+);
+
+/// Reply bytes one PTY read may send back to the program. Output can ask
+/// any number of questions (`ESC [ c` is three bytes), and every answer
+/// used to be its own window event on winit's unbounded queue. A real
+/// program asks a handful per read; the rest of a flood is dropped.
+pub(crate) const MAX_CHUNK_REPLY_BYTES: usize = 16 * 1024;
+
+/// What one PTY read hands the window thread: at most one bell and one
+/// reply write, however many BEL bytes and queries the read held.
+#[derive(Debug, Default)]
+pub(crate) struct ChunkOutput {
+    pub bell: bool,
+    pub replies: String,
+}
+
+/// RESEXHAUST-001: alacritty reports each BEL and answers each query through
+/// the listener as it parses. While the reader thread processes a chunk
+/// (with the term lock held, so nothing from the window thread lands here)
+/// those are collected instead of posted. Outside a read they pass through.
+#[derive(Debug, Default)]
+pub struct EventBatch {
+    active: bool,
+    out: ChunkOutput,
+}
+
+impl EventBatch {
+    pub(crate) fn begin(&mut self) {
+        self.active = true;
+        self.out = ChunkOutput::default();
+    }
+
+    /// `Some(event)` when the event should be posted now.
+    pub(crate) fn absorb(&mut self, event: Event) -> Option<Event> {
+        if !self.active {
+            return Some(event);
+        }
+        match event {
+            Event::Bell => self.out.bell = true,
+            Event::PtyWrite(text) => push_reply(&mut self.out.replies, &text),
+            other => return Some(other),
+        }
+        None
+    }
+
+    /// End the read. Claude mode's Ctrl+L and Bayan's own replies follow
+    /// alacritty's, in the order the reader used to post them.
+    pub(crate) fn finish(&mut self, clean_claude: bool, extra: Vec<String>) -> ChunkOutput {
+        self.active = false;
+        let mut out = std::mem::take(&mut self.out);
+        if clean_claude {
+            out.replies.push('\x0c');
+        }
+        for reply in &extra {
+            push_reply(&mut out.replies, reply);
+        }
+        out
+    }
+}
+
+/// Whole replies only: a reply cut in half would be a broken sequence.
+fn push_reply(out: &mut String, reply: &str) {
+    if out.len() + reply.len() <= MAX_CHUNK_REPLY_BYTES {
+        out.push_str(reply);
+    }
+}
+
+/// A failed input write is reported once; the next report waits until the
+/// window has shown this one, so a full input queue cannot flood the event
+/// loop with copies of the same error.
+pub(crate) fn first_report(pending: &AtomicBool) -> bool {
+    !pending.swap(true, Ordering::AcqRel)
+}
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
+        let Some(event) = self.2.lock_or_recover().absorb(event) else {
+            return;
+        };
         let mapped = match event {
             Event::PtyWrite(text) => UserEvent::PtyWrite(self.1, text),
             Event::Wakeup => UserEvent::Wakeup(self.1),
@@ -1970,7 +2055,11 @@ impl EventListener for EventProxy {
 pub struct Session {
     pub term: Arc<FairMutex<Term<EventProxy>>>,
     pub meta: Arc<Mutex<SessionMeta>>,
-    writer: Box<dyn Write + Send>,
+    writer: crate::pty_writer::PtyWriter,
+    /// Set while a `PtyWriteFailed` is in flight (see [`first_report`]).
+    write_error: Arc<AtomicBool>,
+    proxy: EventLoopProxy<UserEvent>,
+    id: u64,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     /// Command line this pane was spawned with. Drag-drop quoting follows it,
@@ -2088,10 +2177,10 @@ impl Session {
             // UTF-8 code page so Arabic paths survive; no OSC 133 marks
             cmd.args(["/K", "chcp 65001>nul"]);
         }
-        let child = pair.slave.spawn_command(cmd)?;
-        drop(pair.slave);
         let mut reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
+        let mut child = pair.slave.spawn_command(cmd)?;
+        drop(pair.slave);
 
         let config = Config {
             scrolling_history: scrollback,
@@ -2103,10 +2192,11 @@ impl Session {
             kitty_keyboard: kitty_protocol,
             ..Config::default()
         };
+        let batch = Arc::new(Mutex::new(EventBatch::default()));
         let term = Arc::new(FairMutex::new(Term::new(
             config,
             &size,
-            EventProxy(proxy.clone(), id),
+            EventProxy(proxy.clone(), id, Arc::clone(&batch)),
         )));
 
         let meta = Arc::new(Mutex::new(SessionMeta {
@@ -2115,9 +2205,38 @@ impl Session {
             ..SessionMeta::default()
         }));
         let parser = Arc::new(Mutex::new(Processor::new()));
+        let capture_term = Arc::clone(&term);
+        let capture_meta = Arc::clone(&meta);
+        let error_proxy = proxy.clone();
+        let write_error = Arc::new(AtomicBool::new(false));
+        let writer_error = Arc::clone(&write_error);
+        let writer = match crate::pty_writer::PtyWriter::spawn(
+            writer,
+            move |bytes| {
+                // Capture at delivery, immediately before the shell can react.
+                if submits_a_command(bytes) {
+                    let t = capture_term.lock();
+                    let mut m = capture_meta.lock_or_recover();
+                    capture_command_core(&t, &mut m);
+                }
+            },
+            move |error| {
+                if first_report(&writer_error) {
+                    let _ =
+                        error_proxy.send_event(UserEvent::PtyWriteFailed(id, error.to_string()));
+                }
+            },
+        ) {
+            Ok(writer) => writer,
+            Err(error) => {
+                let _ = child.kill();
+                return Err(error.into());
+            }
+        };
         let term2 = Arc::clone(&term);
         let meta2 = Arc::clone(&meta);
         let parser2 = Arc::clone(&parser);
+        let input_proxy = proxy.clone();
         std::thread::spawn(move || {
             let mut carry: Vec<u8> = Vec::new();
             let mut buf = [0u8; PTY_READ];
@@ -2125,13 +2244,20 @@ impl Session {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        let ev = {
+                        let (ev, out) = {
                             // term, then meta, then parser. reset_keyboard
-                            // on the UI thread takes the same order.
+                            // on the UI thread takes the same order. The
+                            // batch opens and closes under the term lock,
+                            // so only this read's events are collected.
                             let mut t = term2.lock();
                             let mut m = meta2.lock_or_recover();
                             let mut p = parser2.lock_or_recover();
-                            process_chunk(&mut p, &mut t, &mut m, &mut carry, &buf[..n])
+                            batch.lock_or_recover().begin();
+                            let mut ev =
+                                process_chunk(&mut p, &mut t, &mut m, &mut carry, &buf[..n]);
+                            let replies = std::mem::take(&mut ev.pty_replies);
+                            let out = batch.lock_or_recover().finish(ev.clean_claude, replies);
+                            (ev, out)
                         };
                         if let Some(txt) = ev.clipboard {
                             let _ = proxy.send_event(UserEvent::ClipboardSet(id, txt));
@@ -2142,17 +2268,21 @@ impl Session {
                         if let Some(ok) = ev.finished {
                             let _ = proxy.send_event(UserEvent::CommandFinished(id, ok));
                         }
-                        if ev.clean_claude {
-                            // Ask Claude to redraw its own screen (Ctrl+L),
-                            // preserving its conversation and terminal state.
-                            let _ = proxy.send_event(UserEvent::PtyWrite(id, "\x0c".into()));
-                        }
+                        // One write for the whole read: alacritty's replies,
+                        // then Claude mode's Ctrl+L (a redraw that keeps the
+                        // conversation), then Bayan's own replies.
                         let mut loop_gone = false;
-                        for reply in ev.pty_replies {
-                            if proxy.send_event(UserEvent::PtyWrite(id, reply)).is_err() {
-                                loop_gone = true;
-                                break;
-                            }
+                        if !out.replies.is_empty()
+                            && proxy
+                                .send_event(UserEvent::PtyWrite(id, out.replies))
+                                .is_err()
+                        {
+                            loop_gone = true;
+                        }
+                        // the cockpit's attention signal: once per read,
+                        // however many BEL bytes it held
+                        if out.bell {
+                            let _ = proxy.send_event(UserEvent::Bell(id));
                         }
                         if let Some((title, body)) = ev.notify {
                             let _ = proxy.send_event(UserEvent::Notify(id, title, body));
@@ -2183,6 +2313,9 @@ impl Session {
             term,
             meta,
             writer,
+            write_error,
+            proxy: input_proxy,
+            id,
             master: pair.master,
             child,
             shell: shell.to_string(),
@@ -2211,15 +2344,19 @@ impl Session {
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
-        // Enter at a prompt starts a command: read it off the screen now,
-        // before the shell reacts (Claude mode auto-enable needs the name)
-        if submits_a_command(bytes) {
-            let t = self.term.lock();
-            let mut m = self.meta.lock_or_recover();
-            capture_command_core(&t, &mut m);
+        if let Err(error) = self.writer.try_write(bytes) {
+            if first_report(&self.write_error) {
+                let _ = self
+                    .proxy
+                    .send_event(UserEvent::PtyWriteFailed(self.id, error.to_string()));
+            }
         }
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+    }
+
+    /// The window has shown the last `PtyWriteFailed`; the next failure
+    /// may post again.
+    pub fn write_error_shown(&self) {
+        self.write_error.store(false, Ordering::Release);
     }
 
     pub fn resize(&mut self, size: TermSize) {
@@ -2265,12 +2402,20 @@ impl PasteRisk {
     /// Card copy. Arabic, matching the rest of the confirm UI.
     pub fn label(self) -> &'static str {
         match self {
-            PasteRisk::Enter => "يحتوي على Enter",
-            PasteRisk::Control => "يحتوي على أحرف تحكم",
-            PasteRisk::EnterAndControl => "يحتوي على Enter وأحرف تحكم",
-            PasteRisk::TooLong => "النص أطول من الحد",
-            PasteRisk::NotAtPrompt => "ليس في موجّه الأوامر",
-            PasteRisk::AltScreen => "البرنامج في وضع الشاشة الكاملة",
+            PasteRisk::Enter => crate::lang::tr("يحتوي على Enter", "Contains Enter"),
+            PasteRisk::Control => {
+                crate::lang::tr("يحتوي على أحرف تحكم", "Contains control characters")
+            }
+            PasteRisk::EnterAndControl => crate::lang::tr(
+                "يحتوي على Enter وأحرف تحكم",
+                "Contains Enter and control characters",
+            ),
+            PasteRisk::TooLong => crate::lang::tr("النص أطول من الحد", "Text is over the limit"),
+            PasteRisk::NotAtPrompt => crate::lang::tr("ليس في موجّه الأوامر", "Not at the prompt"),
+            PasteRisk::AltScreen => crate::lang::tr(
+                "البرنامج في وضع الشاشة الكاملة",
+                "A full-screen program is running",
+            ),
         }
     }
 }
@@ -3792,6 +3937,136 @@ mod tests {
         }
         assert!(osc133_trusted(b"A;n0nce", "n0nce"));
         assert!(osc133_trusted(b"B;n0nce", "n0nce"));
+    }
+
+    /// ABIMISMATCH-001: `RtlGenRandom` returns a one-byte BOOLEAN. With the
+    /// binding typed to match, a real call still yields a 32-hex nonce.
+    #[test]
+    fn prompt_nonce_comes_from_the_os_rng() {
+        let a = fresh_prompt_nonce();
+        assert_eq!(a.len(), 32, "{a}");
+        assert!(a.bytes().all(|b| b.is_ascii_hexdigit()), "{a}");
+        assert_ne!(a, fresh_prompt_nonce());
+    }
+
+    /// The window proxy's batching, over a test sink instead of winit: what
+    /// gets past `absorb` is what the proxy would post right away.
+    struct BatchListener(Arc<Mutex<EventBatch>>, Arc<Mutex<Vec<String>>>);
+
+    impl EventListener for BatchListener {
+        fn send_event(&self, event: Event) {
+            if let Some(event) = self.0.lock_or_recover().absorb(event) {
+                self.1.lock_or_recover().push(format!("{event:?}"));
+            }
+        }
+    }
+
+    type BatchTerm = (
+        Term<BatchListener>,
+        Arc<Mutex<EventBatch>>,
+        Arc<Mutex<Vec<String>>>,
+    );
+
+    fn batch_term() -> BatchTerm {
+        let batch = Arc::new(Mutex::new(EventBatch::default()));
+        let posted = Arc::new(Mutex::new(Vec::new()));
+        let size = TermSize { cols: 40, rows: 6 };
+        let listener = BatchListener(Arc::clone(&batch), Arc::clone(&posted));
+        (Term::new(Config::default(), &size, listener), batch, posted)
+    }
+
+    fn run_batched(
+        t: &mut Term<BatchListener>,
+        batch: &Mutex<EventBatch>,
+        data: &[u8],
+    ) -> ChunkOutput {
+        let (mut p, mut meta, mut carry) = (Processor::new(), SessionMeta::default(), Vec::new());
+        batch.lock_or_recover().begin();
+        let ev = process_chunk(&mut p, t, &mut meta, &mut carry, data);
+        batch
+            .lock_or_recover()
+            .finish(ev.clean_claude, ev.pty_replies)
+    }
+
+    /// RESEXHAUST-001: one read of BEL bytes and terminal queries used to
+    /// post one window event per byte or query, onto an unbounded queue.
+    /// The reader now hands over at most one bell and one capped reply write.
+    #[test]
+    fn a_flood_of_bells_and_queries_is_one_bell_and_one_capped_write() {
+        let (mut t, batch, posted) = batch_term();
+        let one = run_batched(&mut t, &batch, b"\x1b[c");
+        assert!(!one.bell);
+        assert!(!one.replies.is_empty(), "alacritty answers DA");
+
+        let mut flood = Vec::new();
+        for _ in 0..20_000 {
+            flood.extend_from_slice(b"\x07\x1b[c");
+        }
+        let out = run_batched(&mut t, &batch, &flood);
+        assert!(out.bell);
+        assert!(out.replies.len() <= MAX_CHUNK_REPLY_BYTES);
+        assert!(out.replies.len() > MAX_CHUNK_REPLY_BYTES - one.replies.len());
+        // whole replies only, never a cut one
+        assert_eq!(out.replies.len() % one.replies.len(), 0);
+        assert_eq!(out.replies.replace(&one.replies, ""), "");
+        assert!(
+            posted.lock_or_recover().is_empty(),
+            "nothing bypassed the batch"
+        );
+    }
+
+    #[test]
+    fn bayans_own_replies_share_the_cap_and_keep_their_order() {
+        let (mut t, batch, _) = batch_term();
+        // kitty protocol off: `process_chunk` answers `CSI ? u` itself
+        let mut flood = b"\x1b[c".to_vec();
+        for _ in 0..20_000 {
+            flood.extend_from_slice(b"\x1b[?u");
+        }
+        let out = run_batched(&mut t, &batch, &flood);
+        assert!(out.replies.len() <= MAX_CHUNK_REPLY_BYTES);
+        let kitty = out
+            .replies
+            .find("\x1b[?0u")
+            .expect("a kitty reply got through");
+        assert!(
+            out.replies[..kitty].ends_with('c'),
+            "alacritty's DA reply comes first"
+        );
+
+        // Claude mode's Ctrl+L rides in the same write, ahead of Bayan's replies
+        batch.lock_or_recover().begin();
+        let out = batch
+            .lock_or_recover()
+            .finish(true, vec!["\x1b[?0u".into()]);
+        assert_eq!(out.replies, "\x0c\x1b[?0u");
+    }
+
+    #[test]
+    fn outside_a_read_events_pass_straight_through() {
+        let mut batch = EventBatch::default();
+        assert!(matches!(batch.absorb(Event::Bell), Some(Event::Bell)));
+        assert!(matches!(
+            batch.absorb(Event::PtyWrite("x".into())),
+            Some(Event::PtyWrite(s)) if s == "x"
+        ));
+        batch.begin();
+        assert!(batch.absorb(Event::Bell).is_none());
+        assert!(matches!(batch.absorb(Event::Wakeup), Some(Event::Wakeup)));
+        let out = batch.finish(false, Vec::new());
+        assert!(out.bell);
+        // finish ends the read: the next bell is immediate again
+        assert!(matches!(batch.absorb(Event::Bell), Some(Event::Bell)));
+    }
+
+    #[test]
+    fn a_write_error_is_reported_once_until_the_window_shows_it() {
+        let pending = std::sync::atomic::AtomicBool::new(false);
+        assert!(first_report(&pending));
+        assert!(!first_report(&pending));
+        assert!(!first_report(&pending));
+        pending.store(false, std::sync::atomic::Ordering::Release);
+        assert!(first_report(&pending));
     }
 
     #[test]

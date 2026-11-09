@@ -23,10 +23,12 @@ selection and BiDi paths must do.
 | `osc7.rs` | OSC 7 cwd reports, parsed then gated by `term::accept_local_cwd` |
 | `mouse.rs` | mouse tracking modes 1000/1002/1003, SGR vs X10, focus events (1004), who owns a right-click (menu, paste, program) |
 | `keybinds.rs` | action registry + chord map |
+| `lang.rs` | interface language (Arabic default, English): `tr("عربي", "English")` pairs at the point of use, `rtl()`, `lead_x`/`trail_x` for which edge text starts from |
 | `keys.rs` | keyboard → VT byte sequences (ported from EasyTer) |
 | `kitty.rs` | kitty keyboard protocol encoder, layout-aware alternate keys |
 | `layout.rs` | a tab's split tree: side-by-side and stacked splits nest in any mix; leaves index the tab's flat pane list |
-| `mru.rs` | most-recently-used tab order for Ctrl+Tab |
+| `groups.rs` | tab groups: a group id TAG on each tab (tabs never move in the flat list), the group order and labels, the stay-in-group close rule |
+| `mru.rs` | most-recently-used tab order for Ctrl+Tab, walkable within one group |
 | `shells.rs` | installed-shell detection (ported from EasyTer's `profiles.py`) |
 | `posh.rs` | oh-my-posh theme picker with a live ANSI preview |
 | `plugins.rs` | declarative JSON plugin host (`~/.bayan/plugins/`) |
@@ -34,7 +36,7 @@ selection and BiDi paths must do.
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-384 tests across the tree. `term.rs` (70), `link.rs` (60) and `render.rs` (47)
+436 tests across the tree. `term.rs` (75), `link.rs` (60) and `render.rs` (59)
 carry the most.
 
 ## Invariants — do not "simplify" these
@@ -182,6 +184,10 @@ key identity or typed text:
 | `BAYAN_SHORTCUTS=1` | open the keybinding editor |
 | `BAYAN_PICK_THEME=<n>` | open settings and apply theme *n*, so a click's live effect is screenshot-verifiable |
 | `BAYAN_SPLIT=1` | start with the first tab pre-split (pane machinery) |
+| `BAYAN_ARABIC_FONT=<family>` | draw terminal Arabic in that font for this run (config.json untouched) — with `BAYAN_TYPE`, compare Arabic fonts side by side |
+| `BAYAN_LANG=en` | start in English without touching `config.json` (the English, left-to-right layout) |
+| `BAYAN_SHELLS=1` | open the tab bar's shell menu at startup, as a right-click on the bar would (it fills in when shell detection reports) |
+| `BAYAN_GROUPS=1` | add a second tab to the first group, then open a second group of one tab: the group chip and the per-group tab bar |
 | `BAYAN_COCKPIT=1` | open the agent cockpit |
 | `BAYAN_GUARD=1` | arm the PASTE guard with a 3-line sample (not the close guard — the name misleads) |
 | `BAYAN_TYPE=<text>` | feed text into the first pane's PTY — the hook for ligature and shaping checks |
@@ -193,8 +199,11 @@ key identity or typed text:
 | `BAYAN_PROFILE=1` | startup timeline marks to `%TEMP%\bayan_profile.log` (EasyTer's `EASYTER_PROFILE` pattern), zero cost when unset. Key presses log modifiers only, never the key |
 
 Start with `Start-Process -PassThru`, sleep ~6s for GPU init, capture the
-screen with `System.Drawing`, then `Stop-Process` the pid. Pre-approved
-variants of this are already in `.claude/settings.local.json`.
+screen with `System.Drawing`, then `Stop-Process` the pid. Any cleanup in
+a capture script deletes one named temp file, never a variable that could
+come out empty and fall back to a parent folder: one such script once
+issued `Remove-Item` on the user profile root, and only the permission
+guard stopped it.
 
 ## Conventions
 
@@ -220,6 +229,8 @@ hotkey. Prefer that over pulling in WinRT/COM.
 
 ## Project skills
 
-`.claude/skills/` carries `rust-best-practices`, `rust-testing`,
+`skills-lock.json` pins `rust-best-practices`, `rust-testing`,
 `m15-anti-pattern`, `windows-desktop-e2e`, and `webgpu-specs` (first-party from
-the wgpu repo — use it to pull WebGPU/WGSL spec text when touching `gpu.rs`).
+the wgpu repo — WebGPU/WGSL spec text for work on `gpu.rs`). The skill trees
+themselves are not in the repo (`.gitignore`); `.claude/skills/` exists only
+after `skills experimental_install` restores them.
