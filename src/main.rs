@@ -1635,7 +1635,7 @@ impl App {
             return;
         }
         let cur = self.config.shell_program();
-        let i = choices.iter().position(|c| c.command == cur).unwrap_or(0);
+        let i = shells::index_of(choices, &cur).unwrap_or(0);
         self.config.shell = Some(
             choices[keyroute::cycle(i, dir, choices.len())]
                 .command

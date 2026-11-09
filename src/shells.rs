@@ -175,12 +175,21 @@ fn resolve_bare_wsl(prog: &str, system_wsl: Option<&Path>) -> Option<String> {
 /// Command line stored for a distro. A path with a space is quoted so
 /// `split_command` keeps it as one program.
 fn format_wsl_invocation(exe: &Path, distro: &str) -> String {
+    format!("{} -d {distro}", quoted_program(exe))
+}
+
+fn quoted_program(exe: &Path) -> String {
     let p = exe.display().to_string();
     if p.contains([' ', '\t']) {
-        format!("\"{p}\" -d {distro}")
+        format!("\"{p}\"")
     } else {
-        format!("{p} -d {distro}")
+        p
     }
+}
+
+#[cfg(not(windows))]
+fn system32_dir() -> Option<std::path::PathBuf> {
+    None
 }
 
 #[cfg(windows)]
@@ -280,7 +289,7 @@ pub fn is_restorable(command: &str, installed: &[Shell]) -> bool {
     match command {
         "powershell.exe" | FAST_POWERSHELL | "cmd.exe" => true,
         c => {
-            installed.iter().any(|s| s.command == c)
+            index_of(installed, c).is_some()
                 && c.strip_prefix("wsl.exe -d ")
                     .is_none_or(is_safe_distro_name)
         }
@@ -292,11 +301,40 @@ pub fn is_restorable(command: &str, installed: &[Shell]) -> bool {
 /// `found` is the app's one background `detect()`: this runs inside the frame
 /// build, so it must not probe (detection spawns `wsl.exe`).
 pub fn label_for(found: &[Shell], command: &str) -> String {
+    index_of(found, command)
+        .map(|i| found[i].label())
+        .unwrap_or_else(|| command.trim_end_matches(".exe").to_string())
+}
+
+/// Where `command` sits in `found`, the settings row's label and the shell
+/// arrow's starting point.
+pub fn index_of(found: &[Shell], command: &str) -> Option<usize> {
+    let system32 = system32_dir();
     found
         .iter()
-        .find(|s| s.command == command)
-        .map(|s| s.label())
-        .unwrap_or_else(|| command.trim_end_matches(".exe").to_string())
+        .position(|s| same_shell_in(&s.command, command, system32.as_deref()))
+}
+
+/// Whether two stored command lines start the same shell. A bare `wsl` /
+/// `wsl.exe` program reads as the System32 copy `resolve_spawn_program`
+/// spawns, so a line saved before detection stored that path still matches.
+/// Any other program, a `wsl.exe` elsewhere included, compares as written.
+fn same_shell_in(a: &str, b: &str, system32: Option<&Path>) -> bool {
+    let spawn_form = |c: &str| -> String {
+        let c = c.trim();
+        let prog = c.split(char::is_whitespace).next().unwrap_or("");
+        match system32.filter(|d| d.is_absolute()) {
+            Some(dir) if is_bare_wsl(prog) => {
+                format!(
+                    "{}{}",
+                    quoted_program(&dir.join("wsl.exe")),
+                    &c[prog.len()..]
+                )
+            }
+            _ => c.to_string(),
+        }
+    };
+    spawn_form(a) == spawn_form(b)
 }
 
 #[cfg(test)]
@@ -508,6 +546,38 @@ mod tests {
         let (prog, args) = crate::term::split_command(&spaced);
         assert_eq!(prog, r"C:\Program Files\wsl.exe");
         assert_eq!(args, ["-d", "Ubuntu"]);
+    }
+
+    #[test]
+    fn a_wsl_command_saved_before_system32_resolution_is_the_same_shell() {
+        // detection now stores the System32 path; config.json and
+        // session.json written earlier still say `wsl.exe -d <distro>`
+        let sys = Path::new(r"C:\Windows\System32");
+        let stored = r"C:\Windows\System32\wsl.exe -d Ubuntu";
+        assert!(same_shell_in("wsl.exe -d Ubuntu", stored, Some(sys)));
+        assert!(same_shell_in("wsl -d Ubuntu", stored, Some(sys)));
+        assert!(same_shell_in("WSL.EXE -d Ubuntu", stored, Some(sys)));
+        assert!(!same_shell_in("wsl.exe -d Debian", stored, Some(sys)));
+        // only the bare name resolves: a copy elsewhere is another program
+        let planted = r"C:\Users\u\Downloads\wsl.exe -d Ubuntu";
+        assert!(!same_shell_in(planted, stored, Some(sys)));
+        assert!(!same_shell_in("wsl.exe -d Ubuntu", stored, None));
+        assert!(same_shell_in("cmd.exe", "cmd.exe", None));
+
+        // the settings row, the shell arrow and session restore all look up
+        // through the same comparison
+        let dir = system32_dir().expect("GetSystemDirectoryW");
+        let found = vec![
+            Shell::new("Command Prompt", "cmd.exe"),
+            Shell::new(
+                "WSL · Ubuntu",
+                format_wsl_invocation(&dir.join("wsl.exe"), "Ubuntu"),
+            ),
+        ];
+        assert_eq!(index_of(&found, "wsl.exe -d Ubuntu"), Some(1));
+        assert_eq!(label_for(&found, "wsl.exe -d Ubuntu"), "WSL · Ubuntu");
+        assert!(is_restorable("wsl.exe -d Ubuntu", &found));
+        assert!(!is_restorable(planted, &found));
     }
 
     #[test]
