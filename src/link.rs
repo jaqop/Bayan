@@ -97,33 +97,41 @@ pub enum RefuseReason {
     Empty,
     BadFile,
     Editor,
-    /// PATHEXT or another extension Windows association-opens as a program.
-    /// Association-open now reveals these instead of constructing this
-    /// variant. The label stays so a card can still name the reason.
-    #[allow(dead_code)]
-    Blocked,
     /// The path is local, and it is not on disk.
     Missing,
+    /// The path reads as local, but its drive is a mapped network drive or
+    /// a symlink or junction on the way leads off the local drives.
+    NotLocal,
 }
 
 impl RefuseReason {
     pub fn label(self) -> &'static str {
         match self {
-            RefuseReason::Scheme => "المخطط غير مسموح",
-            RefuseReason::ControlOrBidi => "يحتوي على أحرف تحكم",
-            RefuseReason::TooLong => "الرابط أطول من الحد",
-            RefuseReason::Empty => "رابط فارغ",
-            RefuseReason::BadFile => "مسار الملف غير مقبول",
-            RefuseReason::Editor => "تعذّر فتح المحرّر",
-            RefuseReason::Blocked => "لن يُفتح هذا النوع من الملفات",
-            RefuseReason::Missing => "الملف غير موجود",
+            RefuseReason::Scheme => crate::lang::tr("المخطط غير مسموح", "Scheme not allowed"),
+            RefuseReason::ControlOrBidi => {
+                crate::lang::tr("يحتوي على أحرف تحكم", "Contains control characters")
+            }
+            RefuseReason::TooLong => {
+                crate::lang::tr("الرابط أطول من الحد", "Link is over the limit")
+            }
+            RefuseReason::Empty => crate::lang::tr("رابط فارغ", "Empty link"),
+            RefuseReason::BadFile => {
+                crate::lang::tr("مسار الملف غير مقبول", "File path not accepted")
+            }
+            RefuseReason::Editor => crate::lang::tr("تعذّر فتح المحرّر", "Could not open the editor"),
+            RefuseReason::Missing => crate::lang::tr("الملف غير موجود", "File not found"),
+            RefuseReason::NotLocal => {
+                crate::lang::tr("الملف ليس على قرص محلي", "File is not on a local disk")
+            }
         }
     }
 }
 
 /// Shown on the confirm card when a URL carries userinfo. Enter opens it;
 /// Esc dismisses. A [`RefuseReason`] card does not open on Enter.
-pub const HOST_CONFIRM: &str = "تأكد من المضيف";
+pub fn host_confirm() -> &'static str {
+    crate::lang::tr("تأكد من المضيف", "Check the host")
+}
 
 /// What a Ctrl+click should do. The window loop performs it; nothing here
 /// builds a `cmd /c` string.
@@ -235,18 +243,11 @@ impl LinkSpan {
         }
     }
 
-    pub fn activate(
-        &self,
-        cwd: Option<&str>,
-        editor: Option<&str>,
-        code_exe: Option<&str>,
-    ) -> Action {
+    pub fn activate(&self, cwd: Option<&str>, editor: Option<&str>) -> Action {
         match &self.kind {
             LinkKind::Osc { uri, shown } => plan_osc(uri, shown),
             LinkKind::Url { uri } => plan_uri(uri),
-            LinkKind::File { path, line, col } => {
-                plan_file(path, *line, *col, cwd, editor, code_exe)
-            }
+            LinkKind::File { path, line, col } => plan_file(path, *line, *col, cwd, editor),
         }
     }
 }
@@ -326,6 +327,7 @@ fn marker(c: char) -> String {
         '\u{200F}' => "<RLM>".to_string(),
         '\u{061C}' => "<ALM>".to_string(),
         '\u{FEFF}' => "<BOM>".to_string(),
+        '\u{2060}' => "<WJ>".to_string(),
         c if (c as u32) <= 0x1F => char::from_u32(0x2400 + c as u32).unwrap().to_string(),
         '\u{007F}' => "\u{2421}".to_string(),
         c => format!("<U+{:04X}>", c as u32),
@@ -1433,12 +1435,41 @@ fn plan_local_open(path: &str) -> Action {
     }
 }
 
-fn local_file_exists(path: &str) -> bool {
+/// What [`settle`] learned about a local path on disk. A plain `bool` from
+/// a test probe converts: `true` is present, `false` is missing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Probe {
+    Present,
+    Missing,
+    /// On a mapped network drive, or reached through a symlink or junction
+    /// that leaves the local drives. Refused, never revealed: Explorer would
+    /// open the share just as the file's association would.
+    NotLocal,
+}
+
+impl From<bool> for Probe {
+    fn from(present: bool) -> Self {
+        if present {
+            Probe::Present
+        } else {
+            Probe::Missing
+        }
+    }
+}
+
+fn local_file_probe(path: &str) -> Probe {
     // A UNC stat opens SMB. Refuse that even if a caller skipped the gate.
     if crate::term::unc_or_device(path) {
-        return false;
+        return Probe::NotLocal;
     }
-    Path::new(path).exists()
+    // A junction in any component can still point at a share, and `exists`
+    // would follow it. The walk reads each link's target without following
+    // it; only a path that stays local is stat'd.
+    match crate::localpath::walk_live(path) {
+        crate::localpath::Walk::NotLocal => Probe::NotLocal,
+        crate::localpath::Walk::Missing => Probe::Missing,
+        crate::localpath::Walk::Local => Probe::from(Path::new(path).exists()),
+    }
 }
 
 fn plan_file(
@@ -1447,7 +1478,6 @@ fn plan_file(
     col: Option<u32>,
     cwd: Option<&str>,
     editor: Option<&str>,
-    code_exe: Option<&str>,
 ) -> Action {
     if path.is_empty() {
         return refuse(RefuseReason::Empty, path);
@@ -1476,20 +1506,6 @@ fn plan_file(
         match expand_editor(template, &full, Some(line), col) {
             Some(argv) if !is_shell_program(&argv[0]) => Action::Edit { argv, path: full },
             _ => refuse(RefuseReason::Editor, template),
-        }
-    } else if let Some(exe) = code_exe.map(str::trim).filter(|s| !s.is_empty()) {
-        if is_shell_program(exe) {
-            return refuse(RefuseReason::Editor, exe);
-        }
-        match expand_editor("code -g {file}:{line}:{col}", &full, Some(line), col) {
-            Some(mut argv) => {
-                argv[0] = exe.to_string();
-                if is_shell_program(&argv[0]) {
-                    return refuse(RefuseReason::Editor, exe);
-                }
-                Action::Edit { argv, path: full }
-            }
-            None => refuse(RefuseReason::Editor, exe),
         }
     } else {
         Action::EditDefault {
@@ -1607,9 +1623,10 @@ enum DiskPath {
     ForceReveal(String),
 }
 
-fn prepare_disk<E, L>(path: &str, exists: &E, long_path: &L) -> Result<DiskPath, Action>
+fn prepare_disk<E, P, L>(path: &str, exists: &E, long_path: &L) -> Result<DiskPath, Action>
 where
-    E: Fn(&str) -> bool,
+    E: Fn(&str) -> P,
+    P: Into<Probe>,
     L: Fn(&str) -> Option<String>,
 {
     let Some(path) = crate::term::accept_local_cwd(path) else {
@@ -1618,11 +1635,12 @@ where
     if crate::term::unc_or_device(&path) {
         return Err(refuse(RefuseReason::BadFile, &path));
     }
-    if !exists(&path) {
-        if has_short_component(&path) {
-            return Ok(DiskPath::ForceReveal(path));
-        }
-        return Err(refuse(RefuseReason::Missing, &path));
+    match exists(&path).into() {
+        Probe::Present => {}
+        // Not revealed either: Explorer would follow the link to the share.
+        Probe::NotLocal => return Err(refuse(RefuseReason::NotLocal, &path)),
+        Probe::Missing if has_short_component(&path) => return Ok(DiskPath::ForceReveal(path)),
+        Probe::Missing => return Err(refuse(RefuseReason::Missing, &path)),
     }
     match long_path(&path) {
         Some(long) => {
@@ -1656,7 +1674,7 @@ fn rewrite_edit_path(argv: Vec<String>, from: &str, to: &str) -> Vec<String> {
     }
 }
 
-fn settle_edit_default<E, L, C>(
+fn settle_edit_default<E, P, L, C>(
     path: String,
     line: u32,
     col: Option<u32>,
@@ -1665,7 +1683,8 @@ fn settle_edit_default<E, L, C>(
     code_exe: &C,
 ) -> Action
 where
-    E: Fn(&str) -> bool,
+    E: Fn(&str) -> P,
+    P: Into<Probe>,
     L: Fn(&str) -> Option<String>,
     C: Fn() -> Option<String>,
 {
@@ -1682,9 +1701,7 @@ where
                 expand_editor("code -g {file}:{line}:{col}", &path, Some(line), col)
             {
                 argv[0] = exe.to_string();
-                if !is_shell_program(&argv[0]) {
-                    return Action::Edit { argv, path };
-                }
+                return Action::Edit { argv, path };
             }
         }
     }
@@ -1694,9 +1711,10 @@ where
 /// Apply `exists` and 8.3 expansion, then the allowlist, off the UI thread.
 /// `long_path` returns the expanded path (already without a `\\?\` prefix,
 /// or with one — it is stripped). `None` means expansion failed.
-pub fn settle<E, L, C>(action: Action, exists: E, long_path: L, code_exe: C) -> Action
+pub fn settle<E, P, L, C>(action: Action, exists: E, long_path: L, code_exe: C) -> Action
 where
-    E: Fn(&str) -> bool,
+    E: Fn(&str) -> P,
+    P: Into<Probe>,
     L: Fn(&str) -> Option<String>,
     C: Fn() -> Option<String>,
 {
@@ -1724,7 +1742,7 @@ where
 }
 
 pub fn settle_live(action: Action) -> Action {
-    settle(action, local_file_exists, win_long_path, || {
+    settle(action, local_file_probe, win_long_path, || {
         find_code_exe().map(|p| p.to_string_lossy().into_owned())
     })
 }
@@ -1839,9 +1857,9 @@ pub fn card_decision(enter: bool, escape: bool, may_open: bool) -> CardDecision 
 /// Title prefix. The confirm card and the refuse card do not share one.
 pub fn card_title_prefix(may_open: bool) -> &'static str {
     if may_open {
-        "تأكد قبل الفتح"
+        crate::lang::tr("تأكد قبل الفتح", "Check before opening")
     } else {
-        "رابط مرفوض"
+        crate::lang::tr("رابط مرفوض", "Link refused")
     }
 }
 
@@ -1999,65 +2017,32 @@ pub fn spawn_editor(argv: &[String]) -> std::io::Result<()> {
 /// `explorer.exe /select` instead of an editor.
 pub fn find_code_exe() -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
-    find_code_exe_in(std::env::split_paths(&path), &pathexts())
+    find_code_exe_in(std::env::split_paths(&path))
 }
 
-fn pathexts() -> Vec<String> {
-    std::env::var("PATHEXT")
-        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
-        .split(';')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
-pub fn find_code_exe_in<I, P>(dirs: I, exts: &[String]) -> Option<std::path::PathBuf>
+/// NTFS names are case-insensitive, so one spelling of each finds them all.
+pub fn find_code_exe_in<I, P>(dirs: I) -> Option<std::path::PathBuf>
 where
     I: IntoIterator<Item = P>,
     P: AsRef<Path>,
 {
     for dir in dirs {
         let dir = dir.as_ref();
-        for name in ["code.exe", "Code.exe"] {
-            let p = dir.join(name);
-            if p.is_file() {
-                return Some(p);
-            }
+        let exe = dir.join("Code.exe");
+        if exe.is_file() {
+            return Some(exe);
         }
-        for ext in exts {
-            let ext = if ext.starts_with('.') {
-                ext.as_str()
-            } else {
-                continue;
-            };
-            if ext.eq_ignore_ascii_case(".exe") {
-                let p = dir.join(format!("code{ext}"));
-                if p.is_file() {
-                    return Some(p);
-                }
-            }
-        }
-        for cmd_name in ["code.cmd", "code.CMD", "code.bat", "code.BAT"] {
-            let cmd = dir.join(cmd_name);
-            if cmd.is_file() {
-                if let Some(exe) = exe_near_cmd(&cmd) {
+        for shim in ["code.cmd", "code.bat"] {
+            if dir.join(shim).is_file() {
+                // the shim's real exe sits beside it or one level up
+                let near = [dir.join("Code.exe"), dir.join("..").join("Code.exe")];
+                if let Some(exe) = near.into_iter().find(|p| p.is_file()) {
                     return Some(exe);
                 }
             }
         }
     }
     None
-}
-
-fn exe_near_cmd(cmd: &Path) -> Option<std::path::PathBuf> {
-    let dir = cmd.parent()?;
-    let candidates = [
-        dir.join("code.exe"),
-        dir.join("Code.exe"),
-        dir.join("..").join("Code.exe"),
-        dir.join("..").join("code.exe"),
-    ];
-    candidates.into_iter().find(|p| p.is_file())
 }
 
 /// Open `target` with the shell association. `target` is `lpFile` alone.
@@ -2783,7 +2768,7 @@ mod tests {
         assert!(!tip.contains('\u{202E}'), "{tip}");
         assert!(tip.contains("<RLO>"), "{tip}");
         assert!(matches!(
-            spans[0].activate(None, None, None),
+            spans[0].activate(None, None),
             Action::Refuse {
                 reason: RefuseReason::ControlOrBidi,
                 ..
@@ -3107,7 +3092,7 @@ mod tests {
         .is_none());
         let spans = links_in_row(&row("src/main.rs:10:4"));
         assert!(matches!(
-            spans[0].activate(Some(r"C:\work"), Some(r"cmd /c start {file}"), None),
+            spans[0].activate(Some(r"C:\work"), Some(r"cmd /c start {file}")),
             Action::Refuse {
                 reason: RefuseReason::Editor,
                 ..
@@ -3138,7 +3123,7 @@ mod tests {
         // The file is not on disk. The intent is still Edit; settle is
         // what raises the missing-file card, so the UI thread does not stat.
         let spans = links_in_row(&row("src/main.rs:10:4"));
-        match spans[0].activate(Some(r"C:\work"), Some("code -g {file}:{line}:{col}"), None) {
+        match spans[0].activate(Some(r"C:\work"), Some("code -g {file}:{line}:{col}")) {
             Action::Edit { path, .. } => {
                 assert_eq!(path, r"C:\work\src\main.rs");
                 assert!(matches!(
@@ -3176,7 +3161,7 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(bin.join("code.cmd"), b"@echo off\r\n").unwrap();
         std::fs::write(root.join("Code.exe"), b"MZ").unwrap();
-        let found = find_code_exe_in(std::iter::once(&bin), &[".EXE".into(), ".CMD".into()]);
+        let found = find_code_exe_in(std::iter::once(&bin));
         let found = found.expect("sibling Code.exe");
         assert_eq!(found.file_name().and_then(|s| s.to_str()), Some("Code.exe"));
         let _ = std::fs::remove_dir_all(&root);
@@ -3189,7 +3174,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&alone_root);
         std::fs::create_dir_all(&alone).unwrap();
         std::fs::write(alone.join("code.cmd"), b"@echo off\r\n").unwrap();
-        assert!(find_code_exe_in(std::iter::once(&alone), &[".CMD".into()]).is_none());
+        assert!(find_code_exe_in(std::iter::once(&alone)).is_none());
         let _ = std::fs::remove_dir_all(&alone_root);
     }
 
@@ -3417,7 +3402,7 @@ mod tests {
             r"\\?\C:\Windows\a.rs",
         ] {
             assert_eq!(resolve_against_cwd(path, Some(r"C:\work")), None, "{path}");
-            assert!(!local_file_exists(path), "stat of {path}");
+            assert_eq!(local_file_probe(path), Probe::NotLocal, "stat of {path}");
         }
         assert_eq!(cwd_hook(Some(r"\\evil\share")), None);
         assert_eq!(cwd_hook(Some(r"//evil/share")), None);
@@ -3428,7 +3413,7 @@ mod tests {
         let spans = links_in_row(&row(r"\\evil\share\a.rs:12"));
         assert_eq!(spans.len(), 1, "{spans:?}");
         assert!(matches!(
-            spans[0].activate(Some(r"C:\work"), Some("code -g {file}:{line}:{col}"), None),
+            spans[0].activate(Some(r"C:\work"), Some("code -g {file}:{line}:{col}")),
             Action::Refuse {
                 reason: RefuseReason::BadFile,
                 ..
@@ -3437,7 +3422,7 @@ mod tests {
         let spans = links_in_row(&row("//evil/share/a.rs:3"));
         assert_eq!(spans.len(), 1, "{spans:?}");
         assert!(matches!(
-            spans[0].activate(None, Some(r"C:\Program Files\Code.exe"), None),
+            spans[0].activate(None, Some(r"C:\Program Files\Code.exe")),
             Action::Refuse {
                 reason: RefuseReason::BadFile,
                 ..
@@ -3445,7 +3430,7 @@ mod tests {
         ));
         // Not an editor argument and not an association open.
         assert!(!matches!(
-            spans[0].activate(Some(r"C:\work"), None, Some(r"C:\Code.exe")),
+            spans[0].activate(Some(r"C:\work"), None),
             Action::OpenPath(_) | Action::Edit { .. } | Action::Reveal(_) | Action::Browse(_)
         ));
     }
@@ -3563,7 +3548,7 @@ mod tests {
         let spans = links_in_row(&row(&format!("{leaf}:1")));
         assert_eq!(spans.len(), 1, "{spans:?}");
         // No editor yet: the intent defers exists and code.exe to the link thread.
-        match spans[0].activate(Some(&cwd), None, None) {
+        match spans[0].activate(Some(&cwd), None) {
             Action::EditDefault { path, line, col } => {
                 assert_eq!(path, bat);
                 assert_eq!(line, 1);
@@ -3589,18 +3574,26 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        match spans[0].activate(Some(&cwd), None, Some(r"C:\Program Files\Code.exe")) {
+        // CI's temp dir is 8.3 (`RUNNER~1`): expand it the way the link thread does.
+        let long = win_long_path(&bat).unwrap_or_else(|| bat.clone());
+        let code = || Some(r"C:\Program Files\Code.exe".to_string());
+        match settle(
+            spans[0].activate(Some(&cwd), None),
+            |_| true,
+            win_long_path,
+            code,
+        ) {
             Action::Edit { argv, path } => {
-                assert_eq!(path, bat);
+                assert_eq!(path, long);
                 assert_eq!(argv[0], r"C:\Program Files\Code.exe");
                 assert_eq!(argv[1], "-g");
-                assert_eq!(argv[2], format!("{bat}:1"));
+                assert_eq!(argv[2], format!("{long}:1"));
                 assert!(editor_command(&argv).is_some());
             }
             other => panic!("{other:?}"),
         }
         // Configured editor, still no association fallback.
-        match spans[0].activate(Some(&cwd), Some("code -g {file}:{line}:{col}"), None) {
+        match spans[0].activate(Some(&cwd), Some("code -g {file}:{line}:{col}")) {
             Action::Edit { argv, path } => {
                 assert_eq!(path, bat);
                 assert_eq!(argv[0], "code");
@@ -3617,14 +3610,14 @@ mod tests {
         assert_eq!(resolve_against_cwd(r".\src\main.rs", None), None);
         let spans = links_in_row(&row("src/main.rs:10:4"));
         assert!(matches!(
-            spans[0].activate(None, Some("code -g {file}:{line}:{col}"), None),
+            spans[0].activate(None, Some("code -g {file}:{line}:{col}")),
             Action::Refuse {
                 reason: RefuseReason::BadFile,
                 ..
             }
         ));
         assert!(matches!(
-            spans[0].activate(None, None, Some(r"C:\Code.exe")),
+            spans[0].activate(None, None),
             Action::Refuse {
                 reason: RefuseReason::BadFile,
                 ..
@@ -3632,12 +3625,47 @@ mod tests {
         ));
         // A reported UNC cwd is not a directory to join onto.
         assert!(matches!(
-            spans[0].activate(Some(r"\\evil\share"), Some("code -g {file}:{line}"), None),
+            spans[0].activate(Some(r"\\evil\share"), Some("code -g {file}:{line}")),
             Action::Refuse {
                 reason: RefuseReason::BadFile,
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_path_off_the_local_drives_is_refused_not_revealed() {
+        // The probe found a junction to a share, or a mapped network drive.
+        // Every action that would touch the path refuses with NotLocal;
+        // a `~` component does not turn it into a reveal.
+        let not_local = |_: &str| Probe::NotLocal;
+        let is_not_local = |a: &Action| {
+            matches!(
+                a,
+                Action::Refuse {
+                    reason: RefuseReason::NotLocal,
+                    ..
+                }
+            )
+        };
+        for action in [
+            Action::OpenPath(r"C:\proj\notes.txt".into()),
+            Action::Reveal(r"C:\proj\tool.exe".into()),
+            Action::Reveal(r"C:\PROGRA~1\proj\a.txt".into()),
+            Action::Edit {
+                argv: vec!["code".into(), r"C:\proj\a.rs".into()],
+                path: r"C:\proj\a.rs".into(),
+            },
+            Action::EditDefault {
+                path: r"C:\proj\a.rs".into(),
+                line: 3,
+                col: None,
+            },
+        ] {
+            let settled = settle(action.clone(), not_local, |_| None, || None);
+            assert!(is_not_local(&settled), "{action:?} -> {settled:?}");
+        }
+        assert!(!RefuseReason::NotLocal.label().is_empty());
     }
 
     #[test]
@@ -3655,7 +3683,7 @@ mod tests {
             }
         ));
         let spans = links_in_row(&row(r"C:\bayan-qa-missing\no-such.rs:3"));
-        match spans[0].activate(Some(r"D:\other"), Some("code -g {file}:{line}"), None) {
+        match spans[0].activate(Some(r"D:\other"), Some("code -g {file}:{line}")) {
             Action::Edit { path, .. } => {
                 assert!(matches!(
                     settle(
@@ -3675,7 +3703,7 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        match spans[0].activate(Some(r"D:\other"), None, None) {
+        match spans[0].activate(Some(r"D:\other"), None) {
             Action::EditDefault { path, line, col } => {
                 assert!(matches!(
                     settle(
@@ -3741,7 +3769,7 @@ mod tests {
     fn absolute_path_cannot_become_an_editor_flag() {
         let (cwd, full) = scratch("-n.rs");
         let spans = links_in_row(&row("-n.rs:2"));
-        match spans[0].activate(Some(&cwd), Some("code -g {file}:{line}"), None) {
+        match spans[0].activate(Some(&cwd), Some("code -g {file}:{line}")) {
             Action::Edit { argv, path } => {
                 assert_eq!(path, full);
                 assert_eq!(argv[0], "code");
@@ -3927,7 +3955,7 @@ mod tests {
         let tip = spans[0].tooltip(None);
         assert!(tip.host.starts_with("http://evil.com"), "{}", tip.host);
         assert!(tip.text().contains("good.com@evil.com"), "{}", tip.text());
-        match spans[0].activate(None, None, None) {
+        match spans[0].activate(None, None) {
             Action::Confirm { uri, host } => {
                 assert_eq!(host, "evil.com");
                 assert_eq!(uri, "http://good.com@evil.com/a");
@@ -3974,7 +4002,7 @@ mod tests {
             col: None,
         }));
         assert!(!runs_off_ui_thread(&Action::Refuse {
-            reason: RefuseReason::Blocked,
+            reason: RefuseReason::Scheme,
             shown: String::new(),
         }));
         assert!(!runs_off_ui_thread(&Action::Confirm {
@@ -3982,7 +4010,7 @@ mod tests {
             host: "b".into(),
         }));
         assert!(!perform_open(&Action::Refuse {
-            reason: RefuseReason::Blocked,
+            reason: RefuseReason::Scheme,
             shown: "x".into(),
         }));
         assert!(!perform_open(&Action::Confirm {

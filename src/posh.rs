@@ -11,7 +11,9 @@
 //! Applying only ever rewrites the ONE managed line in `$PROFILE`. Every other
 //! line the user has written is left untouched.
 
-use std::path::PathBuf;
+use crate::process::run_with_timeout;
+
+use std::path::{Path, PathBuf};
 
 /// Themes worth showing first, in this order. The rest follow alphabetically.
 /// EasyTer's `FEATURED`, kept because the ordering is a curation decision,
@@ -221,15 +223,23 @@ pub fn eager_previews(names: &[String], sel: usize) -> Vec<usize> {
     out
 }
 
-/// The PowerShell 5 profile Bayan's default shell reads.
+/// The profile whose oh-my-posh line new tabs use (see `term::POSH_PROFILES`).
 pub fn profile_path() -> PathBuf {
     match std::env::var_os("USERPROFILE") {
-        Some(h) => PathBuf::from(h)
-            .join("Documents")
-            .join("WindowsPowerShell")
-            .join("Microsoft.PowerShell_profile.ps1"),
+        Some(h) => managed_profile(Path::new(&h), |p| std::fs::read_to_string(p).ok()),
         None => PathBuf::from("Microsoft.PowerShell_profile.ps1"),
     }
+}
+
+/// The first profile, in spawn's order, that has an oh-my-posh line; the
+/// Windows PowerShell 5 profile when none does.
+fn managed_profile(home: &Path, read: impl Fn(&Path) -> Option<String>) -> PathBuf {
+    let paths = crate::term::POSH_PROFILES.map(|rel| home.join(rel));
+    paths
+        .iter()
+        .find(|p| read(p).is_some_and(|t| crate::term::parse_posh_config(&t).is_some()))
+        .unwrap_or(&paths[1])
+        .clone()
 }
 
 /// Theme names present on disk: featured ones first, then the rest sorted.
@@ -284,14 +294,10 @@ pub fn current() -> Option<String> {
     current_from(&txt)
 }
 
-/// Pull the theme name out of profile text. Separated from I/O so the parsing
-/// — the part that can be wrong — is testable.
+/// Pull the theme name out of profile text, by the same line rule spawn
+/// uses (`term::posh_config_span`).
 fn current_from(txt: &str) -> Option<String> {
-    let i = txt.find("oh-my-posh init pwsh --config")?;
-    let rest = &txt[i..];
-    let a = rest.find('"')? + 1;
-    let b = rest[a..].find('"')? + a;
-    let path = &rest[a..b];
+    let path = &txt[crate::term::posh_config_span(txt)?];
     let file = path.rsplit(['\\', '/']).next()?;
     file.strip_suffix(".omp.json").map(str::to_string)
 }
@@ -302,20 +308,17 @@ fn rewrite_config(txt: &str, theme: &str) -> Option<String> {
     if !is_safe_theme_name(theme) {
         return None;
     }
-    let i = txt.find("oh-my-posh init pwsh --config")?;
-    let rest = &txt[i..];
-    let a = rest.find('"')? + 1;
-    let b = rest[a..].find('"')? + a;
-    let old = &rest[a..b];
+    let span = crate::term::posh_config_span(txt)?;
+    let old = &txt[span.clone()];
     // keep whatever directory form the user already had, swap only the file —
     // a profile written with $env:USERPROFILE must stay portable
     let dir_end = old.rfind(['\\', '/']).map(|p| p + 1).unwrap_or(0);
     let new_path = format!("{}{}.omp.json", &old[..dir_end], theme);
-    let mut out = String::with_capacity(txt.len() + 16);
-    out.push_str(&txt[..i + a]);
-    out.push_str(&new_path);
-    out.push_str(&txt[i + b..]);
-    Some(out)
+    Some(format!(
+        "{}{new_path}{}",
+        &txt[..span.start],
+        &txt[span.end..]
+    ))
 }
 
 /// Point `$PROFILE`'s managed line at `theme`. New shells pick it up.
@@ -330,8 +333,8 @@ pub fn set_theme(theme: &str) -> Result<(), String> {
     let new = rewrite_config(&txt, theme).ok_or("no managed oh-my-posh line in the profile")?;
     // N-06: one backup of the profile as it was, then an atomic replace so
     // a crash cannot truncate the lines Bayan does not own.
-    crate::config::backup_once(&p).map_err(|e| format!("backup profile: {e}"))?;
-    crate::config::write_atomic(&p, new.as_bytes()).map_err(|e| format!("write profile: {e}"))
+    crate::persist::backup_once(&p).map_err(|e| format!("backup profile: {e}"))?;
+    crate::persist::write(&p, new.as_bytes()).map_err(|e| format!("write profile: {e}"))
 }
 
 /// Render a theme the way it will actually appear: ask oh-my-posh for the
@@ -353,11 +356,6 @@ pub fn preview(theme: &str) -> Option<Vec<u8>> {
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["print", "primary", "--shell", "pwsh", "--config"])
         .arg(&cfg);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
     let out = run_with_timeout(cmd, PREVIEW_TIMEOUT)?;
     if !out.status.success() || out.stdout.is_empty() {
         return None;
@@ -368,67 +366,6 @@ pub fn preview(theme: &str) -> Option<Vec<u8>> {
 /// A preview that takes longer than this is not worth freezing the window
 /// for: the picker shows the name alone instead (the same as "no binary").
 const PREVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// `Command::output()` with a deadline. std has no wait-with-timeout, so poll
-/// `try_wait` and kill on expiry; the previews ran on the UI thread with no
-/// bound at all, so one stuck `oh-my-posh` (a broken theme, a slow shell
-/// plugin it shells out to) hung Bayan for good.
-fn run_with_timeout(
-    mut cmd: std::process::Command,
-    limit: std::time::Duration,
-) -> Option<std::process::Output> {
-    use std::io::Read;
-    use std::process::Stdio;
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // previews and tests never open a console
-    }
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    // drain stdout on its own thread so a chatty child never blocks on a
-    // full pipe while we wait on it
-    let mut stdout = child.stdout.take()?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        let _ = tx.send(buf);
-    });
-    let t0 = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break st,
-            Ok(None) if t0.elapsed() < limit => {
-                std::thread::sleep(std::time::Duration::from_millis(15))
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    };
-    // The child is gone, but read_to_end returns only when EVERY write end
-    // of the pipe closes — and oh-my-posh shells out, so a grandchild can
-    // still be holding the one it inherited. Joining that thread outright
-    // would hang the UI thread for as long as the grandchild lives, which
-    // is the exact freeze the deadline above exists to prevent. Bound this
-    // wait too; a preview we cannot collect in time is a preview we skip.
-    let left = limit
-        .saturating_sub(t0.elapsed())
-        .max(std::time::Duration::from_millis(250));
-    let stdout = rx.recv_timeout(left).ok()?;
-    Some(std::process::Output {
-        status,
-        stdout,
-        stderr: Vec::new(),
-    })
-}
 
 #[cfg(test)]
 mod tests {
@@ -503,6 +440,37 @@ mod tests {
         }
         assert!(set_theme("x$(calc)").is_err());
         assert_eq!(preview("x$(calc)"), None);
+    }
+
+    #[test]
+    fn the_picker_reads_and_edits_the_line_new_tabs_use() {
+        // spawn skips comments and accepts `init powershell` in single quotes
+        let txt = concat!(
+            "# oh-my-posh init pwsh --config \"C:\\t\\old.omp.json\"\n",
+            "oh-my-posh init powershell --config 'C:\\t\\live.omp.json' | iex\n",
+        );
+        assert_eq!(current_from(txt).as_deref(), Some("live"));
+        let out = rewrite_config(txt, "kali").unwrap();
+        assert!(out.starts_with("# oh-my-posh init pwsh --config \"C:\\t\\old.omp.json\"\n"));
+        assert_eq!(
+            crate::term::parse_posh_config(&out).as_deref(),
+            Some("C:\\t\\kali.omp.json")
+        );
+    }
+
+    #[test]
+    fn the_picker_edits_the_profile_new_tabs_read_first() {
+        let home = std::path::Path::new("H");
+        let pwsh7 = home.join(r"Documents\PowerShell\Microsoft.PowerShell_profile.ps1");
+        let read = |p: &std::path::Path| {
+            (p == pwsh7).then(|| "oh-my-posh init pwsh --config \"x.omp.json\"".to_string())
+        };
+        assert_eq!(managed_profile(home, read), pwsh7);
+        // no managed line anywhere: the Windows PowerShell 5 profile, as before
+        assert_eq!(
+            managed_profile(home, |_| None),
+            home.join(r"Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1")
+        );
     }
 
     #[test]

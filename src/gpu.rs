@@ -4,6 +4,7 @@
 //! Draw order in the vertex buffer is the painter's order the CPU renderer
 //! already used, so translucent overlays blend identically.
 
+use crate::render::ATLAS_SIZE;
 use std::sync::Arc;
 
 use winit::window::Window;
@@ -76,17 +77,11 @@ pub struct Gpu {
     sampler: wgpu::Sampler,
     globals_buf: wgpu::Buffer,
     atlas_tex: wgpu::Texture,
-    atlas_size: u32,
     layers: u32,
 }
 
 impl Gpu {
-    pub fn new(
-        window: Arc<Window>,
-        width: u32,
-        height: u32,
-        atlas_size: u32,
-    ) -> Result<Self, String> {
+    pub fn new(window: Arc<Window>, width: u32, height: u32) -> Result<Self, String> {
         // DX12 first (native on Windows, fastest to initialize), GL as the
         // universal fallback — enumerating every backend cost ~800ms
         // wgpu 30 dropped Default for InstanceDescriptor (a display handle is
@@ -141,11 +136,7 @@ impl Gpu {
         surface.configure(&device, &config);
 
         let layers = 1u32;
-        let atlas_tex = Self::make_atlas(&device, atlas_size, layers);
-        let atlas_view = atlas_tex.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
-            ..Default::default()
-        });
+        let atlas_tex = Self::make_atlas(&device, layers);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
@@ -189,24 +180,7 @@ impl Gpu {
                 },
             ],
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: globals_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&atlas_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
+        let bind_group = Self::bind_group(&device, &bgl, &globals_buf, &atlas_tex, &sampler);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("bayan quad shader"),
@@ -262,17 +236,16 @@ impl Gpu {
             sampler,
             globals_buf,
             atlas_tex,
-            atlas_size,
             layers,
         })
     }
 
-    fn make_atlas(device: &wgpu::Device, size: u32, layers: u32) -> wgpu::Texture {
+    fn make_atlas(device: &wgpu::Device, layers: u32) -> wgpu::Texture {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("glyph atlas"),
             size: wgpu::Extent3d {
-                width: size,
-                height: size,
+                width: ATLAS_SIZE,
+                height: ATLAS_SIZE,
                 depth_or_array_layers: layers,
             },
             mip_level_count: 1,
@@ -284,18 +257,24 @@ impl Gpu {
         })
     }
 
-    fn rebind_atlas(&mut self) {
-        let view = self.atlas_tex.create_view(&wgpu::TextureViewDescriptor {
+    fn bind_group(
+        device: &wgpu::Device,
+        bgl: &wgpu::BindGroupLayout,
+        globals: &wgpu::Buffer,
+        atlas: &wgpu::Texture,
+        sampler: &wgpu::Sampler,
+    ) -> wgpu::BindGroup {
+        let view = atlas.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
-        self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &self.bgl,
+            layout: bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: self.globals_buf.as_entire_binding(),
+                    resource: globals.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -303,19 +282,20 @@ impl Gpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    resource: wgpu::BindingResource::Sampler(sampler),
                 },
             ],
-        });
+        })
     }
 
-    pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            return;
+    pub fn resize(&mut self, width: u32, height: u32) -> bool {
+        if width == 0 || height == 0 || (width, height) == (self.config.width, self.config.height) {
+            return false;
         }
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        true
     }
 
     /// Sync the CPU atlas pages to the GPU (only on frames that rasterized a
@@ -325,9 +305,15 @@ impl Gpu {
     pub fn upload_atlas(&mut self, pages: &[Vec<u8>]) {
         let n = pages.len() as u32;
         if n != self.layers {
-            self.atlas_tex = Self::make_atlas(&self.device, self.atlas_size, n);
+            self.atlas_tex = Self::make_atlas(&self.device, n);
             self.layers = n;
-            self.rebind_atlas();
+            self.bind_group = Self::bind_group(
+                &self.device,
+                &self.bgl,
+                &self.globals_buf,
+                &self.atlas_tex,
+                &self.sampler,
+            );
         }
         for (layer, page) in pages.iter().enumerate() {
             self.queue.write_texture(
@@ -344,12 +330,12 @@ impl Gpu {
                 page,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(self.atlas_size * 4),
-                    rows_per_image: Some(self.atlas_size),
+                    bytes_per_row: Some(ATLAS_SIZE * 4),
+                    rows_per_image: Some(ATLAS_SIZE),
                 },
                 wgpu::Extent3d {
-                    width: self.atlas_size,
-                    height: self.atlas_size,
+                    width: ATLAS_SIZE,
+                    height: ATLAS_SIZE,
                     depth_or_array_layers: 1,
                 },
             );
@@ -357,7 +343,7 @@ impl Gpu {
     }
 
     /// Render one frame of quads (painter's order). BG is the clear color.
-    pub fn render(&mut self, verts: &[Vertex], bg: (u8, u8, u8)) {
+    pub fn render(&mut self, verts: &[Vertex], bg: (u8, u8, u8)) -> bool {
         use wgpu::util::DeviceExt;
         // wgpu 30 replaced Result<SurfaceTexture, SurfaceError> with an enum.
         // Suboptimal still carries a usable texture — render it rather than
@@ -369,11 +355,11 @@ impl Gpu {
                 self.surface.configure(&self.device, &self.config);
                 match self.surface.get_current_texture() {
                     Cst::Success(f) | Cst::Suboptimal(f) => f,
-                    _ => return,
+                    _ => return false,
                 }
             }
             // Timeout, Occluded (window hidden), Validation: skip this frame.
-            _ => return,
+            _ => return false,
         };
         let view = frame.texture.create_view(&Default::default());
         let globals = Globals {
@@ -424,5 +410,6 @@ impl Gpu {
         self.queue.submit([encoder.finish()]);
         // wgpu 30 moved present() from SurfaceTexture onto Queue
         self.queue.present(frame);
+        true
     }
 }

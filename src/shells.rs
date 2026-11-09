@@ -17,7 +17,22 @@ pub struct Shell {
     pub command: String,
 }
 
+/// PowerShell without `$PROFILE`: the one entry whose label is a word,
+/// so the one that has to follow the interface language.
+const FAST_POWERSHELL: &str = "powershell.exe -NoProfile";
+
 impl Shell {
+    /// The name to show, in the interface language. Detection runs once,
+    /// on a background thread, so a translated `name` would be frozen in
+    /// whatever language was on screen then; this reads it at draw time.
+    pub fn label(&self) -> String {
+        if self.command == FAST_POWERSHELL {
+            crate::lang::tr("PowerShell سريع", "PowerShell (fast)").to_string()
+        } else {
+            self.name.clone()
+        }
+    }
+
     fn new(name: &str, command: impl Into<String>) -> Self {
         Self {
             name: name.to_string(),
@@ -187,15 +202,12 @@ fn system32_dir() -> Option<std::path::PathBuf> {
 
 #[cfg(windows)]
 fn wsl_distros_from(exe: &Path) -> Vec<String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = std::process::Command::new(exe)
-        .args(["-l", "-q"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+    let mut command = std::process::Command::new(exe);
+    command.args(["-l", "-q"]);
+    let out = crate::process::run_with_timeout(command, std::time::Duration::from_secs(3));
     match out {
-        Ok(o) => parse_wsl_result(o.status.success(), &o.stdout),
-        Err(_) => Vec::new(), // no WSL installed is not an error
+        Some(o) => parse_wsl_result(o.status.success(), &o.stdout),
+        None => Vec::new(), // absent or unresponsive WSL: use Windows shells
     }
 }
 
@@ -235,7 +247,7 @@ pub fn detect() -> Vec<Shell> {
 
     // $PROFILE is loaded, so the user's chosen oh-my-posh prompt shows up.
     v.push(Shell::new("PowerShell", "powershell.exe"));
-    v.push(Shell::new("PowerShell سريع", "powershell.exe -NoProfile"));
+    v.push(Shell::new("PowerShell سريع", FAST_POWERSHELL));
 
     if on_path("pwsh") {
         v.push(Shell::new("PowerShell 7", "pwsh.exe -NoLogo"));
@@ -243,11 +255,8 @@ pub fn detect() -> Vec<Shell> {
 
     v.push(Shell::new("Command Prompt", "cmd.exe"));
 
-    if let Some(p) = pick_git_bash(|p| Path::new(p).exists()) {
-        v.push(Shell::new(
-            "Git Bash",
-            format!("{} --login -i", short_path(p)),
-        ));
+    if let Some(c) = git_bash_command() {
+        v.push(Shell::new("Git Bash", c));
     }
 
     v.extend(wsl_entries());
@@ -255,19 +264,85 @@ pub fn detect() -> Vec<Shell> {
     v
 }
 
+/// The installed Git Bash as `detect` lists it, if there is one.
+fn git_bash_command() -> Option<String> {
+    pick_git_bash(|p| Path::new(p).exists()).map(|p| format!("{} --login -i", short_path(p)))
+}
+
+/// May a shell saved in session.json be started again? Only a command
+/// `detect` itself could have offered: the fixed PowerShell and cmd forms,
+/// the installed Git Bash, or an installed WSL distro with a name that is
+/// one safe argument. Anything else (a hand edit, a planted file) falls back to the
+/// default shell, so the session file cannot name a program to run —
+/// config.json's `shell` stays the one place for that. Uses the background
+/// inventory; it never probes a process or the filesystem on the UI thread.
+pub fn is_restorable(command: &str, installed: &[Shell]) -> bool {
+    match command {
+        "powershell.exe" | FAST_POWERSHELL | "cmd.exe" => true,
+        c => {
+            installed.iter().any(|s| s.command == c)
+                && c.strip_prefix("wsl.exe -d ")
+                    .is_none_or(is_safe_distro_name)
+        }
+    }
+}
+
 /// Friendly label for a stored command line, for the settings panel. Falls
 /// back to a trimmed command so a hand-edited config.json still reads sanely.
-pub fn label_for(command: &str) -> String {
-    detect()
-        .into_iter()
+/// `found` is the app's one background `detect()`: this runs inside the frame
+/// build, so it must not probe (detection spawns `wsl.exe`).
+pub fn label_for(found: &[Shell], command: &str) -> String {
+    found
+        .iter()
         .find(|s| s.command == command)
-        .map(|s| s.name)
+        .map(|s| s.label())
         .unwrap_or_else(|| command.trim_end_matches(".exe").to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_shells_detect_could_offer_are_restorable() {
+        let installed = vec![
+            Shell::new("PowerShell 7", "pwsh.exe -NoLogo"),
+            Shell::new("Ubuntu", "wsl.exe -d Ubuntu-22.04"),
+        ];
+        for ok in [
+            "powershell.exe",
+            "powershell.exe -NoProfile",
+            "pwsh.exe -NoLogo",
+            "cmd.exe",
+            "wsl.exe -d Ubuntu-22.04",
+        ] {
+            assert!(is_restorable(ok, &installed), "{ok}");
+        }
+        for bad in [
+            "calc.exe",
+            "cmd.exe /c del x",
+            "powershell.exe -Command evil",
+            "wsl.exe -d -e sh",
+            "wsl.exe -d Ubuntu --exec x",
+            "C:\\Temp\\bash.exe --login -i",
+            "",
+        ] {
+            assert!(!is_restorable(bad, &installed), "{bad}");
+        }
+        if let Some(g) = git_bash_command() {
+            assert!(is_restorable(&g, &[Shell::new("Git Bash", &g)]));
+        }
+        assert!(!is_restorable("wsl.exe -d Ubuntu-22.04", &[]));
+        assert!(!is_restorable("pwsh.exe -NoLogo", &[]));
+    }
+
+    #[test]
+    fn label_comes_from_the_detected_list_without_probing() {
+        let found = [Shell::new("Git Bash", "bash.exe -l")];
+        assert_eq!(label_for(&found, "bash.exe -l"), "Git Bash");
+        assert_eq!(label_for(&found, "nu.exe"), "nu");
+        assert_eq!(label_for(&[], "cmd.exe"), "cmd");
+    }
 
     #[test]
     fn failed_wsl_discovery_does_not_offer_error_messages_as_shells() {
@@ -352,6 +427,10 @@ mod tests {
         // overflow it and collide with the row title. The renderer truncates
         // now, but a name that ALWAYS truncates is a name nobody can read.
         for s in detect() {
+            crate::lang::set(crate::lang::Lang::En);
+            let en = s.label();
+            crate::lang::set(crate::lang::Lang::Ar);
+            assert!(en.chars().count() <= 20, "English label too long: {en:?}");
             assert!(
                 s.name.chars().count() <= 20,
                 "shell label too long for the cycler: {:?} ({} chars)",

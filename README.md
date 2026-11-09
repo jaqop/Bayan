@@ -461,11 +461,12 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       character. And an untouched config serialized `"keyboard"` out of
       nothing, so saving one minted settings the user never set.
 
-      Two limits that applied to `links.rs` apply to `link.rs` too and are
-      NOT fixed: a mapped network drive is still stat'd, and a junction or
-      symlink aimed at a UNC share defeats any gate that reads the path as
-      text. Closing that needs resolution off the UI thread, gating on the
-      canonical path.
+      Two limits that applied to `links.rs` applied to `link.rs` too: a
+      mapped network drive was still stat'd, and a junction or symlink
+      aimed at a UNC share defeated any gate that reads the path as text.
+      Both are closed by `localpath.rs` («Local all the way down», below).
+      Gating on the canonical path, as first planned, would have been too
+      late: the open that produces it has already connected to the share.
 - [x] **M34** — the window comes back where you left it: session.json carries
       the last non-maximized rectangle plus the maximized flag, restored only
       if enough of the title strip lands on a monitor that is still connected
@@ -667,6 +668,178 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       dividers and drags, session round trip). Chrome Arabic (menus,
       settings, cards) now shapes in Segoe UI: Cascadia Code's monospaced
       Arabic stretched every letter to a full cell
+- [x] **Tab groups** — each group holds its own set of tabs, so related
+      sessions stay together and switching groups never mixes unrelated
+      tabs into the bar. Ctrl+Shift+G opens a new group on one fresh tab;
+      Ctrl+Shift+PageDown / PageUp, or a click on the blue chip at the
+      bar's leading edge (`⇄ مجموعة 2`), steps between groups and lands on
+      the tab each group was last on. The bar, its arrows, the tab × and
+      Ctrl+Tab (in both orders) see only the group on screen. The palette
+      lists «المجموعة: …» to jump, «نقل التبويب إلى …» and «نقل التبويب إلى
+      مجموعة جديدة» to regroup the active tab, and «تسمية المجموعة»; the
+      right-click menu offers مجموعة جديدة. With one group nothing changes:
+      no chip, the bar is the old bar. A group is a TAG on each tab, not a
+      container (`groups.rs`): tabs never move in the one flat list, so a
+      background group's panes still get their DSR replies, bells, exits
+      and toasts by pane id, and the MRU and close-card indices stay
+      valid. Closing the visible tab stays in its group; closing a group's
+      last tab drops the group and goes to the most recent tab elsewhere.
+      The chip shows an amber dot when a tab in ANOTHER group is waiting
+      on you, and the cockpit, which spans every group, prefixes each row
+      with its group. Group numbers stay with the group while it lives.
+      The session file saves group names and each tab's group; a file from
+      before restores as one group, and a one-group session writes no
+      group keys. The shortcuts editor's rows now tighten to fit the
+      window: at 20 actions its card ran past a 900px window's bottom
+      edge (caught by the existing layout tests). Proven: `cargo test`,
+      388 passed (11 new: the group model, MRU walks confined to a group,
+      the close rule, palette rows, session round trip, chip geometry; the
+      chip also joins the press-order and chord round-trip tests); clippy
+      and fmt clean; a debug build
+      launched with `BAYAN_GROUPS=1`, captured with `PrintWindow` on
+      Bayan's own HWND (PID-checked, alive before and after), shows the
+      chip and only the second group's one tab, and the same build without
+      the hook shows the unchanged bar. Not verified on screen: clicking
+      the chip, the PageUp/PageDown chords, restore of a saved multi-group
+      session, the attention dot
+- [x] **Shell menu** — a right-click anywhere on the tab bar (a tab, its
+      ×, the group chip, the arrows and plus, the empty strip) opens a
+      menu of the installed shells: PowerShell, PowerShell without its
+      profile, PowerShell 7, Command Prompt, Git Bash and each WSL distro,
+      as `shells::detect` finds them, the default for new tabs marked
+      «الافتراضية». A row opens a new tab with that shell in the group on
+      screen, through the palette's existing `PaletteRow::Shell` path (a
+      failed spawn shows the same card). The pane's right-click menu gains
+      «تبويب جديد بطرفية…», which opens the same list, so it is reachable
+      with the bar hidden; it is the one pane-menu row that is not a keymap
+      action. The caption buttons, the gear and the resize edges keep no
+      right-click meaning, and a card, panel or the cockpit swallows the
+      press (`chrome::right_press`). Until background detection reports,
+      PowerShell and cmd stand in. Proven: `cargo test`, 390 passed (the
+      press decision for every bar spot, the rows and default mark);
+      clippy and fmt clean; a debug build with `BAYAN_SHELLS=1`, captured
+      with `PrintWindow` on Bayan's own HWND (PID-checked, alive before and
+      after), shows the menu listing this machine's five detected shells
+      with Git Bash marked default. Not verified on screen: a real mouse
+      right-click, picking a row
+- [x] **English interface** — Bayan's own chrome can be English. The
+      settings header has a language button written in the language it
+      switches TO («English» in Arabic, «العربية» in English), so a reader
+      of either can always find the way back; the switch is immediate and
+      saved as `"language": "en"` in config.json (anything else, or
+      nothing, is Arabic). English is left to right: the settings ledger
+      and the shortcuts editor are mirrored (labels left, controls right,
+      each control group keeping its order, so «‹ name ›» and «− 16 +»
+      still read left to right), menus open to the right of the pointer
+      with labels left and shortcuts right, and the close card's text
+      starts at the left. Every interface string (149) is a
+      `tr("عربي", "English")` pair at its point of use (`lang.rs`), so a
+      label cannot drift from its translation in a separate table. What
+      programs print in a pane is untouched. Shell names are translated
+      when drawn, not when detected, because detection runs once on a
+      background thread. BAYAN-007's built-in-label check now refuses a
+      plugin label that matches a built-in in EITHER language, since
+      plugins load once and the language can change afterwards. Under
+      `cfg(test)` the language is per thread, so English tests cannot flip
+      Arabic ones running in parallel. Proven: `cargo test`, 395 passed
+      (mirrored settings geometry, menu direction, English rows, the
+      plugin check in both languages); captures of a debug build with
+      `BAYAN_LANG=en` through `PrintWindow` on Bayan's own HWND show the
+      settings panel, the palette and the shell menu in English and
+      mirrored, and the Arabic panel unchanged apart from the new button.
+      The first English capture showed «Silent / Sound / Alert» running
+      into each other; English bell segments are wider now. Not verified
+      on screen: clicking the language button in a live window, the
+      shortcuts editor, the cards and the cockpit in English
+- [x] **Arabic font, and every installed monospace** — a new settings row,
+      «خط العربية» / "Arabic font", picks the font Arabic text in the
+      terminal is drawn with: Auto (the terminal font's own Arabic, as
+      before) or any installed font that maps the probe letters ب ع ه ي ل —
+      on the development machine that is Kawkab Mono, Simplified Arabic
+      Fixed, Cairo, Tajawal, Dubai, Sakkal Majalla, Traditional Arabic,
+      the DecoType families and the bundled Amiri among them. Only Arabic
+      runs change font (`ui_font_runs`, the chrome's splitter); Latin text
+      on the same row stays in the terminal font. Rows with Arabic were
+      already shaped as whole lines and hit-tested through the shaped
+      layout, so a proportional Arabic font (Cairo) needs nothing new from
+      the grid. The coverage scan reads each face's cmap once per process
+      (`skrifa`, re-exported by cosmic-text, no new crate). A name in
+      config.json (`"arabic_font"`) that is not installed or cannot draw
+      Arabic counts as Auto. The font cycler now also lists every installed
+      MONOSPACED family after the known programming fonts, so Ubuntu Mono,
+      Noto Sans Mono, DejaVu Sans Mono, Kawkab Mono and anything installed
+      later appear without a code change. Fifteen settings rows no longer
+      fitted a 700px window (caught by an existing test): rows tighten to
+      fit, down to a floor. Proven: `cargo test`, 398 passed, including a
+      shaping test that inspects each glyph's font: with Amiri chosen,
+      every Arabic glyph of `echo مرحبا` is Amiri and no Latin glyph is;
+      captures of the same typed line with Auto, Kawkab Mono and Cairo
+      (`BAYAN_ARABIC_FONT`, `BAYAN_TYPE`) show three different Arabic
+      letterforms beside unchanged Latin, and the settings row reading
+      Kawkab Mono. Not verified on screen: clicking the cycler arrows
+- [x] **Kawkab Mono bundled** — `fonts/KawkabMono-Regular.ttf` (SIL OFL
+      1.1, unmodified; notice and licence in `fonts/OFL-KawkabMono.txt`)
+      loads beside Amiri, so the Arabic-font row offers a monospaced
+      Arabic font on every PC, not only on one that has it installed. It
+      is a choice, not a new default: Auto is unchanged. Regular weight
+      only (~260 KB); upstream publishes no compiled fonts in its git
+      tree, and this file is the one Ghostty redistributes. `fonts/OFL.txt`
+      had a header copied from EasyTer that named Vazirmatn and Noto Naskh,
+      which Bayan never shipped; it now lists what is in the folder.
+      Proven: `font_lists_find_arabic_fonts_and_every_installed_monospace`
+      requires Kawkab Mono in the Arabic list from a bare renderer
+- [x] **Two defects from the first hands-on pass** (real clicks and keys
+      through `SendInput` on a sandboxed profile). (1) In the Arabic
+      interface the Arabic-font row read blank on Auto: `draw_val` shaped
+      the value with `align_left = false`, so «تلقائي», an RTL paragraph,
+      was right-aligned inside the run's 1,000,000 px buffer and drawn far
+      off-screen while `measure` gave the right width. «PowerShell سريع» and
+      English «Auto» start with a Latin letter, so they never showed it.
+      Values now shape left-aligned. (2) A restored session brought every
+      tab back on the default shell: `SavedTab` kept no shell. Each pane's
+      command is saved beside its cwd (`None` for the default, and no field
+      at all when every pane is), and restored only if
+      `shells::is_restorable` accepts it — the fixed PowerShell/cmd forms,
+      the installed Git Bash, `wsl.exe -d` with a safe distro name — so
+      session.json cannot name a program to run; anything else, or a shell
+      that no longer starts, comes back as the default. Restore itself
+      stays opt-in (`"restore_tabs": true`). Proven: tests for the value's
+      glyph positions (and the off-screen cause), the restorable set, and
+      the shell round trip including a planted `calc.exe`. Seen in that
+      pass and left as is: in Cairo the end-of-line block cursor overlaps
+      the next Arabic letter's edge, and the shell menu opened from + covers
+      the bottom 10 px of the ‹ › + buttons
+- [x] **Local all the way down** — closes the two M33 limits. A Ctrl+clicked
+      file and a new tab's directory both pass `localpath::walk_live` before
+      anything stats them: the drive must not be `DRIVE_REMOTE`, and each
+      component's attributes are read without following it, root first, so
+      every read sits under directories already known to be local. A
+      symlink or junction is not refused outright (pnpm's `node_modules` is
+      made of them): its target is read from the reparse data
+      (`FSCTL_GET_REPARSE_POINT` on a handle opened with
+      `FILE_FLAG_OPEN_REPARSE_POINT`), and the walk restarts on that target
+      when it is a local drive path, through the same `accept_local_cwd`
+      gate. A UNC or volume target, a link type it does not decode, a loop
+      past 32 hops, or a read that fails for any reason but "not found" is
+      refused with «الملف ليس على قرص محلي», never revealed, since Explorer
+      would follow the link too. Cloud placeholders (OneDrive) are reparse
+      points that are not name redirects, so they pass. The old new-tab
+      check read only the LAST component, so a junction in a parent
+      (`C:\proj` → `\\server\share`) still reached the share; that is
+      closed too. Ghostty's kitty-graphics path check
+      (`GetFinalPathNameByHandleW` after the open) was the prior art and
+      the reason not to copy it: it checks after the open has already
+      connected. Proven by 19 tests on the pure walk and reparse-buffer
+      decoder (a fake volume with junctions, relative and rooted symlinks,
+      loops, a mapped drive, cloud and WSL tags, truncated buffers), and
+      a `link.rs` test that every action refuses rather than reveals. Proven
+      live on Windows at review (Nov 2026): a local junction and a relative
+      symlink open, a junction to a missing file is Missing, and a symlink
+      to `\\127.0.0.1\…`, a local junction chained into it, and a junction
+      to a `\\?\Volume{…}\` path are refused as not local. Not run
+      against a real SMB share. A local volume mount point (`\??\Volume{…}`
+      target) is refused too, which is stricter than it needs to be. A
+      link swapped between the walk and the open (TOCTOU) is not covered.
 
 ## Settings
 
@@ -844,4 +1017,5 @@ cargo run --release
 ```
 
 Requires Rust (MSVC toolchain on Windows). The Amiri font (SIL OFL, see
-`fonts/OFL.txt`) is bundled so connected Arabic works from a fresh clone.
+`fonts/OFL.txt`) is bundled so connected Arabic works from a fresh clone,
+and Kawkab Mono so a monospaced Arabic font is always on offer.

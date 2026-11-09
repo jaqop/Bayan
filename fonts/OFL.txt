@@ -2,10 +2,13 @@ The fonts bundled in this folder are licensed under the SIL Open Font License,
 Version 1.1, and are redistributed here under that license:
 
   - Amiri-Regular.ttf, Amiri-Bold.ttf   (Amiri, (c) Khaled Hosny and contributors)
-  - Vazirmatn.ttf                        (Vazirmatn, (c) Saber Rastikerdar)
-  - NotoNaskhArabic.ttf                  (Noto Naskh Arabic, (c) Google Inc.)
+  - KawkabMono-Regular.ttf              (Kawkab Mono, (c) 2015 Abdullah Arif;
+                                         Latin from Source Code Pro, (c) Adobe,
+                                         Reserved Font Name 'Source'). Its own
+                                         copyright notice and licence copy are
+                                         in OFL-KawkabMono.txt.
 
-The EasyTer application code itself is licensed under the MIT License (see ../LICENSE).
+Bayan's own code is licensed under the MIT License (see ../LICENSE).
 The full SIL Open Font License 1.1 text follows.
 
 -----------------------------------------------------------

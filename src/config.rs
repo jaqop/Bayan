@@ -8,6 +8,10 @@
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct UserConfig {
+    /// Interface language: `"en"` for English (left to right); anything
+    /// else, or nothing, is Arabic. The settings header switches it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     /// Restore saved tabs and panes on launch. Default off: start one fresh tab.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restore_tabs: Option<bool>,
@@ -19,6 +23,12 @@ pub struct UserConfig {
     /// Nerd-Font-first candidate list when absent or not found.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_family: Option<String>,
+    /// The font Arabic text in the terminal is drawn with (e.g. "Kawkab
+    /// Mono", "Cairo"). Absent: the terminal font's own Arabic, with
+    /// fallback when it has none. A name that is not installed, or cannot
+    /// draw Arabic, counts as absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arabic_font: Option<String>,
     /// Base font size in points (default 18).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_size: Option<f32>,
@@ -119,14 +129,6 @@ pub struct UserConfig {
     pub keyboard: KeyboardConfig,
 }
 
-fn default_honor_bdsm() -> bool {
-    true
-}
-
-fn default_true() -> bool {
-    true
-}
-
 /// How Bayan treats BDSM from the application.
 ///
 /// `honor_bdsm` defaults to true: an explicit BDSM (`CSI 8 l`) disables
@@ -136,10 +138,8 @@ fn default_true() -> bool {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct BidiConfig {
-    /// Serde fills a missing field from the field type's `Default`, and
-    /// `bool` defaults to false. The function keeps an empty `{"bidi":{}}`
-    /// on the same side as [`Default`].
-    #[serde(default = "default_honor_bdsm")]
+    /// The container `#[serde(default)]` fills a missing field from
+    /// [`Default`], so an empty `{"bidi":{}}` keeps this true.
     pub honor_bdsm: bool,
 }
 
@@ -164,7 +164,6 @@ pub struct KeyboardConfig {
     /// chord is reported as its PC-101 base key (`ؤ` on the C key →
     /// `CSI 99;5u` instead of `CSI 1572;5u`). Deliberate departure from the
     /// kitty spec so Claude Code can still be interrupted. Default on.
-    #[serde(default = "default_true")]
     pub kitty_base_layout_fallback: bool,
 }
 
@@ -276,6 +275,10 @@ impl UserConfig {
         self.copy_on_select.unwrap_or(true)
     }
 
+    pub fn lang(&self) -> crate::lang::Lang {
+        crate::lang::Lang::from_config(self.language.as_deref())
+    }
+
     /// Right-click outside a mouse-tracking program opens the context menu.
     /// Only an explicit `"paste"` brings back M36's paste-on-right-click.
     pub fn right_click_menu_on(&self) -> bool {
@@ -377,136 +380,44 @@ pub fn bayan_dir() -> std::path::PathBuf {
     }
 }
 
-fn config_path() -> Option<std::path::PathBuf> {
-    Some(bayan_dir().join("config.json"))
+pub fn load() -> std::io::Result<UserConfig> {
+    load_from(&bayan_dir().join("config.json"))
 }
 
-pub fn load() -> UserConfig {
-    config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        // Windows editors love a UTF-8 BOM; serde_json rejects it
-        .and_then(|s| serde_json::from_str(s.trim_start_matches('\u{feff}')).ok())
-        .unwrap_or_default()
+fn load_from(path: &std::path::Path) -> std::io::Result<UserConfig> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(UserConfig::default());
+        }
+        Err(error) => return Err(error),
+    };
+    // Windows editors can add a UTF-8 BOM, which serde_json rejects.
+    serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(Into::into)
 }
 
 /// Persist the config (the in-app settings panel writes it on close).
-pub fn save(cfg: &UserConfig) {
-    let Some(path) = config_path() else { return };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(json) = serde_json::to_string_pretty(cfg) {
-        let _ = write_atomic(&path, json.as_bytes());
-    }
-}
-
-/// Write `bytes` to `path` by flushing a sibling temp file and then
-/// replacing `path`. A crash mid-write leaves the previous file intact
-/// (N-06). The temp lives in the same directory so the replace does not
-/// cross a volume.
-pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = sibling_tmp(path);
-    let result = (|| {
-        write_synced(&tmp, bytes)?;
-        replace_file(&tmp, path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
-}
-
-/// Copy `path` to `path` + `.bayan.bak` the first time, and never again.
-/// `$PROFILE` is the user's file; the backup is the copy from before Bayan
-/// rewrote the managed line.
-pub(crate) fn backup_once(path: &std::path::Path) -> std::io::Result<()> {
-    if !path.is_file() {
-        return Ok(());
-    }
-    let Some(name) = path.file_name() else {
-        return Ok(());
-    };
-    let mut bak_name = name.to_os_string();
-    bak_name.push(".bayan.bak");
-    let bak = match path.parent() {
-        Some(dir) => dir.join(bak_name),
-        None => std::path::PathBuf::from(bak_name),
-    };
-    if bak.exists() {
-        return Ok(());
-    }
-    let bytes = std::fs::read(path)?;
-    write_atomic(&bak, &bytes)
-}
-
-fn sibling_tmp(path: &std::path::Path) -> std::path::PathBuf {
-    let mut name = path
-        .file_name()
-        .map(|s| s.to_os_string())
-        .unwrap_or_else(|| std::ffi::OsString::from("bayan"));
-    name.push(".");
-    name.push(std::process::id().to_string());
-    name.push(".tmp");
-    match path.parent() {
-        Some(dir) => dir.join(name),
-        None => std::path::PathBuf::from(name),
-    }
-}
-
-fn write_synced(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
-}
-
-fn replace_file(tmp: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
-    match std::fs::rename(tmp, dest) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            #[cfg(windows)]
-            if dest.exists() {
-                return replace_existing(dest, tmp);
-            }
-            Err(err)
-        }
-    }
-}
-
-#[cfg(windows)]
-fn replace_existing(dest: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACEFILE_WRITE_THROUGH};
-
-    fn wide(p: &std::path::Path) -> Vec<u16> {
-        p.as_os_str().encode_wide().chain(Some(0)).collect()
-    }
-    let replaced = wide(dest);
-    let replacement = wide(tmp);
-    // SAFETY: both buffers are NUL-terminated and live for the call.
-    // Backup, exclude, and reserved stay null. WRITE_THROUGH flushes the
-    // directory update before the call returns.
-    let ok = unsafe {
-        ReplaceFileW(
-            replaced.as_ptr(),
-            replacement.as_ptr(),
-            std::ptr::null(),
-            REPLACEFILE_WRITE_THROUGH,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+pub fn save(cfg: &UserConfig) -> std::io::Result<()> {
+    let path = bayan_dir().join("config.json");
+    let json = serde_json::to_vec_pretty(cfg)?;
+    crate::persist::write(&path, &json)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_config_is_distinguished_from_missing_config() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(load_from(&manifest.join("nonexistent-bayan-config.json")).is_ok());
+        assert_eq!(
+            load_from(&manifest.join("Cargo.toml"))
+                .err()
+                .map(|e| e.kind()),
+            Some(std::io::ErrorKind::InvalidData)
+        );
+    }
 
     #[test]
     fn config_parses_fully_partially_or_not_at_all() {
@@ -665,45 +576,5 @@ mod tests {
         }
         let on: UserConfig = serde_json::from_str(r#"{"osc52":"copy"}"#).unwrap();
         assert!(on.osc52_copy_enabled());
-    }
-
-    #[test]
-    fn atomic_replace_keeps_a_finished_file_and_backs_up_once() {
-        // N-06: temp dir, never ~/.bayan
-        let dir = std::env::temp_dir().join(format!("bayan-atomic-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("session.json");
-        write_atomic(&path, b"{\"a\":1}").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":1}");
-        // the second write is the one that has to replace, not truncate
-        write_atomic(&path, b"{\"a\":2}").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":2}");
-        let names: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            names.iter().all(|n| !n.ends_with(".tmp")),
-            "temp left behind: {names:?}"
-        );
-
-        let profile = dir.join("Microsoft.PowerShell_profile.ps1");
-        backup_once(&profile).unwrap();
-        assert!(!dir
-            .join("Microsoft.PowerShell_profile.ps1.bayan.bak")
-            .exists());
-        std::fs::write(&profile, b"user-line\n").unwrap();
-        backup_once(&profile).unwrap();
-        let bak = dir.join("Microsoft.PowerShell_profile.ps1.bayan.bak");
-        assert_eq!(std::fs::read(&bak).unwrap(), b"user-line\n");
-        std::fs::write(&profile, b"changed\n").unwrap();
-        backup_once(&profile).unwrap();
-        assert_eq!(
-            std::fs::read(&bak).unwrap(),
-            b"user-line\n",
-            "the backup is taken once"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
