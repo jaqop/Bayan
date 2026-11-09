@@ -3527,18 +3527,20 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        // CI's temp dir is 8.3 (`RUNNER~1`): expand it the way the link thread does.
+        let long = win_long_path(&bat).unwrap_or_else(|| bat.clone());
         let code = || Some(r"C:\Program Files\Code.exe".to_string());
         match settle(
             spans[0].activate(Some(&cwd), None),
             |_| true,
-            |_| None,
+            win_long_path,
             code,
         ) {
             Action::Edit { argv, path } => {
-                assert_eq!(path, bat);
+                assert_eq!(path, long);
                 assert_eq!(argv[0], r"C:\Program Files\Code.exe");
                 assert_eq!(argv[1], "-g");
-                assert_eq!(argv[2], format!("{bat}:1"));
+                assert_eq!(argv[2], format!("{long}:1"));
                 assert!(editor_command(&argv).is_some());
             }
             other => panic!("{other:?}"),
