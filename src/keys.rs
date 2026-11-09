@@ -73,6 +73,24 @@ pub fn encode(
         Key::Named(NamedKey::PageUp) => csi_tilde(5, m),
         Key::Named(NamedKey::PageDown) => csi_tilde(6, m),
         Key::Named(NamedKey::Delete) => csi_tilde(3, m),
+        Key::Named(NamedKey::Insert) => csi_tilde(2, m),
+        // F1-F4 are SS3 unmodified and CSI 1;m P-S modified; F5-F12 are CSI n ~
+        Key::Named(NamedKey::F1) if m == 1 => b"\x1bOP".to_vec(),
+        Key::Named(NamedKey::F2) if m == 1 => b"\x1bOQ".to_vec(),
+        Key::Named(NamedKey::F3) if m == 1 => b"\x1bOR".to_vec(),
+        Key::Named(NamedKey::F4) if m == 1 => b"\x1bOS".to_vec(),
+        Key::Named(NamedKey::F1) => csi_arrow('P', m),
+        Key::Named(NamedKey::F2) => csi_arrow('Q', m),
+        Key::Named(NamedKey::F3) => csi_arrow('R', m),
+        Key::Named(NamedKey::F4) => csi_arrow('S', m),
+        Key::Named(NamedKey::F5) => csi_tilde(15, m),
+        Key::Named(NamedKey::F6) => csi_tilde(17, m),
+        Key::Named(NamedKey::F7) => csi_tilde(18, m),
+        Key::Named(NamedKey::F8) => csi_tilde(19, m),
+        Key::Named(NamedKey::F9) => csi_tilde(20, m),
+        Key::Named(NamedKey::F10) => csi_tilde(21, m),
+        Key::Named(NamedKey::F11) => csi_tilde(23, m),
+        Key::Named(NamedKey::F12) => csi_tilde(24, m),
         // Ctrl+letter -> C0 control byte (Ctrl+C = \x03 ...). On Windows,
         // winit may hand us the control char itself instead of the letter —
         // pass it straight through.
@@ -215,7 +233,7 @@ fn altgr_text<'a>(input: &EncodeInput<'a>) -> Option<&'a str> {
         return None;
     }
     let text = input.text?;
-    if text.is_empty() || text.chars().any(is_control) {
+    if text.is_empty() || text.chars().any(char::is_control) {
         return None;
     }
     if same_key_or_pc101_shift(input, text) {
@@ -445,14 +463,10 @@ fn text_char(key: &Key) -> Option<char> {
     };
     let mut chars = raw.chars();
     let c = chars.next()?;
-    if chars.next().is_some() || is_control(c) {
+    if chars.next().is_some() || c.is_control() {
         return None;
     }
     Some(c)
-}
-
-fn is_control(c: char) -> bool {
-    c < '\u{20}' || ('\u{7f}'..='\u{9f}').contains(&c)
 }
 
 /// Shifted alternate. The active layout wins (`text`); ASCII falls back to
@@ -468,7 +482,7 @@ fn shifted_char(
         return None;
     }
     if let Some(c) = text.and_then(one_char) {
-        if !is_control(c) {
+        if !c.is_control() {
             return Some(c);
         }
     }
@@ -487,7 +501,7 @@ fn one_char(text: &str) -> Option<char> {
 }
 
 /// Unshifted character of this physical key on a PC-101 keyboard.
-fn pc101_unshifted(code: KeyCode) -> Option<char> {
+pub(crate) fn pc101_unshifted(code: KeyCode) -> Option<char> {
     use KeyCode::*;
     Some(match code {
         Backquote => '`',
@@ -629,6 +643,18 @@ mod tests {
             enc(Key::Named(NamedKey::Enter), true, false, false),
             "\x1b\r"
         );
+    }
+
+    #[test]
+    fn function_keys_and_insert_use_xterm_sequences() {
+        let k = |n| Key::Named(n);
+        assert_eq!(enc(k(NamedKey::F1), false, false, false), "\x1bOP");
+        assert_eq!(enc(k(NamedKey::F4), false, false, false), "\x1bOS");
+        assert_eq!(enc(k(NamedKey::F1), true, false, false), "\x1b[1;2P");
+        assert_eq!(enc(k(NamedKey::F5), false, false, false), "\x1b[15~");
+        assert_eq!(enc(k(NamedKey::F10), false, false, false), "\x1b[21~");
+        assert_eq!(enc(k(NamedKey::F12), false, false, true), "\x1b[24;5~");
+        assert_eq!(enc(k(NamedKey::Insert), false, false, false), "\x1b[2~");
     }
 
     #[test]
