@@ -553,9 +553,6 @@ impl App {
             return;
         }
         self.track_geometry();
-        if let Some(gpu) = self.gpu.as_mut() {
-            gpu.resize(px.width, px.height);
-        }
         self.relayout_active();
         self.request_redraw();
     }

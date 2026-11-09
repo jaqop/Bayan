@@ -762,6 +762,27 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       which Bayan never shipped; it now lists what is in the folder.
       Proven: `font_lists_find_arabic_fonts_and_every_installed_monospace`
       requires Kawkab Mono in the Arabic list from a bare renderer
+- [x] **Two defects from the first hands-on pass** (real clicks and keys
+      through `SendInput` on a sandboxed profile). (1) In the Arabic
+      interface the Arabic-font row read blank on Auto: `draw_val` shaped
+      the value with `align_left = false`, so «تلقائي», an RTL paragraph,
+      was right-aligned inside the run's 1,000,000 px buffer and drawn far
+      off-screen while `measure` gave the right width. «PowerShell سريع» and
+      English «Auto» start with a Latin letter, so they never showed it.
+      Values now shape left-aligned. (2) A restored session brought every
+      tab back on the default shell: `SavedTab` kept no shell. Each pane's
+      command is saved beside its cwd (`None` for the default, and no field
+      at all when every pane is), and restored only if
+      `shells::is_restorable` accepts it — the fixed PowerShell/cmd forms,
+      the installed Git Bash, `wsl.exe -d` with a safe distro name — so
+      session.json cannot name a program to run; anything else, or a shell
+      that no longer starts, comes back as the default. Restore itself
+      stays opt-in (`"restore_tabs": true`). Proven: tests for the value's
+      glyph positions (and the off-screen cause), the restorable set, and
+      the shell round trip including a planted `calc.exe`. Seen in that
+      pass and left as is: in Cairo the end-of-line block cursor overlaps
+      the next Arabic letter's edge, and the shell menu opened from + covers
+      the bottom 10 px of the ‹ › + buttons
 
 ## Settings
 

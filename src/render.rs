@@ -1064,6 +1064,103 @@ impl CellInfo {
     }
 }
 
+/// A run's glyphs for box arithmetic, with zero-width letters folded in (see
+/// `mouse::fold_empty_letters`). Once per run: `highlight_spans` is per cell.
+fn run_spans(run: &cosmic_text::LayoutRun) -> Vec<crate::mouse::GlyphSpan> {
+    let glyphs = run
+        .glyphs
+        .iter()
+        .map(|g| crate::mouse::GlyphSpan {
+            x: g.x,
+            w: g.w,
+            start: g.start,
+            end: g.end,
+            rtl: g.level.is_rtl(),
+        })
+        .collect();
+    crate::mouse::fold_empty_letters(glyphs, run.text)
+}
+
+/// `LayoutRun::highlight` with one difference: a glyph that covers several
+/// letters (the lam-alef ligature «لا») splits from the RIGHT when it is
+/// RTL, so its first logical letter gets the right part. cosmic-text 0.19
+/// splits every glyph left to right, which put ل's box over ا: the block
+/// cursor sat on the wrong half and a click there picked the other cell.
+/// `mouse::boxes_for_glyphs` already splits this way. A unit is a base
+/// character plus its combining marks and joiners, as a terminal cell is.
+fn highlight_spans(
+    glyphs: &[crate::mouse::GlyphSpan],
+    text: &str,
+    b0: usize,
+    b1: usize,
+) -> Vec<(f32, f32)> {
+    let mut out: Vec<(f32, f32)> = Vec::new();
+    let mut open: Option<(f32, f32)> = None;
+    let mut parts: Vec<(f32, f32, bool)> = Vec::new();
+    for glyph in glyphs {
+        let cluster = &text[glyph.start..glyph.end];
+        let mut units: Vec<(usize, usize)> = Vec::new();
+        let mut joined = false;
+        for (i, c) in cluster.char_indices() {
+            let glue = crate::bidi::is_combining(c)
+                || c == '\u{200d}'
+                || joined
+                || matches!(c as u32, 0xFE00..=0xFE0F | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F);
+            joined = c == '\u{200d}';
+            match units.last_mut() {
+                Some(u) if glue => u.1 = i + c.len_utf8(),
+                _ => units.push((i, i + c.len_utf8())),
+            }
+        }
+        let n = units.len().max(1);
+        let w = glyph.w / n as f32;
+        parts.clear();
+        for (k, &(s, e)) in units.iter().enumerate() {
+            let slot = if glyph.rtl { n - 1 - k } else { k };
+            let (s, e) = (glyph.start + s, glyph.start + e);
+            parts.push((glyph.x + w * slot as f32, w, e > b0 && s < b1));
+        }
+        // visual order inside the glyph, so a span stays contiguous
+        parts.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for &(x, w, hit) in &parts {
+            if hit {
+                open = Some(open.map_or((x, x + w), |(lo, hi)| (lo.min(x), hi.max(x + w))));
+            } else if let Some((lo, hi)) = open.take() {
+                if hi > lo {
+                    out.push((lo, hi - lo));
+                }
+            }
+        }
+    }
+    if let Some((lo, hi)) = open {
+        if hi > lo {
+            out.push((lo, hi - lo));
+        }
+    }
+    out
+}
+
+/// A cursor past the end of a mixed line can attach mid-line: after
+/// `.txt` that ends an RTL paragraph, the next glyph is the Arabic that
+/// precedes it, and shaped spaces are narrower than a cell. A full-cell
+/// block there covers a letter, so narrow it to the free gap — at least
+/// 2px, a caret — keeping the edge it attaches to (right for RTL, left
+/// for LTR).
+fn fit_past_end_cursor(x: i32, w: i32, rtl: bool, letters: &[(i32, i32)]) -> (i32, i32) {
+    let (mut lo, mut hi) = (x, x + w);
+    for &(l, r) in letters {
+        if r - 1 <= lo || l + 1 >= hi {
+            continue;
+        }
+        if rtl {
+            lo = lo.max(r.min(hi - 2));
+        } else {
+            hi = hi.min(l.max(lo + 2));
+        }
+    }
+    (lo, (hi - lo).max(2))
+}
+
 /// Claude's prompt uses a logical cursor offset even though its output
 /// cells are visual. Resolve that offset through the same permutation.
 fn claude_logical_cursor_cell(cells: &[CellInfo], offset: usize) -> Option<usize> {
@@ -2168,7 +2265,7 @@ impl Renderer {
             .collect();
         // shape unconstrained (cached), then compress to the pane on overflow
         let natw = self.measure(&segs, true);
-        let scale = if natw > pane_w as f32 {
+        let mut scale = if natw > pane_w as f32 {
             pane_w as f32 / natw
         } else {
             1.0
@@ -2181,28 +2278,112 @@ impl Renderer {
             .next()
             .is_some_and(|run| run.rtl);
         // Keep Claude's inverse trailing blank inside the shaped field.
-        let reserve = if claude && paragraph_rtl && cells[end..].iter().any(|c| c.bg != self.bg) {
-            self.cell_w.round() as i32
+        let claude_reserve =
+            if claude && paragraph_rtl && cells[end..].iter().any(|c| c.bg != self.bg) {
+                self.cell_w.round() as i32
+            } else {
+                0
+            };
+        // Where the cells after the text (the cursor waiting at a prompt,
+        // inverse blanks) attach: the edge of the LOGICALLY last cell, on
+        // the side its direction grows toward. cosmic's past-the-end
+        // `cursor_position` reads the VISUALLY last glyph instead, so on
+        // `... - total` in an RTL paragraph, or `... مع العربية` in an LTR
+        // one, the end cursor landed on top of a letter. Claude rows keep
+        // the old anchor: their cell order is restored, not logical.
+        let last_col = cells[end - 1].col;
+        let end_geom: Option<(f32, bool)> = if claude {
+            self.cache_hot[&key]
+                .buffer
+                .layout_runs()
+                .filter_map(|run| {
+                    run.cursor_position(&cosmic_text::Cursor::new(0, nbytes))
+                        .map(|x| (x, run.rtl))
+                })
+                .last()
         } else {
-            0
+            cell_bytes
+                .iter()
+                .find(|cb| cb.0 == last_col)
+                .and_then(|&(_, b0, b1)| {
+                    self.cache_hot[&key].buffer.layout_runs().find_map(|run| {
+                        let spans = highlight_spans(&run_spans(&run), run.text, b0, b1);
+                        let lo = spans.iter().map(|s| s.0).reduce(f32::min)?;
+                        let hi = spans.iter().map(|s| s.0 + s.1).reduce(f32::max)?;
+                        let rtl = run
+                            .glyphs
+                            .iter()
+                            .find(|g| g.start <= b0 && b0 < g.end)
+                            .is_some_and(|g| g.level.is_rtl());
+                        Some((if rtl { lo } else { hi }, rtl))
+                    })
+                })
         };
+        // Blanks after the text are trailing neutrals: UAX#9 gives them the
+        // paragraph's direction, not the last letter's, so they start from
+        // the line's visual end. `C:\>مرحبا` followed by spaces grows right
+        // of the whole line, not left from the Arabic's logical end into
+        // the prompt. Only the cell right after the text keeps `end_geom`:
+        // with no blank before it, it is the next letter's slot.
+        let para_end: Option<(f32, bool)> = if claude {
+            end_geom
+        } else {
+            let run = self.cache_hot[&key].buffer.layout_runs().next();
+            run.and_then(|run| {
+                let edges = run.glyphs.iter();
+                if paragraph_rtl {
+                    edges.map(|g| g.x).reduce(f32::min)
+                } else {
+                    edges.map(|g| g.x + g.w).reduce(f32::max)
+                }
+            })
+            .map(|x| (x, paragraph_rtl))
+        };
+        let end_for = |trailing: bool| if trailing { para_end } else { end_geom };
+        // An RTL end grows LEFT. Typing Arabic at a shell prompt
+        // (`$ الامر`) leaves the cursor there, and when the row starts at
+        // the pane edge it mapped outside the clip and vanished. Shift the
+        // text right just enough to show it. Rows with room on the left
+        // (TUI fields, Claude's `> `) keep their place: the shift is only
+        // what the clip would hide.
+        let text_end_col = last_col + cells[end - 1].w;
+        let cursor_end = cursor_col.and_then(|col| end_for(col > text_end_col));
+        let cursor_reserve = match (cursor_col, cursor_end) {
+            (Some(col), Some((end_x, true))) if col >= text_end_col => {
+                let need = ((col - text_end_col + 1) as f32 * self.cell_w).round() as i32;
+                (clip.0 - (x0 + (end_x * scale).round() as i32 - need)).max(0)
+            }
+            _ => 0,
+        };
+        let reserve = claude_reserve.max(cursor_reserve);
+        if cursor_reserve > 0 && natw * scale + reserve as f32 > pane_w as f32 {
+            scale = ((pane_w - reserve).max(1) as f32 / natw).min(1.0);
+        }
         let text_x0 = x0 + reserve;
         let mut backgrounds = Vec::new();
-        let mut end_anchor: Option<(i32, bool)> = None;
+        // drawn letter boxes, so a cursor past the text can avoid them
+        let blank_cols: std::collections::HashSet<usize> = cells[..end]
+            .iter()
+            .filter(|c| c.c == ' ')
+            .map(|c| c.col)
+            .collect();
+        let mut letters: Vec<(i32, i32)> = Vec::new();
         for run in self.cache_hot[&key].buffer.layout_runs() {
+            let glyphs = run_spans(&run);
             for &(col, b0, b1) in &cell_bytes {
-                let start = cosmic_text::Cursor::new(0, b0);
-                let finish = cosmic_text::Cursor::new(0, b1);
                 let rtl = !claude
                     && run
                         .glyphs
                         .iter()
                         .find(|g| g.start <= b0 && b0 < g.end)
                         .is_some_and(|g| g.level.is_rtl());
-                for (hx, hw) in run.highlight(start, finish) {
+                for (hx, hw) in highlight_spans(&glyphs, run.text, b0, b1) {
                     let left = text_x0 + (hx * scale).round() as i32;
                     let right = text_x0 + ((hx + hw) * scale).round() as i32;
                     let bounds = (left, (right - left).max(1), rtl);
+                    if !blank_cols.contains(&col) {
+                        letters.push((left, right));
+                    }
                     if let Some(&bg) = background_by_col.get(&col) {
                         backgrounds.push((bounds.0, bounds.1, bg));
                     }
@@ -2229,33 +2410,35 @@ impl Renderer {
                     }
                 }
             }
-            if let Some(x) = run.cursor_position(&cosmic_text::Cursor::new(0, nbytes)) {
-                end_anchor = Some((text_x0 + (x * scale).round() as i32, run.rtl));
+        }
+        let width = self.cell_w.round() as i32;
+        let x_at = |col: usize, trailing: bool| {
+            end_for(trailing).map(|(x, rtl)| {
+                let anchor = text_x0 + (x * scale).round() as i32;
+                let past = col - text_end_col + usize::from(rtl);
+                let offset = (past as f32 * self.cell_w).round() as i32;
+                let x = if rtl {
+                    anchor - offset
+                } else {
+                    anchor + offset
+                };
+                (x, rtl)
+            })
+        };
+        for ci in cells[end..].iter().filter(|ci| ci.bg != self.bg) {
+            if let Some((x, rtl)) = x_at(ci.col, true) {
+                backgrounds.push((x, width, ci.bg));
+                if let Some((pane, row)) = self.mapping_context {
+                    self.cell_geometry
+                        .entry((pane, row, ci.col))
+                        .or_default()
+                        .push((x, width, rtl));
+                }
             }
         }
-        if let Some((anchor, rtl)) = end_anchor {
-            let end_col = cells[end - 1].col + cells[end - 1].w;
-            let width = self.cell_w.round() as i32;
-            let x_at = |col: usize| {
-                if rtl {
-                    anchor - (((col - end_col + 1) as f32 * self.cell_w).round() as i32)
-                } else {
-                    anchor + (((col - end_col) as f32 * self.cell_w).round() as i32)
-                }
-            };
-            for ci in &cells[end..] {
-                if ci.bg != self.bg {
-                    backgrounds.push((x_at(ci.col), width, ci.bg));
-                    if let Some((pane, row)) = self.mapping_context {
-                        self.cell_geometry
-                            .entry((pane, row, ci.col))
-                            .or_default()
-                            .push((x_at(ci.col), width, rtl));
-                    }
-                }
-            }
-            if let Some(col) = cursor_col.filter(|col| *col >= end_col) {
-                mapped_cursor = Some((x_at(col), width));
+        if let Some(col) = cursor_col.filter(|col| *col >= text_end_col) {
+            if let Some((x, rtl)) = x_at(col, col > text_end_col) {
+                mapped_cursor = Some(fit_past_end_cursor(x, width, rtl, &letters));
             }
         }
         backgrounds.sort_unstable();
@@ -2279,10 +2462,9 @@ impl Renderer {
             let key = self.ensure_shaped(&segs, true);
             let mut rects: Vec<PxDeco> = Vec::new();
             for run in self.cache_hot[&key].buffer.layout_runs() {
+                let glyphs = run_spans(&run);
                 for &(b0, b1, style, fg) in &decos {
-                    let c0 = cosmic_text::Cursor::new(0, b0);
-                    let c1 = cosmic_text::Cursor::new(0, b1);
-                    for (hx, hw) in run.highlight(c0, c1) {
+                    for (hx, hw) in highlight_spans(&glyphs, run.text, b0, b1) {
                         let dx0 = text_x0 + (hx * scale).round() as i32;
                         let dx1 = text_x0 + ((hx + hw) * scale).round() as i32;
                         rects.push((dx0, dx1, style, fg));
@@ -2304,20 +2486,20 @@ impl Renderer {
             return mapped_cursor;
         }
         if let Some((b0, b1)) = cur_bytes {
-            let c0 = cosmic_text::Cursor::new(0, b0);
-            let c1 = cosmic_text::Cursor::new(0, b1);
             let key = self.ensure_shaped(&segs, true);
             for run in self.cache_hot[&key].buffer.layout_runs() {
                 // 0.19: highlight yields per-segment rects — merge to one
-                let merged = run.highlight(c0, c1).fold(None, |acc, (x, w)| {
-                    Some(match acc {
-                        None => (x, x + w),
-                        Some((lo, hi)) => (x.min(lo), (x + w).max(hi)),
-                    })
-                });
+                let merged = highlight_spans(&run_spans(&run), run.text, b0, b1)
+                    .into_iter()
+                    .fold(None, |acc, (x, w)| {
+                        Some(match acc {
+                            None => (x, x + w),
+                            Some((lo, hi)) => (x.min(lo), (x + w).max(hi)),
+                        })
+                    });
                 if let Some((lo, hi)) = merged {
                     return Some((
-                        x0 + (lo * scale).round() as i32,
+                        text_x0 + (lo * scale).round() as i32,
                         (((hi - lo) * scale).ceil() as i32).max(2),
                     ));
                 }
@@ -2377,15 +2559,7 @@ impl Renderer {
             let buffer = &self.cache_hot[&key].buffer;
             let mut glyphs = Vec::new();
             for run in buffer.layout_runs() {
-                for g in run.glyphs.iter() {
-                    glyphs.push(crate::mouse::GlyphSpan {
-                        x: g.x,
-                        w: g.w,
-                        start: g.start,
-                        end: g.end,
-                        rtl: g.level.is_rtl(),
-                    });
-                }
+                glyphs.extend(run_spans(&run));
             }
             glyphs
         };
@@ -3438,6 +3612,11 @@ impl Renderer {
             // with the row's own title. Truncating here protects every row,
             // including a long font family, not just the one that broke.
             let gap = (right.0 - (left.0 + left.2) - 8).max(0);
+            // Left-aligned shaping: without it, a value whose first strong
+            // letter is Arabic («تلقائي») is an RTL paragraph that cosmic-text
+            // right-aligns inside the run's 1,000,000 px buffer, so its
+            // glyphs land far off-screen while `measure` still reports the
+            // right width. A Latin-first value («PowerShell سريع») was fine.
             let mut text = text;
             loop {
                 let seg = [Seg {
@@ -3445,12 +3624,12 @@ impl Renderer {
                     fg: VALUE,
                     style: ST_BOLD,
                 }];
-                let vw = r.measure(&seg, false);
+                let vw = r.measure(&seg, true);
                 if vw as i32 <= gap || text.chars().count() <= 2 {
                     let mid = (left.0 + left.2 + right.0) / 2;
                     r.draw_run(
                         &seg,
-                        false,
+                        true,
                         out,
                         whole,
                         mid as f32 - vw / 2.0,
@@ -4699,6 +4878,95 @@ impl Renderer {
         }
     }
 
+    fn wrap_error_detail<'a>(&mut self, detail: &'a str, width: f32) -> Vec<&'a str> {
+        let mut rows = Vec::new();
+        for line in detail.lines() {
+            let mut rest = line.trim();
+            while !rest.is_empty() {
+                if self.measure(&[Seg::plain(rest, self.fg)], true) <= width {
+                    rows.push(rest);
+                    break;
+                }
+                let mut fit = 0;
+                for (offset, ch) in rest.char_indices() {
+                    let end = offset + ch.len_utf8();
+                    if self.measure(&[Seg::plain(&rest[..end], self.fg)], true) > width {
+                        break;
+                    }
+                    fit = end;
+                }
+                // Prefer a word boundary, but split a long token when needed.
+                let end = if rest[fit..].starts_with(char::is_whitespace) {
+                    fit
+                } else {
+                    rest[..fit].rfind(char::is_whitespace).unwrap_or(fit)
+                };
+                let end = if end == 0 {
+                    rest.chars().next().map_or(0, char::len_utf8)
+                } else {
+                    end
+                };
+                rows.push(&rest[..end]);
+                rest = rest[end..].trim_start();
+            }
+        }
+        rows
+    }
+
+    pub fn draw_app_error(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        fw: i32,
+        fh: i32,
+        title: &str,
+        detail: &str,
+    ) {
+        let pad = 16;
+        let row_h = self.cell_h.ceil() as i32;
+        let w = (self.cell_w * 62.0) as i32;
+        let w = w.min(fw - 2 * pad);
+        let max_rows = ((fh - 4 * pad) / row_h - 2).max(0) as usize;
+        if w <= 2 * pad || max_rows == 0 {
+            return;
+        }
+        let inner_w = w - 2 * pad;
+        let rows = self.wrap_error_detail(detail, inner_w as f32);
+        let h = 2 * pad + (rows.len().min(max_rows) as i32 + 2) * row_h;
+        let (x, y) = ((fw - w) / 2, (fh - h) / 2);
+        let whole = (0, 0, fw, fh);
+        let clip = (x + pad, y + pad, inner_w, h - 2 * pad);
+        push_rect(out, whole, 0, 0, fw, fh, c4((0, 0, 0), 150));
+        push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 255));
+        push_rect(out, whole, x, y, w, 3, c4((0xcf, 0x22, 0x2e), 255));
+
+        let keys = crate::lang::tr("Enter أو Esc للإغلاق", "Enter or Esc closes");
+        let lines = std::iter::once(Seg {
+            text: title.into(),
+            fg: self.fg,
+            style: ST_BOLD,
+        })
+        .chain(
+            rows.iter()
+                .take(max_rows)
+                .map(|row| Seg::plain(*row, (0xf2, 0xcc, 0x60))),
+        )
+        .chain(std::iter::once(Seg::plain(keys, (0x9a, 0xa4, 0xb2))));
+        for (i, seg) in lines.enumerate() {
+            let seg = [seg];
+            let tw = self.measure(&seg, true).ceil() as i32;
+            let left = crate::lang::lead_x(x, w, pad, tw);
+            self.draw_run(
+                &seg,
+                true,
+                out,
+                clip,
+                left as f32,
+                clip.1 + i as i32 * row_h,
+                1.0,
+            );
+        }
+    }
+
     /// A link card. `may_open` is the confirm card (mint bar, Enter opens).
     /// A refusal is the red bar, and Enter only dismisses it.
     pub fn draw_link_block(
@@ -5520,6 +5788,289 @@ mod tests {
             30 - r.cell_w.round() as i32,
             "RTL insertion precedes the leftmost glyph"
         );
+    }
+
+    /// Typing Arabic at a shell prompt (`$ الامر`) makes the row an RTL
+    /// paragraph, so the logical end — where the cursor waits — is the
+    /// visual LEFT edge. The row starts at the pane edge, so mapping the
+    /// cursor one cell left of the text put it outside the pane clip and
+    /// it vanished. It must stay inside the pane, left of the Arabic, and
+    /// the text it pushes right must still hit-test to its own columns.
+    #[test]
+    fn shell_cursor_after_rtl_input_stays_inside_the_pane() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let pane = (0, 0, 600, 120);
+        let cells = row_cells("$ الامر", 0);
+        let end = cells.len();
+        for cursor_col in [end, end + 1] {
+            r.begin_frame();
+            r.mapping_context = Some((pane, 0));
+            let cursor = r
+                .draw_line_bidi(
+                    &mut Vec::new(),
+                    pane,
+                    pane.0,
+                    0,
+                    pane.2,
+                    &cells,
+                    false,
+                    Some(cursor_col),
+                    ParagraphDir::Default,
+                    None,
+                )
+                .expect("a cursor past the text still maps");
+            r.finish_pane_layout(pane);
+            assert!(
+                cursor.0 >= pane.0,
+                "cursor at col {cursor_col} drawn at x={} left of the pane",
+                cursor.0
+            );
+            let arabic_left = (2..end)
+                .map(|col| r.cell_geometry[&(pane, 0, col)][0].0)
+                .min()
+                .unwrap();
+            assert!(
+                cursor.0 + cursor.1 <= arabic_left,
+                "cursor {cursor:?} must sit left of the Arabic (x={arabic_left})"
+            );
+            for ci in &cells {
+                let (x, w, _) = r.cell_geometry[&(pane, 0, ci.col)][0];
+                assert_eq!(
+                    r.hit_cell(pane, 0, x as f64 + w as f64 / 2.0)
+                        .map(|hit| hit.0),
+                    Some(ci.col)
+                );
+            }
+        }
+        // a cursor inside the text does not shift anything
+        r.begin_frame();
+        let inside = r.draw_line_bidi(
+            &mut Vec::new(),
+            pane,
+            pane.0,
+            0,
+            pane.2,
+            &cells,
+            false,
+            Some(3),
+            ParagraphDir::Default,
+            None,
+        );
+        assert!(inside.is_some_and(|c| c.0 >= pane.0));
+    }
+
+    /// «لا» is one glyph for two cells. Its FIRST logical letter, ل, is the
+    /// right half of an RTL ligature; cosmic-text's own split gave ل the
+    /// left half, so the cursor and a click landed on the wrong letter.
+    #[test]
+    fn lam_alef_ligature_splits_from_the_right() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let pane = (0, 0, 600, 120);
+        let cells = row_cells("go إصلاح", 0);
+        let lam = cells.iter().position(|c| c.c == 'ل').unwrap();
+        let alef = lam + 1;
+        assert_eq!(cells[alef].c, 'ا');
+        r.mapping_context = Some((pane, 0));
+        r.draw_line_bidi(
+            &mut Vec::new(),
+            pane,
+            0,
+            0,
+            pane.2,
+            &cells,
+            false,
+            None,
+            ParagraphDir::Default,
+            None,
+        );
+        r.finish_pane_layout(pane);
+        let lam_x = r.cell_geometry[&(pane, 0, lam)][0].0;
+        let alef_x = r.cell_geometry[&(pane, 0, alef)][0].0;
+        assert!(
+            lam_x > alef_x,
+            "ل at {lam_x} must be right of ا at {alef_x}"
+        );
+        for col in [lam, alef] {
+            let (x, w, _) = r.cell_geometry[&(pane, 0, col)][0];
+            assert_eq!(
+                r.hit_cell(pane, 0, x as f64 + w as f64 / 2.0)
+                    .map(|hit| hit.0),
+                Some(col)
+            );
+        }
+    }
+
+    /// The end cursor attaches to the LOGICALLY last cell, on the side that
+    /// cell's direction grows toward. cosmic's past-the-end position reads
+    /// the visually last glyph, which put the cursor on top of a letter
+    /// whenever a line ended in the other direction than its paragraph.
+    #[test]
+    fn end_cursor_never_covers_a_letter_on_mixed_lines() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let pane = (0, 0, 800, 120);
+        for text in [
+            "السعر 45 - total",
+            "עברית + عربي + English",
+            "ls مع العربية",
+        ] {
+            let cells = row_cells(text, 0);
+            let end = cells.len();
+            r.begin_frame();
+            r.mapping_context = Some((pane, 0));
+            let (cx, cw) = r
+                .draw_line_bidi(
+                    &mut Vec::new(),
+                    pane,
+                    0,
+                    0,
+                    pane.2,
+                    &cells,
+                    false,
+                    Some(end),
+                    ParagraphDir::Default,
+                    None,
+                )
+                .expect("end cursor maps");
+            r.finish_pane_layout(pane);
+            assert!(cx >= pane.0, "{text}: cursor x={cx} left of the pane");
+            let last = &cells[end - 1];
+            let (lx, lw, _) = r.cell_geometry[&(pane, 0, last.col)][0];
+            assert!(
+                cx + cw <= lx + 1 || cx >= lx + lw - 1,
+                "{text}: end cursor {cx}..{} covers its last letter {lx}..{}",
+                cx + cw,
+                lx + lw
+            );
+            // no letter under it either: past-end blocks narrow to the gap
+            for ci in cells.iter().filter(|c| c.c != ' ') {
+                let (x, w, _) = r.cell_geometry[&(pane, 0, ci.col)][0];
+                assert!(
+                    cx + cw <= x + 1 || cx >= x + w - 1,
+                    "{text}: end cursor {cx}..{} covers {:?} at {x}..{}",
+                    cx + cw,
+                    ci.c,
+                    x + w
+                );
+            }
+            assert!(cw >= 2, "{text}: cursor narrowed away");
+            // and it sits on the side the last letter's direction grows to
+            let rtl_end = is_arabic(last.c);
+            assert!(
+                if rtl_end { cx < lx } else { cx >= lx + lw - 1 },
+                "{text}: end cursor at {cx} on the wrong side of {lx}..{}",
+                lx + lw
+            );
+        }
+    }
+
+    /// Some fonts draw «لا» as two glyphs: ل with the whole width and ا with
+    /// none. Dropping the empty one left the ا cell with no box at all, so a
+    /// cursor parked on it was not drawn and no click could reach it.
+    #[test]
+    fn cursor_on_the_empty_half_of_lam_alef_is_drawn() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let pane = (0, 0, 600, 120);
+        let cells = row_cells("go إصلاح", 0);
+        let lam = cells.iter().position(|c| c.c == 'ل').unwrap();
+        let cursor_at = |r: &mut Renderer, col| {
+            r.draw_line_bidi(
+                &mut Vec::new(),
+                pane,
+                0,
+                0,
+                pane.2,
+                &cells,
+                false,
+                Some(col),
+                ParagraphDir::Default,
+                None,
+            )
+        };
+        let on_lam = cursor_at(&mut r, lam).expect("cursor on ل");
+        let on_alef = cursor_at(&mut r, lam + 1).expect("cursor on ا");
+        assert!(on_alef.1 > 0);
+        assert!(
+            on_alef.0 < on_lam.0,
+            "ا at x={} must be left of ل at x={}",
+            on_alef.0,
+            on_lam.0
+        );
+    }
+
+    /// Spaces typed after the text are trailing neutrals: UAX#9 gives them
+    /// the paragraph's direction, not the last letter's. At `C:\>مرحبا` the
+    /// logical end of the Arabic is its LEFT edge, so counting blanks from
+    /// there drew the cursor back over the word or inside the prompt, and
+    /// the next letter then appeared a word's width away from it.
+    #[test]
+    fn blanks_after_the_text_follow_the_paragraph_direction() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let pane = (0, 0, 800, 120);
+        let draw = |r: &mut Renderer, cells: &[CellInfo], cursor_col: usize| {
+            r.begin_frame();
+            r.mapping_context = Some((pane, 0));
+            let cursor = r
+                .draw_line_bidi(
+                    &mut Vec::new(),
+                    pane,
+                    0,
+                    0,
+                    pane.2,
+                    cells,
+                    false,
+                    Some(cursor_col),
+                    ParagraphDir::Default,
+                    None,
+                )
+                .expect("a cursor past the text still maps");
+            r.finish_pane_layout(pane);
+            let boxes: Vec<_> = cells
+                .iter()
+                .filter(|c| c.c != ' ')
+                .map(|c| r.cell_geometry[&(pane, 0, c.col)][0])
+                .collect();
+            let left = boxes.iter().map(|b| b.0).min().unwrap();
+            let right = boxes.iter().map(|b| b.0 + b.1).max().unwrap();
+            (cursor, left, right)
+        };
+
+        // LTR paragraph ending in Arabic: blanks grow right, off the line end
+        let cells = row_cells("C:\\>مرحبا", 0);
+        let end = cells.len();
+        for blanks in [1usize, 9] {
+            let (cursor, _, right) = draw(&mut r, &cells, end + blanks);
+            let want = right + (blanks as f32 * r.cell_w).round() as i32;
+            assert!(
+                (cursor.0 - want).abs() <= 1,
+                "{blanks} blanks: cursor at x={} must be at x={want}",
+                cursor.0
+            );
+        }
+        // with no blank the cursor is the next letter's slot: the Arabic's
+        // logical end, which is its left edge
+        let (cursor, _, right) = draw(&mut r, &cells, end);
+        assert!(
+            cursor.0 < right - r.cell_w as i32,
+            "end cursor at x={} left the Arabic's logical end",
+            cursor.0
+        );
+
+        // RTL paragraphs, whichever way they end: blanks grow left of the
+        // whole line, and the text shifts right so the cursor stays visible
+        for text in ["السعر 45 - total", "$ مرحبا"] {
+            let cells = row_cells(text, 0);
+            let end = cells.len();
+            let (cursor, left, _) = draw(&mut r, &cells, end + 3);
+            assert!(
+                cursor.0 >= pane.0,
+                "{text}: cursor x={} left of the pane",
+                cursor.0
+            );
+            assert!(
+                cursor.0 + cursor.1 <= left + 1,
+                "{text}: cursor {cursor:?} must sit left of the whole line (x={left})"
+            );
+        }
     }
 
     #[test]
@@ -6350,6 +6901,61 @@ mod cache_tests {
             ..Default::default()
         };
         assert_eq!(Renderer::new(1.0, &stale, 0.0).arabic_family(), None);
+    }
+
+    /// x of every glyph in a shaped run, relative to where it is drawn.
+    fn glyph_xs(r: &mut Renderer, text: &str, align_left: bool) -> (Vec<f32>, f32) {
+        let key = r.ensure_shaped(&[Seg::plain(text, (255, 255, 255))], align_left);
+        let run = r.cache_hot.get(&key).expect("shaped");
+        let xs = run
+            .buffer
+            .layout_runs()
+            .flat_map(|lr| lr.glyphs.iter())
+            .map(|g| g.x)
+            .collect();
+        (xs, run.natw)
+    }
+
+    #[test]
+    fn error_detail_wraps_to_measured_width_and_preserves_line_breaks() {
+        let mut r = test_renderer();
+        let fg = r.fg;
+        let width = r.measure(&[Seg::plain("first second", fg)], true).ceil();
+        let rows = r.wrap_error_detail(
+            "first second third\nFix config.json and restart Bayan\nإعداداتبيانإعداداتبيان",
+            width,
+        );
+        assert_eq!(&rows[..2], &["first second", "third"]);
+        assert_eq!(rows[2], "Fix");
+        assert_eq!(
+            rows[2..].join("").replace(' ', ""),
+            "Fixconfig.jsonandrestartBayanإعداداتبيانإعداداتبيان"
+        );
+        assert!(rows
+            .iter()
+            .all(|row| r.measure(&[Seg::plain(*row, fg)], true) <= width));
+    }
+
+    #[test]
+    fn an_all_arabic_value_is_drawn_inside_its_measured_width() {
+        // the settings values («تلقائي» on the Arabic-font row) shape left-
+        // aligned; an RTL paragraph shaped without it sits at the far end
+        // of the 1,000,000 px buffer, which is how that row went blank
+        let mut r = test_renderer();
+        let (xs, natw) = glyph_xs(&mut r, "تلقائي", true);
+        assert!(!xs.is_empty() && natw > 0.0);
+        // half a pixel of slack: advances round to 1/64 px, so an RTL line's
+        // last glyph can start a few 64ths left of zero. That draws in the
+        // same pixel; the bug this guards puts it a million pixels away.
+        assert!(
+            xs.iter().all(|&x| (-0.5..=natw + 0.5).contains(&x)),
+            "{xs:?} vs {natw}"
+        );
+        let (far, _) = glyph_xs(&mut r, "تلقائي", false);
+        assert!(
+            far.iter().all(|&x| x > 10_000.0),
+            "the cause, pinned: {far:?}"
+        );
     }
 
     #[test]

@@ -24,8 +24,11 @@ mod link;
 mod mouse;
 mod mru;
 mod osc7;
+mod persist;
 mod plugins;
 mod posh;
+mod process;
+mod pty_writer;
 mod render;
 mod shells;
 mod term;
@@ -402,6 +405,8 @@ pub enum UserEvent {
     Wakeup(u64),
     /// Tab `id`'s emulator answers its child (DSR/DA replies TUIs block on).
     PtyWrite(u64, String),
+    /// Input was rejected or the background pipe writer failed.
+    PtyWriteFailed(u64, String),
     /// The font system finished loading on its background thread.
     RendererReady(Box<render::Renderer>),
     /// Pane `id` asked to set the clipboard via OSC 52. Applied only when
@@ -449,6 +454,7 @@ struct BlockedLink {
     reason: String,
     shown: String,
     confirm_uri: Option<String>,
+    is_app_error: bool,
 }
 
 /// What a confirm card is holding, which decides where Enter sends it.
@@ -482,6 +488,9 @@ struct PendingPaste {
 struct Pane {
     id: u64,
     session: Session,
+    /// the command line it was started with, so a restored session brings
+    /// a Command Prompt tab back as Command Prompt
+    command: String,
     /// when this pane last produced output — feeds the busy dot
     last_output: Option<Instant>,
     /// the program's OSC 9;4 progress report, until it clears it
@@ -673,6 +682,11 @@ struct SavedTab {
     /// files from before tab groups
     #[serde(default, skip_serializing_if = "is_zero")]
     group: usize,
+    /// each pane's shell, beside `cwds`; `None` is the default shell (so a
+    /// changed default applies). Absent in files from before this field.
+    /// Only `shells::is_restorable` commands are started again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    shells: Vec<Option<String>>,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -761,12 +775,35 @@ fn parse_state(json: &str) -> Option<SavedState> {
                 layout: None,
                 name: None,
                 group: 0,
+                shells: Vec::new(),
             })
             .collect(),
         active: legacy.active,
         groups: Vec::new(),
         window: None,
     })
+}
+
+/// Each pane's shell for session.json: `None` where it is the default, and
+/// an empty list when every pane is, so an ordinary session file does not
+/// change shape.
+fn saved_shells<'a>(commands: impl Iterator<Item = &'a str>, default: &str) -> Vec<Option<String>> {
+    let v: Vec<Option<String>> = commands
+        .map(|c| (c != default).then(|| c.to_string()))
+        .collect();
+    if v.iter().all(Option::is_none) {
+        Vec::new()
+    } else {
+        v
+    }
+}
+
+/// The shell a restored pane starts with: its saved one if `detect` could
+/// have offered it, otherwise the default.
+fn restored_shell(saved: Option<String>, default: &str, installed: &[shells::Shell]) -> String {
+    saved
+        .filter(|c| shells::is_restorable(c, installed))
+        .unwrap_or_else(|| default.to_string())
 }
 
 fn state_path() -> Option<std::path::PathBuf> {
@@ -1282,6 +1319,8 @@ struct App {
     /// the command palette, when open
     palette: Option<Palette>,
     shell_profiles: Vec<shells::Shell>,
+    shell_profiles_ready: bool,
+    startup_pending: bool,
     /// last click on the empty title strip — powers double-click-to-maximise
     last_strip_click: Option<std::time::Instant>,
     proxy: EventLoopProxy<UserEvent>,
@@ -1298,6 +1337,7 @@ struct App {
     /// last frame's quad bytes — an identical frame skips the GPU submit
     /// (a still terminal stops re-rendering; laptop battery thanks you)
     last_frame: Vec<u8>,
+    last_frame_size: Option<winit::dpi::PhysicalSize<u32>>,
     cursor_pos: PhysicalPosition<f64>,
     /// Grab, motion dedupe, focus-in memory, and the local selection drag.
     /// A focus loss drops all of them together.
@@ -1338,6 +1378,8 @@ struct App {
     auto_follow: bool,
     claude_manual: bool,
     config: config::UserConfig,
+    config_load_error: Option<String>,
+    startup_error: Option<String>,
     /// every rebindable action's effective chord (defaults + config)
     keymap: Vec<(keybinds::Action, keybinds::Chord)>,
     /// the shortcuts editor overlay, when open
@@ -1516,14 +1558,18 @@ impl App {
 
     /// Step to the previous/next installed shell. New tabs only.
     fn cycle_shell(&mut self, dir: i32) {
-        let choices = term::shell_choices();
+        let choices: Vec<&str> = self
+            .shell_profiles
+            .iter()
+            .map(|s| s.command.as_str())
+            .collect();
         if choices.len() < 2 {
             return;
         }
         let cur = self.config.shell_program();
         let i = choices.iter().position(|c| *c == cur).unwrap_or(0) as i32;
         let n = choices.len() as i32;
-        self.config.shell = Some(choices[(((i + dir) % n + n) % n) as usize].clone());
+        self.config.shell = Some(choices[(((i + dir) % n + n) % n) as usize].to_string());
         self.request_redraw();
     }
 
@@ -1573,7 +1619,13 @@ impl App {
             toast::remove(h);
         }
         // tabs + cwds greet you tomorrow
-        self.save_state();
+        if !self.save_state() {
+            // The window is about to close, so its error card cannot be seen.
+            // An explicit save failure must be acknowledged before exit.
+            if let Some(error) = &self.blocked_link {
+                show_error_dialog(self.hwnd(), &error.reason, &error.shown);
+            }
+        }
         // BAYAN-014: end every shell (and, through ConPTY, its console) now,
         // not whenever the process teardown gets to it
         for t in &mut self.tabs {
@@ -1956,6 +2008,7 @@ impl App {
                         reason: tr("تعذر تشغيل الطرفية", "Could not start the shell").into(),
                         shown: link::preview(&command, 240),
                         confirm_uri: None,
+                        is_app_error: false,
                     });
                 }
                 self.update_title();
@@ -2129,7 +2182,7 @@ impl App {
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => {
                 self.shortcuts = None;
-                config::save(&self.config);
+                self.save_config();
                 self.request_redraw();
             }
             Key::Named(NamedKey::ArrowUp) => {
@@ -2202,7 +2255,7 @@ impl App {
         };
         if !render::rect_hit(lay.card, px, py) {
             self.shortcuts = None;
-            config::save(&self.config);
+            self.save_config();
             self.request_redraw();
             return;
         }
@@ -2259,13 +2312,54 @@ impl App {
         let next = self.config.lang().other();
         self.config.language = Some(next.id().to_string());
         lang::set(next);
-        config::save(&self.config);
+        self.save_config();
         self.request_redraw();
+    }
+
+    fn report_error(&mut self, reason: &str, detail: &str) {
+        eprintln!("bayan: {reason}: {detail}");
+        self.blocked_link = Some(BlockedLink {
+            reason: reason.to_string(),
+            shown: link::preview_with(detail, 240, |c| c != '\n' && link::is_forbidden(c)),
+            confirm_uri: None,
+            is_app_error: true,
+        });
+        self.request_redraw();
+    }
+
+    fn save_config(&mut self) {
+        if self.config_load_error.is_some() {
+            self.report_config_load_error();
+            return;
+        }
+        if let Err(error) = config::save(&self.config) {
+            self.report_error(
+                tr("تعذر حفظ الإعدادات", "Could not save settings"),
+                &error.to_string(),
+            );
+        }
+    }
+
+    fn report_config_load_error(&mut self) {
+        if let Some(error) = &self.config_load_error {
+            let detail = format!(
+                "{}\n{}",
+                error,
+                tr(
+                    "أصلح ملف config.json ثم أعد تشغيل بيان لحفظ الإعدادات.",
+                    "Fix config.json and restart Bayan to save settings.",
+                )
+            );
+            self.report_error(
+                tr("تعذّر تحميل الإعدادات", "Could not load settings"),
+                &detail,
+            );
+        }
     }
 
     fn close_settings(&mut self) {
         self.settings = None;
-        config::save(&self.config); // persist on close
+        self.save_config(); // persist on close
         self.request_redraw();
     }
 
@@ -2521,6 +2615,7 @@ impl App {
             Ok(session) => Some(Pane {
                 id,
                 session,
+                command: command.to_string(),
                 last_output: None,
                 progress: None,
             }),
@@ -2930,8 +3025,15 @@ impl App {
         }
     }
 
-    fn save_state(&self) {
-        let Some(path) = state_path() else { return };
+    fn save_state(&mut self) -> bool {
+        // Closing while discovery is pending must not replace the saved
+        // session with an empty window that has not restored it yet.
+        if self.startup_pending {
+            return true;
+        }
+        let Some(path) = state_path() else {
+            return true;
+        };
         let state = SavedState {
             tabs: self
                 .tabs
@@ -2944,8 +3046,7 @@ impl App {
                             // don't persist a path we would refuse to start in
                             p.session
                                 .meta
-                                .lock()
-                                .unwrap()
+                                .lock_or_recover()
                                 .cwd
                                 .as_deref()
                                 .and_then(term::accept_local_cwd)
@@ -2957,6 +3058,10 @@ impl App {
                     layout: Some(t.layout.clone()),
                     name: t.name.clone(),
                     group: self.groups.position(t.group).unwrap_or(0),
+                    shells: saved_shells(
+                        t.panes.iter().map(|p| p.command.as_str()),
+                        &self.config.shell_program(),
+                    ),
                 })
                 .collect(),
             active: self.active,
@@ -2975,12 +3080,17 @@ impl App {
                 ..g
             }),
         };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        let result = serde_json::to_vec_pretty(&state)
+            .map_err(std::io::Error::other)
+            .and_then(|json| persist::write(&path, &json));
+        if let Err(error) = result {
+            self.report_error(
+                tr("تعذر حفظ الجلسة", "Could not save the session"),
+                &error.to_string(),
+            );
+            return false;
         }
-        if let Ok(json) = serde_json::to_string_pretty(&state) {
-            let _ = std::fs::write(path, json);
-        }
+        true
     }
 
     /// Note the window's current rectangle if it is in its normal state
@@ -3004,6 +3114,121 @@ impl App {
         }
     }
 
+    /// Restore only after the background shell inventory is available.
+    fn start_sessions(&mut self) {
+        if !self.startup_pending
+            || self.window.is_none()
+            || (self.config.restore_tabs.unwrap_or(false) && !self.shell_profiles_ready)
+        {
+            return;
+        }
+        self.startup_pending = false;
+        // the PTY + conhost + PowerShell chain is the slowest dependency:
+        // start it immediately with a default grid; the exact grid follows
+        // once cell metrics exist (EasyTer starts 110x32 the same way).
+        // Start one fresh tab unless saved-tab restoration is explicitly enabled.
+        self.restore_state();
+        // debug hook: BAYAN_SPLIT=1 opens the first tab pre-split, so the
+        // pane machinery can be verified without injecting any input
+        if dev_hook("BAYAN_SPLIT").is_some() {
+            self.split(Orientation::Row);
+        }
+        // debug hook: BAYAN_GROUPS=1 adds a second tab to the first group,
+        // then a second group of one tab, which stays on screen — the chip,
+        // the per-group bar and the group rows, reachable without input
+        if dev_hook("BAYAN_GROUPS").is_some() {
+            self.spawn_tab(None);
+            self.new_group();
+        }
+        // debug hook: BAYAN_SHELLS=1 opens the tab bar's shell menu as a
+        // right-click on the bar would, anchored inside the bar; it fills
+        // in when shell detection reports
+        if dev_hook("BAYAN_SHELLS").is_some() {
+            self.cursor_pos = PhysicalPosition::new(240.0, 20.0);
+            self.open_shell_menu();
+        }
+        if dev_hook("BAYAN_COCKPIT").is_some() {
+            self.cockpit = true;
+            self.cockpit_sel = self.active;
+        }
+        if dev_hook("BAYAN_GUARD").is_some() {
+            self.arm_pending_paste("echo one\necho two\necho three\n".into(), None);
+        }
+        if dev_hook("BAYAN_SETTINGS").is_some() {
+            self.settings = Some(0);
+        }
+        if dev_hook("BAYAN_SHORTCUTS").is_some() {
+            self.shortcuts = Some(ShortcutsState::default());
+        }
+        // BAYAN_TYPE=<text>: feed text into the first pane's PTY — the
+        // visual-verification hook (ligatures, shaping) with no keyboard
+        if let Some(v) = dev_hook("BAYAN_TYPE") {
+            if let Some(t) = v.to_str() {
+                let t = t.to_string();
+                if let Some(s) = self.session_mut() {
+                    s.write(t.as_bytes());
+                }
+            }
+        }
+        // BAYAN_PASTE=<text>: put text on the clipboard and right-click the
+        // focused pane once the renderer exists, so right-click paste can
+        // be verified without injecting mouse input. It replaces whatever
+        // was on the clipboard.
+        if let Some(v) = dev_hook("BAYAN_PASTE") {
+            self.debug_paste = v.to_str().map(str::to_string);
+        }
+        // BAYAN_POSH=1: open the prompt picker at startup (capture without keys)
+        if dev_hook("BAYAN_POSH").is_some() {
+            self.open_posh();
+        }
+        // BAYAN_PALETTE=<query|1>: open the palette at startup, so it can be
+        // captured without injecting keystrokes (the debug-hook rule)
+        if let Some(v) = dev_hook("BAYAN_PALETTE") {
+            let q = v.to_str().unwrap_or("").to_string();
+            self.open_palette(if q == "1" { String::new() } else { q });
+        }
+        // BAYAN_TOAST=<title|1>: fire a sample toast at startup (M19
+        // verification; a custom value becomes the title, so direction
+        // experiments run without rebuilding)
+        if let Some(v) = dev_hook("BAYAN_TOAST") {
+            if let Some(h) = self.hwnd() {
+                let t = v.to_str().unwrap_or("1");
+                let title = if t == "1" {
+                    tr("اكتمل الأمر", "Command finished")
+                } else {
+                    t
+                };
+                let ok = toast::show(
+                    h,
+                    title,
+                    tr(
+                        "بيان — إشعار تجريبي (M19)",
+                        "Bayan — test notification (M19)",
+                    ),
+                );
+                eprintln!("bayan: BAYAN_TOAST show accepted={ok}");
+            }
+        }
+        // BAYAN_PICK_THEME=<n>: open settings and apply theme n, so a click's
+        // live effect can be verified in a screenshot without input injection
+        if let Some(v) = dev_hook("BAYAN_PICK_THEME") {
+            self.settings = Some(0);
+            if let Some(n) = v.to_str().and_then(|s| s.parse::<usize>().ok()) {
+                self.apply_theme(n);
+            }
+        }
+        crate::prof::mark("session spawned");
+        // the window exists now; if it is already focused and a pane has
+        // 1004, say so. has_focus is the same check a later rebase uses.
+        self.sync_focus(None);
+        if self.renderer.is_some() {
+            if let Some(text) = self.debug_paste.take() {
+                self.debug_right_click_paste(text);
+            }
+        }
+        self.request_redraw();
+    }
+
     fn restore_state(&mut self) {
         if !self.config.restore_tabs.unwrap_or(false) {
             self.spawn_tab(None);
@@ -3022,21 +3247,38 @@ impl App {
                 );
                 // BAYAN-014: a session.json with hundreds of tabs (a bug, a
                 // hand edit, a planted file) must not spawn hundreds of shells
+                let default = self.config.shell_program();
+                let installed = self.shell_profiles.clone();
                 for mut st in state.tabs.into_iter().take(MAX_RESTORED_TABS) {
                     let mut cwds = std::mem::take(&mut st.cwds).into_iter();
+                    let mut shells = std::mem::take(&mut st.shells).into_iter();
+                    let mut shell =
+                        || restored_shell(shells.next().flatten(), &default, &installed);
                     // an index past the saved groups (a hand edit) joins
                     // the first group rather than inventing one
                     let group = if st.group < group_count { st.group } else { 0 };
                     self.spawn_group = Some(group as u32);
                     let before = self.tabs.len();
-                    self.spawn_tab(cwds.next().flatten());
+                    let cwd = cwds.next().flatten();
+                    let first = shell();
+                    self.spawn_tab_command(cwd.clone(), &first);
+                    if self.tabs.len() == before && first != default {
+                        // the saved shell is gone (PowerShell 7 uninstalled,
+                        // a WSL distro removed): the tab still comes back
+                        self.spawn_group = Some(group as u32);
+                        self.spawn_tab(cwd);
+                    }
                     self.spawn_group = None;
                     if self.tabs.len() == before {
                         continue; // its shell failed: no tab to fill in
                     }
                     for cwd in cwds.take(3) {
                         // re-split with the saved axis; weights come after
-                        if let Some(pane) = self.spawn_pane(cwd.as_deref()) {
+                        let cmd = shell();
+                        let pane = self
+                            .spawn_pane_command(cwd.as_deref(), &cmd)
+                            .or_else(|| self.spawn_pane(cwd.as_deref()));
+                        if let Some(pane) = pane {
                             if let Some(t) = self.tabs.last_mut() {
                                 t.panes.push(pane);
                             }
@@ -3432,8 +3674,7 @@ impl App {
         let raw = self.tabs[ti].panes[pi]
             .session
             .meta
-            .lock()
-            .unwrap()
+            .lock_or_recover()
             .cwd
             .clone();
         link::cwd_hook(raw.as_deref())
@@ -3528,6 +3769,7 @@ impl App {
                     reason: link::host_confirm().to_string(),
                     shown: link::confirm_card_shown(&host, &uri),
                     confirm_uri: Some(uri),
+                    is_app_error: false,
                 });
                 self.clear_link_hover();
                 self.request_redraw();
@@ -3585,6 +3827,7 @@ impl App {
             reason: reason.label().to_string(),
             shown: link::preview(shown, 160),
             confirm_uri: None,
+            is_app_error: false,
         });
         self.clear_link_hover();
         self.request_redraw();
@@ -4349,7 +4592,10 @@ impl App {
                             notifications: self.config.notifications_on(),
                             padding: self.config.padding_px(),
                             opacity_pct: (self.config.opacity_level() * 100.0).round() as i32,
-                            shell: &shells::label_for(&self.config.shell_program()),
+                            shell: &shells::label_for(
+                                &self.config.shell_program(),
+                                &self.shell_profiles,
+                            ),
                             hide_single_tab: self.config.hide_single_tab_on(),
                             confirm_close: self.config.confirm_close_on(),
                         },
@@ -4370,14 +4616,24 @@ impl App {
                     );
                 }
                 if let Some(block) = &self.blocked_link {
-                    renderer.draw_link_block(
-                        &mut verts,
-                        px.width as usize,
-                        px.height as usize,
-                        &block.reason,
-                        &block.shown,
-                        block.confirm_uri.is_some(),
-                    );
+                    if block.is_app_error {
+                        renderer.draw_app_error(
+                            &mut verts,
+                            px.width as i32,
+                            px.height as i32,
+                            &block.reason,
+                            &block.shown,
+                        );
+                    } else {
+                        renderer.draw_link_block(
+                            &mut verts,
+                            px.width as usize,
+                            px.height as usize,
+                            &block.reason,
+                            &block.shown,
+                            block.confirm_uri.is_some(),
+                        );
+                    }
                 }
                 if let Some((rows, sel, capturing, flash)) = &shortcuts_view {
                     renderer.draw_shortcuts(
@@ -4436,6 +4692,12 @@ impl App {
             _ => {}
         }
         let Some(gpu) = self.gpu.as_mut() else { return };
+        // During a Windows resize, the live client size can advance ahead of
+        // Resized events. Use the same size for geometry and the swapchain.
+        let surface_resized = gpu.resize(px.width, px.height);
+        if surface_resized {
+            self.last_frame_size = None;
+        }
         // new glyphs were rasterized this frame: sync the atlas texture
         let mut heal = false;
         if let Some(renderer) = self.renderer.as_mut() {
@@ -4466,15 +4728,23 @@ impl App {
         // the frame is pixel-for-pixel the last one — skip the submit. (An
         // atlas upload this frame always redraws; so does a heal.)
         let frame_bytes = bytemuck::cast_slice::<gpu::Vertex, u8>(&verts);
-        // never skip the very first present (it reveals the hidden window)
-        let unchanged = self.first_frame && !heal && frame_bytes == self.last_frame.as_slice();
+        let unchanged =
+            self.last_frame_size == Some(px) && !heal && frame_bytes == self.last_frame.as_slice();
         if unchanged {
+            return;
+        }
+        let bg = self.renderer.as_ref().map_or(render::BG, |r| r.bg);
+        if !gpu.render(&verts, bg) {
+            // Retry once after reconfiguring, without spinning on occlusion.
+            self.last_frame_size = None;
+            if surface_resized || heal {
+                window.request_redraw();
+            }
             return;
         }
         self.last_frame.clear();
         self.last_frame.extend_from_slice(frame_bytes);
-        let bg = self.renderer.as_ref().map_or(render::BG, |r| r.bg);
-        gpu.render(&verts, bg);
+        self.last_frame_size = Some(px);
         if heal {
             window.request_redraw();
         }
@@ -4535,14 +4805,28 @@ impl ApplicationHandler<UserEvent> for App {
                 });
             }
         }
-        let window = Arc::new(el.create_window(attrs).expect("create window"));
+        let window = match el.create_window(attrs) {
+            Ok(window) => Arc::new(window),
+            Err(error) => {
+                self.startup_error = Some(format!("Could not create the window: {error}"));
+                el.exit();
+                return;
+            }
+        };
         crate::prof::mark("window created");
         let px = window.inner_size();
-        let gpu = gpu::Gpu::new(window.clone(), px.width, px.height, render::ATLAS_SIZE)
-            .expect("gpu init (DX12/Vulkan/GL via wgpu)");
+        let gpu = match gpu::Gpu::new(window.clone(), px.width, px.height, render::ATLAS_SIZE) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                self.startup_error = Some(format!("Could not initialize graphics: {error}"));
+                el.exit();
+                return;
+            }
+        };
         crate::prof::mark("gpu ready");
         self.gpu = Some(gpu);
         self.window = Some(window.clone());
+        self.report_config_load_error();
         self.apply_opacity(); // the configured window alpha, from frame one
         self.apply_window_frame();
         if let Some(h) = self.hwnd() {
@@ -4554,104 +4838,7 @@ impl ApplicationHandler<UserEvent> for App {
         // first frame NOW: a dark window on screen beats a frozen launcher.
         // The shell and the font system warm up behind it, in parallel.
         self.redraw();
-        // the PTY + conhost + PowerShell chain is the slowest dependency:
-        // start it immediately with a default grid; the exact grid follows
-        // once cell metrics exist (EasyTer starts 110x32 the same way).
-        // Start one fresh tab unless saved-tab restoration is explicitly enabled.
-        self.restore_state();
-        // debug hook: BAYAN_SPLIT=1 opens the first tab pre-split, so the
-        // pane machinery can be verified without injecting any input
-        if dev_hook("BAYAN_SPLIT").is_some() {
-            self.split(Orientation::Row);
-        }
-        // debug hook: BAYAN_GROUPS=1 adds a second tab to the first group,
-        // then a second group of one tab, which stays on screen — the chip,
-        // the per-group bar and the group rows, reachable without input
-        if dev_hook("BAYAN_GROUPS").is_some() {
-            self.spawn_tab(None);
-            self.new_group();
-        }
-        // debug hook: BAYAN_SHELLS=1 opens the tab bar's shell menu as a
-        // right-click on the bar would, anchored inside the bar; it fills
-        // in when shell detection reports
-        if dev_hook("BAYAN_SHELLS").is_some() {
-            self.cursor_pos = PhysicalPosition::new(240.0, 20.0);
-            self.open_shell_menu();
-        }
-        if dev_hook("BAYAN_COCKPIT").is_some() {
-            self.cockpit = true;
-            self.cockpit_sel = self.active;
-        }
-        if dev_hook("BAYAN_GUARD").is_some() {
-            self.arm_pending_paste("echo one\necho two\necho three\n".into(), None);
-        }
-        if dev_hook("BAYAN_SETTINGS").is_some() {
-            self.settings = Some(0);
-        }
-        if dev_hook("BAYAN_SHORTCUTS").is_some() {
-            self.shortcuts = Some(ShortcutsState::default());
-        }
-        // BAYAN_TYPE=<text>: feed text into the first pane's PTY — the
-        // visual-verification hook (ligatures, shaping) with no keyboard
-        if let Some(v) = dev_hook("BAYAN_TYPE") {
-            if let Some(t) = v.to_str() {
-                let t = t.to_string();
-                if let Some(s) = self.session_mut() {
-                    s.write(t.as_bytes());
-                }
-            }
-        }
-        // BAYAN_PASTE=<text>: put text on the clipboard and right-click the
-        // focused pane once the renderer exists, so right-click paste can
-        // be verified without injecting mouse input. It replaces whatever
-        // was on the clipboard.
-        if let Some(v) = dev_hook("BAYAN_PASTE") {
-            self.debug_paste = v.to_str().map(str::to_string);
-        }
-        // BAYAN_POSH=1: open the prompt picker at startup (capture without keys)
-        if dev_hook("BAYAN_POSH").is_some() {
-            self.open_posh();
-        }
-        // BAYAN_PALETTE=<query|1>: open the palette at startup, so it can be
-        // captured without injecting keystrokes (the debug-hook rule)
-        if let Some(v) = dev_hook("BAYAN_PALETTE") {
-            let q = v.to_str().unwrap_or("").to_string();
-            self.open_palette(if q == "1" { String::new() } else { q });
-        }
-        // BAYAN_TOAST=<title|1>: fire a sample toast at startup (M19
-        // verification; a custom value becomes the title, so direction
-        // experiments run without rebuilding)
-        if let Some(v) = dev_hook("BAYAN_TOAST") {
-            if let Some(h) = self.hwnd() {
-                let t = v.to_str().unwrap_or("1");
-                let title = if t == "1" {
-                    tr("اكتمل الأمر", "Command finished")
-                } else {
-                    t
-                };
-                let ok = toast::show(
-                    h,
-                    title,
-                    tr(
-                        "بيان — إشعار تجريبي (M19)",
-                        "Bayan — test notification (M19)",
-                    ),
-                );
-                eprintln!("bayan: BAYAN_TOAST show accepted={ok}");
-            }
-        }
-        // BAYAN_PICK_THEME=<n>: open settings and apply theme n, so a click's
-        // live effect can be verified in a screenshot without input injection
-        if let Some(v) = dev_hook("BAYAN_PICK_THEME") {
-            self.settings = Some(0);
-            if let Some(n) = v.to_str().and_then(|s| s.parse::<usize>().ok()) {
-                self.apply_theme(n);
-            }
-        }
-        crate::prof::mark("session spawned");
-        // the window exists now; if it is already focused and a pane has
-        // 1004, say so. has_focus is the same check a later rebase uses.
-        self.sync_focus(None);
+        self.start_sessions();
         // FontSystem::new scans every installed font — the documented
         // cosmic-text startup cost (pop-os/cosmic-text#247): keep it off
         // the UI thread and swap the renderer in when it's ready
@@ -4690,6 +4877,8 @@ impl ApplicationHandler<UserEvent> for App {
                     }));
                 }
                 self.shell_profiles = profiles;
+                self.shell_profiles_ready = true;
+                self.start_sessions();
                 self.request_redraw();
             }
             UserEvent::Wakeup(id) => {
@@ -4723,6 +4912,11 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::PtyWrite(id, text) => {
                 if let Some((ti, pi)) = self.find_pane(id) {
                     self.tabs[ti].panes[pi].session.write(text.as_bytes());
+                }
+            }
+            UserEvent::PtyWriteFailed(id, error) => {
+                if self.find_pane(id).is_some() {
+                    self.report_error(tr("تعذر إرسال الإدخال", "Could not send input"), &error);
                 }
             }
             UserEvent::ClipboardSet(id, text) => {
@@ -4878,6 +5072,7 @@ impl ApplicationHandler<UserEvent> for App {
                     reason,
                     shown: link::preview(&shown, 160),
                     confirm_uri: None,
+                    is_app_error: false,
                 });
                 self.clear_link_hover();
                 self.request_redraw();
@@ -5045,7 +5240,38 @@ pub(crate) fn harden_dll_search() {
 /// inbox copy could break the DXC path).
 const GPU_SYSTEM_DLLS: &[&str] = &["d3d12.dll", "dcomp.dll", "d3dcompiler_47.dll"];
 
-fn main() {
+fn show_error_dialog(
+    owner: Option<windows_sys::Win32::Foundation::HWND>,
+    title: &str,
+    detail: &str,
+) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+    let detail: Vec<u16> = detail.encode_utf16().chain(Some(0)).collect();
+    // SAFETY: both buffers are NUL-terminated and live for the call.
+    unsafe {
+        MessageBoxW(
+            owner.unwrap_or(std::ptr::null_mut()),
+            detail.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("bayan: {error}");
+            show_error_dialog(None, tr("تعذّر بدء بيان", "Bayan could not run"), &error);
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), String> {
     harden_dll_search();
     prof::init();
     prof::mark("main start");
@@ -5071,7 +5297,7 @@ fn main() {
             false
         })
         .build()
-        .expect("event loop");
+        .map_err(|error| format!("Could not create the event loop: {error}"))?;
     event_loop.set_control_flow(ControlFlow::Wait);
     prof::mark("event loop built");
     let proxy = event_loop.create_proxy();
@@ -5079,7 +5305,10 @@ fn main() {
     std::thread::spawn(move || {
         let _ = profiles_proxy.send_event(UserEvent::ShellProfiles(shells::detect()));
     });
-    let mut cfg = config::load();
+    let (mut cfg, config_load_error) = match config::load() {
+        Ok(cfg) => (cfg, None),
+        Err(error) => (config::UserConfig::default(), Some(error.to_string())),
+    };
     // debug hook: BAYAN_ARABIC_FONT=<family> draws terminal Arabic in that
     // font for this run only (config.json is not written unless a setting
     // is changed in the panel), so the setting is screenshot-verifiable
@@ -5111,6 +5340,8 @@ fn main() {
         spawn_group: None,
         palette: None,
         shell_profiles: Vec::new(),
+        shell_profiles_ready: false,
+        startup_pending: true,
         last_strip_click: None,
         proxy,
         window: None,
@@ -5127,6 +5358,7 @@ fn main() {
         first_frame: false,
         first_output: false,
         last_frame: Vec::new(),
+        last_frame_size: None,
         cursor_pos: PhysicalPosition::new(0.0, 0.0),
         mouse: mouse::Route::default(),
         sel_pane: 0,
@@ -5150,6 +5382,8 @@ fn main() {
         auto_follow: true,
         claude_manual: false,
         config: cfg,
+        config_load_error,
+        startup_error: None,
         keymap,
         shortcuts: None,
         atlas_generation: 0,
@@ -5160,7 +5394,11 @@ fn main() {
         keys_held_away: Vec::new(),
         debug_paste: None,
     };
-    event_loop.run_app(&mut app).expect("run event loop");
+    let result = event_loop.run_app(&mut app);
+    if let Some(error) = app.startup_error {
+        return Err(error);
+    }
+    result.map_err(|error| format!("The event loop failed: {error}"))
 }
 
 /// OSC 52 writes only from the focused pane of the active tab.
@@ -5519,6 +5757,7 @@ mod tests {
             layout: Some(tree.clone()),
             name: None,
             group: 0,
+            shells: Vec::new(),
         };
         assert_eq!(restored_layout(&st, 3), tree);
         // a pane failed to respawn: the tree no longer fits, use one axis
@@ -5641,6 +5880,7 @@ mod tests {
                 layout: None,
                 name: Some("خادم".into()),
                 group: 0,
+                shells: Vec::new(),
             }],
             active: 0,
             groups: Vec::new(),
@@ -5907,6 +6147,74 @@ mod m38_tests {
     }
 
     #[test]
+    fn each_panes_shell_round_trips_and_only_detectable_ones_come_back() {
+        let installed = vec![shells::Shell {
+            name: "PowerShell 7".into(),
+            command: "pwsh.exe -NoLogo".into(),
+        }];
+        let def = "C:\\PROGRA~1\\Git\\bin\\bash.exe --login -i";
+        // all default: the field stays out of the file
+        assert!(saved_shells([def, def].into_iter(), def).is_empty());
+        let shells = saved_shells(["cmd.exe", def, "pwsh.exe -NoLogo"].into_iter(), def);
+        assert_eq!(
+            shells,
+            vec![
+                Some("cmd.exe".into()),
+                None,
+                Some("pwsh.exe -NoLogo".into())
+            ]
+        );
+        let st = SavedState {
+            tabs: vec![SavedTab {
+                cwds: vec![None, None, None],
+                weights: Vec::new(),
+                orientation: 0,
+                focused: 0,
+                layout: None,
+                name: None,
+                group: 0,
+                shells,
+            }],
+            active: 0,
+            groups: Vec::new(),
+            window: None,
+        };
+        let back = parse_state(&serde_json::to_string(&st).unwrap()).unwrap();
+        let got: Vec<String> = back.tabs[0]
+            .shells
+            .iter()
+            .cloned()
+            .map(|s| restored_shell(s, def, &installed))
+            .collect();
+        assert_eq!(got, vec!["cmd.exe", def, "pwsh.exe -NoLogo"]);
+        // a file from before the field restores every pane on the default
+        let old = parse_state(r#"{"tabs":[{"cwds":[null]}],"active":0}"#).unwrap();
+        assert!(old.tabs[0].shells.is_empty());
+        // a planted or hand-edited command is not run: the default is
+        assert_eq!(
+            restored_shell(Some("calc.exe".into()), def, &installed),
+            def
+        );
+        assert_eq!(
+            restored_shell(Some("cmd.exe /c del x".into()), def, &installed),
+            def
+        );
+        assert_eq!(restored_shell(None, def, &installed), def);
+    }
+
+    #[test]
+    fn removed_wsl_distribution_restores_the_default_shell() {
+        assert_eq!(
+            restored_shell(
+                Some("wsl.exe -d Bayan-Removed-Distro".into()),
+                "cmd.exe",
+                &[]
+            ),
+            "cmd.exe"
+        );
+    }
+
+    #[test]
     fn groups_round_trip_and_files_without_them_are_one_group() {
         let tab = |group| SavedTab {
             cwds: vec![None],
@@ -5916,6 +6224,7 @@ mod m38_tests {
             layout: None,
             name: None,
             group,
+            shells: Vec::new(),
         };
         let s = SavedState {
             tabs: vec![tab(0), tab(1), tab(0)],
@@ -6152,6 +6461,7 @@ mod m38_tests {
                 layout: None,
                 name: Some("سجلات".into()),
                 group: 0,
+                shells: Vec::new(),
             }],
             active: 0,
             groups: Vec::new(),

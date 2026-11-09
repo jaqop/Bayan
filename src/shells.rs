@@ -121,15 +121,12 @@ fn on_path(prog: &str) -> bool {
 
 #[cfg(windows)]
 fn wsl_distros() -> Vec<String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = std::process::Command::new("wsl.exe")
-        .args(["-l", "-q"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+    let mut command = std::process::Command::new("wsl.exe");
+    command.args(["-l", "-q"]);
+    let out = crate::process::run_with_timeout(command, std::time::Duration::from_secs(3));
     match out {
-        Ok(o) => parse_wsl_result(o.status.success(), &o.stdout),
-        Err(_) => Vec::new(), // no WSL installed is not an error
+        Some(o) => parse_wsl_result(o.status.success(), &o.stdout),
+        None => Vec::new(), // absent or unresponsive WSL: use Windows shells
     }
 }
 
@@ -166,11 +163,8 @@ pub fn detect() -> Vec<Shell> {
 
     v.push(Shell::new("Command Prompt", "cmd.exe"));
 
-    if let Some(p) = pick_git_bash(|p| Path::new(p).exists()) {
-        v.push(Shell::new(
-            "Git Bash",
-            format!("{} --login -i", short_path(p)),
-        ));
+    if let Some(c) = git_bash_command() {
+        v.push(Shell::new("Git Bash", c));
     }
 
     for d in wsl_distros().into_iter().filter(|d| is_safe_distro_name(d)) {
@@ -180,11 +174,34 @@ pub fn detect() -> Vec<Shell> {
     v
 }
 
+/// The installed Git Bash as `detect` lists it, if there is one.
+fn git_bash_command() -> Option<String> {
+    pick_git_bash(|p| Path::new(p).exists()).map(|p| format!("{} --login -i", short_path(p)))
+}
+
+/// May a shell saved in session.json be started again? Only a command
+/// `detect` itself could have offered: the fixed PowerShell and cmd forms,
+/// the installed Git Bash, or an installed WSL distro with a name that is
+/// one safe argument. Anything else (a hand edit, a planted file) falls back to the
+/// default shell, so the session file cannot name a program to run —
+/// config.json's `shell` stays the one place for that. Uses the background
+/// inventory; it never probes a process or the filesystem on the UI thread.
+pub fn is_restorable(command: &str, installed: &[Shell]) -> bool {
+    match command {
+        "powershell.exe" | FAST_POWERSHELL | "cmd.exe" => true,
+        c => {
+            installed.iter().any(|s| s.command == c)
+                && c.strip_prefix("wsl.exe -d ")
+                    .is_none_or(is_safe_distro_name)
+        }
+    }
+}
+
 /// Friendly label for a stored command line, for the settings panel. Falls
 /// back to a trimmed command so a hand-edited config.json still reads sanely.
-pub fn label_for(command: &str) -> String {
-    detect()
-        .into_iter()
+pub fn label_for(command: &str, installed: &[Shell]) -> String {
+    installed
+        .iter()
         .find(|s| s.command == command)
         .map(|s| s.label())
         .unwrap_or_else(|| command.trim_end_matches(".exe").to_string())
@@ -193,6 +210,46 @@ pub fn label_for(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_shells_detect_could_offer_are_restorable() {
+        let installed = vec![
+            Shell::new("PowerShell 7", "pwsh.exe -NoLogo"),
+            Shell::new("Ubuntu", "wsl.exe -d Ubuntu-22.04"),
+        ];
+        for ok in [
+            "powershell.exe",
+            "powershell.exe -NoProfile",
+            "pwsh.exe -NoLogo",
+            "cmd.exe",
+            "wsl.exe -d Ubuntu-22.04",
+        ] {
+            assert!(is_restorable(ok, &installed), "{ok}");
+        }
+        for bad in [
+            "calc.exe",
+            "cmd.exe /c del x",
+            "powershell.exe -Command evil",
+            "wsl.exe -d -e sh",
+            "wsl.exe -d Ubuntu --exec x",
+            "C:\\Temp\\bash.exe --login -i",
+            "",
+        ] {
+            assert!(!is_restorable(bad, &installed), "{bad}");
+        }
+        if let Some(g) = git_bash_command() {
+            assert!(is_restorable(&g, &[Shell::new("Git Bash", &g)]));
+        }
+        assert!(!is_restorable("wsl.exe -d Ubuntu-22.04", &[]));
+        assert!(!is_restorable("pwsh.exe -NoLogo", &[]));
+    }
+
+    #[test]
+    fn labels_use_the_supplied_snapshot_without_detection() {
+        let installed = [Shell::new("Cached distro", "wsl.exe -d cached")];
+        assert_eq!(label_for("wsl.exe -d cached", &installed), "Cached distro");
+        assert_eq!(label_for("custom.exe", &[]), "custom");
+    }
 
     #[test]
     fn failed_wsl_discovery_does_not_offer_error_messages_as_shells() {

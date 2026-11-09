@@ -2,7 +2,7 @@
 //! alacritty_terminal. Mirrors EasyTer's proven architecture: a reader thread
 //! feeds the emulator behind a mutex and nudges the UI thread to repaint.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
@@ -28,6 +28,7 @@ const PTY_READ: usize = 64 * 1024;
 /// finds what is actually installed — PowerShell with and without $PROFILE,
 /// pwsh when present, cmd, Git Bash, and every WSL distribution. Ported from
 /// EasyTer, whose generator this mirrors.
+#[cfg(test)]
 pub fn shell_choices() -> Vec<String> {
     crate::shells::detect()
         .into_iter()
@@ -2022,7 +2023,9 @@ impl EventListener for EventProxy {
 pub struct Session {
     pub term: Arc<FairMutex<Term<EventProxy>>>,
     pub meta: Arc<Mutex<SessionMeta>>,
-    writer: Box<dyn Write + Send>,
+    writer: crate::pty_writer::PtyWriter,
+    proxy: EventLoopProxy<UserEvent>,
+    id: u64,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     /// Command line this pane was spawned with. Drag-drop quoting follows it,
@@ -2140,10 +2143,10 @@ impl Session {
             // UTF-8 code page so Arabic paths survive; no OSC 133 marks
             cmd.args(["/K", "chcp 65001>nul"]);
         }
-        let child = pair.slave.spawn_command(cmd)?;
-        drop(pair.slave);
         let mut reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
+        let mut child = pair.slave.spawn_command(cmd)?;
+        drop(pair.slave);
 
         let config = Config {
             scrolling_history: scrollback,
@@ -2167,9 +2170,33 @@ impl Session {
             ..SessionMeta::default()
         }));
         let parser = Arc::new(Mutex::new(Processor::new()));
+        let capture_term = Arc::clone(&term);
+        let capture_meta = Arc::clone(&meta);
+        let error_proxy = proxy.clone();
+        let writer = match crate::pty_writer::PtyWriter::spawn(
+            writer,
+            move |bytes| {
+                // Capture at delivery, immediately before the shell can react.
+                if submits_a_command(bytes) {
+                    let t = capture_term.lock();
+                    let mut m = capture_meta.lock_or_recover();
+                    capture_command_core(&t, &mut m);
+                }
+            },
+            move |error| {
+                let _ = error_proxy.send_event(UserEvent::PtyWriteFailed(id, error.to_string()));
+            },
+        ) {
+            Ok(writer) => writer,
+            Err(error) => {
+                let _ = child.kill();
+                return Err(error.into());
+            }
+        };
         let term2 = Arc::clone(&term);
         let meta2 = Arc::clone(&meta);
         let parser2 = Arc::clone(&parser);
+        let input_proxy = proxy.clone();
         std::thread::spawn(move || {
             let mut carry: Vec<u8> = Vec::new();
             let mut buf = [0u8; PTY_READ];
@@ -2235,6 +2262,8 @@ impl Session {
             term,
             meta,
             writer,
+            proxy: input_proxy,
+            id,
             master: pair.master,
             child,
             shell: shell.to_string(),
@@ -2263,15 +2292,11 @@ impl Session {
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
-        // Enter at a prompt starts a command: read it off the screen now,
-        // before the shell reacts (Claude mode auto-enable needs the name)
-        if submits_a_command(bytes) {
-            let t = self.term.lock();
-            let mut m = self.meta.lock_or_recover();
-            capture_command_core(&t, &mut m);
+        if let Err(error) = self.writer.try_write(bytes) {
+            let _ = self
+                .proxy
+                .send_event(UserEvent::PtyWriteFailed(self.id, error.to_string()));
         }
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
     }
 
     pub fn resize(&mut self, size: TermSize) {

@@ -32,7 +32,7 @@ const LTR_PUNCT: &[char] = &[
 
 /// Combining marks (Arabic tashkeel + generic): must travel WITH their base
 /// character when reversing, or shadda/tanwin land on the wrong letter.
-fn is_combining(c: char) -> bool {
+pub(crate) fn is_combining(c: char) -> bool {
     matches!(c as u32,
         0x0300..=0x036F | 0x0610..=0x061A | 0x064B..=0x065F | 0x0670
         | 0x06D6..=0x06DC | 0x06DF..=0x06E4 | 0x06E7..=0x06E8 | 0x06EA..=0x06ED
@@ -74,12 +74,26 @@ fn rev_clusters(s: &str) -> String {
     rev_indexed(&chars, &origin).0.into_iter().collect()
 }
 
-/// Is the line predominantly Arabic (so Claude reversed the whole line)?
+/// Did Claude lay this line out as an RTL paragraph (reversing all of it)?
+///
+/// Claude picks the base from the line's first strong letter, as UAX#9
+/// does. On screen an LTR line starts (left edge) with its logical start
+/// and an RTL line ends (right edge) with it, which fixes two cases:
+/// Arabic at both strong edges is RTL, Latin at both is LTR — however the
+/// letters are counted. Latin then Arabic could be either: `D:\الكتابة`
+/// (LTR) or `git status` closing an Arabic sentence (RTL). Arabic glued to
+/// the Latin before it, with no space, is a path or code, so LTR; otherwise
+/// the majority of letters decides, as it always has.
 pub fn line_is_rtl_visual(text: &str) -> bool {
     let (mut ar, mut lt) = (0usize, 0usize);
     let (mut first_arabic, mut last_arabic) = (None, None);
+    let mut glued = false;
+    let mut prev = ' ';
     for ch in text.chars() {
         if is_arabic_letter(ch) {
+            if ar == 0 && first_arabic == Some(false) && !prev.is_whitespace() {
+                glued = true;
+            }
             ar += 1;
             first_arabic.get_or_insert(true);
             last_arabic = Some(true);
@@ -88,11 +102,17 @@ pub fn line_is_rtl_visual(text: &str) -> bool {
             first_arabic.get_or_insert(false);
             last_arabic = Some(false);
         }
+        prev = ch;
     }
-    // A Latin island cannot change an Arabic paragraph into an English
-    // paragraph merely by growing. Arabic at both strong-text edges
-    // establishes the base even when the island contains most letters.
-    (first_arabic == Some(true) && last_arabic == Some(true)) || (ar > 0 && ar >= lt)
+    match (first_arabic, last_arabic) {
+        // A Latin island cannot change an Arabic paragraph into an English
+        // paragraph merely by growing.
+        (Some(true), Some(true)) => true,
+        // `$ cd D:\الكتابة && ls`: an RTL line would end on Arabic.
+        (Some(false), Some(false)) => false,
+        (Some(false), Some(true)) if glued => false,
+        _ => ar > 0 && ar >= lt,
+    }
 }
 
 /// Reverse L2 for an RTL-base line: reverse the whole line, then re-reverse
@@ -498,5 +518,59 @@ mod tests {
             "مرحبا Windows Terminal 123 عالم"
         );
         assert!(!line_is_rtl_visual("Hello ابحرم Windows Terminal"));
+    }
+
+    /// Claude Code's own output (as captured in Bayan, Nov 2026): a path
+    /// whose folders are Arabic arrives as an LTR line with each Arabic
+    /// word reversed in place. Counting letters (38 Arabic, 1 Latin) called
+    /// it RTL, reversed the whole line, and every folder name read
+    /// backwards on screen. An LTR line's visual left edge is its logical
+    /// start, so a line that starts Latin with Arabic glued straight onto
+    /// it (`D:\` + word) is that LTR line.
+    fn rev(s: &str) -> String {
+        s.chars().rev().collect()
+    }
+
+    #[test]
+    fn a_path_with_arabic_folders_keeps_its_ltr_base() {
+        let logical = r"❯ D:\الكتابة\إلينتور_ملحقات\01_المكتبة_والمراجع\03_المكتبة";
+        let visual = format!(
+            r"❯ D:\{}\{}_{}\01_{}_{}\03_{}",
+            rev("الكتابة"),
+            rev("إلينتور"),
+            rev("ملحقات"),
+            rev("المكتبة"),
+            rev("والمراجع"),
+            rev("المكتبة")
+        );
+        assert!(!line_is_rtl_visual(&visual));
+        assert_eq!(restore_bidi_line(&visual).as_deref(), Some(logical));
+        assert_eq!(restore_bidi_line_with_order(&visual).unwrap().0, logical);
+    }
+
+    #[test]
+    fn a_command_line_with_an_arabic_path_keeps_its_ltr_base() {
+        let logical = r"  └ $ $p = 'D:\الكتابة\إلينتور_ملحقات'; Test-Path -LiteralPat";
+        let visual = format!(
+            r"  └ $ $p = 'D:\{}\{}_{}'; Test-Path -LiteralPat",
+            rev("الكتابة"),
+            rev("إلينتور"),
+            rev("ملحقات")
+        );
+        assert_eq!(restore_bidi_line(&visual).as_deref(), Some(logical));
+        // Latin at BOTH edges: an RTL line would end (visually) on its
+        // Arabic logical start, so this cannot be one however Arabic it is
+        let cd = format!(r"$ cd D:\{}\{} && ls", rev("الكتابة"), rev("الفصول"));
+        assert!(!line_is_rtl_visual(&cd));
+    }
+
+    /// The other side of the rule: an Arabic sentence that ENDS with code
+    /// starts with that code on screen, separated by a space. Still RTL.
+    #[test]
+    fn arabic_prose_ending_in_code_stays_rtl() {
+        let logical = "استخدم الأمر git status";
+        let visual = format!("git status {} {}", rev("الأمر"), rev("استخدم"));
+        assert!(line_is_rtl_visual(&visual));
+        assert_eq!(restore_bidi_line(&visual).as_deref(), Some(logical));
     }
 }
