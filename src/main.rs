@@ -4915,7 +4915,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::PtyWriteFailed(id, error) => {
-                if self.find_pane(id).is_some() {
+                if let Some((ti, pi)) = self.find_pane(id) {
+                    // one report per failure burst; re-arm only once shown
+                    self.tabs[ti].panes[pi].session.write_error_shown();
                     self.report_error(tr("تعذر إرسال الإدخال", "Could not send input"), &error);
                 }
             }
