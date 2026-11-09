@@ -167,17 +167,27 @@ pub fn detect() -> Vec<Shell> {
 
 /// Friendly label for a stored command line, for the settings panel. Falls
 /// back to a trimmed command so a hand-edited config.json still reads sanely.
-pub fn label_for(command: &str) -> String {
-    detect()
-        .into_iter()
+/// `found` is the app's one background `detect()`: this runs inside the frame
+/// build, so it must not probe (detection spawns `wsl.exe`).
+pub fn label_for(found: &[Shell], command: &str) -> String {
+    found
+        .iter()
         .find(|s| s.command == command)
-        .map(|s| s.name)
+        .map(|s| s.name.clone())
         .unwrap_or_else(|| command.trim_end_matches(".exe").to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn label_comes_from_the_detected_list_without_probing() {
+        let found = [Shell::new("Git Bash", "bash.exe -l")];
+        assert_eq!(label_for(&found, "bash.exe -l"), "Git Bash");
+        assert_eq!(label_for(&found, "nu.exe"), "nu");
+        assert_eq!(label_for(&[], "cmd.exe"), "cmd");
+    }
 
     #[test]
     fn failed_wsl_discovery_does_not_offer_error_messages_as_shells() {

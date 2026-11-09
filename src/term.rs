@@ -24,17 +24,6 @@ const MAX_CARRY: usize = 4096;
 /// about 51 KiB when the opener is still inside [`MAX_CARRY`].
 const PTY_READ: usize = 64 * 1024;
 
-/// Shells the settings panel offers. Delegates to `shells::detect`, which
-/// finds what is actually installed — PowerShell with and without $PROFILE,
-/// pwsh when present, cmd, Git Bash, and every WSL distribution. Ported from
-/// EasyTer, whose generator this mirrors.
-pub fn shell_choices() -> Vec<String> {
-    crate::shells::detect()
-        .into_iter()
-        .map(|s| s.command)
-        .collect()
-}
-
 /// The directory Bayan itself was started in — a shortcut's "Start in" field,
 /// which is the standard way to say where a terminal should open.
 ///
@@ -699,39 +688,25 @@ fn find_osc133(data: &[u8], nonce: &str) -> Vec<(usize, usize, u8, Option<i32>, 
     while i + P.len() < data.len() {
         if &data[i..i + P.len()] == P {
             let kind = data[i + P.len()];
-            let mut j = i + P.len();
-            let mut end = None;
-            while j < data.len() {
-                if data[j] == 0x07 {
-                    end = Some(j + 1);
-                    break;
-                }
-                if data[j] == 0x1b && data.get(j + 1) == Some(&b'\\') {
-                    end = Some(j + 2);
-                    break;
-                }
-                j += 1;
-            }
-            match end {
-                Some(e) => {
-                    let payload = &data[i + P.len()..j];
-                    let trusted = osc133_trusted(payload, nonce);
-                    // "D;<code>" carries the exit status. A nonce field after
-                    // the code is not part of the number. The payload can be
-                    // empty (`133;` then the terminator), so skip the kind
-                    // byte with `get`: a bare slice would start past `j`.
-                    let exit = payload
-                        .get(1..)
-                        .unwrap_or_default()
-                        .strip_prefix(b";")
-                        .and_then(|p| std::str::from_utf8(p).ok())
-                        .and_then(|p| p.split(';').next())
-                        .and_then(|p| p.parse().ok());
-                    out.push((i, e, kind, exit, trusted));
-                    i = e;
-                    continue;
-                }
-                None => break,
+            // An ESC that is not ST ends the OSC unterminated, as in vte: the
+            // bytes after it are output, so skip this mark rather than span them.
+            if let Some((j, e)) = osc_terminated_end(data, i + P.len()) {
+                let payload = &data[i + P.len()..j];
+                let trusted = osc133_trusted(payload, nonce);
+                // "D;<code>" carries the exit status. A nonce field after
+                // the code is not part of the number. The payload can be
+                // empty (`133;` then the terminator), so skip the kind
+                // byte with `get`: a bare slice would start past `j`.
+                let exit = payload
+                    .get(1..)
+                    .unwrap_or_default()
+                    .strip_prefix(b";")
+                    .and_then(|p| std::str::from_utf8(p).ok())
+                    .and_then(|p| p.split(';').next())
+                    .and_then(|p| p.parse().ok());
+                out.push((i, e, kind, exit, trusted));
+                i = e;
+                continue;
             }
         }
         i += 1;
@@ -768,28 +743,16 @@ fn osc52_transport_room(scan_len: usize) -> usize {
 fn last_osc_payload<'a>(data: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     let mut found = None;
     let mut i = 0;
-    while i + prefix.len() <= data.len() {
-        if &data[i..i + prefix.len()] == prefix {
-            let s = i + prefix.len();
-            let mut j = s;
-            while j < data.len() && data[j] != 0x07 && data[j] != 0x1b {
-                j += 1;
+    while let Some(rel) = find(&data[i..], prefix) {
+        let s = i + rel + prefix.len();
+        // Unterminated: step past this opener and keep the previous hit.
+        i = match osc_terminated_end(data, s) {
+            Some((e, next)) => {
+                found = Some(&data[s..e]);
+                next
             }
-            if data.get(j) == Some(&0x07) {
-                found = Some(&data[s..j]);
-                i = j + 1;
-                continue;
-            }
-            if data.get(j) == Some(&0x1b) && data.get(j + 1) == Some(&b'\\') {
-                found = Some(&data[s..j]);
-                i = j + 2;
-                continue;
-            }
-            // Unterminated. Step past this opener and keep the previous hit.
-            i = s;
-            continue;
-        }
-        i += 1;
+            None => s,
+        };
     }
     found
 }
@@ -1077,21 +1040,10 @@ fn osc_at(data: &[u8], i: usize) -> Option<OscAt<'_>> {
     if data.get(j) != Some(&b';') {
         return None;
     }
-    j += 1;
-    let pay = j;
-    while j < data.len() && data[j] != 0x07 && data[j] != 0x1b {
-        j += 1;
-    }
-    let end = if data.get(j) == Some(&0x07) {
-        j + 1
-    } else if data.get(j) == Some(&0x1b) && data.get(j + 1) == Some(&b'\\') {
-        j + 2
-    } else {
-        return None;
-    };
+    let (e, end) = osc_terminated_end(data, j + 1)?;
     Some(OscAt {
         number,
-        payload: &data[pay..j],
+        payload: &data[j + 1..e],
         end,
     })
 }
@@ -1208,32 +1160,35 @@ fn handle_osc133<T: EventListener>(
     trusted: bool,
     ev: &mut ChunkEvents,
 ) {
+    if matches!(kind, b'A' | b'D') {
+        // Prompt start (A) or command finished (D). A BDSM/SCP from the
+        // command that just ended must not survive onto this line, even when
+        // the mark is spoofed: `cat` of a file that contains CSI 8 l must not
+        // leave the pane in explicit mode. Only a trusted mark (the session
+        // nonce, or any mark when the nonce is empty) clears the command; an
+        // untrusted one leaves `running_cmd`, so the OSC 7 that a spoofed
+        // mark tries to authorize stays ignored.
+        meta.bidi_mut().reset();
+        if !trusted {
+            return;
+        }
+        meta.running_cmd.clear();
+        meta.clean_claude_after = None;
+        meta.cmd_pending = false;
+        // Nothing is running, so any OSC 9;4 bar still showing is stale — a
+        // program killed with Ctrl+C never gets to send its own 9;4;0. An
+        // explicit report in this same chunk wins, so a prompt followed by
+        // fresh progress is kept.
+        if ev.progress.is_none() {
+            ev.progress = Some(None);
+        }
+        meta.claude_from_abs = None;
+    }
     match kind {
         b'A' => {
-            // Prompt start. A BDSM/SCP from the command that just ended
-            // must not survive onto this line, even when the A is spoofed.
-            // Only a trusted A (the session nonce, or any A when the nonce
-            // is empty) clears the command and records a mark.
-            meta.bidi_mut().reset();
-            if !trusted {
-                return;
-            }
-            meta.running_cmd.clear();
-            meta.clean_claude_after = None;
-            meta.cmd_pending = false;
-            // Back at a prompt, so nothing is running and any OSC 9;4 bar
-            // still showing is stale — a program killed with Ctrl+C never
-            // gets to send its own 9;4;0. An explicit report in this same
-            // chunk wins, so a prompt followed by fresh progress is kept.
-            if ev.progress.is_none() {
-                ev.progress = Some(None);
-            }
-            meta.claude_from_abs = None;
             // a new prompt starts on the cursor's row: record its block
             // GLOBALLY (evicted + history + row — never drifts)
-            let abs = meta.evicted
-                + t.grid().history_size() as u64
-                + t.grid().cursor.point.line.0.max(0) as u64;
+            let (abs, _) = crate::bidi_ctl::cursor_abs(t, meta.evicted);
             meta.marks.push(CmdMark {
                 abs,
                 exit: None,
@@ -1244,22 +1199,6 @@ fn handle_osc133<T: EventListener>(
             }
         }
         b'D' => {
-            // Command finished. Same reset as A: `cat` of a file that
-            // contains CSI 8 l must not leave the pane in explicit mode.
-            // An untrusted D does not clear `running_cmd`, so the OSC 7
-            // that a spoofed mark tries to authorize stays ignored.
-            meta.bidi_mut().reset();
-            if !trusted {
-                return;
-            }
-            meta.running_cmd.clear();
-            meta.clean_claude_after = None;
-            meta.cmd_pending = false;
-            // the command is over: its progress bar goes with it
-            if ev.progress.is_none() {
-                ev.progress = Some(None);
-            }
-            meta.claude_from_abs = None;
             if let Some(m) = meta.marks.last_mut() {
                 m.exit = exit;
             }
@@ -1284,12 +1223,9 @@ fn handle_osc133<T: EventListener>(
                 return;
             }
             meta.at_prompt = true;
-            meta.prompt_col = Some(t.grid().cursor.point.column.0);
-            meta.prompt_abs = Some(
-                meta.evicted
-                    + t.grid().history_size() as u64
-                    + t.grid().cursor.point.line.0.max(0) as u64,
-            );
+            let (abs, col) = crate::bidi_ctl::cursor_abs(t, meta.evicted);
+            meta.prompt_col = Some(col);
+            meta.prompt_abs = Some(abs);
         }
         _ => {}
     }
@@ -1848,7 +1784,7 @@ pub(crate) fn capture_command_core<T: EventListener>(t: &Term<T>, meta: &mut Ses
     meta.cmd_pending = true;
     let cur = t.grid().cursor.point;
     // the output starts on the row below the one Enter was pressed on
-    let out = meta.evicted + t.grid().history_size() as u64 + cur.line.0.max(0) as u64 + 1;
+    let out = crate::bidi_ctl::cursor_abs(t, meta.evicted).0 + 1;
     if let Some(m) = meta.marks.last_mut() {
         m.out = Some(out);
     }
@@ -1893,17 +1829,29 @@ pub(crate) fn capture_command_core<T: EventListener>(t: &Term<T>, meta: &mut Ses
                 .split_whitespace()
                 .any(|arg| matches!(arg, "-p" | "--print"))
         {
-            meta.clean_claude_after =
-                Some(meta.evicted + t.grid().history_size() as u64 + cur.line.0.max(0) as u64 + 1);
+            meta.clean_claude_after = Some(out);
             meta.claude_from_abs = meta.clean_claude_after;
         }
         meta.cmd_started = Some(std::time::Instant::now());
     }
 }
 
+/// Profiles searched for the oh-my-posh line, in order (pwsh 7, then 5),
+/// relative to USERPROFILE. The theme picker edits the same one.
+pub const POSH_PROFILES: [&str; 2] = [
+    r"Documents\PowerShell\Microsoft.PowerShell_profile.ps1",
+    r"Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1",
+];
+
 /// Pull the oh-my-posh theme path out of a PowerShell profile line like
 ///   oh-my-posh init pwsh --config "C:\...\night-owl.omp.json" | Invoke-Expression
 pub fn parse_posh_config(profile_text: &str) -> Option<String> {
+    posh_config_span(profile_text).map(|r| profile_text[r].to_string())
+}
+
+/// Byte range of that path in `profile_text`: the first uncommented line
+/// that has one. Spawn reads it and the theme picker rewrites it.
+pub fn posh_config_span(profile_text: &str) -> Option<std::ops::Range<usize>> {
     for line in profile_text.lines() {
         let l = line.trim();
         if l.starts_with('#') || !l.contains("oh-my-posh") || !l.contains("--config") {
@@ -1917,10 +1865,9 @@ pub fn parse_posh_config(profile_text: &str) -> Option<String> {
         } else {
             rest.split_whitespace().next()
         };
-        if let Some(p) = path {
-            if !p.is_empty() {
-                return Some(p.to_string());
-            }
+        if let Some(p) = path.filter(|p| !p.is_empty()) {
+            let start = p.as_ptr() as usize - profile_text.as_ptr() as usize;
+            return Some(start..start + p.len());
         }
     }
     None
@@ -1965,10 +1912,7 @@ fn detect_posh_theme() -> Option<String> {
         }
     }
     let home = std::env::var("USERPROFILE").ok()?;
-    for rel in [
-        r"Documents\PowerShell\Microsoft.PowerShell_profile.ps1",
-        r"Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1",
-    ] {
+    for rel in POSH_PROFILES {
         let p = std::path::Path::new(&home).join(rel);
         if let Ok(text) = std::fs::read_to_string(&p) {
             if let Some(cfg) = parse_posh_config(&text) {
@@ -2630,32 +2574,9 @@ pub fn drop_needs_confirm(alt_screen: bool, at_prompt: bool, text: &str) -> bool
 /// (␍ ␛ ␊ ␉); bidi overrides and zero-width characters become ASCII markers
 /// so the card cannot be reordered by the text it is asking about.
 pub fn paste_preview(text: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    let mut n = 0usize;
-    for c in text.chars() {
-        let rep = paste_preview_char(c);
-        let extra = rep.chars().count();
-        if n + extra > max_chars {
-            out.push('…');
-            break;
-        }
-        out.push_str(&rep);
-        n += extra;
-    }
-    out
-}
-
-fn paste_preview_char(c: char) -> String {
-    if let Some(label) = paste_spoof_label(c) {
-        return label.to_string();
-    }
-    match c {
-        // C0 control pictures: U+2400 + code. CR is ␍, ESC is ␛, LF is ␊, tab is ␉.
-        c if (c as u32) <= 0x1F => char::from_u32(0x2400 + c as u32).unwrap().to_string(),
-        '\u{007F}' => "\u{2421}".to_string(),
-        c if c.is_control() => format!("<U+{:04X}>", c as u32),
-        c => c.to_string(),
-    }
+    crate::link::preview_with(text, max_chars, |c| {
+        c.is_control() || paste_spoof_label(c).is_some()
+    })
 }
 
 /// Escape a literal so RegexSearch treats it verbatim (search is literal
@@ -3139,16 +3060,12 @@ mod tests {
         // The old contract was "the installed trio" and capped the list at 3.
         // Detection replaced it: Git Bash and every WSL distro now appear too,
         // so the cap is gone deliberately, not by accident.
-        let c = shell_choices();
+        let c: Vec<String> = crate::shells::detect()
+            .into_iter()
+            .map(|s| s.command)
+            .collect();
         assert_eq!(c[0], DEFAULT_SHELL, "PowerShell 5 leads (always present)");
         assert!(c.contains(&"cmd.exe".to_string()));
-        assert_eq!(
-            c,
-            crate::shells::detect()
-                .into_iter()
-                .map(|s| s.command)
-                .collect::<Vec<_>>()
-        );
         let mut sorted = c.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -3273,7 +3190,7 @@ mod tests {
             (r"C:\My.exe Tools\real.exe".into(), vec!["--go".to_string()])
         );
         // every detected shell splits to a real program
-        for c in shell_choices() {
+        for c in crate::shells::detect().into_iter().map(|s| s.command) {
             let (prog, _) = split_command(&c);
             assert!(
                 prog.to_lowercase().ends_with(".exe"),
@@ -3362,6 +3279,22 @@ mod tests {
         // a normal D mark still reads its exit code
         let marks = find_osc133(b"\x1b]133;D;3\x07", "");
         assert_eq!(marks[0].3, Some(3));
+    }
+
+    #[test]
+    fn osc133_ended_by_a_bare_esc_does_not_swallow_output() {
+        // vte ends an OSC at any ESC. A mark left open that way must not
+        // stretch to a later BEL and hide the text in between.
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;A\x1b[31mX\x07",
+        );
+        let row = &t.grid()[alacritty_terminal::index::Line(0)];
+        assert_eq!(row[Column(0)].c, 'X');
     }
 
     #[test]
