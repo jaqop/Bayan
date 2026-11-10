@@ -29,9 +29,25 @@ pub struct UserConfig {
     /// draw Arabic, counts as absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arabic_font: Option<String>,
-    /// Base font size in points (default 18).
+    /// Base font size in points at 100% text size (default 18). When
+    /// `follow_system_text_size` is on, Windows' Accessibility text size
+    /// multiplies this value. It is not an absolute pixel size.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_size: Option<f32>,
+    /// Multiply UI chrome and the terminal font by Windows text size
+    /// (Accessibility, 100–225%). Default on. An explicit [`Self::font_size`]
+    /// is the size at 100% and is still multiplied; set this false to keep
+    /// that point size absolute. DPI is a separate multiplier either way:
+    /// pixels = points × text scale × dpi.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow_system_text_size: Option<bool>,
+    /// While High Contrast is on, map the terminal grid's background,
+    /// foreground, selection and cursor to the system colors. Default on.
+    /// Set false to keep the theme inside the grid. The tab bar, title bar,
+    /// palette, cards, scrollbar and focus rings follow High Contrast either
+    /// way. The 16 ANSI colors stay on the theme.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_follow_high_contrast: Option<bool>,
     /// Background / foreground as "#rrggbb" (EasyTer's heritage defaults).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bg: Option<String>,
@@ -295,6 +311,16 @@ impl UserConfig {
         self.cursor_blink.unwrap_or(true)
     }
 
+    /// Default on. See the `follow_system_text_size` field.
+    pub fn follow_system_text_size(&self) -> bool {
+        self.follow_system_text_size.unwrap_or(true)
+    }
+
+    /// Default on. See the `terminal_follow_high_contrast` field.
+    pub fn terminal_follows_high_contrast(&self) -> bool {
+        self.terminal_follow_high_contrast.unwrap_or(true)
+    }
+
     /// 0.5..=1.0 — anything outside is a typo, not a wish for invisibility.
     pub fn opacity_level(&self) -> f32 {
         self.opacity.unwrap_or(1.0).clamp(0.5, 1.0)
@@ -522,6 +548,25 @@ mod tests {
             json, "{}",
             "an untouched config serializes to nothing: {json}"
         );
+    }
+
+    #[test]
+    fn accessibility_flags_default_on_and_round_trip() {
+        let d = UserConfig::default();
+        assert!(d.follow_system_text_size());
+        assert!(d.terminal_follows_high_contrast());
+        let off: UserConfig = serde_json::from_str(
+            r#"{"follow_system_text_size":false,"terminal_follow_high_contrast":false}"#,
+        )
+        .unwrap();
+        assert!(!off.follow_system_text_size());
+        assert!(!off.terminal_follows_high_contrast());
+        let on: UserConfig = serde_json::from_str(
+            r#"{"follow_system_text_size":true,"terminal_follow_high_contrast":true}"#,
+        )
+        .unwrap();
+        assert!(on.follow_system_text_size());
+        assert!(on.terminal_follows_high_contrast());
     }
 
     #[test]

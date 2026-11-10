@@ -45,6 +45,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading", # GetCurrentProcess for that module walk
     "Win32_System_SystemInformation", # GetSystemDirectoryW: loaded kernel32 must sit under System32
     "Win32_System_IO", # DeviceIoControl: read a link's target without following it (localpath.rs)
+    "Win32_Graphics_Gdi", # GetSysColor: High Contrast system colors
+    "Win32_UI_Accessibility", # HIGHCONTRASTW / HCF_HIGHCONTRASTON
+    "Win32_System_Registry", # TextScaleFactor under HKCU\...\Accessibility
 ] }
 
 [features]

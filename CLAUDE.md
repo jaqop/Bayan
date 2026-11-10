@@ -35,11 +35,12 @@ selection and BiDi paths must do.
 | `posh.rs` | oh-my-posh theme picker with a live ANSI preview |
 | `plugins.rs` | declarative JSON plugin host (`~/.bayan/plugins/`) |
 | `config.rs` | `~/.bayan/config.json`, optional and BOM-tolerant |
+| `a11y.rs` | High Contrast color mapping and the system text-size multiplier, pure and tested; the Win32 read sits behind `read_snapshot` |
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-494 tests across the tree. `term.rs` (81), `link.rs` (61) and `render.rs` (64)
-carry the most; `localpath.rs` has 21.
+508 tests across the tree. `term.rs` (81), `link.rs` (61) and `render.rs` (67)
+carry the most; `localpath.rs` has 21. `a11y.rs` has 10.
 
 ## Invariants — do not "simplify" these
 
@@ -141,6 +142,18 @@ because Explorer and the Start menu often hand a process `System32`, and
 except when it is Bayan's own folder (Explorer's default cwd — a pane opened
 in Downloads would let cmd run a planted `git.bat`). It passes the same
 `accept_local_cwd` + `usable_spawn_dir` gate as every other start directory.
+
+**High Contrast and text size are not the palette's `text_scale`.**
+`PaletteLayout.text_scale` compresses the command palette when the window
+is short. Windows Accessibility text size is `a11y::text_scale_factor`
+(100–225%, clamped), stored on the renderer as `system_text_scale`, and
+multiplied separately from DPI: pixels = points × text scale × dpi. An
+explicit `font_size` is the size at 100% and is still multiplied while
+`follow_system_text_size` is on. High Contrast maps chrome through
+`a11y::map_chrome` and, unless `terminal_follow_high_contrast` is false,
+the grid's fg/bg/selection/cursor through `a11y::map_terminal`. The 16
+ANSI colors stay on the theme. Both are re-read on `WM_SETTINGCHANGE` and
+`WM_SYSCOLORCHANGE`.
 
 **Two performance properties are load-bearing.** The shaped-run cache reshapes
 only changed lines (~1.5ms → ~4µs on a cached frame). Differential redraw skips
