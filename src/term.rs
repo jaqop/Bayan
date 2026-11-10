@@ -2065,8 +2065,57 @@ fn spawn_sync_watchdog<T: EventListener + Send + 'static>(
     (tx, handle)
 }
 
+/// The colours the window paints with, for OSC 4/10/11/12 queries: the 256
+/// indexed colours, then foreground, background and cursor (alacritty's
+/// indices 256, 257, 258). One table: every pane shares the theme.
+pub type QueryColors = [(u8, u8, u8); 259];
+
+static QUERY_COLORS: std::sync::RwLock<Option<QueryColors>> = std::sync::RwLock::new(None);
+
+/// The renderer that is about to paint publishes its colours here.
+pub fn set_query_colors(colors: QueryColors) {
+    *QUERY_COLORS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(colors);
+}
+
+/// An OSC 4/10/11/12 query answered from `colors`, or `None` for an index
+/// the table has no colour for (or no table yet). Claude Code, Codex and
+/// Neovim pick a light or dark theme from the OSC 11 answer.
+fn color_reply(
+    colors: Option<&QueryColors>,
+    index: usize,
+    format: &(dyn Fn(alacritty_terminal::vte::ansi::Rgb) -> String + Sync + Send),
+) -> Option<String> {
+    let &(r, g, b) = colors?.get(index)?;
+    Some(format(alacritty_terminal::vte::ansi::Rgb { r, g, b }))
+}
+
+/// A colour query becomes its reply; an unanswerable one is dropped
+/// (`None`); every other event passes through.
+fn answer_color_query(event: Event, colors: Option<&QueryColors>) -> Option<Event> {
+    match event {
+        Event::ColorRequest(index, format) => {
+            color_reply(colors, index, &*format).map(Event::PtyWrite)
+        }
+        other => Some(other),
+    }
+}
+
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
+        // Answered here, on the reader thread, so the reply joins this
+        // read's batch and its 16 KiB cap: a flood of `OSC 11 ?` must not
+        // become one window event per query.
+        let event = {
+            let colors = QUERY_COLORS
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            answer_color_query(event, colors.as_ref())
+        };
+        let Some(event) = event else {
+            return;
+        };
         let Some(event) = self.2.lock_or_recover().absorb(event) else {
             return;
         };
@@ -4584,6 +4633,61 @@ mod tests {
                 self.0.lock_or_recover().push(text);
             }
         }
+    }
+
+    /// EventProxy's colour path with a fixed table instead of the global.
+    struct ColorLog(Option<QueryColors>, Arc<Mutex<Vec<String>>>);
+
+    impl EventListener for ColorLog {
+        fn send_event(&self, event: Event) {
+            if let Some(Event::PtyWrite(text)) = answer_color_query(event, self.0.as_ref()) {
+                self.1.lock_or_recover().push(text);
+            }
+        }
+    }
+
+    fn color_replies(table: Option<QueryColors>, input: &[u8]) -> Vec<String> {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let size = TermSize { cols: 40, rows: 6 };
+        let mut t = Term::new(Config::default(), &size, ColorLog(table, Arc::clone(&log)));
+        let mut p: Processor = Processor::new();
+        p.advance(&mut t, input);
+        let out = log.lock_or_recover().clone();
+        out
+    }
+
+    fn sample_colors() -> QueryColors {
+        let mut c = [(0xaa, 0xbb, 0xcc); 259];
+        c[1] = (0xcf, 0x22, 0x2e);
+        c[256] = (0xe6, 0xed, 0xf3);
+        c[257] = (0x0d, 0x11, 0x17);
+        c
+    }
+
+    #[test]
+    fn color_queries_are_answered_with_the_painted_colours() {
+        let got = color_replies(
+            Some(sample_colors()),
+            b"\x1b]11;?\x07\x1b]10;?\x1b\\\x1b]4;1;?\x07\x1b]12;?\x07",
+        );
+        assert_eq!(
+            got,
+            [
+                "\x1b]11;rgb:0d0d/1111/1717\x07",
+                "\x1b]10;rgb:e6e6/eded/f3f3\x1b\\",
+                "\x1b]4;1;rgb:cfcf/2222/2e2e\x07",
+                "\x1b]12;rgb:aaaa/bbbb/cccc\x07",
+            ]
+        );
+    }
+
+    #[test]
+    fn without_a_colour_table_a_query_gets_no_reply() {
+        // before the first renderer: silence (programs time out), never a
+        // made-up colour
+        assert!(color_replies(None, b"\x1b]11;?\x07").is_empty());
+        // a set is not a query
+        assert!(color_replies(Some(sample_colors()), b"\x1b]11;#ffffff\x07").is_empty());
     }
 
     struct KittyFixture {
