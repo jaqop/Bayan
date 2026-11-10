@@ -79,8 +79,10 @@ specification; `src/keys.rs` carries the same key-encoding tests.
 - [x] **M9** — the shaped-run cache: the paint loop now re-shapes only
       CHANGED lines (generational LRU, EasyTer's dirty-row lesson) — a
       fully-cached frame's shaping cost dropped from ~1.5ms to ~4µs
-      (~340×, measured once by hand in a release build with 40 rows at
-      43017b0; no benchmark in the repo reproduces it); full
+      (~340×, release build, 40 rows, at 43017b0; `cargo test --release
+      measure_cache_speedup_probe -- --nocapture` prints the two figures
+      without asserting them, and on 4a570b7 it gave 1.14ms and 5.1µs,
+      ~220×); full
       layout persistence: every tab's panes, split axis, weights and focus
       survive a restart (pre-M9 session files still restore)
 - [x] **M10** — the wgpu renderer: every frame is one draw call of quads
