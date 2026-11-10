@@ -39,9 +39,9 @@ selection and BiDi paths must do.
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-510 tests in `src` (`cargo test --all-targets` does not run the vendored
+516 tests in `src` (`cargo test --all-targets` does not run the vendored
 `portable-pty` crate). `term.rs` (84), `link.rs` (61) and `render.rs` (64)
-carry the most; `shellint.rs` has 13 and `localpath.rs` has 21.
+carry the most; `shellint.rs` has 19 and `localpath.rs` has 21.
 
 ## Invariants — do not "simplify" these
 
@@ -136,15 +136,21 @@ only transparency available on this path.
 **Shell integration is opt-out and shell-specific.** PowerShell's prompt
 wrapper stays in `term.rs`. Git Bash, MSYS bash, WSL bash, WSL zsh and cmd
 are built in `shellint.rs` and produce the same nonce-checked OSC 133 A/B/D
-bytes (cmd: A and B only, no exit code). An unknown program is never
-injected. `"shell_integration": false` skips all of them. The nonce is
+bytes (cmd: A and B only, no exit code). `git-bash.exe`, `bash -c`, and
+`bash script.sh` are not injected. An unknown program is never injected.
+`$?` is restored before the user's `PROMPT_COMMAND`. A login shell sources
+`/etc/profile` and one user profile, not `~/.bashrc` as well. `"shell_integration": false` skips all of them. The nonce is
 `BAYAN_PROMPT_NONCE` and is unset before a child inherits it. Do not write
 the user's rc files. An elevated token must not source `~/.bashrc`,
-`~/.bash_profile` or the zsh home files; the temp rc is the only file
-bash/`ZDOTDIR` will read, it is created with a random name and a DACL that
-is not world-writable (high integrity under `%ProgramData%` when elevated),
-and it is removed when the pane closes — and only if the directory name is
-one of those random names.
+`~/.bash_profile`, `~/.inputrc`, or the zsh home files: set `INPUTRC` and
+`HISTFILE` to `/dev/null`, and still read `/etc/profile`. A failed
+elevation query is treated as elevated. `shellint::is_elevated` is a copy
+of the check in PR #59; delete one of them when both are on `bayan-plus`.
+The script directory comes from `SHGetKnownFolderPath(FOLDERID_ProgramData)`
+when elevated, never from the `PROGRAMDATA` environment variable. It is a
+random name with a DACL that is not world-writable, and zsh's `ZDOTDIR` is
+restored to the user's value before the first prompt. Only a directory
+whose name we minted is deleted.
 
 **Start-directory precedence, in order:** a restored session's saved cwd, then
 the launcher's directory (a shortcut's "Start in"), then `USERPROFILE`. The

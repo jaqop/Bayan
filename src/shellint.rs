@@ -41,10 +41,10 @@ pub(crate) fn shell_kind(command: &str) -> ShellKind {
         "powershell" | "pwsh" => ShellKind::PowerShell,
         "cmd" => ShellKind::Cmd,
         "wsl" => ShellKind::Wsl,
-        // `git-bash.exe` is bash. A bare substring "bash" would also match
-        // `notbash`, so the hyphen is part of that rule.
-        "bash" | "git-bash" => ShellKind::Bash,
-        n if n.ends_with("-bash") => ShellKind::Bash,
+        // `git-bash.exe` is a mintty GUI launcher, not a shell we can hand
+        // `--rcfile`. A bare substring "bash" would also match `notbash`.
+        "bash" => ShellKind::Bash,
+        n if n.ends_with("-bash") && n != "git-bash" => ShellKind::Bash,
         // `sh` is not bash (it may be dash). Windows `zsh.exe` is not the
         // WSL case; zsh is handled inside the WSL launcher. Both stay unknown.
         _ => ShellKind::Unknown,
@@ -90,33 +90,49 @@ pub(crate) fn plan(command: &str, enabled: bool, elevated: bool, nonce: &str) ->
     let (_, args) = split_command(command);
     let env = vec![(NONCE_ENV.to_string(), nonce.to_string())];
     match kind {
-        ShellKind::Bash => Some(bash_plan(&args, elevated, env)),
+        ShellKind::Bash => bash_plan(&args, elevated, env),
         ShellKind::Wsl => wsl_plan(&args, elevated, env),
         ShellKind::Cmd => Some(cmd_plan(&args, env)),
         ShellKind::PowerShell | ShellKind::Unknown => None,
     }
 }
 
-fn bash_plan(args: &[String], elevated: bool, env: Vec<(String, String)>) -> Plan {
-    // Elevated: the rcfile is the only file bash will read (`--rcfile`
-    // suppresses both `/etc/bash.bashrc` and `~/.bashrc`), and it does not
-    // source either. A login profile would pull in `~/.bash_profile`.
-    // `--norc` / `--noprofile` are the user asking for the same skip.
-    let login = !elevated && is_login(args) && !has_flag(args, "--noprofile");
-    let bashrc = !elevated && !has_flag(args, "--norc");
-    Plan {
+fn bash_plan(args: &[String], elevated: bool, mut env: Vec<(String, String)>) -> Option<Plan> {
+    // `bash -c` and `bash script.sh` are not interactive prompts. Adding
+    // `-i` would turn the script name into `$0` or a script argument.
+    if !bash_is_interactive(args) {
+        return None;
+    }
+    // A real login shell reads /etc/profile and one user profile, and does
+    // not itself read ~/.bashrc. An elevated login still reads /etc/profile:
+    // that file ships with Git and is not user-writable, and without it
+    // `/usr/bin` is missing. It does not read the user's profile or bashrc.
+    let login = is_login(args) && !has_flag(args, "--noprofile");
+    let user = !elevated && !has_flag(args, "--norc");
+    if elevated {
+        push_safe_readline(&mut env);
+    }
+    Some(Plan {
         kind: ShellKind::Bash,
         args: bash_args(args, "@file:bash.sh"),
-        files: vec![("bash.sh".into(), bash_rc(login, bashrc))],
+        files: vec![("bash.sh".into(), bash_rc(login, user))],
         path_env: Vec::new(),
         env,
         wslenv_path: Vec::new(),
         wslenv_plain: Vec::new(),
         elevated,
-    }
+    })
 }
 
-fn wsl_plan(args: &[String], elevated: bool, env: Vec<(String, String)>) -> Option<Plan> {
+/// readline and the history file are not affected by `--rcfile`. An elevated
+/// shell must not open the user's `~/.inputrc` (a macro there runs as admin)
+/// or append to a history file the user can rewrite.
+fn push_safe_readline(env: &mut Vec<(String, String)>) {
+    env.push(("INPUTRC".into(), "/dev/null".into()));
+    env.push(("HISTFILE".into(), "/dev/null".into()));
+}
+
+fn wsl_plan(args: &[String], elevated: bool, mut env: Vec<(String, String)>) -> Option<Plan> {
     // `wsl -e` / `wsl -- cmd` is already a command, not an interactive login.
     if args.iter().any(|a| a == "-e" || a == "--exec" || a == "--") {
         return None;
@@ -127,13 +143,22 @@ fn wsl_plan(args: &[String], elevated: bool, env: Vec<(String, String)>) -> Opti
     launch.push("-c".into());
     launch.push(wsl_launcher());
     // WSL's own interactive start is a login shell. The rcfile imitates
-    // that, because `-e` would otherwise skip `/etc/profile`.
+    // that, because `-e` would otherwise skip `/etc/profile`. Elevated
+    // still reads `/etc/profile` (not user-writable) and not `~/.bashrc`.
     let source_user = !elevated;
+    if elevated {
+        push_safe_readline(&mut env);
+    }
+    let mut plain = vec![NONCE_ENV.to_string()];
+    if elevated {
+        plain.push("INPUTRC".into());
+        plain.push("HISTFILE".into());
+    }
     Some(Plan {
         kind: ShellKind::Wsl,
         args: launch,
         files: vec![
-            ("bash.sh".into(), bash_rc(source_user, source_user)),
+            ("bash.sh".into(), bash_rc(true, source_user)),
             ("zsh/.zshenv".into(), zsh_env(source_user)),
             ("zsh/.zprofile".into(), zsh_profile(source_user)),
             ("zsh/.zshrc".into(), zsh_rc(source_user)),
@@ -145,7 +170,7 @@ fn wsl_plan(args: &[String], elevated: bool, env: Vec<(String, String)>) -> Opti
         ],
         env,
         wslenv_path: vec!["BAYAN_BASH_RC".into(), "BAYAN_ZDOTDIR".into()],
-        wslenv_plain: vec![NONCE_ENV.into()],
+        wslenv_plain: plain,
         elevated,
     })
 }
@@ -161,6 +186,38 @@ fn cmd_plan(args: &[String], env: Vec<(String, String)>) -> Plan {
         wslenv_plain: Vec::new(),
         elevated: false,
     }
+}
+
+/// `-c` / a script path is a one-shot bash, not a prompt we can mark.
+fn bash_is_interactive(args: &[String]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "-c" || a == "--command" {
+            return false;
+        }
+        if a == "--rcfile" || a == "--init-file" {
+            i += 2;
+            continue;
+        }
+        if let Some(flags) = a
+            .strip_prefix('-')
+            .filter(|s| !s.is_empty() && !s.starts_with('-'))
+        {
+            if flags.contains('c') {
+                return false;
+            }
+            i += 1;
+            continue;
+        }
+        if a.starts_with("--") {
+            i += 1;
+            continue;
+        }
+        // `bash script.sh` — the file name is not a prompt.
+        return false;
+    }
+    true
 }
 
 fn is_login(args: &[String]) -> bool {
@@ -259,21 +316,20 @@ fn cmd_setup() -> String {
     "chcp 65001>nul&prompt $E]133;A;%BAYAN_PROMPT_NONCE%$E\\$P$G$E]133;B;%BAYAN_PROMPT_NONCE%$E\\&set BAYAN_PROMPT_NONCE=".to_string()
 }
 
-fn bash_rc(login_profile: bool, bashrc: bool) -> String {
+/// `login` sources `/etc/profile` and, when `user` is set, the first of
+/// `~/.bash_profile`, `~/.bash_login`, `~/.profile`. It does not also source
+/// `~/.bashrc`: a login shell never does, and Ubuntu's profile already does,
+/// so a second source ran ssh-agent and PATH setup twice. Non-login sources
+/// `~/.bashrc` only, and only when `user` is set.
+fn bash_rc(login: bool, user: bool) -> String {
     let mut s = String::from(BASH_PRELUDE);
-    if login_profile {
-        s.push_str(BASH_LOGIN);
-    }
-    if bashrc {
-        // A login profile on Git for Windows sets MSYSTEM and has already
-        // sourced ~/.bashrc via /etc/bash.bashrc. Sourcing it again would
-        // prepend PATH twice. Everywhere else MSYSTEM is unset and --rcfile
-        // really did skip the file, so this is the load.
-        if login_profile {
-            s.push_str(BASH_BASHRC_UNLESS_GIT);
-        } else {
-            s.push_str(BASH_BASHRC);
+    if login {
+        s.push_str(BASH_SYSTEM_PROFILE);
+        if user {
+            s.push_str(BASH_USER_PROFILE);
         }
+    } else if user {
+        s.push_str(BASH_BASHRC);
     }
     s.push_str(BASH_HOOKS);
     s
@@ -294,12 +350,20 @@ if [ -z "$__BAYAN_NONCE" ]; then
 fi
 "#;
 
-const BASH_LOGIN: &str = r#"
-# --login cannot be combined with --rcfile (bash ignores the rcfile). This
-# is the load a login shell would have done.
+const BASH_SYSTEM_PROFILE: &str = r#"
+# --login cannot be combined with --rcfile (bash ignores the rcfile).
+# /etc/profile is the system file a login shell reads. It is not
+# user-writable, including the copy Git for Windows ships, so an elevated
+# pane still reads it — without it, /usr/bin is not on PATH.
 if [ -r /etc/profile ]; then
   . /etc/profile
 fi
+"#;
+
+const BASH_USER_PROFILE: &str = r#"
+# The first user profile only, the same order bash uses. Do not also source
+# ~/.bashrc: the profile does that when the user wants it (Ubuntu's
+# ~/.profile, Git for Windows' ~/.bash_profile).
 if [ -r "$HOME/.bash_profile" ]; then
   . "$HOME/.bash_profile"
 elif [ -r "$HOME/.bash_login" ]; then
@@ -310,13 +374,8 @@ fi
 "#;
 
 const BASH_BASHRC: &str = r#"
+# Non-login interactive bash reads ~/.bashrc and not the profile.
 if [ -r "$HOME/.bashrc" ]; then
-  . "$HOME/.bashrc"
-fi
-"#;
-
-const BASH_BASHRC_UNLESS_GIT: &str = r#"
-if [ -r "$HOME/.bashrc" ] && [ -z "${MSYSTEM:-}" ]; then
   . "$HOME/.bashrc"
 fi
 "#;
@@ -328,8 +387,32 @@ fi
 /// The user's `PROMPT_COMMAND` is saved first and `eval`'d after D and A,
 /// which is when bash itself would have run it (before `PS1` is drawn).
 const BASH_HOOKS: &str = r#"
+# UTF-8 percent-encoding of one path. od is byte-wise, so an Arabic
+# directory becomes %D8%A8… rather than being dropped. Unreserved bytes
+# and the path separators stay literal.
+__bayan_pct() {
+  local b enc="" ch hex
+  hex=$(printf '%s' "$1" | od -An -tx1)
+  for b in $hex; do
+    case "$b" in
+      2d|2e|2f|3a|5f|7e|3[0-9]|4[1-9a-f]|5[0-9a]|6[1-9a-f]|7[0-9a])
+        printf -v ch "\\x$b"
+        enc="${enc}${ch}"
+        ;;
+      [0-9a-f][0-9a-f])
+        enc="${enc}%${b^^}"
+        ;;
+    esac
+  done
+  printf '%s' "$enc"
+}
+
 __bayan_report_cwd() {
-  __bayan_win=$PWD
+  if [ "$PWD" = "${__bayan_pwd_cache-}" ]; then
+    printf '%s' "${__bayan_osc_cache-}"
+    return 0
+  fi
+  local __bayan_win="$PWD"
   if command -v cygpath >/dev/null 2>&1; then
     __bayan_win=$(cygpath -w "$PWD" 2>/dev/null) || return 0
   elif command -v wslpath >/dev/null 2>&1; then
@@ -342,21 +425,15 @@ __bayan_report_cwd() {
   case "$__bayan_win" in
     *$'\033'*|*$'\007'*|*$'\n'*|*$'\r'*) return 0 ;;
   esac
-  printf '\033]9;9;%s\007' "$__bayan_win"
-  __bayan_p=${__bayan_win//\\//}
-  __bayan_enc=""
-  __bayan_i=0
-  while [ "$__bayan_i" -lt "${#__bayan_p}" ]; do
-    __bayan_c=${__bayan_p:$__bayan_i:1}
-    case "$__bayan_c" in
-      [A-Za-z0-9._~/:-]) __bayan_enc="${__bayan_enc}${__bayan_c}" ;;
-      " ") __bayan_enc="${__bayan_enc}%20" ;;
-      *) return 0 ;;
-    esac
-    __bayan_i=$((__bayan_i + 1))
-  done
-  printf '\033]7;file:///%s\007' "$__bayan_enc"
+  local __bayan_p="${__bayan_win//\\//}"
+  local __bayan_enc
+  __bayan_enc=$(__bayan_pct "$__bayan_p")
+  __bayan_osc_cache="$(printf '\033]9;9;%s\007\033]7;file:///%s\007' "$__bayan_win" "$__bayan_enc")"
+  __bayan_pwd_cache=$PWD
+  printf '%s' "$__bayan_osc_cache"
 }
+
+__bayan_ret() { return "$1"; }
 
 __bayan_pc_items=()
 if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == declare\ -a* ]]; then
@@ -366,16 +443,22 @@ elif [ -n "${PROMPT_COMMAND-}" ]; then
 fi
 
 __bayan_prompt_command() {
-  local __bayan_ec=$?
+  # One builtin, so both expansions see the command that just finished.
+  # Anything after this line (printf, cygpath) would leave $? at 0, and
+  # starship / oh-my-posh would paint a green mark on a failed command.
+  local __bayan_ec=${?} __bayan_pipe=("${PIPESTATUS[@]}")
   printf '\033]133;D;%s;%s\007' "$__bayan_ec" "$__BAYAN_NONCE"
   printf '\033]133;A;%s\007' "$__BAYAN_NONCE"
   __bayan_report_cwd
   local __bayan_cmd
   for __bayan_cmd in "${__bayan_pc_items[@]}"; do
     if [ -n "$__bayan_cmd" ]; then
+      __bayan_ret "$__bayan_ec"
       eval "$__bayan_cmd" || true
     fi
   done
+  # \[ \] are PS1's zero-width markers. They are not for PS0: bash turns
+  # them into literal SOH/STX there.
   local __bayan_b
   __bayan_b=$'\[\033]133;B;'"${__BAYAN_NONCE}"$'\007\]'
   PS1=${PS1-}
@@ -383,28 +466,28 @@ __bayan_prompt_command() {
   PS1="${PS1}${__bayan_b}"
   case "${PS0-}" in
     *']133;C;'*) ;;
-    *) PS0="\[\033]133;C;${__BAYAN_NONCE}\007\]${PS0-}" ;;
+    *) PS0="$(printf '\033]133;C;%s\007' "$__BAYAN_NONCE")${PS0-}" ;;
   esac
   return 0
 }
 PROMPT_COMMAND=__bayan_prompt_command
 case "${PS0-}" in
   *']133;C;'*) ;;
-  *) PS0="\[\033]133;C;${__BAYAN_NONCE}\007\]${PS0-}" ;;
+  *) PS0="$(printf '\033]133;C;%s\007' "$__BAYAN_NONCE")${PS0-}" ;;
 esac
 "#;
 
 fn zsh_env(source_user: bool) -> String {
     let mut s = String::from(ZSH_ENV_HEAD);
     if source_user {
-        s.push_str("[[ -f \"$HOME/.zshenv\" ]] && source \"$HOME/.zshenv\"\n");
+        s.push_str("__bayan_source_user .zshenv\n");
     }
     s
 }
 
 fn zsh_profile(source_user: bool) -> String {
     if source_user {
-        "[[ -f \"$HOME/.zprofile\" ]] && source \"$HOME/.zprofile\"\n".into()
+        "__bayan_source_user .zprofile\n".into()
     } else {
         "# elevated: no user zprofile\n".into()
     }
@@ -413,32 +496,86 @@ fn zsh_profile(source_user: bool) -> String {
 fn zsh_rc(source_user: bool) -> String {
     let mut s = String::new();
     if source_user {
-        s.push_str("[[ -f \"$HOME/.zshrc\" ]] && source \"$HOME/.zshrc\"\n");
+        s.push_str("__bayan_source_user .zshrc\n");
     }
     s.push_str(ZSH_HOOKS);
     s.push_str("__bayan_ensure_hooks\n");
+    // Login shells still have .zlogin to read from THIS directory. Restoring
+    // ZDOTDIR here would make zsh open the user's .zlogin and skip ours.
+    s.push_str("if [[ ! -o login ]]; then __bayan_finish_zdotdir; fi\n");
     s
 }
 
 fn zsh_login(source_user: bool) -> String {
     let mut s = String::new();
     if source_user {
-        s.push_str("[[ -f \"$HOME/.zlogin\" ]] && source \"$HOME/.zlogin\"\n");
+        s.push_str("__bayan_source_user .zlogin\n");
     }
-    // A user .zlogin may have replaced precmd_functions. Put the marks back.
-    s.push_str("__bayan_ensure_hooks\n");
+    // A user .zlogin may have replaced precmd_functions. Put the marks back,
+    // then leave ZDOTDIR as the user left it so history and tmux are theirs.
+    s.push_str("__bayan_ensure_hooks\n__bayan_finish_zdotdir\n");
     s
 }
 
 const ZSH_ENV_HEAD: &str = r#"# Bayan ZDOTDIR for this pane. zsh reads these files instead of ~/.zsh*.
+# The directory is put back before the first prompt (__bayan_finish_zdotdir).
 if [[ -z ${__BAYAN_NONCE:-} ]]; then
   __BAYAN_NONCE=${BAYAN_PROMPT_NONCE-}
   unset BAYAN_PROMPT_NONCE
 fi
+
+# Source one user startup file with ZDOTDIR pointed at their directory, then
+# point it back here so the next file zsh opens is still ours. If their
+# .zshenv sets ZDOTDIR (the XDG layout), that new value is what we keep.
+__bayan_source_user() {
+  local _file=$1
+  local _saved=$ZDOTDIR
+  local _dir=${BAYAN_USER_ZDOTDIR:-$HOME}
+  if [[ -f "$_dir/$_file" ]]; then
+    ZDOTDIR=$_dir
+    source "$ZDOTDIR/$_file"
+    BAYAN_USER_ZDOTDIR=$ZDOTDIR
+    export BAYAN_USER_ZDOTDIR
+  fi
+  ZDOTDIR=$_saved
+  export ZDOTDIR
+}
+
+__bayan_finish_zdotdir() {
+  if [[ -n ${BAYAN_ZDOTDIR_UNSET-} ]]; then
+    unset ZDOTDIR
+  else
+    ZDOTDIR=${BAYAN_USER_ZDOTDIR:-$HOME}
+    export ZDOTDIR
+  fi
+  unset BAYAN_ZDOTDIR BAYAN_BASH_RC BAYAN_USER_ZDOTDIR BAYAN_ZDOTDIR_UNSET
+}
 "#;
 
 const ZSH_HOOKS: &str = r#"
+__bayan_pct() {
+  local enc="" b ch hex
+  hex=$(printf '%s' "$1" | od -An -tx1)
+  for b in ${=hex}; do
+    b=${(L)b}
+    case $b in
+      2d|2e|2f|3a|5f|7e|3[0-9]|4[1-9a-f]|5[0-9a]|6[1-9a-f]|7[0-9a])
+        printf -v ch "\\x$b"
+        enc+="$ch"
+        ;;
+      ??)
+        enc+="%${(U)b}"
+        ;;
+    esac
+  done
+  print -rn -- "$enc"
+}
+
 __bayan_report_cwd() {
+  if [[ $PWD == ${__bayan_pwd_cache-} ]]; then
+    print -rn -- ${__bayan_osc_cache-}
+    return 0
+  fi
   local win="$PWD"
   if (( $+commands[cygpath] )); then
     win="$(cygpath -w "$PWD" 2>/dev/null)" || return 0
@@ -452,13 +589,12 @@ __bayan_report_cwd() {
   case "$win" in
     *$'\e'*|*$'\a'*|*$'\n'*|*$'\r'*) return 0 ;;
   esac
-  printf '\033]9;9;%s\007' "$win"
   local p="${win//\\//}"
-  p="${p// /%20}"
-  case "$p" in
-    *%*) ;;
-    *) printf '\033]7;file:///%s\007' "$p" ;;
-  esac
+  local enc
+  enc=$(__bayan_pct "$p")
+  __bayan_osc_cache="$(printf '\033]9;9;%s\007\033]7;file:///%s\007' "$win" "$enc")"
+  __bayan_pwd_cache=$PWD
+  print -rn -- "$__bayan_osc_cache"
 }
 
 __bayan_precmd() {
@@ -506,6 +642,15 @@ fn wsl_launcher() -> String {
 }
 rc=$(to_unix "${BAYAN_BASH_RC-}")
 zdot=$(to_unix "${BAYAN_ZDOTDIR-}")
+# Remember the user's ZDOTDIR before the zsh branch replaces it. Unset means
+# "zsh should use $HOME", which we restore by unsetting, not by exporting HOME.
+if [ -n "${ZDOTDIR-}" ]; then
+  export BAYAN_USER_ZDOTDIR="$ZDOTDIR"
+  unset BAYAN_ZDOTDIR_UNSET
+else
+  export BAYAN_USER_ZDOTDIR="${HOME:-/}"
+  export BAYAN_ZDOTDIR_UNSET=1
+fi
 name=$(id -un 2>/dev/null) || name=${USER:-root}
 line=
 if command -v getent >/dev/null 2>&1; then
@@ -743,17 +888,129 @@ pub(crate) fn remove_integration_dir(dir: &Path) {
     if !dir_is_removable(dir, &std::env::temp_dir(), &programdata_dir()) {
         return;
     }
-    for rel in [
-        "bash.sh",
-        "zsh/.zshenv",
-        "zsh/.zprofile",
-        "zsh/.zshrc",
-        "zsh/.zlogin",
-    ] {
-        let _ = std::fs::remove_file(dir.join(rel));
-    }
-    let _ = std::fs::remove_dir(dir.join("zsh"));
+    remove_our_dir(dir);
+}
+
+/// Files only, one level, then the directory. A junction is not followed.
+fn remove_our_dir(dir: &Path) {
+    let _ = remove_files_here(dir);
+    let zsh = dir.join("zsh");
+    let _ = remove_files_here(&zsh);
+    let _ = std::fs::remove_dir(&zsh);
     let _ = std::fs::remove_dir(dir);
+}
+
+fn remove_files_here(dir: &Path) -> std::io::Result<()> {
+    for ent in std::fs::read_dir(dir)? {
+        let ent = ent?;
+        let path = ent.path();
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() || meta.is_file() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    Ok(())
+}
+
+/// Drop `bayan-si-*` directories left behind by a crashed process. Only a
+/// name we mint, owned by this user, and last written more than 12 hours
+/// ago. A pane that is still open created its directory moments ago.
+pub(crate) fn sweep_stale_integration_dirs() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let cutoff =
+            std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(12 * 60 * 60));
+        let Some(cutoff) = cutoff else {
+            return;
+        };
+        let Some(sid) = current_user_sid().ok() else {
+            return;
+        };
+        for parent in [std::env::temp_dir(), programdata_dir()] {
+            sweep_parent(&parent, cutoff, &sid);
+        }
+    });
+}
+
+fn sweep_parent(parent: &Path, cutoff: std::time::SystemTime, sid: &str) {
+    let Ok(rd) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for ent in rd.flatten() {
+        let path = ent.path();
+        if !should_sweep(&path, cutoff, sid) {
+            continue;
+        }
+        remove_our_dir(&path);
+    }
+}
+
+fn should_sweep(path: &Path, cutoff: std::time::SystemTime, sid: &str) -> bool {
+    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    if !is_integration_dirname(name) {
+        return false;
+    }
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.is_dir() {
+        return false;
+    }
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    if modified > cutoff {
+        return false;
+    }
+    owner_sid(path).as_deref() == Some(sid)
+}
+
+fn owner_sid(path: &Path) -> Option<String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+
+    let wide = wide_path(path);
+    // SAFETY: `wide` is NUL-terminated. GetNamedSecurityInfoW writes an
+    // owner SID that points into `sd`, which LocalFree releases after the
+    // string copy. ConvertSidToStringSidW allocates `out`, also LocalFree'd.
+    unsafe {
+        let mut owner = std::ptr::null_mut();
+        let mut sd = std::ptr::null_mut();
+        let err = GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        );
+        if err != 0 || owner.is_null() {
+            if !sd.is_null() {
+                LocalFree(sd.cast());
+            }
+            return None;
+        }
+        let mut out = std::ptr::null_mut();
+        let ok = ConvertSidToStringSidW(owner, &mut out);
+        LocalFree(sd.cast());
+        if ok == 0 || out.is_null() {
+            return None;
+        }
+        let mut n = 0usize;
+        while *out.add(n) != 0 {
+            n += 1;
+        }
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(out, n));
+        LocalFree(out.cast());
+        Some(text)
+    }
 }
 
 /// Holds the directory until [`IntegrationDir::disarm`]. Dropping it early
@@ -775,9 +1032,43 @@ impl Drop for IntegrationDir {
 }
 
 fn programdata_dir() -> PathBuf {
-    std::env::var_os("PROGRAMDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+    static CACHED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    CACHED.get_or_init(programdata_from_known_folder).clone()
+}
+
+/// `FOLDERID_ProgramData`, not the `PROGRAMDATA` environment variable. That
+/// variable is per-user (`HKCU\Environment`), so a medium-integrity process
+/// can point it at a directory it owns and then swap the script after we
+/// create it.
+fn programdata_from_known_folder() -> PathBuf {
+    known_folder_programdata().unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+}
+
+fn known_folder_programdata() -> Option<PathBuf> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath};
+
+    // SAFETY: FOLDERID_ProgramData is a static GUID. A null token means the
+    // current process. On success `ptr` is a CoTaskMemAlloc string; we copy
+    // it and CoTaskMemFree it. A failing HRESULT leaves nothing to free.
+    unsafe {
+        let mut ptr = std::ptr::null_mut();
+        let hr = SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, std::ptr::null_mut(), &mut ptr);
+        if hr != 0 || ptr.is_null() {
+            return None;
+        }
+        let mut n = 0usize;
+        while *ptr.add(n) != 0 {
+            n += 1;
+        }
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, n));
+        CoTaskMemFree(ptr.cast());
+        if text.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(text))
+        }
+    }
 }
 
 /// Where a new integration directory is created. Elevated files go in
@@ -864,10 +1155,17 @@ fn current_user_sid() -> std::io::Result<String> {
 }
 
 /// This process token is elevated (UAC's high token, including Explorer's
-/// Run as administrator). A failed query is not elevated: the token bit is
-/// the only signal. Tests pass the boolean into [`plan`] and do not call this.
+/// Run as administrator). A failed query is treated as elevated: sourcing a
+/// user rc file because the check broke is the failure mode this exists to
+/// avoid. PR #59 carries its own copy of this check; when both are on
+/// `bayan-plus`, delete this one and call that helper.
 pub(crate) fn is_elevated() -> bool {
-    token_is_elevated()
+    elevated_from_query(token_is_elevated())
+}
+
+/// `None` is a failed query, not a clear "not elevated".
+pub(crate) fn elevated_from_query(query: Option<bool>) -> bool {
+    query.unwrap_or(true)
 }
 
 /// Enables `SeSecurityPrivilege` for this function's lifetime, then puts it
@@ -941,7 +1239,7 @@ fn set_privilege(name: &str, enable: bool) -> bool {
     }
 }
 
-fn token_is_elevated() -> bool {
+fn token_is_elevated() -> Option<bool> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::Security::{
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
@@ -954,7 +1252,7 @@ fn token_is_elevated() -> bool {
     unsafe {
         let mut token = std::ptr::null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-            return false;
+            return None;
         }
         let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
         let mut written = 0u32;
@@ -966,7 +1264,11 @@ fn token_is_elevated() -> bool {
             &mut written,
         );
         let _ = CloseHandle(token);
-        ok != 0 && elevation.TokenIsElevated != 0
+        if ok == 0 {
+            None
+        } else {
+            Some(elevation.TokenIsElevated != 0)
+        }
     }
 }
 
@@ -1199,6 +1501,70 @@ pub(crate) fn dacl_sddl(path: &Path) -> std::io::Result<String> {
 }
 
 #[cfg(test)]
+fn find_real_bash() -> Option<PathBuf> {
+    for candidate in [
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+    ] {
+        if Path::new(candidate).is_file() {
+            return Some(PathBuf::from(candidate));
+        }
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        let exe = dir.join("bash.exe");
+        let text = exe.to_string_lossy().to_ascii_lowercase();
+        (exe.is_file() && !text.contains("git-bash")).then_some(exe)
+    })
+}
+
+#[cfg(test)]
+fn set_dir_mtime(path: &Path, when: std::time::SystemTime) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, SetFileTime, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+    };
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let ticks = when
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| std::io::Error::other(e.to_string()))?
+        .as_nanos()
+        / 100
+        + 116_444_736_000_000_000u128;
+    let stamp = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    // SAFETY: `wide` is NUL-terminated. BACKUP_SEMANTICS opens a directory.
+    // SetFileTime writes the one FILETIME we pass. CloseHandle releases the
+    // handle. INVALID_HANDLE_VALUE is failure.
+    unsafe {
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            FILE_WRITE_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        );
+        if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        let ok = SetFileTime(handle, std::ptr::null(), std::ptr::null(), &stamp);
+        CloseHandle(handle);
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1241,8 +1607,23 @@ mod tests {
         assert!(rc.contains(r"\033]133;B;"));
         assert!(rc.contains(r"\033]133;C;"));
         assert!(rc.contains("unset BAYAN_PROMPT_NONCE"));
-        assert!(rc.contains(r#". "$HOME/.bashrc""#), "{rc}");
+        // A login shell does not read ~/.bashrc itself. The profile does,
+        // once, when the user wrote it that way.
+        assert!(
+            !rc.contains(r#". "$HOME/.bashrc""#),
+            "login rc must not source bashrc a second time: {rc}"
+        );
         assert!(rc.contains("/etc/profile"), "login shell keeps its profile");
+        assert!(rc.contains(r#". "$HOME/.bash_profile""#));
+        let ret = rc.find("__bayan_ret \"$__bayan_ec\"").unwrap();
+        let eval_at = rc.find("eval \"$__bayan_cmd\"").unwrap();
+        assert!(ret < eval_at, "restore $? before the user's PROMPT_COMMAND");
+        assert!(rc.contains("PIPESTATUS"), "capture the pipeline status");
+        assert!(
+            rc.contains("PS0=\"$(printf"),
+            "PS0 is a raw OSC, not a PS1 \\[ \\] wrapper"
+        );
+        assert!(!rc.contains("PS0=\"\\["));
         assert!(rc.contains(r"\033]9;9;"));
         assert!(rc.contains(r"\033]7;file:///"));
         assert!(
@@ -1266,9 +1647,26 @@ mod tests {
         let plan = plan(bash_git(), true, true, NONCE).unwrap();
         let rc = file(&plan, "bash.sh");
         assert!(!rc.contains("$HOME"), "{rc}");
-        assert!(!rc.contains("/etc/profile"), "{rc}");
+        assert!(
+            rc.contains("/etc/profile"),
+            "elevated Git Bash still needs the system profile"
+        );
         assert!(!rc.contains(".bashrc"), "{rc}");
         assert!(rc.contains(r"printf '\033]133;D;%s;%s\007'"));
+        assert_eq!(
+            plan.env
+                .iter()
+                .find(|(k, _)| k == "INPUTRC")
+                .map(|(_, v)| v.as_str()),
+            Some("/dev/null")
+        );
+        assert_eq!(
+            plan.env
+                .iter()
+                .find(|(k, _)| k == "HISTFILE")
+                .map(|(_, v)| v.as_str()),
+            Some("/dev/null")
+        );
         assert_eq!(integration_parent(true), programdata_dir());
         let user = std::env::var("USERPROFILE").unwrap_or_default();
         if !user.is_empty() {
@@ -1300,9 +1698,15 @@ mod tests {
             "any other default shell starts with no rcfile"
         );
         let bash = file(&got, "bash.sh");
-        assert!(bash.contains(r#". "$HOME/.bashrc""#));
+        assert!(
+            !bash.contains(r#". "$HOME/.bashrc""#),
+            "WSL login must not source bashrc twice"
+        );
+        assert!(bash.contains(r#". "$HOME/.profile""#));
         let zshrc = file(&got, "zsh/.zshrc");
-        assert!(zshrc.contains(r#"source "$HOME/.zshrc""#));
+        assert!(zshrc.contains("__bayan_source_user .zshrc"));
+        assert!(zshrc.contains("__bayan_finish_zdotdir"));
+        assert!(launch.contains("BAYAN_USER_ZDOTDIR"), "{launch}");
         assert!(zshrc.contains(r"printf '\033]133;D;%s;%s\007'"));
         assert!(zshrc.contains(r"\033]133;C;"));
         assert!(zshrc.contains("__bayan_ensure_hooks"));
@@ -1337,10 +1741,16 @@ mod tests {
         let plan = plan(r"C:\Windows\System32\wsl.exe -d Debian", true, true, NONCE).unwrap();
         for (name, body) in &plan.files {
             assert!(
-                !body.contains("$HOME"),
+                !body.contains("__bayan_source_user ."),
+                "{name} sources a user file while elevated:\n{body}"
+            );
+            assert!(
+                !body.contains(". \"$HOME/"),
                 "{name} sources a user file while elevated:\n{body}"
             );
         }
+        assert!(plan.wslenv_plain.iter().any(|n| n == "INPUTRC"));
+        assert!(plan.wslenv_plain.iter().any(|n| n == "HISTFILE"));
         assert!(file(&plan, "zsh/.zshrc").contains(r"printf '\033]133;A;%s\007'"));
     }
 
@@ -1415,8 +1825,10 @@ mod tests {
         assert!(plan("powershell.exe", true, false, NONCE).is_none());
         assert_eq!(
             shell_kind(r"C:\Program Files\Git\git-bash.exe"),
-            ShellKind::Bash
+            ShellKind::Unknown,
+            "git-bash.exe is a GUI launcher"
         );
+        assert!(plan(r"C:\Program Files\Git\git-bash.exe", true, false, NONCE).is_none());
         assert_eq!(shell_kind("cmd.exe /K chcp 65001"), ShellKind::Cmd);
     }
 
@@ -1503,5 +1915,181 @@ mod tests {
         assert!(!sddl.contains("WD"), "world-writable: {sddl}");
         assert!(!sddl.contains("AU"), "{sddl}");
         assert!(!std::fs::metadata(&dir).is_ok(), "cleanup left {dir:?}");
+    }
+
+    #[test]
+    fn a_failed_elevation_query_is_treated_as_elevated() {
+        // Fail closed. PR #59 has another copy of the token query; keep one
+        // helper when both changes are on bayan-plus.
+        assert!(elevated_from_query(None));
+        assert!(elevated_from_query(Some(true)));
+        assert!(!elevated_from_query(Some(false)));
+    }
+
+    #[test]
+    fn one_shot_bash_and_the_gui_launcher_are_not_injected() {
+        for cmd in [
+            r"C:\Program Files\Git\usr\bin\bash.exe -c ls",
+            r"C:\Program Files\Git\usr\bin\bash.exe -lc echo",
+            r"C:\Program Files\Git\usr\bin\bash.exe script.sh",
+            r"C:\Program Files\Git\git-bash.exe",
+        ] {
+            assert!(plan(cmd, true, false, NONCE).is_none(), "{cmd}");
+        }
+        let plain = plan(r"C:\Program Files\Git\usr\bin\bash.exe", true, false, NONCE).unwrap();
+        assert!(plain.args.iter().any(|a| a == "-i"));
+        assert!(plain.env.iter().all(|(k, _)| k != "INPUTRC"));
+    }
+
+    #[test]
+    fn elevated_scripts_ignore_the_programdata_environment_variable() {
+        let previous = std::env::var_os("PROGRAMDATA");
+        std::env::set_var("PROGRAMDATA", r"C:\Users\me\planted-programdata");
+        let parent = integration_parent(true);
+        match previous {
+            Some(value) => std::env::set_var("PROGRAMDATA", value),
+            None => std::env::remove_var("PROGRAMDATA"),
+        }
+        assert_ne!(parent, PathBuf::from(r"C:\Users\me\planted-programdata"));
+        assert!(
+            parent
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("programdata"),
+            "{parent:?}"
+        );
+    }
+
+    #[test]
+    fn cwd_reports_are_cached_and_percent_encode_every_byte() {
+        let bash_plan = plan(bash_git(), true, false, NONCE).unwrap();
+        let rc = file(&bash_plan, "bash.sh");
+        assert!(
+            rc.contains("__bayan_pwd_cache"),
+            "cygpath once per directory"
+        );
+        assert!(
+            rc.contains("od -An -tx1"),
+            "encode UTF-8 bytes, not characters"
+        );
+        assert!(rc.contains("%${b^^}") || rc.contains("%${(U)b}"));
+        let wsl = plan(r"C:\Windows\System32\wsl.exe -d Ubuntu", true, false, NONCE).unwrap();
+        let zsh = file(&wsl, "zsh/.zshrc");
+        assert!(zsh.contains("__bayan_pct"));
+        assert!(zsh.contains("__bayan_pwd_cache"));
+    }
+
+    #[test]
+    fn stale_integration_directories_go_and_fresh_ones_stay() {
+        let parent =
+            std::env::temp_dir().join(format!("bayan-sweep-{}", random_hex().expect("random")));
+        std::fs::create_dir(&parent).unwrap();
+        let old = parent.join(integration_dirname(&"ab".repeat(16)));
+        let fresh = parent.join(integration_dirname(&"cd".repeat(16)));
+        std::fs::create_dir(&old).unwrap();
+        std::fs::create_dir(&fresh).unwrap();
+        let old_time = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(48 * 60 * 60))
+            .unwrap();
+        set_dir_mtime(&old, old_time).unwrap();
+        let sid = current_user_sid().unwrap();
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(12 * 60 * 60))
+            .unwrap();
+        sweep_parent(&parent, cutoff, &sid);
+        assert!(!old.exists(), "a 48-hour-old directory is a crashed pane");
+        assert!(fresh.exists(), "a directory from this run stays");
+        let kept = parent.join(integration_dirname(&"ef".repeat(16)));
+        std::fs::create_dir(&kept).unwrap();
+        set_dir_mtime(&kept, old_time).unwrap();
+        sweep_parent(&parent, cutoff, "S-1-5-99");
+        assert!(
+            kept.exists(),
+            "another user's directory is not ours to delete"
+        );
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// Git Bash on the Windows runner executes the generated rcfile. A missing
+    /// bash on a developer machine skips; CI must have it.
+    #[test]
+    fn real_bash_keeps_the_exit_status_and_sources_bashrc_once() {
+        let Some(bash) = find_real_bash() else {
+            if std::env::var_os("GITHUB_ACTIONS").is_some() {
+                panic!("Git Bash is required on the Windows CI runner");
+            }
+            return;
+        };
+        let home =
+            std::env::temp_dir().join(format!("bayan-bash-home-{}", random_hex().expect("random")));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(
+            home.join(".bashrc"),
+            "echo BASHRC >> \"$HOME/bashrc.count\"\nPROMPT_COMMAND='echo USER_PC_SAW=$?'\n",
+        )
+        .unwrap();
+        let rc_path = home.join("bayan-rc.sh");
+        let rc = bash_rc(false, true);
+        std::fs::write(&rc_path, &rc).unwrap();
+        let mut child = std::process::Command::new(&bash)
+            .arg("--rcfile")
+            .arg(&rc_path)
+            .arg("-i")
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("BAYAN_PROMPT_NONCE", "n0nce")
+            .env_remove("BASH_ENV")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn bash");
+        let mut stdout = child.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
+            buf
+        });
+        let mut stdin = child.stdin.take().unwrap();
+        use std::io::Write;
+        writeln!(stdin, "false").unwrap();
+        writeln!(stdin, "(exit 7)").unwrap();
+        writeln!(stdin, "mkdir -p \"$HOME/بيان\"").unwrap();
+        writeln!(stdin, "cd \"$HOME/بيان\"").unwrap();
+        writeln!(stdin, "printf 'CD_DONE\\n'").unwrap();
+        writeln!(stdin, "exit").unwrap();
+        drop(stdin);
+        let start = std::time::Instant::now();
+        loop {
+            if child.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(20) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("bash did not exit");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let output = reader.join().expect("stdout");
+        let text = String::from_utf8_lossy(&output);
+        let count = std::fs::read_to_string(home.join("bashrc.count")).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(
+            count.lines().filter(|l| l.contains("BASHRC")).count(),
+            1,
+            "bashrc once, output:\n{text}"
+        );
+        assert!(text.contains("USER_PC_SAW=1"), "{text}");
+        assert!(text.contains("USER_PC_SAW=7"), "{text}");
+        assert!(text.contains("]133;D;1;"), "{text}");
+        assert!(text.contains("]133;D;7;"), "{text}");
+        assert!(text.contains("CD_DONE"), "{text}");
+        assert!(
+            text.contains("%D8%A8"),
+            "Arabic directory must be percent-encoded in OSC 7:\n{text}"
+        );
+        assert!(!text.contains('\u{1}'), "PS0 leaked SOH:\n{text}");
     }
 }

@@ -2156,6 +2156,7 @@ impl Session {
         shell_integration: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let prompt_nonce = fresh_prompt_nonce();
+        crate::shellint::sweep_stale_integration_dirs();
         let pty = native_pty_system();
         let pair = pty.openpty(PtySize {
             rows: size.rows as u16,

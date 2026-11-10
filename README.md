@@ -929,34 +929,44 @@ and capped. Bayan's own toasts (a long command finished, the bell) follow
 
 `"shell_integration"` defaults to **on** (leave the key out and it stays
 on). `false` starts new panes with no OSC 133 injection. It applies to
-PowerShell, Git Bash and MSYS `bash.exe`, WSL bash and zsh, and cmd.
-An unknown program — fish, nushell, dash, `sh`, a Windows `zsh.exe` — is
-never injected, even when the key is on. Bash is started with a temporary
-`--rcfile` (a `--login` flag is dropped, because bash would ignore the
-rcfile) that sources the user's `~/.bashrc` first, and for a login shell
-also `/etc/profile` and the first of `~/.bash_profile`, `~/.bash_login`,
-`~/.profile`. Git Bash's profile already sources `~/.bashrc`; the rcfile
-skips a second load when `MSYSTEM` is set. The existing `PROMPT_COMMAND`
-is kept and run after the `D` and `A` marks. `PS0` emits `C` (command
-start). Nothing is written into the user's home. WSL reads the distro's
-login shell from passwd (`getent`, or `/etc/passwd` when getent is
-absent). Bash gets that rcfile; zsh gets a `ZDOTDIR` that sources the
-home zsh files and then the same marks. fish, dash, or any other default
-shell is exec'd with no rcfile. Windows paths become Linux paths through
-`WSLENV` (`/up`) and, if the value still looks like `C:\…`, `wslpath -u`.
-cmd's `PROMPT` uses `$E` for `A` and `B` only. cmd has no hook that runs
-when a command starts, and no way to report `ERRORLEVEL` as that command's
-exit, so the gutter stays unknown and a `D` mark is not invented. The
-nonce travels in `BAYAN_PROMPT_NONCE` and is removed before a child
-inherits it, except that cmd has to keep the expanded value inside
-`PROMPT` itself. An elevated token (Run as administrator) does not source
-those user rc files, and does not init oh-my-posh from the user profile:
-`--rcfile` and `ZDOTDIR` are the only startup files, and they contain the
-marks alone. Elevated scripts are created under `%ProgramData%` with a
-random name, a protected DACL for SYSTEM and Administrators, and a high
-integrity label, so a medium-integrity process cannot replace them. A
-normal pane uses the user temp directory with a DACL for the current user
-only. The directory is removed when the pane closes. A name that is not
+PowerShell, Git Bash and MSYS `bash.exe` (not `git-bash.exe`, which is a
+GUI launcher), WSL bash and zsh, and cmd. `bash -c` and `bash script.sh`
+are not injected. An unknown program — fish, nushell, dash, `sh`, a
+Windows `zsh.exe` — is never injected, even when the key is on. Bash is
+started with a temporary `--rcfile` (`--login` is dropped, because bash
+would ignore the rcfile). A login shell then reads `/etc/profile` and the
+first of `~/.bash_profile`, `~/.bash_login`, `~/.profile`, and does not
+also read `~/.bashrc` — that is bash's own rule, and Ubuntu's profile
+already sources it. A non-login shell reads `~/.bashrc` only. The user's
+`PROMPT_COMMAND` is kept; `$?` is restored immediately before it runs, so
+starship and oh-my-posh still see a failed command. `PS0` emits `C` as a
+raw OSC (not `\[ \]`, which bash would print as SOH/STX). Nothing is
+written into the user's home. WSL reads the distro's login shell from
+passwd (`getent`, or `/etc/passwd` when getent is absent). Bash gets that
+rcfile. zsh gets a `ZDOTDIR` only while its startup files load, then the
+user's `ZDOTDIR` is restored (or unset, if it was unset) so history and
+tmux keep the user's directory. fish, dash, or any other default shell is
+exec'd with no rcfile. Windows paths become Linux paths through `WSLENV`
+(`/up`) and, if the value still looks like `C:\…`, `wslpath -u`. OSC 7
+percent-encodes the path as UTF-8 bytes, including spaces and Arabic, and
+`cygpath`/`wslpath` run once per directory. cmd's `PROMPT` uses `$E` for
+`A` and `B` only. cmd has no hook that runs when a command starts, and no
+way to report `ERRORLEVEL` as that command's exit, so the gutter stays
+unknown and a `D` mark is not invented. The nonce travels in
+`BAYAN_PROMPT_NONCE` and is removed before a child inherits it, except
+that cmd has to keep the expanded value inside `PROMPT` itself. An
+elevated token (Run as administrator) does not source user rc files, sets
+`INPUTRC` and `HISTFILE` to `/dev/null` so `~/.inputrc` cannot run a
+macro, still reads `/etc/profile` (Git's copy is not user-writable; without
+it `/usr/bin` is missing), and does not init oh-my-posh from the user
+profile. A failed elevation query is treated as elevated. Elevated scripts
+are created under the real ProgramData folder
+(`SHGetKnownFolderPath(FOLDERID_ProgramData)`, not the `PROGRAMDATA`
+environment variable) with a random name, a protected DACL for SYSTEM and
+Administrators, and a high integrity label. A normal pane uses the user
+temp directory with a DACL for the current user only. The directory is
+removed when the pane closes, and a later launch deletes `bayan-si-*`
+directories older than 12 hours that this user owns. A name that is not
 one of those random directories is not deleted.
 
 Shell and scrollback apply to new tabs (no terminal restarts a live
