@@ -536,6 +536,10 @@ impl App {
             if let Some(t) = self.tabs.get_mut(self.active) {
                 t.attention = false;
             }
+            // Focus drops and rebuilds the IME context. The candidate
+            // window is back at the origin until the cursor box is sent
+            // again, even when the cell has not moved (winit#2569).
+            self.ime_area_reset = true;
             self.request_redraw();
         } else {
             // Alt+Tab with the button down must not keep dragging

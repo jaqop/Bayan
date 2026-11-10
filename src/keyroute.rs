@@ -100,6 +100,45 @@ pub(crate) fn commit_target(owner: Option<KeyOwner>) -> CommitTo {
     }
 }
 
+/// The cursor box last handed to `set_ime_cursor_area`, in physical pixels.
+pub(crate) type ImeSpot = (i32, i32, i32, i32);
+
+/// Windows reports a key the IME has already consumed as
+/// `NamedKey::Process` (`VK_PROCESSKEY`). winit 0.30.13 still delivers
+/// that `KeyboardInput` (winit#4508), often before `Ime::Preedit` stores
+/// a composition string. The text arrives separately as preedit or
+/// commit, so the key must not be encoded for the PTY.
+pub(crate) fn is_ime_process_key(key: &Key) -> bool {
+    matches!(key, Key::Named(NamedKey::Process))
+}
+
+/// Swallow a key the IME owns. A visible preedit owns every key (the
+/// IME is composing). `NamedKey::Process` is swallowed even before that
+/// string exists, which is when Windows emits it.
+pub(crate) fn ime_swallows_key(composing: bool, key: &Key) -> bool {
+    composing || is_ime_process_key(key)
+}
+
+/// The rectangle to pass to `set_ime_cursor_area`, if a call is due.
+///
+/// An unchanged box is not sent again. Windows drops the composition
+/// window when the IME context is rebuilt (`Ime::Enabled`, or the window
+/// focused again — winit#2569), so `reset` forces that same box out
+/// again. `None` current means there is no cell to anchor yet; the
+/// caller keeps `reset` set.
+pub(crate) fn ime_area_due(
+    last_sent: Option<ImeSpot>,
+    current: Option<ImeSpot>,
+    reset: bool,
+) -> Option<ImeSpot> {
+    let current = current?;
+    if reset || last_sent != Some(current) {
+        Some(current)
+    } else {
+        None
+    }
+}
+
 /// Enter is `Some(true)`, Esc `Some(false)`, anything else `None`.
 pub(crate) fn enter_or_escape(key: &Key) -> Option<bool> {
     match key {
@@ -205,7 +244,10 @@ impl App {
         match ime {
             Ime::Preedit(text, _) => self.set_preedit(Some(text)),
             Ime::Disabled => self.set_preedit(None),
-            Ime::Enabled => {}
+            // The IME context was just (re)built. Windows has forgotten
+            // the composition window, so the same cursor box has to be
+            // sent again (winit#2569).
+            Ime::Enabled => self.ime_area_reset = true,
             Ime::Commit(text) => {
                 self.set_preedit(None);
                 match commit_target(key_owner(&self.open_overlays())) {
@@ -258,8 +300,9 @@ impl App {
         // early return above the write leaves the key here, so its release
         // stays out of the PTY too.
         self.note_held_away(event);
-        // the IME owns every key while it composes
-        if self.composing() {
+        // Preedit owns every key. `NamedKey::Process` is the IME's too,
+        // and it arrives before the preedit string does (winit#4508).
+        if ime_swallows_key(self.composing(), &event.logical_key) {
             return;
         }
         let m = self.modifiers;
@@ -583,6 +626,13 @@ impl App {
     /// still own every shortcut; a release only reports, and only when the
     /// press itself reached the PTY.
     fn key_released(&mut self, event: &KeyEvent) {
+        // A Process release must not be reported either: the press was
+        // the IME's, and a TUI that asked for key-up would see a release
+        // whose press it never got.
+        if is_ime_process_key(&event.logical_key) {
+            let _ = self.take_held_away(event);
+            return;
+        }
         let held_away = self.take_held_away(event);
         if held_away {
             return;
@@ -635,6 +685,42 @@ mod tests {
             ..Open::default()
         };
         assert_eq!(commit_target(key_owner(&both)), CommitTo::Drop);
+    }
+
+    #[test]
+    fn ime_process_keys_are_swallowed_and_ordinary_letters_are_not() {
+        let process = Key::Named(NamedKey::Process);
+        let arabic = Key::Character(SmolStr::new("ب"));
+        let ctrl_letter = Key::Character(SmolStr::new("ؤ"));
+        // Process is the IME's even before a preedit string exists, so it
+        // is not encoded beside the later Commit.
+        assert!(is_ime_process_key(&process));
+        assert!(ime_swallows_key(false, &process));
+        assert!(ime_swallows_key(true, &process));
+        // a visible composition still owns every other key
+        assert!(ime_swallows_key(true, &arabic));
+        // Arabic letters and the logical char of an Arabic-layout Ctrl
+        // chord are not Process, so they keep the normal key path
+        assert!(!is_ime_process_key(&arabic));
+        assert!(!ime_swallows_key(false, &arabic));
+        assert!(!is_ime_process_key(&ctrl_letter));
+        assert!(!ime_swallows_key(false, &ctrl_letter));
+        assert!(!ime_swallows_key(false, &Key::Named(NamedKey::Enter)));
+    }
+
+    #[test]
+    fn ime_cursor_area_is_sent_again_after_the_context_is_rebuilt() {
+        let spot = (40, 80, 10, 20);
+        let moved = (50, 80, 10, 20);
+        // unchanged and no reset: winit already has this rectangle
+        assert_eq!(ime_area_due(Some(spot), Some(spot), false), None);
+        // Ime::Enabled or a focus return: Windows dropped it, send again
+        assert_eq!(ime_area_due(Some(spot), Some(spot), true), Some(spot));
+        // a real move is sent whether or not the context was rebuilt
+        assert_eq!(ime_area_due(Some(spot), Some(moved), false), Some(moved));
+        assert_eq!(ime_area_due(None, Some(spot), false), Some(spot));
+        // nothing to anchor yet: the caller keeps the reset flag
+        assert_eq!(ime_area_due(Some(spot), None, true), None);
     }
 
     #[test]

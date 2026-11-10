@@ -1431,6 +1431,10 @@ struct App {
     cursor_pos: PhysicalPosition<f64>,
     /// The cursor box last given to `set_ime_cursor_area`.
     ime_spot: Option<(i32, i32, i32, i32)>,
+    /// The IME context was rebuilt (`Ime::Enabled`) or the window focused
+    /// again. Windows forgot the composition window; send the same box
+    /// again even when it has not moved (winit#2569).
+    ime_area_reset: bool,
     /// Grab, motion dedupe, focus-in memory, and the local selection drag.
     /// A focus loss drops all of them together.
     mouse: mouse::Route,
@@ -4809,14 +4813,17 @@ impl App {
             // renderer still warming up on its thread: clear-only dark frame
             _ => {}
         }
-        // the IME candidate window sits at the focused cursor
+        // the IME candidate window sits at the focused cursor. After the
+        // IME context is rebuilt the same box has to be sent again.
         let spot = self.renderer.as_ref().and_then(|r| r.ime_spot);
-        if let Some((x, y, w, h)) = spot.filter(|_| spot != self.ime_spot) {
+        if let Some((x, y, w, h)) = keyroute::ime_area_due(self.ime_spot, spot, self.ime_area_reset)
+        {
             window.set_ime_cursor_area(
                 PhysicalPosition::new(x, y),
                 winit::dpi::PhysicalSize::new(w.max(1) as u32, h.max(1) as u32),
             );
-            self.ime_spot = spot;
+            self.ime_spot = Some((x, y, w, h));
+            self.ime_area_reset = false;
         }
         let Some(gpu) = self.gpu.as_mut() else { return };
         // During a Windows resize, the live client size can advance ahead of
@@ -5552,6 +5559,7 @@ fn run() -> Result<(), String> {
         last_frame_size: None,
         cursor_pos: PhysicalPosition::new(0.0, 0.0),
         ime_spot: None,
+        ime_area_reset: false,
         mouse: mouse::Route::default(),
         sel_pane: 0,
         drag_divider: None,
