@@ -50,7 +50,10 @@ windows-sys = { version = "0.61", features = [
 # is ReadDirectoryChangesW (a target dependency, not a crate feature).
 # config_watch watches the parent directory so an editor that saves by
 # renaming a temp file over config.json is seen, then debounces itself.
+# notify 8.2.2 accepts notify-types ^2. 2.3.0 needs rustc 1.91, above
+# this crate's 1.89 floor, so the lock stays on 2.2.0 (rustc 1.88).
 notify = { version = "8.2.2", default-features = false }
+notify-types = "=2.2.0"
 
 [features]
 # BAYAN_* environment debug hooks (BAYAN_TYPE, BAYAN_PASTE, BAYAN_PROFILE, …)

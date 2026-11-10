@@ -514,6 +514,20 @@ fn watch_loop(
     ready.store(false, Ordering::Relaxed);
 }
 
+/// Read `next` as a new config.json over a session already running `baseline`
+/// (the bytes that were on disk at startup). Tests use this so a reload is
+/// the same parse the watcher thread runs.
+#[cfg(test)]
+pub fn reload_from_bytes(
+    baseline: UserConfig,
+    baseline_bytes: &[u8],
+    next: &[u8],
+) -> Option<ReloadMsg> {
+    let mut state = WatchState::new(baseline);
+    state.prime(Some(baseline_bytes));
+    state.ingest(next)
+}
+
 fn wait_until_watched(watcher: &mut impl notify::Watcher, dir: &Path, rx: &Receiver<Wake>) -> bool {
     loop {
         match watcher.watch(dir, notify::RecursiveMode::NonRecursive) {
@@ -691,6 +705,97 @@ mod tests {
         assert!(plan.cursor);
         assert_eq!(config.font_size, Some(22.0));
         assert!(config.osc52_copy_enabled());
+    }
+
+    /// A config the corrupt-file tests start from. Several fields are set so
+    /// a parser that applied the keys it saw before the file ended would
+    /// show up as a change.
+    fn rich_settings() -> UserConfig {
+        UserConfig {
+            font_size: Some(22.0),
+            arabic_font: Some("Amiri".into()),
+            cursor_style: Some("bar".into()),
+            bg: Some("#112233".into()),
+            osc52: Some("copy".into()),
+            padding: Some(12),
+            bidi: Some(crate::config::BidiConfig { honor_bdsm: false }),
+            ..UserConfig::default()
+        }
+    }
+
+    fn primed_rich() -> WatchState {
+        let cfg = rich_settings();
+        let bytes = config::encode(&cfg).unwrap();
+        let mut state = WatchState::new(cfg);
+        state.prime(Some(&bytes));
+        state
+    }
+
+    /// `bytes` is not a config. The running settings stay byte-for-byte the
+    /// same, including fields the broken text had already started to name.
+    fn assert_corrupt_keeps_everything(state: &mut WatchState, bytes: &[u8]) {
+        let before = state.last_good.clone();
+        match state.ingest(bytes) {
+            Some(ReloadMsg::Rejected { error }) => assert!(
+                !error.is_empty(),
+                "a bad file must report why it was refused"
+            ),
+            Some(ReloadMsg::Applied { config, .. }) => {
+                panic!("corrupt file applied {config:?}")
+            }
+            None => panic!("corrupt file produced no error"),
+        }
+        assert_eq!(
+            state.last_good, before,
+            "a bad file must not apply any field"
+        );
+        assert!(
+            state.ingest(bytes).is_none(),
+            "the same bad bytes must not be applied on the next read"
+        );
+        assert_eq!(state.last_good, before);
+    }
+
+    #[test]
+    fn invalid_json_keeps_every_current_setting() {
+        let mut state = primed_rich();
+        assert_corrupt_keeps_everything(&mut state, b"{oops");
+        assert_corrupt_keeps_everything(&mut state, b"not json at all");
+        // A UTF-8 break in the middle of an otherwise plausible object.
+        assert_corrupt_keeps_everything(&mut state, b"{\"font_size\":99.0,\xff}");
+        assert_eq!(state.last_good.font_size, Some(22.0));
+        assert_eq!(state.last_good.arabic_font.as_deref(), Some("Amiri"));
+        assert!(state.last_good.osc52_copy_enabled());
+        assert!(!state.last_good.honor_bdsm());
+    }
+
+    #[test]
+    fn empty_config_file_keeps_every_current_setting() {
+        let mut state = primed_rich();
+        assert_corrupt_keeps_everything(&mut state, b"");
+        assert_corrupt_keeps_everything(&mut state, b"\n\n");
+        assert_corrupt_keeps_everything(&mut state, b"\xef\xbb\xbf");
+        assert_eq!(state.last_good, rich_settings());
+    }
+
+    #[test]
+    fn truncated_config_write_keeps_every_current_setting() {
+        let mut state = primed_rich();
+        // font_size and cursor_style are on disk, but the object never
+        // closes. Those keys must not land.
+        assert_corrupt_keeps_everything(
+            &mut state,
+            br#"{"font_size":99.0,"cursor_style":"underline","arabic_font":"Kawkab"#,
+        );
+        assert_corrupt_keeps_everything(&mut state, b"{\n  \"font_size\": 99.0,\n");
+        assert_corrupt_keeps_everything(&mut state, b"{\"padding\":");
+        assert_eq!(state.last_good.font_size, Some(22.0));
+        assert_eq!(state.last_good.cursor(), CursorStyle::Bar);
+        assert_eq!(state.last_good.arabic_font.as_deref(), Some("Amiri"));
+        assert_eq!(state.last_good.padding_px(), 12);
+        assert_eq!(state.last_good.bg.as_deref(), Some("#112233"));
+        assert!(state.last_good.osc52_copy_enabled());
+        assert!(!state.last_good.honor_bdsm());
     }
 
     #[test]

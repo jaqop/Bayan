@@ -7247,6 +7247,140 @@ mod cache_tests {
         assert_eq!(Renderer::new(1.0, &stale, 0.0).arabic_family(), None);
     }
 
+    /// Logical endpoints of an aligned terminal row: x of the first char,
+    /// x of the last char, natural width, whether the paragraph is RTL,
+    /// and how many .notdef glyphs were produced.
+    fn arabic_row_shape(r: &mut Renderer, text: &str) -> (f32, f32, f32, bool, usize) {
+        let key = r.ensure_shaped(&[Seg::plain(text, (255, 255, 255))], true);
+        let shaped = r.cache_hot.get(&key).expect("shaped");
+        let buf = &shaped.buffer;
+        let hl = |b0: usize, b1: usize| -> f32 {
+            for run in buf.layout_runs() {
+                if let Some((x, _)) = run
+                    .highlight(
+                        cosmic_text::Cursor::new(0, b0),
+                        cosmic_text::Cursor::new(0, b1),
+                    )
+                    .next()
+                {
+                    return x;
+                }
+            }
+            panic!("no highlight for byte range {b0}..{b1}");
+        };
+        let first_len = text.chars().next().expect("text").len_utf8();
+        let last_len = text.chars().next_back().expect("text").len_utf8();
+        let notdef = buf
+            .layout_runs()
+            .flat_map(|run| run.glyphs.iter())
+            .filter(|glyph| glyph.glyph_id == 0)
+            .count();
+        (
+            hl(0, first_len),
+            hl(text.len() - last_len, text.len()),
+            shaped.natw,
+            buf.is_rtl(0) == Some(true),
+            notdef,
+        )
+    }
+
+    /// A font-size reload rebuilds the renderer. The one already drawing
+    /// keeps its Arabic fallback and the row it has shaped; the replacement
+    /// shapes that row again at the new size, still RTL, still Amiri.
+    #[test]
+    fn font_size_reload_reshapes_an_arabic_row_without_changing_bidi_or_fallback() {
+        let before = crate::config::UserConfig {
+            font_size: Some(16.0),
+            arabic_font: Some("Amiri".into()),
+            bidi: Some(crate::config::BidiConfig { honor_bdsm: false }),
+            ..Default::default()
+        };
+        let before_bytes = crate::config::encode(&before).unwrap();
+        let mut live = Renderer::new(1.0, &before, 0.0);
+        assert_eq!(live.arabic_family(), Some("Amiri"));
+        let text = "مرحبا";
+        let old = arabic_row_shape(&mut live, text);
+        let (old_first, old_last, old_w, old_rtl, old_notdef) = old;
+        assert!(old_rtl, "مرحبا is an RTL paragraph");
+        assert!(
+            old_first > old_last,
+            "logical start x {old_first} is not right of the logical end {old_last}"
+        );
+        assert_eq!(
+            old_notdef, 0,
+            "Arabic fell through to .notdef before the reload"
+        );
+        assert!(old_w > 0.0);
+
+        let after = crate::config::UserConfig {
+            font_size: Some(28.0),
+            ..before.clone()
+        };
+        let next = crate::config::encode(&after).unwrap();
+        let msg = crate::config_watch::reload_from_bytes(before, &before_bytes, &next)
+            .expect("a font-size change reloads");
+        let crate::config_watch::ReloadMsg::Applied {
+            config,
+            plan,
+            deferred,
+        } = msg
+        else {
+            panic!("font-size reload was rejected");
+        };
+        assert!(plan.font);
+        assert!(deferred.is_empty());
+        assert_eq!(config.font_size, Some(28.0));
+        assert_eq!(config.arabic_font.as_deref(), Some("Amiri"));
+        assert!(
+            !config.honor_bdsm(),
+            "the reload must not flip the BiDi policy back to the default"
+        );
+
+        // The renderer that is mid-frame is not retargeted: same fallback,
+        // same shaped row.
+        assert_eq!(live.arabic_family(), Some("Amiri"));
+        assert_eq!(arabic_row_shape(&mut live, text), old);
+
+        let mut replaced = Renderer::new(1.0, &config, 0.0);
+        assert_eq!(replaced.arabic_family(), Some("Amiri"));
+        assert!(
+            replaced.cell_h > live.cell_h,
+            "the replacement is built at the new size"
+        );
+        let (new_first, new_last, new_w, new_rtl, new_notdef) =
+            arabic_row_shape(&mut replaced, text);
+        assert!(new_rtl);
+        assert!(
+            new_first > new_last,
+            "re-shaped row is still RTL: start {new_first}, end {new_last}"
+        );
+        assert_eq!(new_notdef, 0);
+        assert!(
+            new_w > old_w,
+            "the row was shaped again at 28pt ({new_w}) rather than reused at 16pt ({old_w})"
+        );
+        let families = {
+            let key = replaced.ensure_shaped(&[Seg::plain(text, (255, 255, 255))], true);
+            let shaped = replaced.cache_hot.get(&key).expect("shaped");
+            let db = replaced.font_system.db();
+            shaped
+                .buffer
+                .layout_runs()
+                .flat_map(|run| run.glyphs.iter())
+                .map(|glyph| {
+                    db.face(glyph.font_id)
+                        .and_then(|face| face.families.first().map(|(name, _)| name.clone()))
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(!families.is_empty());
+        assert!(
+            families.iter().all(|family| family == "Amiri"),
+            "Arabic fallback changed across the reload: {families:?}"
+        );
+    }
+
     /// x of every glyph in a shaped run, relative to where it is drawn.
     fn glyph_xs(r: &mut Renderer, text: &str, align_left: bool) -> (Vec<f32>, f32) {
         let key = r.ensure_shaped(&[Seg::plain(text, (255, 255, 255))], align_left);
