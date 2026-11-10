@@ -388,6 +388,40 @@ mod tests {
     }
 
     #[test]
+    fn a_copy_mode_selection_cleans_when_asked_and_stays_raw_when_not() {
+        // 20 columns. "    hello world this" fills the row and wraps, then
+        // a real newline and an indented next line. y copies this selection.
+        let mut t = vi_term(b"    hello world this is long\r\n    next");
+        run(
+            &mut t,
+            &[
+                Cmd::Top,
+                Cmd::Motion(ViMotion::First),
+                Cmd::Select(SelectionType::Simple),
+                Cmd::Motion(ViMotion::Down),
+                Cmd::Motion(ViMotion::Down),
+                Cmd::Motion(ViMotion::Last),
+            ],
+        );
+        let raw = t.selection_to_string().expect("the yank has text");
+        let rows = crate::copyclean::selection_rows(&t);
+        assert!(
+            rows.iter().any(|r| r.wrapped),
+            "the long line wrapped: {rows:?}"
+        );
+        // setting off: the bytes copy mode already put on the clipboard
+        assert_eq!(
+            crate::copyclean::clipboard_text(&raw, &rows, false, false),
+            raw
+        );
+        // setting on: the wrap joins, the margin goes, the hard break stays
+        assert_eq!(
+            crate::copyclean::clipboard_text(&raw, &rows, true, false),
+            "hello world this is long\nnext"
+        );
+    }
+
+    #[test]
     fn enter_escape_and_ctrl_c_leave_and_other_ctrl_keys_are_swallowed() {
         assert_eq!(named(NamedKey::Enter, false, false), Some(Cmd::CopyAndExit));
         assert_eq!(named(NamedKey::Escape, false, false), Some(Cmd::Exit));

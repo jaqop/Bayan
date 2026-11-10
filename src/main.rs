@@ -11,6 +11,7 @@ mod bidi;
 mod bidi_ctl;
 mod chrome;
 mod config;
+mod copyclean;
 mod copymode;
 mod gpu;
 mod groups;
@@ -953,6 +954,7 @@ fn context_menu_rows(
     };
     if has_selection {
         add(Copy, Copy.label());
+        add(CopyClean, CopyClean.label());
     }
     for a in [Paste, CopyLastOutput, Search, SplitH, SplitV] {
         add(a, a.label());
@@ -2205,6 +2207,9 @@ impl App {
             NextGroup => self.step_group(false),
             PrevGroup => self.step_group(true),
             CopyMode => self.toggle_copy_mode(),
+            CopyClean => {
+                self.copy_selection_clean();
+            }
         }
     }
 
@@ -4085,27 +4090,44 @@ impl App {
     }
 
     /// Copy the current selection to the system clipboard; optionally clear it.
+    ///
+    /// `copy.clean` decides whether the TUI margin, trailing spaces and soft
+    /// wraps come off. Copy-mode yanks come through here too, so the same
+    /// setting covers `y`.
     fn copy_selection(&mut self, clear: bool) -> bool {
+        self.copy_clipboard(clear, false)
+    }
+
+    /// Copy the selection cleaned, whatever `copy.clean` says.
+    fn copy_selection_clean(&mut self) -> bool {
+        self.copy_clipboard(false, true)
+    }
+
+    fn copy_clipboard(&mut self, clear: bool, force_clean: bool) -> bool {
         let Some(session) = self.session() else {
             return false;
         };
         let text = {
             let mut t = session.term.lock();
             let txt = t.selection_to_string();
+            let rows = copyclean::selection_rows(&t);
             if clear {
                 t.selection = None;
             }
-            txt
+            txt.map(|raw| (raw, rows))
         };
+        // claude_active locks the term too; take it only after the guard above
+        let claude = self.claude_active();
+        let clean = force_clean || self.config.clean_copy().enabled(claude);
         match text {
-            Some(s) if !s.is_empty() => {
+            Some((raw, rows)) if !raw.is_empty() => {
                 // Claude rows hold VISUAL-order Arabic: restore logical so a
-                // paste elsewhere reads correctly (M7 gap closed)
-                let s = if self.claude_active() {
-                    bidi::restore_block(&s)
-                } else {
-                    s
-                };
+                // paste elsewhere reads correctly (M7 gap closed). Clean copy
+                // runs that same restore; it does not reorder by visual x.
+                let s = copyclean::clipboard_text(&raw, &rows, clean, claude);
+                if s.is_empty() {
+                    return false;
+                }
                 self.set_clipboard(s);
                 true
             }
@@ -6808,7 +6830,7 @@ mod m38_tests {
             .into_iter()
             .map(|(_, l)| l)
             .collect();
-        assert_eq!(&labels[..2], ["Copy selection", "Paste"]);
+        assert_eq!(&labels[..3], ["Copy selection", "Copy clean", "Paste"]);
         assert!(labels.iter().any(|l| l == "New tab with shell…"));
         let rows = shell_menu_rows(&[], "cmd.exe");
         assert_eq!(rows[1].1, "Command Prompt · default");
@@ -6870,15 +6892,20 @@ mod m38_tests {
             "copy stays off the menu until something is selected"
         );
         assert!(
+            !one.iter().any(|l| l == keybinds::Action::CopyClean.label()),
+            "clean copy stays off the menu until something is selected"
+        );
+        assert!(
             !one.iter().any(|l| l.contains("تكبير")),
             "no zoom with one pane"
         );
         assert!(one.iter().any(|l| l == "الإعدادات"));
         let sel = labels(context_menu_rows(true, 1, false, false));
         assert_eq!(
-            &sel[..2],
+            &sel[..3],
             [
                 keybinds::Action::Copy.label(),
+                keybinds::Action::CopyClean.label(),
                 keybinds::Action::Paste.label(),
             ]
         );

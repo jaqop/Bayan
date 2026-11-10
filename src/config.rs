@@ -59,6 +59,10 @@ pub struct UserConfig {
     /// EasyTer's convention). Explicit Ctrl+C copy always works.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub copy_on_select: Option<bool>,
+    /// Clean copy. Absent means `claude_mode`: strip the TUI margin while
+    /// Claude mode is on, and copy the grid bytes otherwise. See [`CopyConfig`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copy: Option<CopyConfig>,
     /// `"menu"` (default) or `"paste"`: what a right-click does at the prompt
     #[serde(skip_serializing_if = "Option::is_none")]
     pub right_click: Option<String>,
@@ -127,6 +131,24 @@ pub struct UserConfig {
     /// [`KeyboardConfig`].
     #[serde(default, skip_serializing_if = "KeyboardConfig::is_default")]
     pub keyboard: KeyboardConfig,
+}
+
+/// Selection copy. `clean` is `"off"`, `"on"`, or `"claude_mode"`.
+///
+/// ```json
+/// { "copy": { "clean": "claude_mode" } }
+/// ```
+///
+/// Absent, or `"copy": {}`, is `claude_mode`. A typo is too: it must not
+/// start cleaning every shell copy. The copy-clean shortcut ignores this
+/// and always cleans. Copy-mode `y` follows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CopyConfig {
+    /// `"off"` copies the grid bytes. `"on"` always cleans. `"claude_mode"`
+    /// cleans only while Claude mode is active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clean: Option<String>,
 }
 
 /// How Bayan treats BDSM from the application.
@@ -273,6 +295,16 @@ impl UserConfig {
 
     pub fn copy_on_select_on(&self) -> bool {
         self.copy_on_select.unwrap_or(true)
+    }
+
+    /// `copy.clean`. Missing, or anything other than `off` / `on`, is
+    /// `claude_mode`.
+    pub fn clean_copy(&self) -> crate::copyclean::CleanCopy {
+        self.copy
+            .as_ref()
+            .and_then(|c| c.clean.as_deref())
+            .map(crate::copyclean::CleanCopy::parse)
+            .unwrap_or_default()
     }
 
     pub fn lang(&self) -> crate::lang::Lang {
@@ -550,6 +582,33 @@ mod tests {
         .unwrap();
         assert!(c.kitty_protocol_on());
         assert!(!c.kitty_base_layout_fallback_on());
+    }
+
+    #[test]
+    fn clean_copy_defaults_to_claude_mode_and_only_off_or_on_opt_out() {
+        use crate::copyclean::CleanCopy;
+        assert_eq!(UserConfig::default().clean_copy(), CleanCopy::ClaudeMode);
+        let absent: UserConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.clean_copy(), CleanCopy::ClaudeMode);
+        let empty: UserConfig = serde_json::from_str(r#"{"copy":{}}"#).unwrap();
+        assert_eq!(empty.clean_copy(), CleanCopy::ClaudeMode);
+        let off: UserConfig = serde_json::from_str(r#"{"copy":{"clean":"off"}}"#).unwrap();
+        assert_eq!(off.clean_copy(), CleanCopy::Off);
+        let on: UserConfig = serde_json::from_str(r#"{"copy":{"clean":"on"}}"#).unwrap();
+        assert_eq!(on.clean_copy(), CleanCopy::On);
+        let named: UserConfig =
+            serde_json::from_str(r#"{"copy":{"clean":"claude_mode"}}"#).unwrap();
+        assert_eq!(named.clean_copy(), CleanCopy::ClaudeMode);
+        let typo: UserConfig = serde_json::from_str(r#"{"copy":{"clean":"banana"}}"#).unwrap();
+        assert_eq!(
+            typo.clean_copy(),
+            CleanCopy::ClaudeMode,
+            "a typo must not change when cleaning runs"
+        );
+        // an untouched config still writes nothing
+        assert_eq!(serde_json::to_string(&UserConfig::default()).unwrap(), "{}");
+        let saved = serde_json::to_string(&off).unwrap();
+        assert!(saved.contains("\"clean\":\"off\""), "{saved}");
     }
 
     #[test]
