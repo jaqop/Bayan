@@ -1248,26 +1248,6 @@ fn ink_cover(
     (hi > lo).then_some((lo, hi - lo))
 }
 
-/// An RTL end cursor is the empty cell beside the last cluster. Size it to
-/// that cluster's ink and keep its inner edge on the ink, so a monospace
-/// cell does not sit across the joined letter.
-fn fit_rtl_end_to_cluster(x: i32, w: i32, ink_left: i32, ink_w: i32, min_x: i32) -> (i32, i32) {
-    let adj = ink_w.max(2);
-    let hi = (x + w).min(ink_left);
-    let mut lo = x;
-    if hi - lo > adj {
-        lo = hi - adj;
-    }
-    if hi - lo < 2 {
-        lo = hi - 2;
-    }
-    if lo < min_x {
-        lo = min_x;
-    }
-    let width = (hi - lo).max(2);
-    (lo, width)
-}
-
 /// Claude's prompt uses a logical cursor offset even though its output
 /// cells are visual. Resolve that offset through the same permutation.
 fn claude_logical_cursor_cell(cells: &[CellInfo], offset: usize) -> Option<usize> {
@@ -2631,39 +2611,22 @@ impl Renderer {
                 }
             }
         }
-        let mut past_rtl = false;
         if let Some(col) = cursor_col.filter(|col| *col >= text_end_col) {
             if let Some((x, rtl)) = x_at(col, col > text_end_col) {
-                past_rtl = rtl;
                 mapped_cursor = Some(fit_past_end_cursor(x, width, rtl, &letters));
             }
         }
-        // The block follows the shaped cluster. An on-letter cursor covers
-        // that cluster's ink (Cairo joins outside the pen slot). An RTL
-        // end cursor is only as wide as the cluster it sits against, not a
-        // Latin cell, and its inner edge stays on the ink.
+        // A block on a letter covers that glyph's ink. Cairo joins outside
+        // the pen slot, so the advance box misses the cluster and overlaps
+        // the next letter. The cell past the text is unchanged: on
+        // 22bc5d66 that cursor already sits at the logical end.
         if !claude {
-            if let Some(col) = cursor_col {
-                if col < text_end_col {
-                    if let Some(&(_, b0, b1)) = cell_bytes.iter().find(|cell| cell.0 == col) {
-                        if let Some((x, w)) = self.ink_cursor_box(&key, b0, b1) {
-                            let left = text_x0 + (x * scale).round() as i32;
-                            let iw = ((w * scale).round() as i32).max(2);
-                            mapped_cursor = Some((left, iw));
-                        }
-                    }
-                } else if past_rtl {
-                    if let Some((x, w)) = mapped_cursor {
-                        if let Some(&(_, b0, b1)) =
-                            cell_bytes.iter().find(|cell| cell.0 == last_col)
-                        {
-                            if let Some((ix, iw)) = self.ink_cursor_box(&key, b0, b1) {
-                                let ink_left = text_x0 + (ix * scale).round() as i32;
-                                let ink_w = ((iw * scale).round() as i32).max(2);
-                                mapped_cursor =
-                                    Some(fit_rtl_end_to_cluster(x, w, ink_left, ink_w, clip.0));
-                            }
-                        }
+            if let Some(col) = cursor_col.filter(|col| *col < text_end_col) {
+                if let Some(&(_, b0, b1)) = cell_bytes.iter().find(|cell| cell.0 == col) {
+                    if let Some((x, w)) = self.ink_cursor_box(&key, b0, b1) {
+                        let left = text_x0 + (x * scale).round() as i32;
+                        let iw = ((w * scale).round() as i32).max(2);
+                        mapped_cursor = Some((left, iw));
                     }
                 }
             }
@@ -7270,9 +7233,11 @@ mod tests {
         (left, right - left)
     }
 
-    /// A prompt path, a space, Arabic, spaces, then English. The space stays
-    /// between the path and the Arabic run, each extra blank widens the gap
-    /// before `hello`, and the cursor at the logical end sits on `o`.
+    /// Pins the end cursor measured on bayan-plus `22bc5d66`, where the
+    /// pre-1f71b9d drift does not reproduce. For `C:\Users\me> مرحبا hello`
+    /// the cursor's left edge is the right edge of `o`, the space after `>`
+    /// stays between the path and the Arabic run, and each extra blank
+    /// before `hello` widens that gap. The placement itself is unchanged.
     #[test]
     fn prompt_path_arabic_and_english_place_the_cursor_and_the_gaps() {
         let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
