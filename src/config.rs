@@ -127,6 +127,13 @@ pub struct UserConfig {
     /// [`KeyboardConfig`].
     #[serde(default, skip_serializing_if = "KeyboardConfig::is_default")]
     pub keyboard: KeyboardConfig,
+    /// Scrollbar on each pane. Absent means the right edge, a thin width,
+    /// and hiding after the pointer has been idle.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::scrollbar::ScrollbarConfig::is_default"
+    )]
+    pub scrollbar: crate::scrollbar::ScrollbarConfig,
 }
 
 /// How Bayan treats BDSM from the application.

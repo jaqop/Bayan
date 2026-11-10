@@ -32,6 +32,7 @@ mod posh;
 mod process;
 mod pty_writer;
 mod render;
+mod scrollbar;
 mod shells;
 mod term;
 mod toast;
@@ -1438,6 +1439,8 @@ struct App {
     sel_pane: usize,
     /// divider being dragged (between pane i and i+1)
     drag_divider: Option<usize>,
+    /// Per-pane scrollbar: hover, thumb drag, and when it was last scrolled.
+    bars: scrollbar::Bars,
     /// the agent cockpit overlay (Ctrl+Shift+D): one glance at every tab
     cockpit: bool,
     cockpit_sel: usize,
@@ -4571,6 +4574,7 @@ impl App {
         match (self.renderer.as_mut(), self.tabs.get(self.active)) {
             (Some(renderer), Some(tab)) if !rects.is_empty() => {
                 renderer.begin_frame();
+                self.bars.begin_frame();
                 let bordered = tab.panes.len() > 1 && !tab.zoomed;
                 let (auto_follow, claude_manual) = (self.auto_follow, self.claude_manual);
                 let mut focused_claude = false;
@@ -4670,7 +4674,27 @@ impl App {
                         link_hover,
                         link_tip,
                     };
+                    let rows = t.screen_lines();
                     renderer.draw_pane(&mut verts, &view, &t);
+                    // fraction stays 0. Smooth scroll's sub-line remainder is
+                    // the same unit — lines in [0, 1) added to display_offset —
+                    // and can be passed to Place::with_fraction without
+                    // changing the geometry.
+                    let place = scrollbar::Place::new(history as usize + rows, rows, off as usize)
+                        .with_fraction(0.0);
+                    let side = self.config.scrollbar.side();
+                    let width = self.config.scrollbar.width_px();
+                    let autohide = self.config.scrollbar.autohide_on();
+                    let now = Instant::now();
+                    self.bars.observe(pane.id, off as usize, now);
+                    let engaged = self.bars.hover == Some(pane.id) || self.bars.dragging(pane.id);
+                    if scrollbar::shown(autohide, engaged, self.bars.last_of(pane.id), now) {
+                        if let Some(geom) = scrollbar::layout(*rect, side, width, place, alt) {
+                            renderer
+                                .draw_scrollbar(&mut verts, *rect, geom.track, geom.thumb, engaged);
+                            self.bars.mark_painted(pane.id);
+                        }
+                    }
                 }
                 renderer.use_ui_metrics(true);
                 renderer.draw_chrome(
@@ -5267,6 +5291,17 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(b) = blink_wake {
             wake = Some(wake.map_or(b, |w| w.min(b)));
         }
+        // a scrollbar that auto-hides wakes once, then the next frame drops
+        // it and the window goes back to sleeping
+        let tick = self
+            .bars
+            .tick(self.config.scrollbar.autohide_on(), Instant::now());
+        if tick.redraw {
+            self.request_redraw();
+        }
+        if let Some(t) = tick.wake {
+            wake = Some(wake.map_or(t, |w| w.min(t)));
+        }
         match wake {
             Some(t) => el.set_control_flow(ControlFlow::WaitUntil(t)),
             None => el.set_control_flow(ControlFlow::Wait),
@@ -5293,6 +5328,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => self.cursor_moved(position),
             WindowEvent::CursorLeft { .. } => {
                 self.clear_link_hover();
+                self.clear_scrollbar_pointer();
                 if let Some(r) = self.renderer.as_mut() {
                     if r.hover_tab.take().is_some() {
                         self.request_redraw();
@@ -5555,6 +5591,7 @@ fn run() -> Result<(), String> {
         mouse: mouse::Route::default(),
         sel_pane: 0,
         drag_divider: None,
+        bars: scrollbar::Bars::default(),
         cockpit: false,
         cockpit_sel: 0,
         pending_paste: None,

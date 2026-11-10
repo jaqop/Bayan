@@ -3123,13 +3123,6 @@ impl Renderer {
             );
         }
 
-        // scroll position indicator while in history (EasyTer's slim bar)
-        if off > 0 && history > 0 {
-            let th = ((ph as f32 * rows as f32 / (history + rows) as f32) as i32).max(24);
-            let ty = py + ((ph - th) as f32 * (1.0 - off as f32 / history as f32)) as i32;
-            push_rect(out, clip, px + pw - 7, ty, 4, th, c4(self.fg, 70));
-        }
-
         // pane border when split: green marks the focused pane (EasyTer)
         if view.bordered {
             let c = if view.focused {
@@ -3146,6 +3139,24 @@ impl Renderer {
         if let Some(tip) = view.link_tip {
             self.draw_link_status(out, clip, tip);
         }
+    }
+
+    /// The pane's scrollbar: a faint track and a thumb, both solid quads on
+    /// the same pipeline as the cells. `clip` is the pane, so the bar cannot
+    /// bleed into a neighbour. Geometry comes from `scrollbar`; this only paints.
+    pub fn draw_scrollbar(
+        &self,
+        out: &mut Vec<Vertex>,
+        clip: Rect,
+        track: Rect,
+        thumb: Rect,
+        hot: bool,
+    ) {
+        let (tx, ty, tw, th) = track;
+        let (ux, uy, uw, uh) = thumb;
+        push_rect(out, clip, tx, ty, tw, th, c4(self.fg, 40));
+        let alpha = if hot { 200 } else { 130 };
+        push_rect(out, clip, ux, uy, uw, uh, c4(self.fg, alpha));
     }
 
     /// The link under the pointer, pinned to the bottom of the pane so a
