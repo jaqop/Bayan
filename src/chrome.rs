@@ -11,7 +11,7 @@
 use std::time::Instant;
 
 use winit::dpi::PhysicalPosition;
-use winit::window::ResizeDirection;
+use winit::window::{CursorIcon, ResizeDirection};
 
 use crate::render::Rect;
 use crate::App;
@@ -214,24 +214,25 @@ pub(crate) enum LeftPress {
     Scrollbar,
 }
 
-/// Corners resize first. A side edge does not: the caption buttons and the
-/// scrollbar track are checked before it, so a wide padding cannot turn the
-/// close button or the thumb into a window grip. The cursor uses the same
-/// split (`edge_is_corner`). An open editor or settings panel hides the
-/// edges, the buttons, and the bar.
+/// Corners first, then the scrollbar track, then every other edge, then the
+/// caption buttons. A side grip beats min/max/close, the way it did before
+/// the bar existed; only the track takes a side grip away from the window.
+/// [`cursor_for_press`] reads this same result, so the pointer and the click
+/// cannot disagree. An open editor or settings panel hides the edges, the
+/// buttons, and the bar.
 pub(crate) fn left_press(h: &Hits) -> LeftPress {
     if !h.shortcuts_open && !h.settings_open {
         if let Some(dir) = h.edge.filter(|dir| edge_is_corner(*dir)) {
             return LeftPress::Resize(dir);
-        }
-        if let Some(i) = h.caption {
-            return LeftPress::Caption(Caption::from_index(i));
         }
         if h.on_scrollbar {
             return LeftPress::Scrollbar;
         }
         if let Some(dir) = h.edge {
             return LeftPress::Resize(dir);
+        }
+        if let Some(i) = h.caption {
+            return LeftPress::Caption(Caption::from_index(i));
         }
     }
     if h.shortcuts_open {
@@ -275,6 +276,25 @@ pub(crate) fn left_press(h: &Hits) -> LeftPress {
         return LeftPress::DragStrip;
     }
     LeftPress::Terminal
+}
+
+/// The pointer shape for a [`left_press`] result. `divider_axis` is the
+/// seam under a divider press; `on_link` is a hyperlink when the press
+/// reached the terminal.
+pub(crate) fn cursor_for_press(
+    press: LeftPress,
+    divider_axis: Option<crate::Orientation>,
+    on_link: bool,
+) -> CursorIcon {
+    match press {
+        LeftPress::Resize(dir) => CursorIcon::from(dir),
+        LeftPress::Divider(_) => match divider_axis {
+            Some(crate::Orientation::Column) => CursorIcon::NsResize,
+            _ => CursorIcon::EwResize,
+        },
+        LeftPress::Terminal if on_link => CursorIcon::Pointer,
+        _ => CursorIcon::Default,
+    }
 }
 
 /// Who owns a right press.
@@ -453,7 +473,7 @@ impl App {
             cockpit_open: self.cockpit,
             cockpit_row: self.cockpit_row_hit(pos),
             divider: self.divider_at(pos),
-            on_scrollbar: self.pointer_on_scrollbar(pos.x, pos.y),
+            on_scrollbar: !self.overlay_blocks_mouse() && self.pointer_on_scrollbar(pos.x, pos.y),
             tab: self.tab_at(pos),
             tab_close: self.tab_close_at(pos),
             group_chip: self.group_chip_at(pos),
@@ -606,16 +626,25 @@ mod tests {
             None,
             "10px in from the edge is padding, not a grip"
         );
-        let edge = resize_edge_beside_bar(w - 3.0, 16.0, w, h, false, EDGE_BAND, band);
-        assert_eq!(edge, Some(ResizeDirection::East));
+        // Outside the 6px grip the close button is a close. Inside it the
+        // edge wins, and the cursor is the same resize arrow the press uses.
         assert_eq!(
             left_press(&Hits {
-                edge,
+                edge: None,
                 caption: Some(2),
                 ..Hits::default()
             }),
             LeftPress::Caption(Caption::Close)
         );
+        let edge = resize_edge_beside_bar(w - 3.0, 16.0, w, h, false, EDGE_BAND, band);
+        assert_eq!(edge, Some(ResizeDirection::East));
+        let press = left_press(&Hits {
+            edge,
+            caption: Some(2),
+            ..Hits::default()
+        });
+        assert_eq!(press, LeftPress::Resize(ResizeDirection::East));
+        assert_eq!(cursor_for_press(press, None, false), CursorIcon::EwResize);
         // the corner of that same button still resizes
         assert_eq!(
             left_press(&Hits {
@@ -741,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn edges_beat_captions_and_both_beat_everything_else() {
+    fn corners_and_side_edges_beat_caption_buttons() {
         let h = Hits {
             edge: Some(ResizeDirection::NorthEast),
             caption: Some(2),
@@ -757,6 +786,23 @@ mod tests {
             left_press(&h),
             LeftPress::Resize(ResizeDirection::NorthEast)
         );
+        // a side edge, not only a corner, beats the button under it
+        assert_eq!(
+            left_press(&Hits {
+                edge: Some(ResizeDirection::East),
+                caption: Some(2),
+                ..Hits::default()
+            }),
+            LeftPress::Resize(ResizeDirection::East)
+        );
+        assert_eq!(
+            left_press(&Hits {
+                edge: Some(ResizeDirection::North),
+                caption: Some(0),
+                ..Hits::default()
+            }),
+            LeftPress::Resize(ResizeDirection::North)
+        );
         let h = Hits { edge: None, ..h };
         assert_eq!(left_press(&h), LeftPress::Caption(Caption::Close));
         let h = Hits {
@@ -769,6 +815,50 @@ mod tests {
             ..h
         };
         assert_eq!(left_press(&h), LeftPress::Caption(Caption::Maximize));
+    }
+
+    #[test]
+    fn cursor_and_press_agree_on_the_caption_buttons() {
+        // Top 6px over each caption button, clear of the corner: both say
+        // resize from the top. The right 2px (and the full 6px grip) beside
+        // close say resize from the side. Past the grip, both say close.
+        let agree = |edge, caption| {
+            let press = left_press(&Hits {
+                edge,
+                caption,
+                ..Hits::default()
+            });
+            (press, cursor_for_press(press, None, false))
+        };
+        for caption in [Some(0), Some(1), Some(2)] {
+            assert_eq!(
+                agree(Some(ResizeDirection::North), caption),
+                (
+                    LeftPress::Resize(ResizeDirection::North),
+                    CursorIcon::NsResize
+                )
+            );
+        }
+        assert_eq!(
+            agree(Some(ResizeDirection::East), Some(2)),
+            (
+                LeftPress::Resize(ResizeDirection::East),
+                CursorIcon::EwResize
+            )
+        );
+        assert_eq!(
+            agree(None, Some(2)),
+            (LeftPress::Caption(Caption::Close), CursorIcon::Default)
+        );
+        // the thumb still beats a side edge, and the cursor is not a grip
+        let press = left_press(&Hits {
+            edge: Some(ResizeDirection::East),
+            on_scrollbar: true,
+            caption: Some(2),
+            ..Hits::default()
+        });
+        assert_eq!(press, LeftPress::Scrollbar);
+        assert_eq!(cursor_for_press(press, None, false), CursorIcon::Default);
     }
 
     #[test]

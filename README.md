@@ -913,12 +913,16 @@ outer bar. `scrollbar.autohide` (default on) drops the bar one second after
 the last scroll or hover. The bar is drawn in the window padding, or in the
 side-by-side seam, never on a grid cell, so the last column stays visible
 and clickable. The resize grip on the bar's side is 2–6px and never wider
-than the old edge. A press on the thumb drags the bar even where that grip
-overlaps the track; the corners still resize the window, and the cursor
-matches the press. The ConPTY column count is the grid width divided by
-the cell width. A side-by-side split widens the seam to the bar, which can
-cost one column per pane: at 1280px with 11px cells the two panes are
-56 and 56, where a 1px seam was 57 and 57. It is hidden with no scrollback
+than the old edge. Corners and that grip resize the window, including the
+top 6px of the caption buttons and the outer pixels of the close button;
+the pointer is the resize arrow there, because it is chosen from the same
+decision as the click. A scrollbar track beats a side grip, so the thumb
+drags instead. The ConPTY column count is the grid width divided by the
+cell width. Padding grows with the display scale, so at 150% and 200% the
+grid is narrower and a pane can lose a column even with the bar hidden. A
+side-by-side split widens the seam to the bar, which can cost one more
+column per pane: at 1280px with 11px cells the two panes are 56 and 56,
+where a 1px seam was 57 and 57. It is hidden with no scrollback
 and on the alternate screen. The thumb is at least 16px, or the bar's
 width when that is wider. A sub-line `fraction` on the scroll position
 defaults to 0 so smooth scroll can pass its remainder later.

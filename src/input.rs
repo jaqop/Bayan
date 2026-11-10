@@ -94,18 +94,14 @@ pub(crate) fn hover_cursor(
     orientation: Option<Orientation>,
     on_link: bool,
 ) -> CursorIcon {
-    if let Some(dir) = edge {
-        CursorIcon::from(dir)
+    let press = if let Some(dir) = edge {
+        chrome::LeftPress::Resize(dir)
     } else if on_divider {
-        match orientation {
-            Some(Orientation::Column) => CursorIcon::NsResize,
-            _ => CursorIcon::EwResize,
-        }
-    } else if on_link {
-        CursorIcon::Pointer
+        chrome::LeftPress::Divider(0)
     } else {
-        CursorIcon::Default
-    }
+        chrome::LeftPress::Terminal
+    };
+    chrome::cursor_for_press(press, orientation, on_link && edge.is_none() && !on_divider)
 }
 
 /// 1 click = simple drag anchor, 2 = word, 3 = line.
@@ -423,39 +419,36 @@ impl App {
             self.refresh_link_hover(position)
         };
         if let Some(w) = &self.window {
-            // The gutter is not a resize edge and not a divider, even where
-            // the old 6px band or the seam's grab would have said so.
-            let on_bar = self.bars.hover.is_some();
-            let raw_edge = self.resize_edge_at(position);
-            // A corner still resizes, so the cursor matches the press.
-            // A side grip under the thumb does not.
-            let edge = match raw_edge {
-                Some(dir) if chrome::edge_is_corner(dir) => Some(dir),
-                _ if on_bar => None,
-                other => other,
+            // The same `left_press` the click uses. A side edge over a
+            // caption button stays a resize, for the cursor and the press.
+            let hits = self.chrome_hits(position);
+            let press = chrome::left_press(&hits);
+            let edge = match press {
+                LeftPress::Resize(dir) => Some(dir),
+                _ => None,
             };
-            let divider = if on_bar || edge.is_some() {
-                None
-            } else {
-                self.divider_at(position)
+            let orientation = match press {
+                LeftPress::Divider(i) => self.dividers().get(i).map(|d| d.axis),
+                _ => None,
             };
-            let on_divider = divider.is_some();
-            // the cursor follows the divider under it: nested splits mix both
-            let orientation = divider.and_then(|d| self.dividers().get(d).map(|d| d.axis));
             w.set_cursor(hover_cursor(
                 edge,
-                on_divider,
+                matches!(press, LeftPress::Divider(_)),
                 orientation,
                 self.link_hover.is_some(),
             ));
-            // caption/gear hover feedback; a redraw only when it changed
-            let cap = self.caption_button_at(position);
+            // caption/gear hover feedback; a redraw only when it changed.
+            // Light the button only when the press will actually use it.
+            let cap = match press {
+                LeftPress::Caption(_) => hits.caption,
+                _ => None,
+            };
             let pw = w.inner_size().width as usize;
             let gear = self
                 .renderer
                 .as_ref()
                 .is_some_and(|r| r.settings_button_hit(pw, position.x, position.y));
-            let tab = if edge.is_none() && !on_divider {
+            let tab = if edge.is_none() && !matches!(press, LeftPress::Divider(_)) {
                 self.tab_at(position)
             } else {
                 None
