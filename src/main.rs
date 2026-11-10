@@ -1514,6 +1514,90 @@ struct App {
 }
 
 impl App {
+    /// The only `App { ... }` in the crate. `run` and the tests both call
+    /// this, so a new field is added here and nowhere else. A test that
+    /// needs a different size or id counter changes that field afterwards.
+    /// It must not write its own struct literal: another branch's new field
+    /// would then be missing, and the tests would fail to build with no
+    /// textual conflict.
+    pub(crate) fn new(
+        proxy: EventLoopProxy<UserEvent>,
+        config: config::UserConfig,
+        config_load_error: Option<String>,
+        start_dir: Option<String>,
+    ) -> Self {
+        let keymap = keybinds::effective_map(&config);
+        Self {
+            posh: None,
+            last_toast: None,
+            mru: mru::Mru::new(),
+            groups: groups::Groups::new(),
+            spawn_group: None,
+            palette: None,
+            shell_profiles: Vec::new(),
+            shell_profiles_ready: false,
+            startup_pending: true,
+            last_strip_click: None,
+            proxy,
+            window: None,
+            gpu: None,
+            renderer: None,
+            tabs: Vec::new(),
+            active: 0,
+            next_id: 0,
+            size: TermSize {
+                cols: 110,
+                rows: 32,
+            },
+            modifiers: ModifiersState::default(),
+            first_frame: false,
+            first_output: false,
+            last_frame: Vec::new(),
+            last_frame_size: None,
+            cursor_pos: PhysicalPosition::new(0.0, 0.0),
+            ime_spot: None,
+            mouse: mouse::Route::default(),
+            sel_pane: 0,
+            drag_divider: None,
+            cockpit: false,
+            cockpit_sel: 0,
+            pending_paste: None,
+            pending_close: None,
+            swallow_guard_release: false,
+            link_hover: None,
+            blocked_link: None,
+            link_cache: link::SpanCache::default(),
+            last_input: Instant::now(),
+            blink_drawn_on: true,
+            settings: None,
+            focused: false,
+            clicks: ClickTracker::new(),
+            wheel_accum: 0.0,
+            smooth: std::collections::HashMap::new(),
+            smooth_at: None,
+            alt_seen: std::collections::HashMap::new(),
+            search: None,
+            clipboard: None,
+            auto_follow: true,
+            claude_manual: false,
+            config,
+            config_load_error,
+            startup_error: None,
+            keymap,
+            shortcuts: None,
+            atlas_generation: 0,
+            font_delta: 0.0,
+            renderer_building: false,
+            inflight_delta: 0.0,
+            normal_geom: None,
+            keys_held_away: Vec::new(),
+            debug_paste: None,
+            start_dir,
+            #[cfg(test)]
+            test_content: None,
+        }
+    }
+
     fn request_redraw(&self) {
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -5688,81 +5772,38 @@ fn run() -> Result<(), String> {
     if let Some(v) = dev_hook("BAYAN_LANG") {
         lang::set(lang::Lang::from_config(v.to_str()));
     }
-    let keymap = keybinds::effective_map(&cfg);
-    let mut app = App {
-        posh: None,
-        last_toast: None,
-        mru: mru::Mru::new(),
-        groups: groups::Groups::new(),
-        spawn_group: None,
-        palette: None,
-        shell_profiles: Vec::new(),
-        shell_profiles_ready: false,
-        startup_pending: true,
-        last_strip_click: None,
-        proxy,
-        window: None,
-        gpu: None,
-        renderer: None,
-        tabs: Vec::new(),
-        active: 0,
-        next_id: 0,
-        size: TermSize {
-            cols: 110,
-            rows: 32,
-        },
-        modifiers: ModifiersState::default(),
-        first_frame: false,
-        first_output: false,
-        last_frame: Vec::new(),
-        last_frame_size: None,
-        cursor_pos: PhysicalPosition::new(0.0, 0.0),
-        ime_spot: None,
-        mouse: mouse::Route::default(),
-        sel_pane: 0,
-        drag_divider: None,
-        cockpit: false,
-        cockpit_sel: 0,
-        pending_paste: None,
-        pending_close: None,
-        swallow_guard_release: false,
-        link_hover: None,
-        blocked_link: None,
-        link_cache: link::SpanCache::default(),
-        last_input: Instant::now(),
-        blink_drawn_on: true,
-        settings: None,
-        focused: false,
-        clicks: ClickTracker::new(),
-        wheel_accum: 0.0,
-        smooth: std::collections::HashMap::new(),
-        smooth_at: None,
-        alt_seen: std::collections::HashMap::new(),
-        search: None,
-        clipboard: None,
-        auto_follow: true,
-        claude_manual: false,
-        config: cfg,
-        config_load_error,
-        startup_error: None,
-        keymap,
-        shortcuts: None,
-        atlas_generation: 0,
-        font_delta: 0.0,
-        renderer_building: false,
-        inflight_delta: 0.0,
-        normal_geom: None,
-        keys_held_away: Vec::new(),
-        debug_paste: None,
-        start_dir,
-        #[cfg(test)]
-        test_content: None,
-    };
+    let mut app = App::new(proxy, cfg, config_load_error, start_dir);
     let result = event_loop.run_app(&mut app);
     if let Some(error) = app.startup_error {
         return Err(error);
     }
     result.map_err(|error| format!("The event loop failed: {error}"))
+}
+
+/// The one winit event loop this process may own, as a proxy.
+///
+/// winit 0.30 allows a single `EventLoop` per process. A second `build`
+/// fails with `EventLoopError::RecreationAttempt`, and dropping the loop does not clear
+/// that flag. Every test that needs a proxy must call this and must not
+/// build its own loop — a second builder in another test module panics
+/// whichever of the two runs second. The loop is leaked so the proxy's
+/// window target stays alive for the rest of the process.
+#[cfg(test)]
+pub(crate) fn test_proxy() -> EventLoopProxy<UserEvent> {
+    use std::sync::OnceLock;
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    static PROXY: OnceLock<EventLoopProxy<UserEvent>> = OnceLock::new();
+    PROXY
+        .get_or_init(|| {
+            let el = EventLoop::<UserEvent>::with_user_event()
+                .with_any_thread(true)
+                .build()
+                .expect("event loop");
+            let proxy = el.create_proxy();
+            std::mem::forget(el);
+            proxy
+        })
+        .clone()
 }
 
 /// OSC 52 writes only from the focused pane of the active tab.
@@ -7136,95 +7177,14 @@ mod m38_tests {
 #[cfg(test)]
 mod scroll_app_tests {
     use super::*;
-    use std::sync::OnceLock;
     use std::time::Duration;
-    use winit::event_loop::EventLoop;
-    use winit::platform::windows::EventLoopBuilderExtWindows;
-
-    fn proxy() -> EventLoopProxy<UserEvent> {
-        static PROXY: OnceLock<EventLoopProxy<UserEvent>> = OnceLock::new();
-        PROXY
-            .get_or_init(|| {
-                let el = EventLoop::<UserEvent>::with_user_event()
-                    .with_any_thread(true)
-                    .build()
-                    .expect("event loop");
-                let proxy = el.create_proxy();
-                // The proxy posts to this loop's window. Keep the loop alive.
-                std::mem::forget(el);
-                proxy
-            })
-            .clone()
-    }
 
     fn bare() -> App {
-        let cfg = config::UserConfig::default();
-        let keymap = keybinds::effective_map(&cfg);
-        App {
-            posh: None,
-            last_toast: None,
-            mru: mru::Mru::new(),
-            groups: groups::Groups::new(),
-            spawn_group: None,
-            palette: None,
-            shell_profiles: Vec::new(),
-            shell_profiles_ready: false,
-            startup_pending: false,
-            last_strip_click: None,
-            proxy: proxy(),
-            window: None,
-            gpu: None,
-            renderer: None,
-            tabs: Vec::new(),
-            active: 0,
-            next_id: 1,
-            size: TermSize { cols: 40, rows: 12 },
-            modifiers: ModifiersState::default(),
-            first_frame: false,
-            first_output: false,
-            last_frame: Vec::new(),
-            last_frame_size: None,
-            cursor_pos: PhysicalPosition::new(0.0, 0.0),
-            ime_spot: None,
-            mouse: mouse::Route::default(),
-            sel_pane: 0,
-            drag_divider: None,
-            cockpit: false,
-            cockpit_sel: 0,
-            pending_paste: None,
-            pending_close: None,
-            swallow_guard_release: false,
-            link_hover: None,
-            blocked_link: None,
-            link_cache: link::SpanCache::default(),
-            last_input: Instant::now(),
-            blink_drawn_on: true,
-            settings: None,
-            focused: false,
-            clicks: ClickTracker::new(),
-            wheel_accum: 0.0,
-            smooth: std::collections::HashMap::new(),
-            smooth_at: None,
-            alt_seen: std::collections::HashMap::new(),
-            search: None,
-            clipboard: None,
-            auto_follow: true,
-            claude_manual: false,
-            config: cfg,
-            config_load_error: None,
-            startup_error: None,
-            keymap,
-            shortcuts: None,
-            atlas_generation: 0,
-            font_delta: 0.0,
-            renderer_building: false,
-            inflight_delta: 0.0,
-            normal_geom: None,
-            keys_held_away: Vec::new(),
-            debug_paste: None,
-            start_dir: None,
-            test_content: None,
-        }
+        let mut app = App::new(test_proxy(), config::UserConfig::default(), None, None);
+        app.startup_pending = false;
+        app.next_id = 1;
+        app.size = TermSize { cols: 40, rows: 12 };
+        app
     }
 
     fn host(draw: bool) -> (App, u64, term::HeadlessWrite) {
@@ -7377,6 +7337,13 @@ mod scroll_app_tests {
         let (mut app, id, _) = host(false);
         fill_history(&app);
         app.smooth_scroll_pane(id, 3.0, false);
+        // The loop finishes in microseconds, so a fresh `last_motion` would
+        // keep the notch even if `scrolling` ignored `pending`. Age the
+        // touch: only the pending notch may protect it from the wakeups.
+        let aged = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        app.smooth.get_mut(&id).unwrap().note_motion(aged);
         for _ in 0..40 {
             app.smooth_at = Some(Instant::now() - Duration::from_millis(16));
             app.tick_smooth_scroll();
