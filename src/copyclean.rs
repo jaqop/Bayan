@@ -6,12 +6,14 @@
 //! (Claude Code #18170). `copy.clean` strips the chrome.
 //!
 //! A soft wrap is the grid's `WRAPLINE` flag on that row. A row without it
-//! is a real newline and stays one. Characters are read in grid order, the
-//! same order `selection_to_string` uses. Trailing spaces are trimmed and
-//! soft wraps are joined on that logical string, before Claude mode's
-//! `bidi::restore_block`. An RTL paragraph draws its trailing blanks on the
-//! visual left once the row is right-aligned; those blanks are still the
-//! end of the grid string, and this path never walks a row by its visual x.
+//! is a real newline and stays one. Cells are read in grid order, never by
+//! visual x. Claude stores each row in visual order, so clean copy restores
+//! that row to logical order first and only then trims trailing spaces and
+//! joins soft wraps. Restoring the joined line instead swaps the halves of
+//! a wrapped Arabic paragraph. A shell's grid is already logical, so it is
+//! trimmed and joined as stored. `copy.clean = off` does neither: it is the
+//! old `selection_to_string` bytes, plus the existing whole-block restore
+//! when Claude mode is on.
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
@@ -87,28 +89,46 @@ const GUTTERS: [&str; 2] = ["⎿ ", "│ "];
 /// joined its own soft wraps, and those newlines are real.
 pub(crate) fn clipboard_text(raw: &str, rows: &[CopyRow], clean: bool, claude: bool) -> String {
     if !clean {
-        return restore(raw, claude);
+        return restore_block(raw, claude);
     }
-    let stored = if rows.is_empty() {
+    let source = if rows.is_empty() {
         let body = raw.strip_suffix('\n').unwrap_or(raw);
-        let lines = body
-            .split('\n')
+        body.split('\n')
             .map(|text| CopyRow {
                 text: text.to_string(),
                 wrapped: false,
             })
-            .collect::<Vec<_>>();
-        assemble(&lines)
+            .collect::<Vec<_>>()
     } else {
-        assemble(rows)
+        rows.to_vec()
     };
-    // `assemble` already trimmed and joined the grid string. Claude's
-    // visual-to-logical restore runs on that result and must not decide
-    // which spaces were trailing.
-    restore(&stored, claude)
+    // Gutter characters sit in column 0. Strip them before a Claude row is
+    // restored, or an RTL line moves the marker to the other end.
+    assemble(&logical_rows(&source, claude))
 }
 
-fn restore(text: &str, claude: bool) -> String {
+/// Claude visual rows become logical one row at a time. A shell row is
+/// already logical and stays byte for byte apart from the later trim.
+fn logical_rows(rows: &[CopyRow], claude: bool) -> Vec<CopyRow> {
+    let texts = strip_uniform_gutter(&rows.iter().map(|row| row.text.clone()).collect::<Vec<_>>());
+    texts
+        .into_iter()
+        .zip(rows.iter())
+        .map(|(text, row)| {
+            let text = if claude {
+                crate::bidi::restore_bidi_line(&text).unwrap_or(text)
+            } else {
+                text
+            };
+            CopyRow {
+                text,
+                wrapped: row.wrapped,
+            }
+        })
+        .collect()
+}
+
+fn restore_block(text: &str, claude: bool) -> String {
     if claude {
         crate::bidi::restore_block(text)
     } else {
@@ -116,18 +136,20 @@ fn restore(text: &str, claude: bool) -> String {
     }
 }
 
-/// Join soft wraps, drop a gutter every selected line shares, and remove
-/// the indent those lines share. Trailing spaces on a wrapped row are the
-/// row's own padding: a row that ends in spaces joins the next with one
-/// space, and a row that ends on a character joins mid-word.
+/// Join soft wraps and remove only the indent every logical line shares.
+/// Rows are already in logical order. Trailing spaces are the end of that
+/// string: a wrapped row that ends in spaces joins the next with one space
+/// when the continuation does not already start with one, and a row that
+/// ends on a character joins mid-word. Extra spaces on a continuation are
+/// relative indent and stay.
 fn assemble(rows: &[CopyRow]) -> String {
-    let texts = strip_uniform_gutter(&rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>());
     let mut lines: Vec<String> = Vec::new();
     let mut buf = String::new();
     let mut indent = 0usize;
     let mut prev_ended_with_space = false;
     let mut joining = false;
-    for (i, text) in texts.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate() {
+        let text = &row.text;
         let ended_with_space = text.ends_with(' ');
         let trimmed = text.trim_end_matches(' ');
         if !joining {
@@ -135,17 +157,16 @@ fn assemble(rows: &[CopyRow]) -> String {
             buf.push_str(trimmed);
         } else {
             let cont = strip_margin(trimmed, indent);
-            if prev_ended_with_space {
-                let rest = cont.trim_start_matches(' ');
-                if !buf.is_empty() && !rest.is_empty() {
-                    buf.push(' ');
-                }
-                buf.push_str(rest);
-            } else {
-                buf.push_str(cont);
+            if prev_ended_with_space
+                && !buf.is_empty()
+                && !cont.is_empty()
+                && !cont.starts_with(' ')
+            {
+                buf.push(' ');
             }
+            buf.push_str(cont);
         }
-        let last = i + 1 == texts.len();
+        let last = i + 1 == rows.len();
         // `wrapped` on the last selected row has no next row to join.
         if !rows[i].wrapped || last {
             lines.push(std::mem::take(&mut buf));
@@ -211,6 +232,8 @@ fn leading_spaces(text: &str) -> usize {
     text.chars().take_while(|&c| c == ' ').count()
 }
 
+/// Spaces shared by every non-empty logical line, the first line included.
+/// A later line's extra spaces are its own indent and are not part of this.
 fn common_indent(lines: &[String]) -> usize {
     lines
         .iter()
@@ -335,6 +358,29 @@ mod tests {
         // blank lines stay, and they do not count as zero indent
         let blank = [row("  alpha", false), row("", false), row("  beta", false)];
         assert_eq!(clean(&blank), "alpha\n\nbeta");
+        // A whole function body: only the margin every line shares comes
+        // off. The body's extra indent, and a nested line's extra indent,
+        // stay. The first line counts, so a signature at column 0 keeps
+        // the body where it was.
+        let body = [
+            row("    fn body() {", false),
+            row("        let x = 1;", false),
+            row("            nested();", false),
+            row("    }", false),
+        ];
+        assert_eq!(
+            clean(&body),
+            "fn body() {\n    let x = 1;\n        nested();\n}"
+        );
+        let with_signature = [
+            row("fn body() {", false),
+            row("    let x = 1;", false),
+            row("}", false),
+        ];
+        assert_eq!(clean(&with_signature), "fn body() {\n    let x = 1;\n}");
+        // A soft wrap must not eat the continuation's extra indent.
+        let wrapped_body = [row("    let x = ", true), row("        1;", false)];
+        assert_eq!(clean(&wrapped_body), format!("let x ={}1;", " ".repeat(4)));
     }
 
     #[test]
@@ -457,6 +503,85 @@ mod tests {
         assert_eq!(copied.chars().last(), Some('o'));
         assert!(!copied.ends_with(' '));
         assert_ne!(crate::bidi::restore_block(&raw), copied);
+    }
+
+    /// Claude stores each wrapped row in visual order. Restoring the joined
+    /// line swaps the halves (`في بيان 2026مرحبا بكم`) and drops the space.
+    /// Each row is restored first, then the soft wrap is joined.
+    #[test]
+    fn claude_wrapped_line_copies_the_logical_arabic_english_and_digits() {
+        let first = "مرحبا hello ";
+        let second = "123 عالم";
+        let logical = "مرحبا hello 123 عالم";
+        let (v0, v1) = (visual_of(first), visual_of(second));
+        let rows = [row(&v0, true), row(&v1, false)];
+        let copied = clipboard_text("RAW", &rows, true, true);
+        assert_eq!(copied, logical);
+        assert!(!copied.starts_with(' '));
+        assert!(copied.contains("hello") && copied.contains("123") && copied.contains("عالم"));
+        let joined_visual = format!("{v0}{v1}");
+        assert_ne!(
+            crate::bidi::restore_block(&joined_visual),
+            logical,
+            "restoring the joined visual line is the bug"
+        );
+    }
+
+    #[test]
+    fn claude_wrap_keeps_harakat_zwj_zwnj_and_a_wide_char() {
+        let marked = "مَرْحَبًا ";
+        let after = "بكم";
+        let rows = [row(&visual_of(marked), true), row(&visual_of(after), false)];
+        assert_eq!(
+            clipboard_text("RAW", &rows, true, true),
+            "مَرْحَبًا بكم",
+            "tashkeel stays on its letter"
+        );
+
+        let zwj = "م\u{200D}ر ";
+        let zwnj_next = "ح\u{200C}با";
+        let rows = [
+            row(&visual_of(zwj), true),
+            row(&visual_of(zwnj_next), false),
+        ];
+        assert_eq!(
+            clipboard_text("RAW", &rows, true, true),
+            "م\u{200D}ر ح\u{200C}با"
+        );
+
+        // The wide character is the wrap boundary: its spacer is the last
+        // cell of the row, and the next row continues. It is copied once.
+        let mut term = grid(3, 2);
+        {
+            let row0 = &mut term.grid_mut()[Line(0)];
+            row0[Column(0)].c = 'م';
+            row0[Column(1)].c = '字';
+            row0[Column(1)].flags.insert(Flags::WIDE_CHAR);
+            row0[Column(2)].c = ' ';
+            row0[Column(2)].flags.insert(Flags::WIDE_CHAR_SPACER);
+            row0[Column(2)].flags.insert(Flags::WRAPLINE);
+        }
+        term.grid_mut()[Line(1)][Column(0)].c = 'ر';
+        select_all(&mut term, 2);
+        let raw = term.selection_to_string().expect("selection");
+        let grid_rows = selection_rows(&term);
+        let copied = clipboard_text(&raw, &grid_rows, true, true);
+        assert_eq!(copied.matches('字').count(), 1, "{copied:?} {grid_rows:?}");
+        assert!(copied.contains('م') && copied.contains('ر'), "{copied}");
+        assert!(!copied.contains('\u{FFFD}'));
+    }
+
+    /// `logical` is an RTL paragraph. Claude's row is the visual order,
+    /// and restoring that visual order returns `logical`.
+    fn visual_of(logical: &str) -> String {
+        let visual = crate::bidi::restore_bidi_line(logical)
+            .unwrap_or_else(|| panic!("no visual form for {logical:?}"));
+        assert_eq!(
+            crate::bidi::restore_bidi_line(&visual).as_deref(),
+            Some(logical),
+            "visual {visual:?} did not round-trip {logical:?}"
+        );
+        visual
     }
 
     #[test]
