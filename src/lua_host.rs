@@ -41,12 +41,16 @@
 //! length as a JSON action.
 //!
 //! `bayan.spawn(program, args)` starts `program` with `args` and no shell,
-//! then returns. The wait, the output cap, and the kill happen on a worker.
+//! then returns `""`. Stdout is discarded. The process is killed after two
+//! seconds, so this is not a way to launch an editor. At most four such
+//! processes run at once. On Windows the process is created suspended, put
+//! in a job, and only then resumed, so it cannot outlive the job handle.
 //! It is absent unless this plugin's allowlist entry sets `"spawn": true`.
 //!
-//! Each call into a plugin — loading it, a key binding, an event — gets its
-//! own instruction budget and its own deadline. A loop is cut off. The next
-//! call starts clean.
+//! Each call into a plugin — loading it, a key binding, one event dispatch —
+//! gets its own instruction budget and its own deadline. Handlers of one
+//! dispatch share that deadline, and one event holds at most 32 of them.
+//! A loop is cut off. The next call starts clean. `__gc` is rejected.
 //!
 //! Strings crossing the boundary are UTF-8. Arabic round-trips unchanged.
 //!
@@ -60,7 +64,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -86,6 +90,15 @@ const INSTRUCTION_BUDGET: u64 = 1_000_000;
 const DEADLINE: Duration = Duration::from_millis(100);
 
 const EVENTS: [&str; 4] = ["tab-opened", "title-changed", "bell", "osc7-cwd"];
+/// Handlers past this for one event are refused. Each one used to get a
+/// full deadline, so a few thousand spinning handlers froze a tab open.
+const MAX_HANDLERS_PER_EVENT: usize = 32;
+/// Processes `bayan.spawn` may have started and not yet reaped.
+const MAX_SPAWNS: usize = 4;
+/// `string.find` and its siblings. A short subject with a chain of `.-`
+/// is otherwise free to run for hundreds of milliseconds with no hook.
+const MAX_PATTERN_SUBJECT: usize = 1024;
+const MAX_PATTERN: usize = 64;
 
 struct Limits {
     memory: usize,
@@ -264,7 +277,11 @@ impl PluginSet {
     /// Run every callback bound to `chord`. Terminal bytes never arrive here.
     pub fn fire(&mut self, chord: &str) -> Vec<PluginSend> {
         let mut out = Vec::new();
+        let started = Instant::now();
         for plugin in &self.plugins {
+            if started.elapsed() > DEADLINE {
+                break;
+            }
             let hits: Vec<usize> = plugin
                 .bindings
                 .borrow()
@@ -273,7 +290,15 @@ impl PluginSet {
                 .filter(|(_, (c, _))| c == chord)
                 .map(|(i, _)| i)
                 .collect();
+            if hits.is_empty() {
+                continue;
+            }
+            // One budget for every binding this chord runs on this plugin.
+            plugin.fuel.reset();
             for index in hits {
+                if started.elapsed() > DEADLINE || plugin.fuel.over() {
+                    break;
+                }
                 call_binding(plugin, index);
                 out.extend(drain_sends(plugin));
             }
@@ -282,9 +307,14 @@ impl PluginSet {
     }
 
     /// Dispatch a host event. Callers must not use this for PTY bytes.
+    /// Every handler of this call shares one deadline.
     pub fn emit(&mut self, event: &str, fields: &[(&str, &str)]) -> Vec<PluginSend> {
         let mut out = Vec::new();
+        let started = Instant::now();
         for plugin in &self.plugins {
+            if started.elapsed() > DEADLINE {
+                break;
+            }
             let hits: Vec<usize> = plugin
                 .handlers
                 .borrow()
@@ -293,7 +323,14 @@ impl PluginSet {
                 .filter(|(_, (name, _))| name == event)
                 .map(|(i, _)| i)
                 .collect();
+            if hits.is_empty() {
+                continue;
+            }
+            plugin.fuel.reset();
             for index in hits {
+                if started.elapsed() > DEADLINE || plugin.fuel.over() {
+                    break;
+                }
                 call_handler(plugin, index, event, fields);
                 out.extend(drain_sends(plugin));
             }
@@ -354,7 +391,9 @@ fn call_binding(plugin: &LoadedPlugin, index: usize) {
             }
         }
     };
-    plugin.fuel.reset();
+    if plugin.fuel.over() {
+        return;
+    }
     plugin.runs.fetch_add(1, Ordering::Relaxed);
     if let Err(err) = func.call::<()>(()) {
         log_line(&format!("{}: binding: {err}", plugin.name));
@@ -375,7 +414,9 @@ fn call_handler(plugin: &LoadedPlugin, index: usize, event: &str, fields: &[(&st
             }
         }
     };
-    plugin.fuel.reset();
+    if plugin.fuel.over() {
+        return;
+    }
     plugin.runs.fetch_add(1, Ordering::Relaxed);
     let info = match plugin.lua.create_table() {
         Ok(t) => t,
@@ -847,8 +888,15 @@ fn install_plugin_api(lua: &Lua, spawn: bool, regs: &PluginRegs) -> Result<(), S
                 if !EVENTS.contains(&event.as_str()) {
                     return Err(mlua::Error::runtime(format!("unknown event {event:?}")));
                 }
+                let mut list = handlers.borrow_mut();
+                let count = list.iter().filter(|(name, _)| name == &event).count();
+                if count >= MAX_HANDLERS_PER_EVENT {
+                    return Err(mlua::Error::runtime(format!(
+                        "too many handlers for {event}"
+                    )));
+                }
                 let key = lua.create_registry_value(func)?;
-                handlers.borrow_mut().push((event, key));
+                list.push((event, key));
                 Ok(())
             })
             .map_err(|e| e.to_string())?,
@@ -910,7 +958,51 @@ fn strings_from_table(t: mlua::Table) -> mlua::Result<Vec<String>> {
     Ok(out)
 }
 
+static SPAWNS: AtomicUsize = AtomicUsize::new(0);
+
+/// True when this call reserved one of [`MAX_SPAWNS`] slots.
+fn try_begin_spawn(slot: &AtomicUsize) -> bool {
+    let mut cur = slot.load(Ordering::Relaxed);
+    loop {
+        if cur >= MAX_SPAWNS {
+            return false;
+        }
+        match slot.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(seen) => cur = seen,
+        }
+    }
+}
+
+fn end_spawn(slot: &AtomicUsize) {
+    slot.fetch_sub(1, Ordering::AcqRel);
+}
+
 fn spawn_process(program: &str, args: &[String]) -> Result<String, String> {
+    if !try_begin_spawn(&SPAWNS) {
+        return Err("too many spawns".into());
+    }
+    match spawn_started(program, args) {
+        Ok(child) => {
+            std::thread::spawn(move || {
+                supervise_child(child.child, child.job);
+                end_spawn(&SPAWNS);
+            });
+            Ok(String::new())
+        }
+        Err(err) => {
+            end_spawn(&SPAWNS);
+            Err(err)
+        }
+    }
+}
+
+struct Started {
+    child: std::process::Child,
+    job: Option<JobGuard>,
+}
+
+fn spawn_started(program: &str, args: &[String]) -> Result<Started, String> {
     let mut cmd = std::process::Command::new(program);
     cmd.args(args)
         .stdin(std::process::Stdio::null())
@@ -919,18 +1011,23 @@ fn spawn_process(program: &str, args: &[String]) -> Result<String, String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW: a console program must not flash a console.
-        cmd.creation_flags(0x0800_0000);
+        // CREATE_SUSPENDED | CREATE_NO_WINDOW. The process stays frozen
+        // until it is inside the job, and no console window flashes.
+        cmd.creation_flags(0x0000_0004 | 0x0800_0000);
     }
-    // Starting the process is the only work on the caller. The wait, the
-    // output cap, and the kill run on a worker so the UI thread returns.
     let child = cmd.spawn().map_err(|e| e.to_string())?;
-    std::thread::spawn(move || supervise_child(child));
-    Ok(String::new())
+    #[cfg(windows)]
+    let job = {
+        let job = tie_to_job(&child);
+        resume_process(&child);
+        job
+    };
+    #[cfg(not(windows))]
+    let job = None;
+    Ok(Started { child, job })
 }
 
-fn supervise_child(mut child: std::process::Child) {
-    let job = tie_to_job(&child);
+fn supervise_child(mut child: std::process::Child, job: Option<JobGuard>) {
     let stdout = child.stdout.take();
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
@@ -957,22 +1054,22 @@ fn supervise_child(mut child: std::process::Child) {
 
 /// A job that kills the process and anything it spawned when the handle
 /// closes. Absent off Windows, and best-effort if the job cannot be made.
+/// Called while the process is still suspended, so the job owns it before
+/// the first instruction runs.
 fn tie_to_job(_child: &std::process::Child) -> Option<JobGuard> {
     #[cfg(windows)]
     {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
             SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         };
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
-        };
-        // SAFETY: CreateJobObjectW and OpenProcess return handles this function
-        // either closes or hands to JobGuard. The information pointer is a
-        // local struct that outlives SetInformationJobObject, and the length
-        // is that struct's size.
+        // SAFETY: CreateJobObjectW returns a handle this function either
+        // closes or wraps in OwnedHandle. AssignProcessToJobObject borrows
+        // the process handle owned by `Child`. The information pointer is a
+        // local struct that outlives SetInformationJobObject.
         unsafe {
             let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             if job.is_null() {
@@ -990,16 +1087,11 @@ fn tie_to_job(_child: &std::process::Child) -> Option<JobGuard> {
                 let _ = CloseHandle(job);
                 return None;
             }
-            let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, _child.id());
-            if proc.is_null() || AssignProcessToJobObject(job, proc) == 0 {
-                if !proc.is_null() {
-                    let _ = CloseHandle(proc);
-                }
+            if AssignProcessToJobObject(job, _child.as_raw_handle()) == 0 {
                 let _ = CloseHandle(job);
                 return None;
             }
-            let _ = CloseHandle(proc);
-            Some(JobGuard(job))
+            Some(JobGuard(OwnedHandle::from_raw_handle(job)))
         }
     }
     #[cfg(not(windows))]
@@ -1009,17 +1101,25 @@ fn tie_to_job(_child: &std::process::Child) -> Option<JobGuard> {
     }
 }
 
-struct JobGuard(#[cfg(windows)] windows_sys::Win32::Foundation::HANDLE);
-
-impl Drop for JobGuard {
-    fn drop(&mut self) {
-        #[cfg(windows)]
-        unsafe {
-            // SAFETY: the handle came from CreateJobObjectW and has not been closed.
-            let _ = windows_sys::Win32::Foundation::CloseHandle(self.0);
-        }
+/// Std closes the primary thread when CREATE_SUSPENDED is set and does not
+/// resume it. Resume the whole process after the job assignment.
+#[cfg(windows)]
+fn resume_process(child: &std::process::Child) {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtResumeProcess(process: windows_sys::Win32::Foundation::HANDLE) -> i32;
+    }
+    // SAFETY: the handle is the live process from Command::spawn.
+    unsafe {
+        let _ = NtResumeProcess(child.as_raw_handle());
     }
 }
+
+#[cfg(windows)]
+struct JobGuard(std::os::windows::io::OwnedHandle);
+#[cfg(not(windows))]
+struct JobGuard;
 
 fn check_send(text: &str) -> Result<(), String> {
     if text.is_empty() {
@@ -1102,7 +1202,76 @@ fn harden(lua: &Lua, fuel: &Arc<Fuel>) -> Result<(), String> {
             .map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
+    // Lua 5.4 runs __gc with hooks disabled, so a finalizer loop never
+    // trips the instruction budget. Finalization is decided at setmetatable
+    // time, from a raw __gc lookup. Adding __gc later does not arm it, but
+    // rawset of that key is refused too.
+    let orig_setmt: mlua::Function = g.get("setmetatable").map_err(|e| e.to_string())?;
+    g.set(
+        "setmetatable",
+        lua.create_function(move |_, (obj, mt): (Value, Value)| {
+            if let Value::Table(ref table) = mt {
+                let gc: Value = table.raw_get("__gc").map_err(mlua::Error::external)?;
+                if !matches!(gc, Value::Nil) {
+                    return Err(mlua::Error::runtime("__gc is disabled"));
+                }
+            }
+            orig_setmt.call::<Value>((obj, mt))
+        })
+        .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let orig_rawset: mlua::Function = g.get("rawset").map_err(|e| e.to_string())?;
+    g.set(
+        "rawset",
+        lua.create_function(move |_, (table, key, value): (Value, Value, Value)| {
+            if let Value::String(s) = &key {
+                if s.to_str().ok().as_deref() == Some("__gc") && !matches!(value, Value::Nil) {
+                    return Err(mlua::Error::runtime("__gc is disabled"));
+                }
+            }
+            orig_rawset.call::<Value>((table, key, value))
+        })
+        .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    cap_pattern_functions(lua, &string)?;
     Ok(())
+}
+
+fn cap_pattern_functions(lua: &Lua, string: &mlua::Table) -> Result<(), String> {
+    for name in ["find", "match", "gmatch", "gsub"] {
+        let orig: mlua::Function = string.get(name).map_err(|e| e.to_string())?;
+        string
+            .set(
+                name,
+                lua.create_function(move |_, args: MultiValue| {
+                    let args = args.into_vec();
+                    if let Some(Value::String(s)) = args.first() {
+                        if s.as_bytes().len() > MAX_PATTERN_SUBJECT {
+                            return Err(mlua::Error::runtime("string is too long"));
+                        }
+                    }
+                    if let Some(Value::String(p)) = args.get(1) {
+                        let pat = p.as_bytes();
+                        if pat.len() > MAX_PATTERN || dot_repeats(&pat) > 3 {
+                            return Err(mlua::Error::runtime("pattern is rejected"));
+                        }
+                    }
+                    orig.call::<MultiValue>(MultiValue::from_vec(args))
+                })
+                .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn dot_repeats(pattern: &[u8]) -> usize {
+    pattern
+        .windows(2)
+        .filter(|w| w == b".-" || w == b".*" || w == b".+")
+        .count()
 }
 
 /// `pcall` that re-raises once the instruction or time limit has tripped.
@@ -1954,7 +2123,7 @@ mod tests {
         let dir = scratch("budget");
         let plugins = dir.join("plugins");
         fs::create_dir_all(&plugins).unwrap();
-        let src = "bayan.bind('f12', function() bayan.send('ok') end)\n";
+        let src = "bayan.bind('f12', function() local s=0; for i=1,5000 do s=s+i end; bayan.send('ok') end)\n";
         fs::write(plugins.join("hello.lua"), src).unwrap();
         let mut cfg = plugin_cfg(&plugins, "hello", false);
         approve(&mut cfg, src.as_bytes());
@@ -1977,7 +2146,7 @@ mod tests {
         fs::create_dir_all(&plugins).unwrap();
         let src = r#"
             bayan.bind("f12", function() while true do end end)
-            bayan.bind("f11", function() bayan.send("ok") end)
+            bayan.bind("f11", function() local s=0; for i=1,5000 do s=s+i end; bayan.send("ok") end)
         "#;
         fs::write(plugins.join("hello.lua"), src).unwrap();
         let mut cfg = plugin_cfg(&plugins, "hello", false);
@@ -2101,6 +2270,128 @@ mod tests {
         );
         assert_eq!(sends[0].text, "fast");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_finalizer_loop_fails_fast_instead_of_hanging() {
+        let dir = scratch("gc");
+        let src =
+            "setmetatable({}, {__gc=function() while true do end end})\nconfig.font_size = 3\n";
+        fs::write(dir.join("config.lua"), src).unwrap();
+        let mut cfg = json_cfg(r#"{"font_size":12.0}"#);
+        approve(&mut cfg, src.as_bytes());
+        let start = Instant::now();
+        {
+            let out = load_with(&cfg, &dir, false);
+            assert!(!out.errors.is_empty(), "a __gc metatable must be rejected");
+            assert_ne!(out.config.font_size, Some(3.0));
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "dropping the state hung in a finalizer"
+        );
+
+        let plugins = dir.join("plugins");
+        fs::create_dir_all(&plugins).unwrap();
+        let plug = "setmetatable({}, {__gc=function() while true do end end})\n";
+        fs::write(plugins.join("hello.lua"), plug).unwrap();
+        let mut pcfg = plugin_cfg(&plugins, "hello", false);
+        approve(&mut pcfg, plug.as_bytes());
+        let start = Instant::now();
+        {
+            let out = load_with(&pcfg, &dir, false);
+            assert!(!out.errors.is_empty(), "{:?}", out.errors);
+            assert_eq!(out.plugins.callback_runs(), 0);
+        }
+        assert!(start.elapsed() < Duration::from_secs(2));
+
+        let raw = r#"
+            local t, mt = {}, {}
+            setmetatable(t, mt)
+            local ok = pcall(function() rawset(mt, "__gc", function() while true do end end) end)
+            if ok then error("rawset allowed __gc") end
+            config.font_size = 7
+        "#;
+        fs::write(dir.join("config.lua"), raw).unwrap();
+        let mut rcfg = json_cfg(r#"{"font_size":12.0}"#);
+        approve(&mut rcfg, raw.as_bytes());
+        let out = load_with(&rcfg, &dir, false);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.config.font_size, Some(7.0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_event_keeps_thirty_two_handlers_and_one_deadline() {
+        let dir = scratch("handlers");
+        let plugins = dir.join("plugins");
+        fs::create_dir_all(&plugins).unwrap();
+        let src = r#"
+            local n = 0
+            for i = 1, 1000 do
+              local ok = pcall(function()
+                bayan.on("bell", function() while true do end end)
+              end)
+              if ok then n = n + 1 end
+            end
+            bayan.bind("f12", function() bayan.send(tostring(n)) end)
+        "#;
+        fs::write(plugins.join("hello.lua"), src).unwrap();
+        let mut cfg = plugin_cfg(&plugins, "hello", false);
+        approve(&mut cfg, src.as_bytes());
+        let mut out = load_with(&cfg, &dir, false);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.plugins.fire("f12")[0].text, "32");
+        let before = out.plugins.callback_runs();
+        let start = Instant::now();
+        let _ = out.plugins.emit("bell", &[]);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "handlers must share one deadline, took {:?}",
+            start.elapsed()
+        );
+        // The first spinning handler spends the shared budget. The rest
+        // must not be entered, so the run count moves by one, not by 32.
+        assert_eq!(out.plugins.callback_runs() - before, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_backtracking_pattern_is_rejected() {
+        let dir = scratch("pattern");
+        let src = r#"
+            local ok = pcall(string.find, string.rep("a", 24), ".-.-.-.-.-.-.-.-b")
+            if ok then error("pattern ran") end
+            config.font_size = 15
+        "#;
+        fs::write(dir.join("config.lua"), src).unwrap();
+        let mut cfg = json_cfg(r#"{"font_size":12.0}"#);
+        approve(&mut cfg, src.as_bytes());
+        let start = Instant::now();
+        let out = load_with(&cfg, &dir, false);
+        assert!(
+            start.elapsed() < Duration::from_millis(400),
+            "the pattern ran for {:?}",
+            start.elapsed()
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.config.font_size, Some(15.0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fifth_spawn_is_refused_while_four_are_running() {
+        let slot = AtomicUsize::new(0);
+        assert!(try_begin_spawn(&slot));
+        assert!(try_begin_spawn(&slot));
+        assert!(try_begin_spawn(&slot));
+        assert!(try_begin_spawn(&slot));
+        assert!(!try_begin_spawn(&slot), "the cap is four");
+        end_spawn(&slot);
+        assert!(try_begin_spawn(&slot));
+        while slot.load(Ordering::Relaxed) > 0 {
+            end_spawn(&slot);
+        }
     }
 
     fn feed_terminal(bytes: &[u8]) {

@@ -329,10 +329,12 @@ impl App {
                 self.request_redraw();
             }
             KeyOwner::PasteGuard => {
-                match enter_or_escape(&event.logical_key) {
-                    Some(true) => self.confirm_pending(),
-                    Some(false) => self.dismiss_paste_card(),
-                    None => {}
+                if !self.scroll_lua_card_key(&event.logical_key) {
+                    match enter_or_escape(&event.logical_key) {
+                        Some(true) => self.confirm_pending(),
+                        Some(false) => self.dismiss_paste_card(),
+                        None => {}
+                    }
                 }
                 self.request_redraw();
             }

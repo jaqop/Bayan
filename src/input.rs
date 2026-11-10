@@ -455,6 +455,16 @@ impl App {
         if n == 0 {
             return;
         }
+        // The approval card scrolls instead of the pane behind it.
+        if self
+            .pending_paste
+            .as_ref()
+            .is_some_and(|p| p.kind == crate::PendingKind::ApproveLua)
+        {
+            self.scroll_lua_card(-n);
+            self.request_redraw();
+            return;
+        }
         // Ctrl+wheel = live font zoom (EasyTer's favorite)
         if self.modifiers.control_key() {
             self.font_delta = zoomed(self.font_delta, n as f32);

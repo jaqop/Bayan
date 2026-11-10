@@ -938,21 +938,30 @@ entry's `spawn` is true, and `config.lua` never has it. `send` waits on
 the same confirm card as a JSON plugin action. Events are `tab-opened`,
 `title-changed`, `bell`, and `osc7-cwd`. Opening a tab dispatches
 `tab-opened`. Bytes from the pane — escape sequences, OSC, hyperlinks,
-bells, program output — do not enter Lua.
+bells, program output — do not enter Lua. One event accepts 32 handlers.
+Every handler of one dispatch shares a single deadline.
 
 The sandbox is Lua 5.4 via mlua, with `string`, `table`, `math`, and
 `utf8` only. `io`, `os`, `debug`, and `package` are absent. `require`,
 `loadfile`, `dofile`, and `string.dump` are removed, and `load` accepts
-text chunks only. Each call into Lua gets its own instruction budget and
-its own short deadline, so one callback cannot spend the next one's time.
-A loop is still cut off. Strings are UTF-8; Arabic round-trips.
+text chunks only. A metatable with `__gc` is rejected, because Lua 5.4
+runs finalizers with the instruction hook switched off. `string.find`,
+`match`, `gmatch`, and `gsub` refuse a long subject, a long pattern, or
+a pattern with a long chain of `.-` / `.*`. Each call into Lua gets its
+own instruction budget and its own short deadline, so one callback cannot
+spend the next one's time. A loop is still cut off. Strings are UTF-8;
+Arabic round-trips.
 
-`bayan.spawn` starts the program and returns without waiting for it. A
-worker caps what it reads, and on Windows the process is created with
-`CREATE_NO_WINDOW` inside a job that ends the process tree when the job
-closes. The values `config.lua` changes are not written back to
-`config.json`. A script longer than the card shows its size and hash
-first; Enter reveals the rest before it can approve.
+`bayan.spawn` returns `""` immediately. Stdout is discarded, and the
+process is killed after two seconds, so it is not a way to open an
+editor. At most four of these processes run at once. On Windows the
+process is created suspended (`CREATE_SUSPENDED | CREATE_NO_WINDOW`),
+placed in a job, and only then resumed, so it cannot outlive the job.
+The values `config.lua` changes are not written back to `config.json`,
+and editing a shortcut writes only that one action. A script longer than
+the card shows its size and hash first. Enter reveals the rest, the card
+scrolls, and a second Enter can approve only after a short pause and
+only once the last row has been on screen.
 
 An elevated token does not run any of it. That is `--elevated` after the
 UAC prompt and Explorer's Run as administrator: the process token, not a

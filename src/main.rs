@@ -455,6 +455,10 @@ struct PendingPaste {
     reason: String,
     /// Set when Enter approves a Lua file instead of typing `text`.
     lua: Option<lua_host::PendingScript>,
+    /// Rows of a long approval card already scrolled off the top.
+    scroll: usize,
+    /// The last row of that card has been inside the window.
+    saw_end: bool,
 }
 
 /// One terminal pane (a tab holds one or more).
@@ -1188,6 +1192,65 @@ fn dismiss_paste_for(pending: &mut Option<PendingPaste>, removed: &[u64]) {
 
 /// Chars of preview per card row; the card is 62 cells wide.
 const CARD_ROW_CHARS: usize = 56;
+/// Visible rows of a Lua approval card. The rest scroll.
+const LUA_CARD_ROWS: usize = 12;
+/// After Enter reveals a script, the next Enter is ignored until this
+/// passes, so a held key cannot approve on autorepeat.
+const LUA_APPROVE_DELAY: std::time::Duration = std::time::Duration::from_millis(700);
+
+/// Change one action on the saved map and the same action on the runtime
+/// map. A chord that exists only on the runtime map — a `config.lua`
+/// binding — is left where it is.
+fn apply_shortcut(
+    saved: &mut Option<std::collections::HashMap<String, String>>,
+    runtime: &mut Option<std::collections::HashMap<String, String>>,
+    action_id: &str,
+    chord: Option<String>,
+) {
+    put_binding(saved, action_id, chord.clone());
+    put_binding(runtime, action_id, chord);
+}
+
+fn put_binding(
+    map: &mut Option<std::collections::HashMap<String, String>>,
+    action_id: &str,
+    chord: Option<String>,
+) {
+    match chord {
+        Some(c) => {
+            map.get_or_insert_with(Default::default)
+                .insert(action_id.to_string(), c);
+        }
+        None => {
+            let empty = map.as_mut().is_some_and(|m| {
+                m.remove(action_id);
+                m.is_empty()
+            });
+            if empty {
+                *map = None;
+            }
+        }
+    }
+}
+
+/// The rows the approval card paints, and whether the last row is in view.
+fn lua_card_window(rows: &[String], scroll: usize) -> (Vec<String>, usize, bool) {
+    if rows.len() <= LUA_CARD_ROWS {
+        return (rows.to_vec(), 0, true);
+    }
+    let max = rows.len() - LUA_CARD_ROWS;
+    let scroll = scroll.min(max);
+    let at_end = scroll >= max;
+    (
+        rows[scroll..scroll + LUA_CARD_ROWS].to_vec(),
+        scroll,
+        at_end,
+    )
+}
+
+fn lua_enter_ready(not_before: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    not_before.is_none_or(|t| now >= t)
+}
 
 /// The card's preview rows. A paste shows one elided row, as before. A
 /// plugin command shows ALL of what Enter will type (R-03), wrapped into
@@ -1249,6 +1312,8 @@ fn plugin_pending(label: &str, send: &str, pane: Option<u64>) -> PendingPaste {
             tr("إضافة تريد كتابة نص", "A plugin wants to type text")
         ),
         lua: None,
+        scroll: 0,
+        saw_end: true,
     }
 }
 
@@ -1496,6 +1561,8 @@ struct App {
     lua_errors: Vec<String>,
     /// Set when the token is elevated and scripts were left unloaded.
     lua_notice: Option<String>,
+    /// Enter on a revealed Lua card is ignored until this instant.
+    lua_approve_not_before: Option<std::time::Instant>,
     /// every rebindable action's effective chord (defaults + config)
     keymap: Vec<(keybinds::Action, keybinds::Chord)>,
     /// the shortcuts editor overlay, when open
@@ -2149,6 +2216,8 @@ impl App {
                     )
                     .into(),
                     lua: None,
+                    scroll: 0,
+                    saw_end: true,
                 });
             }
             PaletteRow::Plugin(i) => {
@@ -2329,28 +2398,28 @@ impl App {
     /// Store a binding (pruned back out if it IS the default) and rebuild
     /// the live keymap.
     fn set_binding(&mut self, action: keybinds::Action, chord: keybinds::Chord) {
-        let kb = self.config.keybinds.get_or_insert_with(Default::default);
-        if chord == action.default_chord() {
-            kb.remove(action.id());
+        let stored = if chord == action.default_chord() {
+            None
         } else {
-            kb.insert(action.id().to_string(), chord.to_config());
-        }
-        if self.config.keybinds.as_ref().is_some_and(|m| m.is_empty()) {
-            self.config.keybinds = None;
-        }
-        self.json_config.keybinds = self.config.keybinds.clone();
+            Some(chord.to_config())
+        };
+        apply_shortcut(
+            &mut self.json_config.keybinds,
+            &mut self.config.keybinds,
+            action.id(),
+            stored,
+        );
         self.keymap = keybinds::effective_map(&self.config);
         self.request_redraw();
     }
 
     fn clear_binding(&mut self, action: keybinds::Action) {
-        if let Some(kb) = self.config.keybinds.as_mut() {
-            kb.remove(action.id());
-            if kb.is_empty() {
-                self.config.keybinds = None;
-            }
-        }
-        self.json_config.keybinds = self.config.keybinds.clone();
+        apply_shortcut(
+            &mut self.json_config.keybinds,
+            &mut self.config.keybinds,
+            action.id(),
+            None,
+        );
         self.keymap = keybinds::effective_map(&self.config);
         self.request_redraw();
     }
@@ -4349,6 +4418,8 @@ impl App {
             chars,
             reason,
             lua: None,
+            scroll: 0,
+            saw_end: true,
         });
         self.request_redraw();
     }
@@ -4390,6 +4461,7 @@ impl App {
             self.lua_skipped.push(hash);
         }
         self.pending_paste = None;
+        self.lua_approve_not_before = None;
         self.after_confirm_card();
         self.request_redraw();
     }
@@ -4421,8 +4493,13 @@ impl App {
     }
 
     fn raise_lua_card(&mut self, script: lua_host::PendingScript) {
-        let reason = script.reason();
         let text = script.preview.clone();
+        let rows = card_preview(PendingKind::ApproveLua, &text);
+        let saw_end = rows.len() <= LUA_CARD_ROWS;
+        let mut reason = script.reason();
+        if !saw_end {
+            reason.push_str(&tr(" — مرّر حتى آخر السكربت", " — scroll to the end"));
+        }
         let lines = text.lines().count().max(1);
         let chars = text.chars().count();
         self.pending_paste = Some(PendingPaste {
@@ -4433,18 +4510,76 @@ impl App {
             chars,
             reason,
             lua: Some(script),
+            scroll: 0,
+            saw_end,
         });
     }
 
+    /// Wheel and arrows while the approval card is up. Returns whether the
+    /// card consumed the input.
+    fn scroll_lua_card(&mut self, delta: i32) -> bool {
+        let Some(p) = self.pending_paste.as_mut() else {
+            return false;
+        };
+        if p.kind != PendingKind::ApproveLua {
+            return false;
+        }
+        let rows = card_preview(p.kind, &p.text);
+        let (_, scroll, _) = lua_card_window(&rows, p.scroll);
+        if rows.len() <= LUA_CARD_ROWS {
+            p.saw_end = true;
+            p.scroll = scroll;
+            return true;
+        }
+        let max = rows.len() - LUA_CARD_ROWS;
+        let next = (scroll as i32 + delta).clamp(0, max as i32) as usize;
+        p.scroll = next;
+        if next >= max {
+            p.saw_end = true;
+        }
+        true
+    }
+
+    fn scroll_lua_card_key(&mut self, key: &winit::keyboard::Key) -> bool {
+        let lua = self
+            .pending_paste
+            .as_ref()
+            .is_some_and(|p| p.kind == PendingKind::ApproveLua);
+        if !lua {
+            return false;
+        }
+        let delta = match key {
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowDown) => 1,
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp) => -1,
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::PageDown) => {
+                LUA_CARD_ROWS as i32
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::PageUp) => {
+                -(LUA_CARD_ROWS as i32)
+            }
+            _ => return false,
+        };
+        self.scroll_lua_card(delta);
+        true
+    }
+
     fn approve_lua(&mut self, card: PendingPaste) {
-        let Some(script) = card.lua else {
+        let Some(script) = card.lua.clone() else {
             return;
         };
         if !script.shows_everything() {
+            self.lua_approve_not_before = Some(std::time::Instant::now() + LUA_APPROVE_DELAY);
             self.raise_lua_card(script.reveal());
             self.request_redraw();
             return;
         }
+        if !lua_enter_ready(self.lua_approve_not_before, std::time::Instant::now()) || !card.saw_end
+        {
+            self.pending_paste = Some(card);
+            self.request_redraw();
+            return;
+        }
+        self.lua_approve_not_before = None;
         match lua_host::unchanged(&script) {
             Ok(()) => {
                 lua_host::grant(&mut self.json_config, &script.hash);
@@ -4925,7 +5060,12 @@ impl App {
                     );
                 }
                 if let Some(p) = &self.pending_paste {
-                    let preview = card_preview(p.kind, &p.text);
+                    let all = card_preview(p.kind, &p.text);
+                    let preview = if p.kind == PendingKind::ApproveLua {
+                        lua_card_window(&all, p.scroll).0
+                    } else {
+                        all
+                    };
                     let heading = (p.kind == PendingKind::ApproveLua)
                         .then(|| tr("تشغيل سكربت لوا؟", "Run this Lua script?"));
                     renderer.draw_paste_guard(
@@ -5829,6 +5969,7 @@ fn run() -> Result<(), String> {
         lua_send_queue: std::collections::VecDeque::new(),
         lua_errors,
         lua_notice,
+        lua_approve_not_before: None,
         keymap,
         shortcuts: None,
         atlas_generation: 0,
@@ -5909,6 +6050,66 @@ mod tests {
     }
 
     #[test]
+    fn a_shortcut_edit_does_not_copy_lua_bindings_into_json() {
+        use std::collections::HashMap;
+        let mut saved = Some(HashMap::from([(
+            "copy".to_string(),
+            "ctrl+shift+c".to_string(),
+        )]));
+        let mut runtime = Some(HashMap::from([
+            ("copy".to_string(), "ctrl+shift+c".to_string()),
+            ("new-tab".to_string(), "ctrl+alt+t".to_string()),
+        ]));
+        apply_shortcut(
+            &mut saved,
+            &mut runtime,
+            "copy",
+            Some("ctrl+shift+x".into()),
+        );
+        assert_eq!(
+            saved.as_ref().unwrap().get("copy").map(String::as_str),
+            Some("ctrl+shift+x")
+        );
+        assert!(
+            saved.as_ref().unwrap().get("new-tab").is_none(),
+            "a lua binding must not be written into config.json: {saved:?}"
+        );
+        assert_eq!(
+            runtime.as_ref().unwrap().get("new-tab").map(String::as_str),
+            Some("ctrl+alt+t")
+        );
+        apply_shortcut(&mut saved, &mut runtime, "copy", None);
+        assert!(
+            !saved.as_ref().is_some_and(|m| m.contains_key("new-tab")),
+            "clearing a shortcut must not copy the lua map: {saved:?}"
+        );
+        assert!(runtime.as_ref().unwrap().contains_key("new-tab"));
+    }
+
+    #[test]
+    fn a_long_approval_card_scrolls_and_enter_waits() {
+        let rows: Vec<String> = (0..40).map(|i| format!("row {i}")).collect();
+        let (window, scroll, at_end) = lua_card_window(&rows, 0);
+        assert_eq!(window.len(), LUA_CARD_ROWS);
+        assert_eq!(scroll, 0);
+        assert!(!at_end);
+        assert_eq!(window[0], "row 0");
+        let (end, _, at_end) = lua_card_window(&rows, 1000);
+        assert!(at_end);
+        assert_eq!(end.last().map(String::as_str), Some("row 39"));
+        let short = vec!["only".to_string()];
+        assert!(lua_card_window(&short, 0).2);
+
+        let now = std::time::Instant::now();
+        assert!(lua_enter_ready(None, now));
+        assert!(!lua_enter_ready(Some(now + LUA_APPROVE_DELAY), now));
+        assert!(lua_enter_ready(
+            Some(now - std::time::Duration::from_millis(1)),
+            now
+        ));
+    }
+
+    #[test]
     fn a_confirm_card_goes_away_with_its_pane() {
         // The card is keyed by pane id (R-02 keeps the send safe). When that
         // pane is removed — shell exit, pane close, or the whole tab — the
@@ -5923,6 +6124,8 @@ mod tests {
                 chars: 8,
                 reason: "test".into(),
                 lua: None,
+                scroll: 0,
+                saw_end: true,
             })
         };
         let mut pending = card(Some(7));

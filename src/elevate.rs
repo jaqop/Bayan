@@ -28,6 +28,12 @@ pub fn is_elevated() -> bool {
     }
 }
 
+/// The name PR #56 uses for the same check. One implementation, so a merge
+/// does not keep two token queries.
+pub fn process_is_elevated() -> bool {
+    is_elevated()
+}
+
 #[cfg(windows)]
 fn token_is_elevated() -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -69,5 +75,6 @@ mod tests {
         assert!(elevated_from_query(true, false, false));
         assert!(!elevated_from_query(true, true, false));
         assert!(elevated_from_query(true, true, true));
+        assert_eq!(process_is_elevated(), is_elevated());
     }
 }
