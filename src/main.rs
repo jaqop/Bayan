@@ -1429,6 +1429,8 @@ struct App {
     last_frame: Vec<u8>,
     last_frame_size: Option<winit::dpi::PhysicalSize<u32>>,
     cursor_pos: PhysicalPosition<f64>,
+    /// The cursor box last given to `set_ime_cursor_area`.
+    ime_spot: Option<(i32, i32, i32, i32)>,
     /// Grab, motion dedupe, focus-in memory, and the local selection drag.
     /// A focus loss drops all of them together.
     mouse: mouse::Route,
@@ -4400,18 +4402,26 @@ impl App {
                 }
             }
             _ => {
-                if let (Some(st), Some(t)) = (self.search.as_mut(), event.text.as_ref()) {
-                    for ch in t.chars() {
-                        if !ch.is_control() {
-                            st.query.push(ch);
-                            st.hl = None;
-                            st.selected_needle = None;
-                        }
-                    }
+                if let Some(t) = event.text.as_ref() {
+                    self.search_push(t);
                 }
             }
         }
         self.request_redraw();
+    }
+
+    /// Typed or IME-committed text into the search query, controls dropped.
+    pub(crate) fn search_push(&mut self, t: &str) {
+        let Some(st) = self.search.as_mut() else {
+            return;
+        };
+        for ch in t.chars() {
+            if !ch.is_control() {
+                st.query.push(ch);
+                st.hl = None;
+                st.selected_needle = None;
+            }
+        }
     }
 
     fn redraw(&mut self) {
@@ -4785,6 +4795,15 @@ impl App {
             // renderer still warming up on its thread: clear-only dark frame
             _ => {}
         }
+        // the IME candidate window sits at the focused cursor
+        let spot = self.renderer.as_ref().and_then(|r| r.ime_spot);
+        if let Some((x, y, w, h)) = spot.filter(|_| spot != self.ime_spot) {
+            window.set_ime_cursor_area(
+                PhysicalPosition::new(x, y),
+                winit::dpi::PhysicalSize::new(w.max(1) as u32, h.max(1) as u32),
+            );
+            self.ime_spot = spot;
+        }
         let Some(gpu) = self.gpu.as_mut() else { return };
         // During a Windows resize, the live client size can advance ahead of
         // Resized events. Use the same size for geometry and the swapchain.
@@ -4908,6 +4927,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         crate::prof::mark("window created");
+        // winit turns the IME off on every new window: CJK input, the
+        // emoji panel (Win+.) and dictation (Win+H) need it on
+        window.set_ime_allowed(true);
         let px = window.inner_size();
         let gpu = match gpu::Gpu::new(window.clone(), px.width, px.height) {
             Ok(gpu) => gpu,
@@ -5266,6 +5288,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state, button, .. } => self.mouse_input(state, button, el),
             WindowEvent::MouseWheel { delta, .. } => self.mouse_wheel(delta),
             WindowEvent::KeyboardInput { event, .. } => self.key_input(&event, el),
+            WindowEvent::Ime(ime) => self.ime_input(ime),
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }
@@ -5474,6 +5497,7 @@ fn run() -> Result<(), String> {
         last_frame: Vec::new(),
         last_frame_size: None,
         cursor_pos: PhysicalPosition::new(0.0, 0.0),
+        ime_spot: None,
         mouse: mouse::Route::default(),
         sel_pane: 0,
         drag_divider: None,
