@@ -7326,7 +7326,7 @@ mod tests {
             cursor.1
         );
         assert!(
-            cursor.0 <= bx - 1,
+            cursor.0 < bx,
             "reh block x {} did not move left of the cell {bx}",
             cursor.0
         );
@@ -7360,7 +7360,7 @@ mod tests {
             cursor.1
         );
         assert!(
-            cursor.0 <= bx - 1 && cursor.0 + cursor.1 >= bx + bw + 1,
+            cursor.0 < bx && cursor.0 + cursor.1 > bx + bw,
             "seen block {cursor:?} does not stick out of the cell {bx}+{bw}"
         );
     }
