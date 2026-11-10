@@ -30,8 +30,9 @@ pub enum BidiReorder {
     /// each glyph still follows the font; only UAX#9 reordering is skipped.
     Off,
     /// `1` / `"alt_off"`. The primary screen reorders. The alternate screen
-    /// does not, whichever sequence put it there (`?1049`, `?1047`, `?47`).
-    /// The decision reads `TermMode::ALT_SCREEN`, not the sequence bytes.
+    /// does not. `?1049` is alacritty's own alt-screen bit. `?47` and
+    /// `?1047` are tracked beside it, for this decision only, and the
+    /// bytes the parser sees are not rewritten.
     AltOff,
     /// `2` / `"full"`. Reorder on both screens, still gated by BDSM when
     /// `honor_bdsm` is set. The default.
@@ -66,6 +67,18 @@ impl BidiReorder {
             Self::Full => Self::AltOff,
             Self::AltOff => Self::Off,
             Self::Off => Self::Full,
+        }
+    }
+
+    /// Alt-screen bit this mode should consult.
+    ///
+    /// `full` and `off` use only alacritty's `TermMode::ALT_SCREEN` (`?1049`).
+    /// `alt_off` also honors the side tracker for `?47` and `?1047`, which
+    /// do not change the parser's screen.
+    pub fn effective_alt(self, term_alt: bool, tracked_alt: bool) -> bool {
+        match self {
+            Self::AltOff => term_alt || tracked_alt,
+            Self::Off | Self::Full => term_alt,
         }
     }
 
@@ -262,6 +275,103 @@ pub fn viewport_line_abs(evicted: u64, history: u64, display_offset: u64, vrow: 
         .saturating_add(history)
         .saturating_add(vrow)
         .saturating_sub(display_offset)
+}
+
+/// Side state for mintty `Bidi=1` (`alt_off`).
+///
+/// vte 0.15 only enters the alternate screen for `?1049`. `?47` and `?1047`
+/// are the other two ways a full-screen program gets there. This tracker
+/// records set/reset of all three so `alt_off` can stop reordering, and it
+/// does not change the bytes the parser receives. A sequence split across
+/// PTY reads stays open until its final byte.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct AltScreenTrack {
+    on: bool,
+    phase: AltPhase,
+    /// CSI body after `ESC [`, before the final byte.
+    body: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum AltPhase {
+    #[default]
+    Ground,
+    Esc,
+    Csi,
+}
+
+impl AltScreenTrack {
+    pub fn on(&self) -> bool {
+        self.on
+    }
+
+    /// Watch one PTY read. The slice is not modified.
+    pub fn observe(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.byte(b);
+        }
+    }
+
+    fn byte(&mut self, b: u8) {
+        match self.phase {
+            AltPhase::Ground => {
+                if b == 0x1b {
+                    self.phase = AltPhase::Esc;
+                }
+            }
+            AltPhase::Esc => match b {
+                0x1b => {}
+                b'[' => {
+                    self.body.clear();
+                    self.phase = AltPhase::Csi;
+                }
+                b'c' => {
+                    self.on = false;
+                    self.phase = AltPhase::Ground;
+                }
+                0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f..=0xff => {}
+                0x18 | 0x1a => self.phase = AltPhase::Ground,
+                _ => self.phase = AltPhase::Ground,
+            },
+            AltPhase::Csi => {
+                if b == 0x18 || b == 0x1a {
+                    self.body.clear();
+                    self.phase = AltPhase::Ground;
+                } else if b == 0x1b {
+                    self.body.clear();
+                    self.phase = AltPhase::Esc;
+                } else if b < 0x20 || b == 0x7f || b > 0x7e {
+                    // C0 is executed, DEL and high bytes are ignored, and
+                    // the CSI stays open. Same rule as the BDSM filter.
+                } else if (0x40..=0x7e).contains(&b) {
+                    self.finish(b);
+                } else if self.body.len() < 64 {
+                    self.body.push(b);
+                } else {
+                    self.body.clear();
+                    self.phase = AltPhase::Ground;
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self, final_byte: u8) {
+        let body = std::mem::take(&mut self.body);
+        self.phase = AltPhase::Ground;
+        if final_byte != b'h' && final_byte != b'l' {
+            return;
+        }
+        let Some(params) = body.strip_prefix(b"?") else {
+            return;
+        };
+        let enter = final_byte == b'h';
+        for param in params.split(|b| *b == b';') {
+            let head = param.split(|b| *b == b':').next().unwrap_or(param);
+            if matches!(head, b"47" | b"1047" | b"1049") {
+                self.on = enter;
+            }
+        }
+    }
 }
 
 /// UAX#9 base-direction mark. cosmic-text chooses the paragraph level from
@@ -1150,53 +1260,48 @@ mod tests {
         assert!(saw_alt, "seeded streams contained no alt-screen CSI");
     }
 
-    /// `alt_off` follows `TermMode::ALT_SCREEN`, so every way onto that
-    /// screen disables reordering and every way off restores it. `full`
-    /// and `off` do not change with the screen.
-    #[test]
-    fn alt_off_follows_alt_screen_for_every_enter_sequence() {
-        for seq in ["1049", "1047", "47"] {
-            let (mut t, mut p, mut meta, mut carry) = fresh();
-            let on = |t: &Term<VoidListener>, meta: &SessionMeta| {
-                let alt = t.mode().contains(TermMode::ALT_SCREEN);
-                meta.bidi
-                    .presentation(BidiReorder::AltOff, true, false, alt)
-            };
-            assert!(
-                !t.mode().contains(TermMode::ALT_SCREEN),
-                "?{seq} starts on the primary screen"
-            );
-            assert_eq!(on(&t, &meta), (true, false), "?{seq} primary reorders");
+    fn alt_for(mode: BidiReorder, t: &Term<VoidListener>, meta: &SessionMeta) -> bool {
+        mode.effective_alt(t.mode().contains(TermMode::ALT_SCREEN), meta.alt_track.on())
+    }
 
+    /// `?47` and `?1047` must reach the parser unchanged. Rewriting them to
+    /// `?1049` would switch the screen buffer even in `full` mode. `alt_off`
+    /// still sees them via the tracker. `?1049` is the one sequence that
+    /// really sets `TermMode::ALT_SCREEN`.
+    #[test]
+    fn full_mode_leaves_47_and_1047_bytes_unchanged() {
+        for seq in ["47", "1047"] {
+            let (mut t, mut p, mut meta, mut carry) = fresh();
             feed(
                 &mut t,
                 &mut p,
                 &mut meta,
                 &mut carry,
-                format!("\x1b[?{seq}h").as_bytes(),
+                format!("AB\x1b[?{seq}hZ").as_bytes(),
             );
             assert!(
-                t.mode().contains(TermMode::ALT_SCREEN),
-                "?{seq}h must set ALT_SCREEN"
+                !t.mode().contains(TermMode::ALT_SCREEN),
+                "?{seq}h must not be rewritten into ?1049"
             );
-            let alt = t.mode().contains(TermMode::ALT_SCREEN);
-            assert_eq!(
-                meta.bidi
-                    .presentation(BidiReorder::AltOff, true, false, alt),
-                (false, false),
-                "?{seq}h disables reordering under alt_off"
-            );
+            assert_eq!(cell(&t, 0), 'A', "?{seq}: the primary screen was swapped");
+            assert_eq!(cell(&t, 1), 'B');
+            assert_eq!(cell(&t, 2), 'Z');
+            assert!(meta.alt_track.on(), "?{seq}h is tracked for alt_off");
+            let term_alt = t.mode().contains(TermMode::ALT_SCREEN);
             assert!(
                 meta.bidi
-                    .presentation(BidiReorder::Full, true, false, alt)
+                    .presentation(BidiReorder::Full, true, false, term_alt)
                     .0,
-                "full still reorders on the alt screen"
+                "full keeps reordering"
             );
+            let alt = alt_for(BidiReorder::AltOff, &t, &meta);
             assert!(
-                !meta.bidi.presentation(BidiReorder::Off, true, false, alt).0,
-                "off stays off on the alt screen"
+                !meta
+                    .bidi
+                    .presentation(BidiReorder::AltOff, true, false, alt)
+                    .0,
+                "alt_off stops while ?{seq} is set"
             );
-
             feed(
                 &mut t,
                 &mut p,
@@ -1204,27 +1309,63 @@ mod tests {
                 &mut carry,
                 format!("\x1b[?{seq}l").as_bytes(),
             );
-            assert!(
-                !t.mode().contains(TermMode::ALT_SCREEN),
-                "?{seq}l must clear ALT_SCREEN"
-            );
-            let alt = t.mode().contains(TermMode::ALT_SCREEN);
-            assert_eq!(
-                meta.bidi
-                    .presentation(BidiReorder::AltOff, true, false, alt),
-                (true, false),
-                "?{seq}l restores reordering under alt_off"
-            );
+            assert!(!meta.alt_track.on());
+            let alt = alt_for(BidiReorder::AltOff, &t, &meta);
             assert!(
                 meta.bidi
-                    .presentation(BidiReorder::Full, true, false, alt)
-                    .0
-            );
-            assert!(
-                !meta.bidi.presentation(BidiReorder::Off, true, false, alt).0,
-                "off stays off after leaving the alt screen"
+                    .presentation(BidiReorder::AltOff, true, false, alt)
+                    .0,
+                "?{seq}l restores reordering"
             );
         }
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"AB\x1b[?1049hZ");
+        assert!(t.mode().contains(TermMode::ALT_SCREEN));
+        assert_eq!(cell(&t, 0), 'Z', "?1049 really does switch screens");
+        assert_ne!(cell(&t, 1), 'B');
+    }
+
+    /// `?1047h` split across two reads still turns alt_off off, and the
+    /// reset turns it back on. The term bit stays clear: the bytes were
+    /// not promoted to `?1049`.
+    #[test]
+    fn alt_off_detects_1047_split_across_reads() {
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[?104");
+        assert!(!meta.alt_track.on(), "half a CSI is not alt screen yet");
+        assert!(!t.mode().contains(TermMode::ALT_SCREEN));
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"7h");
+        assert!(meta.alt_track.on(), "the final byte closes the split CSI");
+        assert!(
+            !t.mode().contains(TermMode::ALT_SCREEN),
+            "the parser must still see ?1047, not ?1049"
+        );
+        let alt = alt_for(BidiReorder::AltOff, &t, &meta);
+        assert!(
+            !meta
+                .bidi
+                .presentation(BidiReorder::AltOff, true, false, alt)
+                .0
+        );
+        assert!(
+            meta.bidi
+                .presentation(
+                    BidiReorder::Full,
+                    true,
+                    false,
+                    t.mode().contains(TermMode::ALT_SCREEN)
+                )
+                .0
+        );
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[?1047l");
+        assert!(!meta.alt_track.on());
+        let alt = alt_for(BidiReorder::AltOff, &t, &meta);
+        assert!(
+            meta.bidi
+                .presentation(BidiReorder::AltOff, true, false, alt)
+                .0,
+            "reset restores bidi"
+        );
     }
 
     /// BDSM still sits on top of a mode that would reorder. `off` does not

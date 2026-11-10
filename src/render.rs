@@ -1067,6 +1067,65 @@ struct CellInfo {
     style: u8,
 }
 
+/// First strong character of a row: `Some(true)` for RTL (AL/R), `Some(false)`
+/// for LTR. Digits, ZWJ/ZWNJ, and tashkeel are not strong.
+fn strong_paragraph_char(c: char) -> Option<bool> {
+    if crate::bidi::is_combining(c) || c.is_numeric() {
+        return None;
+    }
+    match c {
+        '\u{200C}' | '\u{200D}' | '\u{200E}' | '\u{200F}' | '\u{FEFF}' => return None,
+        _ => {}
+    }
+    if is_rtl(c) {
+        Some(true)
+    } else if c.is_alphabetic() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn auto_paragraph_dir(cells: &[CellInfo]) -> ParagraphDir {
+    for cell in cells {
+        if let Some(rtl) = strong_paragraph_char(cell.c) {
+            return if rtl {
+                ParagraphDir::Rtl
+            } else {
+                ParagraphDir::Ltr
+            };
+        }
+        if let Some(marks) = &cell.zw {
+            for mark in marks {
+                if let Some(rtl) = strong_paragraph_char(*mark) {
+                    return if rtl {
+                        ParagraphDir::Rtl
+                    } else {
+                        ParagraphDir::Ltr
+                    };
+                }
+            }
+        }
+    }
+    ParagraphDir::Default
+}
+
+/// The previous grid row ended in a soft wrap, so this viewport row is the
+/// same paragraph. `display_offset` is the scroll into history.
+fn line_wrapped_into<T: alacritty_terminal::event::EventListener>(
+    term: &Term<T>,
+    viewport_row: usize,
+    display_offset: i32,
+) -> bool {
+    use alacritty_terminal::index::{Column, Line};
+    let prev = Line(viewport_row as i32 - display_offset - 1);
+    if prev < term.grid().topmost_line() {
+        return false;
+    }
+    let col = Column(term.columns().saturating_sub(1));
+    term.grid()[prev][col].flags.contains(Flags::WRAPLINE)
+}
+
 fn is_tui_row(cells: &[CellInfo]) -> bool {
     tui_row(cells.len(), |i| (cells[i].col, cells[i].w, cells[i].c))
 }
@@ -3091,6 +3150,9 @@ impl Renderer {
         let cursor_vrow = cursor.point.line.0 + off;
         let ccol = cursor.point.column.0;
         let mut cursor_rect: Option<(i32, i32)> = None; // (x, w) via shaped layout
+                                                        // Direction of the paragraph a soft wrap is still inside. A wrapped
+                                                        // row does not re-detect from its own first letter.
+        let mut open_dir = ParagraphDir::Default;
         for (li, cells) in lines.iter().enumerate() {
             self.mapping_context = Some((view.rect, li));
             if cells.is_empty() {
@@ -3104,11 +3166,30 @@ impl Renderer {
             // recommendation, presentation forms). The grid path does not
             // run UAX#9 and does not reshape. Implicit mode keeps the
             // whole-line shaper, with SCP's base direction if one was set.
+            let explicit = view.line_dir.get(li).copied().unwrap_or_default();
+            let continued = line_wrapped_into(term, li, off);
+            let auto = auto_paragraph_dir(cells);
+            let dir = if explicit != ParagraphDir::Default {
+                explicit
+            } else if continued && open_dir != ParagraphDir::Default {
+                open_dir
+            } else {
+                auto
+            };
+            if !continued || explicit != ParagraphDir::Default {
+                open_dir = if explicit != ParagraphDir::Default {
+                    explicit
+                } else {
+                    auto
+                };
+            }
             let arabic = cells.iter().any(|ci| is_rtl(ci.c));
             let row_claude = view.claude && view.claude_from.is_none_or(|start| li as i64 >= start);
-            if arabic && view.reorder {
+            // A wrapped tail of an RTL paragraph stays on the bidi path even
+            // when this row itself has no Arabic letter.
+            let follow_rtl = continued && dir == ParagraphDir::Rtl;
+            if (arabic || follow_rtl) && view.reorder {
                 let on_row = cursor_vrow >= 0 && cursor_vrow as usize == li;
-                let dir = view.line_dir.get(li).copied().unwrap_or_default();
                 let col = if on_row { Some(ccol) } else { None };
                 // Alternate-screen rows stay in their grid columns: a TUI
                 // positioned the cells. The primary screen's prose aligns
@@ -8647,6 +8728,220 @@ mod paragraph_align {
         assert_eq!(crate::bidi_ctl::BidiReorder::Off.badge(), Some("BiDi 0"));
         assert_eq!(crate::bidi_ctl::BidiReorder::AltOff.badge(), Some("BiDi 1"));
         assert_eq!(crate::bidi_ctl::BidiReorder::Full.badge(), None);
+    }
+
+    fn pane_view(rect: Rect, reorder: bool) -> PaneView<'static> {
+        PaneView {
+            rect,
+            focused: false,
+            cursor: crate::config::CursorStyle::Block,
+            cursor_on: false,
+            bordered: false,
+            claude: false,
+            claude_from: None,
+            reorder,
+            bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+            line_dir: &[],
+            search_match: None,
+            marks: &[],
+            link_hover: None,
+            link_tip: None,
+        }
+    }
+
+    /// A soft-wrapped RTL paragraph keeps one direction. The tail is flush
+    /// right too, not re-detected as its own paragraph.
+    #[test]
+    fn wrapped_rtl_line_keeps_paragraph_alignment() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let mut term = Term::new(
+            Config::default(),
+            &crate::term::TermSize { cols: 8, rows: 4 },
+            VoidListener,
+        );
+        let mut processor: Processor = Processor::new();
+        // 5 Arabic + space + hello = 11 columns. At width 8 the tail is
+        // the Latin `llo`, which would re-detect as LTR if the wrap were
+        // a new paragraph.
+        processor.advance(&mut term, "مرحبا hello".as_bytes());
+        let pane = (0, 0, 600, 160);
+        r.begin_frame();
+        r.draw_pane(&mut Vec::new(), &pane_view(pane, true), &term);
+        for row in 0..2 {
+            let boxes: Vec<_> = (0..8)
+                .filter_map(|col| r.cell_geometry.get(&(pane, row, col)).map(|s| s[0]))
+                .collect();
+            assert!(
+                !boxes.is_empty(),
+                "row {row} left the bidi path (a wrap must keep the paragraph)"
+            );
+            let left = boxes.iter().map(|b| b.0).min().unwrap();
+            let right = boxes.iter().map(|b| b.0 + b.1).max().unwrap();
+            assert!(
+                (right - pane.2).abs() <= 2,
+                "row {row} must stay flush right, right={right}"
+            );
+            assert!(left > 40, "row {row} left the left edge, left={left}");
+        }
+        let arabic_first = r.cell_geometry[&(pane, 0, 0)][0].0;
+        let arabic_later = (1..5)
+            .filter_map(|col| r.cell_geometry.get(&(pane, 0, col)).map(|s| s[0].0))
+            .min()
+            .unwrap();
+        assert!(
+            arabic_first > arabic_later,
+            "the Arabic head lost RTL order"
+        );
+        let latin = (0..3)
+            .map(|col| r.cell_geometry[&(pane, 1, col)][0].0)
+            .collect::<Vec<_>>();
+        assert!(
+            latin.windows(2).all(|w| w[0] < w[1]),
+            "the Latin tail was reversed: {latin:?}"
+        );
+    }
+
+    /// ZWJ and ZWNJ travel with the Arabic. `full` still orders the word
+    /// right to left. `off` draws storage order from the left.
+    #[test]
+    fn zwj_and_zwnj_keep_order_in_full_and_storage_order_when_off() {
+        for joiner in ['\u{200D}', '\u{200C}'] {
+            let text = format!("مر{joiner}حبا");
+            let (full_first, full_last, full_right) = edge_of(&text, true);
+            assert!(
+                full_first > full_last,
+                "{joiner:?}: full mode lost RTL order ({full_first} vs {full_last})"
+            );
+            assert!(
+                (full_right - 600).abs() <= 2,
+                "{joiner:?}: full mode not flush right ({full_right})"
+            );
+            let (off_first, off_last, off_right) = edge_of(&text, false);
+            assert!(
+                off_first < off_last,
+                "{joiner:?}: off mode reordered storage ({off_first} vs {off_last})"
+            );
+            assert!(
+                off_right < 300,
+                "{joiner:?}: off mode was pushed right ({off_right})"
+            );
+        }
+    }
+
+    /// European digits inside Arabic stay in numeric order under `full`
+    /// (an LTR run) and in storage order under `off`.
+    #[test]
+    fn digits_inside_arabic_keep_order_in_full_and_storage_order_when_off() {
+        let text = "عام 2026";
+        let full = digit_xs(text, true);
+        assert!(
+            full.windows(2).all(|w| w[0] < w[1]),
+            "full mode reversed 2026: {full:?}"
+        );
+        let off = digit_xs(text, false);
+        assert!(
+            off.windows(2).all(|w| w[0] < w[1]),
+            "off mode did not keep storage order of 2026: {off:?}"
+        );
+        assert!(
+            off[0] < 8.0 * 20.0,
+            "off mode did not start at the left, x={}",
+            off[0]
+        );
+    }
+
+    /// x of the first logical glyph, the last logical glyph, and the row's
+    /// right edge. `reorder` selects full vs off.
+    fn edge_of(text: &str, reorder: bool) -> (i32, i32, i32) {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let mut term = Term::new(
+            Config::default(),
+            &crate::term::TermSize { cols: 40, rows: 2 },
+            VoidListener,
+        );
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, text.as_bytes());
+        let pane = (0, 0, 600, 80);
+        r.begin_frame();
+        r.draw_pane(&mut Vec::new(), &pane_view(pane, reorder), &term);
+        let mut xs = Vec::new();
+        for col in 0..20 {
+            if let Some(spans) = r.cell_geometry.get(&(pane, 0, col)) {
+                xs.push(spans[0].0);
+            }
+        }
+        if reorder {
+            assert!(!xs.is_empty(), "full mode drew no Arabic boxes");
+            let right = (0..20)
+                .filter_map(|col| r.cell_geometry.get(&(pane, 0, col)))
+                .map(|s| s[0].0 + s[0].1)
+                .max()
+                .unwrap();
+            (*xs.first().unwrap(), *xs.last().unwrap(), right)
+        } else {
+            let mut out = Vec::new();
+            r.begin_frame();
+            r.draw_pane(&mut out, &pane_view(pane, false), &term);
+            let at = |col: usize| ink_in_column(&out, r.cell_w, col);
+            let first = at(0).expect("off mode drew nothing in column 0");
+            let last_col = (1..20).rev().find(|col| at(*col).is_some()).unwrap();
+            let last = at(last_col).unwrap();
+            (first as i32, last as i32, last as i32)
+        }
+    }
+
+    fn ink_in_column(out: &[Vertex], cell_w: f32, col: usize) -> Option<f32> {
+        let x0 = col as f32 * cell_w;
+        let x1 = x0 + cell_w;
+        out.iter()
+            .filter(|v| v.uv != [WHITE_UV, WHITE_UV] && v.pos[0] >= x0 - 1.0 && v.pos[0] < x1)
+            .map(|v| v.pos[0])
+            .reduce(f32::min)
+    }
+
+    fn digit_xs(text: &str, reorder: bool) -> Vec<f32> {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::index::Column;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let mut term = Term::new(
+            Config::default(),
+            &crate::term::TermSize { cols: 40, rows: 2 },
+            VoidListener,
+        );
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, text.as_bytes());
+        let pane = (0, 0, 600, 80);
+        let mut out = Vec::new();
+        r.begin_frame();
+        r.draw_pane(&mut out, &pane_view(pane, reorder), &term);
+        let row = &term.grid()[alacritty_terminal::index::Line(0)];
+        let mut cols = Vec::new();
+        for col in 0..20 {
+            if row[Column(col)].c.is_ascii_digit() {
+                cols.push(col);
+            }
+        }
+        assert_eq!(cols.len(), 4, "expected the four digits of 2026");
+        if reorder {
+            cols.iter()
+                .map(|col| r.cell_geometry[&(pane, 0, *col)][0].0 as f32)
+                .collect()
+        } else {
+            cols.iter()
+                .map(|col| ink_in_column(&out, r.cell_w, *col).unwrap_or(f32::MAX))
+                .collect()
+        }
     }
 }
 

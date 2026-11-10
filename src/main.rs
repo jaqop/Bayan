@@ -59,6 +59,7 @@ type PaneSnap = (
     u64,
     Option<u64>,
     Option<bidi_ctl::BidiReorder>,
+    bool,
 );
 
 /// The Windows caret rhythm; kitty's idea on top: stop after 15s idle.
@@ -3490,15 +3491,22 @@ impl App {
             return false;
         };
         // term first, then meta — the crate's lock order
-        let alt = s.term.lock().mode().contains(TermMode::ALT_SCREEN);
-        let (bidi_state, running, pane_mode) = {
+        let term_alt = s.term.lock().mode().contains(TermMode::ALT_SCREEN);
+        let (bidi_state, running, pane_mode, tracked_alt) = {
             let m = s.meta.lock_or_recover();
-            (m.bidi.clone(), m.running_cmd.clone(), m.bidi_reorder)
+            (
+                m.bidi.clone(),
+                m.running_cmd.clone(),
+                m.bidi_reorder,
+                m.alt_track.on(),
+            )
         };
         // Idle explicit mode (a command that forgot to reset) must not
         // suppress restoration at the prompt. A live explicit mode still does.
         // The pane's BiDi mode (off / alt screen) is the same kind of gate.
+        // `alt_off` also counts ?47 and ?1047, which do not set the term bit.
         let mode = pane_mode.unwrap_or_else(|| self.config.bidi_mode());
+        let alt = mode.effective_alt(term_alt, tracked_alt);
         let (reorder, _) =
             bidi_state.presentation(mode, self.config.honor_bdsm(), !running.is_empty(), alt);
         if !reorder {
@@ -3634,7 +3642,7 @@ impl App {
     ) -> Option<(u64, usize, usize)> {
         // copy what the locks need, then drop the pane borrow so the term
         // lock below can re-borrow the tab
-        let (pane_id, running, bidi_state, evicted, claude_from, pane_mode) = {
+        let (pane_id, running, bidi_state, evicted, claude_from, pane_mode, tracked_alt) = {
             let pane = self.tabs.get(self.active)?.panes.get(hit.pane)?;
             let m = pane.session.meta.lock_or_recover();
             (
@@ -3644,6 +3652,7 @@ impl App {
                 m.evicted,
                 m.claude_from_abs,
                 m.bidi_reorder,
+                m.alt_track.on(),
             )
         };
         let (auto, manual) = (self.auto_follow, self.claude_manual);
@@ -3659,7 +3668,8 @@ impl App {
             // SCP mark included. Neither applies once the command has ended
             // and the pane is back on the primary screen. `off` and
             // `alt_off` on the alternate screen take the grid path too.
-            let alt = t.mode().contains(TermMode::ALT_SCREEN);
+            let term_alt = t.mode().contains(TermMode::ALT_SCREEN);
+            let alt = mode.effective_alt(term_alt, tracked_alt);
             let (reorder, use_stamps) =
                 bidi_state.presentation(mode, honor, !running.is_empty(), alt);
             let mut claude = reorder
@@ -4626,7 +4636,15 @@ impl App {
                     let focused = pi == tab.focused;
                     // meta snapshot BEFORE the term lock (lock order term>meta
                     // only applies when holding both; here they don't overlap)
-                    let (marks, running_cmd, bidi_state, evicted, claude_from, pane_mode): PaneSnap = {
+                    let (
+                        marks,
+                        running_cmd,
+                        bidi_state,
+                        evicted,
+                        claude_from,
+                        pane_mode,
+                        tracked_alt,
+                    ): PaneSnap = {
                         let m = pane.session.meta.lock_or_recover();
                         (
                             // global -> grid space: subtract the evictions
@@ -4640,6 +4658,7 @@ impl App {
                             m.evicted,
                             m.claude_from_abs,
                             m.bidi_reorder,
+                            m.alt_track.on(),
                         )
                     };
                     let t = pane.session.term.lock();
@@ -4647,9 +4666,10 @@ impl App {
                     // Claude restoration included, and only while the command
                     // is running or the alt screen is up. honor_bdsm defaults on.
                     // The Arc is the frame's snapshot: cloning it does not copy
-                    // the stamp list.
-                    let alt = t.mode().contains(TermMode::ALT_SCREEN);
+                    // the stamp list. alt_off also counts ?47 and ?1047.
+                    let term_alt = t.mode().contains(TermMode::ALT_SCREEN);
                     let mode = pane_mode.unwrap_or_else(|| self.config.bidi_mode());
+                    let alt = mode.effective_alt(term_alt, tracked_alt);
                     let (reorder, use_stamps) = bidi_state.presentation(
                         mode,
                         self.config.honor_bdsm(),

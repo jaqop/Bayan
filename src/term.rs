@@ -358,6 +358,9 @@ pub struct SessionMeta {
     /// `bidi.mode` in the config. Kept off `bidi` so an alt-screen reset,
     /// which clears BDSM and SCP, does not forget the toggle.
     pub bidi_reorder: Option<crate::bidi_ctl::BidiReorder>,
+    /// `?47` / `?1047` / `?1049` set and reset, for `bidi.mode = alt_off`
+    /// only. The parser's bytes are not rewritten from this.
+    pub alt_track: crate::bidi_ctl::AltScreenTrack,
     /// Half-parsed BDSM/SCP/RIS held across PTY reads.
     pub(crate) esc_filter: crate::bidi_ctl::StreamFilter,
     /// command blocks (OSC 133 A/D): gutter lights + prompt jumping
@@ -1373,68 +1376,6 @@ fn kitty_pop_count(params: &[u8]) -> u16 {
     }
 }
 
-/// `?47` and `?1047` become `?1049` so alacritty's parser sets
-/// `TermMode::ALT_SCREEN`. A slice with neither is returned borrowed.
-fn promote_legacy_alt_screen(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    let mut copied = 0;
-    let mut changed = false;
-    while i + 3 < bytes.len() {
-        if bytes[i] != 0x1b || bytes.get(i + 1) != Some(&b'[') || bytes.get(i + 2) != Some(&b'?') {
-            i += 1;
-            continue;
-        }
-        let mut j = i + 3;
-        let params_at = j;
-        while j < bytes.len() && matches!(bytes[j], b'0'..=b'9' | b';' | b':') {
-            j += 1;
-        }
-        let Some(&final_b) = bytes.get(j) else {
-            break;
-        };
-        if !(0x40..=0x7e).contains(&final_b) {
-            i += 1;
-            continue;
-        }
-        let next = j + 1;
-        if matches!(final_b, b'h' | b'l') {
-            let params = &bytes[params_at..j];
-            let legacy = params.split(|b| *b == b';').any(|p| {
-                let head = p.split(|b| *b == b':').next().unwrap_or(p);
-                matches!(head, b"47" | b"1047")
-            });
-            if legacy {
-                out.extend_from_slice(&bytes[copied..i]);
-                out.extend_from_slice(b"\x1b[?");
-                let mut first = true;
-                for p in params.split(|b| *b == b';') {
-                    if !first {
-                        out.push(b';');
-                    }
-                    first = false;
-                    let head = p.split(|b| *b == b':').next().unwrap_or(p);
-                    if matches!(head, b"47" | b"1047") {
-                        out.extend_from_slice(b"1049");
-                        out.extend_from_slice(&p[head.len()..]);
-                    } else {
-                        out.extend_from_slice(p);
-                    }
-                }
-                out.push(final_b);
-                copied = next;
-                changed = true;
-            }
-        }
-        i = next;
-    }
-    if !changed {
-        return std::borrow::Cow::Borrowed(bytes);
-    }
-    out.extend_from_slice(&bytes[copied..]);
-    std::borrow::Cow::Owned(out)
-}
-
 fn note_screen_swap<T: EventListener>(before_alt: bool, t: &Term<T>, meta: &mut SessionMeta) {
     if before_alt != t.mode().contains(TermMode::ALT_SCREEN) {
         std::mem::swap(&mut meta.kitty_depth, &mut meta.kitty_alt_depth);
@@ -1451,12 +1392,7 @@ fn feed_plain<T: EventListener>(
         return;
     }
     let before_alt = t.mode().contains(TermMode::ALT_SCREEN);
-    // vte 0.15 sets `TermMode::ALT_SCREEN` for `?1049` only. `?47` and
-    // `?1047` are the other two ways a program enters that screen. Promote
-    // them to `?1049` for the parser so the mode bit is the one fact every
-    // caller reads. The original bytes stay in the scanners above this.
-    let promoted = promote_legacy_alt_screen(bytes);
-    parser.advance(t, promoted.as_ref());
+    parser.advance(t, bytes);
     note_screen_swap(before_alt, t, meta);
     // Same `ESC c` that [`process_chunk`] records in `saw_ris`. The parser
     // has just cleared both keyboard stacks. The counter has to follow, or
@@ -1727,6 +1663,10 @@ pub(crate) fn process_chunk<T: EventListener>(
     carry: &mut Vec<u8>,
     data: &[u8],
 ) -> ChunkEvents {
+    // `?47` / `?1047` / `?1049` for alt_off. Raw bytes, so a CSI split
+    // across reads stays open here. The parser still receives `data`
+    // unchanged (the filter below only strips BDSM and SCP).
+    meta.alt_track.observe(data);
     let items = meta.esc_filter.pull(data);
     let mut ev = ChunkEvents::default();
     for item in items {

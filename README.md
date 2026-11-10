@@ -943,9 +943,11 @@ sends `CSI 8 l`:
 ```
 
 `bidi.mode` is mintty's `Bidi=2/1/0`. `"full"` (2, the default) is the
-behavior above. `"alt_off"` (1) does not reorder while the pane is on the
-alternate screen — `TermMode::ALT_SCREEN`, whether the program got there
-with `?1049`, `?1047`, or `?47` — and reorders again on the primary screen.
+behavior above. `"alt_off"` (1) does not reorder while the program has
+entered the alternate screen with `?1049`, `?1047`, or `?47`, including
+when that CSI is split across reads, and reorders again after the reset.
+Only `?1049` changes alacritty's screen buffer. `?47` and `?1047` are
+tracked beside it for this decision and are not rewritten into `?1049`.
 `"off"` (0) does not reorder anywhere, so an agent that already ordered
 Arabic is not reversed a second time; Arabic shaping is unchanged. An
 explicit BDSM still disables reordering on top of `full` and of `alt_off`
