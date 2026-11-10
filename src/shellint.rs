@@ -1573,18 +1573,6 @@ fn find_real_bash() -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-fn set_dir_mtime(path: &Path, when: std::time::SystemTime) -> std::io::Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-    // A directory handle needs backup semantics or CreateFile refuses it.
-    // FILE_ATTRIBUTE_NORMAL must not be combined with that flag.
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?
-        .set_modified(when)
-}
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2005,40 +1993,36 @@ mod tests {
             std::env::temp_dir().join(format!("bayan-sweep-{}", random_hex().expect("random")));
         std::fs::create_dir(&parent).unwrap();
         let old = parent.join(integration_dirname(&"ab".repeat(16)));
-        let fresh = parent.join(integration_dirname(&"cd".repeat(16)));
         std::fs::create_dir(&old).unwrap();
-        std::fs::create_dir(&fresh).unwrap();
-        let old_time = std::time::SystemTime::now()
-            .checked_sub(std::time::Duration::from_secs(48 * 60 * 60))
-            .unwrap();
-        set_dir_mtime(&old, old_time).unwrap();
-        let cutoff = std::time::SystemTime::now()
-            .checked_sub(std::time::Duration::from_secs(12 * 60 * 60))
-            .unwrap();
-        let modified = std::fs::metadata(&old).unwrap().modified().unwrap();
-        assert!(
-            modified <= cutoff,
-            "directory mtime did not move into the past: {modified:?} cutoff {cutoff:?}"
-        );
-        // The CI token sometimes owns new directories as Administrators, not
-        // as the user SID `current_user_sid` returns. Sweep with the owner
-        // Windows actually stored, which is the check production makes.
         let sid = token_owner_sid().expect("token owner");
         assert_eq!(
             owner_sid(&old).as_deref(),
             Some(sid.as_str()),
             "a directory this process created is owned by the token owner"
         );
-        sweep_parent(&parent, cutoff, &sid);
-        assert!(!old.exists(), "a 48-hour-old directory is a crashed pane");
-        assert!(fresh.exists(), "a directory from this run stays");
-        let kept = parent.join(integration_dirname(&"ef".repeat(16)));
-        std::fs::create_dir(&kept).unwrap();
-        set_dir_mtime(&kept, old_time).unwrap();
-        sweep_parent(&parent, cutoff, "S-1-5-99");
+        // Rewriting a directory timestamp is Access Denied on the CI runner.
+        // A cutoff behind "now" is a fresh pane; a cutoff ahead of "now" is
+        // the same comparison as a 12-hour-old directory.
+        let past = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(12 * 60 * 60))
+            .unwrap();
+        sweep_parent(&parent, past, &sid);
         assert!(
-            kept.exists(),
+            old.exists(),
+            "a directory from this run is not 12 hours old"
+        );
+        let future = std::time::SystemTime::now()
+            .checked_add(std::time::Duration::from_secs(60))
+            .unwrap();
+        sweep_parent(&parent, future, "S-1-5-99");
+        assert!(
+            old.exists(),
             "another user's directory is not ours to delete"
+        );
+        sweep_parent(&parent, future, &sid);
+        assert!(
+            !old.exists(),
+            "a directory older than the cutoff is removed"
         );
         let _ = std::fs::remove_dir_all(&parent);
     }
