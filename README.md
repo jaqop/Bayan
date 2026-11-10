@@ -948,9 +948,30 @@ The flags are inherit-cursor, the resize quirk, and Win32 input mode
 DCS and APC and does not forward them, so a real Windows console host will
 not deliver Sixel or Kitty graphics. OSC is forwarded, which is why OSC 7,
 9, 52 and 133 already work, so an iTerm2 `OSC 1337` is not stripped the way
-DCS and APC are. Whether a full inline image survives conhost's OSC limits
-has not been checked on a live Windows console (see wezterm#3624 and
-Rio#1764). The parsers and the quad builder are covered by unit tests either way.
+DCS and APC are. A 96×48 PNG (224 base64 bytes) printed with `cmd /c type`
+arrived intact through conhost on Windows 11 26200; larger payloads against
+conhost's OSC limits have not been checked (see wezterm#3624 and Rio#1764).
+
+**The image never moves the cursor.** The first build reserved the image's
+rows the way the protocols ask (`ESC D` per row). Under ConPTY that was
+wrong, and live: conhost does not know the image, keeps its own cursor, and
+repaints from its own buffer with absolute positions (captured after a
+resize: `ESC[H` and every row with `ESC[K`). Bayan's rows then disagreed
+with conhost's by the image's height, and the line printed after the image
+disappeared. Now the image stays on the rows it arrived on and the text
+conhost prints next draws over it (images are drawn first, and a cell with
+the default background draws nothing). The cost: conhost's repaint clears
+lines with EL, and EL clears an iTerm or Sixel image it touches, so a resize
+repaint or `cls` (also all EL) removes the image. Reserving rows is worth
+revisiting only with `PSEUDOCONSOLE_PASSTHROUGH_MODE`.
+
+PNG payloads (iTerm2 and Kitty `f=100`, chunked uploads included) and Sixel
+are decoded on the reader thread before the terminal lock is taken. For a
+chunked Kitty upload the reader keeps its own copy of the base64 until the
+last chunk; the store uses that early decode only if its own assembled
+base64 is identical. The image filter copies text and CSI runs whole and
+steps byte by byte only through `ESC P`, `ESC _` and `ESC ]`: SGR-heavy
+output through `process_chunk` went from 76 to 82 MB/s (main: 88).
 
 ## BiDi controls and the current directory
 

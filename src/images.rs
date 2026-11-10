@@ -274,12 +274,11 @@ enum ClearKind {
     El(u16),
 }
 
-/// What applying one image command did. `move_down` is fed back through the
-/// VTE parser so the cursor the program sees matches the cells the image took.
+/// What applying one image command did. The cursor is never moved: under
+/// ConPTY conhost owns it (see `term::apply_image_pieces`).
 #[derive(Default)]
 pub struct Effect {
     pub replies: Vec<String>,
-    pub move_down: usize,
 }
 
 /// Images for one pane, plus the filter that feeds them.
@@ -316,8 +315,6 @@ struct PendingKitty {
     quiet: u8,
     columns: Option<u32>,
     rows: Option<u32>,
-    /// `true` when the client sent `C=1` (do not move the cursor).
-    hold_cursor: bool,
     /// `true` when the client sent `i=`. Replies are suppressed otherwise.
     client_id: bool,
     action: Action,
@@ -588,7 +585,11 @@ impl ImageStore {
                 overflow,
                 raster,
             } => self.place_sixel(p2, &data, overflow, raster, at),
-            Inbound::Kitty { body, overflow } => self.place_kitty(&body, overflow, at),
+            Inbound::Kitty {
+                body,
+                overflow,
+                warm,
+            } => self.place_kitty(&body, overflow, warm, at),
             Inbound::Iterm {
                 body,
                 overflow,
@@ -618,11 +619,8 @@ impl ImageStore {
         if !self.store_image(id, raster, false) {
             return Effect::default();
         }
-        let move_down = self.add_placement(id, None, at, cols, rows, true, Proto::Sixel, 0);
-        Effect {
-            move_down,
-            ..Effect::default()
-        }
+        self.add_placement(id, None, at, cols, rows, Proto::Sixel, 0);
+        Effect::default()
     }
 
     fn place_iterm(
@@ -665,23 +663,17 @@ impl ImageStore {
         if !self.store_image(id, raster, false) {
             return Effect::default();
         }
-        let move_down = self.add_placement(
-            id,
-            None,
-            at,
-            cols,
-            rows,
-            parsed.move_cursor,
-            Proto::Iterm,
-            0,
-        );
-        Effect {
-            move_down,
-            ..Effect::default()
-        }
+        self.add_placement(id, None, at, cols, rows, Proto::Iterm, 0);
+        Effect::default()
     }
 
-    fn place_kitty(&mut self, body: &[u8], overflow: bool, at: &PlaceAt) -> Effect {
+    fn place_kitty(
+        &mut self,
+        body: &[u8],
+        overflow: bool,
+        warm: Option<Box<(String, Raster)>>,
+        at: &PlaceAt,
+    ) -> Effect {
         if overflow {
             return Effect::default();
         }
@@ -711,7 +703,9 @@ impl ImageStore {
             Action::Delete => self.kitty_delete(&fields, at),
             Action::Put => self.kitty_put(&fields, at),
             Action::Query => self.kitty_query(&fields),
-            Action::Transmit | Action::TransmitDisplay => self.kitty_transmit(fields, payload, at),
+            Action::Transmit | Action::TransmitDisplay => {
+                self.kitty_transmit(fields, payload, warm, at)
+            }
             Action::Other => self.kitty_fail(&fields),
         }
     }
@@ -720,7 +714,6 @@ impl ImageStore {
     fn kitty_query(&mut self, fields: &KittyFields) -> Effect {
         Effect {
             replies: kitty_reply(fields.quiet, self.reply_id(fields), None, true),
-            move_down: 0,
         }
     }
 
@@ -732,11 +725,16 @@ impl ImageStore {
         self.pending = None;
         Effect {
             replies: kitty_reply(fields.quiet, self.reply_id(fields), None, false),
-            move_down: 0,
         }
     }
 
-    fn kitty_transmit(&mut self, fields: KittyFields, payload: &[u8], at: &PlaceAt) -> Effect {
+    fn kitty_transmit(
+        &mut self,
+        fields: KittyFields,
+        payload: &[u8],
+        warm: Option<Box<(String, Raster)>>,
+        at: &PlaceAt,
+    ) -> Effect {
         let quiet = fields.quiet;
         // A later chunk often omits `i`. It belongs to the open transmission.
         let id = if let Some(id) = fields.image_id {
@@ -784,7 +782,6 @@ impl ImageStore {
                 quiet,
                 columns: fields.columns,
                 rows: fields.rows,
-                hold_cursor: fields.hold_cursor,
                 client_id: fields.client_id,
                 action: fields.action,
                 pinned: fields.action == Action::Transmit,
@@ -801,9 +798,6 @@ impl ImageStore {
         }
         if fields.rows.is_some() {
             pending.rows = fields.rows;
-        }
-        if fields.cursor_set {
-            pending.hold_cursor = fields.hold_cursor;
         }
         if fields.client_id {
             pending.client_id = true;
@@ -828,12 +822,16 @@ impl ImageStore {
         let quiet = pending.quiet;
         let place = pending.action == Action::TransmitDisplay;
         let pinned = pending.pinned || pending.action == Action::Transmit;
-        let hold_cursor = pending.hold_cursor;
         let columns = pending.columns;
         let rows_hint = pending.rows;
         let id = pending.id;
         let client_id = pending.client_id;
-        let decoded = match finish_kitty(&pending, &self.limits) {
+        // The reader decoded the PNG before the lock. Use it only for the
+        // exact upload assembled here; otherwise decode now.
+        let early = warm
+            .filter(|w| pending.format == 100 && w.0 == pending.b64)
+            .map(|w| w.1);
+        let decoded = match early.or_else(|| finish_kitty(&pending, &self.limits)) {
             Some(r) => r,
             None => return self.kitty_fail(&fields),
         };
@@ -843,24 +841,21 @@ impl ImageStore {
         if !self.store_image(id, decoded, pinned) {
             return self.kitty_fail(&fields);
         }
-        let mut move_down = 0;
         if place {
             let img = &self.images[&id];
             let (cols, rows) = self.cell_span(img.w, img.h, columns, rows_hint);
-            move_down = self.add_placement(
+            self.add_placement(
                 id,
                 fields.placement_id,
                 at,
                 cols,
                 rows,
-                !hold_cursor,
                 Proto::Kitty,
                 fields.z,
             );
         }
         Effect {
             replies: kitty_reply(quiet, client_id.then_some(id), fields.placement_id, true),
-            move_down,
         }
     }
 
@@ -877,19 +872,17 @@ impl ImageStore {
         }
         let img = &self.images[&id];
         let (cols, rows) = self.cell_span(img.w, img.h, fields.columns, fields.rows);
-        let move_down = self.add_placement(
+        self.add_placement(
             id,
             fields.placement_id,
             at,
             cols,
             rows,
-            !fields.hold_cursor,
             Proto::Kitty,
             fields.z,
         );
         Effect {
             replies: kitty_reply(fields.quiet, Some(id), fields.placement_id, true),
-            move_down,
         }
     }
 
@@ -957,7 +950,6 @@ impl ImageStore {
                 fields.placement_id,
                 true,
             ),
-            move_down: 0,
         }
     }
 
@@ -1090,10 +1082,9 @@ impl ImageStore {
         at: &PlaceAt,
         cols: usize,
         rows: usize,
-        move_cursor: bool,
         proto: Proto,
         z: i32,
-    ) -> usize {
+    ) {
         let id = protocol_id.unwrap_or_else(|| {
             self.next_place = self.next_place.wrapping_add(1).max(1);
             self.next_place
@@ -1112,11 +1103,6 @@ impl ImageStore {
             proto,
             z,
         });
-        if move_cursor {
-            rows
-        } else {
-            0
-        }
     }
 
     fn free_image(&mut self, id: u32) {
@@ -1626,14 +1612,10 @@ struct KittyFields {
     height: Option<u32>,
     columns: Option<u32>,
     rows: Option<u32>,
-    /// `C=1`: do not move the cursor. The default (`C` omitted or `C=0`) moves.
-    hold_cursor: bool,
     /// The client included the `i` key. Replies are sent only then.
     client_id: bool,
     /// The client included the `a` key. A chunk that omits it keeps the open action.
     action_set: bool,
-    /// The client included `C`.
-    cursor_set: bool,
     /// Delete cell, 1-based, `0` means the key was absent.
     cell_x: u32,
     cell_y: u32,
@@ -1656,10 +1638,8 @@ impl Default for KittyFields {
             height: None,
             columns: None,
             rows: None,
-            hold_cursor: false,
             client_id: false,
             action_set: false,
-            cursor_set: false,
             cell_x: 0,
             cell_y: 0,
             z: 0,
@@ -1727,11 +1707,6 @@ fn apply_kitty_key(f: &mut KittyFields, key: u8, val: &str) -> Option<()> {
         b'v' => f.height = Some(parse_u32_key(val)?),
         b'c' => f.columns = Some(parse_u32_key(val)?),
         b'r' => f.rows = Some(parse_u32_key(val)?),
-        b'C' => {
-            f.cursor_set = true;
-            // Spec: 0 moves the cursor to after the image; 1 does not move it.
-            f.hold_cursor = val == "1";
-        }
         b'x' => f.cell_x = parse_u32_key(val)?,
         b'y' => f.cell_y = parse_u32_key(val)?,
         b'z' => {
@@ -1852,7 +1827,15 @@ fn decode_b64(s: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// PNG decodes on this thread, so a test can tell where one happened.
+    static PNG_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn decode_png(data: &[u8], limits: &ImageLimits) -> Option<Raster> {
+    #[cfg(test)]
+    PNG_DECODES.with(|n| n.set(n.get() + 1));
     if data.len() < 8 || !data.starts_with(b"\x89PNG\r\n\x1a\n") {
         return None;
     }
@@ -1897,7 +1880,6 @@ struct ItermParsed {
     inline: bool,
     width: Dim,
     height: Dim,
-    move_cursor: bool,
     size: Option<usize>,
     b64: String,
 }
@@ -1910,7 +1892,6 @@ fn parse_iterm(body: &[u8]) -> Option<ItermParsed> {
     let mut inline = false;
     let mut width = Dim::Auto;
     let mut height = Dim::Auto;
-    let mut move_cursor = true;
     let mut size = None;
     for arg in args.split(';') {
         if arg.is_empty() {
@@ -1923,11 +1904,6 @@ fn parse_iterm(body: &[u8]) -> Option<ItermParsed> {
             "inline" => inline = v == "1",
             "width" => width = parse_dim(v),
             "height" => height = parse_dim(v),
-            "doNotMoveCursor" => {
-                if v == "1" {
-                    move_cursor = false;
-                }
-            }
             "size" => {
                 size = v.parse::<usize>().ok();
             }
@@ -1938,7 +1914,6 @@ fn parse_iterm(body: &[u8]) -> Option<ItermParsed> {
         inline,
         width,
         height,
-        move_cursor,
         size,
         b64: b64.to_string(),
     })
@@ -2001,6 +1976,10 @@ pub(crate) enum Inbound {
     Kitty {
         body: Vec<u8>,
         overflow: bool,
+        /// A finished `f=100` upload decoded before the lock: the whole
+        /// base64 it was decoded from, and the pixels. The store uses them
+        /// only when that base64 equals the upload it assembled itself.
+        warm: Option<Box<(String, Raster)>>,
     },
     Iterm {
         body: Vec<u8>,
@@ -2009,10 +1988,82 @@ pub(crate) enum Inbound {
     },
 }
 
-/// Decode sixel and PNG payloads. Safe to call without the terminal lock.
-pub(crate) fn warm_inbound(pieces: &mut [Inbound], limits: &ImageLimits) {
+/// The reader's copy of an open Kitty `f=100` upload, so the PNG can be
+/// decoded before the terminal lock when the last chunk arrives.
+struct KittyShadow {
+    id: Option<u32>,
+    action: Action,
+    b64: String,
+}
+
+/// Follow Kitty transmissions the way [`ImageStore::place_kitty`] does,
+/// closely enough to decode a finished PNG upload early. A divergence from
+/// the store only costs the early decode: the store checks the base64.
+fn shadow_kitty(
+    open: &mut Option<KittyShadow>,
+    body: &[u8],
+    limits: &ImageLimits,
+) -> Option<Box<(String, Raster)>> {
+    let (mut fields, payload) = parse_kitty(body)?;
+    let prev = open.take();
+    if fields.transmission != Trans::Direct || fields.compression {
+        return None;
+    }
+    if !fields.action_set {
+        if let Some(p) = &prev {
+            fields.action = p.action;
+        }
+    }
+    if !matches!(fields.action, Action::Transmit | Action::TransmitDisplay) {
+        *open = prev;
+        return None;
+    }
+    let continuing = prev
+        .as_ref()
+        .is_some_and(|p| fields.image_id.is_none() || fields.image_id == p.id);
+    let mut shadow = match prev {
+        Some(p) if continuing => p,
+        _ if fields.format == 100 => KittyShadow {
+            id: fields.image_id,
+            action: fields.action,
+            b64: String::new(),
+        },
+        _ => return None,
+    };
+    let piece = std::str::from_utf8(payload).unwrap_or("");
+    shadow
+        .b64
+        .extend(piece.chars().filter(|c| !c.is_ascii_whitespace()));
+    // shortcut: an open upload is held twice (here and in the store's
+    // pending) until its last chunk; bounded by the same base64 cap.
+    if shadow.b64.len() > limits.max_bytes.saturating_mul(4) / 3 + 8 {
+        return None;
+    }
+    if fields.more {
+        *open = Some(shadow);
+        return None;
+    }
+    let bytes = decode_b64(&shadow.b64)?;
+    if bytes.len() > limits.max_bytes {
+        return None;
+    }
+    let raster = decode_png(&bytes, limits)?;
+    Some(Box::new((shadow.b64, raster)))
+}
+
+/// Decode sixel and PNG payloads (Kitty `f=100` included). Safe to call
+/// without the terminal lock. `kitty` carries an open Kitty PNG upload from
+/// one read to the next.
+fn warm_inbound(pieces: &mut [Inbound], limits: &ImageLimits, kitty: &mut Option<KittyShadow>) {
     for piece in pieces {
         match piece {
+            Inbound::Kitty {
+                body,
+                overflow,
+                warm,
+            } if !*overflow => {
+                *warm = shadow_kitty(kitty, body, limits);
+            }
             Inbound::Sixel {
                 p2,
                 data,
@@ -2040,7 +2091,7 @@ pub(crate) fn warm_inbound(pieces: &mut [Inbound], limits: &ImageLimits) {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Ground,
     Esc,
@@ -2049,7 +2100,7 @@ enum Phase {
     Apc(StrKind),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StrKind {
     Probe,
     Take,
@@ -2073,6 +2124,7 @@ pub struct ImageFilter {
     sixel_p2: u8,
     /// Probe or in-progress payload held from the previous read.
     carry: Vec<u8>,
+    kitty: Option<KittyShadow>,
 }
 
 impl Default for ImageFilter {
@@ -2084,11 +2136,17 @@ impl Default for ImageFilter {
             overflow: false,
             sixel_p2: 0,
             carry: Vec::new(),
+            kitty: None,
         }
     }
 }
 
 impl ImageFilter {
+    /// Decode what [`Self::pull`] lifted, before the terminal lock is taken.
+    pub(crate) fn warm(&mut self, pieces: &mut [Inbound], limits: &ImageLimits) {
+        warm_inbound(pieces, limits, &mut self.kitty);
+    }
+
     pub fn set_limits(&mut self, limits: ImageLimits) {
         self.limits = limits;
     }
@@ -2122,6 +2180,74 @@ impl ImageFilter {
             return vec![Inbound::Bytes(input.to_vec())];
         }
         let mut held = std::mem::take(&mut self.carry);
+        let mut out = Vec::with_capacity(input.len());
+        let mut pieces = Vec::new();
+        let mut i = 0;
+        while i < input.len() {
+            // Runs that cannot change state are copied (or held) whole:
+            // Ground ends only at an ESC that may open a string (ESC P,
+            // ESC _, ESC ], ESC ESC, or an ESC the read ends on); a CSI
+            // such as SGR is copied with the text around it. A string body
+            // ends only at ESC, BEL, CAN or SUB. Only the bytes that can
+            // start or end an image go through `once` one at a time.
+            let run = if self.saw_esc {
+                0
+            } else {
+                let rest = &input[i..];
+                let stop = match self.phase {
+                    Phase::Ground => ground_stop(rest),
+                    Phase::Osc(StrKind::Forward | StrKind::Take)
+                    | Phase::Dcs(StrKind::Forward | StrKind::Take)
+                    | Phase::Apc(StrKind::Forward | StrKind::Take) => rest
+                        .iter()
+                        .position(|&b| matches!(b, 0x1b | 0x07 | 0x18 | 0x1a)),
+                    _ => Some(0),
+                };
+                stop.unwrap_or(rest.len())
+            };
+            if run > 0 {
+                let bytes = &input[i..i + run];
+                if self.is_forward() || matches!(self.phase, Phase::Ground) {
+                    out.extend_from_slice(bytes);
+                } else {
+                    self.take_run(bytes, &mut held);
+                }
+                i += run;
+                continue;
+            }
+            let mut next = Some(input[i]);
+            while let Some(b) = next.take() {
+                next = self.once(b, &mut held, &mut out, &mut pieces);
+            }
+            i += 1;
+        }
+        flush_bytes(&mut out, &mut pieces);
+        if self.keeping() {
+            self.carry = held;
+        }
+        pieces
+    }
+
+    /// `push_body` for a whole run of image payload: the same cap, hit at
+    /// the same byte count.
+    fn take_run(&mut self, bytes: &[u8], held: &mut Vec<u8>) {
+        if !self.limits.enabled || self.overflow {
+            return;
+        }
+        if held.len().saturating_add(bytes.len()) > self.raw_cap() {
+            self.overflow = true;
+            held.clear();
+            held.shrink_to_fit();
+            return;
+        }
+        held.extend_from_slice(bytes);
+    }
+
+    /// The loop `pull_limited` had before the run fast path: every byte
+    /// through `once`. Kept as the reference the fast path is tested against.
+    #[cfg(test)]
+    fn pull_bytewise(&mut self, input: &[u8]) -> Vec<Inbound> {
+        let mut held = std::mem::take(&mut self.carry);
         let mut out = Vec::new();
         let mut pieces = Vec::new();
         for &b in input {
@@ -2135,6 +2261,19 @@ impl ImageFilter {
             self.carry = held;
         }
         pieces
+    }
+}
+
+/// The first ESC in `data` that Ground cannot pass through as plain bytes.
+/// Any other `ESC x` leaves Ground for one byte and returns, emitting both.
+fn ground_stop(data: &[u8]) -> Option<usize> {
+    let mut from = 0;
+    loop {
+        let at = from + data[from..].iter().position(|&b| b == 0x1b)?;
+        match data.get(at + 1) {
+            None | Some(b'P' | b'_' | b']' | 0x1b) => return Some(at),
+            Some(_) => from = at + 2,
+        }
     }
 }
 
@@ -2383,6 +2522,7 @@ impl ImageFilter {
                     pieces.push(Inbound::Kitty {
                         body: std::mem::take(held),
                         overflow,
+                        warm: None,
                     });
                 }
             }
@@ -2534,7 +2674,12 @@ mod tests {
         feed(&mut t, &mut p, &mut meta, &mut carry, red_green_sixel());
         feed(&mut t, &mut p, &mut meta, &mut carry, b"B");
         assert_eq!(cell(&t, 0, 0), 'A');
-        assert_eq!(cell(&t, 1, 0), 'B', "the cursor steps past the image");
+        // Conhost owns the cursor, so the image does not move it.
+        assert_eq!(
+            cell(&t, 0, 1),
+            'B',
+            "the cursor stays where the text left it"
+        );
         let snaps = meta.images.snapshot();
         assert_eq!(snaps.len(), 1);
         assert_eq!(snaps[0].line, 0);
@@ -2730,6 +2875,229 @@ mod tests {
         feed(&mut t, &mut p, &mut meta, &mut carry, seq.as_bytes());
         assert_eq!(meta.images.placement_count(), 0);
         assert_eq!(meta.images.pane_bytes(), 0);
+    }
+
+    /// `cmd /c type` of a file holding an iTerm image, as conhost forwards
+    /// it (captured through ConPTY). Conhost does not know the image, so its
+    /// cursor stays where the text left it and its later output, a repaint
+    /// above all, lands on the rows it counts. Bayan must count the same
+    /// rows: text after the image prints where conhost puts it, over the
+    /// image (drawn beneath text), instead of being pushed below it.
+    #[test]
+    fn text_after_an_iterm_image_stays_on_the_rows_conhost_counts() {
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(
+                &[255, 0, 0, 255].repeat(96 * 48),
+                96,
+                48,
+                image::ExtendedColorType::Rgba8,
+            )
+            .expect("encode png");
+        let (mut t, mut p, mut meta, mut carry) = fresh_sized(40, 12, 10);
+        let stream = format!(
+            "before-image\r\n\x1b]1337;File=inline=1;size={}:{}\x07\r\nafter-image\r\n",
+            png.len(),
+            b64(&png)
+        );
+        feed(&mut t, &mut p, &mut meta, &mut carry, stream.as_bytes());
+        // cmd's blank line, then the prompt at the row conhost addresses.
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[5;1HC:\\>");
+        let row = |t: &Term<VoidListener>, line: i32| -> String {
+            (0..t.columns())
+                .map(|c| cell(t, line, c))
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        assert_eq!(row(&t, 0), "before-image");
+        assert_eq!(row(&t, 2), "after-image", "conhost printed it on row 2");
+        assert_eq!(row(&t, 4), "C:\\>");
+        assert_eq!(row(&t, 5), "", "nothing was pushed below the prompt");
+        let info = meta.images.placements();
+        assert_eq!(info.len(), 1, "the image is still shown");
+        assert_eq!(
+            (info[0].line, info[0].col),
+            (1, 0),
+            "anchored where it arrived"
+        );
+    }
+
+    /// The run fast path in `pull` emits exactly what the byte-at-a-time
+    /// loop did, read by read, for streams dense in image starts, other
+    /// strings, terminators, cancels, a lone ESC, split reads, and payloads
+    /// past a small cap.
+    #[test]
+    fn the_run_fast_path_matches_the_bytewise_filter() {
+        let pieces: &[&[u8]] = &[
+            b"plain text ",
+            "مرحبا ".as_bytes(),
+            b"\x1b[31m",
+            b"\x1b[0m",
+            b"\x1b]0;title\x07",
+            b"\x1b]1337;File=inline=1:",
+            b"\x1b]1337;Fi",
+            b"\x1bPq",
+            b"\x1bP0;2q",
+            b"\x1bP1$r",
+            b"#1~~-",
+            b"\x1b_Ga=T,f=24,s=1,v=1;",
+            b"\x1b_X",
+            b"AAAAAAAAAAAAAAAA",
+            b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            b"AAAAAAA",
+            b"A",
+            b"A",
+            b"\x1b",
+            b"\x1b\\",
+            b"\\",
+            b"\x07",
+            b"\x18",
+            b"\x1a",
+            b"P",
+            b"_",
+            b"]",
+            b"\x9b",
+        ];
+        let mut rng = 0x1A6E_u64;
+        let mut next = move |n: usize| {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((rng >> 33) as usize) % n
+        };
+        let shape = |ps: &[Inbound]| -> Vec<(u8, Vec<u8>, bool)> {
+            ps.iter()
+                .map(|p| match p {
+                    Inbound::Bytes(b) => (0, b.clone(), false),
+                    Inbound::Sixel { data, overflow, .. } => (1, data.clone(), *overflow),
+                    Inbound::Kitty { body, overflow, .. } => (2, body.clone(), *overflow),
+                    Inbound::Iterm { body, overflow, .. } => (3, body.clone(), *overflow),
+                })
+                .collect()
+        };
+        let mut compared = 0;
+        for case in 0..400 {
+            let stream: Vec<u8> = (0..80)
+                .flat_map(|_| pieces[next(pieces.len())].iter().copied())
+                .collect();
+            let (mut fast, mut slow) = (ImageFilter::default(), ImageFilter::default());
+            if case % 2 == 1 {
+                // raw_cap = 12 * 4 / 3 + 64 = 80: some payloads overflow.
+                let small = ImageLimits {
+                    max_bytes: 12,
+                    ..ImageLimits::default()
+                };
+                fast.set_limits(small);
+                slow.set_limits(small);
+            }
+            let mut at = 0;
+            while at < stream.len() {
+                let end = (at + 1 + next(48)).min(stream.len());
+                let read = &stream[at..end];
+                assert_eq!(
+                    shape(&fast.pull(read)),
+                    shape(&slow.pull_bytewise(read)),
+                    "case {case}, read {at}..{end} of {stream:?}"
+                );
+                assert_eq!(
+                    (fast.phase, fast.saw_esc, fast.overflow, &fast.carry),
+                    (slow.phase, slow.saw_esc, slow.overflow, &slow.carry),
+                    "case {case}: state after {end}"
+                );
+                compared += 1;
+                at = end;
+            }
+        }
+        assert!(compared > 1000, "only {compared} reads compared");
+    }
+
+    /// The reader's order: `pull` and `warm` with no lock, then `ingest`
+    /// under it. A Kitty PNG, single or chunked with `m=1` and split across
+    /// reads, must be decoded in `warm`, never in `ingest`.
+    #[test]
+    fn kitty_png_is_decoded_before_the_lock() {
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(
+                &[0, 0, 255, 255].repeat(40 * 20),
+                40,
+                20,
+                image::ExtendedColorType::Rgba8,
+            )
+            .expect("encode png");
+        let enc = b64(&png);
+        let chunks: Vec<&str> = enc
+            .as_bytes()
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        assert!(chunks.len() > 2, "the upload must be chunked");
+        let mut chunked = Vec::new();
+        for (i, c) in chunks.iter().enumerate() {
+            let more = u8::from(i + 1 < chunks.len());
+            let ctl = if i == 0 {
+                format!("a=T,f=100,i=7,q=2,m={more}")
+            } else {
+                format!("m={more}")
+            };
+            chunked.extend(kitty(&format!("{ctl};{c}")));
+        }
+        let single = kitty(&format!("a=T,f=100,q=2;{enc}"));
+        let at = PlaceAt {
+            line: 0,
+            col: 0,
+            columns: 40,
+            screen_rows: 8,
+            screen_top: 0,
+        };
+        for stream in [single, chunked] {
+            let mut filter = ImageFilter::default();
+            let mut store = ImageStore::default();
+            let limits = store.limits();
+            let mut warmed = 0;
+            // Reads that cut through sequences, as a PTY does.
+            for read in stream.chunks(37) {
+                let mut pieces = filter.pull(read);
+                let before = PNG_DECODES.with(|n| n.get());
+                filter.warm(&mut pieces, &limits);
+                warmed += PNG_DECODES.with(|n| n.get()) - before;
+                let before = PNG_DECODES.with(|n| n.get());
+                for piece in pieces {
+                    store.ingest(piece, &at);
+                }
+                assert_eq!(
+                    PNG_DECODES.with(|n| n.get()),
+                    before,
+                    "a PNG was decoded under the lock"
+                );
+                store.sync_inflight(filter.carry_len());
+            }
+            assert_eq!(warmed, 1);
+            let snaps = store.snapshot();
+            assert_eq!(snaps.len(), 1);
+            assert_eq!((snaps[0].width, snaps[0].height), (40, 20));
+            assert_eq!(&snaps[0].rgba[..4], &[0, 0, 255, 255]);
+        }
+
+        // An early decode that is not this upload's is not used.
+        let mut store = ImageStore::default();
+        let wrong = Raster {
+            w: 1,
+            h: 1,
+            rgba: vec![9, 9, 9, 255],
+        };
+        store.ingest(
+            Inbound::Kitty {
+                body: format!("a=T,f=100,q=2;{enc}").into_bytes(),
+                overflow: false,
+                warm: Some(Box::new((String::from("AAAA"), wrong))),
+            },
+            &at,
+        );
+        let snaps = store.snapshot();
+        assert_eq!((snaps[0].width, snaps[0].height), (40, 20));
     }
 
     #[test]
@@ -3028,7 +3396,8 @@ mod tests {
             (max_u - 0.4).abs() < 0.02,
             "a 200px quad clipped to 80px keeps the left of the texture, u={max_u}"
         );
-        // Fully below the pane: no quad.
+        // Fully below the pane: no quad, but the sprite is still sent, so
+        // the GPU keeps its texture and scrolling back does not re-upload.
         let below = ImageSnap {
             cookie: 2,
             line: 50,
@@ -3039,7 +3408,10 @@ mod tests {
             height: 1,
             rgba: Arc::from(vec![0u8; 4]),
         };
-        assert!(crate::render::image_sprites(clip, 10.0, 10.0, 0, 0, &[below]).is_empty());
+        let off = crate::render::image_sprites(clip, 10.0, 10.0, 0, 0, &[below]);
+        assert_eq!(off.len(), 1);
+        assert_eq!(off[0].cookie, 2);
+        assert!(off[0].verts.is_empty());
     }
 
     #[test]
@@ -3137,7 +3509,7 @@ mod tests {
     }
 
     #[test]
-    fn image_on_the_last_row_scrolls_instead_of_being_overwritten() {
+    fn image_on_the_last_row_does_not_scroll_the_screen() {
         for kind in ["iterm", "sixel", "kitty"] {
             let (mut t, mut p, mut meta, mut carry) = fresh_sized(20, 8, 30);
             for _ in 0..7 {
@@ -3157,8 +3529,6 @@ mod tests {
                     );
                 }
                 "sixel" => {
-                    // three bands of one red pixel column: 18 pixels tall → 2 cells at 16px, but
-                    // we force the move by the decoded cell span. A short sixel still moves.
                     feed(&mut t, &mut p, &mut meta, &mut carry, red_green_sixel());
                 }
                 _ => {
@@ -3170,26 +3540,20 @@ mod tests {
                     feed(&mut t, &mut p, &mut meta, &mut carry, seq.as_bytes());
                 }
             }
-            let rows = meta.images.placements()[0].rows;
-            assert!(
-                t.grid().history_size() >= before + rows,
-                "{kind}: history {} did not grow by {rows} from {before}",
-                t.grid().history_size()
-            );
+            // A scroll conhost did not make would shift every row it repaints.
+            assert_eq!(t.grid().history_size(), before, "{kind}: screen scrolled");
             let anchor = meta.images.placements()[0].line;
             feed(&mut t, &mut p, &mut meta, &mut carry, b"NEXT");
             let (line, _) = crate::bidi_ctl::cursor_abs(&t, meta.evicted);
-            assert!(
-                line >= anchor + rows as u64,
-                "{kind}: next text at {line} overlaps image at {anchor}+{rows}"
-            );
+            assert_eq!(line, anchor, "{kind}: text continues on the image's row");
         }
     }
 
     #[test]
     fn kitty_matches_the_graphics_protocol() {
         let px = b64(&[255, 0, 0]);
-        // Default and C=0 move the cursor. C=1 does not.
+        // The protocol moves the cursor unless C=1, but conhost owns the
+        // cursor (see `apply_image_pieces`), so neither form moves it.
         let (mut t, mut p, mut meta, mut carry) = fresh();
         feed(
             &mut t,
@@ -3198,7 +3562,7 @@ mod tests {
             &mut carry,
             &kitty(&format!("a=T,f=24,s=1,v=1,r=3,c=1,i=1;{px}")),
         );
-        assert_eq!(t.grid().cursor.point.line.0, 3);
+        assert_eq!(t.grid().cursor.point.line.0, 0);
         let (mut t, mut p, mut meta, mut carry) = fresh();
         feed(
             &mut t,

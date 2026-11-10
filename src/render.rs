@@ -450,9 +450,8 @@ pub fn image_sprites(
             1.0,
             [1.0, 1.0, 1.0, 1.0],
         );
-        if verts.is_empty() {
-            continue;
-        }
+        // An off-screen image is still sent, with no verts: the GPU keeps
+        // its texture while the store holds it, so scrolling back is free.
         sprites.push(ImageSprite {
             cookie: snap.cookie,
             width: snap.width,

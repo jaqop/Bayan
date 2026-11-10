@@ -79,8 +79,9 @@ pub struct Gpu {
     globals_buf: wgpu::Buffer,
     atlas_tex: wgpu::Texture,
     layers: u32,
-    /// Inline-image textures, keyed by the store's cookie. Dropped when a
-    /// frame no longer shows that image.
+    /// Inline-image textures, keyed by the store's cookie. Dropped when the
+    /// frame's panes no longer hold that image; one scrolled out of view
+    /// arrives with no verts and keeps its texture.
     images: HashMap<u64, CachedImage>,
 }
 

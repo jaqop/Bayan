@@ -1714,7 +1714,8 @@ pub(crate) fn process_chunk<T: EventListener>(
     let mut pieces = meta.image_in.pull(data);
     // Sixel and PNG are decoded before the rest of the chunk mutates the
     // grid. The reader calls the same warm step with the locks released.
-    crate::images::warm_inbound(&mut pieces, &meta.images.limits());
+    let limits = meta.images.limits();
+    meta.image_in.warm(&mut pieces, &limits);
     // The completed payload has left the carry. Charge only what is still open
     // before the decoded image itself is charged. A carry the budget cannot
     // hold is dropped rather than kept for free.
@@ -1781,17 +1782,14 @@ fn apply_image_pieces<T: EventListener>(
                 let at = place_at(t, meta);
                 let effect = meta.images.ingest(other, &at);
                 ev.pty_replies.extend(effect.replies);
-                if effect.move_down > 0 {
-                    // IND scrolls at the bottom margin. CUD does not, so an
-                    // image on the last row would be overwritten by the next line.
-                    let mut seq = String::new();
-                    for _ in 0..effect.move_down {
-                        seq.push_str("\x1bD");
-                    }
-                    seq.push('\r');
-                    let part = process_bytes(parser, t, meta, carry, seq.as_bytes());
-                    merge_chunk(&mut ev, part);
-                }
+                // The cursor is not moved past the image, whatever the
+                // protocol asks. Conhost owns the cursor and does not know
+                // the image: it keeps counting rows without it and repaints
+                // with absolute positions, so rows reserved here put its
+                // later output on the wrong lines (text after the image was
+                // lost). The image stays on the rows it arrived on and the
+                // text that follows draws over it. Revisit only if
+                // PSEUDOCONSOLE_PASSTHROUGH_MODE is turned on.
             }
         }
     }
@@ -1868,7 +1866,10 @@ fn next_grid_op(data: &[u8]) -> Option<(usize, usize, GridOp)> {
     let mut i = 0;
     while i < data.len() {
         if data[i] != 0x1b {
-            i += 1;
+            i = data[i..]
+                .iter()
+                .position(|&b| b == 0x1b)
+                .map_or(data.len(), |k| i + k);
             continue;
         }
         if let Some((start, end)) = ris_at(data, i) {
@@ -2611,7 +2612,7 @@ impl Session {
                             let mut pieces = filter.pull(&buf[..n]);
                             // Drop the meta guard before decoding.
                             drop(m);
-                            crate::images::warm_inbound(&mut pieces, &limits);
+                            filter.warm(&mut pieces, &limits);
                             (filter, pieces)
                         };
                         let (ev, out, sync_deadline) = {
@@ -5900,6 +5901,16 @@ mod measure_probes {
                     mb / secs
                 );
             };
+            let mut images = crate::images::ImageFilter::default();
+            time("image filter", &mut |c| {
+                std::hint::black_box(images.pull(c));
+            });
+            time("next_grid_op", &mut |c| {
+                let mut pos = 0;
+                while let Some((_, end, _)) = next_grid_op(&c[pos..]) {
+                    pos += end;
+                }
+            });
             let mut filter = SessionMeta::default().esc_filter;
             time("bidi_ctl filter", &mut |c| {
                 std::hint::black_box(filter.pull(c));

@@ -39,7 +39,7 @@ selection and BiDi paths must do.
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-520 tests across the tree. `term.rs` (82), `link.rs` (61) and `render.rs` (66)
+523 tests across the tree. `term.rs` (82), `link.rs` (61) and `render.rs` (66)
 carry the most; `localpath.rs` has 21. Three more in `term.rs` are `#[ignore]`d
 probes, run by hand (see Measuring).
 
