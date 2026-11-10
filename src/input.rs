@@ -395,7 +395,7 @@ impl App {
         if let Some(s) = self.session() {
             let mut t = s.term.lock();
             let off = t.grid().display_offset() as i32;
-            let point = Point::new(Line(row - off), Column(col));
+            let point = Point::new(Line(crate::scroll::grid_line(row, off)), Column(col));
             if let Some(sel) = t.selection.as_mut() {
                 sel.update(point, side);
             }
@@ -551,7 +551,7 @@ impl App {
             if delta != 0 {
                 // Term::scroll_display, not the grid's: in copy mode this
                 // keeps the vi cursor inside the viewport.
-                term.scroll_display(Scroll::Delta(delta));
+                term.scroll_display(crate::scroll::display_delta(offset, next));
             }
             delta
         };
@@ -591,7 +591,7 @@ impl App {
             let (next, _) = st.commit_for_navigation(offset, history);
             let delta = next - offset;
             if delta != 0 {
-                term.scroll_display(Scroll::Delta(delta));
+                term.scroll_display(crate::scroll::display_delta(offset, next));
             }
             delta
         };
@@ -644,7 +644,7 @@ impl App {
                     let next = st.tick(offset, history, dt);
                     let delta = next - term.grid().display_offset() as i32;
                     if delta != 0 {
-                        term.scroll_display(Scroll::Delta(delta));
+                        term.scroll_display(crate::scroll::display_delta(offset, next));
                     }
                     delta
                 };
@@ -941,7 +941,7 @@ impl App {
         if let Some(s) = self.session() {
             let mut t = s.term.lock();
             let off = t.grid().display_offset() as i32;
-            let point = Point::new(Line(row - off), Column(col));
+            let point = Point::new(Line(crate::scroll::grid_line(row, off)), Column(col));
             t.selection = Some(Selection::new(ty, point, side));
         }
         self.mouse.selecting = true;

@@ -2993,12 +2993,11 @@ impl Renderer {
         if arabic && view.reorder {
             let on_row = cursor_vrow == vis;
             let col = if on_row { Some(ccol) } else { None };
-            let r = if (row_claude || alt) && is_tui_row(cells) {
+            if (row_claude || alt) && is_tui_row(cells) {
                 self.draw_line_tui(out, clip, px, y, cells, row_claude, col, dir, hover)
             } else {
                 self.draw_line_bidi(out, clip, px, y, pw, cells, row_claude, col, dir, hover)
-            };
-            r
+            }
         } else {
             self.draw_line_grid(out, clip, px, y, cells, hover);
             None
@@ -8022,6 +8021,112 @@ mod cache_tests {
         assert!(
             underlined > plain,
             "no underline quads on the Arabic row ({underlined} vs {plain})"
+        );
+    }
+
+    /// A smooth scroll that has landed on a whole line draws an Arabic and
+    /// Hebrew row the same way a `Scroll::Delta` of those lines does. While
+    /// the fraction is still on screen the shaped boxes (x, width, RTL) do
+    /// not move; only the pixels do.
+    #[test]
+    fn settled_smooth_scroll_matches_the_whole_line_bidi_frame() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::grid::{Dimensions, Scroll};
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let mut renderer = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 40, rows: 4 };
+        let bytes: String = [
+            "latin-aaa\r\n",
+            "مرحبا واحد\r\n",
+            "latin-bbb\r\n",
+            "שלום שתיים\r\n",
+            "latin-ccc\r\n",
+            "مرحبا ثلاثة\r\n",
+            "latin-ddd\r\n",
+            "שלום ארבע\r\n",
+        ]
+        .concat();
+        let term = || {
+            let mut t = Term::new(Config::default(), &size, VoidListener);
+            let mut parser: Processor = Processor::new();
+            parser.advance(&mut t, bytes.as_bytes());
+            t
+        };
+        let pane = (0, 0, 800, 200);
+        let frame = |renderer: &mut Renderer, term: &Term<VoidListener>, scroll_px: i32| {
+            let mut out = Vec::new();
+            let view = PaneView {
+                rect: pane,
+                focused: false,
+                cursor: crate::config::CursorStyle::Block,
+                cursor_on: false,
+                bordered: false,
+                claude: false,
+                claude_from: None,
+                reorder: true,
+                line_dir: &[],
+                search_match: None,
+                marks: &[],
+                link_hover: None,
+                link_tip: None,
+                scroll_px,
+            };
+            renderer.draw_pane(&mut out, &view, term);
+            let mut geom: Vec<((usize, usize), Vec<(i32, i32, bool)>)> = renderer
+                .cell_geometry
+                .iter()
+                .filter(|((_, row, _), _)| *row != crate::scroll::PEEK_ROW)
+                .map(|((_, row, col), spans)| ((*row, *col), spans.clone()))
+                .collect();
+            geom.sort_by_key(|entry| entry.0);
+            (out, geom)
+        };
+        let same_quads = |a: &[crate::gpu::Vertex], b: &[crate::gpu::Vertex]| {
+            a.len() == b.len()
+                && a.iter().zip(b).all(|(p, q)| {
+                    p.pos == q.pos && p.uv == q.uv && p.layer == q.layer && p.color == q.color
+                })
+        };
+
+        let mut held = term();
+        let (whole_now, geom_now) = frame(&mut renderer, &held, 0);
+        let shift = crate::scroll::offset_px(0.5, renderer.cell_h);
+        assert!(shift > 0, "half a line must be a visible pixel offset");
+        let (_shifted, geom_shifted) = frame(&mut renderer, &held, shift);
+        assert_eq!(
+            geom_shifted, geom_now,
+            "a fractional offset moved the Arabic/Hebrew shaping"
+        );
+        assert!(
+            geom_now.iter().any(|(_, spans)| spans.iter().any(|s| s.2)),
+            "the row was not shaped as RTL"
+        );
+        // settling the same half plus another half is one whole line
+        let history = held.grid().history_size() as i32;
+        assert!(history >= 1);
+        let mut smooth = crate::scroll::PaneScroll::default();
+        let mut offset = smooth.apply_pixels(0, history, 0.5);
+        assert!(smooth.subline > 0.0);
+        offset = smooth.apply_pixels(offset, history, 0.5);
+        assert_eq!(smooth.subline, 0.0);
+        assert_eq!(offset, 1);
+        assert_eq!(crate::scroll::offset_px(smooth.subline, renderer.cell_h), 0);
+        held.scroll_display(Scroll::Delta(offset));
+        let (settled, geom_settled) = frame(&mut renderer, &held, 0);
+
+        let mut jumped = term();
+        jumped.scroll_display(Scroll::Delta(1));
+        let (whole_line, geom_line) = frame(&mut renderer, &jumped, 0);
+        assert!(
+            same_quads(&settled, &whole_line),
+            "settled smooth scroll diverged from a one-line wheel"
+        );
+        assert_eq!(geom_settled, geom_line);
+        assert!(
+            !same_quads(&settled, &whole_now),
+            "scrolling one line should reveal a different row"
         );
     }
 
