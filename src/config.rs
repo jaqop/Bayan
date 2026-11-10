@@ -79,6 +79,12 @@ pub struct UserConfig {
     /// "pwsh.exe", "cmd.exe". Live sessions keep their shell.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
+    /// OSC 133 shell integration for new panes. Absent or true injects
+    /// prompt marks into PowerShell, Git Bash, WSL bash/zsh, and cmd.
+    /// `false` launches every shell without them. An unknown program never
+    /// gets the injection, even when this is on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell_integration: Option<bool>,
     /// Hide the tab bar while only one tab is open (default off).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hide_single_tab: Option<bool>,
@@ -306,6 +312,12 @@ impl UserConfig {
             .unwrap_or_else(|| crate::term::DEFAULT_SHELL.to_string())
     }
 
+    /// Prompt marks (OSC 133) for shells Bayan knows. Default on. An
+    /// explicit `false` is the opt-out; anything absent stays on.
+    pub fn shell_integration_on(&self) -> bool {
+        self.shell_integration.unwrap_or(true)
+    }
+
     pub fn hide_single_tab_on(&self) -> bool {
         self.hide_single_tab.unwrap_or(false)
     }
@@ -457,6 +469,11 @@ mod tests {
         assert_eq!(c.scrollback_lines(), 50_000);
         assert!(!c.copy_on_select_on());
         assert_eq!(c.bell_mode(), BellMode::Silent);
+        assert!(d.shell_integration_on(), "absent means on");
+        let off: UserConfig = serde_json::from_str(r#"{"shell_integration":false}"#).unwrap();
+        assert!(!off.shell_integration_on());
+        let on: UserConfig = serde_json::from_str(r#"{"shell_integration":true}"#).unwrap();
+        assert!(on.shell_integration_on());
         assert_eq!(CursorStyle::parse("banana"), CursorStyle::Block);
         assert_eq!(BellMode::parse("banana"), BellMode::Attention);
         // scrollback is clamped to sane bounds

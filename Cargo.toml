@@ -45,6 +45,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading", # GetCurrentProcess for that module walk
     "Win32_System_SystemInformation", # GetSystemDirectoryW: loaded kernel32 must sit under System32
     "Win32_System_IO", # DeviceIoControl: read a link's target without following it (localpath.rs)
+    "Win32_Security", # TokenElevation; DACL on shell-integration temp files
+    "Win32_Security_Authorization", # SDDL for those files (not world-writable, high integrity when elevated)
 ] }
 
 [features]

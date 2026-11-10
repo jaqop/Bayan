@@ -32,14 +32,16 @@ selection and BiDi paths must do.
 | `localpath.rs` | no-follow walk: is a drive path local in every component, links read but not followed (link probe, new-tab cwd) |
 | `mru.rs` | most-recently-used tab order for Ctrl+Tab, walkable within one group |
 | `shells.rs` | installed-shell detection (ported from EasyTer's `profiles.py`) |
+| `shellint.rs` | OSC 133 injection for Git Bash, WSL bash/zsh, and cmd (PowerShell's wrapper stays in `term.rs`) |
 | `posh.rs` | oh-my-posh theme picker with a live ANSI preview |
 | `plugins.rs` | declarative JSON plugin host (`~/.bayan/plugins/`) |
 | `config.rs` | `~/.bayan/config.json`, optional and BOM-tolerant |
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-494 tests across the tree. `term.rs` (81), `link.rs` (61) and `render.rs` (64)
-carry the most; `localpath.rs` has 21.
+507 tests in `src` (`cargo test --all-targets` does not run the vendored
+`portable-pty` crate). `term.rs` (84), `link.rs` (61) and `render.rs` (64)
+carry the most; `shellint.rs` has 13 and `localpath.rs` has 21.
 
 ## Invariants — do not "simplify" these
 
@@ -130,6 +132,19 @@ desktop behind the window — `LWA_ALPHA` blends the whole window uniformly and
 bypasses DWM's blur, so the layered-window transparency Bayan already has and
 the accent blur are mutually exclusive. The existing `opacity` setting is the
 only transparency available on this path.
+
+**Shell integration is opt-out and shell-specific.** PowerShell's prompt
+wrapper stays in `term.rs`. Git Bash, MSYS bash, WSL bash, WSL zsh and cmd
+are built in `shellint.rs` and produce the same nonce-checked OSC 133 A/B/D
+bytes (cmd: A and B only, no exit code). An unknown program is never
+injected. `"shell_integration": false` skips all of them. The nonce is
+`BAYAN_PROMPT_NONCE` and is unset before a child inherits it. Do not write
+the user's rc files. An elevated token must not source `~/.bashrc`,
+`~/.bash_profile` or the zsh home files; the temp rc is the only file
+bash/`ZDOTDIR` will read, it is created with a random name and a DACL that
+is not world-writable (high integrity under `%ProgramData%` when elevated),
+and it is removed when the pane closes — and only if the directory name is
+one of those random names.
 
 **Start-directory precedence, in order:** a restored session's saved cwd, then
 the launcher's directory (a shortcut's "Start in"), then `USERPROFILE`. The

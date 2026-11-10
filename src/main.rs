@@ -32,6 +32,7 @@ mod posh;
 mod process;
 mod pty_writer;
 mod render;
+mod shellint;
 mod shells;
 mod term;
 mod toast;
@@ -2693,6 +2694,7 @@ impl App {
             self.config.scrollback_lines(),
             command,
             self.config.kitty_protocol_on(),
+            self.config.shell_integration_on(),
         ) {
             Ok(session) => Some(Pane {
                 id,

@@ -874,6 +874,31 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       selection, the RTL arrow and a clean prompt after Esc. There is no
       vim count prefix, `gg` is a single g, and the column is not
       remembered across short lines.
+- [x] **Shell integration for bash, WSL and cmd** — the PowerShell OSC 133
+      wrapper is no longer the only one. Git Bash and MSYS bash get a temp
+      `--rcfile`, WSL bash the same file after the distro's login shell is
+      read from passwd, WSL zsh a `ZDOTDIR`, and cmd a `PROMPT` of `$E`
+      marks. The sequences are the ones PowerShell already emits (`D` with
+      the exit code, `A`, `B`, all carrying the session nonce), so prompt
+      jump, command blocks, "at prompt" drops and the exit-code gutter see
+      the same marks. Bash and zsh also emit `C` at command start; the
+      parser ignores it as a boundary. cmd cannot: `A` and `B` only, exit
+      stays unknown, and the nonce remains inside the `PROMPT` variable
+      because cmd has no other place for it. Unknown shells are not
+      injected. `"shell_integration": false` turns it off, including for
+      PowerShell. User rc files are never rewritten. An elevated token does
+      not source them (and does not init oh-my-posh from the profile); the
+      scripts sit in `%ProgramData%` with a random name, a protected
+      administrator DACL and a high integrity label, and are deleted with
+      the pane. A normal pane's files are in the user temp directory, current
+      user only, not world-writable. Proven by the `shellint` plan tests
+      (bash rcfile, login vs not, elevated, WSL bash/zsh/other, cmd, opt-out,
+      unknown shell, WSLENV, the SDDL, the delete guard) and by feeding the
+      emitted bytes through the same OSC 133 parser as PowerShell, including
+      an Arabic prompt that must not show the sequence. Not run here: a live
+      Git Bash, a WSL distro, or an elevated token — this tree was checked
+      with `cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings`
+      and `cargo fmt --check`.
 
 ## Settings
 
@@ -887,7 +912,7 @@ key falls back to a sane default:
   "theme": "Bayan", "font_family": "Cascadia Code NF", "font_size": 15.0,
   "cursor_style": "bar", "cursor_blink": true, "scrollback": 20000,
   "copy_on_select": true, "ligatures": true, "bell": "attention",
-  "shell": "pwsh.exe", "padding": 8, "opacity": 0.9,
+  "shell": "pwsh.exe", "shell_integration": true, "padding": 8, "opacity": 0.9,
   "hide_single_tab": true, "confirm_close": true, "osc52": "off",
   "editor": "code -g {file}:{line}:{col}", "tab_switch": "recent",
   "keybinds": { "new-tab": "ctrl+shift+n" },
@@ -901,6 +926,38 @@ those sequences (an ssh host, a `cat`'d file, an install script). When on,
 the toast's title is always «بيان · tab» and the program's text is cleaned
 and capped. Bayan's own toasts (a long command finished, the bell) follow
 `notifications` and need no opt-in.
+
+`"shell_integration"` defaults to **on** (leave the key out and it stays
+on). `false` starts new panes with no OSC 133 injection. It applies to
+PowerShell, Git Bash and MSYS `bash.exe`, WSL bash and zsh, and cmd.
+An unknown program — fish, nushell, dash, `sh`, a Windows `zsh.exe` — is
+never injected, even when the key is on. Bash is started with a temporary
+`--rcfile` (a `--login` flag is dropped, because bash would ignore the
+rcfile) that sources the user's `~/.bashrc` first, and for a login shell
+also `/etc/profile` and the first of `~/.bash_profile`, `~/.bash_login`,
+`~/.profile`. Git Bash's profile already sources `~/.bashrc`; the rcfile
+skips a second load when `MSYSTEM` is set. The existing `PROMPT_COMMAND`
+is kept and run after the `D` and `A` marks. `PS0` emits `C` (command
+start). Nothing is written into the user's home. WSL reads the distro's
+login shell from passwd (`getent`, or `/etc/passwd` when getent is
+absent). Bash gets that rcfile; zsh gets a `ZDOTDIR` that sources the
+home zsh files and then the same marks. fish, dash, or any other default
+shell is exec'd with no rcfile. Windows paths become Linux paths through
+`WSLENV` (`/up`) and, if the value still looks like `C:\…`, `wslpath -u`.
+cmd's `PROMPT` uses `$E` for `A` and `B` only. cmd has no hook that runs
+when a command starts, and no way to report `ERRORLEVEL` as that command's
+exit, so the gutter stays unknown and a `D` mark is not invented. The
+nonce travels in `BAYAN_PROMPT_NONCE` and is removed before a child
+inherits it, except that cmd has to keep the expanded value inside
+`PROMPT` itself. An elevated token (Run as administrator) does not source
+those user rc files, and does not init oh-my-posh from the user profile:
+`--rcfile` and `ZDOTDIR` are the only startup files, and they contain the
+marks alone. Elevated scripts are created under `%ProgramData%` with a
+random name, a protected DACL for SYSTEM and Administrators, and a high
+integrity label, so a medium-integrity process cannot replace them. A
+normal pane uses the user temp directory with a DACL for the current user
+only. The directory is removed when the pane closes. A name that is not
+one of those random directories is not deleted.
 
 Shell and scrollback apply to new tabs (no terminal restarts a live
 session); everything else applies immediately. `osc52` is config-file
@@ -965,8 +1022,12 @@ pending, and the pane is not on the alt screen. Enter at the prompt sets
 only a nonce-verified OSC 133 A or D clears it. While it is set, OSC 7
 needs the nonce the same way it does while a command is running.
 PowerShell's wrapper sends OSC 133 D and A with a per-session nonce, and
-only that A arms the report, so a spoofed `133;D` from `cat` cannot. An
-idle OSC 7 (cmd/clink, which has no 133) is still stored. A new tab calls
+only that A arms the report, so a spoofed `133;D` from `cat` cannot. Bash
+and zsh emit the same D/A/B bytes (and a C from `PS0` / `preexec`, which
+the parser does not treat as a prompt boundary), plus OSC 9;9 and OSC 7
+when the directory converts to a Windows path. cmd emits A and B with ST
+(`ESC \`) and no exit code. An idle OSC 7 with no 133 — clink, or cmd
+when shell integration is off — is still stored. A new tab calls
 `GetDriveTypeW` on the drive root and rejects a remote drive, and it
 rejects a reparse point without following it, before `is_dir`.
 
