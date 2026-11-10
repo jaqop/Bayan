@@ -1519,9 +1519,7 @@ impl App {
     /// (Re)build the renderer off-thread for the current scale, config and
     /// zoom. Debounced: one build in flight; a stale result triggers another.
     fn rebuild_renderer(&mut self) {
-        if scroll::after_font_change() == scroll::OffsetFate::Clear {
-            self.smooth.clear();
-        }
+        scroll::apply_font_change(&mut self.smooth);
         if self.renderer_building {
             return;
         }
@@ -2829,9 +2827,7 @@ impl App {
         // Pane rows moved. Cached link spans would underline the wrong cells,
         // and a pixel offset belongs to the old cell height.
         self.link_cache.clear();
-        if scroll::after_resize() == scroll::OffsetFate::Clear {
-            self.smooth.clear();
-        }
+        scroll::apply_resize(&mut self.smooth);
         // resolve "hide the bar with one tab" BEFORE measuring the content
         let hide = self.config.hide_single_tab_on() && self.tabs.len() <= 1;
         if let Some(r) = self.renderer.as_mut() {
@@ -3532,7 +3528,7 @@ impl App {
     /// Viewport row under a pane-local y, including `-1` for the history
     /// line a smooth scroll has pulled into the pane.
     fn signed_row(&self, pane_id: u64, local_y: f64, cell_h: f64, rows: usize) -> i32 {
-        scroll::selection_row(
+        scroll::locate_row(
             local_y,
             cell_h,
             self.pane_offset_px(pane_id, cell_h as f32) as f64,
@@ -3688,17 +3684,53 @@ impl App {
             row as usize
         };
         if row < 0 {
-            let cols = {
+            let (cols, alt, history, off, cells) = {
                 let t = self.tabs[self.active].panes[hit.pane].session.term.lock();
-                t.columns().max(1)
+                let off = t.grid().display_offset() as u64;
+                (
+                    t.columns().max(1),
+                    t.mode().contains(TermMode::ALT_SCREEN),
+                    t.grid().history_size() as u64,
+                    off,
+                    render::snapshot_grid_line(&t, scroll::grid_line(row, off as i32)),
+                )
             };
-            let mapped = rects.get(hit.pane).and_then(|rect| {
+            // Same gate as a fully visible row: explicit BDSM (`CSI 8 l`,
+            // the off mode) does not reorder, so the column is the grid's.
+            let (reorder, use_stamps) = bidi_state.for_display(honor, !running.is_empty(), alt);
+            let abs = bidi_ctl::peek_line_abs(evicted, history, off);
+            let mut claude = reorder
+                && if !auto {
+                    manual
+                } else {
+                    bidi::cmd_is_claude(&running)
+                };
+            if !alt && auto {
+                claude &= claude_from.is_none_or(|start| abs >= start);
+            }
+            let dir = if use_stamps {
+                bidi_state.direction_at(abs)
+            } else {
+                bidi_ctl::ParagraphDir::Default
+            };
+            let shaped = rects.get(hit.pane).and_then(|rect| {
                 self.renderer
                     .as_ref()
                     .and_then(|r| r.hit_cell(*rect, geom_row, pos.x))
+                    .map(|h| h.0)
             });
-            let col = mapped.map(|h| h.0).unwrap_or(hit.col).min(cols - 1);
-            return Some((pane_id, row, col));
+            let shaped = shaped.or_else(|| {
+                if !reorder || !cells.iter().any(|c| render::is_rtl(c.c)) {
+                    return None;
+                }
+                let rect = rects.get(hit.pane).copied().unwrap_or((0, 0, 1, 1));
+                let x = (pos.x - rect.0 as f64) as f32;
+                self.renderer
+                    .as_mut()
+                    .and_then(|r| r.logical_column_for(&cells, x, rect.2, claude, dir, cols))
+            });
+            let col = scroll::history_click_column(reorder, shaped, hit.col.min(cols - 1));
+            return Some((pane_id, row, col.min(cols - 1)));
         }
         let (cols, row, cells, claude, vis, reorder, dir) = {
             let t = self.tabs[self.active].panes[hit.pane].session.term.lock();
@@ -5140,11 +5172,9 @@ impl ApplicationHandler<UserEvent> for App {
                         )
                     };
                     let was_alt = self.alt_seen.insert(id, alt).unwrap_or(false);
-                    if scroll::after_alt_screen(was_alt, alt) == scroll::OffsetFate::Clear
-                        || scroll::after_output(following) == scroll::OffsetFate::Clear
-                    {
-                        self.drop_smooth(id);
-                    }
+                    let now = Instant::now();
+                    scroll::apply_alt_screen(&mut self.smooth, id, was_alt, alt);
+                    scroll::apply_output(&mut self.smooth, id, following, now);
                     let ris = {
                         let mut meta = self.tabs[ti].panes[pi].session.meta.lock_or_recover();
                         let ris = meta.saw_ris;

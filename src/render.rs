@@ -1271,6 +1271,51 @@ pub fn snapshot_row<T: alacritty_terminal::event::EventListener>(
     cells
 }
 
+/// Cells of one grid line, including a history line above the viewport.
+/// `line` is the grid's own index (`0` is the top of the screen when the
+/// view is at the bottom; negative lines are scrollback).
+pub fn snapshot_grid_line<T: alacritty_terminal::event::EventListener>(
+    term: &Term<T>,
+    line: i32,
+) -> Vec<SnapCell> {
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::{Column, Line};
+    let at = Line(line);
+    if at < term.topmost_line() || at > term.bottommost_line() {
+        return Vec::new();
+    }
+    let grid_row = &term.grid()[at];
+    let mut cells = Vec::new();
+    let mut col = 0;
+    while col < term.columns() {
+        let cell = &grid_row[Column(col)];
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            col += 1;
+            continue;
+        }
+        let w = if cell.flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else {
+            1
+        };
+        cells.push(SnapCell {
+            col,
+            w,
+            c: if cell.flags.intersects(Flags::HIDDEN) {
+                ' '
+            } else {
+                cell.c
+            },
+            zw: cell.zerowidth().map(|z| z.to_vec()).unwrap_or_default(),
+            fg: cell.fg,
+            bg: cell.bg,
+            flags: cell.flags,
+        });
+        col += 1;
+    }
+    cells
+}
+
 /// The shaped form of a bidi row: the segments `draw_line_bidi` draws,
 /// plus the byte→column map a click needs to invert that shaping.
 struct BidiPlan {

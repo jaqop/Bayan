@@ -39,8 +39,8 @@ selection and BiDi paths must do.
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-494 tests across the tree. `term.rs` (81), `link.rs` (61) and `render.rs` (64)
-carry the most; `localpath.rs` has 21.
+520 tests across the tree (Windows CI, `cargo test`). `term.rs`, `link.rs`
+and `render.rs` carry the most.
 
 ## Invariants — do not "simplify" these
 
@@ -112,10 +112,12 @@ be pre-reversed into VISUAL word order — the opposite direction from `bidi.rs`
 defaults on. A touchpad fraction shifts the viewport and draws one extra
 history row, clipped to the pane; a wheel notch eases in. `false` is the
 old whole-line wheel. Alt-screen wheels stay arrows, and mouse reports use
-the shifted row (the history sliver above the viewport is not row 0). The
-offset is cleared when output arrives at the bottom, on an alt-screen
-transition, on resize, and on a font change. Copy-mode keys snap it onto a
-whole line first.
+the shifted row (the history sliver above the viewport is not row 0). A
+stale idle fraction is cleared when output arrives at the bottom. A wheel
+notch still easing, or a touch that moved within the last easing window,
+is kept — continuous output must not swallow the scroll. An alt-screen
+transition, a resize, and a font change clear it too. Copy-mode keys snap
+it onto a whole line first.
 
 **Chords resolve by PHYSICAL key.** Ctrl+T must fire when that key's logical
 char is "ف". This is the Arabic-layout guarantee and it extends to user

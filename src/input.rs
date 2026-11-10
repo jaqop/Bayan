@@ -546,6 +546,7 @@ impl App {
             let mut term = self.tabs[ti].panes[pi].session.term.lock();
             let offset = term.grid().display_offset() as i32;
             let history = term.grid().history_size() as i32;
+            st.note_motion(Instant::now());
             let next = if pixel {
                 st.apply_pixels(offset, history, lines)
             } else {

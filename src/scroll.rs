@@ -24,6 +24,9 @@ pub(crate) struct PaneScroll {
     pub subline: f32,
     pub pending: f32,
     per_ms: f32,
+    /// Last wheel or touchpad motion. Output at the bottom keeps a
+    /// fraction that is still being dragged.
+    last_motion: Option<std::time::Instant>,
 }
 
 /// Where a wheel delta goes. Classic is the pre-smooth path: whole lines
@@ -142,6 +145,21 @@ impl PaneScroll {
     pub(crate) fn idle(&self) -> bool {
         self.subline == 0.0 && self.pending == 0.0
     }
+
+    /// The user moved this pane's wheel or touchpad.
+    pub(crate) fn note_motion(&mut self, now: std::time::Instant) {
+        self.last_motion = Some(now);
+    }
+
+    /// A notch is still easing, or the finger moved within [`WHEEL_MS`].
+    pub(crate) fn scrolling(&self, now: std::time::Instant) -> bool {
+        if self.pending != 0.0 {
+            return true;
+        }
+        self.last_motion.is_some_and(|t| {
+            now.saturating_duration_since(t) <= std::time::Duration::from_millis(WHEEL_MS as u64)
+        })
+    }
 }
 
 /// `offset + subline + delta`, clamped to `0..=history`, split back into a
@@ -215,6 +233,12 @@ pub(crate) fn grid_line(viewport_row: i32, display_offset: i32) -> i32 {
     viewport_row - display_offset
 }
 
+/// The viewport row [`crate`] `App::locate` uses. One call of
+/// [`selection_row`], so the pointer path cannot grow a second formula.
+pub(crate) fn locate_row(local_y: f64, cell_h: f64, offset_px: f64, rows: usize) -> i32 {
+    selection_row(local_y, cell_h, offset_px, rows)
+}
+
 /// A screen row the program can be told about. The history line above the
 /// viewport is not row 0.
 pub(crate) fn screen_row(viewport_row: i32) -> Option<usize> {
@@ -232,13 +256,67 @@ pub(crate) enum OffsetFate {
     Clear,
 }
 
-/// New output while the view is pinned to the live bottom drops the
-/// fraction. Scrolled-up history keeps it.
-pub(crate) fn after_output(following_bottom: bool) -> OffsetFate {
-    if following_bottom {
-        OffsetFate::Clear
-    } else {
+/// New output while the view is pinned to the live bottom drops a stale
+/// idle fraction. A notch still easing (`pending`) or a touch that moved
+/// within [`WHEEL_MS`] is kept: every PTY read wakes the window, and
+/// wiping those would swallow a wheel-up during `tail -f`.
+pub(crate) fn after_output(
+    following_bottom: bool,
+    state: Option<&PaneScroll>,
+    now: std::time::Instant,
+) -> OffsetFate {
+    if !following_bottom || state.is_some_and(|s| s.scrolling(now)) {
         OffsetFate::Keep
+    } else {
+        OffsetFate::Clear
+    }
+}
+
+/// Column on the history row. Explicit BDSM (`reorder == false`, the `off`
+/// mode) stays on the grid column. Implicit mode uses the shaped column.
+pub(crate) fn history_click_column(reorder: bool, shaped: Option<usize>, grid_col: usize) -> usize {
+    if reorder {
+        shaped.unwrap_or(grid_col)
+    } else {
+        grid_col
+    }
+}
+
+/// What `App`'s wakeup does with one pane's offset.
+pub(crate) fn apply_output(
+    panes: &mut std::collections::HashMap<u64, PaneScroll>,
+    id: u64,
+    following_bottom: bool,
+    now: std::time::Instant,
+) {
+    if after_output(following_bottom, panes.get(&id), now) == OffsetFate::Clear {
+        panes.remove(&id);
+    }
+}
+
+/// What `App` does on an alt-screen transition.
+pub(crate) fn apply_alt_screen(
+    panes: &mut std::collections::HashMap<u64, PaneScroll>,
+    id: u64,
+    was_alt: bool,
+    now_alt: bool,
+) {
+    if after_alt_screen(was_alt, now_alt) == OffsetFate::Clear {
+        panes.remove(&id);
+    }
+}
+
+/// What `App::relayout_active` does.
+pub(crate) fn apply_resize(panes: &mut std::collections::HashMap<u64, PaneScroll>) {
+    if after_resize() == OffsetFate::Clear {
+        panes.clear();
+    }
+}
+
+/// What `App::rebuild_renderer` does.
+pub(crate) fn apply_font_change(panes: &mut std::collections::HashMap<u64, PaneScroll>) {
+    if after_font_change() == OffsetFate::Clear {
+        panes.clear();
     }
 }
 
@@ -611,8 +689,7 @@ mod tests {
         let offset = t.grid().display_offset() as i32;
         let st = PaneScroll {
             subline: 0.7,
-            pending: 0.0,
-            per_ms: 0.0,
+            ..PaneScroll::default()
         };
         let (next, st) = st.commit_for_navigation(offset, history);
         assert_eq!(st.subline, 0.0);
@@ -638,42 +715,122 @@ mod tests {
         assert_eq!(t.topmost_line(), Line(-(t.grid().history_size() as i32)));
     }
 
+    fn resting_fraction() -> PaneScroll {
+        let mut st = PaneScroll::default();
+        st.subline = 0.4;
+        st.note_motion(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(1_000))
+                .unwrap_or_else(std::time::Instant::now),
+        );
+        st
+    }
+
     #[test]
     fn new_output_at_the_bottom_clears_the_offset() {
-        assert_eq!(after_output(true), OffsetFate::Clear);
+        let mut panes = std::collections::HashMap::new();
+        panes.insert(1, resting_fraction());
+        apply_output(&mut panes, 1, true, std::time::Instant::now());
+        assert!(
+            panes.is_empty(),
+            "a stale fraction at the bottom must go on output"
+        );
     }
 
     #[test]
     fn new_output_while_scrolled_up_keeps_the_offset() {
-        assert_eq!(after_output(false), OffsetFate::Keep);
+        let mut panes = std::collections::HashMap::new();
+        panes.insert(1, resting_fraction());
+        apply_output(&mut panes, 1, false, std::time::Instant::now());
+        approx(panes[&1].subline, 0.4);
     }
 
     #[test]
     fn entering_the_alt_screen_clears_a_resting_offset() {
-        // pending is empty: the fraction alone still has to go
-        assert_eq!(after_alt_screen(false, true), OffsetFate::Clear);
-        assert_eq!(after_alt_screen(false, false), OffsetFate::Keep);
+        let mut panes = std::collections::HashMap::new();
+        panes.insert(1, resting_fraction());
+        apply_alt_screen(&mut panes, 1, false, false);
+        assert!(panes.contains_key(&1));
+        apply_alt_screen(&mut panes, 1, false, true);
+        assert!(panes.is_empty());
     }
 
     #[test]
     fn leaving_the_alt_screen_clears_a_resting_offset() {
-        assert_eq!(after_alt_screen(true, false), OffsetFate::Clear);
-        assert_eq!(after_alt_screen(true, true), OffsetFate::Keep);
+        let mut panes = std::collections::HashMap::new();
+        panes.insert(1, resting_fraction());
+        apply_alt_screen(&mut panes, 1, true, true);
+        assert!(panes.contains_key(&1));
+        apply_alt_screen(&mut panes, 1, true, false);
+        assert!(panes.is_empty());
     }
 
     #[test]
     fn resize_clears_the_offset() {
-        assert_eq!(after_resize(), OffsetFate::Clear);
+        let mut panes = std::collections::HashMap::new();
+        panes.insert(1, resting_fraction());
+        panes.insert(2, resting_fraction());
+        apply_resize(&mut panes);
+        assert!(panes.is_empty());
     }
 
     #[test]
     fn font_change_clears_the_offset() {
-        assert_eq!(after_font_change(), OffsetFate::Clear);
+        let mut panes = std::collections::HashMap::new();
+        panes.insert(1, resting_fraction());
+        apply_font_change(&mut panes);
+        assert!(panes.is_empty());
     }
 
-    /// The row a mouse report names, for a click part-way down a cell.
+    /// Wheel-up while output is streaming. On b3746d5 every wakeup at the
+    /// bottom called `drop_smooth`, so the notch never became a line.
+    #[test]
+    fn wheel_up_followed_by_output_wakeups_still_scrolls() {
+        let mut panes = std::collections::HashMap::new();
+        let mut st = PaneScroll::default();
+        let start = std::time::Instant::now();
+        st.queue_lines(3.0);
+        st.note_motion(start);
+        panes.insert(1, st);
+        let mut offset = 0;
+        let mut now = start;
+        for _ in 0..40 {
+            let mut st = panes.get(&1).copied().unwrap_or_default();
+            offset = st.tick(offset, 100, 16.0);
+            panes.insert(1, st);
+            now += std::time::Duration::from_millis(16);
+            apply_output(&mut panes, 1, true, now);
+        }
+        assert!(
+            offset >= 1,
+            "output wiped the wheel; display offset stayed {offset}"
+        );
+    }
+
+    #[test]
+    fn a_slow_touchpad_drag_survives_output_at_the_bottom() {
+        let mut panes = std::collections::HashMap::new();
+        panes.insert(1, PaneScroll::default());
+        let mut offset = 0;
+        let mut now = std::time::Instant::now();
+        for _ in 0..20 {
+            let mut st = panes.get(&1).copied().unwrap_or_default();
+            st.note_motion(now);
+            offset = st.apply_pixels(offset, 100, 0.1);
+            panes.insert(1, st);
+            apply_output(&mut panes, 1, true, now);
+            now += std::time::Duration::from_millis(20);
+        }
+        assert!(
+            offset >= 1,
+            "slow touch motion was cleared before a line, offset {offset}"
+        );
+    }
+
+    /// The row a mouse report names. `App::locate` asks [`locate_row`],
+    /// then [`screen_row`] drops the history line before the bytes.
     fn reported(local_y: f64, offset_px: f64) -> Option<Vec<u8>> {
-        let row = selection_row(local_y, 20.0, offset_px, 10);
+        let row = locate_row(local_y, 20.0, offset_px, 10);
         let row = screen_row(row)?;
         let proto = crate::mouse::Proto {
             clicks: true,
@@ -710,9 +867,17 @@ mod tests {
     fn the_peek_sliver_is_not_reported_as_the_top_row() {
         let raw = (3.0f64 / 20.0).floor() as usize;
         assert_eq!(raw, 0, "cell_at would call this row 0");
-        assert_eq!(selection_row(3.0, 20.0, 8.0, 10), -1);
+        assert_eq!(locate_row(3.0, 20.0, 8.0, 10), -1);
         assert!(reported(3.0, 8.0).is_none());
         // the bug this guards: reporting that sliver as row 1
         assert!(reported(3.0, 0.0).unwrap().ends_with(b";1M"));
+    }
+
+    #[test]
+    fn history_row_click_keeps_the_grid_column_when_reordering_is_off() {
+        // explicit BDSM: the shaped column must not win
+        assert_eq!(history_click_column(false, Some(7), 2), 2);
+        assert_eq!(history_click_column(true, Some(7), 2), 7);
+        assert_eq!(history_click_column(true, None, 2), 2);
     }
 }
