@@ -483,7 +483,8 @@ pub fn scripts_enabled(elevated: bool) -> bool {
 /// query is elevated (scripts stay off). Tests pass the boolean into
 /// [`load_with`] instead of calling this.
 pub fn is_elevated() -> bool {
-    crate::elevate::is_elevated()
+    // `process_is_elevated` is the name #56 uses. Same function.
+    crate::elevate::process_is_elevated()
 }
 
 /// Load Lua beside `dir`'s config.json. Unapproved and changed files are
@@ -1120,6 +1121,16 @@ fn resume_process(child: &std::process::Child) {
 struct JobGuard(std::os::windows::io::OwnedHandle);
 #[cfg(not(windows))]
 struct JobGuard;
+
+#[cfg(windows)]
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle;
+        // The field is the owned job handle. Dropping it after this function
+        // closes the handle, and that close kills the process tree.
+        let _ = self.0.as_raw_handle();
+    }
+}
 
 fn check_send(text: &str) -> Result<(), String> {
     if text.is_empty() {

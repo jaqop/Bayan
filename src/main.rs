@@ -4498,7 +4498,7 @@ impl App {
         let saw_end = rows.len() <= LUA_CARD_ROWS;
         let mut reason = script.reason();
         if !saw_end {
-            reason.push_str(&tr(" — مرّر حتى آخر السكربت", " — scroll to the end"));
+            reason.push_str(tr(" — مرّر حتى آخر السكربت", " — scroll to the end"));
         }
         let lines = text.lines().count().max(1);
         let chars = text.chars().count();
