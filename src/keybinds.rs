@@ -25,6 +25,7 @@ pub enum Action {
     PromptPrev,
     PromptNext,
     ClaudeToggle,
+    BidiToggle,
     ResetKeyboard,
     RenameTab,
     Broadcast,
@@ -37,7 +38,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 21] = [
+    pub const ALL: [Action; 22] = [
         Action::NewTab,
         Action::ClosePane,
         Action::Search,
@@ -50,6 +51,7 @@ impl Action {
         Action::PromptPrev,
         Action::PromptNext,
         Action::ClaudeToggle,
+        Action::BidiToggle,
         Action::ResetKeyboard,
         Action::RenameTab,
         Action::Broadcast,
@@ -76,6 +78,7 @@ impl Action {
             Action::PromptPrev => "prompt-prev",
             Action::PromptNext => "prompt-next",
             Action::ClaudeToggle => "claude-toggle",
+            Action::BidiToggle => "bidi-toggle",
             Action::ResetKeyboard => "reset-keyboard",
             Action::RenameTab => "rename-tab",
             Action::Broadcast => "broadcast",
@@ -110,6 +113,7 @@ impl Action {
             Action::PromptPrev => crate::lang::pick(lang, "الأمر السابق", "Previous command"),
             Action::PromptNext => crate::lang::pick(lang, "الأمر التالي", "Next command"),
             Action::ClaudeToggle => crate::lang::pick(lang, "وضع كلود", "Claude mode"),
+            Action::BidiToggle => crate::lang::pick(lang, "اتجاه النص", "BiDi mode"),
             Action::ResetKeyboard => {
                 crate::lang::pick(lang, "إعادة ضبط لوحة المفاتيح", "Reset keyboard")
             }
@@ -149,6 +153,10 @@ impl Action {
             Action::PromptPrev => c(true, true, Up),
             Action::PromptNext => c(true, true, Down),
             Action::ClaudeToggle => c(false, false, F(2)),
+            // Next to Claude's F2. F3 cycles this pane's BiDi mode
+            // (full → alt screen off → off). Physical F3, so an Arabic
+            // layout still reaches it, and it can be rebound.
+            Action::BidiToggle => c(false, false, F(3)),
             // Ctrl+Shift+K: the leaked-flags escape hatch. Physical K, so an
             // Arabic layout still reaches it.
             Action::ResetKeyboard => c(true, true, Letter('k')),
@@ -564,6 +572,19 @@ mod tests {
         assert_eq!(
             lookup(&defaults, Action::ResetKeyboard.default_chord()),
             Some(Action::ResetKeyboard)
+        );
+    }
+
+    #[test]
+    fn bidi_toggle_defaults_to_f3() {
+        let map = effective_map(&crate::config::UserConfig::default());
+        assert_eq!(
+            lookup(&map, Chord::parse("f3").unwrap()),
+            Some(Action::BidiToggle)
+        );
+        assert_ne!(
+            Action::BidiToggle.default_chord(),
+            Action::ClaudeToggle.default_chord()
         );
     }
 

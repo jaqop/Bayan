@@ -17,6 +17,104 @@
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::Term;
 
+/// How far Bayan reorders a pane, mintty's `Bidi=0/1/2`.
+///
+/// The config key is `bidi.mode`. A pane may override it at runtime; `None`
+/// on the pane means "use the config". `Full` is the default and is what
+/// Bayan did before the setting existed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BidiReorder {
+    /// `0` / `"off"`. Cells are drawn in storage order. An agent that
+    /// already ordered Arabic is not reversed a second time. Shaping of
+    /// each glyph still follows the font; only UAX#9 reordering is skipped.
+    Off,
+    /// `1` / `"alt_off"`. The primary screen reorders. The alternate screen
+    /// does not, whichever sequence put it there (`?1049`, `?1047`, `?47`).
+    /// The decision reads `TermMode::ALT_SCREEN`, not the sequence bytes.
+    AltOff,
+    /// `2` / `"full"`. Reorder on both screens, still gated by BDSM when
+    /// `honor_bdsm` is set. The default.
+    #[default]
+    Full,
+}
+
+impl BidiReorder {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::AltOff => "alt_off",
+            Self::Full => "full",
+        }
+    }
+
+    /// `"off"` / `"alt_off"` / `"full"`, or the mintty digits `"0"` / `"1"`
+    /// / `"2"`. Anything else is not a mode.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "0" => Some(Self::Off),
+            "alt_off" | "1" => Some(Self::AltOff),
+            "full" | "2" => Some(Self::Full),
+            _ => None,
+        }
+    }
+
+    /// `full → alt_off → off → full`. One press from the default reaches
+    /// the mode full-screen programs that order their own text want.
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Full => Self::AltOff,
+            Self::AltOff => Self::Off,
+            Self::Off => Self::Full,
+        }
+    }
+
+    /// Whether this setting itself reorders. BDSM is applied separately,
+    /// so explicit mode can still turn reordering off on top.
+    pub fn reorders_on(self, alt_screen: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::AltOff => !alt_screen,
+            Self::Full => true,
+        }
+    }
+
+    /// User mode AND BDSM. `bdsm_reorders` is the flag `for_display` already
+    /// computed (including the idle-prompt rule). `off` never reorders.
+    /// `alt_off` never reorders while `alt_screen` is set. Otherwise BDSM
+    /// wins, which is how `CSI 8 h/l` stays in force when `honor_bdsm` is on.
+    pub fn allows(self, alt_screen: bool, bdsm_reorders: bool) -> bool {
+        self.reorders_on(alt_screen) && bdsm_reorders
+    }
+
+    /// Corner chip. `Full` draws nothing, so a default pane looks as before.
+    pub fn badge(self) -> Option<&'static str> {
+        match self {
+            Self::Full => None,
+            Self::AltOff => Some("BiDi 1"),
+            Self::Off => Some("BiDi 0"),
+        }
+    }
+
+    /// Palette row, naming the mode the focused pane is in now.
+    pub fn palette_label(self) -> String {
+        let which = match self {
+            Self::Off => crate::lang::tr("إيقاف", "off"),
+            Self::AltOff => crate::lang::tr("الشاشة البديلة", "alt screen"),
+            Self::Full => crate::lang::tr("كامل", "full"),
+        };
+        if crate::lang::rtl() {
+            format!("اتجاه النص: {which}")
+        } else {
+            format!("BiDi mode: {which}")
+        }
+    }
+
+    pub fn is_full(self) -> bool {
+        self == Self::Full
+    }
+}
+
 /// `CSI 8 h` — the terminal applies the BiDi algorithm.
 /// `CSI 8 l` — the application already ordered the text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -94,6 +192,25 @@ impl BidiState {
         } else {
             (true, false)
         }
+    }
+
+    /// The reorder flag a frame should use.
+    ///
+    /// `mode` is the pane's effective setting (its override, or the config).
+    /// `alt_screen` must be `TermMode::ALT_SCREEN` on that pane's term: the
+    /// three ways in (`?1049`, `?1047`, `?47`) all set the same bit, and a
+    /// program that gets there any other way is the same case. The second
+    /// flag is SCP stamps, and only while this frame actually reorders.
+    pub fn presentation(
+        &self,
+        mode: BidiReorder,
+        honor_bdsm: bool,
+        command_running: bool,
+        alt_screen: bool,
+    ) -> (bool, bool) {
+        let (bdsm, stamps) = self.for_display(honor_bdsm, command_running, alt_screen);
+        let reorder = mode.allows(alt_screen, bdsm);
+        (reorder, stamps && reorder)
     }
 
     /// Record an SCP. Column 0 updates the line the cursor is on; anywhere
@@ -1031,5 +1148,142 @@ mod tests {
         }
         assert!(saw_ris, "seeded streams contained no RIS");
         assert!(saw_alt, "seeded streams contained no alt-screen CSI");
+    }
+
+    /// `alt_off` follows `TermMode::ALT_SCREEN`, so every way onto that
+    /// screen disables reordering and every way off restores it. `full`
+    /// and `off` do not change with the screen.
+    #[test]
+    fn alt_off_follows_alt_screen_for_every_enter_sequence() {
+        for seq in ["1049", "1047", "47"] {
+            let (mut t, mut p, mut meta, mut carry) = fresh();
+            let on = |t: &Term<VoidListener>, meta: &SessionMeta| {
+                let alt = t.mode().contains(TermMode::ALT_SCREEN);
+                meta.bidi
+                    .presentation(BidiReorder::AltOff, true, false, alt)
+            };
+            assert!(
+                !t.mode().contains(TermMode::ALT_SCREEN),
+                "?{seq} starts on the primary screen"
+            );
+            assert_eq!(on(&t, &meta), (true, false), "?{seq} primary reorders");
+
+            feed(
+                &mut t,
+                &mut p,
+                &mut meta,
+                &mut carry,
+                format!("\x1b[?{seq}h").as_bytes(),
+            );
+            assert!(
+                t.mode().contains(TermMode::ALT_SCREEN),
+                "?{seq}h must set ALT_SCREEN"
+            );
+            let alt = t.mode().contains(TermMode::ALT_SCREEN);
+            assert_eq!(
+                meta.bidi
+                    .presentation(BidiReorder::AltOff, true, false, alt),
+                (false, false),
+                "?{seq}h disables reordering under alt_off"
+            );
+            assert!(
+                meta.bidi
+                    .presentation(BidiReorder::Full, true, false, alt)
+                    .0,
+                "full still reorders on the alt screen"
+            );
+            assert!(
+                !meta.bidi.presentation(BidiReorder::Off, true, false, alt).0,
+                "off stays off on the alt screen"
+            );
+
+            feed(
+                &mut t,
+                &mut p,
+                &mut meta,
+                &mut carry,
+                format!("\x1b[?{seq}l").as_bytes(),
+            );
+            assert!(
+                !t.mode().contains(TermMode::ALT_SCREEN),
+                "?{seq}l must clear ALT_SCREEN"
+            );
+            let alt = t.mode().contains(TermMode::ALT_SCREEN);
+            assert_eq!(
+                meta.bidi
+                    .presentation(BidiReorder::AltOff, true, false, alt),
+                (true, false),
+                "?{seq}l restores reordering under alt_off"
+            );
+            assert!(
+                meta.bidi
+                    .presentation(BidiReorder::Full, true, false, alt)
+                    .0
+            );
+            assert!(
+                !meta.bidi.presentation(BidiReorder::Off, true, false, alt).0,
+                "off stays off after leaving the alt screen"
+            );
+        }
+    }
+
+    /// BDSM still sits on top of a mode that would reorder. `off` does not
+    /// come back on because the application sent `CSI 8 h`.
+    #[test]
+    fn bidi_mode_keeps_bdsm_and_does_not_reorder_when_off() {
+        let state = BidiState::default();
+        assert_eq!(
+            state.presentation(BidiReorder::Full, true, false, false),
+            (true, false),
+            "idle full still reorders"
+        );
+        let mut explicit = state.clone();
+        explicit.mode = BidiMode::Explicit;
+        assert_eq!(
+            explicit.presentation(BidiReorder::Full, true, true, false),
+            (false, false),
+            "explicit BDSM while a command runs still wins under full"
+        );
+        assert!(
+            explicit
+                .presentation(BidiReorder::Full, false, true, false)
+                .0,
+            "honor_bdsm = false keeps reordering"
+        );
+        assert!(
+            !state.presentation(BidiReorder::Off, true, false, false).0,
+            "off does not reorder at the prompt"
+        );
+        assert!(
+            !state.presentation(BidiReorder::Off, true, true, true).0,
+            "off does not reorder because BDSM is implicit"
+        );
+        assert_eq!(BidiReorder::Full.cycle(), BidiReorder::AltOff);
+        assert_eq!(BidiReorder::AltOff.cycle(), BidiReorder::Off);
+        assert_eq!(BidiReorder::Off.cycle(), BidiReorder::Full);
+    }
+
+    /// The toggle is stored on the pane, not in BDSM state, so resetting
+    /// BiDi on an alt-screen switch does not forget it. A second pane is
+    /// untouched.
+    #[test]
+    fn bidi_toggle_is_per_pane() {
+        let cfg = BidiReorder::Full;
+        let mut a = SessionMeta::default();
+        let b = SessionMeta::default();
+        assert_eq!(a.bidi_reorder.unwrap_or(cfg), BidiReorder::Full);
+        a.bidi_reorder = Some(a.bidi_reorder.unwrap_or(cfg).cycle());
+        assert_eq!(a.bidi_reorder, Some(BidiReorder::AltOff));
+        assert_eq!(b.bidi_reorder.unwrap_or(cfg), BidiReorder::Full);
+        a.bidi_mut().reset();
+        assert_eq!(
+            a.bidi_reorder,
+            Some(BidiReorder::AltOff),
+            "a BiDi reset must not clear the pane's mode"
+        );
+        a.bidi_reorder = Some(a.bidi_reorder.unwrap().cycle());
+        assert_eq!(a.bidi_reorder, Some(BidiReorder::Off));
+        assert!(a.bidi_reorder.unwrap().badge().is_some());
+        assert!(BidiReorder::Full.badge().is_none());
     }
 }

@@ -129,23 +129,83 @@ pub struct UserConfig {
     pub keyboard: KeyboardConfig,
 }
 
-/// How Bayan treats BDSM from the application.
+/// How Bayan treats BDSM from the application, and how far it reorders.
 ///
 /// `honor_bdsm` defaults to true: an explicit BDSM (`CSI 8 l`) disables
 /// reordering for that pane, including Claude-mode auto-detection. Set it
 /// false to keep Bayan's own detection when an application selects
-/// explicit mode.
+/// explicit mode. `mode` is mintty's `Bidi=2/1/0`: `full` (default),
+/// `alt_off` (no reordering on the alternate screen), `off` (no reordering
+/// anywhere). BDSM still applies on top of a mode that would otherwise
+/// reorder, when `honor_bdsm` is set.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct BidiConfig {
     /// The container `#[serde(default)]` fills a missing field from
     /// [`Default`], so an empty `{"bidi":{}}` keeps this true.
     pub honor_bdsm: bool,
+    /// `"off"` | `"alt_off"` | `"full"`. A missing field, or a value that
+    /// is not one of those (or the digits 0, 1, 2), stays `full`.
+    #[serde(
+        default,
+        deserialize_with = "de_bidi_mode",
+        skip_serializing_if = "bidi_mode_is_full"
+    )]
+    pub mode: crate::bidi_ctl::BidiReorder,
+}
+
+fn bidi_mode_is_full(mode: &crate::bidi_ctl::BidiReorder) -> bool {
+    mode.is_full()
+}
+
+fn de_bidi_mode<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<crate::bidi_ctl::BidiReorder, D::Error> {
+    struct Mode;
+    impl<'de> serde::de::Visitor<'de> for Mode {
+        type Value = crate::bidi_ctl::BidiReorder;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("bidi mode off, alt_off, or full")
+        }
+
+        fn visit_str<E: serde::de::Error>(
+            self,
+            value: &str,
+        ) -> Result<crate::bidi_ctl::BidiReorder, E> {
+            // A typo must not reject the rest of the file. Full is the
+            // historical behavior, so an unknown word keeps it.
+            Ok(crate::bidi_ctl::BidiReorder::parse(value)
+                .unwrap_or(crate::bidi_ctl::BidiReorder::Full))
+        }
+
+        fn visit_u64<E: serde::de::Error>(
+            self,
+            value: u64,
+        ) -> Result<crate::bidi_ctl::BidiReorder, E> {
+            Ok(match value {
+                0 => crate::bidi_ctl::BidiReorder::Off,
+                1 => crate::bidi_ctl::BidiReorder::AltOff,
+                _ => crate::bidi_ctl::BidiReorder::Full,
+            })
+        }
+
+        fn visit_i64<E: serde::de::Error>(
+            self,
+            value: i64,
+        ) -> Result<crate::bidi_ctl::BidiReorder, E> {
+            self.visit_u64(value.max(0) as u64)
+        }
+    }
+    deserializer.deserialize_any(Mode)
 }
 
 impl Default for BidiConfig {
     fn default() -> Self {
-        Self { honor_bdsm: true }
+        Self {
+            honor_bdsm: true,
+            mode: crate::bidi_ctl::BidiReorder::Full,
+        }
     }
 }
 
@@ -348,6 +408,15 @@ impl UserConfig {
         self.bidi.as_ref().map(|b| b.honor_bdsm).unwrap_or(true)
     }
 
+    /// Mintty-style reorder mode. Absent config is `full`, the behavior
+    /// from before the setting existed. A pane may still override it.
+    pub fn bidi_mode(&self) -> crate::bidi_ctl::BidiReorder {
+        self.bidi
+            .as_ref()
+            .map(|b| b.mode)
+            .unwrap_or(crate::bidi_ctl::BidiReorder::Full)
+    }
+
     pub fn kitty_protocol_on(&self) -> bool {
         self.keyboard.kitty_protocol
     }
@@ -533,6 +602,43 @@ mod tests {
         // an empty object still gets the field default
         let empty: UserConfig = serde_json::from_str(r#"{"bidi":{}}"#).unwrap();
         assert!(empty.honor_bdsm());
+        assert_eq!(empty.bidi_mode(), crate::bidi_ctl::BidiReorder::Full);
+    }
+
+    #[test]
+    fn bidi_mode_is_full_unless_the_config_says_otherwise() {
+        use crate::bidi_ctl::BidiReorder;
+        assert_eq!(UserConfig::default().bidi_mode(), BidiReorder::Full);
+        let absent: UserConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.bidi_mode(), BidiReorder::Full);
+        let off: UserConfig = serde_json::from_str(r#"{"bidi":{"mode":"off"}}"#).unwrap();
+        assert_eq!(off.bidi_mode(), BidiReorder::Off);
+        assert!(off.honor_bdsm(), "mode does not touch honor_bdsm");
+        let alt: UserConfig = serde_json::from_str(r#"{"bidi":{"mode":"alt_off"}}"#).unwrap();
+        assert_eq!(alt.bidi_mode(), BidiReorder::AltOff);
+        let digits: UserConfig = serde_json::from_str(r#"{"bidi":{"mode":1}}"#).unwrap();
+        assert_eq!(digits.bidi_mode(), BidiReorder::AltOff);
+        let zero: UserConfig = serde_json::from_str(r#"{"bidi":{"mode":"0"}}"#).unwrap();
+        assert_eq!(zero.bidi_mode(), BidiReorder::Off);
+        // a typo keeps full rather than refusing the file
+        let typo: UserConfig = serde_json::from_str(r#"{"bidi":{"mode":"line"}}"#).unwrap();
+        assert_eq!(typo.bidi_mode(), BidiReorder::Full);
+        // the default mode is not written back next to an explicit flag
+        let saved = serde_json::to_string(&BidiConfig {
+            honor_bdsm: false,
+            mode: BidiReorder::Full,
+        })
+        .unwrap();
+        assert!(
+            !saved.contains("mode"),
+            "full is the default and must not appear: {saved}"
+        );
+        let kept = serde_json::to_string(&BidiConfig {
+            honor_bdsm: true,
+            mode: BidiReorder::Off,
+        })
+        .unwrap();
+        assert!(kept.contains("\"mode\":\"off\""), "{kept}");
     }
 
     #[test]
