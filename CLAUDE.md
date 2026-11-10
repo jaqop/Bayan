@@ -32,14 +32,16 @@ selection and BiDi paths must do.
 | `localpath.rs` | no-follow walk: is a drive path local in every component, links read but not followed (link probe, new-tab cwd) |
 | `mru.rs` | most-recently-used tab order for Ctrl+Tab, walkable within one group |
 | `shells.rs` | installed-shell detection (ported from EasyTer's `profiles.py`) |
+| `ssh.rs` | OpenSSH tab: System32 `ssh.exe`, `~/.ssh/config` hosts, injection-safe argv |
+| `mux.rs` | opt-in per-user mux: named-pipe server, detach / reattach / kill |
 | `posh.rs` | oh-my-posh theme picker with a live ANSI preview |
 | `plugins.rs` | declarative JSON plugin host (`~/.bayan/plugins/`) |
 | `config.rs` | `~/.bayan/config.json`, optional and BOM-tolerant |
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-494 tests across the tree. `term.rs` (81), `link.rs` (61) and `render.rs` (64)
-carry the most; `localpath.rs` has 21.
+510 tests across the tree. `term.rs` (81), `link.rs` (61) and `render.rs` (64)
+carry the most; `localpath.rs` has 21. `ssh.rs` has 7 and `mux.rs` has 8.
 
 ## Invariants — do not "simplify" these
 

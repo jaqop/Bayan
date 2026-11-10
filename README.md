@@ -875,6 +875,48 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       vim count prefix, `gg` is a single g, and the column is not
       remembered across short lines.
 
+## SSH tabs and the session multiplexer
+
+An SSH tab runs the Windows OpenSSH client, `GetSystemDirectoryW()\OpenSSH\ssh.exe`,
+in a new ConPTY tab. A copy on `PATH`, beside `bayan.exe`, or named by an
+environment variable is never used, including when Bayan is elevated. The
+command palette row «فتح SSH» lists hosts from `ssh_hosts` in
+`config.json` and from `Host` lines in `~/.ssh/config`. Wildcard patterns
+(`*`, `?`) and `Match` blocks are not destinations. The host is the tab
+title. A host that starts with `-` is rejected, and `--` is placed before
+the destination so the host cannot become an ssh option. Bayan does not
+store a password; authentication stays with the ssh agent and keys.
+
+```json
+{ "ssh_hosts": ["example.com", "me@bastion.example"] }
+```
+
+`Include` directives inside the ssh config are not followed. An IPv6
+literal is not a palette token; give it a `Host` alias and Bayan will pass
+that alias to `ssh.exe`.
+
+The multiplexer is off unless config says so:
+
+```json
+{ "mux": { "enabled": true } }
+```
+
+With it on, «فتح SSH» asks a per-user server (`bayan --mux-server`) to own
+the ConPTY. The window talks to that process over a named pipe. The pipe's
+DACL allows only the current user's SID, and the pipe is created with
+`PIPE_REJECT_REMOTE_CLIENTS`. «فصل الجلسة» drops the tab and leaves the
+session running in the server. «إعادة الاتصال» lists those sessions and
+opens one again, replaying the output tail (capped at 256 KiB) through the
+same VT path as a live read. «إنهاء الجلسة» kills one. Closing the window
+kills sessions that are still attached and leaves the server running while
+any detached session remains. The server process exits when the last
+session ends.
+
+A shell Bayan started itself (PowerShell, cmd, WSL) stays in the window
+process, so the existing prompt injection is unchanged. Moving that ConPTY
+into the server with `DuplicateHandle` is not done. Scrollback saved to
+disk is a different item and is not part of this.
+
 ## Settings
 
 Everything lives in the in-app panel (Ctrl+, or the tab-bar gear); the
