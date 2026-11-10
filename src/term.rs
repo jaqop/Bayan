@@ -4,7 +4,8 @@
 
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Instant;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -2003,6 +2004,67 @@ pub(crate) fn first_report(pending: &AtomicBool) -> bool {
     !pending.swap(true, Ordering::AcqRel)
 }
 
+/// DEC 2026: vte holds a synchronized update's bytes and leaves its 150 ms
+/// timeout to the host; `advance` never checks it. Flush the update when
+/// its deadline has passed. Returns the deadline still pending, if any.
+fn expire_sync_update<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    now: Instant,
+) -> Option<Instant> {
+    let deadline = parser.sync_timeout().sync_timeout()?;
+    if deadline > now {
+        return Some(deadline);
+    }
+    parser.stop_sync(t);
+    None
+}
+
+/// The timer for [`expire_sync_update`]. The reader blocks in `read`, so a
+/// program that begins an update and never ends it (or ends it after a
+/// long pause) froze the pane, typing included, until 2 MiB piled up. The
+/// reader sends each pending deadline here; the thread ends when the
+/// reader drops its sender.
+fn spawn_sync_watchdog<T: EventListener + Send + 'static>(
+    term: Arc<FairMutex<Term<T>>>,
+    parser: Arc<Mutex<Processor>>,
+    batch: Arc<Mutex<EventBatch>>,
+    on_flush: impl Fn(ChunkOutput) + Send + 'static,
+) -> (mpsc::Sender<Instant>, std::thread::JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel::<Instant>();
+    let handle = std::thread::spawn(move || {
+        while let Ok(mut deadline) = rx.recv() {
+            loop {
+                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(later) => {
+                        deadline = later;
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                // term, then parser: the reader's order, without meta
+                let (pending, out) = {
+                    let mut t = term.lock();
+                    let mut p = parser.lock_or_recover();
+                    batch.lock_or_recover().begin();
+                    let pending = expire_sync_update(&mut p, &mut t, Instant::now());
+                    (pending, batch.lock_or_recover().finish(false, Vec::new()))
+                };
+                match pending {
+                    // a later BSU moved the deadline
+                    Some(later) => deadline = later,
+                    None => {
+                        on_flush(out);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    (tx, handle)
+}
+
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         let Some(event) = self.2.lock_or_recover().absorb(event) else {
@@ -2212,6 +2274,21 @@ impl Session {
         let meta2 = Arc::clone(&meta);
         let parser2 = Arc::clone(&parser);
         let input_proxy = proxy.clone();
+        let sync_proxy = proxy.clone();
+        let (sync_tx, _) = spawn_sync_watchdog(
+            Arc::clone(&term),
+            Arc::clone(&parser),
+            Arc::clone(&batch),
+            move |out| {
+                if !out.replies.is_empty() {
+                    let _ = sync_proxy.send_event(UserEvent::PtyWrite(id, out.replies));
+                }
+                if out.bell {
+                    let _ = sync_proxy.send_event(UserEvent::Bell(id));
+                }
+                let _ = sync_proxy.send_event(UserEvent::Wakeup(id));
+            },
+        );
         std::thread::spawn(move || {
             let mut carry: Vec<u8> = Vec::new();
             let mut buf = [0u8; PTY_READ];
@@ -2219,7 +2296,7 @@ impl Session {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        let (ev, out) = {
+                        let (ev, out, sync_deadline) = {
                             // term, then meta, then parser. reset_keyboard
                             // on the UI thread takes the same order. The
                             // batch opens and closes under the term lock,
@@ -2232,8 +2309,11 @@ impl Session {
                                 process_chunk(&mut p, &mut t, &mut m, &mut carry, &buf[..n]);
                             let replies = std::mem::take(&mut ev.pty_replies);
                             let out = batch.lock_or_recover().finish(ev.clean_claude, replies);
-                            (ev, out)
+                            (ev, out, p.sync_timeout().sync_timeout())
                         };
+                        if let Some(deadline) = sync_deadline {
+                            let _ = sync_tx.send(deadline);
+                        }
                         if let Some(txt) = ev.clipboard {
                             let _ = proxy.send_event(UserEvent::ClipboardSet(id, txt));
                         }
@@ -3342,6 +3422,131 @@ mod tests {
             meta,
             Vec::new(),
         )
+    }
+
+    const BSU: &[u8] = b"\x1b[?2026h";
+
+    fn first_row(t: &Term<VoidListener>) -> String {
+        let row = &t.grid()[alacritty_terminal::index::Line(0)];
+        (0..t.columns())
+            .map(|c| row[Column(c)].c)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn a_sync_update_without_its_end_is_held_until_the_deadline() {
+        let (mut t, mut p, ..) = test_term();
+        p.advance(&mut t, BSU);
+        p.advance(&mut t, b"held");
+        let deadline = p.sync_timeout().sync_timeout().expect("BSU set a deadline");
+        let early = deadline - std::time::Duration::from_millis(1);
+        assert_eq!(expire_sync_update(&mut p, &mut t, early), Some(deadline));
+        assert_eq!(first_row(&t), "", "nothing is drawn before the deadline");
+    }
+
+    #[test]
+    fn a_sync_update_without_its_end_is_flushed_after_the_deadline() {
+        let (mut t, mut p, ..) = test_term();
+        p.advance(&mut t, BSU);
+        p.advance(&mut t, b"frozen");
+        let deadline = p.sync_timeout().sync_timeout().unwrap();
+        assert_eq!(expire_sync_update(&mut p, &mut t, deadline), None);
+        assert_eq!(first_row(&t), "frozen");
+        // the parser is out of the update: later bytes draw at once
+        p.advance(&mut t, b"!");
+        assert_eq!(first_row(&t), "frozen!");
+        assert_eq!(p.sync_timeout().sync_timeout(), None);
+    }
+
+    struct Watched {
+        t: Arc<FairMutex<Term<VoidListener>>>,
+        p: Arc<Mutex<Processor>>,
+        tx: mpsc::Sender<Instant>,
+        handle: std::thread::JoinHandle<()>,
+        flushed: mpsc::Receiver<ChunkOutput>,
+    }
+
+    fn watched() -> Watched {
+        let (t, p, ..) = test_term();
+        let (t, p) = (Arc::new(FairMutex::new(t)), Arc::new(Mutex::new(p)));
+        let (flushed_tx, flushed) = mpsc::channel();
+        let (tx, handle) =
+            spawn_sync_watchdog(Arc::clone(&t), Arc::clone(&p), Arc::default(), move |out| {
+                let _ = flushed_tx.send(out);
+            });
+        Watched {
+            t,
+            p,
+            tx,
+            handle,
+            flushed,
+        }
+    }
+
+    impl Watched {
+        /// The reader's side: feed under the locks, then report the deadline.
+        fn feed(&self, b: &[u8]) -> Option<Instant> {
+            let mut t = self.t.lock();
+            let mut p = self.p.lock_or_recover();
+            p.advance(&mut *t, b);
+            let deadline = p.sync_timeout().sync_timeout();
+            if let Some(d) = deadline {
+                self.tx.send(d).unwrap();
+            }
+            deadline
+        }
+
+        fn row(&self) -> String {
+            first_row(&self.t.lock())
+        }
+
+        fn wait_for(&self, text: &str) {
+            let give_up = Instant::now() + std::time::Duration::from_secs(5);
+            while self.row() != text {
+                let left = give_up.saturating_duration_since(Instant::now());
+                assert!(
+                    self.flushed.recv_timeout(left).is_ok(),
+                    "no flush drew {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_watchdog_flushes_a_stalled_update_with_no_further_output() {
+        let w = watched();
+        w.feed(b"\x1b[?2026hstalled");
+        assert_eq!(w.row(), "");
+        w.wait_for("stalled");
+    }
+
+    #[test]
+    fn the_watchdog_waits_for_a_deadline_a_second_begin_moved() {
+        let w = watched();
+        let first = w.feed(BSU).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // a second BSU inside the update restarts its 150 ms
+        let second = w.feed(b"\x1b[?2026hlate").unwrap();
+        assert!(second > first);
+        std::thread::sleep(
+            first.saturating_duration_since(Instant::now()) + std::time::Duration::from_millis(20),
+        );
+        // read, then look at the clock: a read before the moved deadline
+        // must still be empty, whatever the scheduler did
+        let row = w.row();
+        if Instant::now() < second {
+            assert_eq!(row, "", "flushed at the first deadline");
+        }
+        w.wait_for("late");
+    }
+
+    #[test]
+    fn the_watchdog_ends_with_the_reader() {
+        let Watched { tx, handle, .. } = watched();
+        drop(tx);
+        handle.join().expect("the watchdog exits cleanly");
     }
 
     #[test]

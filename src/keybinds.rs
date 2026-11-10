@@ -33,10 +33,11 @@ pub enum Action {
     NewGroup,
     NextGroup,
     PrevGroup,
+    CopyMode,
 }
 
 impl Action {
-    pub const ALL: [Action; 20] = [
+    pub const ALL: [Action; 21] = [
         Action::NewTab,
         Action::ClosePane,
         Action::Search,
@@ -57,6 +58,7 @@ impl Action {
         Action::NewGroup,
         Action::NextGroup,
         Action::PrevGroup,
+        Action::CopyMode,
     ];
 
     /// The config.json key.
@@ -82,6 +84,7 @@ impl Action {
             Action::NewGroup => "new-group",
             Action::NextGroup => "next-group",
             Action::PrevGroup => "prev-group",
+            Action::CopyMode => "copy-mode",
         }
     }
 
@@ -121,6 +124,7 @@ impl Action {
             Action::NewGroup => crate::lang::pick(lang, "مجموعة جديدة", "New group"),
             Action::NextGroup => crate::lang::pick(lang, "المجموعة التالية", "Next group"),
             Action::PrevGroup => crate::lang::pick(lang, "المجموعة السابقة", "Previous group"),
+            Action::CopyMode => crate::lang::pick(lang, "وضع النسخ", "Copy mode"),
         }
     }
 
@@ -161,6 +165,8 @@ impl Action {
             Action::NewGroup => c(true, true, Letter('g')),
             Action::NextGroup => c(true, true, PageDown),
             Action::PrevGroup => c(true, true, PageUp),
+            // X: WezTerm's ActivateCopyMode chord
+            Action::CopyMode => c(true, true, Letter('x')),
         }
     }
 }

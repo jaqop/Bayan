@@ -1910,6 +1910,15 @@ impl Renderer {
         ))
     }
 
+    /// Whether the last frame laid cell `col` of viewport `row` right to
+    /// left. False for a grid row, or a cell the frame did not draw.
+    pub fn cell_rtl(&self, pane: Rect, row: usize, col: usize) -> bool {
+        self.cell_geometry
+            .get(&(pane, row, col))
+            .and_then(|spans| spans.first())
+            .is_some_and(|&(_, _, rtl)| rtl)
+    }
+
     /// The primary family actually in use (post-fallback) — what the
     /// settings panel displays.
     pub fn family(&self) -> &str {
@@ -5239,15 +5248,18 @@ impl Renderer {
         width: usize,
         height: usize,
         tabs: &[TabInfo],
-        search_query: Option<&str>,
+        bar_text: Option<&str>,
         claude: bool,
     ) {
         let oy = self.tab_bar_h().round() as i32;
         let whole: Rect = (0, 0, width as i32, height as i32);
 
-        // search bar, top-right below the tab bar
-        if let Some(q) = search_query {
-            let bar_w = (self.cell_w * 34.0) as i32;
+        // search bar (or the copy-mode hint), top-right below the tab bar;
+        // it widens past 34 cells for a longer text
+        if let Some(text) = bar_text {
+            let segs = [Seg::plain(text.to_string(), self.fg)];
+            let text_w = self.measure(&segs, true).ceil() as i32;
+            let bar_w = ((self.cell_w * 34.0) as i32).max(text_w + 16);
             let bar_h = (self.cell_h + 10.0) as i32;
             let bx = width as i32 - bar_w - 10;
             let by = oy + 6;
@@ -5269,10 +5281,6 @@ impl Renderer {
                 2,
                 c4(PALETTE[11], 200),
             ); // amber underline = search accent
-            let segs = [Seg::plain(
-                format!("{}: {q}_", crate::lang::tr("بحث", "Search")),
-                self.fg,
-            )];
             self.draw_run(&segs, true, out, whole, (bx + 8) as f32, by + 5, 1.0);
         }
 
@@ -6161,6 +6169,61 @@ mod tests {
                 cursor.0 + cursor.1 <= left + 1,
                 "{text}: cursor {cursor:?} must sit left of the whole line (x={left})"
             );
+        }
+    }
+
+    /// `مرحبا … hello` at a prompt: Latin typed after Arabic and one to three
+    /// blanks. The cursor stays on the end of `hello`, not on the Arabic's
+    /// logical end, and every blank still widens the gap before `hello`.
+    /// Checked live on 4a570b7 (Nov 2026) before this test pinned it.
+    #[test]
+    fn latin_after_arabic_and_blanks_keeps_the_cursor_after_the_latin() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let pane = (0, 0, 800, 120);
+        let mut last_gap = 0;
+        for blanks in 1..=3usize {
+            let text = format!("C:\\>مرحبا{}hello", " ".repeat(blanks));
+            let cells = row_cells(&text, 0);
+            let end = cells.len();
+            r.begin_frame();
+            r.mapping_context = Some((pane, 0));
+            let cursor = r
+                .draw_line_bidi(
+                    &mut Vec::new(),
+                    pane,
+                    0,
+                    0,
+                    pane.2,
+                    &cells,
+                    false,
+                    Some(end),
+                    ParagraphDir::Default,
+                    None,
+                )
+                .expect("the end cursor maps");
+            r.finish_pane_layout(pane);
+            let box_of = |col: usize| r.cell_geometry[&(pane, 0, col)][0];
+            let arabic_right = cells
+                .iter()
+                .filter(|c| is_arabic(c.c))
+                .map(|c| box_of(c.col))
+                .map(|b| b.0 + b.1)
+                .max()
+                .unwrap();
+            let h = box_of(end - 5);
+            let o = box_of(end - 1);
+            assert!(
+                (cursor.0 - (o.0 + o.1)).abs() <= 1,
+                "{blanks} blanks: cursor x={} must follow hello's o (ends at {})",
+                cursor.0,
+                o.0 + o.1
+            );
+            let gap = h.0 - arabic_right;
+            assert!(
+                gap > last_gap,
+                "{blanks} blanks: the gap before hello ({gap}) did not grow past {last_gap}"
+            );
+            last_gap = gap;
         }
     }
 
@@ -7759,6 +7822,25 @@ mod cache_tests {
             underlined > plain,
             "no underline quads on the Arabic row ({underlined} vs {plain})"
         );
+    }
+
+    /// The top-right bar draws for any text, and widens for a text longer
+    /// than its 34-cell floor instead of letting it run out of the box.
+    #[test]
+    fn the_bar_draws_and_holds_its_text() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let by = r.tab_bar_h().round() + 6.0;
+        let bar = |r: &mut Renderer, text: Option<&str>| -> Option<f32> {
+            let mut out = Vec::new();
+            r.draw_chrome(&mut out, 1600, 600, &[], text, false);
+            out.chunks(6)
+                .find(|q| q[0].pos[1] == by)
+                .map(|q| q[1].pos[0] - q[0].pos[0])
+        };
+        assert_eq!(bar(&mut r, None), None);
+        let short = bar(&mut r, Some("بحث: x_")).expect("a search bar");
+        let long = bar(&mut r, Some(&"م".repeat(80))).expect("a long bar");
+        assert!(long > short, "{long} <= {short}");
     }
 
     /// A tab with OSC 9;4 progress draws its bar (track + fill) and the

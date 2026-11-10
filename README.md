@@ -79,7 +79,10 @@ specification; `src/keys.rs` carries the same key-encoding tests.
 - [x] **M9** — the shaped-run cache: the paint loop now re-shapes only
       CHANGED lines (generational LRU, EasyTer's dirty-row lesson) — a
       fully-cached frame's shaping cost dropped from ~1.5ms to ~4µs
-      (~340×), which is the honest 80% of what a GPU renderer buys; full
+      (~340×, release build, 40 rows, at 43017b0; `cargo test --release
+      measure_cache_speedup_probe -- --nocapture` prints the two figures
+      without asserting them, and on 4a570b7 it gave 1.14ms and 5.1µs,
+      ~220×); full
       layout persistence: every tab's panes, split axis, weights and focus
       survive a restart (pre-M9 session files still restore)
 - [x] **M10** — the wgpu renderer: every frame is one draw call of quads
@@ -87,8 +90,9 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       texel), WGSL pipeline with straight-alpha blending, vsync'd present,
       DX12-first with GL fallback; Arabic shapes through the same cosmic-text
       cache and rasterizes into the atlas — verified pixel-identical to the
-      CPU renderer. The window stays hidden until the first frame (~0.4s,
-      GPU init) so there's no white flash.
+      CPU renderer. The window stays hidden until the first frame (GPU
+      init, about 0.4s on the development machine; not measured by any
+      test) so there's no white flash.
 - [x] **M11** — cap-proof command marks WITHOUT upstream changes: Grid's
       scroll_up advances a non-zero display_offset by exactly the scrolled
       amount, so the feed parks the offset at 1, reads how far it moved,
@@ -837,9 +841,39 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       symlink open, a junction to a missing file is Missing, and a symlink
       to `\\127.0.0.1\…`, a local junction chained into it, and a junction
       to a `\\?\Volume{…}\` path are refused as not local. Not run
-      against a real SMB share. A local volume mount point (`\??\Volume{…}`
-      target) is refused too, which is stricter than it needs to be. A
+      against a real SMB share. A volume mount point (a link to
+      `\??\Volume{GUID}\`, a volume's root) was refused too; since #36 the
+      walk goes through it in place and checks every component below it,
+      while a link to a folder inside a volume is still refused. A
       link swapped between the walk and the open (TOCTOU) is not covered.
+- [x] **Copy mode** (Ctrl+Shift+X, WezTerm's chord) — select and copy
+      scrollback without the mouse. It runs on alacritty_terminal's vi
+      mode, which already moves the cursor, scrolls the view after it and
+      stretches the selection; `copymode.rs` only maps keys to it. Arrows
+      or h j k l move, w b e by word (Shift for whitespace words), 0 and $
+      (or Home and End) to the line's ends, g and Shift+G to the top and
+      bottom of the scrollback, PageUp/PageDown by a screen. v starts a
+      selection, Shift+V a line selection, Ctrl+V a block; pressing the
+      same one again drops it. y, Enter or Ctrl+C copies and leaves; Esc or
+      q leaves without copying, and leaving returns the view to the prompt.
+      Keys resolve by physical key, so the Arabic layout keeps every one,
+      and no key reaches the shell while the mode is on. The cursor is a
+      solid block that does not blink, and the top-right bar (the search
+      bar's slot) reads «وضع النسخ: v تحديد · y نسخ · Esc خروج». On a cell
+      laid right to left the horizontal keys swap, so Left still moves
+      left; the renderer's shaped layout answers which way a cell runs
+      (`Renderer::cell_rtl`), never the column index. A cursor that would
+      sit past the end of an Arabic row snaps back onto its last character:
+      the shaped path lays the row out to the cursor's column, and in a
+      right-to-left line those blanks go visually left, so the word jumped
+      toward the cursor (seen live before the fix). The action is in the
+      shortcuts editor and the palette. Proven by 10 tests (the key map on
+      an Arabic layout, motions and selections on a real `Term`, the snap,
+      the bar) and live: real scan-code keys in a debug build copied a
+      line to the clipboard, and PrintWindow captures showed the hint, the
+      selection, the RTL arrow and a clean prompt after Esc. There is no
+      vim count prefix, `gg` is a single g, and the column is not
+      remembered across short lines.
 
 ## Settings
 
@@ -881,7 +915,7 @@ Two escape sequences from ECMA-48 / the terminal-wg "BiDi in Terminal
 Emulators" recommendation, which `alacritty_terminal` 0.26 does not act on
 (mode 8 is an unknown SM/RM parameter; `CSI Ps SP k` is not in its CSI
 dispatch). Bayan strips them from the PTY stream before the parser, including
-when a sequence is split across reads. The tree has 224 unit tests.
+when a sequence is split across reads.
 
 - **BDSM** — `CSI 8 h` implicit (Bayan applies UAX#9; this is the initial
   state, so a shell that never sends BDSM still gets Arabic), `CSI 8 l`
