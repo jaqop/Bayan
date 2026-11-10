@@ -157,7 +157,7 @@ fn snap_to_arabic_text<T: EventListener>(t: &mut Term<T>) {
     let at = t.vi_mode_cursor.point;
     let row = &t.grid()[at.line];
     let cols = t.columns();
-    if !(0..cols).any(|c| crate::render::is_arabic(row[Column(c)].c)) {
+    if !(0..cols).any(|c| crate::render::is_rtl(row[Column(c)].c)) {
         return;
     }
     let Some(last) = (0..cols).rev().find(|&c| row[Column(c)].c != ' ') else {

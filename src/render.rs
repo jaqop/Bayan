@@ -1039,6 +1039,15 @@ pub(crate) fn is_arabic(c: char) -> bool {
         | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF | 0x10EC0..=0x10EFF)
 }
 
+/// A letter of a right-to-left script: Arabic, Hebrew (with its
+/// presentation forms), Syriac, Thaana or NKo. A row holding one takes the
+/// BiDi path. Only `is_arabic` picks the Arabic font, which has no Hebrew.
+pub(crate) fn is_rtl(c: char) -> bool {
+    is_arabic(c)
+        || matches!(c as u32,
+            0x0590..=0x05FF | 0xFB1D..=0xFB4F | 0x0700..=0x074F | 0x0780..=0x07FF)
+}
+
 /// One visible grid cell (wide chars own their spacer's width).
 struct CellInfo {
     col: usize,
@@ -2585,7 +2594,7 @@ impl Renderer {
         dir: ParagraphDir,
         grid_cols: usize,
     ) -> Option<usize> {
-        if !cells.iter().any(|c| is_arabic(c.c)) {
+        if !cells.iter().any(|c| is_rtl(c.c)) {
             return None;
         }
         let infos: Vec<CellInfo> = cells
@@ -2854,7 +2863,7 @@ impl Renderer {
                 i += 1;
             }
             let field = &cells[start..i];
-            if field.iter().any(|c| is_arabic(c.c)) {
+            if field.iter().any(|c| is_rtl(c.c)) {
                 let left = (field[0].col as f32 * self.cell_w).round() as i32;
                 let last = &field[field.len() - 1];
                 let right = ((last.col + last.w) as f32 * self.cell_w).round() as i32;
@@ -2985,7 +2994,7 @@ impl Renderer {
             // recommendation, presentation forms). The grid path does not
             // run UAX#9 and does not reshape. Implicit mode keeps the
             // whole-line shaper, with SCP's base direction if one was set.
-            let arabic = cells.iter().any(|ci| is_arabic(ci.c));
+            let arabic = cells.iter().any(|ci| is_rtl(ci.c));
             let row_claude = view.claude && view.claude_from.is_none_or(|start| li as i64 >= start);
             if arabic && view.reorder {
                 let on_row = cursor_vrow >= 0 && cursor_vrow as usize == li;
@@ -6340,6 +6349,59 @@ mod tests {
         for col in 2..7 {
             assert!(r.cell_geometry[&(pane, 0, col)][0].0 >= inverse.0 + inverse.1);
         }
+    }
+
+    /// A Hebrew word takes the BiDi path like Arabic: its first letter is
+    /// drawn rightmost, and the Latin after it stays to its right.
+    #[test]
+    fn hebrew_rows_are_laid_out_right_to_left() {
+        use alacritty_terminal::{
+            event::VoidListener,
+            term::{Config, Term},
+            vte::ansi::Processor,
+        };
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 40, rows: 3 };
+        let mut t = Term::new(Config::default(), &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        // `C` opens an LTR paragraph, as at a cmd prompt
+        p.advance(&mut t, "C:\\> שלום ab".as_bytes());
+        let pane = (0, 0, 600, 120);
+        let view = PaneView {
+            rect: pane,
+            focused: true,
+            cursor: crate::config::CursorStyle::Block,
+            cursor_on: true,
+            bordered: false,
+            claude: false,
+            claude_from: None,
+            reorder: true,
+            line_dir: &[],
+            search_match: None,
+            marks: &[],
+            link_hover: None,
+            link_tip: None,
+        };
+        r.draw_pane(&mut Vec::new(), &view, &t);
+        let x = |col: usize| {
+            r.cell_geometry
+                .get(&(pane, 0, col))
+                .unwrap_or_else(|| panic!("col {col}: a Hebrew row must use the shaped cell map"))
+                [0]
+            .0
+        };
+        // ש ל ו ם sit at columns 5..=8 in logical order, `a` at 10
+        assert!(
+            x(5) > x(6) && x(6) > x(7) && x(7) > x(8),
+            "Hebrew drawn left to right"
+        );
+        assert!(x(10) > x(5), "the Latin after the Hebrew moved left of it");
+        assert!(x(8) > x(3), "the Hebrew moved left of the prompt");
+        for c in ['ש', 'ﬠ', 'ܐ', 'ހ', 'ߊ'] {
+            assert!(is_rtl(c), "{c:?} is a right-to-left letter");
+            assert!(!is_arabic(c), "{c:?} must not take the Arabic font");
+        }
+        assert!(is_rtl('م') && !is_rtl('a') && !is_rtl('─'));
     }
 
     #[test]
