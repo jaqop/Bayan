@@ -17,11 +17,19 @@
 //! `~/.bayan` is writable by the same user before UAC. An elevated window
 //! does not load `plugins/` (a plugin `send` would reach the shell after the
 //! confirm card) and does not use `config.json`'s `editor` template (that
-//! string is a program to spawn). `session.json` is not restored and
-//! `config.json`'s `shell` is not what new tabs run. Keybindings in
-//! `config.json` only remap fixed actions; they have no send or command
-//! string. There is no snippets file. Theme colours and font names do not
-//! run anything. `jumplist.stamp` is compared, never executed.
+//! string is a program to spawn). `session.json` is not restored and is not
+//! written. `config.json`'s `shell` is not what new tabs run. Nothing under
+//! `~/.bayan` is written, including `jumplist.stamp` and a settings save, so
+//! a junction planted on that directory is not followed by an elevated
+//! process. Keybindings in `config.json` only remap fixed actions; they have
+//! no send or command string. There is no snippets file. Theme colours and
+//! font names do not run anything.
+//!
+//! PowerShell is started with `-NoProfile`, and the elevated setup script
+//! does not inject oh-my-posh. The theme path would come from `$PROFILE` or
+//! `POSH_THEME`, and `oh-my-posh` would be resolved from the user's `PATH`.
+//! `Ctrl+click` on `path:line` looks for `Code.exe` only under Program Files
+//! and `%LOCALAPPDATA%\Programs\Microsoft VS Code`, not on `PATH`.
 
 use std::path::Path;
 
@@ -43,8 +51,48 @@ pub fn window_title(elevated: bool) -> String {
     }
 }
 
+/// Whether startup may reopen `session.json`. An elevated window never does.
+pub fn may_restore_saved_tabs(elevated: bool, restore_tabs: bool, has_saved_tabs: bool) -> bool {
+    !elevated && restore_tabs && has_saved_tabs
+}
+
+/// Whether this process may create or replace a file under `~/.bayan`.
+/// Session, settings, and the jump-list stamp all go through this.
+pub fn may_write_bayan(elevated: bool) -> bool {
+    !elevated
+}
+
+/// The command a new tab starts. Elevated windows never use `config_shell`.
+pub fn spawn_shell_command(
+    elevated: bool,
+    profile_command: Option<&str>,
+    installed: &[crate::shells::Shell],
+    config_shell: &str,
+) -> String {
+    if elevated {
+        profile_command
+            .filter(|command| !command.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| crate::shells::elevated_default_command(installed))
+    } else {
+        config_shell.to_string()
+    }
+}
+
+/// Title and body of the card shown when an elevated window opens.
+pub fn admin_notice() -> (&'static str, &'static str) {
+    (
+        crate::lang::tr("نافذة مسؤول", "Administrator window"),
+        crate::lang::tr(
+            "لا تُحمَّل الإضافات ولا الجلسة، ولا تُحقن سمة الموجّه، ولا يُؤخذ المحرّر أو الصدفة من الإعدادات.",
+            "Plugins, the saved session, the prompt theme, and the configured shell and editor are not used.",
+        ),
+    )
+}
+
 /// `config.json`'s editor template, or nothing when this window is elevated.
-/// The template is a program argv. The built-in `code.exe` lookup stays.
+/// The template is a program argv. `Code.exe` is then resolved only from
+/// the known install folders, not from `PATH`.
 pub fn configured_editor(elevated: bool, editor: Option<&str>) -> Option<&str> {
     if elevated {
         None
@@ -276,6 +324,48 @@ mod tests {
         let mut launch = launch(Some("PowerShell"), None, None);
         launch.elevated = false;
         assert!(forward_args(&launch).is_err());
+    }
+
+    #[test]
+    fn an_elevated_window_does_not_restore_or_write_the_session_or_its_home() {
+        assert!(!may_restore_saved_tabs(true, true, true));
+        assert!(!may_write_bayan(true));
+        assert!(may_restore_saved_tabs(false, true, true));
+        assert!(!may_restore_saved_tabs(false, false, true));
+        assert!(!may_restore_saved_tabs(false, true, false));
+        assert!(may_write_bayan(false));
+    }
+
+    #[test]
+    fn an_elevated_new_tab_does_not_run_the_configured_shell() {
+        let installed = [crate::shells::Shell {
+            name: "PowerShell".into(),
+            command: "powershell.exe".into(),
+        }];
+        let planted = r"C:\Users\me\payload.exe";
+        assert_eq!(
+            spawn_shell_command(true, None, &installed, planted),
+            "powershell.exe"
+        );
+        assert_eq!(
+            spawn_shell_command(true, Some("pwsh.exe -NoLogo"), &installed, planted),
+            "pwsh.exe -NoLogo"
+        );
+        assert_eq!(
+            spawn_shell_command(false, None, &installed, "pwsh.exe"),
+            "pwsh.exe"
+        );
+        assert!(!spawn_shell_command(true, None, &installed, planted).contains("payload"));
+    }
+
+    #[test]
+    fn the_admin_notice_says_what_is_left_out() {
+        let (title, body) = admin_notice();
+        assert!(title.contains("مسؤول") || title.contains("Administrator"));
+        assert!(body.contains("الإضافات"));
+        assert!(body.contains("الجلسة"));
+        assert!(body.contains("سمة"));
+        assert!(body.contains("المحرّر"));
     }
 
     #[test]

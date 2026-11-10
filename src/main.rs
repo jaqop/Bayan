@@ -1708,7 +1708,7 @@ impl App {
         }
         // tabs + cwds greet you tomorrow. An elevated window does not write
         // session.json: that file is the next launch's command list.
-        if !self.elevated && !self.save_state() {
+        if elevate::may_write_bayan(self.elevated) && !self.save_state() {
             // The window is about to close, so its error card cannot be seen.
             // An explicit save failure must be acknowledged before exit.
             if let Some(error) = &self.blocked_link {
@@ -2426,6 +2426,16 @@ impl App {
     }
 
     fn save_config(&mut self) {
+        if !elevate::may_write_bayan(self.elevated) {
+            self.report_error(
+                tr("نافذة مسؤول", "Administrator window"),
+                tr(
+                    "لا يُحفظ الإعداد من نافذة المسؤول.",
+                    "Settings are not saved from an administrator window.",
+                ),
+            );
+            return;
+        }
         if self.config_load_error.is_some() {
             self.report_config_load_error();
             return;
@@ -2702,13 +2712,12 @@ impl App {
     /// The shell a new tab starts. Elevated windows use the profile this
     /// process already resolved from its own detection, never `config.shell`.
     fn spawn_shell(&self) -> String {
-        if self.elevated {
-            self.start_profile_command
-                .clone()
-                .unwrap_or_else(|| shells::elevated_default_command(&self.shell_profiles))
-        } else {
-            self.config.shell_program()
-        }
+        elevate::spawn_shell_command(
+            self.elevated,
+            self.start_profile_command.as_deref(),
+            &self.shell_profiles,
+            &self.config.shell_program(),
+        )
     }
 
     fn spawn_pane_command(
@@ -2728,6 +2737,7 @@ impl App {
             command,
             self.config.kitty_protocol_on(),
             raw,
+            self.elevated,
         ) {
             Ok(session) => Some(Pane {
                 id,
@@ -3255,10 +3265,11 @@ impl App {
         if explicit {
             // Elevated: do not replay session.json. Its commands and folders
             // were written by a process that was not elevated.
-            if !self.elevated
-                && self.config.restore_tabs.unwrap_or(false)
-                && load_saved_state().is_some_and(|s| !s.tabs.is_empty())
-            {
+            if elevate::may_restore_saved_tabs(
+                self.elevated,
+                self.config.restore_tabs.unwrap_or(false),
+                load_saved_state().is_some_and(|s| !s.tabs.is_empty()),
+            ) {
                 self.restore_state();
             }
             let default = self.spawn_shell();
@@ -3956,11 +3967,12 @@ impl App {
         };
         let proxy = self.proxy.clone();
         let shown_for_fail = shown.clone();
+        let elevated = self.elevated;
         let spawned = std::thread::Builder::new()
             .name("bayan-link".into())
             .spawn(move || {
                 link::init_link_thread();
-                let action = link::settle_live(action);
+                let action = link::settle_live(action, elevated);
                 if let link::Action::Refuse { reason, shown } = &action {
                     let _ = proxy.send_event(UserEvent::LinkFailed {
                         reason: reason.label().to_string(),
@@ -5016,6 +5028,15 @@ impl ApplicationHandler<UserEvent> for App {
         self.gpu = Some(gpu);
         self.window = Some(window.clone());
         self.report_config_load_error();
+        if self.elevated && self.blocked_link.is_none() {
+            let (title, body) = elevate::admin_notice();
+            self.blocked_link = Some(BlockedLink {
+                reason: title.to_string(),
+                shown: body.to_string(),
+                confirm_uri: None,
+                is_app_error: true,
+            });
+        }
         self.apply_opacity(); // the configured window alpha, from frame one
         self.apply_window_frame();
         if let Some(h) = self.hwnd() {
@@ -5073,7 +5094,9 @@ impl ApplicationHandler<UserEvent> for App {
                         )
                     }));
                 }
-                if let Err(error) = jumplist::refresh(&profiles) {
+                if let Err(error) =
+                    jumplist::refresh(&profiles, elevate::may_write_bayan(self.elevated))
+                {
                     eprintln!("bayan: jump list: {error}");
                 }
                 self.shell_profiles = profiles;
@@ -5719,7 +5742,7 @@ fn run(startup: Startup) -> Result<(), String> {
     }
     lang::set(cfg.lang());
     if let Some(shells) = &startup.shells {
-        if let Err(error) = jumplist::refresh(shells) {
+        if let Err(error) = jumplist::refresh(shells, elevate::may_write_bayan(startup.elevated)) {
             eprintln!("bayan: jump list: {error}");
         }
     }

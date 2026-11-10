@@ -129,7 +129,7 @@ pub trait JumpListStore {
 
 /// Startup entry. Profiles come from this process's own `shells::detect`.
 /// A failure is logged by the caller; the terminal still opens.
-pub fn refresh(profiles: &[Shell]) -> Result<(), String> {
+pub fn refresh(profiles: &[Shell], persist_stamp: bool) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
     let exe = cli::exe_display(&exe)?;
     let next = jump_tasks(
@@ -139,10 +139,16 @@ pub fn refresh(profiles: &[Shell]) -> Result<(), String> {
             .collect::<Vec<_>>(),
     );
     let path = crate::config::bayan_dir().join("jumplist.stamp");
-    let previous = read_stamp(&path);
+    // An elevated process does not create or replace anything under ~/.bayan.
+    // The comparison file is skipped; the task list is still committed.
+    let previous = if persist_stamp {
+        read_stamp(&path)
+    } else {
+        Vec::new()
+    };
     let app_id = app_user_model_id(&exe);
     let mut live = LiveDestinations { exe };
-    if apply(&mut live, &previous, &next, &app_id)? {
+    if apply(&mut live, &previous, &next, &app_id)? && persist_stamp {
         let bytes = serde_json::to_vec(&next).map_err(|error| error.to_string())?;
         crate::persist::write(&path, &bytes).map_err(|error| error.to_string())?;
     }

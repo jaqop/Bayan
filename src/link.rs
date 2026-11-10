@@ -1741,9 +1741,9 @@ where
     }
 }
 
-pub fn settle_live(action: Action) -> Action {
+pub fn settle_live(action: Action, elevated: bool) -> Action {
     settle(action, local_file_probe, win_long_path, || {
-        find_code_exe().map(|p| p.to_string_lossy().into_owned())
+        code_exe(elevated).map(|p| p.to_string_lossy().into_owned())
     })
 }
 
@@ -2010,14 +2010,72 @@ pub fn spawn_editor(argv: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `code.exe` on PATH, or the `Code.exe` that sits next to the `code.cmd`
-/// shim VS Code puts on PATH. A `.cmd` is not returned: `Command` would
+/// `Code.exe` for this window. A `.cmd` is not returned: `Command` would
 /// not start it, and wrapping it in `cmd /c` is the thing this module
 /// does not do. `None` means a `path:line` link opens its folder with
 /// `explorer.exe /select` instead of an editor.
-pub fn find_code_exe() -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    find_code_exe_in(std::env::split_paths(&path))
+///
+/// Not elevated: `code.exe` on `PATH`, or the `Code.exe` next to the
+/// `code.cmd` shim. Elevated: those PATH entries are ignored. The lookup
+/// is only `Program Files`, `Program Files (x86)`, and
+/// `%LOCALAPPDATA%\Programs\Microsoft VS Code`.
+pub fn code_exe(elevated: bool) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH");
+    code_exe_from(
+        elevated,
+        path.as_ref()
+            .map(|path| std::env::split_paths(path))
+            .into_iter()
+            .flatten(),
+        trusted_vscode_dirs(
+            std::env::var_os("ProgramFiles").as_deref().map(Path::new),
+            std::env::var_os("ProgramFiles(x86)")
+                .as_deref()
+                .map(Path::new),
+            std::env::var_os("LOCALAPPDATA").as_deref().map(Path::new),
+        ),
+    )
+}
+
+/// Those install folders, with nothing else. A `Code.exe` beside a user
+/// `PATH` entry is not among them.
+pub fn trusted_vscode_dirs(
+    program_files: Option<&Path>,
+    program_files_x86: Option<&Path>,
+    local_app_data: Option<&Path>,
+) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    for root in [program_files, program_files_x86].into_iter().flatten() {
+        let install = root.join("Microsoft VS Code");
+        dirs.push(install.join("bin"));
+        dirs.push(install);
+    }
+    if let Some(local) = local_app_data {
+        let install = local.join("Programs").join("Microsoft VS Code");
+        dirs.push(install.join("bin"));
+        dirs.push(install);
+    }
+    dirs
+}
+
+/// `path_dirs` is `PATH`. `trusted` is [`trusted_vscode_dirs`]. Elevated
+/// uses only the second.
+pub fn code_exe_from<A, B, P, Q>(
+    elevated: bool,
+    path_dirs: A,
+    trusted: B,
+) -> Option<std::path::PathBuf>
+where
+    A: IntoIterator<Item = P>,
+    B: IntoIterator<Item = Q>,
+    P: AsRef<Path>,
+    Q: AsRef<Path>,
+{
+    if elevated {
+        find_code_exe_in(trusted)
+    } else {
+        find_code_exe_in(path_dirs)
+    }
 }
 
 /// NTFS names are case-insensitive, so one spelling of each finds them all.
@@ -3176,6 +3234,37 @@ mod tests {
         std::fs::write(alone.join("code.cmd"), b"@echo off\r\n").unwrap();
         assert!(find_code_exe_in(std::iter::once(&alone)).is_none());
         let _ = std::fs::remove_dir_all(&alone_root);
+    }
+
+    #[test]
+    fn an_elevated_editor_lookup_ignores_path_and_keeps_the_known_installs() {
+        let root = std::env::temp_dir().join(format!("bayan-code-elev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let path_bin = root.join("user-path");
+        let program_files = root.join("Program Files");
+        let local = root.join("Local");
+        let install = program_files.join("Microsoft VS Code");
+        let user_install = local.join("Programs").join("Microsoft VS Code");
+        std::fs::create_dir_all(&path_bin).unwrap();
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::create_dir_all(&user_install).unwrap();
+        std::fs::write(path_bin.join("Code.exe"), b"MZ").unwrap();
+        let trusted = trusted_vscode_dirs(Some(&program_files), None, Some(&local));
+        assert!(
+            code_exe_from(true, std::iter::once(&path_bin), trusted.iter()).is_none(),
+            "a Code.exe on PATH is not an elevated editor"
+        );
+        assert!(code_exe_from(false, std::iter::once(&path_bin), trusted.iter()).is_some());
+        std::fs::write(install.join("Code.exe"), b"MZ").unwrap();
+        let trusted = trusted_vscode_dirs(Some(&program_files), None, Some(&local));
+        let found = code_exe_from(true, std::iter::once(&path_bin), trusted.iter()).unwrap();
+        assert_eq!(found, install.join("Code.exe"));
+        let _ = std::fs::remove_file(install.join("Code.exe"));
+        std::fs::write(user_install.join("Code.exe"), b"MZ").unwrap();
+        let trusted = trusted_vscode_dirs(Some(&program_files), None, Some(&local));
+        let found = code_exe_from(true, std::iter::once(&path_bin), trusted.iter()).unwrap();
+        assert_eq!(found, user_install.join("Code.exe"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
