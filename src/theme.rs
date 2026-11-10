@@ -121,7 +121,9 @@ pub const LIGHT: Colors = Colors {
         (0x21, 0x86, 0xeb),
         (0xa4, 0x75, 0xf9),
         (0x31, 0x92, 0xaa),
-        (0xff, 0xff, 0xff),
+        // Not paper-white: `#ffffff` on `#f6f8fa` is 1.06:1, so bright
+        // white follows GitHub Light's `#8c959f`.
+        (0x8c, 0x95, 0x9f),
     ],
     title_bar_dark: false,
 };
@@ -142,8 +144,56 @@ pub fn pair(choice: ThemeChoice, apps_light: Option<bool>) -> Colors {
 }
 
 /// `AppsUseLightTheme` is light only when the DWORD is exactly 1.
+/// Every caller uses this; a raw `value == 1` would be a second copy.
 pub fn apps_use_light_theme(value: Option<u32>) -> bool {
     value == Some(1)
+}
+
+/// Tab-bar status ink. `dark` is `title_bar_dark_for` of the page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BarAccent {
+    Green,
+    Amber,
+}
+
+/// Colour of a mark drawn on the tab bar.
+///
+/// A dark page keeps today's colours: green `#7ee787`, amber `#f2cc60`.
+/// A light page uses `#1a7c37` and `#9a5f00`. Those are the light palette's
+/// green `#1a7f37` and amber `#9a6700` stepped down so each clears 3:1 on
+/// the light bar (`background × 0.8`, `#c4c6c8`); the palette slots
+/// themselves sit at 2.96:1 and 2.84:1 there.
+///
+/// Pull request 56 draws the elevated «مسؤول» badge with a hard-coded
+/// `#f2cc60`. After that work merges, the badge should call
+/// `bar_accent(BarAccent::Amber, title_bar_dark_for(bg))` instead, or the
+/// badge disappears on a light bar the same way «● Claude» did.
+pub fn bar_accent(kind: BarAccent, dark: bool) -> (u8, u8, u8) {
+    match (kind, dark) {
+        (BarAccent::Green, true) => (0x7e, 0xe7, 0x87),
+        (BarAccent::Amber, true) => (0xf2, 0xcc, 0x60),
+        (BarAccent::Green, false) => (0x1a, 0x7c, 0x37),
+        (BarAccent::Amber, false) => (0x9a, 0x5f, 0x00),
+    }
+}
+
+/// WCAG contrast ratio of two opaque colours. Tests use it; the painter does not.
+#[cfg(test)]
+pub fn contrast_ratio(a: (u8, u8, u8), b: (u8, u8, u8)) -> f32 {
+    fn channel(c: u8) -> f32 {
+        let s = f32::from(c) / 255.0;
+        if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    fn lum((r, g, b): (u8, u8, u8)) -> f32 {
+        0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+    }
+    let (l1, l2) = (lum(a), lum(b));
+    let (hi, lo) = if l1 > l2 { (l1, l2) } else { (l2, l1) };
+    (hi + 0.05) / (lo + 0.05)
 }
 
 /// What a system-theme signal resolved to, and whether the next one may replace it.
@@ -153,9 +203,9 @@ pub struct ThemeSurface {
     pub follows_system: bool,
 }
 
-/// A live theme signal. Both carry the new appearance; the registry DWORD
-/// is the source for `ImmersiveColorSet`, and winit's theme is the fallback
-/// when that value cannot be read.
+/// A live theme signal. winit's `ThemeChanged` is the one the window loop
+/// receives (`WM_SETTINGCHANGE` is sent, not posted, so the message hook
+/// never sees it). The registry DWORD is still what that handler reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SystemThemeEvent {
     /// `WindowEvent::ThemeChanged`. `light` is the appearance to apply.
@@ -232,33 +282,6 @@ pub fn read_apps_use_light_theme() -> Option<u32> {
     }
 }
 
-/// `WM_SETTINGCHANGE` carries this lParam when the app theme changed.
-pub fn is_immersive_color_set(name: &str) -> bool {
-    name == "ImmersiveColorSet"
-}
-
-/// True when `lparam` is the wide string `ImmersiveColorSet`.
-/// `0` is the documented null lParam and is not that name.
-pub fn setting_change_is_immersive(lparam: isize) -> bool {
-    if lparam == 0 {
-        return false;
-    }
-    // SAFETY: the caller passes `WM_SETTINGCHANGE`'s lParam during the
-    // message hook. The system documents that pointer as either null or a
-    // NUL-terminated wide string valid for the call. The read stops at the
-    // first NUL or at 64 units, so a missing NUL cannot walk off the buffer
-    // we are willing to inspect. The string is not retained.
-    let name = unsafe {
-        let p = lparam as *const u16;
-        let mut n = 0;
-        while n < 64 && *p.add(n) != 0 {
-            n += 1;
-        }
-        String::from_utf16_lossy(std::slice::from_raw_parts(p, n))
-    };
-    is_immersive_color_set(&name)
-}
-
 /// The mode a fresh or mode-word config is in. Named schemes are `None`
 /// here: the gallery tile is the selection, not one of these segments.
 pub fn appearance_highlight(cfg: &UserConfig) -> Option<ThemeChoice> {
@@ -322,6 +345,9 @@ mod tests {
         assert_eq!(choice_of(Some("light")), ThemeChoice::Light);
         assert!(is_mode_word(Some("system")));
         assert!(!is_mode_word(Some("Dracula")));
+        // Bright white on this paper is invisible. GitHub Light's grey holds.
+        assert_eq!(LIGHT.palette[15], (0x8c, 0x95, 0x9f));
+        assert_ne!(LIGHT.palette[15], (0xff, 0xff, 0xff));
     }
 
     #[test]
@@ -379,19 +405,33 @@ mod tests {
     }
 
     #[test]
-    fn immersive_color_set_is_the_only_setting_name() {
-        assert!(is_immersive_color_set("ImmersiveColorSet"));
-        assert!(!is_immersive_color_set("ImmersiveColor"));
-        assert!(!is_immersive_color_set("Policy"));
-        assert!(!is_immersive_color_set(""));
-        assert!(!setting_change_is_immersive(0));
-
-        let mut wide: Vec<u16> = "ImmersiveColorSet".encode_utf16().collect();
-        wide.push(0);
-        assert!(setting_change_is_immersive(wide.as_ptr() as isize));
-        let mut other: Vec<u16> = "intl".encode_utf16().collect();
-        other.push(0);
-        assert!(!setting_change_is_immersive(other.as_ptr() as isize));
+    fn bar_accents_clear_three_to_one_on_the_bar() {
+        // The light bar is the page darkened by the same 0.80 the chrome uses.
+        let light_bar = (
+            (LIGHT.bg.0 as f32 * 0.80) as u8,
+            (LIGHT.bg.1 as f32 * 0.80) as u8,
+            (LIGHT.bg.2 as f32 * 0.80) as u8,
+        );
+        let dark_bar = (
+            (DARK.bg.0 as f32 * 0.80) as u8,
+            (DARK.bg.1 as f32 * 0.80) as u8,
+            (DARK.bg.2 as f32 * 0.80) as u8,
+        );
+        for kind in [BarAccent::Green, BarAccent::Amber] {
+            let light = contrast_ratio(bar_accent(kind, false), light_bar);
+            let dark = contrast_ratio(bar_accent(kind, true), dark_bar);
+            assert!(
+                light >= 3.0,
+                "{kind:?} on the light bar is {light}:1, want >= 3"
+            );
+            assert!(
+                dark >= 3.0,
+                "{kind:?} on the dark bar is {dark}:1, want >= 3"
+            );
+        }
+        // Dark pages keep the colours the bar has always used.
+        assert_eq!(bar_accent(BarAccent::Green, true), (0x7e, 0xe7, 0x87));
+        assert_eq!(bar_accent(BarAccent::Amber, true), (0xf2, 0xcc, 0x60));
     }
 
     #[test]

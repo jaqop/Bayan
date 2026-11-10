@@ -1089,9 +1089,64 @@ pub struct PaneView<'a> {
 // translucent overlays, EasyTer's colors: selection blue, search amber
 const SELECTION_RGBA: ((u8, u8, u8), u32) = ((80, 140, 255), 90);
 const SEARCH_RGBA: ((u8, u8, u8), u32) = ((240, 180, 40), 120);
-/// Hover underline for a hyperlink. Mint, so it sits in the palette
-/// instead of introducing a new blue the rest of the chrome doesn't use.
+/// Hover underline for a hyperlink. Mint on a dark page. On a light page
+/// the mint is 1.75:1, so the underline switches to the light palette's blue.
 const LINK_UNDER: (u8, u8, u8) = (0x58, 0xd1, 0xc0);
+
+fn link_underline(page: (u8, u8, u8)) -> (u8, u8, u8) {
+    if crate::theme::title_bar_dark_for(page) {
+        LINK_UNDER
+    } else {
+        (0x09, 0x69, 0xda)
+    }
+}
+
+/// The tab bar is the page at 80%. Caption glyphs and accents are measured
+/// against this, not against the page itself.
+fn chrome_bar_bg(bg: (u8, u8, u8)) -> (u8, u8, u8) {
+    (
+        (bg.0 as f32 * 0.80) as u8,
+        (bg.1 as f32 * 0.80) as u8,
+        (bg.2 as f32 * 0.80) as u8,
+    )
+}
+
+/// Caption buttons and the gear. The same ink as ‹ › +, except the close
+/// button under the pointer, which is white on the red hover.
+fn caption_glyph(fg: (u8, u8, u8), close_hovered: bool) -> (u8, u8, u8) {
+    if close_hovered {
+        (0xff, 0xff, 0xff)
+    } else {
+        fg
+    }
+}
+
+/// Hover fill. Close stays red. The others are the dark slate on a dark
+/// page, and the page stepped down on a light one — a dark slate on the
+/// light bar is a blob.
+fn caption_hover(bg: (u8, u8, u8), close: bool) -> (u8, u8, u8) {
+    if close {
+        (0xc4, 0x2b, 0x1c)
+    } else if crate::theme::title_bar_dark_for(bg) {
+        (0x33, 0x3c, 0x48)
+    } else {
+        (
+            bg.0.saturating_sub(0x20),
+            bg.1.saturating_sub(0x20),
+            bg.2.saturating_sub(0x20),
+        )
+    }
+}
+
+/// The search bar's underline. The dark page keeps the Blow amber; the
+/// light page uses the bar's amber accent, which clears 3:1 on the paper.
+fn search_line(page: (u8, u8, u8)) -> (u8, u8, u8) {
+    if crate::theme::title_bar_dark_for(page) {
+        PALETTE[11]
+    } else {
+        crate::theme::bar_accent(crate::theme::BarAccent::Amber, false)
+    }
+}
 
 /// The string the status bar shapes. The host is cut from the left only
 /// when it alone is wider than `columns`. The path is cut from the right,
@@ -2529,7 +2584,7 @@ impl Renderer {
                             y + self.cell_h.round() as i32 - th,
                             bounds.1,
                             th,
-                            c4(LINK_UNDER, 255),
+                            c4(link_underline(self.bg), 255),
                         );
                     }
                     if let Some((pane, row)) = self.mapping_context {
@@ -2864,7 +2919,7 @@ impl Renderer {
                     uy,
                     (dx1 - dx0).max(1),
                     th,
-                    c4(LINK_UNDER, 255),
+                    c4(link_underline(self.bg), 255),
                 );
             }
         }
@@ -5408,8 +5463,15 @@ impl Renderer {
                 by + bar_h - 2,
                 bar_w,
                 2,
-                c4(PALETTE[11], 200),
-            ); // amber underline = search accent
+                c4(
+                    search_line(self.bg),
+                    if crate::theme::title_bar_dark_for(self.bg) {
+                        200
+                    } else {
+                        255
+                    },
+                ),
+            );
             self.draw_run(&segs, true, out, whole, (bx + 8) as f32, by + 5, 1.0);
         }
 
@@ -5418,11 +5480,8 @@ impl Renderer {
         if self.bar_hidden {
             return;
         }
-        let bar_bg = (
-            (self.bg.0 as f32 * 0.80) as u8,
-            (self.bg.1 as f32 * 0.80) as u8,
-            (self.bg.2 as f32 * 0.80) as u8,
-        );
+        let bar_bg = chrome_bar_bg(self.bg);
+        let page_dark = crate::theme::title_bar_dark_for(self.bg);
         push_rect(out, whole, 0, 0, width as i32, oy, c4(bar_bg, 255));
         push_rect(out, whole, 0, oy - 1, width as i32, 1, c4(self.fg, 28));
         // the group chip: which group's tabs these are. Blue, so it never
@@ -5557,9 +5616,16 @@ impl Renderer {
             }
             // dots: amber attention (a Claude waiting on you) beats green busy
             let dot = if tab.attention {
-                Some((0xf2, 0xcc, 0x60))
+                Some(crate::theme::bar_accent(
+                    crate::theme::BarAccent::Amber,
+                    page_dark,
+                ))
             } else if tab.busy {
-                Some((0x56, 0xd3, 0x64))
+                Some(if page_dark {
+                    (0x56, 0xd3, 0x64)
+                } else {
+                    crate::theme::bar_accent(crate::theme::BarAccent::Green, false)
+                })
             } else {
                 None
             };
@@ -5596,7 +5662,10 @@ impl Renderer {
         }
 
         if claude {
-            let label = [Seg::plain("● Claude", (0x7e, 0xe7, 0x87))];
+            let label = [Seg::plain(
+                "● Claude",
+                crate::theme::bar_accent(crate::theme::BarAccent::Green, page_dark),
+            )];
             let tw = self.measure(&label, false);
             let x = self.tab_controls(width)[0].0 - tw.ceil() as i32 - 18;
             let end = self
@@ -5642,21 +5711,14 @@ impl Renderer {
             .enumerate()
         {
             let (bx, by, bw, bh) = *rect;
+            let close = i == 2;
             if self.hover_caption == Some(i) {
-                let tint = if i == 2 {
-                    (0xc4, 0x2b, 0x1c)
-                } else {
-                    (0x33, 0x3c, 0x48)
-                };
+                let tint = caption_hover(self.bg, close);
                 push_rect(out, whole, bx, by, bw, bh, c4(tint, 255));
             }
             let seg = [Seg::plain(
                 glyph,
-                if self.hover_caption == Some(2) && i == 2 {
-                    (0xff, 0xff, 0xff)
-                } else {
-                    (0xb6, 0xc2, 0xcf)
-                },
+                caption_glyph(self.fg, self.hover_caption == Some(2) && close),
             )];
             let gw = self.measure(&seg, false);
             self.draw_run(
@@ -5674,9 +5736,17 @@ impl Renderer {
         // and layout-proof (a shortcut fights an Arabic layout)
         let (bx, by, bw, bh) = self.settings_button_rect(width);
         if self.hover_gear {
-            push_rect(out, whole, bx, by, bw, bh, c4((0x33, 0x3c, 0x48), 255));
+            push_rect(
+                out,
+                whole,
+                bx,
+                by,
+                bw,
+                bh,
+                c4(caption_hover(self.bg, false), 255),
+            );
         }
-        let seg = [Seg::plain("⚙", (0xb6, 0xc2, 0xcf))];
+        let seg = [Seg::plain("⚙", caption_glyph(self.fg, false))];
         let gw = self.measure(&seg, false);
         self.draw_run(
             &seg,
@@ -7736,6 +7806,145 @@ mod cache_tests {
         live.set_colors(after.colors.bg, after.colors.fg, after.colors.palette);
         assert_eq!(live.palette, crate::theme::LIGHT.palette);
         assert!(!after.colors.title_bar_dark);
+    }
+
+    fn vertex_rgb(c: [f32; 4]) -> (u8, u8, u8) {
+        (
+            (c[0] * 255.0).round() as u8,
+            (c[1] * 255.0).round() as u8,
+            (c[2] * 255.0).round() as u8,
+        )
+    }
+
+    /// Minimise, maximise, close, and the gear. Their ink is the page
+    /// foreground (the same as ‹ › +), and each pairing with the bar or
+    /// the hover fill clears 3:1 in both themes. The old `#b6c2cf` glyph
+    /// and `#333c48` hover are a dark-bar pair; on the light bar they vanish.
+    #[test]
+    fn title_bar_glyphs_clear_three_to_one_in_light_and_dark() {
+        for (bg, fg) in [
+            (crate::theme::LIGHT.bg, crate::theme::LIGHT.fg),
+            (crate::theme::DARK.bg, crate::theme::DARK.fg),
+        ] {
+            let bar = chrome_bar_bg(bg);
+            let glyph = caption_glyph(fg, false);
+            let on_close = caption_glyph(fg, true);
+            let rest = caption_hover(bg, false);
+            let close = caption_hover(bg, true);
+            for (ink, ground, name) in [
+                (glyph, bar, "glyph on the bar"),
+                (glyph, rest, "glyph on the hover"),
+                (on_close, close, "close glyph on red"),
+            ] {
+                let ratio = crate::theme::contrast_ratio(ink, ground);
+                assert!(ratio >= 3.0, "{name} is {ratio}:1 on {bg:?}, want >= 3");
+            }
+        }
+
+        let mut cfg = crate::config::UserConfig {
+            system_apps_light: Some(true),
+            ..Default::default()
+        };
+        let mut r = Renderer::new(1.0, &cfg, 0.0);
+        r.use_ui_metrics(true);
+        let tabs = vec![TabInfo {
+            title: "hi".into(),
+            busy: true,
+            attention: true,
+            active: true,
+            progress: None,
+        }];
+        let mut out = Vec::new();
+        r.draw_chrome(&mut out, 1400, 800, &tabs, Some("بحث"), true);
+        let painted: Vec<(u8, u8, u8)> = out.iter().map(|v| vertex_rgb(v.color)).collect();
+        let glyph = caption_glyph(r.fg, false);
+        let accent = crate::theme::bar_accent(crate::theme::BarAccent::Green, false);
+        let amber = crate::theme::bar_accent(crate::theme::BarAccent::Amber, false);
+        assert!(
+            painted.contains(&glyph),
+            "caption ink is not the page foreground"
+        );
+        assert!(
+            painted.contains(&accent),
+            "the Claude mark is not the light green"
+        );
+        assert!(
+            painted.contains(&amber),
+            "the attention dot is not the light amber"
+        );
+        assert!(
+            painted.contains(&search_line(r.bg)),
+            "the search line is not the light amber"
+        );
+        assert!(!painted.contains(&(0xb6, 0xc2, 0xcf)));
+        assert!(!painted.contains(&(0x33, 0x3c, 0x48)));
+
+        r.hover_caption = Some(0);
+        r.hover_gear = true;
+        out.clear();
+        r.draw_chrome(&mut out, 1400, 800, &tabs, None, false);
+        let hovered: Vec<(u8, u8, u8)> = out.iter().map(|v| vertex_rgb(v.color)).collect();
+        assert!(hovered.contains(&caption_hover(r.bg, false)));
+        assert!(!hovered.contains(&(0x33, 0x3c, 0x48)));
+
+        r.hover_caption = Some(2);
+        r.hover_gear = false;
+        out.clear();
+        r.draw_chrome(&mut out, 1400, 800, &tabs, None, false);
+        let closing: Vec<(u8, u8, u8)> = out.iter().map(|v| vertex_rgb(v.color)).collect();
+        assert!(closing.contains(&caption_glyph(r.fg, true)));
+        assert!(closing.contains(&caption_hover(r.bg, true)));
+
+        cfg.system_apps_light = Some(false);
+        cfg.theme = Some("dark".into());
+        let mut dark = Renderer::new(1.0, &cfg, 0.0);
+        dark.use_ui_metrics(true);
+        let mut dark_out = Vec::new();
+        dark.draw_chrome(&mut dark_out, 1400, 800, &tabs, None, true);
+        let dark_painted: Vec<(u8, u8, u8)> =
+            dark_out.iter().map(|v| vertex_rgb(v.color)).collect();
+        assert!(dark_painted.contains(&caption_glyph(dark.fg, false)));
+        assert!(dark_painted.contains(&crate::theme::bar_accent(
+            crate::theme::BarAccent::Green,
+            true
+        )));
+    }
+
+    #[test]
+    fn link_underline_and_search_line_clear_three_to_one() {
+        let light = crate::theme::LIGHT.bg;
+        let dark = crate::theme::DARK.bg;
+        let light_search = (
+            light.0.saturating_sub(12),
+            light.1.saturating_sub(12),
+            light.2.saturating_sub(12),
+        );
+        let dark_search = (0x1c, 0x21, 0x28);
+        for (ink, ground, name) in [
+            (
+                link_underline(light),
+                light,
+                "link underline on the light page",
+            ),
+            (
+                link_underline(dark),
+                dark,
+                "link underline on the dark page",
+            ),
+            (
+                search_line(light),
+                light_search,
+                "search line on the light bar",
+            ),
+            (
+                search_line(dark),
+                dark_search,
+                "search line on the dark bar",
+            ),
+        ] {
+            let ratio = crate::theme::contrast_ratio(ink, ground);
+            assert!(ratio >= 3.0, "{name} is {ratio}:1, want >= 3");
+        }
     }
 
     /// The ligatures toggle picks a Mono-leading font family when off (so a

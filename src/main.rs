@@ -125,8 +125,6 @@ fn beep() {
 static QUAKE_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// A toast/tray click wants the window raised (summon, never hide).
 static SUMMON_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// `WM_SETTINGCHANGE` / `ImmersiveColorSet`: the app theme changed.
-static THEME_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const QUAKE_ID: usize = 0xB1AA;
 
 /// The letter a Ctrl+<letter> event represents, resolved the way real
@@ -1416,7 +1414,9 @@ struct App {
     startup_pending: bool,
     /// last click on the empty title strip — powers double-click-to-maximise
     last_strip_click: Option<std::time::Instant>,
-    proxy: EventLoopProxy<UserEvent>,
+    /// `None` only in tests that never post an event. The running app sets it
+    /// from the event loop before anything sends.
+    proxy: Option<EventLoopProxy<UserEvent>>,
     window: Option<Arc<Window>>,
     gpu: Option<gpu::Gpu>,
     renderer: Option<render::Renderer>,
@@ -1502,6 +1502,12 @@ struct App {
 }
 
 impl App {
+    fn event_proxy(&self) -> EventLoopProxy<UserEvent> {
+        self.proxy
+            .clone()
+            .expect("the event loop proxy is set once the loop exists")
+    }
+
     fn request_redraw(&self) {
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -1517,7 +1523,7 @@ impl App {
         let Some(w) = &self.window else { return };
         self.renderer_building = true;
         self.inflight_delta = self.font_delta;
-        let proxy = self.proxy.clone();
+        let proxy = self.event_proxy();
         let scale = w.scale_factor() as f32;
         let cfg = self.config.clone();
         let delta = self.font_delta;
@@ -1879,7 +1885,7 @@ impl App {
         // subprocess per row passed over. Skipped highlights come back as
         // PoshDropped and their claims are cleared.
         let (tx, rx) = std::sync::mpsc::channel::<(usize, String, bool)>();
-        let proxy = self.proxy.clone();
+        let proxy = self.event_proxy();
         let _ = std::thread::Builder::new()
             .name("bayan-posh".into())
             .spawn(move || {
@@ -2739,7 +2745,7 @@ impl App {
         self.next_id += 1;
         match Session::spawn(
             self.size,
-            self.proxy.clone(),
+            self.event_proxy(),
             id,
             cwd,
             self.config.scrollback_lines(),
@@ -3948,7 +3954,7 @@ impl App {
             },
             link::Action::Confirm { .. } | link::Action::Refuse { .. } => return,
         };
-        let proxy = self.proxy.clone();
+        let proxy = self.event_proxy();
         let shown_for_fail = shown.clone();
         let spawned = std::thread::Builder::new()
             .name("bayan-link".into())
@@ -5283,14 +5289,6 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        if THEME_HIT.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            // A failed read must not force dark over the winit fallback.
-            if let Some(value) = theme::read_apps_use_light_theme() {
-                self.on_system_theme(theme::SystemThemeEvent::ImmersiveColorSet {
-                    apps_use_light_theme: Some(value),
-                });
-            }
-        }
         // quake toggle: summon Bayan from anywhere / tuck it away again
         if QUAKE_HIT.swap(false, std::sync::atomic::Ordering::Relaxed) {
             if let Some(w) = &self.window {
@@ -5372,12 +5370,17 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Ime(ime) => self.ime_input(ime),
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::ThemeChanged(theme) => {
-                // The registry is the app theme. winit's value covers a
+                // The registry DWORD is the app theme. winit's value covers a
                 // read that fails (the key is missing, or this is not Windows).
-                let light = theme::read_apps_use_light_theme()
-                    .map(|v| theme::apps_use_light_theme(Some(v)))
-                    .unwrap_or(matches!(theme, winit::window::Theme::Light));
-                self.on_system_theme(theme::SystemThemeEvent::Winit { light });
+                let event = match theme::read_apps_use_light_theme() {
+                    Some(value) => theme::SystemThemeEvent::ImmersiveColorSet {
+                        apps_use_light_theme: Some(value),
+                    },
+                    None => theme::SystemThemeEvent::Winit {
+                        light: matches!(theme, winit::window::Theme::Light),
+                    },
+                };
+                self.on_system_theme(event);
             }
             _ => {}
         }
@@ -5548,11 +5551,6 @@ fn run() -> Result<(), String> {
             // SAFETY: winit's msg hook is handed a pointer to the MSG being
             // dispatched, valid for the duration of the callback. It is only read.
             let m = unsafe { &*(msg as *const MSG) };
-            if m.message == windows_sys::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE
-                && theme::setting_change_is_immersive(m.lParam)
-            {
-                THEME_HIT.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
             if m.message == WM_HOTKEY && m.wParam == QUAKE_ID {
                 QUAKE_HIT.store(true, std::sync::atomic::Ordering::Relaxed);
                 return true; // consumed
@@ -5580,7 +5578,8 @@ fn run() -> Result<(), String> {
         Ok(cfg) => (cfg, None),
         Err(error) => (config::UserConfig::default(), Some(error.to_string())),
     };
-    cfg.system_apps_light = theme::read_apps_use_light_theme().map(|v| v == 1);
+    cfg.system_apps_light =
+        theme::read_apps_use_light_theme().map(|v| theme::apps_use_light_theme(Some(v)));
     // debug hook: BAYAN_ARABIC_FONT=<family> draws terminal Arabic in that
     // font for this run only (config.json is not written unless a setting
     // is changed in the panel), so the setting is screenshot-verifiable
@@ -5615,7 +5614,7 @@ fn run() -> Result<(), String> {
         shell_profiles_ready: false,
         startup_pending: true,
         last_strip_click: None,
-        proxy,
+        proxy: Some(proxy),
         window: None,
         gpu: None,
         renderer: None,
@@ -5689,6 +5688,112 @@ fn osc52_pane_is_focused(tabs: &[(usize, &[u64])], active: usize, source: u64) -
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// Enough of an `App` to run `on_system_theme`. No window, so the caption
+    /// flag is computed and then has nowhere to go; the renderer and the
+    /// config sample are what the test can see.
+    fn app_for_theme(cfg: config::UserConfig) -> App {
+        let renderer = render::Renderer::new(1.0, &cfg, 0.0);
+        App {
+            posh: None,
+            last_toast: None,
+            mru: mru::Mru::new(),
+            groups: groups::Groups::new(),
+            spawn_group: None,
+            palette: None,
+            shell_profiles: Vec::new(),
+            shell_profiles_ready: false,
+            startup_pending: false,
+            last_strip_click: None,
+            proxy: None,
+            window: None,
+            gpu: None,
+            renderer: Some(renderer),
+            tabs: Vec::new(),
+            active: 0,
+            next_id: 0,
+            size: TermSize { cols: 80, rows: 24 },
+            modifiers: ModifiersState::default(),
+            first_frame: false,
+            first_output: false,
+            last_frame: Vec::new(),
+            last_frame_size: None,
+            cursor_pos: PhysicalPosition::new(0.0, 0.0),
+            ime_spot: None,
+            mouse: mouse::Route::default(),
+            sel_pane: 0,
+            drag_divider: None,
+            cockpit: false,
+            cockpit_sel: 0,
+            pending_paste: None,
+            pending_close: None,
+            swallow_guard_release: false,
+            link_hover: None,
+            blocked_link: None,
+            link_cache: link::SpanCache::default(),
+            last_input: Instant::now(),
+            blink_drawn_on: true,
+            settings: None,
+            focused: false,
+            clicks: ClickTracker::new(),
+            wheel_accum: 0.0,
+            search: None,
+            clipboard: None,
+            auto_follow: true,
+            claude_manual: false,
+            config: cfg,
+            config_load_error: None,
+            startup_error: None,
+            keymap: Vec::new(),
+            shortcuts: None,
+            atlas_generation: 0,
+            font_delta: 0.0,
+            renderer_building: false,
+            inflight_delta: 0.0,
+            normal_geom: None,
+            keys_held_away: Vec::new(),
+            debug_paste: None,
+            start_dir: None,
+        }
+    }
+
+    /// The window loop's theme handler. Removing `on_system_theme` fails
+    /// this test: the renderer must take the new palette, and the config
+    /// must record the sample. A named scheme stays put.
+    #[test]
+    fn on_system_theme_paints_the_renderer_and_records_the_sample() {
+        let cfg = config::UserConfig {
+            system_apps_light: Some(false),
+            ..Default::default()
+        };
+        let mut app = app_for_theme(cfg);
+        assert_eq!(app.renderer.as_ref().map(|r| r.bg), Some(theme::DARK.bg));
+        app.on_system_theme(theme::SystemThemeEvent::Winit { light: true });
+        assert_eq!(app.config.system_apps_light, Some(true));
+        assert_eq!(
+            app.renderer.as_ref().map(|r| r.bg),
+            Some(theme::LIGHT.bg),
+            "a light ThemeChanged must reach the renderer"
+        );
+        app.on_system_theme(theme::SystemThemeEvent::Winit { light: false });
+        assert_eq!(app.config.system_apps_light, Some(false));
+        assert_eq!(app.renderer.as_ref().map(|r| r.bg), Some(theme::DARK.bg));
+
+        let locked = config::UserConfig {
+            theme: Some("Dracula".into()),
+            system_apps_light: Some(false),
+            ..Default::default()
+        };
+        let dracula = render::theme_by_name("Dracula").unwrap().bg;
+        let mut app = app_for_theme(locked);
+        app.on_system_theme(theme::SystemThemeEvent::Winit { light: true });
+        assert_eq!(app.config.system_apps_light, Some(true));
+        assert_eq!(
+            app.renderer.as_ref().map(|r| r.bg),
+            Some(dracula),
+            "a named scheme is not replaced"
+        );
+    }
 
     #[test]
     fn the_cwd_argument_opens_a_local_folder_and_refuses_the_rest() {
