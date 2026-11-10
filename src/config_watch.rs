@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use notify::Watcher;
+
 use crate::config::{self, UserConfig};
 
 /// Quiet period after the last filesystem event before the file is read.
@@ -179,6 +181,12 @@ pub fn event_hits_config(event: &notify::Event, config: &Path) -> bool {
         .any(|path| path_names_config(path, config))
 }
 
+/// The watched directory itself went away. The watch has to be armed again
+/// when the directory is recreated; events for files inside it are not this.
+pub fn directory_watch_lost(event: &notify::Event, dir: &Path) -> bool {
+    event.kind.is_remove() && event.paths.iter().any(|path| path == dir)
+}
+
 fn diff(prev: &UserConfig, next: &UserConfig) -> (ApplyPlan, Vec<DeferredSetting>) {
     // Behavioral fields with no flag (copy on select, bell, osc52, the editor,
     // kitty's base-layout fallback, …) are live because the caller swaps the
@@ -280,6 +288,13 @@ impl WatchState {
         }
     }
 
+    /// The running session has the config on screen. Until this, a parsed
+    /// file is only a proposal: `last_good` stays at the last one applied.
+    fn commit_applied(&mut self, config: &UserConfig) {
+        self.last_good = config.clone();
+        self.had_error = false;
+    }
+
     fn ingest_file(&mut self, path: &Path) -> Option<ReloadMsg> {
         self.ingest_result(std::fs::read(path))
     }
@@ -300,9 +315,21 @@ impl WatchState {
             return None;
         }
         self.seen = Some(Seen::Missing);
-        self.had_error = true;
-        Some(ReloadMsg::Rejected {
-            error: "config.json is missing".to_string(),
+        // Deleting the file is the same as never having one: defaults, and
+        // the panel may save them back. It is not a parse error, so it must
+        // not block that save. `last_good` moves only when the session
+        // applies this.
+        let defaults = UserConfig::default();
+        let (plan, deferred) = diff(&self.last_good, &defaults);
+        let was_error = self.had_error;
+        self.had_error = false;
+        if !was_error && defaults == self.last_good {
+            return None;
+        }
+        Some(ReloadMsg::Applied {
+            config: Box::new(defaults),
+            plan,
+            deferred,
         })
     }
 
@@ -352,7 +379,9 @@ impl WatchState {
                 if !was_error && cfg == self.last_good {
                     return None;
                 }
-                self.last_good = cfg.clone();
+                // Leave last_good. The session commits it when the new
+                // config is actually on screen, so a renderer build that
+                // is still in flight cannot strand a newer file.
                 Some(ReloadMsg::Applied {
                     config: Box::new(cfg),
                     plan,
@@ -392,6 +421,12 @@ impl ConfigWatcher {
 
     pub fn finish_self_write(&self, wrote: bool) {
         lock(&self.state).finish_self_write(wrote);
+    }
+
+    /// The config is on screen (the renderer caught up, or nothing visual
+    /// had to be rebuilt). Further reads diff against this.
+    pub fn commit_applied(&self, config: &UserConfig) {
+        lock(&self.state).commit_applied(config);
     }
 
     /// Block until the directory watch is installed, or the thread has exited.
@@ -454,6 +489,79 @@ pub fn spawn(
     }
 }
 
+/// One renderer build at a time. A reload that arrives while a build is
+/// running is remembered (`config_gen`) and started when that build
+/// finishes, so the installed renderer ends on the latest config rather
+/// than the one captured at the start of the in-flight build.
+#[derive(Clone, Debug)]
+pub struct RendererSlot {
+    building: bool,
+    config_gen: u64,
+    inflight_gen: u64,
+    inflight_delta: f32,
+    wanted: UserConfig,
+    inflight: UserConfig,
+    /// Config the installed renderer was built from. The session does not
+    /// read it; the reload-during-build test does.
+    #[cfg_attr(not(test), allow(dead_code))]
+    rendered: Option<UserConfig>,
+}
+
+impl RendererSlot {
+    pub fn new(config: UserConfig) -> Self {
+        Self {
+            building: false,
+            config_gen: 0,
+            inflight_gen: 0,
+            inflight_delta: 0.0,
+            wanted: config.clone(),
+            inflight: config,
+            rendered: None,
+        }
+    }
+
+    /// `config` is what the session wants on screen. A change bumps the
+    /// generation so a build that already started is known to be stale.
+    pub fn note_wanted(&mut self, config: &UserConfig) {
+        if &self.wanted != config {
+            self.wanted = config.clone();
+            self.config_gen = self.config_gen.wrapping_add(1);
+        }
+    }
+
+    /// Start a build of the wanted config, or return false when one is
+    /// already running. The caller keeps painting the previous renderer.
+    pub fn try_begin(&mut self, font_delta: f32) -> bool {
+        if self.building {
+            return false;
+        }
+        self.building = true;
+        self.inflight_gen = self.config_gen;
+        self.inflight_delta = font_delta;
+        self.inflight = self.wanted.clone();
+        true
+    }
+
+    /// The config the in-flight build captured. Valid after `try_begin`.
+    pub fn snapshot(&self) -> &UserConfig {
+        &self.inflight
+    }
+
+    /// The build finished. True when the installed renderer is behind the
+    /// latest config or the zoom moved, so the caller starts another build.
+    pub fn finish(&mut self, font_delta: f32) -> bool {
+        self.building = false;
+        self.rendered = Some(self.inflight.clone());
+        self.config_gen != self.inflight_gen
+            || (font_delta - self.inflight_delta).abs() > f32::EPSILON
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn rendered(&self) -> Option<&UserConfig> {
+        self.rendered.as_ref()
+    }
+}
+
 fn watch_loop(
     path: PathBuf,
     state: Arc<Mutex<WatchState>>,
@@ -479,39 +587,64 @@ fn watch_loop(
     if !wait_until_watched(&mut watcher, &dir, &rx) {
         return;
     }
-    if let Some(msg) = lock(&state).ingest_file(&path) {
-        on_reload(msg);
-    }
-    ready.store(true, Ordering::Relaxed);
-    let mut debounce = Debounce::default();
     loop {
-        let wake = match debounce.remaining(Instant::now()) {
-            None => match rx.recv() {
-                Ok(wake) => wake,
-                Err(_) => break,
-            },
-            Some(wait) => match rx.recv_timeout(wait) {
-                Ok(wake) => wake,
-                Err(RecvTimeoutError::Timeout) => {
-                    if debounce.take(Instant::now()) {
-                        if let Some(msg) = lock(&state).ingest_file(&path) {
-                            on_reload(msg);
+        if let Some(msg) = lock(&state).ingest_file(&path) {
+            on_reload(msg);
+        }
+        ready.store(true, Ordering::Relaxed);
+        let mut debounce = Debounce::default();
+        let lost = loop {
+            let wake = match debounce.remaining(Instant::now()) {
+                None => match rx.recv() {
+                    Ok(wake) => wake,
+                    Err(_) => break false,
+                },
+                Some(wait) => match rx.recv_timeout(wait) {
+                    Ok(wake) => wake,
+                    Err(RecvTimeoutError::Timeout) => {
+                        if debounce.take(Instant::now()) {
+                            if let Some(msg) = lock(&state).ingest_file(&path) {
+                                on_reload(msg);
+                            }
                         }
+                        continue;
                     }
-                    continue;
+                    Err(RecvTimeoutError::Disconnected) => break false,
+                },
+            };
+            match wake {
+                Wake::Stop => break false,
+                Wake::Fs(Err(_)) => break true,
+                Wake::Fs(Ok(event)) if directory_watch_lost(&event, &dir) => break true,
+                Wake::Fs(Ok(event)) if event_hits_config(&event, &path) => {
+                    debounce.push(Instant::now());
                 }
-                Err(RecvTimeoutError::Disconnected) => break,
-            },
-        };
-        match wake {
-            Wake::Stop => break,
-            Wake::Fs(Ok(event)) if event_hits_config(&event, &path) => {
-                debounce.push(Instant::now());
+                Wake::Fs(_) => {}
             }
-            Wake::Fs(_) => {}
+        };
+        ready.store(false, Ordering::Relaxed);
+        if !lost {
+            return;
+        }
+        // The directory was removed or the backend dropped the watch.
+        // Wait until it exists again, then read whatever config.json is there.
+        let _ = watcher.unwatch(&dir);
+        if !wait_until_watched(&mut watcher, &dir, &rx) {
+            return;
         }
     }
-    ready.store(false, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub fn reload_missing(baseline: UserConfig) -> Option<ReloadMsg> {
+    let bytes = crate::config::encode(&baseline).unwrap();
+    let mut state = WatchState::new(baseline.clone());
+    state.prime(Some(&bytes));
+    state.commit_applied(&baseline);
+    state.ingest_result(Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "deleted",
+    )))
 }
 
 /// Read `next` as a new config.json over a session already running `baseline`
@@ -668,6 +801,7 @@ mod tests {
         state.prime(Some(b"{}"));
         let good = br##"{"font_size":22.0,"bg":"#112233","cursor_style":"bar","osc52":"copy"}"##;
         let (config, _, _) = applied(state.ingest(good).unwrap());
+        state.commit_applied(&config);
         assert_eq!(config.font_size, Some(22.0));
         assert!(config.osc52_copy_enabled());
 
@@ -687,24 +821,13 @@ mod tests {
         // The same broken bytes do not reset, and do not raise a second error.
         assert!(state.ingest(b"{oops").is_none());
 
-        let missing = state
-            .ingest_result(Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "gone",
-            )))
-            .unwrap();
-        let ReloadMsg::Rejected { .. } = missing else {
-            panic!("a missing file is an error, not defaults");
-        };
-        assert_eq!(state.last_good.font_size, Some(22.0));
-        assert_ne!(state.last_good, UserConfig::default());
-
-        let (config, plan, _) =
-            applied(state.ingest(br##"{"font_size":22.0,"bg":"#112233","cursor_style":"underline","osc52":"copy"}"##).unwrap());
+        let (config, plan, _) = applied(state.ingest(br##"{"font_size":22.0,"bg":"#112233","cursor_style":"underline","osc52":"copy"}"##).unwrap());
+        state.commit_applied(&config);
         assert_eq!(config.cursor(), CursorStyle::Underline);
         assert!(plan.cursor);
         assert_eq!(config.font_size, Some(22.0));
         assert!(config.osc52_copy_enabled());
+        assert_eq!(state.last_good.cursor(), CursorStyle::Underline);
     }
 
     /// A config the corrupt-file tests start from. Several fields are set so
@@ -969,5 +1092,83 @@ mod tests {
         }
         let (config, _, _) = applied(state.ingest(br#"{"osc52":"copy"}"#).unwrap());
         assert!(config.osc52_copy_enabled());
+    }
+
+    #[test]
+    fn reload_during_a_build_applies_the_latest_config() {
+        let mut slot = RendererSlot::new(UserConfig::default());
+        assert!(slot.try_begin(0.0), "the startup build starts");
+        let during_startup = UserConfig {
+            font_size: Some(18.0),
+            bg: Some("#010203".into()),
+            ..UserConfig::default()
+        };
+        slot.note_wanted(&during_startup);
+        assert!(
+            !slot.try_begin(0.0),
+            "a reload during the initial build must not start a second one"
+        );
+        assert!(
+            slot.finish(0.0),
+            "the startup renderer is behind the file that arrived"
+        );
+        assert!(slot.try_begin(0.0));
+        assert!(!slot.finish(0.0));
+        assert_eq!(slot.rendered().unwrap(), &during_startup);
+
+        let second = UserConfig {
+            font_size: Some(22.0),
+            ..during_startup.clone()
+        };
+        let latest = UserConfig {
+            font_size: Some(30.0),
+            fg: Some("#eeeecc".into()),
+            ..second.clone()
+        };
+        slot.note_wanted(&second);
+        assert!(slot.try_begin(0.0));
+        slot.note_wanted(&latest);
+        assert!(
+            !slot.try_begin(0.0),
+            "the second reload waits for the build already running"
+        );
+        assert!(slot.finish(0.0));
+        assert!(slot.try_begin(0.0));
+        assert!(!slot.finish(0.0));
+        assert_eq!(
+            slot.rendered().unwrap(),
+            &latest,
+            "the installed renderer is the latest file, not the one in flight"
+        );
+
+        // last_good stays on the previous applied config until that renderer
+        // is actually installed.
+        let mut state = WatchState::new(UserConfig::default());
+        state.prime(Some(b"{}"));
+        let bytes = config::encode(&latest).unwrap();
+        let (parsed, plan, _) = applied(state.ingest(&bytes).unwrap());
+        assert!(plan.font);
+        assert!(plan.colors);
+        assert_eq!(
+            state.last_good.font_size, None,
+            "parsing the file must not pretend the renderer already has it"
+        );
+        state.commit_applied(slot.rendered().unwrap());
+        assert_eq!(state.last_good, parsed);
+        assert_eq!(state.last_good, latest);
+    }
+
+    #[test]
+    fn removing_the_config_directory_is_a_lost_watch() {
+        let dir = std::path::PathBuf::from("/home/user/.bayan");
+        let file = dir.join("config.json");
+        let removed =
+            notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::Folder))
+                .add_path(dir.clone());
+        assert!(directory_watch_lost(&removed, &dir));
+        let file_removed =
+            notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::File))
+                .add_path(file);
+        assert!(!directory_watch_lost(&file_removed, &dir));
     }
 }

@@ -1493,7 +1493,6 @@ struct App {
     /// Ctrl+wheel zoom, in points on top of the configured size.
     font_delta: f32,
     renderer_building: bool,
-    inflight_delta: f32,
     /// the last rectangle the window had while NOT maximized — what a
     /// maximized window restores down to, and what the session saves
     normal_geom: Option<WindowGeom>,
@@ -1510,8 +1509,52 @@ struct App {
     start_dir: Option<String>,
     /// Watches config.json. A panel save tells it to ignore that write.
     config_watch: config_watch::ConfigWatcher,
+    /// Which config the in-flight renderer build captured, and which one
+    /// the session wants. A reload during a build is finished when that
+    /// build lands.
+    config_build: config_watch::RendererSlot,
     /// Parse error, or the list of settings that wait for a new pane.
     config_notice: Option<ConfigNotice>,
+}
+
+/// What a reload does to the session's config and its load error.
+/// A rejected file leaves the config alone and blocks the next save.
+/// A missing file arrives as an applied default, which clears the error.
+struct AbsorbedReload {
+    config: config::UserConfig,
+    load_error: Option<String>,
+    plan: config_watch::ApplyPlan,
+    deferred: Vec<config_watch::DeferredSetting>,
+}
+
+fn absorb_reload(current: config::UserConfig, msg: config_watch::ReloadMsg) -> AbsorbedReload {
+    match msg {
+        config_watch::ReloadMsg::Rejected { error } => AbsorbedReload {
+            config: current,
+            load_error: Some(error),
+            plan: config_watch::ApplyPlan::default(),
+            deferred: Vec::new(),
+        },
+        config_watch::ReloadMsg::Applied {
+            config,
+            plan,
+            deferred,
+        } => AbsorbedReload {
+            config: *config,
+            load_error: None,
+            plan,
+            deferred,
+        },
+    }
+}
+
+/// Bytes to write, or the load error that blocks the save. A missing file
+/// is not a load error: the caller can recreate config.json.
+fn save_bytes(load_error: &Option<String>, config: &config::UserConfig) -> Result<Vec<u8>, String> {
+    if let Some(error) = load_error {
+        return Err(error.clone());
+    }
+    config::encode(config).map_err(|error| error.to_string())
 }
 
 impl App {
@@ -1522,17 +1565,21 @@ impl App {
     }
 
     /// (Re)build the renderer off-thread for the current scale, config and
-    /// zoom. Debounced: one build in flight; a stale result triggers another.
+    /// zoom. One build runs at a time. A newer config that arrives while
+    /// it runs is kept by `config_build` and started from `RendererReady`.
     fn rebuild_renderer(&mut self) {
+        self.config_build.note_wanted(&self.config);
         if self.renderer_building {
             return;
         }
         let Some(w) = &self.window else { return };
+        if !self.config_build.try_begin(self.font_delta) {
+            return;
+        }
         self.renderer_building = true;
-        self.inflight_delta = self.font_delta;
         let proxy = self.proxy.clone();
         let scale = w.scale_factor() as f32;
-        let cfg = self.config.clone();
+        let cfg = self.config_build.snapshot().clone();
         let delta = self.font_delta;
         std::thread::spawn(move || {
             let r = render::Renderer::new(scale, &cfg, delta);
@@ -2426,17 +2473,14 @@ impl App {
     }
 
     fn save_config(&mut self) {
-        if self.config_load_error.is_some() {
-            self.report_config_load_error();
-            return;
-        }
-        let bytes = match config::encode(&self.config) {
+        let bytes = match save_bytes(&self.config_load_error, &self.config) {
             Ok(bytes) => bytes,
             Err(error) => {
-                self.report_error(
-                    tr("تعذر حفظ الإعدادات", "Could not save settings"),
-                    &error.to_string(),
-                );
+                if self.config_load_error.is_some() {
+                    self.report_config_load_error();
+                } else {
+                    self.report_error(tr("تعذر حفظ الإعدادات", "Could not save settings"), &error);
+                }
                 return;
             }
         };
@@ -2460,45 +2504,44 @@ impl App {
     /// resizes every PTY to the new cell size. Padding alone resizes with
     /// the metrics already on screen.
     fn apply_config_reload(&mut self, msg: config_watch::ReloadMsg) {
-        match msg {
-            config_watch::ReloadMsg::Rejected { error } => {
-                self.config_load_error = Some(error.clone());
-                self.config_notice = Some(ConfigNotice {
-                    text: config_watch::parse_error_notice(&error),
-                    until: None,
-                });
-                self.request_redraw();
-            }
-            config_watch::ReloadMsg::Applied {
-                config,
-                plan,
-                deferred,
-            } => {
-                self.config_load_error = None;
-                let language = plan.language && config.lang() != self.config.lang();
-                self.config = *config;
-                if language {
-                    lang::set(self.config.lang());
-                }
-                if plan.keybinds {
-                    self.keymap = keybinds::effective_map(&self.config);
-                }
-                if plan.opacity {
-                    self.apply_opacity();
-                }
-                if plan.font || plan.colors {
-                    self.rebuild_renderer();
-                } else if plan.padding || plan.hide_bar {
-                    self.relayout_active();
-                }
-                self.config_notice =
-                    config_watch::deferred_notice(&deferred).map(|text| ConfigNotice {
-                        text,
-                        until: Some(Instant::now() + std::time::Duration::from_secs(8)),
-                    });
-                self.request_redraw();
-            }
+        let absorbed = absorb_reload(self.config.clone(), msg);
+        if let Some(error) = absorbed.load_error {
+            self.config_load_error = Some(error.clone());
+            self.config_notice = Some(ConfigNotice {
+                text: config_watch::parse_error_notice(&error),
+                until: None,
+            });
+            self.request_redraw();
+            return;
         }
+        self.config_load_error = None;
+        let language = absorbed.plan.language && absorbed.config.lang() != self.config.lang();
+        self.config = absorbed.config;
+        if language {
+            lang::set(self.config.lang());
+        }
+        if absorbed.plan.keybinds {
+            self.keymap = keybinds::effective_map(&self.config);
+        }
+        if absorbed.plan.opacity {
+            self.apply_opacity();
+        }
+        let rebuild = absorbed.plan.font || absorbed.plan.colors;
+        if rebuild {
+            self.rebuild_renderer();
+        } else {
+            if absorbed.plan.padding || absorbed.plan.hide_bar {
+                self.relayout_active();
+            }
+            // Nothing is waiting on a renderer build, so this config is live.
+            self.config_watch.commit_applied(&self.config);
+        }
+        self.config_notice =
+            config_watch::deferred_notice(&absorbed.deferred).map(|text| ConfigNotice {
+                text,
+                until: Some(Instant::now() + std::time::Duration::from_secs(8)),
+            });
+        self.request_redraw();
     }
 
     fn report_config_load_error(&mut self) {
@@ -5263,9 +5306,13 @@ impl ApplicationHandler<UserEvent> for App {
                 self.renderer_building = false;
                 // now that cell metrics exist, snap every pane to its rect
                 self.relayout_active();
-                // the zoom moved again while this build ran: chase it
-                if (self.font_delta - self.inflight_delta).abs() > f32::EPSILON {
+                // A reload or a zoom that arrived while this build ran is
+                // not in the renderer we just installed. Start the next one
+                // from the config the session wants now.
+                if self.config_build.finish(self.font_delta) {
                     self.rebuild_renderer();
+                } else {
+                    self.config_watch.commit_applied(&self.config);
                 }
                 if let Some(text) = self.debug_paste.take() {
                     self.debug_right_click_paste(text);
@@ -5634,6 +5681,7 @@ fn run() -> Result<(), String> {
             let _ = reload_proxy.send_event(UserEvent::ConfigReloaded(msg));
         },
     );
+    let config_build = config_watch::RendererSlot::new(cfg.clone());
     let mut app = App {
         posh: None,
         last_toast: None,
@@ -5692,12 +5740,12 @@ fn run() -> Result<(), String> {
         atlas_generation: 0,
         font_delta: 0.0,
         renderer_building: false,
-        inflight_delta: 0.0,
         normal_geom: None,
         keys_held_away: Vec::new(),
         debug_paste: None,
         start_dir,
         config_watch,
+        config_build,
         config_notice: None,
     };
     let result = event_loop.run_app(&mut app);
@@ -5721,6 +5769,102 @@ fn osc52_pane_is_focused(tabs: &[(usize, &[u64])], active: usize, source: u64) -
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bayan-save-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn truncated_config_reload_blocks_saving() {
+        let current = config::UserConfig {
+            font_size: Some(22.0),
+            cursor_style: Some("bar".into()),
+            osc52: Some("copy".into()),
+            ..config::UserConfig::default()
+        };
+        let bytes = config::encode(&current).unwrap();
+        let msg = config_watch::reload_from_bytes(
+            current.clone(),
+            &bytes,
+            br#"{"font_size":99.0,"cursor_style":"underline""#,
+        )
+        .expect("a truncated file is a reload message");
+        let absorbed = absorb_reload(current, msg);
+        assert!(
+            absorbed.load_error.is_some(),
+            "truncated json is a load error"
+        );
+        assert_eq!(absorbed.config.font_size, Some(22.0));
+        assert_eq!(absorbed.config.cursor(), config::CursorStyle::Bar);
+        assert!(absorbed.config.osc52_copy_enabled());
+        assert!(save_bytes(&absorbed.load_error, &absorbed.config).is_err());
+        let dir = temp_dir("truncated");
+        let path = dir.join("config.json");
+        assert!(!path.exists(), "a blocked save must not create config.json");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_json_reload_blocks_saving() {
+        let current = config::UserConfig {
+            font_size: Some(22.0),
+            arabic_font: Some("Amiri".into()),
+            ..config::UserConfig::default()
+        };
+        let bytes = config::encode(&current).unwrap();
+        let msg = config_watch::reload_from_bytes(current.clone(), &bytes, b"{oops")
+            .expect("invalid json is a reload message");
+        let absorbed = absorb_reload(current, msg);
+        assert!(absorbed.load_error.is_some());
+        assert_eq!(absorbed.config.arabic_font.as_deref(), Some("Amiri"));
+        assert_eq!(absorbed.config.font_size, Some(22.0));
+        assert!(save_bytes(&absorbed.load_error, &absorbed.config).is_err());
+    }
+
+    #[test]
+    fn deleting_config_json_clears_the_load_error_and_save_recreates_the_file() {
+        let current = config::UserConfig {
+            font_size: Some(22.0),
+            cursor_style: Some("bar".into()),
+            ..config::UserConfig::default()
+        };
+        // An earlier bad file is blocking saves. Deleting the file is not
+        // another bad file: it is the default config, and a save may write it.
+        let mut blocked = absorb_reload(
+            current.clone(),
+            config_watch::reload_from_bytes(
+                current.clone(),
+                &config::encode(&current).unwrap(),
+                b"{oops",
+            )
+            .unwrap(),
+        );
+        assert!(blocked.load_error.is_some());
+        let deleted = config_watch::reload_missing(current).expect("delete is noticed");
+        blocked = absorb_reload(blocked.config, deleted);
+        assert!(
+            blocked.load_error.is_none(),
+            "a missing file must not block save_config"
+        );
+        assert_eq!(blocked.config, config::UserConfig::default());
+        let bytes = save_bytes(&blocked.load_error, &blocked.config).unwrap();
+        let dir = temp_dir("deleted");
+        let path = dir.join("config.json");
+        config::write_bytes_at(&path, &bytes).unwrap();
+        let restored = config::parse_bytes(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(restored, config::UserConfig::default());
+        assert!(path.is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_cwd_argument_opens_a_local_folder_and_refuses_the_rest() {

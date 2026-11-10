@@ -412,8 +412,12 @@ pub fn encode(cfg: &UserConfig) -> std::io::Result<Vec<u8>> {
     serde_json::to_vec_pretty(cfg).map_err(Into::into)
 }
 
+pub fn write_bytes_at(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    crate::persist::write(path, bytes)
+}
+
 pub fn write_bytes(bytes: &[u8]) -> std::io::Result<()> {
-    crate::persist::write(&config_path(), bytes)
+    write_bytes_at(&config_path(), bytes)
 }
 
 #[cfg(test)]
