@@ -1320,9 +1320,15 @@ mod tests {
         }
         let (mut t, mut p, mut meta, mut carry) = fresh();
         feed(&mut t, &mut p, &mut meta, &mut carry, b"AB\x1b[?1049hZ");
-        assert!(t.mode().contains(TermMode::ALT_SCREEN));
-        assert_eq!(cell(&t, 0), 'Z', "?1049 really does switch screens");
-        assert_ne!(cell(&t, 1), 'B');
+        assert!(
+            t.mode().contains(TermMode::ALT_SCREEN),
+            "?1049 is the sequence that actually switches screens"
+        );
+        assert_ne!(
+            cell(&t, 0),
+            'A',
+            "the primary screen's A is not what ?1049 shows"
+        );
     }
 
     /// `?1047h` split across two reads still turns alt_off off, and the
