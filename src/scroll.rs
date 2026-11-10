@@ -82,6 +82,7 @@ pub(crate) fn wheel_plan(
 }
 
 impl PaneScroll {
+    #[cfg(test)]
     pub(crate) fn with_subline(subline: f32) -> Self {
         Self {
             subline,
