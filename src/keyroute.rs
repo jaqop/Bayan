@@ -442,7 +442,11 @@ impl App {
             link::CardDecision::Open => {
                 if let Some(card) = self.blocked_link.take() {
                     if let Some(uri) = card.confirm_uri {
-                        self.spawn_link_open(link::Action::Browse(uri));
+                        if uri.starts_with("http://") || uri.starts_with("https://") {
+                            self.spawn_link_open(link::Action::Browse(uri));
+                        } else {
+                            self.spawn_link_open(link::Action::Reveal(uri));
+                        }
                     }
                 }
                 self.request_redraw();

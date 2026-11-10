@@ -405,6 +405,11 @@ pub enum UserEvent {
         reason: String,
         shown: String,
     },
+    /// Elevated `path:line` with no Program Files `Code.exe`. The card shows
+    /// the full path; Enter reveals it in Explorer.
+    LinkConfirm {
+        path: String,
+    },
 }
 
 /// The link under the pointer. Stable while the pointer stays inside it,
@@ -826,12 +831,22 @@ fn restored_shell(saved: Option<String>, default: &str, installed: &[shells::She
 }
 
 fn state_path() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = SESSION_FILE.with(|slot| slot.borrow().clone()) {
+        return Some(path);
+    }
     let home = std::env::var("USERPROFILE").ok()?;
     Some(
         std::path::Path::new(&home)
             .join(".bayan")
             .join("session.json"),
     )
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static SESSION_FILE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Multi-click detection: 1 = simple, 2 = word (semantic), 3 = line.
@@ -1834,6 +1849,17 @@ impl App {
     /// ones it skipped, so coming back asks again. Closing or reopening
     /// stops the worker.
     fn open_posh(&mut self) {
+        if self.elevated {
+            let (title, body) = elevate::prompt_picker_notice();
+            self.blocked_link = Some(BlockedLink {
+                reason: title.to_string(),
+                shown: body.to_string(),
+                confirm_uri: None,
+                is_app_error: true,
+            });
+            self.request_redraw();
+            return;
+        }
         use std::sync::atomic::Ordering;
         let names = posh::available();
         if names.is_empty() {
@@ -1933,9 +1959,19 @@ impl App {
             Key::Named(NamedKey::Enter) => {
                 let name = p.names[p.sel].clone();
                 self.close_posh();
-                match posh::set_theme(&name) {
-                    Ok(()) => eprintln!("bayan: prompt theme set to {name} (new tabs)"),
-                    Err(e) => eprintln!("bayan: prompt theme failed: {e}"),
+                if self.elevated {
+                    let (title, body) = elevate::prompt_picker_notice();
+                    self.blocked_link = Some(BlockedLink {
+                        reason: title.to_string(),
+                        shown: body.to_string(),
+                        confirm_uri: None,
+                        is_app_error: true,
+                    });
+                } else {
+                    match posh::set_theme(&name) {
+                        Ok(()) => eprintln!("bayan: prompt theme set to {name} (new tabs)"),
+                        Err(e) => eprintln!("bayan: prompt theme failed: {e}"),
+                    }
                 }
             }
             _ => {}
@@ -2423,6 +2459,25 @@ impl App {
             is_app_error: true,
         });
         self.request_redraw();
+    }
+
+    /// The Arabic admin card. A config-load error already on the card stays;
+    /// the notice is appended instead of replacing it.
+    fn apply_admin_notice(&mut self) {
+        if !self.elevated {
+            return;
+        }
+        let (title, body) = elevate::admin_notice();
+        if let Some(block) = self.blocked_link.as_mut() {
+            block.shown = elevate::with_admin_notice(Some(&block.shown), title, body);
+        } else {
+            self.blocked_link = Some(BlockedLink {
+                reason: title.to_string(),
+                shown: body.to_string(),
+                confirm_uri: None,
+                is_app_error: true,
+            });
+        }
     }
 
     fn save_config(&mut self) {
@@ -3150,6 +3205,11 @@ impl App {
     }
 
     fn save_state(&mut self) -> bool {
+        // Every caller (close, rename, group assign) comes through here.
+        // An elevated process must not create or replace session.json.
+        if !elevate::may_write_bayan(self.elevated) {
+            return true;
+        }
         // Closing while discovery is pending must not replace the saved
         // session with an empty window that has not restored it yet.
         if self.startup_pending {
@@ -3973,6 +4033,12 @@ impl App {
             .spawn(move || {
                 link::init_link_thread();
                 let action = link::settle_live(action, elevated);
+                if let link::Action::Confirm { uri, host } = &action {
+                    if !uri.starts_with("http://") && !uri.starts_with("https://") {
+                        let _ = proxy.send_event(UserEvent::LinkConfirm { path: host.clone() });
+                        return;
+                    }
+                }
                 if let link::Action::Refuse { reason, shown } = &action {
                     let _ = proxy.send_event(UserEvent::LinkFailed {
                         reason: reason.label().to_string(),
@@ -5028,15 +5094,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.gpu = Some(gpu);
         self.window = Some(window.clone());
         self.report_config_load_error();
-        if self.elevated && self.blocked_link.is_none() {
-            let (title, body) = elevate::admin_notice();
-            self.blocked_link = Some(BlockedLink {
-                reason: title.to_string(),
-                shown: body.to_string(),
-                confirm_uri: None,
-                is_app_error: true,
-            });
-        }
+        self.apply_admin_notice();
         self.apply_opacity(); // the configured window alpha, from frame one
         self.apply_window_frame();
         if let Some(h) = self.hwnd() {
@@ -5308,6 +5366,20 @@ impl ApplicationHandler<UserEvent> for App {
                     reason,
                     shown: link::preview(&shown, 160),
                     confirm_uri: None,
+                    is_app_error: false,
+                });
+                self.clear_link_hover();
+                self.request_redraw();
+            }
+            UserEvent::LinkConfirm { path } => {
+                self.blocked_link = Some(BlockedLink {
+                    reason: tr(
+                        "لا يوجد محرّر في Program Files",
+                        "No editor under Program Files",
+                    )
+                    .to_string(),
+                    shown: path.clone(),
+                    confirm_uri: Some(path),
                     is_app_error: false,
                 });
                 self.clear_link_hover();
@@ -7188,5 +7260,122 @@ mod m38_tests {
         );
         let old = r#"{"tabs":[{"cwds":[null]}],"active":0}"#;
         assert_eq!(parse_state(old).unwrap().tabs[0].name, None);
+    }
+
+    #[test]
+    fn an_elevated_rename_or_group_change_does_not_write_session_json() {
+        let dir = std::env::temp_dir().join(format!("bayan-session-elev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.json");
+        std::fs::write(&path, b"ORIGINAL").unwrap();
+        super::SESSION_FILE.with(|slot| *slot.borrow_mut() = Some(path.clone()));
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event()
+            .with_any_thread(true)
+            .build()
+            .expect("event loop");
+        let mut app = super::session_app(event_loop.create_proxy(), true);
+        app.rename_tab(Some("مسؤول".into()));
+        app.rename_group(Some("مجموعة".into()));
+        app.move_tab_to_group(None);
+        app.blocked_link = Some(BlockedLink {
+            reason: "load".into(),
+            shown: "config.json is unreadable".into(),
+            confirm_uri: None,
+            is_app_error: true,
+        });
+        app.apply_admin_notice();
+        let both = app
+            .blocked_link
+            .as_ref()
+            .expect("config error and admin notice");
+        assert!(both.shown.contains("config.json"));
+        assert!(both.shown.contains("الإضافات"));
+        app.open_posh();
+        SESSION_FILE.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(std::fs::read(&path).unwrap(), b"ORIGINAL");
+        assert!(app.posh.is_none());
+        let card = app.blocked_link.as_ref().expect("the picker refusal");
+        assert!(card.shown.contains("منتقي"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+fn session_app(proxy: EventLoopProxy<UserEvent>, elevated: bool) -> App {
+    App {
+        posh: None,
+        last_toast: None,
+        mru: mru::Mru::new(),
+        groups: groups::Groups::new(),
+        spawn_group: None,
+        palette: None,
+        shell_profiles: Vec::new(),
+        shell_profiles_ready: true,
+        startup_pending: false,
+        last_strip_click: None,
+        proxy,
+        window: None,
+        gpu: None,
+        renderer: None,
+        tabs: vec![Tab {
+            panes: Vec::new(),
+            layout: layout::Node::single(),
+            focused: 0,
+            title: "بيان".into(),
+            name: None,
+            attention: false,
+            broadcast: false,
+            zoomed: false,
+            group: 0,
+        }],
+        active: 0,
+        next_id: 1,
+        size: TermSize { cols: 80, rows: 24 },
+        modifiers: ModifiersState::default(),
+        first_frame: false,
+        first_output: false,
+        last_frame: Vec::new(),
+        last_frame_size: None,
+        cursor_pos: PhysicalPosition::new(0.0, 0.0),
+        ime_spot: None,
+        mouse: mouse::Route::default(),
+        sel_pane: 0,
+        drag_divider: None,
+        cockpit: false,
+        cockpit_sel: 0,
+        pending_paste: None,
+        pending_close: None,
+        swallow_guard_release: false,
+        link_hover: None,
+        blocked_link: None,
+        link_cache: link::SpanCache::default(),
+        last_input: Instant::now(),
+        blink_drawn_on: true,
+        settings: None,
+        focused: false,
+        clicks: ClickTracker::new(),
+        wheel_accum: 0.0,
+        search: None,
+        clipboard: None,
+        auto_follow: true,
+        claude_manual: false,
+        config: config::UserConfig::default(),
+        config_load_error: None,
+        startup_error: None,
+        keymap: Vec::new(),
+        shortcuts: None,
+        atlas_generation: 0,
+        font_delta: 0.0,
+        renderer_building: false,
+        inflight_delta: 0.0,
+        normal_geom: None,
+        keys_held_away: Vec::new(),
+        debug_paste: None,
+        start_dir: None,
+        start_profile_command: None,
+        start_command: None,
+        elevated,
     }
 }

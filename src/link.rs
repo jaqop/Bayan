@@ -1681,6 +1681,7 @@ fn settle_edit_default<E, P, L, C>(
     exists: &E,
     long_path: &L,
     code_exe: &C,
+    confirm_if_missing: bool,
 ) -> Action
 where
     E: Fn(&str) -> P,
@@ -1693,7 +1694,8 @@ where
         Ok(DiskPath::Ready(path)) => path,
         Err(refusal) => return refusal,
     };
-    // Still never association-open. No editor means reveal.
+    // Still never association-open. No trusted editor means reveal, unless
+    // this is an elevated window: then the caller shows the path and waits.
     if let Some(exe) = code_exe() {
         let exe = exe.trim();
         if !exe.is_empty() && !is_shell_program(exe) {
@@ -1705,6 +1707,12 @@ where
             }
         }
     }
+    if confirm_if_missing {
+        return Action::Confirm {
+            uri: path.clone(),
+            host: path,
+        };
+    }
     Action::Reveal(path)
 }
 
@@ -1712,6 +1720,22 @@ where
 /// `long_path` returns the expanded path (already without a `\\?\` prefix,
 /// or with one — it is stripped). `None` means expansion failed.
 pub fn settle<E, P, L, C>(action: Action, exists: E, long_path: L, code_exe: C) -> Action
+where
+    E: Fn(&str) -> P,
+    P: Into<Probe>,
+    L: Fn(&str) -> Option<String>,
+    C: Fn() -> Option<String>,
+{
+    settle_choosing(action, exists, long_path, code_exe, false)
+}
+
+fn settle_choosing<E, P, L, C>(
+    action: Action,
+    exists: E,
+    long_path: L,
+    code_exe: C,
+    confirm_if_missing: bool,
+) -> Action
 where
     E: Fn(&str) -> P,
     P: Into<Probe>,
@@ -1734,17 +1758,33 @@ where
                 Action::Edit { argv, path: full }
             }
         },
-        Action::EditDefault { path, line, col } => {
-            settle_edit_default(path, line, col, &exists, &long_path, &code_exe)
-        }
+        Action::EditDefault { path, line, col } => settle_edit_default(
+            path,
+            line,
+            col,
+            &exists,
+            &long_path,
+            &code_exe,
+            confirm_if_missing,
+        ),
         other => other,
     }
 }
 
 pub fn settle_live(action: Action, elevated: bool) -> Action {
-    settle(action, local_file_probe, win_long_path, || {
-        code_exe(elevated).map(|p| p.to_string_lossy().into_owned())
-    })
+    if elevated {
+        settle_choosing(
+            action,
+            local_file_probe,
+            win_long_path,
+            || code_exe(true).map(|p| p.to_string_lossy().into_owned()),
+            true,
+        )
+    } else {
+        settle(action, local_file_probe, win_long_path, || {
+            code_exe(false).map(|p| p.to_string_lossy().into_owned())
+        })
+    }
 }
 
 /// Apartment COM, before `ShellExecuteW`. Called on the `bayan-link` thread.
@@ -2016,33 +2056,34 @@ pub fn spawn_editor(argv: &[String]) -> std::io::Result<()> {
 /// `explorer.exe /select` instead of an editor.
 ///
 /// Not elevated: `code.exe` on `PATH`, or the `Code.exe` next to the
-/// `code.cmd` shim. Elevated: those PATH entries are ignored. The lookup
-/// is only `Program Files`, `Program Files (x86)`, and
-/// `%LOCALAPPDATA%\Programs\Microsoft VS Code`.
+/// `code.cmd` shim. Elevated: `PATH` and `%LOCALAPPDATA%` are ignored.
+/// The lookup is only Program Files and Program Files (x86), from
+/// `SHGetKnownFolderPath`, not from environment variables. `None` means
+/// the file is not opened by an editor; the window asks with the full path.
 pub fn code_exe(elevated: bool) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH");
+    let trusted = if elevated {
+        trusted_vscode_dirs(
+            known_program_files().as_deref(),
+            known_program_files_x86().as_deref(),
+        )
+    } else {
+        Vec::new()
+    };
     code_exe_from(
         elevated,
         path.as_ref()
             .map(|path| std::env::split_paths(path))
             .into_iter()
             .flatten(),
-        trusted_vscode_dirs(
-            std::env::var_os("ProgramFiles").as_deref().map(Path::new),
-            std::env::var_os("ProgramFiles(x86)")
-                .as_deref()
-                .map(Path::new),
-            std::env::var_os("LOCALAPPDATA").as_deref().map(Path::new),
-        ),
+        trusted,
     )
 }
 
-/// Those install folders, with nothing else. A `Code.exe` beside a user
-/// `PATH` entry is not among them.
+/// VS Code's per-machine install folders. Nothing under the user profile.
 pub fn trusted_vscode_dirs(
     program_files: Option<&Path>,
     program_files_x86: Option<&Path>,
-    local_app_data: Option<&Path>,
 ) -> Vec<std::path::PathBuf> {
     let mut dirs = Vec::new();
     for root in [program_files, program_files_x86].into_iter().flatten() {
@@ -2050,12 +2091,39 @@ pub fn trusted_vscode_dirs(
         dirs.push(install.join("bin"));
         dirs.push(install);
     }
-    if let Some(local) = local_app_data {
-        let install = local.join("Programs").join("Microsoft VS Code");
-        dirs.push(install.join("bin"));
-        dirs.push(install);
-    }
     dirs
+}
+
+/// `FOLDERID_ProgramFiles` via `SHGetKnownFolderPath`. Not the
+/// `ProgramFiles` environment variable.
+pub fn known_program_files() -> Option<std::path::PathBuf> {
+    known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles)
+}
+
+/// `FOLDERID_ProgramFilesX86` via `SHGetKnownFolderPath`.
+pub fn known_program_files_x86() -> Option<std::path::PathBuf> {
+    known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramFilesX86)
+}
+
+fn known_folder(id: &windows_sys::core::GUID) -> Option<std::path::PathBuf> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::SHGetKnownFolderPath;
+    // SAFETY: the folder id is a static GUID. On success `path` is a
+    // CoTaskMemAlloc string, freed before return. A failed call leaves it null.
+    unsafe {
+        let mut path = std::ptr::null_mut();
+        let hr = SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut path);
+        if hr != 0 || path.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while *path.add(len) != 0 {
+            len += 1;
+        }
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(path, len));
+        CoTaskMemFree(path.cast());
+        Some(std::path::PathBuf::from(text))
+    }
 }
 
 /// `path_dirs` is `PATH`. `trusted` is [`trusted_vscode_dirs`]. Elevated
@@ -3237,7 +3305,7 @@ mod tests {
     }
 
     #[test]
-    fn an_elevated_editor_lookup_ignores_path_and_keeps_the_known_installs() {
+    fn an_elevated_editor_lookup_ignores_path_and_user_installs() {
         let root = std::env::temp_dir().join(format!("bayan-code-elev-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let path_bin = root.join("user-path");
@@ -3249,21 +3317,37 @@ mod tests {
         std::fs::create_dir_all(&install).unwrap();
         std::fs::create_dir_all(&user_install).unwrap();
         std::fs::write(path_bin.join("Code.exe"), b"MZ").unwrap();
-        let trusted = trusted_vscode_dirs(Some(&program_files), None, Some(&local));
+        std::fs::write(user_install.join("Code.exe"), b"MZ").unwrap();
+        let trusted = trusted_vscode_dirs(Some(&program_files), None);
         assert!(
-            code_exe_from(true, std::iter::once(&path_bin), trusted.iter()).is_none(),
-            "a Code.exe on PATH is not an elevated editor"
+            trusted.iter().all(|dir| !dir.starts_with(&local)),
+            "LocalAppData is not a trusted editor folder"
+        );
+        assert!(
+            code_exe_from(true, [&path_bin, &user_install], trusted.iter()).is_none(),
+            "PATH and the user installer are not elevated editors"
         );
         assert!(code_exe_from(false, std::iter::once(&path_bin), trusted.iter()).is_some());
         std::fs::write(install.join("Code.exe"), b"MZ").unwrap();
-        let trusted = trusted_vscode_dirs(Some(&program_files), None, Some(&local));
+        let trusted = trusted_vscode_dirs(Some(&program_files), None);
         let found = code_exe_from(true, std::iter::once(&path_bin), trusted.iter()).unwrap();
         assert_eq!(found, install.join("Code.exe"));
-        let _ = std::fs::remove_file(install.join("Code.exe"));
-        std::fs::write(user_install.join("Code.exe"), b"MZ").unwrap();
-        let trusted = trusted_vscode_dirs(Some(&program_files), None, Some(&local));
-        let found = code_exe_from(true, std::iter::once(&path_bin), trusted.iter()).unwrap();
-        assert_eq!(found, user_install.join("Code.exe"));
+        let file = r"C:\src\main.rs";
+        match settle_edit_default(
+            file.to_string(),
+            10,
+            None,
+            &|_: &str| true,
+            &|_: &str| None,
+            &|| None,
+            true,
+        ) {
+            Action::Confirm { uri, host } => {
+                assert_eq!(uri, file);
+                assert_eq!(host, file);
+            }
+            other => panic!("expected a confirm card, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

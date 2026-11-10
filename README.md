@@ -1043,14 +1043,18 @@ It does not restore `session.json` and it does not start `config.json`'s
 title and the tab strip show **مسؤول** while the token is elevated. Cancelling
 UAC does not open a window. Bayan does not elevate on its own, and the
 executable manifest stays `asInvoker`. An elevated window, including one
-Explorer started with Run as administrator, does not load `~/.bayan/plugins`,
-does not inject oh-my-posh (the theme path would come from `$PROFILE` or
-`POSH_THEME`, and the program from `PATH`), and does not use `config.json`'s
-`editor` command. Ctrl+click looks for `Code.exe` only under Program Files
-and `%LOCALAPPDATA%\Programs\Microsoft VS Code`. Nothing is written under
-`~/.bayan`. Keybindings there only remap fixed actions (there is no send
-string), theme colours do not run anything, and there is no snippets file.
-The window says so in Arabic when it opens, not only with the مسؤول badge.
+Explorer started with Run as administrator, does not load `~/.bayan/plugins`
+and does not inject oh-my-posh. The prompt picker does not open in that
+window, so it neither runs `oh-my-posh.exe` nor rewrites `$PROFILE`. It does
+not use `config.json`'s `editor` command. Ctrl+click looks for `Code.exe`
+only under Program Files and Program Files (x86), from the known-folder
+API, not from `PATH` or `%LOCALAPPDATA%`. If that copy is missing, a confirm
+card shows the full path. `pwsh.exe` is started only from
+`Program Files\PowerShell\7`. `save_state` does not write `session.json`
+when the token is elevated, including a rename or a group change, and a
+settings change is not written either. The jump-list stamp is not written.
+The window says so in Arabic when it opens, and a config-load error keeps
+that notice on the same card.
 
 `"terminal_handoff": true` (absent means off; the same switches are
 `--register-terminal-handoff` and `--unregister-terminal-handoff`) registers

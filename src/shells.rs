@@ -354,6 +354,36 @@ pub fn require_profile_by_name<'a>(
     })
 }
 
+/// `pwsh.exe` for an elevated window: only
+/// `{Program Files}\PowerShell\7\pwsh.exe`. A bare name becomes that path.
+/// A copy anywhere else, including on `PATH`, is refused. Other programs
+/// are unchanged.
+pub fn resolve_elevated_pwsh(
+    prog: &str,
+    program_files: Option<&Path>,
+    is_file: impl Fn(&Path) -> bool,
+) -> Result<String, String> {
+    let base = prog.rsplit(['\\', '/']).next().unwrap_or(prog);
+    if !base.eq_ignore_ascii_case("pwsh.exe") {
+        return Ok(prog.to_string());
+    }
+    let Some(root) = program_files else {
+        return Err("pwsh.exe is not under Program Files".into());
+    };
+    let trusted = root.join("PowerShell").join("7").join("pwsh.exe");
+    if !is_file(&trusted) {
+        return Err("pwsh.exe is not under Program Files\\PowerShell\\7".into());
+    }
+    let bare = !prog.contains(['\\', '/']);
+    let trusted_text = trusted.display().to_string();
+    let same = prog.replace('/', "\\").eq_ignore_ascii_case(&trusted_text);
+    if bare || same {
+        Ok(trusted_text)
+    } else {
+        Err("refusing pwsh.exe outside Program Files".into())
+    }
+}
+
 /// The shell an elevated window starts when no profile was named.
 /// The first entry `detect` itself offers, or PowerShell. Never a string
 /// read from config.json.
@@ -750,5 +780,33 @@ mod tests {
             "config.json is not an argument of this function"
         );
         assert_eq!(elevated_default_command(&[]), crate::term::DEFAULT_SHELL);
+    }
+
+    #[test]
+    fn an_elevated_pwsh_is_the_program_files_copy_or_nothing() {
+        let root = std::env::temp_dir().join(format!("bayan-pwsh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let program_files = root.join("Program Files");
+        let user = root.join("path");
+        let trusted = program_files.join("PowerShell").join("7");
+        std::fs::create_dir_all(&trusted).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(user.join("pwsh.exe"), b"MZ").unwrap();
+        assert!(resolve_elevated_pwsh("pwsh.exe", Some(&program_files), |p| p.is_file()).is_err());
+        std::fs::write(trusted.join("pwsh.exe"), b"MZ").unwrap();
+        let got = resolve_elevated_pwsh("pwsh.exe", Some(&program_files), |p| p.is_file()).unwrap();
+        assert_eq!(got, trusted.join("pwsh.exe").display().to_string());
+        assert!(got.contains("Program Files"));
+        assert!(resolve_elevated_pwsh(
+            &user.join("pwsh.exe").display().to_string(),
+            Some(&program_files),
+            |p| p.is_file()
+        )
+        .is_err());
+        assert_eq!(
+            resolve_elevated_pwsh("powershell.exe", Some(&program_files), |p| p.is_file()).unwrap(),
+            "powershell.exe"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -43,7 +43,7 @@ selection and BiDi paths must do.
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-528 tests across the tree. `term.rs` (81), `link.rs` (61) and `render.rs` (64)
+530 tests across the tree. `term.rs` (81), `link.rs` (61) and `render.rs` (64)
 carry the most; `localpath.rs` has 21.
 
 ## Invariants — do not "simplify" these
@@ -141,10 +141,12 @@ only transparency available on this path.
 `--elevated` and, if a profile was named, `-p <name>` only. It resolves
 that name with `shells::find_profile_by_name` (the stored command does not
 match). It does not restore `session.json` and does not spawn
-`config.shell`. It does not load `~/.bayan/plugins`, does not inject oh-my-posh, does not
-use `config.json`'s `editor` template, and does not write `~/.bayan`.
-`Code.exe` is resolved only from the known install folders. No environment
-block, registry value,
+`config.shell`. It does not load `~/.bayan/plugins`, does not inject oh-my-posh, and does
+not open the prompt picker. It does not use `config.json`'s `editor`
+template. `Code.exe` comes only from Program Files via
+`SHGetKnownFolderPath`. `pwsh.exe` is only
+`Program Files\PowerShell\7\pwsh.exe`. `save_state` does not write
+`session.json` while elevated. No environment block, registry value,
 pipe, or file carries the request. The jump list's admin task is
 `--elevated` with no profile.
 

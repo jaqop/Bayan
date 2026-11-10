@@ -26,10 +26,17 @@
 //! font names do not run anything.
 //!
 //! PowerShell is started with `-NoProfile`, and the elevated setup script
-//! does not inject oh-my-posh. The theme path would come from `$PROFILE` or
-//! `POSH_THEME`, and `oh-my-posh` would be resolved from the user's `PATH`.
+//! does not inject oh-my-posh. The prompt picker does not open, and it does
+//! not run `oh-my-posh.exe` or rewrite `$PROFILE`. The theme path would come
+//! from `$PROFILE` or `POSH_THEME`, and the program from
+//! `%LOCALAPPDATA%\Programs\oh-my-posh` or `PATH`.
 //! `Ctrl+click` on `path:line` looks for `Code.exe` only under Program Files
-//! and `%LOCALAPPDATA%\Programs\Microsoft VS Code`, not on `PATH`.
+//! and Program Files (x86), from `SHGetKnownFolderPath`, not from environment
+//! variables and not from `%LOCALAPPDATA%`. If that copy is absent, a confirm
+//! card shows the full path and Enter reveals it in Explorer.
+//! `pwsh.exe` is started only as `Program Files\PowerShell\7\pwsh.exe`.
+//! `save_state` itself refuses to write when the token is elevated, so a
+//! rename or a group change cannot replace `session.json`.
 
 use std::path::Path;
 
@@ -84,10 +91,29 @@ pub fn admin_notice() -> (&'static str, &'static str) {
     (
         crate::lang::tr("نافذة مسؤول", "Administrator window"),
         crate::lang::tr(
-            "لا تُحمَّل الإضافات ولا الجلسة، ولا تُحقن سمة الموجّه، ولا يُؤخذ المحرّر أو الصدفة من الإعدادات.",
-            "Plugins, the saved session, the prompt theme, and the configured shell and editor are not used.",
+            "لا تُحمَّل الإضافات ولا الجلسة، ولا تُحقن سمة الموجّه، ولا يُؤخذ المحرّر أو الصدفة من الإعدادات. منتقي الموجّه غير متاح.",
+            "Plugins, the saved session, the prompt theme, and the configured shell and editor are not used. The prompt picker is not available.",
         ),
     )
+}
+
+/// Shown when an elevated window tries to open the prompt picker.
+pub fn prompt_picker_notice() -> (&'static str, &'static str) {
+    (
+        crate::lang::tr("نافذة مسؤول", "Administrator window"),
+        crate::lang::tr(
+            "منتقي الموجّه غير متاح في نافذة المسؤول.",
+            "The prompt picker is not available in an administrator window.",
+        ),
+    )
+}
+
+/// Keep a config-load error and the admin notice on the same card.
+pub fn with_admin_notice(existing: Option<&str>, title: &str, body: &str) -> String {
+    match existing.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(shown) => format!("{shown}\n\n{title}\n{body}"),
+        None => format!("{title}\n{body}"),
+    }
 }
 
 /// `config.json`'s editor template, or nothing when this window is elevated.
@@ -366,6 +392,13 @@ mod tests {
         assert!(body.contains("الجلسة"));
         assert!(body.contains("سمة"));
         assert!(body.contains("المحرّر"));
+        assert!(body.contains("منتقي"));
+        let (picker_title, picker) = prompt_picker_notice();
+        assert!(picker.contains("منتقي"));
+        assert!(picker_title.contains("مسؤول") || picker_title.contains("Administrator"));
+        let both = with_admin_notice(Some("config.json is unreadable"), title, body);
+        assert!(both.contains("config.json"));
+        assert!(both.contains("الإضافات"));
     }
 
     #[test]

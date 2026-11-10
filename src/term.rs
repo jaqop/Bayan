@@ -2206,6 +2206,15 @@ impl Session {
                 "refusing to spawn wsl.exe by a bare name; System32\\wsl.exe is not there".into(),
             );
         };
+        let prog = if elevated {
+            crate::shells::resolve_elevated_pwsh(
+                prog.as_str(),
+                crate::link::known_program_files().as_deref(),
+                |path| path.is_file(),
+            )?
+        } else {
+            prog
+        };
         let mut cmd = CommandBuilder::new(prog);
         for a in &args {
             cmd.arg(a);
