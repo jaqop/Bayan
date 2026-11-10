@@ -837,8 +837,10 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       symlink open, a junction to a missing file is Missing, and a symlink
       to `\\127.0.0.1\…`, a local junction chained into it, and a junction
       to a `\\?\Volume{…}\` path are refused as not local. Not run
-      against a real SMB share. A local volume mount point (`\??\Volume{…}`
-      target) is refused too, which is stricter than it needs to be. A
+      against a real SMB share. A volume mount point (a link to
+      `\??\Volume{GUID}\`, a volume's root) was refused too; since #36 the
+      walk goes through it in place and checks every component below it,
+      while a link to a folder inside a volume is still refused. A
       link swapped between the walk and the open (TOCTOU) is not covered.
 - [x] **Copy mode** (Ctrl+Shift+X, WezTerm's chord) — select and copy
       scrollback without the mouse. It runs on alacritty_terminal's vi

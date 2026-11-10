@@ -13,9 +13,11 @@
 //! can leave the machine. A symlink or junction is not refused outright,
 //! because pnpm's `node_modules` and many dev trees are made of them: its
 //! target is read from the reparse data, without following it, and the walk
-//! restarts on the target when the target is a local drive path. A UNC or
-//! volume target, an unknown link type, too many hops, or a probe that fails
-//! for any reason other than "not found" is [`Walk::NotLocal`].
+//! restarts on the target when the target is a local drive path. A volume
+//! mount point (a link to a volume's root) is walked through in place. A UNC
+//! target, a folder inside a volume, an unknown link type, too many hops, or
+//! a probe that fails for any reason other than "not found" is
+//! [`Walk::NotLocal`].
 //!
 //! The drive itself is checked first: a mapped network drive is
 //! `DRIVE_REMOTE` and is refused before any component is read.
@@ -131,7 +133,8 @@ pub fn parse_reparse(buf: &[u8]) -> Option<Reparse> {
 
 /// Where a link points, as a drive path to walk next, or `None` when it
 /// leaves the local drives. `link` is the prefix the link was found at.
-/// `\??\C:\x` is `C:\x`; `\??\UNC\…` and `\??\Volume{…}\` are `None`.
+/// `\??\C:\x` is `C:\x`; `\??\UNC\…` and `\??\Volume{…}\` are `None` (a
+/// volume root never gets here: [`walk`] passes it in place).
 /// A relative target is joined to the link's own directory; the caller
 /// normalizes the result (`..` included) with the same gate as any path.
 pub fn link_target(link: &str, target: &str, relative: bool) -> Option<String> {
@@ -156,6 +159,29 @@ pub fn link_target(link: &str, target: &str, relative: bool) -> Option<String> {
     } else {
         None
     }
+}
+
+/// `\??\Volume{GUID}\` or `\\?\Volume{GUID}\`, a volume's root and nothing
+/// below it: a folder inside the volume could itself be a link, and the walk
+/// would not see it.
+pub fn is_volume_root(target: &str) -> bool {
+    let Some(rest) = target
+        .strip_prefix(r"\??\")
+        .or_else(|| target.strip_prefix(r"\\?\"))
+    else {
+        return false;
+    };
+    let Some(guid) = rest
+        .strip_prefix("Volume{")
+        .and_then(|r| r.strip_suffix('\\').unwrap_or(r).strip_suffix('}'))
+    else {
+        return false;
+    };
+    let groups: Vec<&str> = guid.split('-').collect();
+    groups.iter().map(|g| g.len()).eq([8, 4, 4, 4, 12])
+        && groups
+            .iter()
+            .all(|g| g.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Walk `path` (already through [`crate::term::accept_local_cwd`]) with
@@ -186,6 +212,13 @@ where
                 Attr::Unknown => return Walk::NotLocal,
                 Attr::Reparse => match reparse(prefix) {
                     Some(Reparse::InPlace) => {}
+                    // A volume mount point: the mount manager only mounts
+                    // local volumes, and the components below it are still
+                    // walked one by one through this same path.
+                    Some(Reparse::Link {
+                        target,
+                        relative: false,
+                    }) if is_volume_root(&target) => {}
                     Some(Reparse::Link { target, relative }) => {
                         hops += 1;
                         if hops > MAX_HOPS {
@@ -521,14 +554,47 @@ mod tests {
         assert_eq!(fs.walk(r"C:\a\l"), Walk::NotLocal);
     }
 
+    const VOLUME: &str = r"\??\Volume{1b2c3d4e-0000-0000-0000-100000000000}\";
+
     #[test]
-    fn a_volume_mount_point_is_refused() {
-        let fs = Fs::new(&[]).link(
-            r"C:\mnt",
-            r"\??\Volume{1b2c3d4e-0000-0000-0000-100000000000}\",
+    fn a_volume_mount_point_is_walked_in_place() {
+        // #36: C:\mnt\data is a local disk, VHD or Dev Drive mounted there.
+        let fs = Fs::new(&[r"C:\mnt", r"C:\mnt\data\sub", r"C:\mnt\data\notes.txt"]).link(
+            r"C:\mnt\data",
+            VOLUME,
             false,
         );
-        assert_eq!(fs.walk(r"C:\mnt\a.txt"), Walk::NotLocal);
+        assert_eq!(fs.walk(r"C:\mnt\data\notes.txt"), Walk::Local);
+        assert_eq!(fs.walk(r"C:\mnt\data\sub"), Walk::Local);
+        assert_eq!(fs.walk(r"C:\mnt\data"), Walk::Local);
+        assert_eq!(fs.walk(r"C:\mnt\data\gone.txt"), Walk::Missing);
+        let win32 = Fs::new(&[r"C:\v\a"]).link(r"C:\v", &VOLUME.replace(r"\??\", r"\\?\"), false);
+        assert_eq!(win32.walk(r"C:\v\a"), Walk::Local);
+    }
+
+    #[test]
+    fn a_link_below_a_volume_mount_point_is_still_checked() {
+        let fs = Fs::new(&[r"C:\mnt"])
+            .link(r"C:\mnt\data", VOLUME, false)
+            .link(r"C:\mnt\data\share", r"\??\UNC\srv\s", false);
+        assert_eq!(fs.walk(r"C:\mnt\data\share\x.rs"), Walk::NotLocal);
+    }
+
+    #[test]
+    fn a_link_into_a_folder_inside_a_volume_is_refused() {
+        // The walk cannot see whether `sub` on that volume is a link itself.
+        let inside = format!("{VOLUME}sub");
+        for (target, relative) in [
+            (inside.as_str(), false),
+            (r"\??\Volume{1b2c3d4e-0000-0000-0000-10000000000}\", false),
+            (r"\??\Volume{1b2c3d4e-0000-0000-0000-10000000000g}\", false),
+            (r"\??\Volume{1b2c3d4e00000000000000001000000000000}\", false),
+            (r"\??\GLOBALROOT\Device\Mup\srv\s", false),
+            (r"Volume{1b2c3d4e-0000-0000-0000-100000000000}\", false),
+        ] {
+            let fs = Fs::new(&[r"C:\mnt"]).link(r"C:\mnt\data", target, relative);
+            assert_eq!(fs.walk(r"C:\mnt\data\a.txt"), Walk::NotLocal, "{target}");
+        }
     }
 
     #[test]
