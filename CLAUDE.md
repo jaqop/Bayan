@@ -43,7 +43,7 @@ selection and BiDi paths must do.
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-530 tests across the tree. `term.rs` (81), `link.rs` (61) and `render.rs` (64)
+534 tests across the tree. `term.rs` (81), `link.rs` (65) and `render.rs` (64)
 carry the most; `localpath.rs` has 21.
 
 ## Invariants — do not "simplify" these
@@ -144,9 +144,13 @@ match). It does not restore `session.json` and does not spawn
 `config.shell`. It does not load `~/.bayan/plugins`, does not inject oh-my-posh, and does
 not open the prompt picker. It does not use `config.json`'s `editor`
 template. `Code.exe` comes only from Program Files via
-`SHGetKnownFolderPath`. `pwsh.exe` is only
+`SHGetKnownFolderPath`. A missing editor is a reveal-only card: Enter runs
+`explorer.exe /select` and does not association-open. `explorer.exe` comes
+from `GetWindowsDirectoryW`, not `WINDIR`. A host card stores Browse or
+RevealOnly, so `HTTPS://` still opens in the browser. `pwsh.exe` is only
 `Program Files\PowerShell\7\pwsh.exe`. `save_state` does not write
-`session.json` while elevated. No environment block, registry value,
+`session.json` while elevated. A failed elevation query is treated as
+elevated. No environment block, registry value,
 pipe, or file carries the request. The jump list's admin task is
 `--elevated` with no profile.
 

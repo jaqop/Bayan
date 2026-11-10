@@ -33,7 +33,10 @@
 //! `Ctrl+click` on `path:line` looks for `Code.exe` only under Program Files
 //! and Program Files (x86), from `SHGetKnownFolderPath`, not from environment
 //! variables and not from `%LOCALAPPDATA%`. If that copy is absent, a confirm
-//! card shows the full path and Enter reveals it in Explorer.
+//! card shows the full path. Enter on that card runs `explorer.exe /select`
+//! and does not association-open the file. `explorer.exe` comes from
+//! `GetWindowsDirectoryW`, not from `WINDIR`. A host card stores `Browse`
+//! or `RevealOnly` when it is built, so `HTTPS://` still opens in the browser.
 //! `pwsh.exe` is started only as `Program Files\PowerShell\7\pwsh.exe`.
 //! `save_state` itself refuses to write when the token is elevated, so a
 //! rename or a group change cannot replace `session.json`.
@@ -208,9 +211,21 @@ fn checked_forward(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// `opened` is `OpenProcessToken` succeeding. `query_ok` is
+/// `GetTokenInformation` succeeding. `bit` is `TokenIsElevated`.
+/// A failed open or a failed query is elevated: the restrictions stay on
+/// when the token cannot be proved limited. The same reading as the
+/// sandboxed-config work.
+pub fn elevated_from_query(opened: bool, query_ok: bool, bit: bool) -> bool {
+    if !opened || !query_ok {
+        return true;
+    }
+    bit
+}
+
 /// True when this process token is elevated (UAC's high integrity token),
 /// not merely when the user is a member of Administrators. A failed query
-/// is treated as not elevated, so the only way up is the UAC prompt.
+/// is treated as elevated.
 pub fn process_is_elevated() -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::Security::{
@@ -225,7 +240,7 @@ pub fn process_is_elevated() -> bool {
     unsafe {
         let mut token = std::ptr::null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-            return false;
+            return elevated_from_query(false, false, false);
         }
         let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
         let mut written = 0u32;
@@ -237,7 +252,7 @@ pub fn process_is_elevated() -> bool {
             &mut written,
         );
         CloseHandle(token);
-        ok != 0 && elevation.TokenIsElevated != 0
+        elevated_from_query(true, ok != 0, elevation.TokenIsElevated != 0)
     }
 }
 
@@ -382,6 +397,15 @@ mod tests {
             "pwsh.exe"
         );
         assert!(!spawn_shell_command(true, None, &installed, planted).contains("payload"));
+    }
+
+    #[test]
+    fn a_failed_elevation_query_is_treated_as_elevated() {
+        assert!(elevated_from_query(false, false, false));
+        assert!(elevated_from_query(false, true, false));
+        assert!(elevated_from_query(true, false, false));
+        assert!(!elevated_from_query(true, true, false));
+        assert!(elevated_from_query(true, true, true));
     }
 
     #[test]

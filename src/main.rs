@@ -423,13 +423,14 @@ struct LinkHover {
     target: link::StatusParts,
 }
 
-/// A Ctrl+click that was refused, or a userinfo URL waiting for Enter.
-/// Esc dismisses either. Enter opens only when `confirm_uri` is set;
-/// a refusal leaves it empty so Enter cannot launch the target.
+/// A Ctrl+click that was refused, or a confirm card waiting for Enter.
+/// Esc dismisses either. Enter runs `confirm` when it is set. A refusal
+/// leaves it empty so Enter cannot launch the target. The variant is the
+/// action: Enter does not guess from the text.
 struct BlockedLink {
     reason: String,
     shown: String,
-    confirm_uri: Option<String>,
+    confirm: Option<link::ConfirmOpen>,
     is_app_error: bool,
 }
 
@@ -1854,7 +1855,7 @@ impl App {
             self.blocked_link = Some(BlockedLink {
                 reason: title.to_string(),
                 shown: body.to_string(),
-                confirm_uri: None,
+                confirm: None,
                 is_app_error: true,
             });
             self.request_redraw();
@@ -1964,7 +1965,7 @@ impl App {
                     self.blocked_link = Some(BlockedLink {
                         reason: title.to_string(),
                         shown: body.to_string(),
-                        confirm_uri: None,
+                        confirm: None,
                         is_app_error: true,
                     });
                 } else {
@@ -2142,7 +2143,7 @@ impl App {
                     self.blocked_link = Some(BlockedLink {
                         reason: tr("تعذر تشغيل الطرفية", "Could not start the shell").into(),
                         shown: link::preview(&command, 240),
-                        confirm_uri: None,
+                        confirm: None,
                         is_app_error: false,
                     });
                 }
@@ -2455,7 +2456,7 @@ impl App {
         self.blocked_link = Some(BlockedLink {
             reason: reason.to_string(),
             shown: link::preview_with(detail, 240, |c| c != '\n' && link::is_forbidden(c)),
-            confirm_uri: None,
+            confirm: None,
             is_app_error: true,
         });
         self.request_redraw();
@@ -2474,7 +2475,7 @@ impl App {
             self.blocked_link = Some(BlockedLink {
                 reason: title.to_string(),
                 shown: body.to_string(),
-                confirm_uri: None,
+                confirm: None,
                 is_app_error: true,
             });
         }
@@ -3997,7 +3998,7 @@ impl App {
                 self.blocked_link = Some(BlockedLink {
                     reason: link::host_confirm().to_string(),
                     shown: link::confirm_card_shown(&host, &uri),
-                    confirm_uri: Some(uri),
+                    confirm: Some(link::confirm_open_from_uri(&uri)),
                     is_app_error: false,
                 });
                 self.clear_link_hover();
@@ -4034,10 +4035,17 @@ impl App {
                 link::init_link_thread();
                 let action = link::settle_live(action, elevated);
                 if let link::Action::Confirm { uri, host } = &action {
-                    if !uri.starts_with("http://") && !uri.starts_with("https://") {
+                    if link::is_browser_uri(uri) {
+                        if !link::perform_open(&link::Action::Browse(uri.clone())) {
+                            let _ = proxy.send_event(UserEvent::LinkFailed {
+                                reason: link::RefuseReason::Editor.label().to_string(),
+                                shown: uri.clone(),
+                            });
+                        }
+                    } else {
                         let _ = proxy.send_event(UserEvent::LinkConfirm { path: host.clone() });
-                        return;
                     }
+                    return;
                 }
                 if let link::Action::Refuse { reason, shown } = &action {
                     let _ = proxy.send_event(UserEvent::LinkFailed {
@@ -4058,11 +4066,33 @@ impl App {
         }
     }
 
+    /// Explorer `/select` for a reveal-only card. This does not call
+    /// `settle`: an allowlisted extension would become an association open.
+    fn spawn_reveal_only(&mut self, path: &str) {
+        let path = path.to_string();
+        let proxy = self.proxy.clone();
+        let owned = path.clone();
+        let spawned = std::thread::Builder::new()
+            .name("bayan-link".into())
+            .spawn(move || {
+                link::init_link_thread();
+                if link::spawn_reveal(&owned).is_err() {
+                    let _ = proxy.send_event(UserEvent::LinkFailed {
+                        reason: link::RefuseReason::Editor.label().to_string(),
+                        shown: owned,
+                    });
+                }
+            });
+        if spawned.is_err() {
+            self.refuse_link(link::RefuseReason::Editor, &path);
+        }
+    }
+
     fn refuse_link(&mut self, reason: link::RefuseReason, shown: &str) {
         self.blocked_link = Some(BlockedLink {
             reason: reason.label().to_string(),
             shown: link::preview(shown, 160),
-            confirm_uri: None,
+            confirm: None,
             is_app_error: false,
         });
         self.clear_link_hover();
@@ -4886,7 +4916,7 @@ impl App {
                             px.height as usize,
                             &block.reason,
                             &block.shown,
-                            block.confirm_uri.is_some(),
+                            block.confirm.is_some(),
                         );
                     }
                 }
@@ -5365,7 +5395,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.blocked_link = Some(BlockedLink {
                     reason,
                     shown: link::preview(&shown, 160),
-                    confirm_uri: None,
+                    confirm: None,
                     is_app_error: false,
                 });
                 self.clear_link_hover();
@@ -5379,7 +5409,7 @@ impl ApplicationHandler<UserEvent> for App {
                     )
                     .to_string(),
                     shown: path.clone(),
-                    confirm_uri: Some(path),
+                    confirm: Some(link::ConfirmOpen::RevealOnly(path)),
                     is_app_error: false,
                 });
                 self.clear_link_hover();
@@ -5657,8 +5687,9 @@ fn dispatch() -> Result<(), String> {
             let requested = launch.elevated;
             // The badge follows the token, including a window Explorer
             // started with "Run as administrator" and no `--elevated`.
-            // Only the flag relaunches. The token still refuses session.json
-            // and config.json's shell, which a standard user can write.
+            // A failed token query counts as elevated, so the restrictions
+            // stay on. Only the flag relaunches, and only when the query
+            // succeeds and says this process is not elevated.
             let elevated = requested || elevate::process_is_elevated();
             // `--elevated` relaunches through UAC unless this process is
             // already the elevated one. The child receives only the
@@ -7282,7 +7313,7 @@ mod m38_tests {
         app.blocked_link = Some(BlockedLink {
             reason: "load".into(),
             shown: "config.json is unreadable".into(),
-            confirm_uri: None,
+            confirm: None,
             is_app_error: true,
         });
         app.apply_admin_notice();

@@ -143,8 +143,9 @@ pub enum Action {
     /// Only an allowlisted document or media extension, after `settle`
     /// has expanded an 8.3 name and re-checked the long path.
     OpenPath(String),
-    /// `%WINDIR%\explorer.exe` with `/select,"<path>"` passed via
-    /// `CommandExt::raw_arg`. Not an association open.
+    /// `GetWindowsDirectoryW()\explorer.exe` with `/select,"<path>"` passed
+    /// via `CommandExt::raw_arg`. Not an association open. `WINDIR` is not
+    /// read: a standard user can set it in `HKCU\Environment`.
     Reveal(String),
     /// `Command::new(argv[0]).args(&argv[1..])`. No association fallback:
     /// a spawn failure is reported, and the file is not opened by its type.
@@ -1800,11 +1801,54 @@ pub fn init_link_thread() {
     }
 }
 
-/// Absolute `explorer.exe`. `WINDIR` is used only when it is a local drive
-/// path whose last component is `Windows`. Otherwise `C:\Windows\explorer.exe`.
-pub fn explorer_from_windir(windir: Option<&str>) -> String {
+/// What Enter does with a confirm card. Chosen when the card is built.
+/// Enter does not look at the link text again: `HTTPS://` is still a
+/// browser URI, and a missing-editor path is never reclassified.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfirmOpen {
+    /// `ShellExecuteW` of this URI. The scheme was already accepted.
+    Browse(String),
+    /// `explorer.exe /select` only. The caller must not pass this through
+    /// [`settle`]: that would turn `config.json` into an association open.
+    RevealOnly(String),
+}
+
+/// `http` or `https`, in any case. `plan_uri` keeps the scheme as written.
+pub fn is_browser_uri(uri: &str) -> bool {
+    scheme_name(uri).is_some_and(|scheme| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    })
+}
+
+/// A host-confirm card. A browser URI is stored as [`ConfirmOpen::Browse`]
+/// so Enter does not match the scheme again. Anything else is reveal-only.
+pub fn confirm_open_from_uri(uri: &str) -> ConfirmOpen {
+    if is_browser_uri(uri) {
+        ConfirmOpen::Browse(uri.to_string())
+    } else {
+        ConfirmOpen::RevealOnly(uri.to_string())
+    }
+}
+
+/// The action Enter performs. [`ConfirmOpen::RevealOnly`] stays `Reveal`.
+pub fn confirm_enter(open: &ConfirmOpen) -> Action {
+    match open {
+        ConfirmOpen::Browse(uri) => Action::Browse(uri.clone()),
+        ConfirmOpen::RevealOnly(path) => Action::Reveal(path.clone()),
+    }
+}
+
+/// Whether Enter's action may go through [`settle`]. Reveal-only must not.
+pub fn confirm_enter_settles(open: &ConfirmOpen) -> bool {
+    matches!(open, ConfirmOpen::Browse(_))
+}
+
+/// `explorer.exe` under `windows_dir`. That directory is the result of
+/// `GetWindowsDirectoryW`, never `WINDIR`. A path that is not a local
+/// directory named `Windows` falls back to `C:\Windows\explorer.exe`.
+pub fn explorer_exe(windows_dir: Option<&str>) -> String {
     const FALLBACK: &str = r"C:\Windows\explorer.exe";
-    let Some(dir) = windir.map(str::trim).filter(|s| !s.is_empty()) else {
+    let Some(dir) = windows_dir.map(str::trim).filter(|s| !s.is_empty()) else {
         return FALLBACK.to_string();
     };
     let Some(norm) = crate::term::accept_local_cwd(dir) else {
@@ -1818,8 +1862,34 @@ pub fn explorer_from_windir(windir: Option<&str>) -> String {
     }
 }
 
+/// Absolute `explorer.exe` from `GetWindowsDirectoryW`. `WINDIR` is not
+/// read. A failed call uses `C:\Windows\explorer.exe`.
 pub fn explorer_program() -> String {
-    explorer_from_windir(std::env::var("WINDIR").ok().as_deref())
+    explorer_exe(windows_directory().as_deref())
+}
+
+#[cfg(windows)]
+fn windows_directory() -> Option<String> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
+    let mut buf = [0u16; 260];
+    // SAFETY: the length passed is `buf`'s own, so the write stays inside it.
+    // Zero, or a length that does not fit, falls back to `C:\Windows`
+    // instead of reading `WINDIR`.
+    let n = unsafe { GetWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
+    if n == 0 || n as usize >= buf.len() {
+        return None;
+    }
+    Some(
+        std::ffi::OsString::from_wide(&buf[..n as usize])
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+#[cfg(not(windows))]
+fn windows_directory() -> Option<String> {
+    None
 }
 
 /// One raw argument: `/select,"<path>"`. The path has already rejected
@@ -3736,7 +3806,7 @@ mod tests {
                     Action::Reveal(path) => {
                         assert_eq!(path, bat);
                         assert_eq!(select_arg(&path), format!(r#"/select,"{path}""#));
-                        let prog = explorer_from_windir(Some(r"C:\Windows"));
+                        let prog = explorer_exe(Some(r"C:\Windows"));
                         assert_eq!(prog, r"C:\Windows\explorer.exe");
                         assert!(!prog.to_ascii_lowercase().contains("cmd"));
                         assert!(!select_arg(&path).contains("/c"));
@@ -4340,30 +4410,80 @@ mod tests {
             Some(r"C:\b")
         );
         assert_eq!(
-            explorer_from_windir(Some(r"C:\Windows")),
+            explorer_exe(Some(r"C:\Windows")),
+            r"C:\Windows\explorer.exe"
+        );
+        assert_eq!(explorer_exe(Some(r"C:\evil")), r"C:\Windows\explorer.exe");
+        assert_eq!(
+            explorer_exe(Some(r"\\evil\share")),
             r"C:\Windows\explorer.exe"
         );
         assert_eq!(
-            explorer_from_windir(Some(r"D:\Windows")),
-            r"D:\Windows\explorer.exe"
-        );
-        assert_eq!(
-            explorer_from_windir(Some(r"C:\evil")),
+            explorer_exe(Some(r"C:\Windows\..\evil")),
             r"C:\Windows\explorer.exe"
         );
-        assert_eq!(
-            explorer_from_windir(Some(r"\\evil\share")),
-            r"C:\Windows\explorer.exe"
-        );
-        assert_eq!(
-            explorer_from_windir(Some(r"C:\Windows\..\evil")),
-            r"C:\Windows\explorer.exe"
-        );
-        assert_eq!(explorer_from_windir(None), r"C:\Windows\explorer.exe");
+        assert_eq!(explorer_exe(None), r"C:\Windows\explorer.exe");
         assert_eq!(select_arg(r"C:\qa\note.txt"), r#"/select,"C:\qa\note.txt""#);
-        let prog = explorer_from_windir(Some(r"C:\Windows"));
+        let prog = explorer_exe(Some(r"C:\Windows"));
         assert!(prog.to_ascii_lowercase().ends_with(r"\explorer.exe"));
         assert!(!prog.to_ascii_lowercase().contains("cmd"));
+    }
+
+    #[test]
+    fn enter_on_an_uppercase_scheme_opens_the_browser() {
+        let uri = "HTTPS://u@host/";
+        // The old Enter check was case-sensitive and would reveal this.
+        assert!(!uri.starts_with("https://"));
+        assert!(!uri.starts_with("http://"));
+        let open = confirm_open_from_uri(uri);
+        assert_eq!(open, ConfirmOpen::Browse(uri.to_string()));
+        assert_eq!(confirm_enter(&open), Action::Browse(uri.to_string()));
+        assert!(confirm_enter_settles(&open));
+    }
+
+    #[test]
+    fn enter_on_an_elevated_missing_editor_only_reveals() {
+        let path = r"C:\Users\me\.bayan\config.json";
+        let open = ConfirmOpen::RevealOnly(path.to_string());
+        assert_eq!(confirm_enter(&open), Action::Reveal(path.to_string()));
+        assert!(
+            !confirm_enter_settles(&open),
+            "Enter must not send this card through settle"
+        );
+        let reclassified = settle(
+            Action::Reveal(path.to_string()),
+            |_| true,
+            |p: &str| Some(p.to_string()),
+            || None,
+        );
+        assert!(
+            matches!(reclassified, Action::OpenPath(ref got) if got == path),
+            "settle would association-open the json file"
+        );
+    }
+
+    #[test]
+    fn a_planted_windir_does_not_choose_explorer() {
+        let root = std::env::temp_dir().join(format!("bayan-windir-{}", std::process::id()));
+        let windows = root.join("Windows");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&windows).unwrap();
+        let planted = windows.display().to_string();
+        let previous = std::env::var_os("WINDIR");
+        std::env::set_var("WINDIR", &windows);
+        let got = explorer_program();
+        match &previous {
+            Some(value) => std::env::set_var("WINDIR", value),
+            None => std::env::remove_var("WINDIR"),
+        }
+        let planted_exe = format!(r"{planted}\explorer.exe");
+        assert_ne!(
+            got, planted_exe,
+            "WINDIR is user-writable and must not choose explorer.exe"
+        );
+        assert!(got.to_ascii_lowercase().ends_with(r"\explorer.exe"));
+        assert!(!got.to_ascii_lowercase().contains("users"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

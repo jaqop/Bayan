@@ -1049,7 +1049,11 @@ window, so it neither runs `oh-my-posh.exe` nor rewrites `$PROFILE`. It does
 not use `config.json`'s `editor` command. Ctrl+click looks for `Code.exe`
 only under Program Files and Program Files (x86), from the known-folder
 API, not from `PATH` or `%LOCALAPPDATA%`. If that copy is missing, a confirm
-card shows the full path. `pwsh.exe` is started only from
+card shows the full path. Enter on that card reveals the file in Explorer
+and does not open it by its file association. `explorer.exe` comes from
+`GetWindowsDirectoryW`, not from `WINDIR`. A host card remembers whether
+Enter browses or reveals, so `HTTPS://` still opens in the browser.
+`pwsh.exe` is started only from
 `Program Files\PowerShell\7`. `save_state` does not write `session.json`
 when the token is elevated, including a rename or a group change, and a
 settings change is not written either. The jump-list stamp is not written.
