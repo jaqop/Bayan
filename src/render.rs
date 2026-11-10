@@ -2640,17 +2640,29 @@ impl Renderer {
                 mapped_cursor = Some(fit_past_end_cursor(x, width, rtl, &letters));
             }
         }
-        // A block on a letter covers that glyph's ink. Cairo joins outside
-        // the pen slot, so the advance box misses the cluster and overlaps
-        // the next letter. The cell past the text is unchanged: on
-        // 22bc5d66 that cursor already sits at the logical end.
+        // A block on a letter covers that glyph's ink when the ink still
+        // sits on the advance box. Cairo joins outside the pen slot, so the
+        // advance misses the cluster. A face that draws «ا» in «لا» with no
+        // bitmap of its own puts that ink on the lam; keeping the advance
+        // there leaves the empty half on the correct side. The cell past
+        // the text is unchanged: on 22bc5d66 that cursor already sits at
+        // the logical end.
         if !claude {
             if let Some(col) = cursor_col.filter(|col| *col < text_end_col) {
                 if let Some(&(_, b0, b1)) = cell_bytes.iter().find(|cell| cell.0 == col) {
                     if let Some((x, w)) = self.ink_cursor_box(&key, b0, b1) {
                         let left = text_x0 + (x * scale).round() as i32;
                         let iw = ((w * scale).round() as i32).max(2);
-                        mapped_cursor = Some((left, iw));
+                        // The ink has to cover the middle of the advance. A
+                        // zero-width alef's bitmap can sit on the lam, a pixel
+                        // to the right, and must not replace the half-box.
+                        let on_the_advance = mapped_cursor.is_none_or(|(ax, aw)| {
+                            let mid = ax + aw / 2;
+                            left <= mid && mid < left + iw
+                        });
+                        if on_the_advance {
+                            mapped_cursor = Some((left, iw));
+                        }
                     }
                 }
             }
