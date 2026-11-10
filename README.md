@@ -890,17 +890,23 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       New output is a polite live region, held for 500ms and then spoken as
       one tail, so `cargo build` is not a line-by-line flood. An OSC 133
       finish replaces that tail with one sentence that includes the exit
-      code. Tabs, panes, the command palette, the right-click menu and the
+      code. AccessKit raises LiveRegionChanged only when the name string
+      changes, so the same sentence twice in a row (two commands finishing
+      alike) toggles a trailing space to be spoken again. Tabs, panes, the
+      command palette, the right-click menu and the
       confirm cards have names and roles in the UI language (Arabic by
       default). Focus follows the active pane, and a card or the palette
       takes it while it is open. The shaping path is unchanged. Proven by
-      8 tests (a mixed Arabic+Latin line stays in storage order, including
+      9 tests (a mixed Arabic+Latin line stays in storage order, including
       off a real `Term`; the caret column, including a wide glyph; the
-      selection range; flood coalescing; the exit-code sentence; Arabic
+      selection range; flood coalescing; the exit-code sentence; a repeated
+      sentence re-firing; Arabic
       names and roles for tabs, panes, the palette and a confirm card;
       focus following the active pane). Not verified on a machine: NVDA,
       JAWS or Narrator actually speaking a running Bayan. Character boxes
-      for a magnifier's caret highlight are not provided.
+      for a magnifier's caret highlight are not provided, and a reader
+      cannot move the selection: the document does not advertise
+      SetTextSelection because nothing handles it.
 
 ## Settings
 

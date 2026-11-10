@@ -3708,7 +3708,8 @@ impl App {
                 self.a11y_bodies.clone()
             };
         if let Some(live) = update.live.clone() {
-            self.a11y_live = Some(live);
+            let on_screen = self.a11y_live.as_deref().unwrap_or(a11y::live_name());
+            self.a11y_live = Some(a11y::live_label(on_screen, live));
         }
         let palette = self.palette.as_ref().map(|p| {
             let menu = p.menu.is_some();

@@ -17,7 +17,7 @@
 //! 133 finish replaces that tail with a single exit-code sentence.
 
 use accesskit::{
-    Action, Live, Node, NodeId, Role, TextDirection, TextPosition, TextSelection, TreeId, TreeInfo,
+    Live, Node, NodeId, Role, TextDirection, TextPosition, TextSelection, TreeId, TreeInfo,
     TreeUpdate,
 };
 use alacritty_terminal::event::EventListener;
@@ -97,6 +97,17 @@ pub fn menu_name() -> &'static str {
 
 pub fn live_name() -> &'static str {
     tr("المخرجات الجديدة", "New output")
+}
+
+/// The live-region label that announces `next` after `on_screen`. AccessKit
+/// raises UIA LiveRegionChanged only when the name string differs, so a
+/// repeat gets a trailing ASCII space: unspoken, and unlike U+200B it is
+/// not printed as an escape by braille tables.
+pub fn live_label(on_screen: &str, mut next: String) -> String {
+    if next == on_screen {
+        next.push(' ');
+    }
+    next
 }
 
 pub fn paste_dialog_name() -> &'static str {
@@ -672,7 +683,8 @@ fn pane_nodes(tab: usize, pane: &PaneItem) -> Vec<(NodeId, Node)> {
     let mut doc = Node::new(Role::Document);
     doc.set_label(pane.name.clone());
     doc.set_children(children.clone());
-    doc.add_action(Action::SetTextSelection);
+    // No SetTextSelection: ActionRequested does not handle it, so a reader
+    // must not be told it can move the selection.
     doc.set_font_family("monospace");
     if let Some((anchor, focus)) = text_selection(tab, pane) {
         doc.set_text_selection(TextSelection { anchor, focus });
@@ -1081,6 +1093,30 @@ mod tests {
         assert!(failed.contains("رمز الخروج 2"), "{failed}");
     }
 
+    /// Two commands that finish the same way produce the same sentence. The
+    /// second must still change the live region's name, or UIA stays silent.
+    #[test]
+    fn a_repeated_finish_sentence_changes_the_live_label() {
+        let _lang = with_lang(Lang::Ar);
+        let mut gate = OutputGate::default();
+        let lines = vec!["ready".to_string()];
+        gate.push(&lines, 0);
+        let mut on_screen = live_name().to_string();
+        let mut labels = Vec::new();
+        for t in [10, 20, 30] {
+            gate.command_finished(Some(0), "cargo build", t);
+            let live = gate.push(&lines, t).live.expect("each finish announces");
+            on_screen = live_label(&on_screen, live);
+            labels.push(on_screen.clone());
+        }
+        assert_ne!(labels[0], labels[1], "the repeat must re-fire");
+        assert_ne!(labels[1], labels[2], "and so must the one after it");
+        assert_eq!(labels[0].trim_end(), labels[1].trim_end());
+        assert!(labels.iter().all(|l| !l.contains('\u{200b}')));
+        // A different sentence goes through untouched.
+        assert_eq!(live_label(&on_screen, "other".into()), "other");
+    }
+
     #[test]
     fn tabs_and_panes_have_arabic_names_and_roles() {
         let _lang = with_lang(Lang::Ar);
@@ -1137,6 +1173,10 @@ mod tests {
         let pane = find(&tree, pane_node(0, 1));
         assert_eq!(pane.role(), Role::Document);
         assert_eq!(pane.label(), Some("اللوحة 2"));
+        assert!(
+            !pane.supports_action(accesskit::Action::SetTextSelection),
+            "ActionRequested does not handle it, so it is not advertised"
+        );
         assert_eq!(find(&tree, pane_node(0, 0)).label(), Some("اللوحة 1"));
         let live = find(&tree, ID_LIVE);
         assert_eq!(live.role(), Role::Log);
