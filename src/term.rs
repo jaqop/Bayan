@@ -2198,7 +2198,7 @@ fn text_area_reply(
     area: Option<WindowSize>,
     format: &(dyn Fn(WindowSize) -> String + Sync + Send),
 ) -> Option<String> {
-    area.map(|size| format(size))
+    area.map(format)
 }
 
 /// Bytes to write for an OSC 52 read, or nothing.
@@ -2219,12 +2219,6 @@ pub(crate) fn clipboard_load_reply(read_enabled: bool) -> Option<String> {
 /// are written. `None` drops the event.
 fn prepare_event(pane: u64, event: Event) -> Option<Event> {
     match event {
-        Event::ColorRequest(index, format) => {
-            let colors = QUERY_COLORS
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            color_reply(colors.as_ref(), index, &*format).map(Event::PtyWrite)
-        }
         Event::TextAreaSizeRequest(format) => {
             text_area_reply(text_area_for(pane), &*format).map(Event::PtyWrite)
         }
@@ -2235,7 +2229,12 @@ fn prepare_event(pane: u64, event: Event) -> Option<Event> {
                 None => Some(Event::ClipboardLoad(kind, format)),
             }
         }
-        other => Some(other),
+        other => {
+            let colors = QUERY_COLORS
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            answer_color_query(other, colors.as_ref())
+        }
     }
 }
 
@@ -4840,7 +4839,7 @@ mod tests {
         struct Live(Arc<Mutex<QueryColors>>, Arc<Mutex<Vec<String>>>);
         impl EventListener for Live {
             fn send_event(&self, event: Event) {
-                let colors = self.0.lock_or_recover().clone();
+                let colors = *self.0.lock_or_recover();
                 if let Some(Event::PtyWrite(text)) = answer_color_query(event, Some(&colors)) {
                     self.1.lock_or_recover().push(text);
                 }
