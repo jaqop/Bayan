@@ -13,6 +13,15 @@
 //! process looks the name up in its own shell detection. It does not read
 //! a command line out of the argument, and this module does not write the
 //! request to the environment, the registry, a pipe, or a file.
+//!
+//! `~/.bayan` is writable by the same user before UAC. An elevated window
+//! does not load `plugins/` (a plugin `send` would reach the shell after the
+//! confirm card) and does not use `config.json`'s `editor` template (that
+//! string is a program to spawn). `session.json` is not restored and
+//! `config.json`'s `shell` is not what new tabs run. Keybindings in
+//! `config.json` only remap fixed actions; they have no send or command
+//! string. There is no snippets file. Theme colours and font names do not
+//! run anything. `jumplist.stamp` is compared, never executed.
 
 use std::path::Path;
 
@@ -31,6 +40,16 @@ pub fn window_title(elevated: bool) -> String {
         )
     } else {
         "Bayan — بيان".to_string()
+    }
+}
+
+/// `config.json`'s editor template, or nothing when this window is elevated.
+/// The template is a program argv. The built-in `code.exe` lookup stays.
+pub fn configured_editor(elevated: bool, editor: Option<&str>) -> Option<&str> {
+    if elevated {
+        None
+    } else {
+        editor.map(str::trim).filter(|s| !s.is_empty())
     }
 }
 
@@ -257,6 +276,20 @@ mod tests {
         let mut launch = launch(Some("PowerShell"), None, None);
         launch.elevated = false;
         assert!(forward_args(&launch).is_err());
+    }
+
+    #[test]
+    fn an_elevated_window_does_not_keep_a_configured_editor_command() {
+        assert_eq!(
+            configured_editor(true, Some(r"C:\Users\me\planted.exe {file}")),
+            None
+        );
+        assert_eq!(configured_editor(true, Some("   ")), None);
+        assert_eq!(
+            configured_editor(false, Some("code -g {file}:{line}")),
+            Some("code -g {file}:{line}")
+        );
+        assert_eq!(configured_editor(false, None), None);
     }
 
     #[test]

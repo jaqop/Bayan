@@ -43,7 +43,7 @@ selection and BiDi paths must do.
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-521 tests across the tree. `term.rs` (81), `link.rs` (61) and `render.rs` (64)
+523 tests across the tree. `term.rs` (81), `link.rs` (61) and `render.rs` (64)
 carry the most; `localpath.rs` has 21.
 
 ## Invariants — do not "simplify" these
@@ -141,8 +141,10 @@ only transparency available on this path.
 `--elevated` and, if a profile was named, `-p <name>` only. It resolves
 that name with `shells::find_profile_by_name` (the stored command does not
 match). It does not restore `session.json` and does not spawn
-`config.shell`. No environment block, registry value, pipe, or file carries
-the request. The jump list's admin task is `--elevated` with no profile.
+`config.shell`. It does not load `~/.bayan/plugins` and does not use
+`config.json`'s `editor` template. No environment block, registry value,
+pipe, or file carries the request. The jump list's admin task is
+`--elevated` with no profile.
 
 **Start-directory precedence, in order:** a restored session's saved cwd, then
 the launcher's directory (a shortcut's "Start in"), then `USERPROFILE`. The

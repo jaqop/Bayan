@@ -3913,7 +3913,10 @@ impl App {
         let cwd = self.pane_link_cwd(id);
         // `exists` and `find_code_exe` run on the link thread. A disconnected
         // network drive must not stall this handler.
-        match span.activate(cwd.as_deref(), self.config.editor.as_deref()) {
+        match span.activate(
+            cwd.as_deref(),
+            elevate::configured_editor(self.elevated, self.config.editor.as_deref()),
+        ) {
             action @ (link::Action::Browse(_)
             | link::Action::OpenPath(_)
             | link::Action::Reveal(_)
@@ -5690,8 +5693,10 @@ fn run(startup: Startup) -> Result<(), String> {
         cfg.arabic_font = v.to_str().map(str::to_string);
     }
     // plugins load once, before the first renderer, so a plugin theme named in
-    // the config resolves on the very first frame
-    let plug = plugins::init(&cfg.disabled_plugins());
+    // the config resolves on the very first frame. An elevated token loads
+    // none: ~/.bayan/plugins is writable before UAC, and a send would reach
+    // the elevated shell after the confirm card.
+    let plug = plugins::init(startup.elevated, &cfg.disabled_plugins());
     if !plug.failed.is_empty() {
         eprintln!(
             "bayan: {} plugin(s) failed — see {}",

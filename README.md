@@ -1042,7 +1042,11 @@ It does not restore `session.json` and it does not start `config.json`'s
 `shell` value, because both are files a standard user can write. The window
 title and the tab strip show **مسؤول** while the token is elevated. Cancelling
 UAC does not open a window. Bayan does not elevate on its own, and the
-executable manifest stays `asInvoker`.
+executable manifest stays `asInvoker`. An elevated window, including one
+Explorer started with Run as administrator, does not load `~/.bayan/plugins`
+and does not use `config.json`'s `editor` command. Keybindings there only
+remap fixed actions (there is no send string), theme colours do not run
+anything, and there is no snippets file.
 
 `"terminal_handoff": true` (absent means off; the same switches are
 `--register-terminal-handoff` and `--unregister-terminal-handoff`) registers
