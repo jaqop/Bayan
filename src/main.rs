@@ -20,6 +20,7 @@ mod keyroute;
 mod keys;
 mod kitty;
 mod lang;
+mod latency;
 mod layout;
 mod link;
 mod localpath;
@@ -320,8 +321,51 @@ mod prof {
     }
 
     /// Whether marks are being recorded; lets a caller skip building one.
+    /// Read once: the reader thread asks on every PTY read.
     pub fn on() -> bool {
-        super::dev_hook("BAYAN_PROFILE").is_some()
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| super::dev_hook("BAYAN_PROFILE").is_some())
+    }
+
+    static LATENCY: std::sync::Mutex<crate::latency::Latency> =
+        std::sync::Mutex::new(crate::latency::Latency::new());
+
+    fn latency() -> std::sync::MutexGuard<'static, crate::latency::Latency> {
+        LATENCY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A key's bytes reached the focused pane; `arrived` is when winit
+    /// delivered the key. Nothing about the key itself is recorded.
+    pub fn key_sent(arrived: Instant) {
+        if on() {
+            latency().key_sent(arrived);
+        }
+    }
+
+    /// A PTY read returned (any pane).
+    pub fn output_read() {
+        if on() {
+            latency().output_read(Instant::now());
+        }
+    }
+
+    /// A frame went to the GPU.
+    pub fn frame_presented() {
+        if !on() {
+            return;
+        }
+        let mut l = latency();
+        if let Some(s) = l.frame_presented(Instant::now()) {
+            mark(&format!(
+                "latency key->pty-output {:.1} ms, key->frame {:.1} ms",
+                s.to_output_ms, s.to_frame_ms
+            ));
+            if let Some(summary) = l.summary() {
+                mark(&summary);
+            }
+        }
     }
 
     pub fn mark(label: &str) {
@@ -4872,6 +4916,7 @@ impl App {
             }
             return;
         }
+        crate::prof::frame_presented();
         self.last_frame.clear();
         self.last_frame.extend_from_slice(frame_bytes);
         self.last_frame_size = Some(px);
