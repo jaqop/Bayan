@@ -119,13 +119,36 @@ pub(crate) fn ime_swallows_key(composing: bool, key: &Key) -> bool {
     composing || is_ime_process_key(key)
 }
 
+/// A window event that may rebuild the IME context.
+///
+/// `ImeEnabled` is `WindowEvent::Ime(Ime::Enabled)`. `FocusGained` is
+/// `WindowEvent::Focused(true)`, handled in `input::focus_changed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CursorAreaEvent {
+    ImeEnabled,
+    ImePreedit,
+    ImeCommit,
+    ImeDisabled,
+    FocusGained,
+    FocusLost,
+}
+
+/// Windows drops the composition window on these two events, so the
+/// cursor box has to be sent again even when it has not moved
+/// (winit#2569). Every other IME phase and a focus loss leave it.
+pub(crate) fn cursor_area_reset(event: CursorAreaEvent) -> bool {
+    matches!(
+        event,
+        CursorAreaEvent::ImeEnabled | CursorAreaEvent::FocusGained
+    )
+}
+
 /// The rectangle to pass to `set_ime_cursor_area`, if a call is due.
 ///
-/// An unchanged box is not sent again. Windows drops the composition
-/// window when the IME context is rebuilt (`Ime::Enabled`, or the window
-/// focused again — winit#2569), so `reset` forces that same box out
-/// again. `None` current means there is no cell to anchor yet; the
-/// caller keeps `reset` set.
+/// An unchanged box is not sent again. `reset` comes from
+/// [`cursor_area_reset`]: `Ime::Enabled` and a focus return both set it.
+/// `None` current means there is no cell to anchor yet; the caller keeps
+/// `reset` set.
 pub(crate) fn ime_area_due(
     last_sent: Option<ImeSpot>,
     current: Option<ImeSpot>,
@@ -247,7 +270,11 @@ impl App {
             // The IME context was just (re)built. Windows has forgotten
             // the composition window, so the same cursor box has to be
             // sent again (winit#2569).
-            Ime::Enabled => self.ime_area_reset = true,
+            Ime::Enabled => {
+                if cursor_area_reset(CursorAreaEvent::ImeEnabled) {
+                    self.ime_area_reset = true;
+                }
+            }
             Ime::Commit(text) => {
                 self.set_preedit(None);
                 match commit_target(key_owner(&self.open_overlays())) {
@@ -721,6 +748,39 @@ mod tests {
         assert_eq!(ime_area_due(None, Some(spot), false), Some(spot));
         // nothing to anchor yet: the caller keeps the reset flag
         assert_eq!(ime_area_due(Some(spot), None, true), None);
+    }
+
+    /// Both context rebuilds ask for the candidate window again, and the
+    /// other IME phases and a blur do not. The handlers call
+    /// `cursor_area_reset` with these same variants: `Ime::Enabled` in
+    /// `ime_input`, and `Focused(true)` in `input::focus_changed`.
+    #[test]
+    fn ime_enabled_and_focus_regained_both_resend_the_cursor_area() {
+        let spot = (12, 48, 9, 18);
+        // already on screen, and the cell has not moved
+        assert_eq!(ime_area_due(Some(spot), Some(spot), false), None);
+        for event in [CursorAreaEvent::ImeEnabled, CursorAreaEvent::FocusGained] {
+            assert!(
+                cursor_area_reset(event),
+                "{event:?} rebuilds the IME context"
+            );
+            assert_eq!(
+                ime_area_due(Some(spot), Some(spot), cursor_area_reset(event)),
+                Some(spot),
+                "{event:?} re-sends the same cursor box"
+            );
+        }
+        for event in [
+            CursorAreaEvent::ImePreedit,
+            CursorAreaEvent::ImeCommit,
+            CursorAreaEvent::ImeDisabled,
+            CursorAreaEvent::FocusLost,
+        ] {
+            assert!(
+                !cursor_area_reset(event),
+                "{event:?} must leave the candidate window where it is"
+            );
+        }
     }
 
     #[test]
