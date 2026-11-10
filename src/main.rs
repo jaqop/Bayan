@@ -11,6 +11,7 @@ mod bidi;
 mod bidi_ctl;
 mod chrome;
 mod config;
+mod config_watch;
 mod copymode;
 mod gpu;
 mod groups;
@@ -400,6 +401,17 @@ pub enum UserEvent {
         reason: String,
         shown: String,
     },
+    /// `config.json` changed on disk (or failed to parse). Never a panel save.
+    ConfigReloaded(config_watch::ReloadMsg),
+}
+
+/// A one-line notice for a config reload. A parse error stays until the file
+/// is valid. A "takes effect later" line expires on its own. Neither blocks
+/// the terminal.
+#[derive(Clone)]
+struct ConfigNotice {
+    text: String,
+    until: Option<Instant>,
 }
 
 /// The link under the pointer. Stable while the pointer stays inside it,
@@ -1496,6 +1508,10 @@ struct App {
     debug_paste: Option<String>,
     /// `--cwd`'s folder, already gated, until the first tab opens in it.
     start_dir: Option<String>,
+    /// Watches config.json. A panel save tells it to ignore that write.
+    config_watch: config_watch::ConfigWatcher,
+    /// Parse error, or the list of settings that wait for a new pane.
+    config_notice: Option<ConfigNotice>,
 }
 
 impl App {
@@ -2414,11 +2430,74 @@ impl App {
             self.report_config_load_error();
             return;
         }
-        if let Err(error) = config::save(&self.config) {
+        let bytes = match config::encode(&self.config) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.report_error(
+                    tr("تعذر حفظ الإعدادات", "Could not save settings"),
+                    &error.to_string(),
+                );
+                return;
+            }
+        };
+        // Arm the watcher before the rename, so the event that rename
+        // produces is recognized as ours and not loaded back.
+        self.config_watch.note_self_write(&bytes);
+        if let Err(error) = config::write_bytes(&bytes) {
+            self.config_watch.finish_self_write(false);
             self.report_error(
                 tr("تعذر حفظ الإعدادات", "Could not save settings"),
                 &error.to_string(),
             );
+        } else {
+            self.config_watch.finish_self_write(true);
+        }
+    }
+
+    /// Apply a config.json change that did not come from the settings panel.
+    /// A bad file leaves `self.config` as it was. Font and color changes
+    /// rebuild the renderer; when that renderer arrives, `relayout_active`
+    /// resizes every PTY to the new cell size. Padding alone resizes with
+    /// the metrics already on screen.
+    fn apply_config_reload(&mut self, msg: config_watch::ReloadMsg) {
+        match msg {
+            config_watch::ReloadMsg::Rejected { error } => {
+                self.config_load_error = Some(error.clone());
+                self.config_notice = Some(ConfigNotice {
+                    text: config_watch::parse_error_notice(&error),
+                    until: None,
+                });
+                self.request_redraw();
+            }
+            config_watch::ReloadMsg::Applied {
+                config,
+                plan,
+                deferred,
+            } => {
+                self.config_load_error = None;
+                let language = plan.language && config.lang() != self.config.lang();
+                self.config = *config;
+                if language {
+                    lang::set(self.config.lang());
+                }
+                if plan.keybinds {
+                    self.keymap = keybinds::effective_map(&self.config);
+                }
+                if plan.opacity {
+                    self.apply_opacity();
+                }
+                if plan.font || plan.colors {
+                    self.rebuild_renderer();
+                } else if plan.padding || plan.hide_bar {
+                    self.relayout_active();
+                }
+                self.config_notice =
+                    config_watch::deferred_notice(&deferred).map(|text| ConfigNotice {
+                        text,
+                        until: Some(Instant::now() + std::time::Duration::from_secs(8)),
+                    });
+                self.request_redraw();
+            }
         }
     }
 
@@ -2428,8 +2507,8 @@ impl App {
                 "{}\n{}",
                 error,
                 tr(
-                    "أصلح ملف config.json ثم أعد تشغيل بيان لحفظ الإعدادات.",
-                    "Fix config.json and restart Bayan to save settings.",
+                    "أصلح ملف config.json. بيان يُبقي آخر إعدادات سليمة ويعيد التحميل عند إصلاح الملف.",
+                    "Fix config.json. Bayan is keeping the last good settings and will reload when the file is valid.",
                 )
             );
             self.report_error(
@@ -4560,6 +4639,7 @@ impl App {
                 progress: t.progress(),
             })
             .collect();
+        let config_notice = self.config_notice.clone();
         let Some(window) = self.window.as_ref() else {
             return;
         };
@@ -4808,6 +4888,17 @@ impl App {
             }
             // renderer still warming up on its thread: clear-only dark frame
             _ => {}
+        }
+        if let (Some(notice), Some(renderer)) = (&config_notice, self.renderer.as_mut()) {
+            renderer.use_ui_metrics(true);
+            renderer.draw_config_notice(
+                &mut verts,
+                px.width as i32,
+                px.height as i32,
+                &notice.text,
+                notice.until.is_none(),
+            );
+            renderer.use_ui_metrics(false);
         }
         // the IME candidate window sits at the focused cursor
         let spot = self.renderer.as_ref().and_then(|r| r.ime_spot);
@@ -5220,6 +5311,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.clear_link_hover();
                 self.request_redraw();
             }
+            UserEvent::ConfigReloaded(msg) => self.apply_config_reload(msg),
         }
     }
 
@@ -5266,6 +5358,14 @@ impl ApplicationHandler<UserEvent> for App {
         }
         if let Some(b) = blink_wake {
             wake = Some(wake.map_or(b, |w| w.min(b)));
+        }
+        if let Some(until) = self.config_notice.as_ref().and_then(|notice| notice.until) {
+            if Instant::now() >= until {
+                self.config_notice = None;
+                self.request_redraw();
+            } else {
+                wake = Some(wake.map_or(until, |w| w.min(until)));
+            }
         }
         match wake {
             Some(t) => el.set_control_flow(ControlFlow::WaitUntil(t)),
@@ -5523,6 +5623,17 @@ fn run() -> Result<(), String> {
         lang::set(lang::Lang::from_config(v.to_str()));
     }
     let keymap = keybinds::effective_map(&cfg);
+    let config_path = config::config_path();
+    let baseline_bytes = std::fs::read(&config_path).ok();
+    let reload_proxy = proxy.clone();
+    let config_watch = config_watch::spawn(
+        config_path,
+        cfg.clone(),
+        baseline_bytes.as_deref(),
+        move |msg| {
+            let _ = reload_proxy.send_event(UserEvent::ConfigReloaded(msg));
+        },
+    );
     let mut app = App {
         posh: None,
         last_toast: None,
@@ -5586,6 +5697,8 @@ fn run() -> Result<(), String> {
         keys_held_away: Vec::new(),
         debug_paste: None,
         start_dir,
+        config_watch,
+        config_notice: None,
     };
     let result = event_loop.run_app(&mut app);
     if let Some(error) = app.startup_error {

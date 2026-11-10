@@ -902,8 +902,18 @@ the toast's title is always «بيان · tab» and the program's text is cleane
 and capped. Bayan's own toasts (a long command finished, the bell) follow
 `notifications` and need no opt-in.
 
-Shell and scrollback apply to new tabs (no terminal restarts a live
-session); everything else applies immediately. `osc52` is config-file
+`config.json` is watched while Bayan is running. A change is re-read
+after about 200 ms of quiet, including when an editor saves by renaming
+a temp file over the real one. Theme, colors, font family and size (the
+grid is laid out again and the PTY is resized), key bindings, padding,
+cursor, opacity, and the other live settings apply without a restart.
+A save from the settings panel is recognized as Bayan's own write, so
+it is not loaded again. A file that does not parse is left alone: the
+last good settings stay in effect and a small notice shows the error.
+Scrollback applies to new panes, the shell to new tabs, restoring tabs
+on the next launch, the plugin list after a restart, and the kitty
+keyboard protocol in new panes. When one of those changes, the notice
+names it. `osc52` is config-file
 only (there is no settings-panel row). Leave it out or set `"off"`.
 `"copy"` lets a focused window accept OSC 52 clipboard writes from the
 focused pane; no value enables a clipboard read. The decode backstop is

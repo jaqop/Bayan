@@ -5019,6 +5019,45 @@ impl Renderer {
         }
     }
 
+    /// A single line at the bottom of the window. A parse error uses the
+    /// amber bar and stays; a "later" notice uses the blue bar and expires.
+    /// The bar does not dim the terminal.
+    pub fn draw_config_notice(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        fw: i32,
+        fh: i32,
+        text: &str,
+        error: bool,
+    ) {
+        if fw < 40 || fh < 20 || text.is_empty() {
+            return;
+        }
+        let margin = 10;
+        let row_h = self.cell_h.ceil() as i32;
+        let h = row_h + 8;
+        let w = fw - margin * 2;
+        let x = margin;
+        let y = (fh - h - margin).max(0);
+        let whole = (0, 0, fw, fh);
+        let bg = if error {
+            (0x3a, 0x2a, 0x12)
+        } else {
+            (0x1a, 0x27, 0x33)
+        };
+        let accent = if error {
+            (0xe0, 0xa0, 0x40)
+        } else {
+            (0x3d, 0x8f, 0xd1)
+        };
+        push_rect(out, whole, x, y, w, h, c4(bg, 235));
+        push_rect(out, whole, x, y, 3, h, c4(accent, 255));
+        let seg = [Seg::plain(text, (0xe6, 0xed, 0xf3))];
+        let tw = self.measure(&seg, true).ceil() as i32;
+        let left = crate::lang::lead_x(x, w, 12, tw);
+        self.draw_run(&seg, true, out, (x, y, w, h), left as f32, y + 4, 1.0);
+    }
+
     /// A link card. `may_open` is the confirm card (mint bar, Enter opens).
     /// A refusal is the red bar, and Enter only dismisses it.
     pub fn draw_link_block(

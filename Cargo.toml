@@ -46,6 +46,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_SystemInformation", # GetSystemDirectoryW: loaded kernel32 must sit under System32
     "Win32_System_IO", # DeviceIoControl: read a link's target without following it (localpath.rs)
 ] }
+# Hot-reload of ~/.bayan/config.json. On Windows the recommended backend
+# is ReadDirectoryChangesW (a target dependency, not a crate feature).
+# config_watch watches the parent directory so an editor that saves by
+# renaming a temp file over config.json is seen, then debounces itself.
+notify = { version = "8.2.2", default-features = false }
 
 [features]
 # BAYAN_* environment debug hooks (BAYAN_TYPE, BAYAN_PASTE, BAYAN_PROFILE, …)
