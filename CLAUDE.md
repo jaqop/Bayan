@@ -38,9 +38,38 @@ selection and BiDi paths must do.
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `a11y.rs` | screen-reader tree: each pane is a document in logical order, with the caret, the selection, and a coalesced live region (AccessKit, which speaks UIA on Windows) |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
+| `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-502 tests across the tree. `term.rs` (81), `link.rs` (61) and `render.rs` (64)
-carry the most; `localpath.rs` has 21; `a11y.rs` has 8.
+500 tests across the tree. `term.rs` (82), `link.rs` (61) and `render.rs` (65)
+carry the most; `localpath.rs` has 21; `a11y.rs` has 8. Three more in `term.rs` are `#[ignore]`d
+probes, run by hand (see Measuring).
+
+## Measuring
+
+Measure before optimizing, in release builds:
+
+- **Reader throughput and scrollback memory**, headless:
+  `cargo test --release -- --ignored measure_ --nocapture --test-threads=1`.
+  It prints MB/s through `process_chunk` (Bayan's whole per-read path) against
+  the bare vte parser, for plain, colour-heavy and Arabic output, and private
+  bytes once the scrollback is full and after as much again.
+  `measure_reader_stages` times each pass `process_chunk` makes over a read on
+  its own, so a slow one shows up by name.
+- **Key-to-frame latency**, live: `cargo build --release --features dev-hooks`,
+  then `scripts\measure-latency.ps1 -Exe <that exe>`. It types through
+  SendInput (only while Bayan has the foreground) and summarises the
+  `BAYAN_PROFILE` latency lines. It covers winit's key event to the PTY echo
+  and to the GPU submit; the OS input queue and the display are outside it.
+
+Figures from 2026-11-10 on the author's machine (22bc5d6 + this harness):
+`process_chunk` 83 / 49 / 100 MB/s for plain / SGR / Arabic, which is 57 / 27 /
+48% of vte alone; scrollback +33 MB at 10k lines and +303 MB at 100k, flat after
+that; latency p50 1.4 ms key->frame (0.5 ms to the echo), p95 1.7 ms over 100
+keys. A control run with no shell reading input recorded no samples.
+
+After the reader fixes (Ground fast path and a reused CSI buffer in
+`bidi_ctl`, a first-byte `find`, OSC scanners skipped on reads with no
+`ESC ]`): `process_chunk` 117 / 88 / 151 MB/s, 79 / 51 / 73% of vte.
 
 ## Invariants — do not "simplify" these
 
@@ -216,7 +245,7 @@ key identity or typed text:
 | `BAYAN_POSH=1` | open the oh-my-posh prompt picker at startup |
 | `BAYAN_TOAST=<title\|1>` | fire a sample toast at startup (M19 A/B loops without rebuilding) |
 | `BAYAN_ATLAS_STRESS=1` | shape a large spread of unique glyphs to force page-1 atlas growth |
-| `BAYAN_PROFILE=1` | startup timeline marks to `%TEMP%\bayan_profile.log` (EasyTer's `EASYTER_PROFILE` pattern), zero cost when unset. Key presses log modifiers only, never the key |
+| `BAYAN_PROFILE=1` | startup timeline marks to `%TEMP%\bayan_profile.log` (EasyTer's `EASYTER_PROFILE` pattern), zero cost when unset. Key presses log modifiers only, never the key. Also key-to-frame latency samples and a summary every 25 (see Measuring) |
 
 Start with `Start-Process -PassThru`, sleep ~6s for GPU init, capture the
 screen with `System.Drawing`, then `Stop-Process` the pid. Any cleanup in
