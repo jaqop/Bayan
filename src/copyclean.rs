@@ -7,9 +7,11 @@
 //!
 //! A soft wrap is the grid's `WRAPLINE` flag on that row. A row without it
 //! is a real newline and stays one. Characters are read in grid order, the
-//! same order `selection_to_string` uses; Claude mode then runs the existing
-//! `bidi::restore_block` so Arabic stays logical. Nothing here walks a row
-//! by its visual x.
+//! same order `selection_to_string` uses. Trailing spaces are trimmed and
+//! soft wraps are joined on that logical string, before Claude mode's
+//! `bidi::restore_block`. An RTL paragraph draws its trailing blanks on the
+//! visual left once the row is right-aligned; those blanks are still the
+//! end of the grid string, and this path never walks a row by its visual x.
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
@@ -100,9 +102,10 @@ pub(crate) fn clipboard_text(raw: &str, rows: &[CopyRow], clean: bool, claude: b
     } else {
         assemble(rows)
     };
-    // Logical restore runs on the joined lines, the same split `restore_block`
-    // has always used. Cleaning after that only drops spaces.
-    trim_trailing(&restore(&stored, claude))
+    // `assemble` already trimmed and joined the grid string. Claude's
+    // visual-to-logical restore runs on that result and must not decide
+    // which spaces were trailing.
+    restore(&stored, claude)
 }
 
 fn restore(text: &str, claude: bool) -> String {
@@ -162,16 +165,6 @@ fn assemble(rows: &[CopyRow]) -> String {
         }
     }
     lines.join("\n")
-}
-
-/// Trailing spaces of the logical lines. Runs after BiDi restore, so a
-/// margin that an RTL line carried on its visual left and the restore
-/// moved to the end comes off here, not out of the middle of a word.
-fn trim_trailing(text: &str) -> String {
-    text.split('\n')
-        .map(|line| line.trim_end_matches(' '))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn strip_uniform_gutter(lines: &[String]) -> Vec<String> {
@@ -393,6 +386,77 @@ mod tests {
         );
         let arabic = [row("    ابحرم   ", false)];
         assert_eq!(clipboard_text("RAW", &arabic, true, true), "مرحبا");
+    }
+
+    /// Grid order is the logical string. A soft wrap is two WRAPLINE rows
+    /// of that string, not a walk of the shaped visual x. BiDi restore of
+    /// the same letters is a different string and must not run first.
+    #[test]
+    fn a_soft_wrapped_arabic_line_with_english_and_digits_stays_logical() {
+        let logical = "مرحبا hello 123 عالم";
+        // 12 columns: "مرحبا hello " fills the row and wraps. The rest,
+        // "123 عالم", is the next row, with blanks after the logical end.
+        let mut term = grid(12, 2);
+        put(&mut term, 0, "مرحبا hello ", true);
+        put(&mut term, 1, "123 عالم", true);
+        select_all(&mut term, 2);
+        let raw = term.selection_to_string().expect("selection");
+        let rows = selection_rows(&term);
+        assert!(rows[0].wrapped && rows[1].wrapped);
+        assert!(
+            rows[0].text.starts_with("مرحبا hello"),
+            "grid order starts at the logical start: {:?}",
+            rows[0].text
+        );
+        assert!(
+            rows[1].text.starts_with("123 عالم"),
+            "the continuation keeps the digits and the second word: {:?}",
+            rows[1].text
+        );
+        assert!(
+            rows[1].text.ends_with(' '),
+            "WRAPLINE keeps the blanks after عالم in the grid string"
+        );
+        let copied = clipboard_text(&raw, &rows, true, false);
+        assert_eq!(copied, logical);
+        assert!(!copied.starts_with(' '));
+        assert!(copied.contains("hello") && copied.contains("123") && copied.contains("عالم"));
+        assert_ne!(
+            crate::bidi::restore_block(&raw),
+            copied,
+            "reordering first would not yield the logical line"
+        );
+    }
+
+    /// SCP 2 marks an RTL paragraph. Right-alignment will draw the blanks
+    /// after the logical end on the visual left. They are still the end of
+    /// the grid string, and the trim removes them there.
+    #[test]
+    fn an_rtl_paragraph_trims_blanks_at_the_logical_end() {
+        let logical = "مرحبا hello";
+        let mut term = grid(16, 1);
+        put(&mut term, 0, logical, true);
+        select_all(&mut term, 1);
+        let mut bidi = crate::bidi_ctl::BidiState::default();
+        bidi.note_scp(crate::bidi_ctl::ParagraphDir::Rtl, 0, 0);
+        assert_eq!(
+            bidi.direction_at(0),
+            crate::bidi_ctl::ParagraphDir::Rtl,
+            "SCP 2 stamps this line"
+        );
+        let raw = term.selection_to_string().expect("selection");
+        let rows = selection_rows(&term);
+        assert!(
+            rows[0].text.ends_with(' ') && rows[0].text.starts_with(logical),
+            "blanks sit after the logical text in grid order: {:?}",
+            rows[0].text
+        );
+        let copied = clipboard_text(&raw, &rows, true, false);
+        assert_eq!(copied, logical);
+        assert_eq!(copied.chars().next(), Some('م'));
+        assert_eq!(copied.chars().last(), Some('o'));
+        assert!(!copied.ends_with(' '));
+        assert_ne!(crate::bidi::restore_block(&raw), copied);
     }
 
     #[test]
