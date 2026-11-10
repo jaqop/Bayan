@@ -39,8 +39,8 @@ selection and BiDi paths must do.
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-497 tests across the tree. `term.rs` (81), `link.rs` (61) and `render.rs` (64)
-carry the most; `localpath.rs` has 21. Two more in `term.rs` are `#[ignore]`d
+499 tests across the tree. `term.rs` (82), `link.rs` (61) and `render.rs` (64)
+carry the most; `localpath.rs` has 21. Three more in `term.rs` are `#[ignore]`d
 probes, run by hand (see Measuring).
 
 ## Measuring
@@ -52,6 +52,8 @@ Measure before optimizing, in release builds:
   It prints MB/s through `process_chunk` (Bayan's whole per-read path) against
   the bare vte parser, for plain, colour-heavy and Arabic output, and private
   bytes once the scrollback is full and after as much again.
+  `measure_reader_stages` times each pass `process_chunk` makes over a read on
+  its own, so a slow one shows up by name.
 - **Key-to-frame latency**, live: `cargo build --release --features dev-hooks`,
   then `scripts\measure-latency.ps1 -Exe <that exe>`. It types through
   SendInput (only while Bayan has the foreground) and summarises the
@@ -63,6 +65,10 @@ Figures from 2026-11-10 on the author's machine (22bc5d6 + this harness):
 48% of vte alone; scrollback +33 MB at 10k lines and +303 MB at 100k, flat after
 that; latency p50 1.4 ms key->frame (0.5 ms to the echo), p95 1.7 ms over 100
 keys. A control run with no shell reading input recorded no samples.
+
+After the reader fixes (Ground fast path and a reused CSI buffer in
+`bidi_ctl`, a first-byte `find`, OSC scanners skipped on reads with no
+`ESC ]`): `process_chunk` 117 / 88 / 151 MB/s, 79 / 51 / 73% of vte.
 
 ## Invariants — do not "simplify" these
 
