@@ -1008,6 +1008,9 @@ pub struct PaneView<'a> {
     /// Pixels the grid is shifted down inside the pane. Zero draws every
     /// row where it was drawn before this offset existed.
     pub scroll_px: i32,
+    /// SCP direction of the history line drawn above the pane. Ignored
+    /// when `scroll_px` is zero, so a whole-line frame does not read it.
+    pub peek_dir: ParagraphDir,
 }
 
 // translucent overlays, EasyTer's colors: selection blue, search amber
@@ -2975,9 +2978,14 @@ impl Renderer {
             vis as usize
         };
         self.mapping_context = Some((view.rect, key));
+        let hover_key = if vis < 0 {
+            crate::scroll::PEEK_ROW
+        } else {
+            vis as usize
+        };
         let hover = view
             .link_hover
-            .and_then(|(row, a, b)| (row as i32 == vis).then_some((a, b)));
+            .and_then(|(row, a, b)| (row == hover_key).then_some((a, b)));
         // Explicit BDSM: the application sent visual order (and, per the
         // recommendation, presentation forms). The grid path does not
         // run UAX#9 and does not reshape. Implicit mode keeps the
@@ -2987,8 +2995,7 @@ impl Renderer {
         let dir = if vis >= 0 {
             view.line_dir.get(vis as usize).copied().unwrap_or_default()
         } else {
-            // The peeking line has no stamp in this frame's viewport list.
-            ParagraphDir::default()
+            view.peek_dir
         };
         if arabic && view.reorder {
             let on_row = cursor_vrow == vis;
@@ -3110,15 +3117,19 @@ impl Renderer {
         if shift > 0 && off >= 0 && (off as usize) < history {
             let line = alacritty_terminal::index::Line(-(off + 1));
             let extra = self.cells_of_line(term, line);
-            if let Some(sel) = selection {
-                for c in &extra {
-                    let point = alacritty_terminal::index::Point::new(
-                        line,
-                        alacritty_terminal::index::Column(c.col),
-                    );
-                    if sel.contains(point) {
-                        sel_cells.push((crate::scroll::PEEK_ROW, c.col, c.w));
-                    }
+            for c in &extra {
+                let point = alacritty_terminal::index::Point::new(
+                    line,
+                    alacritty_terminal::index::Column(c.col),
+                );
+                if selection.is_some_and(|sel| sel.contains(point)) {
+                    sel_cells.push((crate::scroll::PEEK_ROW, c.col, c.w));
+                }
+                if view
+                    .search_match
+                    .is_some_and(|m| *m.start() <= point && point <= *m.end())
+                {
+                    hit_cells.push((crate::scroll::PEEK_ROW, c.col, c.w));
                 }
             }
             if let Some(r) = self.paint_row(
@@ -6396,6 +6407,7 @@ mod tests {
             link_hover: None,
             link_tip: None,
             scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
         };
         let block = c4(r.fg, 170);
         let opaque_bg = c4(r.bg, 255);
@@ -6473,6 +6485,7 @@ mod tests {
             link_hover: None,
             link_tip: None,
             scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
         };
         r.draw_pane(&mut Vec::new(), &view, &t);
         let inverse = r
@@ -6516,6 +6529,7 @@ mod tests {
             link_hover: None,
             link_tip: None,
             scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
         };
         r.draw_pane(&mut Vec::new(), &view, &t);
         let x = |col: usize| {
@@ -6613,6 +6627,7 @@ mod tests {
             reorder: true,
             line_dir: &[],
             scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
         };
         let mut out = Vec::new();
         r.draw_pane(&mut out, &view, &t);
@@ -6773,6 +6788,7 @@ mod tests {
                 reorder: true,
                 line_dir: &[],
                 scroll_px: 0,
+                peek_dir: ParagraphDir::Default,
             };
             let mut out = Vec::new();
             r.draw_pane(&mut out, &view, &t);
@@ -8001,6 +8017,7 @@ mod cache_tests {
                 reorder: true,
                 line_dir: &[],
                 scroll_px: 0,
+                peek_dir: ParagraphDir::Default,
             };
             // an underline is a solid quad (page 0, white texel) th px tall
             let th = (r.cell_h / 14.0).max(1.0) as i32;
@@ -8074,6 +8091,7 @@ mod cache_tests {
                 link_hover: None,
                 link_tip: None,
                 scroll_px,
+                peek_dir: ParagraphDir::Default,
             };
             renderer.draw_pane(&mut out, &view, term);
             let mut geom: Vec<RowGeom> = renderer
@@ -8129,6 +8147,75 @@ mod cache_tests {
         assert!(
             !same_quads(&settled, &whole_now),
             "scrolling one line should reveal a different row"
+        );
+    }
+
+    /// The history line peeking in keeps its SCP direction, and a search hit
+    /// on that line is drawn in the sliver.
+    #[test]
+    fn the_peek_row_keeps_its_paragraph_direction_and_search_hit() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::index::{Column, Line, Point};
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let mut renderer = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 40, rows: 4 };
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(
+            &mut term,
+            "aaa\r\nbbb\r\nA\u{645}\u{631}\u{62d}\u{628}\u{627}\r\nccc\r\nddd\r\neee\r\n"
+                .as_bytes(),
+        );
+        let above = &term.grid()[Line(-1)];
+        assert_eq!(above[Column(0)].c, 'A', "the peek line is the mixed row");
+        let shift = 12;
+        let pane = (0, 40, 800, 160);
+        let draw = |renderer: &mut Renderer, dir: ParagraphDir, search: bool| {
+            let start = Point::new(Line(-1), Column(0));
+            let end = Point::new(Line(-1), Column(2));
+            let range = start..=end;
+            let mut out = Vec::new();
+            let view = PaneView {
+                rect: pane,
+                focused: false,
+                cursor: crate::config::CursorStyle::Block,
+                cursor_on: false,
+                bordered: false,
+                claude: false,
+                claude_from: None,
+                reorder: true,
+                line_dir: &[],
+                search_match: search.then_some(&range),
+                marks: &[],
+                link_hover: None,
+                link_tip: None,
+                scroll_px: shift,
+                peek_dir: dir,
+            };
+            renderer.draw_pane(&mut out, &view, &term);
+            let geom: Vec<(i32, i32, bool)> = renderer
+                .cell_geometry
+                .iter()
+                .filter(|((_, row, _), _)| *row == crate::scroll::PEEK_ROW)
+                .flat_map(|(_, spans)| spans.iter().copied())
+                .collect();
+            let top = out
+                .chunks(6)
+                .filter(|q| q[0].pos[1] < pane.1 as f32 + shift as f32)
+                .count();
+            (geom, top, out.len())
+        };
+        let (ltr, _, _) = draw(&mut renderer, ParagraphDir::Default, false);
+        let (rtl, _, _) = draw(&mut renderer, ParagraphDir::Rtl, false);
+        assert!(!ltr.is_empty(), "the peek row was not shaped");
+        assert_ne!(ltr, rtl, "an SCP RTL stamp must move the mixed peek row");
+        let (_, plain, _) = draw(&mut renderer, ParagraphDir::Default, false);
+        let (_, hit, _) = draw(&mut renderer, ParagraphDir::Default, true);
+        assert!(
+            hit > plain,
+            "the search hit on the peek row added no quads ({hit} vs {plain})"
         );
     }
 

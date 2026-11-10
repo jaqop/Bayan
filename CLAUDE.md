@@ -13,6 +13,7 @@ selection and BiDi paths must do.
 | `main.rs` | event loop, tabs, panes, settings panel, cockpit, OSC handling; `window_event` only dispatches |
 | `chrome.rs` | window chrome hit-testing (edges, caption buttons, tab bar, dividers, drag strip) and the left-press order |
 | `input.rs` | pointer routing: buttons, motion, wheel, drops, and the pointer side of the close guard and palette |
+| `scroll.rs` | smooth scrollback: sub-line pixel offset, wheel easing, and when that offset is cleared |
 | `keyroute.rs` | keyboard routing: which overlay owns a press, then the window chords before `keys.rs` encodes it |
 | `render.rs` | the dual text engine + shaped-run cache (see below) |
 | `gpu.rs` | wgpu: one pipeline, one 2048² atlas, one draw call per frame |
@@ -106,6 +107,15 @@ weak LTR runs; ١٧٥ must stay ١٧٥. `is_arabic_letter` excludes them explici
 renderer lays words in logical order left-to-right with no BiDi reordering and
 ignores RLM/RLO (established by A/B capture). So Arabic handed to a toast must
 be pre-reversed into VISUAL word order — the opposite direction from `bidi.rs`.
+
+**Smooth scroll is a pixel offset on the primary screen only.** `scroll.smooth`
+defaults on. A touchpad fraction shifts the viewport and draws one extra
+history row, clipped to the pane; a wheel notch eases in. `false` is the
+old whole-line wheel. Alt-screen wheels stay arrows, and mouse reports use
+the shifted row (the history sliver above the viewport is not row 0). The
+offset is cleared when output arrives at the bottom, on an alt-screen
+transition, on resize, and on a font change. Copy-mode keys snap it onto a
+whole line first.
 
 **Chords resolve by PHYSICAL key.** Ctrl+T must fire when that key's logical
 char is "ف". This is the Arabic-layout guarantee and it extends to user

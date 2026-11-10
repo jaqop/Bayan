@@ -408,7 +408,9 @@ pub enum UserEvent {
 #[derive(PartialEq, Eq)]
 struct LinkHover {
     pane_id: u64,
-    row: usize,
+    /// Viewport row. `-1` is the history line a smooth scroll has
+    /// brought into the top of the pane.
+    row: i32,
     start_col: usize,
     end_col: usize,
     target: link::StatusParts,
@@ -1469,6 +1471,9 @@ struct App {
     smooth: std::collections::HashMap<u64, scroll::PaneScroll>,
     /// Last time an easing notch was sampled. None while nothing is pending.
     smooth_at: Option<Instant>,
+    /// Last alt-screen bit seen per pane, so a transition clears the offset
+    /// even when no wheel notch is still easing.
+    alt_seen: std::collections::HashMap<u64, bool>,
     search: Option<SearchState>,
     clipboard: Option<arboard::Clipboard>,
     /// Claude mode follows (alt screen + claude command) automatically;
@@ -1514,6 +1519,9 @@ impl App {
     /// (Re)build the renderer off-thread for the current scale, config and
     /// zoom. Debounced: one build in flight; a stale result triggers another.
     fn rebuild_renderer(&mut self) {
+        if scroll::after_font_change() == scroll::OffsetFate::Clear {
+            self.smooth.clear();
+        }
         if self.renderer_building {
             return;
         }
@@ -2818,8 +2826,12 @@ impl App {
     /// Resize every pane of the ACTIVE tab to its rect (background tabs
     /// re-layout when they become active — the standard terminal tradeoff).
     fn relayout_active(&mut self) {
-        // Pane rows moved. Cached link spans would underline the wrong cells.
+        // Pane rows moved. Cached link spans would underline the wrong cells,
+        // and a pixel offset belongs to the old cell height.
         self.link_cache.clear();
+        if scroll::after_resize() == scroll::OffsetFate::Clear {
+            self.smooth.clear();
+        }
         // resolve "hide the bar with one tab" BEFORE measuring the content
         let hide = self.config.hide_single_tab_on() && self.tabs.len() <= 1;
         if let Some(r) = self.renderer.as_mut() {
@@ -3507,6 +3519,27 @@ impl App {
         bidi::cmd_is_claude(&running)
     }
 
+    /// Pixel offset of one pane. Zero on the alt screen and when smooth
+    /// scroll is off, so those paths stay on `cell_at`'s rows.
+    fn pane_offset_px(&self, pane_id: u64, cell_h: f32) -> i32 {
+        if !self.config.smooth_scroll_on() || self.mode_of(pane_id).contains(TermMode::ALT_SCREEN) {
+            return 0;
+        }
+        let sub = self.smooth.get(&pane_id).map(|s| s.subline).unwrap_or(0.0);
+        scroll::offset_px(sub, cell_h)
+    }
+
+    /// Viewport row under a pane-local y, including `-1` for the history
+    /// line a smooth scroll has pulled into the pane.
+    fn signed_row(&self, pane_id: u64, local_y: f64, cell_h: f64, rows: usize) -> i32 {
+        scroll::selection_row(
+            local_y,
+            cell_h,
+            self.pane_offset_px(pane_id, cell_h as f32) as f64,
+            rows,
+        )
+    }
+
     /// Pixel position -> (pane index, viewport row, col, cell side).
     /// None inside the tab bar, the padding, or a divider gap.
     fn pane_cell_at(&self, pos: PhysicalPosition<f64>) -> Option<(usize, i32, usize, Side)> {
@@ -3516,19 +3549,7 @@ impl App {
         let rect = rects.get(hit.pane).copied()?;
         let rows = ((rect.3 as f64 / r.cell_h as f64).floor() as usize).max(1);
         let pane_id = self.tabs.get(self.active)?.panes.get(hit.pane)?.id;
-        let alt = self.mode_of(pane_id).contains(TermMode::ALT_SCREEN);
-        let offset_px = if alt || !self.config.smooth_scroll_on() {
-            0
-        } else {
-            let sub = self.smooth.get(&pane_id).map(|s| s.subline).unwrap_or(0.0);
-            scroll::offset_px(sub, r.cell_h)
-        };
-        let row = scroll::selection_row(
-            pos.y - rect.1 as f64,
-            r.cell_h as f64,
-            offset_px as f64,
-            rows,
-        );
+        let row = self.signed_row(pane_id, pos.y - rect.1 as f64, r.cell_h as f64, rows);
         let geom_row = if row < 0 {
             scroll::PEEK_ROW
         } else {
@@ -3636,13 +3657,16 @@ impl App {
     }
 
     /// Viewport cell under `pos`, with a bidi row's column mapped back to
-    /// the grid cell the program stored. `hit` is the raw grid cell.
+    /// the grid cell the program stored. `row` is the offset-aware viewport
+    /// row (`-1` is the history line above the screen). `hit` still names
+    /// the pane and the unshifted column.
     fn finish_locate(
         &mut self,
         hit: mouse::CellHit,
+        row: i32,
         pos: PhysicalPosition<f64>,
         rects: &[render::Rect],
-    ) -> Option<(u64, usize, usize)> {
+    ) -> Option<(u64, i32, usize)> {
         // copy what the locks need, then drop the pane borrow so the term
         // lock below can re-borrow the tab
         let (pane_id, running, bidi_state, evicted, claude_from) = {
@@ -3658,11 +3682,29 @@ impl App {
         };
         let (auto, manual) = (self.auto_follow, self.claude_manual);
         let honor = self.config.honor_bdsm();
+        let geom_row = if row < 0 {
+            scroll::PEEK_ROW
+        } else {
+            row as usize
+        };
+        if row < 0 {
+            let cols = {
+                let t = self.tabs[self.active].panes[hit.pane].session.term.lock();
+                t.columns().max(1)
+            };
+            let mapped = rects.get(hit.pane).and_then(|rect| {
+                self.renderer
+                    .as_ref()
+                    .and_then(|r| r.hit_cell(*rect, geom_row, pos.x))
+            });
+            let col = mapped.map(|h| h.0).unwrap_or(hit.col).min(cols - 1);
+            return Some((pane_id, row, col));
+        }
         let (cols, row, cells, claude, vis, reorder, dir) = {
             let t = self.tabs[self.active].panes[hit.pane].session.term.lock();
             let cols = t.columns().max(1);
             let rows = t.screen_lines().max(1);
-            let row = hit.row.min(rows - 1);
+            let row = row.min(rows as i32 - 1);
             // Explicit BDSM draws Arabic on the grid, so the click column
             // is x / cell_w. Implicit mode uses the same plan as the painter,
             // SCP mark included. Neither applies once the command has ended
@@ -3688,7 +3730,7 @@ impl App {
             } else {
                 bidi_ctl::ParagraphDir::Default
             };
-            let cells = render::snapshot_row(&t, row);
+            let cells = render::snapshot_row(&t, row as usize);
             (
                 cols,
                 row,
@@ -3704,7 +3746,7 @@ impl App {
             .and_then(|rect| {
                 self.renderer
                     .as_ref()
-                    .and_then(|r| r.hit_cell(*rect, row, pos.x))
+                    .and_then(|r| r.hit_cell(*rect, row as usize, pos.x))
             })
             .map(|h| h.0);
         let col = if let Some(col) = mapped {
@@ -3723,7 +3765,8 @@ impl App {
     }
 
     /// The cell under the pointer, or None when it isn't over a pane.
-    fn locate(&mut self, pos: PhysicalPosition<f64>) -> Option<(usize, u64, usize, usize)> {
+    /// The row is offset-aware and may be `-1`.
+    fn locate(&mut self, pos: PhysicalPosition<f64>) -> Option<(usize, u64, i32, usize)> {
         let rects = self.pane_rects();
         let (cw, ch) = {
             let r = self.renderer.as_ref()?;
@@ -3731,7 +3774,11 @@ impl App {
         };
         let hit = mouse::cell_at(pos.x, pos.y, &rects, cw, ch)?;
         let pane = hit.pane;
-        let (id, row, col) = self.finish_locate(hit, pos, &rects)?;
+        let rect = *rects.get(pane)?;
+        let rows = ((rect.3 as f64 / ch).floor() as usize).max(1);
+        let pane_id = self.tabs.get(self.active)?.panes.get(pane)?.id;
+        let row = self.signed_row(pane_id, pos.y - rect.1 as f64, ch, rows);
+        let (id, row, col) = self.finish_locate(hit, row, pos, &rects)?;
         Some((pane, id, row, col))
     }
 
@@ -3741,7 +3788,7 @@ impl App {
         &mut self,
         pane_id: u64,
         pos: PhysicalPosition<f64>,
-    ) -> Option<(usize, usize)> {
+    ) -> Option<(i32, usize)> {
         let (ti, pi) = self.find_pane(pane_id)?;
         if ti != self.active {
             return None;
@@ -3762,7 +3809,9 @@ impl App {
         // cell_at's pane index is 0 for the one-rect slice; the real index
         // is `pi`, which finish_locate uses to read the grid.
         let hit = mouse::CellHit { pane: pi, ..hit };
-        let (_, row, col) = self.finish_locate(hit, PhysicalPosition::new(cx, cy), &rects)?;
+        let rows = ((h as f64 / ch).floor() as usize).max(1);
+        let row = self.signed_row(pane_id, cy - y as f64, ch, rows);
+        let (_, row, col) = self.finish_locate(hit, row, PhysicalPosition::new(cx, cy), &rects)?;
         Some((row, col))
     }
 
@@ -3803,8 +3852,13 @@ impl App {
         link::cwd_hook(raw.as_deref())
     }
 
-    fn links_on(&mut self, id: u64, row: usize) -> Vec<link::LinkSpan> {
-        if let Some(spans) = self.link_cache.get(id, row) {
+    fn links_on(&mut self, id: u64, row: i32) -> Vec<link::LinkSpan> {
+        let key = if row < 0 {
+            scroll::PEEK_ROW
+        } else {
+            row as usize
+        };
+        if let Some(spans) = self.link_cache.get(id, key) {
             return spans;
         }
         let Some((ti, pi)) = self.find_pane(id) else {
@@ -3812,9 +3866,9 @@ impl App {
         };
         let spans = {
             let term = self.tabs[ti].panes[pi].session.term.lock();
-            link::links_on_row(&term, row)
+            link::links_on_viewport(&term, row)
         };
-        self.link_cache.insert(id, row, spans.clone());
+        self.link_cache.insert(id, key, spans.clone());
         spans
     }
 
@@ -3832,7 +3886,7 @@ impl App {
     /// Recompute the hover from `pos`. Returns the logical cell so mouse
     /// motion can be reported without a second hit-test. `None` when the
     /// pointer is not over a pane.
-    fn refresh_link_hover(&mut self, pos: PhysicalPosition<f64>) -> Option<(u64, usize, usize)> {
+    fn refresh_link_hover(&mut self, pos: PhysicalPosition<f64>) -> Option<(u64, i32, usize)> {
         if self.overlay_blocks_mouse() {
             self.clear_link_hover();
             return None;
@@ -4000,6 +4054,9 @@ impl App {
         let Some((pane, id, row, col)) = self.locate(self.cursor_pos) else {
             return false;
         };
+        let Some(row) = scroll::screen_row(row) else {
+            return false;
+        };
         let proto = mouse::Proto::from_mode(self.mode_of(id));
         let cell = mouse::Cell { pane: id, row, col };
         let Some(bytes) = self.mouse.press(cell, button, proto, self.mods_now()) else {
@@ -4026,10 +4083,12 @@ impl App {
         let proto = mouse::Proto::from_mode(self.mode_of(pane_id));
         let cell = self
             .cell_in_pane_clamped(pane_id, self.cursor_pos)
-            .map(|(row, col)| mouse::Cell {
-                pane: pane_id,
-                row,
-                col,
+            .and_then(|(row, col)| {
+                scroll::screen_row(row).map(|row| mouse::Cell {
+                    pane: pane_id,
+                    row,
+                    col,
+                })
             });
         match self.mouse.release(button, cell, proto, self.mods_now()) {
             mouse::Take::Ignore => false,
@@ -4051,6 +4110,9 @@ impl App {
         };
         let proto = mouse::Proto::from_mode(self.mode_of(pane_id));
         let Some((row, col)) = self.cell_in_pane_clamped(pane_id, pos) else {
+            return;
+        };
+        let Some(row) = scroll::screen_row(row) else {
             return;
         };
         let cell = mouse::Cell {
@@ -4664,9 +4726,19 @@ impl App {
                     } else {
                         Vec::new()
                     };
+                    let peek_dir = if use_stamps {
+                        bidi_state.direction_at(bidi_ctl::peek_line_abs(evicted, history, off))
+                    } else {
+                        bidi_ctl::ParagraphDir::Default
+                    };
                     let (link_hover, link_tip) = match &self.link_hover {
                         Some(h) if h.pane_id == pane.id => {
-                            (Some((h.row, h.start_col, h.end_col)), Some(&h.target))
+                            let row = if h.row < 0 {
+                                scroll::PEEK_ROW
+                            } else {
+                                h.row as usize
+                            };
+                            (Some((row, h.start_col, h.end_col)), Some(&h.target))
                         }
                         _ => (None, None),
                     };
@@ -4698,6 +4770,7 @@ impl App {
                         marks: &marks,
                         link_hover,
                         link_tip,
+                        peek_dir,
                         scroll_px: if alt || !self.config.smooth_scroll_on() {
                             0
                         } else {
@@ -5059,6 +5132,19 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if let Some((ti, pi)) = self.find_pane(id) {
                     self.tabs[ti].panes[pi].last_output = Some(Instant::now());
+                    let (alt, following) = {
+                        let t = self.tabs[ti].panes[pi].session.term.lock();
+                        (
+                            t.mode().contains(TermMode::ALT_SCREEN),
+                            t.grid().display_offset() == 0,
+                        )
+                    };
+                    let was_alt = self.alt_seen.insert(id, alt).unwrap_or(false);
+                    if scroll::after_alt_screen(was_alt, alt) == scroll::OffsetFate::Clear
+                        || scroll::after_output(following) == scroll::OffsetFate::Clear
+                    {
+                        self.drop_smooth(id);
+                    }
                     let ris = {
                         let mut meta = self.tabs[ti].panes[pi].session.meta.lock_or_recover();
                         let ris = meta.saw_ris;
@@ -5609,6 +5695,7 @@ fn run() -> Result<(), String> {
         wheel_accum: 0.0,
         smooth: std::collections::HashMap::new(),
         smooth_at: None,
+        alt_seen: std::collections::HashMap::new(),
         search: None,
         clipboard: None,
         auto_follow: true,

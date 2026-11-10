@@ -443,7 +443,9 @@ impl App {
         // 1003: motion with no button. Shift and overlays already dropped
         // out inside the report.
         if let Some((id, row, col)) = cell {
-            self.report_motion_at(id, row, col);
+            if let Some(row) = crate::scroll::screen_row(row) {
+                self.report_motion_at(id, row, col);
+            }
         }
     }
 
@@ -467,7 +469,10 @@ impl App {
         // the tab bar or the padding is not a cell: tracking programs do
         // not hear 1;1. Shift scrolls locally, including on the alt screen.
         let (at, view_id) = match self.locate(self.cursor_pos) {
-            Some((_, id, row, col)) => (Some(mouse::Cell { pane: id, row, col }), Some(id)),
+            Some((_, id, row, col)) => (
+                crate::scroll::screen_row(row).map(|row| mouse::Cell { pane: id, row, col }),
+                Some(id),
+            ),
             None => (None, self.focused_pane_id()),
         };
         let Some(id) = view_id else {

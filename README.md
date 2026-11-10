@@ -356,7 +356,11 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       mode on, and a RIS forgets the last CSI I so the next one is sent
       again. The wheel still scrolls the pane under the pointer and is
       not reported at all over the tab bar or the padding; Ctrl+wheel is
-      still font zoom. The suite size after this merged with main is
+      still font zoom. Scrollback itself moves by pixels when
+      `scroll.smooth` is on (the default): a touchpad keeps the fraction
+      of a line, a notch eases in, and `"scroll": {"smooth": false}` is
+      the old whole-line jump. The alt screen still turns the wheel into
+      arrows. The suite size after this merged with main is
       under M31. Not proven here: a live htop /
       vim `mouse=a` / lazygit / Claude Code session — this tree doesn't
       run a window on the machine that built it. Windows CI is the build
@@ -891,7 +895,8 @@ key falls back to a sane default:
   "hide_single_tab": true, "confirm_close": true, "osc52": "off",
   "editor": "code -g {file}:{line}:{col}", "tab_switch": "recent",
   "keybinds": { "new-tab": "ctrl+shift+n" },
-  "keyboard": { "kitty_protocol": false, "kitty_base_layout_fallback": true }
+  "keyboard": { "kitty_protocol": false, "kitty_base_layout_fallback": true },
+  "scroll": { "smooth": true }
 }
 ```
 

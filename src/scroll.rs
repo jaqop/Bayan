@@ -209,9 +209,60 @@ pub(crate) fn selection_row(local_y: f64, cell_h: f64, offset_px: f64, rows: usi
 }
 
 /// Grid line of a viewport row. Viewport row 0 is `Line(-display_offset)`,
-/// the same subtraction the selection anchor uses.
+/// the same subtraction the selection anchor uses. Row `-1` is the history
+/// line peeking in above the pane.
 pub(crate) fn grid_line(viewport_row: i32, display_offset: i32) -> i32 {
     viewport_row - display_offset
+}
+
+/// A screen row the program can be told about. The history line above the
+/// viewport is not row 0.
+pub(crate) fn screen_row(viewport_row: i32) -> Option<usize> {
+    if viewport_row < 0 {
+        None
+    } else {
+        Some(viewport_row as usize)
+    }
+}
+
+/// What happens to a pane's pixel offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OffsetFate {
+    Keep,
+    Clear,
+}
+
+/// New output while the view is pinned to the live bottom drops the
+/// fraction. Scrolled-up history keeps it.
+pub(crate) fn after_output(following_bottom: bool) -> OffsetFate {
+    if following_bottom {
+        OffsetFate::Clear
+    } else {
+        OffsetFate::Keep
+    }
+}
+
+/// Entering or leaving the alternate screen drops a resting offset. The
+/// alt screen does not scroll by pixels, and the primary grid must not
+/// inherit a fraction that was never part of it.
+pub(crate) fn after_alt_screen(was_alt: bool, now_alt: bool) -> OffsetFate {
+    if was_alt != now_alt {
+        OffsetFate::Clear
+    } else {
+        OffsetFate::Keep
+    }
+}
+
+/// A resize rebuilds the cell grid. The old fraction is not a row of the
+/// new grid.
+pub(crate) fn after_resize() -> OffsetFate {
+    OffsetFate::Clear
+}
+
+/// A font change moves the cell height, so the pixel offset would land
+/// on a different fraction of a line.
+pub(crate) fn after_font_change() -> OffsetFate {
+    OffsetFate::Clear
 }
 
 /// Whole lines `scroll_display` needs so the viewport matches `next`.
@@ -585,5 +636,83 @@ mod tests {
         crate::copymode::apply(&mut t, crate::copymode::Cmd::Motion(ViMotion::Down));
         cursor_in_view(&t);
         assert_eq!(t.topmost_line(), Line(-(t.grid().history_size() as i32)));
+    }
+
+    #[test]
+    fn new_output_at_the_bottom_clears_the_offset() {
+        assert_eq!(after_output(true), OffsetFate::Clear);
+    }
+
+    #[test]
+    fn new_output_while_scrolled_up_keeps_the_offset() {
+        assert_eq!(after_output(false), OffsetFate::Keep);
+    }
+
+    #[test]
+    fn entering_the_alt_screen_clears_a_resting_offset() {
+        // pending is empty: the fraction alone still has to go
+        assert_eq!(after_alt_screen(false, true), OffsetFate::Clear);
+        assert_eq!(after_alt_screen(false, false), OffsetFate::Keep);
+    }
+
+    #[test]
+    fn leaving_the_alt_screen_clears_a_resting_offset() {
+        assert_eq!(after_alt_screen(true, false), OffsetFate::Clear);
+        assert_eq!(after_alt_screen(true, true), OffsetFate::Keep);
+    }
+
+    #[test]
+    fn resize_clears_the_offset() {
+        assert_eq!(after_resize(), OffsetFate::Clear);
+    }
+
+    #[test]
+    fn font_change_clears_the_offset() {
+        assert_eq!(after_font_change(), OffsetFate::Clear);
+    }
+
+    /// The row a mouse report names, for a click part-way down a cell.
+    fn reported(local_y: f64, offset_px: f64) -> Option<Vec<u8>> {
+        let row = selection_row(local_y, 20.0, offset_px, 10);
+        let row = screen_row(row)?;
+        let proto = crate::mouse::Proto {
+            clicks: true,
+            sgr: true,
+            ..crate::mouse::Proto::default()
+        };
+        let mut route = crate::mouse::Route::default();
+        let out = route.press(
+            crate::mouse::Cell {
+                pane: 1,
+                row,
+                col: 2,
+            },
+            crate::mouse::Btn::Left,
+            proto,
+            crate::mouse::Mods::default(),
+        )?;
+        out.map(|o| o.bytes)
+    }
+
+    #[test]
+    fn a_partial_offset_reports_the_shifted_row() {
+        // y=22 is cell_at's row 1 and, shifted down 8px, row 0.
+        let raw = (22.0f64 / 20.0).floor() as usize;
+        assert_eq!(raw, 1);
+        let shifted = reported(22.0, 8.0).unwrap();
+        let unshifted = reported(22.0, 0.0).unwrap();
+        assert_eq!(shifted, b"\x1b[<0;3;1M");
+        assert_eq!(unshifted, b"\x1b[<0;3;2M");
+        assert_ne!(shifted, unshifted);
+    }
+
+    #[test]
+    fn the_peek_sliver_is_not_reported_as_the_top_row() {
+        let raw = (3.0f64 / 20.0).floor() as usize;
+        assert_eq!(raw, 0, "cell_at would call this row 0");
+        assert_eq!(selection_row(3.0, 20.0, 8.0, 10), -1);
+        assert!(reported(3.0, 8.0).is_none());
+        // the bug this guards: reporting that sliver as row 1
+        assert!(reported(3.0, 0.0).unwrap().ends_with(b";1M"));
     }
 }
