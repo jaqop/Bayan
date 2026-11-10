@@ -1210,9 +1210,28 @@ fn glyph_ink(
     Some((phys.x as f32 + entry.left as f32, w))
 }
 
-/// Cursor rectangle for the byte range, from glyph ink. A ligature still
-/// splits from the right when it is RTL (lam-alef); tashkeel stays in the
-/// base's box because its bytes belong to that cell.
+/// How many terminal cells a cluster holds. Combining marks and joiners
+/// stay on the base, so «بَ» is one unit and «لا» is two.
+fn cluster_unit_count(cluster: &str) -> usize {
+    let mut n = 0usize;
+    let mut joined = false;
+    for c in cluster.chars() {
+        let glue = crate::bidi::is_combining(c)
+            || c == '\u{200d}'
+            || joined
+            || matches!(c as u32, 0xFE00..=0xFE0F | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F);
+        joined = c == '\u{200d}';
+        if n == 0 || !glue {
+            n += 1;
+        }
+    }
+    n.max(1)
+}
+
+/// Cursor rectangle for the byte range. A single letter uses its ink, so
+/// Cairo's join is covered. A ligature keeps the advance and splits from
+/// the right: some faces draw «ا» with no ink of its own, and sizing the
+/// split to that empty bitmap put both halves on the same pixel.
 fn ink_cover(
     spans: &[crate::mouse::GlyphSpan],
     inks: &[(usize, usize, f32, f32)],
@@ -1230,7 +1249,12 @@ fn ink_cover(
                 hi = hi.max(x + w);
             }
         }
-        let (x, w) = if hi > lo { (lo, hi - lo) } else { (g.x, g.w) };
+        let one = cluster_unit_count(&text[g.start..g.end]) == 1;
+        let (x, w) = if one && hi > lo {
+            (lo, hi - lo)
+        } else {
+            (g.x, g.w)
+        };
         if w <= 0.0 {
             continue;
         }
