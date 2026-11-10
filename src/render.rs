@@ -6139,6 +6139,61 @@ mod tests {
         }
     }
 
+    /// `مرحبا … hello` at a prompt: Latin typed after Arabic and one to three
+    /// blanks. The cursor stays on the end of `hello`, not on the Arabic's
+    /// logical end, and every blank still widens the gap before `hello`.
+    /// Checked live on 4a570b7 (Nov 2026) before this test pinned it.
+    #[test]
+    fn latin_after_arabic_and_blanks_keeps_the_cursor_after_the_latin() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let pane = (0, 0, 800, 120);
+        let mut last_gap = 0;
+        for blanks in 1..=3usize {
+            let text = format!("C:\\>مرحبا{}hello", " ".repeat(blanks));
+            let cells = row_cells(&text, 0);
+            let end = cells.len();
+            r.begin_frame();
+            r.mapping_context = Some((pane, 0));
+            let cursor = r
+                .draw_line_bidi(
+                    &mut Vec::new(),
+                    pane,
+                    0,
+                    0,
+                    pane.2,
+                    &cells,
+                    false,
+                    Some(end),
+                    ParagraphDir::Default,
+                    None,
+                )
+                .expect("the end cursor maps");
+            r.finish_pane_layout(pane);
+            let box_of = |col: usize| r.cell_geometry[&(pane, 0, col)][0];
+            let arabic_right = cells
+                .iter()
+                .filter(|c| is_arabic(c.c))
+                .map(|c| box_of(c.col))
+                .map(|b| b.0 + b.1)
+                .max()
+                .unwrap();
+            let h = box_of(end - 5);
+            let o = box_of(end - 1);
+            assert!(
+                (cursor.0 - (o.0 + o.1)).abs() <= 1,
+                "{blanks} blanks: cursor x={} must follow hello's o (ends at {})",
+                cursor.0,
+                o.0 + o.1
+            );
+            let gap = h.0 - arabic_right;
+            assert!(
+                gap > last_gap,
+                "{blanks} blanks: the gap before hello ({gap}) did not grow past {last_gap}"
+            );
+            last_gap = gap;
+        }
+    }
+
     #[test]
     fn claude_inverse_space_cursor_stays_attached_to_arabic_input() {
         use alacritty_terminal::{
