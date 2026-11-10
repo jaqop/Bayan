@@ -923,7 +923,9 @@ pub(crate) fn sweep_stale_integration_dirs() {
         let Some(cutoff) = cutoff else {
             return;
         };
-        let Some(sid) = current_user_sid().ok() else {
+        // TokenOwner, not TokenUser. An elevated token's new directories are
+        // owned by Administrators, which is the token owner, not the user SID.
+        let Some(sid) = token_owner_sid().ok() else {
             return;
         };
         for parent in [std::env::temp_dir(), programdata_dir()] {
@@ -1150,6 +1152,58 @@ fn current_user_sid() -> std::io::Result<String> {
             Ok(text)
         } else {
             Err(std::io::Error::other("token user was not an SDDL sid"))
+        }
+    }
+}
+
+/// SID that owns objects this process creates. Elevated, that is usually
+/// BUILTIN\Administrators rather than the user account.
+fn token_owner_sid() -> std::io::Result<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenOwner, TOKEN_OWNER, TOKEN_QUERY};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    // SAFETY: same token and buffer rules as `current_user_sid`. TokenOwner's
+    // SID points into `buf` until ConvertSidToStringSidW copies it.
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut needed = 0u32;
+        GetTokenInformation(token, TokenOwner, std::ptr::null_mut(), 0, &mut needed);
+        if needed == 0 {
+            CloseHandle(token);
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut buf = vec![0u64; needed.div_ceil(8) as usize];
+        let ok = GetTokenInformation(
+            token,
+            TokenOwner,
+            buf.as_mut_ptr().cast(),
+            (buf.len() * std::mem::size_of::<u64>()) as u32,
+            &mut needed,
+        );
+        CloseHandle(token);
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let owner = &*buf.as_ptr().cast::<TOKEN_OWNER>();
+        let mut out = std::ptr::null_mut();
+        if ConvertSidToStringSidW(owner.Owner, &mut out) == 0 || out.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut n = 0usize;
+        while *out.add(n) != 0 {
+            n += 1;
+        }
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(out, n));
+        LocalFree(out.cast());
+        if text.starts_with("S-1-") {
+            Ok(text)
+        } else {
+            Err(std::io::Error::other("token owner was not an SDDL sid"))
         }
     }
 }
@@ -1520,49 +1574,15 @@ fn find_real_bash() -> Option<PathBuf> {
 
 #[cfg(test)]
 fn set_dir_mtime(path: &Path, when: std::time::SystemTime) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, SetFileTime, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        OPEN_EXISTING,
-    };
-    const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+    use std::os::windows::fs::OpenOptionsExt;
+    // A directory handle needs backup semantics or CreateFile refuses it.
+    // FILE_ATTRIBUTE_NORMAL must not be combined with that flag.
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let ticks = when
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| std::io::Error::other(e.to_string()))?
-        .as_nanos()
-        / 100
-        + 116_444_736_000_000_000u128;
-    let stamp = FILETIME {
-        dwLowDateTime: ticks as u32,
-        dwHighDateTime: (ticks >> 32) as u32,
-    };
-    // SAFETY: `wide` is NUL-terminated. BACKUP_SEMANTICS opens a directory.
-    // SetFileTime writes the one FILETIME we pass. CloseHandle releases the
-    // handle. INVALID_HANDLE_VALUE is failure.
-    unsafe {
-        let handle = CreateFileW(
-            wide.as_ptr(),
-            FILE_WRITE_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
-            std::ptr::null_mut(),
-        );
-        if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-            return Err(std::io::Error::last_os_error());
-        }
-        let ok = SetFileTime(handle, std::ptr::null(), std::ptr::null(), &stamp);
-        CloseHandle(handle);
-        if ok == 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?
+        .set_modified(when)
 }
 #[cfg(test)]
 mod tests {
@@ -1992,10 +2012,23 @@ mod tests {
             .checked_sub(std::time::Duration::from_secs(48 * 60 * 60))
             .unwrap();
         set_dir_mtime(&old, old_time).unwrap();
-        let sid = current_user_sid().unwrap();
         let cutoff = std::time::SystemTime::now()
             .checked_sub(std::time::Duration::from_secs(12 * 60 * 60))
             .unwrap();
+        let modified = std::fs::metadata(&old).unwrap().modified().unwrap();
+        assert!(
+            modified <= cutoff,
+            "directory mtime did not move into the past: {modified:?} cutoff {cutoff:?}"
+        );
+        // The CI token sometimes owns new directories as Administrators, not
+        // as the user SID `current_user_sid` returns. Sweep with the owner
+        // Windows actually stored, which is the check production makes.
+        let sid = token_owner_sid().expect("token owner");
+        assert_eq!(
+            owner_sid(&old).as_deref(),
+            Some(sid.as_str()),
+            "a directory this process created is owned by the token owner"
+        );
         sweep_parent(&parent, cutoff, &sid);
         assert!(!old.exists(), "a 48-hour-old directory is a crashed pane");
         assert!(fresh.exists(), "a directory from this run stays");
