@@ -410,12 +410,15 @@ pub struct ImageSprite {
 /// Quads for `snaps`, in pane pixels. `screen_top` is the absolute line of
 /// viewport row 0 when the view is not scrolled; `display_offset` moves
 /// history down into the pane. The quad is clipped to `clip`.
+#[allow(clippy::too_many_arguments)]
 pub fn image_sprites(
     clip: Rect,
     cell_w: f32,
     cell_h: f32,
     screen_top: u64,
     display_offset: u64,
+    columns: usize,
+    row_rtl: impl Fn(usize) -> bool,
     snaps: &[crate::images::ImageSnap],
 ) -> Vec<ImageSprite> {
     if !(cell_w > 0.0 && cell_h > 0.0) {
@@ -427,7 +430,13 @@ pub fn image_sprites(
             continue;
         }
         let vrow = snap.line as i64 - screen_top as i64 + display_offset as i64;
-        let x = clip.0 as f32 + snap.col as f32 * cell_w;
+        let mirrored = vrow >= 0 && row_rtl(vrow as usize);
+        let visual_col = if mirrored {
+            columns.saturating_sub(snap.col.saturating_add(snap.cols))
+        } else {
+            snap.col
+        };
+        let x = clip.0 as f32 + visual_col as f32 * cell_w;
         let y = clip.1 as f32 + vrow as f32 * cell_h;
         let w = snap.cols as f32 * cell_w;
         let h = snap.rows as f32 * cell_h;
@@ -6893,7 +6902,7 @@ mod tests {
         let mut c1 = Vec::new();
         let mut c2 = Vec::new();
         let px = base64::engine::general_purpose::STANDARD.encode([255u8, 0, 0]);
-        let img = format!("\x1b_Ga=T,f=24,s=1,v=1,c=2,r=1,C=0,q=2;{px}\x1b\\");
+        let img = format!("\x1b_Ga=T,f=24,s=1,v=1,c=2,r=1,C=1,q=2;{px}\x1b\\");
         let arabic = "\x1b[1;12Hمرحبا";
         crate::term::process_chunk(&mut p1, &mut with_img, &mut m1, &mut c1, img.as_bytes());
         crate::term::process_chunk(&mut p1, &mut with_img, &mut m1, &mut c1, arabic.as_bytes());

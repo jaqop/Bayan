@@ -4603,7 +4603,16 @@ impl App {
                             m.claude_from_abs,
                         )
                     };
-                    let image_snaps = pane.session.meta.lock_or_recover().images.snapshot();
+                    // Cell size is published before the term lock. Taking meta
+                    // again while `term` is held deadlocks the reader, which
+                    // locks term and then meta.
+                    let cw = renderer.cell_w.round().max(1.0) as u32;
+                    let ch = renderer.cell_h.round().max(1.0) as u32;
+                    let image_snaps = {
+                        let mut m = pane.session.meta.lock_or_recover();
+                        m.images.set_cell_px(cw, ch);
+                        m.images.snapshot()
+                    };
                     let t = pane.session.term.lock();
                     // Explicit BDSM suppresses reordering for the whole pane,
                     // Claude restoration included, and only while the command
@@ -4637,6 +4646,8 @@ impl App {
                         renderer.cell_h,
                         evicted.saturating_add(history),
                         off,
+                        t.columns(),
+                        |vrow| reorder && viewport_row_is_rtl(&t, off, vrow),
                         &image_snaps,
                     ));
                     let line_dir: Vec<bidi_ctl::ParagraphDir> = if use_stamps {
@@ -4869,12 +4880,20 @@ impl App {
         // differential redraw: an identical quad set + unchanged atlas means
         // the frame is pixel-for-pixel the last one — skip the submit. (An
         // atlas upload this frame always redraws; so does a heal.)
-        let mut frame_key = bytemuck::cast_slice::<gpu::Vertex, u8>(&verts).to_vec();
-        for sprite in &sprites {
-            frame_key.extend_from_slice(&sprite.cookie.to_le_bytes());
-            frame_key.extend_from_slice(bytemuck::cast_slice(&sprite.verts));
-        }
-        let unchanged = self.last_frame_size == Some(px) && !heal && frame_key == self.last_frame;
+        let frame_bytes = bytemuck::cast_slice::<gpu::Vertex, u8>(&verts);
+        let mut extended = Vec::new();
+        let frame_key: &[u8] = if sprites.is_empty() {
+            frame_bytes
+        } else {
+            extended.extend_from_slice(frame_bytes);
+            for sprite in &sprites {
+                extended.extend_from_slice(&sprite.cookie.to_le_bytes());
+                extended.extend_from_slice(bytemuck::cast_slice(&sprite.verts));
+            }
+            &extended
+        };
+        let unchanged =
+            self.last_frame_size == Some(px) && !heal && frame_key == self.last_frame.as_slice();
         if unchanged {
             return;
         }
@@ -4898,7 +4917,7 @@ impl App {
             return;
         }
         self.last_frame.clear();
-        self.last_frame.extend_from_slice(&frame_key);
+        self.last_frame.extend_from_slice(frame_key);
         self.last_frame_size = Some(px);
         if heal {
             window.request_redraw();
@@ -5621,6 +5640,19 @@ fn run() -> Result<(), String> {
         return Err(error);
     }
     result.map_err(|error| format!("The event loop failed: {error}"))
+}
+
+/// A viewport row whose cells include an RTL letter. Used to mirror an image
+/// onto the visual side of a shaped row without changing how the text is shaped.
+fn viewport_row_is_rtl<T: alacritty_terminal::event::EventListener>(
+    term: &alacritty_terminal::term::Term<T>,
+    display_offset: u64,
+    vrow: usize,
+) -> bool {
+    use alacritty_terminal::index::{Column, Line};
+    let line = vrow as i32 - display_offset as i32;
+    let row = &term.grid()[Line(line)];
+    (0..term.columns()).any(|c| render::is_rtl(row[Column(c)].c))
 }
 
 /// OSC 52 writes only from the focused pane of the active tab.

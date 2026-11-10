@@ -914,8 +914,9 @@ focused pane; no value enables a clipboard read. The decode backstop is
 Sixel (`DCS q`), Kitty graphics (`APC _G`) and iTerm2 (`OSC 1337 ; File=`
 with `inline=1`) are placed on the grid cell under the cursor. They scroll
 with that row, leave when the row leaves the scrollback, and clear with
-ED/EL, RIS, and a resize (a resize reflows rows, so the anchor would no
-longer name the text). The alt screen has its own placements; leaving it
+ED 2, ED 3, and RIS. EL and a partial ED leave Kitty graphics in place.
+A resize drops them only when the column count changes, which is when rows
+reflow; switching tabs does not. The alt screen has its own placements; leaving it
 drops those and shows the primary screen's images again. Rows that also
 contain Arabic still take the whole-line shaper.
 
@@ -944,8 +945,10 @@ The flags are inherit-cursor, the resize quirk, and Win32 input mode
 (`vendor/portable-pty/src/win/psuedocon.rs`). In that mode conhost parses
 DCS and APC and does not forward them, so a real Windows console host will
 not deliver Sixel or Kitty graphics. OSC is forwarded, which is why OSC 7,
-9, 52 and 133 already work, and why iTerm2 inline images can arrive. The
-parsers and the quad builder are covered by unit tests either way.
+9, 52 and 133 already work, so an iTerm2 `OSC 1337` is not stripped the way
+DCS and APC are. Whether a full inline image survives conhost's OSC limits
+has not been checked on a live Windows console (see wezterm#3624 and
+Rio#1764). The parsers and the quad builder are covered by unit tests either way.
 
 ## BiDi controls and the current directory
 
@@ -968,7 +971,9 @@ when a sequence is split across reads.
   including `ESC ESC c`, `ESC` plus a C0 byte then `c`, and `ESC` plus a
   byte >= 0x80 then `c`) and when a `?1049` / `?47` / `?1047` CSI is seen,
   including a colon subparameter such as `?1049:0`, even if a second one in
-  the same read toggles the mode back. A resize drops SCP stamps. A BDSM or
+  the same read toggles the mode back. A resize drops SCP stamps when the
+  column count changes (rows reflow); a row-only resize and a same-size
+  resize leave them. A BDSM or
   SCP that ends an open OSC is stripped only after that OSC is closed, so
   the text after it is not swallowed.
 

@@ -1677,7 +1677,27 @@ pub(crate) fn process_chunk<T: EventListener>(
     // bytes (the terminator) and are larger than the BiDi filter's hold,
     // so the filter never sees them. What remains is the stream BDSM, SCP,
     // and OSC 133 already understand.
-    let pieces = meta.image_in.pull(data);
+    let room = meta.images.inflight_room();
+    let mut pieces = meta.image_in.pull_within(data, room);
+    // Sixel and PNG are decoded before the rest of the chunk mutates the
+    // grid. The reader calls the same warm step with the locks released.
+    crate::images::warm_inbound(&mut pieces, &meta.images.limits());
+    // The completed payload has left the carry. Charge only what is still open
+    // before the decoded image itself is charged.
+    meta.images.sync_inflight(meta.image_in.carry_len());
+    let ev = apply_image_pieces(parser, t, meta, carry, pieces);
+    // A chunked upload now sits in `pending`. Charge it before the next read.
+    meta.images.sync_inflight(meta.image_in.carry_len());
+    ev
+}
+
+fn apply_image_pieces<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    meta: &mut SessionMeta,
+    carry: &mut Vec<u8>,
+    pieces: Vec<crate::images::Inbound>,
+) -> ChunkEvents {
     let mut ev = ChunkEvents::default();
     for piece in pieces {
         match piece {
@@ -1724,7 +1744,13 @@ pub(crate) fn process_chunk<T: EventListener>(
                 let effect = meta.images.ingest(other, &at);
                 ev.pty_replies.extend(effect.replies);
                 if effect.move_down > 0 {
-                    let seq = format!("\x1b[{}B\x1b[G", effect.move_down);
+                    // IND scrolls at the bottom margin. CUD does not, so an
+                    // image on the last row would be overwritten by the next line.
+                    let mut seq = String::new();
+                    for _ in 0..effect.move_down {
+                        seq.push_str("\x1bD");
+                    }
+                    seq.push('\r');
                     let part = process_bytes(parser, t, meta, carry, seq.as_bytes());
                     merge_chunk(&mut ev, part);
                 }
@@ -2536,6 +2562,20 @@ impl Session {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        // Lift and decode images before taking the terminal
+                        // lock. A large sixel or PNG must not freeze the UI
+                        // thread, which draws under that lock.
+                        let (filter, pieces) = {
+                            let mut m = meta2.lock_or_recover();
+                            let room = m.images.inflight_room();
+                            let limits = m.images.limits();
+                            let mut filter = std::mem::take(&mut m.image_in);
+                            let mut pieces = filter.pull_within(&buf[..n], room);
+                            // Drop the meta guard before decoding.
+                            drop(m);
+                            crate::images::warm_inbound(&mut pieces, &limits);
+                            (filter, pieces)
+                        };
                         let (ev, out, sync_deadline) = {
                             // term, then meta, then parser. reset_keyboard
                             // on the UI thread takes the same order. The
@@ -2544,9 +2584,14 @@ impl Session {
                             let mut t = term2.lock();
                             let mut m = meta2.lock_or_recover();
                             let mut p = parser2.lock_or_recover();
+                            m.image_in = filter;
+                            let carry_len = m.image_in.carry_len();
+                            m.images.sync_inflight(carry_len);
                             batch.lock_or_recover().begin();
                             let mut ev =
-                                process_chunk(&mut p, &mut t, &mut m, &mut carry, &buf[..n]);
+                                apply_image_pieces(&mut p, &mut t, &mut m, &mut carry, pieces);
+                            let open = m.image_in.carry_len();
+                            m.images.sync_inflight(open);
                             let replies = std::mem::take(&mut ev.pty_replies);
                             let out = batch.lock_or_recover().finish(ev.clean_claude, replies);
                             (ev, out, p.sync_timeout().sync_timeout())
@@ -2655,22 +2700,38 @@ impl Session {
     }
 
     pub fn resize(&mut self, size: TermSize) {
+        let reflow = {
+            let t = self.term.lock();
+            match column_reflow(t.columns(), t.screen_lines(), size) {
+                None => return,
+                Some(reflow) => reflow,
+            }
+        };
         let _ = self.master.resize(PtySize {
             rows: size.rows as u16,
             cols: size.cols as u16,
             pixel_width: 0,
             pixel_height: 0,
         });
-        // Drop the term lock before meta. A resize reflows rows, so SCP
-        // stamps and image anchors no longer name the text they were
-        // written on.
         self.term.lock().resize(size);
-        after_resize(&mut self.meta.lock_or_recover());
+        if reflow {
+            after_resize(&mut self.meta.lock_or_recover());
+        }
     }
 }
 
-/// Resize drops SCP stamps and inline images: both are anchored to rows
-/// the reflow no longer keeps.
+/// `None` when the size is unchanged. `Some(true)` when the column count
+/// changes and rows will reflow. `Some(false)` when only the row count changes.
+pub(crate) fn column_reflow(old_cols: usize, old_rows: usize, size: TermSize) -> Option<bool> {
+    if old_cols == size.cols && old_rows == size.rows {
+        None
+    } else {
+        Some(old_cols != size.cols)
+    }
+}
+
+/// A column change reflows rows, so SCP stamps and image anchors no longer
+/// name the text they were written on.
 pub(crate) fn after_resize(meta: &mut SessionMeta) {
     meta.bidi_mut().on_resize();
     meta.images.on_resize();

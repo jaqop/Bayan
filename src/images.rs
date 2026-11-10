@@ -138,9 +138,15 @@ impl ImageBudget {
         self.limits
     }
 
-    #[cfg(test)]
     pub fn charged_bytes(&self) -> usize {
         self.bytes.load(Ordering::Relaxed)
+    }
+
+    fn fits(&self, bytes: usize, images: usize) -> bool {
+        let b = self.bytes.load(Ordering::Relaxed);
+        let n = self.images.load(Ordering::Relaxed);
+        b.saturating_add(bytes) <= self.limits.max_session_bytes
+            && n.saturating_add(images) <= self.limits.max_session_images
     }
 
     fn try_charge(&self, bytes: usize, images: usize) -> bool {
@@ -235,6 +241,13 @@ struct Img {
     pinned: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Proto {
+    Sixel,
+    Kitty,
+    Iterm,
+}
+
 struct Placement {
     id: u32,
     image: u32,
@@ -243,6 +256,8 @@ struct Placement {
     cols: usize,
     rows: usize,
     alt: bool,
+    proto: Proto,
+    z: i32,
 }
 
 struct Raster {
@@ -279,6 +294,18 @@ pub struct ImageStore {
     next_cookie: u64,
     on_alt: bool,
     pending: Option<PendingKitty>,
+    /// Pixel size of one cell, published by the renderer. iTerm `auto`/`px`
+    /// and Kitty's implicit cell size use this, not a fixed 8×16.
+    cell_w: u32,
+    cell_h: u32,
+    /// Open-sequence bytes already charged, split so a finished kitty upload
+    /// can release its base64 before the decoded pixels are charged.
+    inflight_carry: usize,
+    inflight_pending: usize,
+    /// Last screen the reader placed into, so quota eviction can prefer
+    /// images that are not on that screen.
+    view_top: u64,
+    view_rows: usize,
 }
 
 struct PendingKitty {
@@ -289,7 +316,11 @@ struct PendingKitty {
     quiet: u8,
     columns: Option<u32>,
     rows: Option<u32>,
-    cursor_move: bool,
+    /// `true` when the client sent `C=1` (do not move the cursor).
+    hold_cursor: bool,
+    /// `true` when the client sent `i=`. Replies are suppressed otherwise.
+    client_id: bool,
+    action: Action,
     pinned: bool,
     b64: String,
 }
@@ -313,6 +344,93 @@ impl ImageStore {
             next_cookie: 1,
             on_alt: false,
             pending: None,
+            cell_w: CELL_PX_W,
+            cell_h: CELL_PX_H,
+            inflight_carry: 0,
+            inflight_pending: 0,
+            view_top: 0,
+            view_rows: 0,
+        }
+    }
+
+    pub(crate) fn limits(&self) -> ImageLimits {
+        self.limits
+    }
+
+    fn cell_span(
+        &self,
+        px_w: u32,
+        px_h: u32,
+        cols: Option<u32>,
+        rows: Option<u32>,
+    ) -> (usize, usize) {
+        cell_span(px_w, px_h, cols, rows, self.cell_w, self.cell_h)
+    }
+
+    /// The window publishes the real cell size. `0` leaves the previous value.
+    pub fn set_cell_px(&mut self, w: u32, h: u32) {
+        if w > 0 {
+            self.cell_w = w;
+        }
+        if h > 0 {
+            self.cell_h = h;
+        }
+    }
+
+    /// How many more payload bytes this pane may hold without passing the
+    /// pane cap or the shared session cap. Open sequences are included.
+    pub(crate) fn inflight_room(&self) -> usize {
+        let pane = self.limits.max_pane_bytes.saturating_sub(self.pane_bytes);
+        let session = self
+            .budget
+            .limits
+            .max_session_bytes
+            .saturating_sub(self.budget.charged_bytes());
+        pane.min(session)
+    }
+
+    /// Charge or release the open-sequence buffer so it counts toward the caps.
+    pub(crate) fn sync_inflight(&mut self, carry: usize) {
+        self.set_charged(true, carry);
+        let pending = self.pending.as_ref().map(|p| p.b64.len()).unwrap_or(0);
+        self.set_charged(false, pending);
+    }
+
+    /// The kitty base64 is about to become pixels (or was dropped). Release
+    /// that charge first so the decoded image is not counted on top of it.
+    fn release_pending_charge(&mut self) {
+        self.set_charged(false, 0);
+    }
+
+    fn set_charged(&mut self, carry: bool, now: usize) {
+        let cur = if carry {
+            self.inflight_carry
+        } else {
+            self.inflight_pending
+        };
+        if now == cur {
+            return;
+        }
+        if now > cur {
+            let add = now - cur;
+            self.make_room(add, false);
+            if self.pane_bytes.saturating_add(add) <= self.limits.max_pane_bytes
+                && self.budget.try_charge(add, 0)
+            {
+                self.pane_bytes += add;
+                if carry {
+                    self.inflight_carry = now;
+                } else {
+                    self.inflight_pending = now;
+                }
+            }
+        } else {
+            self.release(cur - now, 0);
+            if carry {
+                self.inflight_carry = now;
+            } else {
+                self.inflight_pending = now;
+            }
         }
     }
 
@@ -384,6 +502,12 @@ impl ImageStore {
         self.placements.clear();
         self.pending = None;
         self.on_alt = false;
+        let open = self.inflight_carry.saturating_add(self.inflight_pending);
+        if open > 0 {
+            self.budget.uncharge(open, 0);
+            self.inflight_carry = 0;
+            self.inflight_pending = 0;
+        }
         self.pane_bytes = 0;
     }
 
@@ -439,39 +563,63 @@ impl ImageStore {
     }
 
     pub(crate) fn ingest(&mut self, cmd: Inbound, at: &PlaceAt) -> Effect {
+        self.view_top = at.screen_top;
+        self.view_rows = at.screen_rows;
         if !self.limits.enabled {
             return Effect::default();
         }
         match cmd {
             Inbound::Bytes(_) => Effect::default(),
-            Inbound::Sixel { p2, data, overflow } => self.place_sixel(p2, &data, overflow, at),
+            Inbound::Sixel {
+                p2,
+                data,
+                overflow,
+                raster,
+            } => self.place_sixel(p2, &data, overflow, raster, at),
             Inbound::Kitty { body, overflow } => self.place_kitty(&body, overflow, at),
-            Inbound::Iterm { body, overflow } => self.place_iterm(&body, overflow, at),
+            Inbound::Iterm {
+                body,
+                overflow,
+                raster,
+            } => self.place_iterm(&body, overflow, raster, at),
         }
     }
 
-    fn place_sixel(&mut self, p2: u8, data: &[u8], overflow: bool, at: &PlaceAt) -> Effect {
+    fn place_sixel(
+        &mut self,
+        p2: u8,
+        data: &[u8],
+        overflow: bool,
+        raster: Option<Raster>,
+        at: &PlaceAt,
+    ) -> Effect {
         if overflow {
             return Effect::default();
         }
-        let Some(raster) = decode_sixel(p2, data, &self.limits) else {
+        let Some(raster) = raster.or_else(|| decode_sixel(p2, data, &self.limits)) else {
             return Effect::default();
         };
-        let (cols, rows) = cell_span(raster.w, raster.h, None, None);
+        let (cols, rows) = self.cell_span(raster.w, raster.h, None, None);
         let Some(id) = self.alloc_id() else {
             return Effect::default();
         };
         if !self.store_image(id, raster, false) {
             return Effect::default();
         }
-        let move_down = self.add_placement(id, None, at, cols, rows, true);
+        let move_down = self.add_placement(id, None, at, cols, rows, true, Proto::Sixel, 0);
         Effect {
             move_down,
             ..Effect::default()
         }
     }
 
-    fn place_iterm(&mut self, body: &[u8], overflow: bool, at: &PlaceAt) -> Effect {
+    fn place_iterm(
+        &mut self,
+        body: &[u8],
+        overflow: bool,
+        raster: Option<Raster>,
+        at: &PlaceAt,
+    ) -> Effect {
         if overflow {
             return Effect::default();
         }
@@ -484,23 +632,37 @@ impl ImageStore {
         if parsed.size.is_some_and(|n| n > self.limits.max_bytes) {
             return Effect::default();
         }
-        let Some(bytes) = decode_b64(&parsed.b64) else {
-            return Effect::default();
+        let raster = if let Some(raster) = raster {
+            raster
+        } else {
+            let Some(bytes) = decode_b64(&parsed.b64) else {
+                return Effect::default();
+            };
+            if bytes.len() > self.limits.max_bytes {
+                return Effect::default();
+            }
+            let Some(raster) = decode_png(&bytes, &self.limits) else {
+                return Effect::default();
+            };
+            raster
         };
-        if bytes.len() > self.limits.max_bytes {
-            return Effect::default();
-        }
-        let Some(raster) = decode_png(&bytes, &self.limits) else {
-            return Effect::default();
-        };
-        let (cols, rows) = iterm_cells(&parsed, raster.w, raster.h, at);
+        let (cols, rows) = iterm_cells(&parsed, raster.w, raster.h, at, self.cell_w, self.cell_h);
         let Some(id) = self.alloc_id() else {
             return Effect::default();
         };
         if !self.store_image(id, raster, false) {
             return Effect::default();
         }
-        let move_down = self.add_placement(id, None, at, cols, rows, parsed.move_cursor);
+        let move_down = self.add_placement(
+            id,
+            None,
+            at,
+            cols,
+            rows,
+            parsed.move_cursor,
+            Proto::Iterm,
+            0,
+        );
         Effect {
             move_down,
             ..Effect::default()
@@ -509,33 +671,55 @@ impl ImageStore {
 
     fn place_kitty(&mut self, body: &[u8], overflow: bool, at: &PlaceAt) -> Effect {
         if overflow {
-            return self.kitty_fail(0, true);
+            return Effect::default();
         }
-        let Some((fields, payload)) = parse_kitty(body) else {
-            return self.kitty_fail(0, true);
+        let Some((mut fields, payload)) = parse_kitty(body) else {
+            // No `i` was parsed, so there is nothing to write back to the program.
+            return Effect::default();
         };
+        // A continuation omits `a`. Keep the action of the open transmission
+        // instead of falling back to the default (`t`).
+        if !fields.action_set {
+            if let Some(p) = &self.pending {
+                fields.action = p.action;
+                fields.action_set = true;
+            }
+        }
         if fields.transmission != Trans::Direct {
             // File, temp-file, and shared-memory payloads are not decoded
             // and are not opened. Drop the bytes.
             self.pending = None;
-            return self.kitty_fail(fields.quiet, false);
+            return self.kitty_fail(&fields);
         }
         if fields.compression {
             self.pending = None;
-            return self.kitty_fail(fields.quiet, false);
+            return self.kitty_fail(&fields);
         }
         match fields.action {
             Action::Delete => self.kitty_delete(&fields, at),
             Action::Put => self.kitty_put(&fields, at),
+            Action::Query => self.kitty_query(&fields),
             Action::Transmit | Action::TransmitDisplay => self.kitty_transmit(fields, payload, at),
-            Action::Other => self.kitty_fail(fields.quiet, false),
+            Action::Other => self.kitty_fail(&fields),
         }
     }
 
-    fn kitty_fail(&mut self, quiet: u8, _parse: bool) -> Effect {
+    /// `a=q` checks that we speak the protocol. It stores nothing.
+    fn kitty_query(&mut self, fields: &KittyFields) -> Effect {
+        Effect {
+            replies: kitty_reply(fields.quiet, self.reply_id(fields), None, true),
+            move_down: 0,
+        }
+    }
+
+    fn reply_id(&self, fields: &KittyFields) -> Option<u32> {
+        fields.client_id.then(|| fields.image_id.unwrap_or(0))
+    }
+
+    fn kitty_fail(&mut self, fields: &KittyFields) -> Effect {
         self.pending = None;
         Effect {
-            replies: kitty_reply(quiet, None, None, false),
+            replies: kitty_reply(fields.quiet, self.reply_id(fields), None, false),
             move_down: 0,
         }
     }
@@ -550,38 +734,35 @@ impl ImageStore {
         } else {
             match self.alloc_id() {
                 Some(id) => id,
-                None => return self.kitty_fail(quiet, false),
+                None => return self.kitty_fail(&fields),
             }
         };
-        if !matches!(fields.format, 24 | 32 | 100) {
+        let continuing = self.pending_matches(id);
+        if !continuing && !matches!(fields.format, 24 | 32 | 100) {
             self.pending = None;
-            return self.kitty_fail(quiet, false);
+            return self.kitty_fail(&fields);
         }
-        if matches!(fields.format, 24 | 32)
+        if !continuing
+            && matches!(fields.format, 24 | 32)
             && (fields.width.is_none() || fields.height.is_none())
-            && self.pending.is_none()
         {
-            // Size can arrive on the first chunk only. A continuation keeps
-            // the size already stored.
-            if !self.pending_matches(id) {
-                return self.kitty_fail(quiet, false);
-            }
+            return self.kitty_fail(&fields);
         }
         if let (Some(w), Some(h)) = (fields.width, fields.height) {
             if !dims_ok(w, h, &self.limits) {
                 self.pending = None;
-                return self.kitty_fail(quiet, false);
+                return self.kitty_fail(&fields);
             }
         }
         let piece = std::str::from_utf8(payload).unwrap_or("");
-        let start = if self.pending_matches(id) {
+        let start = if continuing {
             self.pending.take().unwrap()
         } else {
             self.pending = None;
             let (w, h) = match (fields.width, fields.height) {
                 (Some(w), Some(h)) => (w, h),
                 _ if fields.format == 100 => (0, 0),
-                _ => return self.kitty_fail(quiet, false),
+                _ => return self.kitty_fail(&fields),
             };
             PendingKitty {
                 id,
@@ -591,31 +772,35 @@ impl ImageStore {
                 quiet,
                 columns: fields.columns,
                 rows: fields.rows,
-                cursor_move: fields.cursor_move,
+                hold_cursor: fields.hold_cursor,
+                client_id: fields.client_id,
+                action: fields.action,
                 pinned: fields.action == Action::Transmit,
                 b64: String::new(),
             }
         };
         let mut pending = start;
-        // Later chunks may fill in placement hints. The first chunk's size
-        // and format stay.
+        if fields.action_set {
+            pending.action = fields.action;
+            pending.pinned = fields.action == Action::Transmit;
+        }
         if fields.columns.is_some() {
             pending.columns = fields.columns;
         }
         if fields.rows.is_some() {
             pending.rows = fields.rows;
         }
-        if fields.cursor_move {
-            pending.cursor_move = true;
+        if fields.cursor_set {
+            pending.hold_cursor = fields.hold_cursor;
         }
-        if fields.action == Action::Transmit {
-            pending.pinned = true;
+        if fields.client_id {
+            pending.client_id = true;
         }
         let extra = piece.chars().filter(|c| !c.is_ascii_whitespace()).count();
         let cap = self.limits.max_bytes.saturating_mul(4) / 3 + 8;
-        if pending.b64.len().saturating_add(extra) > cap {
+        if extra > self.inflight_room() || pending.b64.len().saturating_add(extra) > cap {
             self.pending = None;
-            return self.kitty_fail(quiet, false);
+            return self.kitty_fail(&fields);
         }
         pending
             .b64
@@ -625,30 +810,40 @@ impl ImageStore {
             return Effect::default();
         }
         let quiet = pending.quiet;
-        let place = fields.action != Action::Transmit && !pending.pinned;
-        // `a=t` on a later chunk can pin; `a=T` on the first does not.
-        let pinned = pending.pinned;
-        let cursor_move = pending.cursor_move && !pinned;
+        let place = pending.action == Action::TransmitDisplay;
+        let pinned = pending.pinned || pending.action == Action::Transmit;
+        let hold_cursor = pending.hold_cursor;
         let columns = pending.columns;
-        let rows = pending.rows;
+        let rows_hint = pending.rows;
         let id = pending.id;
+        let client_id = pending.client_id;
         let decoded = match finish_kitty(&pending, &self.limits) {
             Some(r) => r,
-            None => return self.kitty_fail(quiet, false),
+            None => return self.kitty_fail(&fields),
         };
+        // `pending` is no longer in `self.pending`. Drop its charge before
+        // the pixels are charged, or the pane would count both.
+        self.release_pending_charge();
         if !self.store_image(id, decoded, pinned) {
-            return self.kitty_fail(quiet, false);
+            return self.kitty_fail(&fields);
         }
         let mut move_down = 0;
-        if place || fields.action == Action::TransmitDisplay {
+        if place {
             let img = &self.images[&id];
-            let (cols, rows) = cell_span(img.w, img.h, columns, rows);
-            let do_move =
-                cursor_move || (fields.action == Action::TransmitDisplay && fields.cursor_move);
-            move_down = self.add_placement(id, fields.placement_id, at, cols, rows, do_move);
+            let (cols, rows) = self.cell_span(img.w, img.h, columns, rows_hint);
+            move_down = self.add_placement(
+                id,
+                fields.placement_id,
+                at,
+                cols,
+                rows,
+                !hold_cursor,
+                Proto::Kitty,
+                fields.z,
+            );
         }
         Effect {
-            replies: kitty_reply(quiet, Some(id), fields.placement_id, true),
+            replies: kitty_reply(quiet, client_id.then_some(id), fields.placement_id, true),
             move_down,
         }
     }
@@ -659,15 +854,23 @@ impl ImageStore {
 
     fn kitty_put(&mut self, fields: &KittyFields, at: &PlaceAt) -> Effect {
         let Some(id) = fields.image_id else {
-            return self.kitty_fail(fields.quiet, false);
+            return self.kitty_fail(fields);
         };
         if !self.images.contains_key(&id) {
-            return self.kitty_fail(fields.quiet, false);
+            return self.kitty_fail(fields);
         }
         let img = &self.images[&id];
-        let (cols, rows) = cell_span(img.w, img.h, fields.columns, fields.rows);
-        let move_down =
-            self.add_placement(id, fields.placement_id, at, cols, rows, fields.cursor_move);
+        let (cols, rows) = self.cell_span(img.w, img.h, fields.columns, fields.rows);
+        let move_down = self.add_placement(
+            id,
+            fields.placement_id,
+            at,
+            cols,
+            rows,
+            !fields.hold_cursor,
+            Proto::Kitty,
+            fields.z,
+        );
         Effect {
             replies: kitty_reply(fields.quiet, Some(id), fields.placement_id, true),
             move_down,
@@ -675,7 +878,10 @@ impl ImageStore {
     }
 
     fn kitty_delete(&mut self, fields: &KittyFields, at: &PlaceAt) -> Effect {
+        // An unfinished chunked upload is aborted by any delete.
+        self.pending = None;
         let which = fields.delete.unwrap_or('a');
+        let free = which.is_ascii_uppercase();
         let alt = self.on_alt;
         match which {
             'A' => {
@@ -684,49 +890,65 @@ impl ImageStore {
                     self.free_image(id);
                 }
                 self.placements.clear();
-                self.pending = None;
-            }
-            'i' | 'I' => {
-                let Some(id) = fields.image_id else {
-                    return self.kitty_fail(fields.quiet, false);
-                };
-                if let Some(pid) = fields.placement_id {
-                    self.placements.retain(|p| !(p.image == id && p.id == pid));
-                    if which == 'I' {
-                        self.gc();
-                    }
-                } else {
-                    self.free_image(id);
-                }
-            }
-            'p' | 'q' => {
-                let Some(pid) = fields.placement_id else {
-                    return self.kitty_fail(fields.quiet, false);
-                };
-                self.placements.retain(|p| p.id != pid);
-                if which == 'q' {
-                    self.gc();
-                }
-            }
-            'c' => {
-                self.placements
-                    .retain(|p| p.alt != alt || !cell_in(p, at.line, at.col));
-                self.gc();
             }
             'a' => {
                 self.placements
                     .retain(|p| p.alt != alt || !rows_overlap(p, at.screen_top, at.screen_rows));
-                self.gc();
             }
-            _ => return self.kitty_fail(fields.quiet, false),
+            'i' | 'I' => {
+                let Some(id) = fields.image_id else {
+                    return self.kitty_fail(fields);
+                };
+                if let Some(pid) = fields.placement_id {
+                    self.placements.retain(|p| !(p.image == id && p.id == pid));
+                    if free {
+                        self.gc();
+                    }
+                } else if free {
+                    self.free_image(id);
+                } else {
+                    self.placements.retain(|p| p.image != id);
+                }
+            }
+            'p' | 'P' | 'q' | 'Q' => {
+                // `d=p` / `d=q` name a cell (x, y), 1-based. They are not placement ids.
+                let Some((line, col)) = spec_cell(at, fields.cell_x, fields.cell_y) else {
+                    return self.kitty_fail(fields);
+                };
+                let z = fields.z;
+                let check_z = matches!(which, 'q' | 'Q');
+                self.placements.retain(|p| {
+                    let hit = p.alt == alt && cell_in(p, line, col) && (!check_z || p.z == z);
+                    !hit
+                });
+                if free {
+                    self.gc();
+                }
+            }
+            'c' | 'C' => {
+                self.placements
+                    .retain(|p| p.alt != alt || !cell_in(p, at.line, at.col));
+                if free {
+                    self.gc();
+                }
+            }
+            _ => return self.kitty_fail(fields),
         }
         Effect {
-            replies: kitty_reply(fields.quiet, fields.image_id, fields.placement_id, true),
+            replies: kitty_reply(
+                fields.quiet,
+                self.reply_id(fields),
+                fields.placement_id,
+                true,
+            ),
             move_down: 0,
         }
     }
 
     fn alloc_id(&mut self) -> Option<u32> {
+        if self.images.len() >= self.limits.max_images {
+            self.make_room(0, true);
+        }
         if self.images.len() >= self.limits.max_images {
             return None;
         }
@@ -753,16 +975,20 @@ impl ImageStore {
         let old = self.images.remove(&id);
         let replacing = old.is_some();
         let old_pin = old.as_ref().is_some_and(|img| img.pinned);
-        if !replacing && self.images.len() >= self.limits.max_images {
-            if let Some(old) = old {
-                self.images.insert(id, old);
-            }
-            return false;
-        }
         if let Some(ref old) = old {
             self.release(old.bytes, 0);
         }
         let count = usize::from(!replacing);
+        if !self.make_room(bytes, !replacing) {
+            if let Some(old) = old {
+                let b = old.bytes;
+                if self.budget.try_charge(b, 0) {
+                    self.pane_bytes += b;
+                    self.images.insert(id, old);
+                }
+            }
+            return false;
+        }
         if self.pane_bytes.saturating_add(bytes) > self.limits.max_pane_bytes
             || !self.budget.try_charge(bytes, count)
         {
@@ -774,6 +1000,11 @@ impl ImageStore {
                 }
             }
             return false;
+        }
+        if replacing {
+            // A new transmission of an existing id replaces the image, so the
+            // placements of the previous pixels are not kept.
+            self.placements.retain(|p| p.image != id);
         }
         let cookie = self.alloc_cookie();
         self.pane_bytes += bytes;
@@ -792,6 +1023,48 @@ impl ImageStore {
         true
     }
 
+    /// Drop oldest images until `extra_bytes` (and one new image, if asked)
+    /// fit. Off-screen images go first.
+    fn make_room(&mut self, extra_bytes: usize, extra_image: bool) -> bool {
+        let guard = self.images.len().saturating_add(2);
+        for _ in 0..guard {
+            let bytes_ok =
+                self.pane_bytes.saturating_add(extra_bytes) <= self.limits.max_pane_bytes;
+            let count_ok = !extra_image || self.images.len() < self.limits.max_images;
+            let session_ok = self.budget.fits(extra_bytes, usize::from(extra_image));
+            if bytes_ok && count_ok && session_ok {
+                return true;
+            }
+            if !self.drop_oldest() {
+                return false;
+            }
+        }
+        false
+    }
+
+    fn drop_oldest(&mut self) -> bool {
+        let id = self.oldest(true).or_else(|| self.oldest(false));
+        let Some(id) = id else {
+            return false;
+        };
+        self.free_image(id);
+        true
+    }
+
+    fn oldest(&self, hidden_only: bool) -> Option<u32> {
+        self.images
+            .iter()
+            .filter(|(id, _)| !hidden_only || !self.image_visible(**id))
+            .min_by_key(|(_, img)| img.cookie)
+            .map(|(id, _)| *id)
+    }
+
+    fn image_visible(&self, id: u32) -> bool {
+        self.placements.iter().any(|p| {
+            p.image == id && p.alt == self.on_alt && rows_overlap(p, self.view_top, self.view_rows)
+        })
+    }
+
     fn add_placement(
         &mut self,
         image: u32,
@@ -800,6 +1073,8 @@ impl ImageStore {
         cols: usize,
         rows: usize,
         move_cursor: bool,
+        proto: Proto,
+        z: i32,
     ) -> usize {
         let id = protocol_id.unwrap_or_else(|| {
             self.next_place = self.next_place.wrapping_add(1).max(1);
@@ -816,6 +1091,8 @@ impl ImageStore {
             cols,
             rows,
             alt: self.on_alt,
+            proto,
+            z,
         });
         if move_cursor {
             rows
@@ -853,7 +1130,21 @@ impl ImageStore {
     }
 }
 
+fn spec_cell(at: &PlaceAt, x: u32, y: u32) -> Option<(u64, usize)> {
+    if x == 0 || y == 0 {
+        return None;
+    }
+    Some((
+        at.screen_top.saturating_add(u64::from(y - 1)),
+        (x - 1) as usize,
+    ))
+}
+
 fn hits_clear(p: &Placement, kind: ClearKind, at: &PlaceAt) -> bool {
+    // Kitty graphics ignore EL and partial ED. Full-screen ED 2 still clears them.
+    if p.proto == Proto::Kitty && !matches!(kind, ClearKind::Ed(2)) {
+        return false;
+    }
     let top = at.screen_top;
     let bottom = top.saturating_add(at.screen_rows as u64);
     let line = at.line;
@@ -914,13 +1205,20 @@ fn cell_in(p: &Placement, line: u64, col: usize) -> bool {
         && col < p.col.saturating_add(p.cols)
 }
 
-fn cell_span(px_w: u32, px_h: u32, cols: Option<u32>, rows: Option<u32>) -> (usize, usize) {
+fn cell_span(
+    px_w: u32,
+    px_h: u32,
+    cols: Option<u32>,
+    rows: Option<u32>,
+    cell_w: u32,
+    cell_h: u32,
+) -> (usize, usize) {
     let c = cols
         .map(|n| n as usize)
-        .unwrap_or_else(|| px_span(px_w, CELL_PX_W));
+        .unwrap_or_else(|| px_span(px_w, cell_w));
     let r = rows
         .map(|n| n as usize)
-        .unwrap_or_else(|| px_span(px_h, CELL_PX_H));
+        .unwrap_or_else(|| px_span(px_h, cell_h));
     (c.clamp(1, MAX_CELLS), r.clamp(1, MAX_CELLS))
 }
 
@@ -1021,6 +1319,9 @@ struct SixelDec {
     palette: [[u8; 4]; 256],
     selected: u8,
     rows: Vec<Vec<u8>>,
+    /// RGBA bytes currently stored. Grown by the delta of one row, so a wide
+    /// image is linear instead of rescanning every row on each pixel.
+    used: usize,
     x: usize,
     y: usize,
     max_w: usize,
@@ -1044,6 +1345,7 @@ impl SixelDec {
             palette,
             selected: 0,
             rows: Vec::new(),
+            used: 0,
             x: 0,
             y: 0,
             max_w: limits.max_width as usize,
@@ -1054,23 +1356,10 @@ impl SixelDec {
         }
     }
 
+    /// Raster attributes are a hint. They do not allocate: a `"1;1;4096;1280`
+    /// with no pixels stores nothing. Drawing is capped by the real pixels.
     fn reserve(&mut self, w: u32, h: u32) -> bool {
-        if w == 0 || h == 0 {
-            return true;
-        }
-        let w = w as usize;
-        let h = h as usize;
-        if w > self.max_w || h > self.max_h {
-            return false;
-        }
-        if w.saturating_mul(h).saturating_mul(4) > self.max_bytes {
-            return false;
-        }
-        for y in 0..h {
-            if !self.ensure_row(y, w) {
-                return false;
-            }
-        }
+        let _ = (w, h);
         true
     }
 
@@ -1140,42 +1429,33 @@ impl SixelDec {
         if y >= self.max_h || width > self.max_w {
             return false;
         }
-        let h = y + 1;
-        let pixels =
-            h.saturating_mul(width.max(self.rows.first().map(|r| r.len() / 4).unwrap_or(0)));
-        // Checked properly below per row. This is a cheap reject.
-        if pixels.saturating_mul(4) > self.max_bytes && width > 0 && h > self.max_bytes {
-            return false;
-        }
         while self.rows.len() <= y {
             self.rows.push(Vec::new());
         }
         let need = width * 4;
-        if self.rows[y].len() >= need {
+        let have = self.rows[y].len();
+        if have >= need {
             return true;
         }
-        let mut total = 0usize;
-        for (i, row) in self.rows.iter().enumerate() {
-            let len = if i == y { need } else { row.len() };
-            total = match total.checked_add(len) {
-                Some(n) => n,
-                None => return false,
-            };
-        }
-        if total > self.max_bytes {
+        let add = need - have;
+        if self.used.saturating_add(add) > self.max_bytes {
             return false;
         }
         let bg = self.bg.unwrap_or([0, 0, 0, 0]);
-        let row = &mut self.rows[y];
-        row.reserve(need - row.len());
-        while row.len() < need {
-            row.extend_from_slice(&bg);
+        self.rows[y].resize(need, 0);
+        if bg != [0, 0, 0, 0] {
+            let mut i = have;
+            while i < need {
+                self.rows[y][i..i + 4].copy_from_slice(&bg);
+                i += 4;
+            }
         }
+        self.used += add;
         true
     }
 
     fn finish(self) -> Option<Raster> {
-        if self.fail || self.rows.is_empty() {
+        if self.fail || self.used == 0 || self.rows.is_empty() {
             return None;
         }
         let w = self.rows.iter().map(|r| r.len() / 4).max().unwrap_or(0);
@@ -1302,6 +1582,7 @@ enum Action {
     Transmit,
     Put,
     Delete,
+    Query,
     Other,
 }
 
@@ -1327,7 +1608,18 @@ struct KittyFields {
     height: Option<u32>,
     columns: Option<u32>,
     rows: Option<u32>,
-    cursor_move: bool,
+    /// `C=1`: do not move the cursor. The default (`C` omitted or `C=0`) moves.
+    hold_cursor: bool,
+    /// The client included the `i` key. Replies are sent only then.
+    client_id: bool,
+    /// The client included the `a` key. A chunk that omits it keeps the open action.
+    action_set: bool,
+    /// The client included `C`.
+    cursor_set: bool,
+    /// Delete cell, 1-based, `0` means the key was absent.
+    cell_x: u32,
+    cell_y: u32,
+    z: i32,
     delete: Option<char>,
     compression: bool,
 }
@@ -1335,7 +1627,7 @@ struct KittyFields {
 impl Default for KittyFields {
     fn default() -> Self {
         Self {
-            action: Action::TransmitDisplay,
+            action: Action::Transmit,
             transmission: Trans::Direct,
             format: 32,
             quiet: 0,
@@ -1346,7 +1638,13 @@ impl Default for KittyFields {
             height: None,
             columns: None,
             rows: None,
-            cursor_move: false,
+            hold_cursor: false,
+            client_id: false,
+            action_set: false,
+            cursor_set: false,
+            cell_x: 0,
+            cell_y: 0,
+            z: 0,
             delete: None,
             compression: false,
         }
@@ -1380,11 +1678,13 @@ fn parse_kitty(body: &[u8]) -> Option<(KittyFields, &[u8])> {
 fn apply_kitty_key(f: &mut KittyFields, key: u8, val: &str) -> Option<()> {
     match key {
         b'a' => {
+            f.action_set = true;
             f.action = match val {
-                "T" | "" => Action::TransmitDisplay,
-                "t" => Action::Transmit,
+                "T" => Action::TransmitDisplay,
+                "t" | "" => Action::Transmit,
                 "p" => Action::Put,
                 "d" => Action::Delete,
+                "q" => Action::Query,
                 _ => Action::Other,
             };
         }
@@ -1400,13 +1700,29 @@ fn apply_kitty_key(f: &mut KittyFields, key: u8, val: &str) -> Option<()> {
         b'f' => f.format = parse_u16(val)?,
         b'q' => f.quiet = parse_u16(val)?.min(255) as u8,
         b'm' => f.more = val == "1",
-        b'i' => f.image_id = Some(parse_u32_key(val)?),
+        b'i' => {
+            f.client_id = true;
+            f.image_id = Some(parse_u32_key(val)?);
+        }
         b'p' => f.placement_id = Some(parse_u32_key(val)?),
         b's' => f.width = Some(parse_u32_key(val)?),
         b'v' => f.height = Some(parse_u32_key(val)?),
         b'c' => f.columns = Some(parse_u32_key(val)?),
         b'r' => f.rows = Some(parse_u32_key(val)?),
-        b'C' => f.cursor_move = val == "1",
+        b'C' => {
+            f.cursor_set = true;
+            // Spec: 0 moves the cursor to after the image; 1 does not move it.
+            f.hold_cursor = val == "1";
+        }
+        b'x' => f.cell_x = parse_u32_key(val)?,
+        b'y' => f.cell_y = parse_u32_key(val)?,
+        b'z' => {
+            f.z = if val.starts_with('-') {
+                val.parse::<i32>().ok()?
+            } else {
+                i32::try_from(parse_u32_key(val)?).ok()?
+            };
+        }
         b'd' => f.delete = val.chars().next(),
         b'o' => {
             if val == "z" {
@@ -1485,6 +1801,11 @@ fn expand_rgb(rgb: &[u8], w: u32, h: u32) -> Raster {
 }
 
 fn kitty_reply(quiet: u8, id: Option<u32>, place: Option<u32>, ok: bool) -> Vec<String> {
+    // The protocol answers only when the client supplied `i`. An invented id
+    // would be written into the program's stdin.
+    let Some(id) = id else {
+        return Vec::new();
+    };
     let send = match quiet {
         2 => false,
         1 => !ok,
@@ -1493,17 +1814,9 @@ fn kitty_reply(quiet: u8, id: Option<u32>, place: Option<u32>, ok: bool) -> Vec<
     if !send {
         return Vec::new();
     }
-    let mut ctl = String::from("\x1b_G");
-    let mut wrote = false;
-    if let Some(id) = id {
-        ctl.push_str(&format!("i={id}"));
-        wrote = true;
-    }
+    let mut ctl = format!("\x1b_Gi={id}");
     if let Some(p) = place {
-        if wrote {
-            ctl.push(',');
-        }
-        ctl.push_str(&format!("p={p}"));
+        ctl.push_str(&format!(",p={p}"));
     }
     ctl.push(';');
     ctl.push_str(if ok { "OK" } else { "EINVAL" });
@@ -1626,14 +1939,21 @@ fn parse_dim(v: &str) -> Dim {
     v.parse().map(Dim::Cells).unwrap_or(Dim::Auto)
 }
 
-fn iterm_cells(p: &ItermParsed, img_w: u32, img_h: u32, at: &PlaceAt) -> (usize, usize) {
-    let cols = dim_cells(p.width, img_w, CELL_PX_W, at.columns);
+fn iterm_cells(
+    p: &ItermParsed,
+    img_w: u32,
+    img_h: u32,
+    at: &PlaceAt,
+    cell_w: u32,
+    cell_h: u32,
+) -> (usize, usize) {
+    let cols = dim_cells(p.width, img_w, cell_w, at.columns);
     let rows = match p.height {
         Dim::Auto if !matches!(p.width, Dim::Auto) && img_w > 0 => (cols
             .saturating_mul(img_h as usize))
         .div_ceil(img_w as usize)
         .clamp(1, MAX_CELLS),
-        other => dim_cells(other, img_h, CELL_PX_H, at.screen_rows),
+        other => dim_cells(other, img_h, cell_h, at.screen_rows),
     };
     (cols, rows)
 }
@@ -1651,12 +1971,14 @@ fn dim_cells(dim: Dim, px: u32, cell_px: u32, screen: usize) -> usize {
 // --- byte filter -----------------------------------------------------------
 
 /// One slice of a PTY read after image sequences have been lifted out.
-pub enum Inbound {
+pub(crate) enum Inbound {
     Bytes(Vec<u8>),
     Sixel {
         p2: u8,
         data: Vec<u8>,
         overflow: bool,
+        /// Filled before the terminal lock is taken. `None` means "decode now".
+        raster: Option<Raster>,
     },
     Kitty {
         body: Vec<u8>,
@@ -1665,7 +1987,39 @@ pub enum Inbound {
     Iterm {
         body: Vec<u8>,
         overflow: bool,
+        raster: Option<Raster>,
     },
+}
+
+/// Decode sixel and PNG payloads. Safe to call without the terminal lock.
+pub(crate) fn warm_inbound(pieces: &mut [Inbound], limits: &ImageLimits) {
+    for piece in pieces {
+        match piece {
+            Inbound::Sixel {
+                p2,
+                data,
+                overflow,
+                raster,
+            } if !*overflow && raster.is_none() => {
+                *raster = decode_sixel(*p2, data, limits);
+                data.clear();
+            }
+            Inbound::Iterm {
+                body,
+                overflow,
+                raster,
+            } if !*overflow && raster.is_none() => {
+                if let Some(parsed) = parse_iterm(body) {
+                    if parsed.inline {
+                        if let Some(bytes) = decode_b64(&parsed.b64) {
+                            *raster = decode_png(&bytes, limits);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1701,6 +2055,8 @@ pub struct ImageFilter {
     sixel_p2: u8,
     /// Probe or in-progress payload held from the previous read.
     carry: Vec<u8>,
+    /// Maximum carry length for this pull, including bytes already held.
+    carry_limit: usize,
 }
 
 impl Default for ImageFilter {
@@ -1712,6 +2068,7 @@ impl Default for ImageFilter {
             overflow: false,
             sixel_p2: 0,
             carry: Vec::new(),
+            carry_limit: usize::MAX,
         }
     }
 }
@@ -1721,7 +2078,21 @@ impl ImageFilter {
         self.limits = limits;
     }
 
+    pub fn carry_len(&self) -> usize {
+        self.carry.len()
+    }
+
     pub fn pull(&mut self, input: &[u8]) -> Vec<Inbound> {
+        self.pull_within(input, usize::MAX / 4)
+    }
+
+    /// `extra` is how many more payload bytes the pane budget still allows.
+    pub fn pull_within(&mut self, input: &[u8], extra: usize) -> Vec<Inbound> {
+        self.carry_limit = self.carry.len().saturating_add(extra);
+        self.pull_limited(input)
+    }
+
+    fn pull_limited(&mut self, input: &[u8]) -> Vec<Inbound> {
         if matches!(self.phase, Phase::Ground) && !input.contains(&0x1b) {
             if input.is_empty() {
                 return Vec::new();
@@ -1744,18 +2115,6 @@ impl ImageFilter {
         pieces
     }
 }
-
-// The carry buffer cannot live in the Copy filter. ImageFilter is not Copy
-// if it owns the carry. I declared Copy above and also a carry field that
-// doesn't exist. Fix this properly: ImageFilter owns `carry: Vec<u8>`.
-//
-// The impl above references `self.carry` which I need to add, and I must
-// drop Copy. I'll rewrite the struct and pull() in a follow-up edit if this
-// doesn't compile — I'm including the field now by replacing the struct.
-//
-// This comment is a mistake if I leave it. I'll rewrite the filter struct
-// before shipping. The code below is the real struct; the one above gets
-// replaced.
 
 fn flush_bytes(out: &mut Vec<u8>, pieces: &mut Vec<Inbound>) {
     if !out.is_empty() {
@@ -1928,7 +2287,7 @@ impl ImageFilter {
                 if self.overflow {
                     return;
                 }
-                if held.len() >= self.raw_cap() {
+                if held.len() >= self.raw_cap() || held.len() >= self.carry_limit {
                     self.overflow = true;
                     held.clear();
                     held.shrink_to_fit();
@@ -1981,6 +2340,7 @@ impl ImageFilter {
                     pieces.push(Inbound::Iterm {
                         body: std::mem::take(held),
                         overflow,
+                        raster: None,
                     });
                 }
             }
@@ -1990,6 +2350,7 @@ impl ImageFilter {
                     pieces.push(Inbound::Sixel {
                         p2,
                         data: std::mem::take(held),
+                        raster: None,
                         overflow,
                     });
                 }
@@ -2197,10 +2558,17 @@ mod tests {
         assert_eq!(&snaps[0].rgba[..], &[255, 0, 0, 255]);
         assert!(meta.images.pane_bytes() > 0);
 
+        // Lowercase `d=i` removes the placement and keeps the pixels.
         let ev = feed(&mut t, &mut p, &mut meta, &mut carry, &kitty("a=d,d=i,i=7"));
         assert!(ev.pty_replies.iter().any(|r| r.contains("OK")));
         assert_eq!(meta.images.placement_count(), 0);
-        assert_eq!(meta.images.pane_bytes(), 0);
+        assert!(
+            meta.images.pane_bytes() > 0,
+            "lowercase d=i keeps the pixels"
+        );
+        let ev = feed(&mut t, &mut p, &mut meta, &mut carry, &kitty("a=d,d=I,i=7"));
+        assert!(ev.pty_replies.iter().any(|r| r.contains("OK")));
+        assert_eq!(meta.images.pane_bytes(), 0, "uppercase d=I frees the data");
         assert_eq!(meta.images.snapshot().len(), 0);
     }
 
@@ -2235,9 +2603,26 @@ mod tests {
         assert_eq!(snaps.len(), 1);
         assert_eq!(snaps[0].col, 3, "put uses the cursor column");
         assert_eq!(&snaps[0].rgba[..], &[0, 255, 0, 255]);
-        // Missing id cannot be placed.
+        // A response is written only when the client sent `i`.
         let ev = feed(&mut t, &mut p, &mut meta, &mut carry, &kitty("a=p,q=1"));
-        assert!(ev.pty_replies.iter().any(|r| r.contains("EINVAL")));
+        assert!(
+            ev.pty_replies.is_empty(),
+            "no i= means no reply: {:?}",
+            ev.pty_replies
+        );
+        assert_eq!(meta.images.placement_count(), 1);
+        let ev = feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            &kitty("a=p,i=99,q=1"),
+        );
+        assert!(
+            ev.pty_replies.iter().any(|r| r.contains("EINVAL")),
+            "{:?}",
+            ev.pty_replies
+        );
     }
 
     #[test]
@@ -2278,6 +2663,18 @@ mod tests {
                 &mut meta,
                 &mut carry,
                 &kitty(&format!("a=T,t={kind};{path}")),
+            );
+            assert!(
+                ev.pty_replies.is_empty(),
+                "t={kind} has no i=, so it must not write {:?}",
+                ev.pty_replies
+            );
+            let ev = feed(
+                &mut t,
+                &mut p,
+                &mut meta,
+                &mut carry,
+                &kitty(&format!("a=T,t={kind},i=1;{path}")),
             );
             assert!(
                 ev.pty_replies.iter().any(|r| r.contains("EINVAL")),
@@ -2322,7 +2719,7 @@ mod tests {
             &mut p,
             &mut meta,
             &mut carry,
-            &kitty(&format!("a=T,f=24,s=1,v=1,c=1,r=1,C=0,q=2;{px}")),
+            &kitty(&format!("a=T,f=24,s=1,v=1,c=1,r=1,C=1,q=2;{px}")),
         );
         // Arabic in the other cells of the same row. The image must not
         // eat it, and the row stays logical Arabic for the shaper.
@@ -2357,7 +2754,7 @@ mod tests {
             &mut p,
             &mut meta,
             &mut carry,
-            &kitty(&format!("a=T,f=24,s=1,v=1,C=0,q=2;{px}")),
+            &kitty(&format!("a=T,f=24,s=1,v=1,C=1,q=2;{px}")),
         );
         assert_eq!(meta.images.placement_count(), 1);
         t.resize(TermSize { cols: 20, rows: 6 });
@@ -2371,7 +2768,7 @@ mod tests {
             &mut p,
             &mut meta,
             &mut carry,
-            &kitty(&format!("a=T,f=24,s=1,v=1,i=1,C=0,q=2;{px}")),
+            &kitty(&format!("a=T,f=24,s=1,v=1,i=1,C=1,q=2;{px}")),
         );
         feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[?1049h");
         assert!(t
@@ -2392,7 +2789,7 @@ mod tests {
             &mut p,
             &mut meta,
             &mut carry,
-            &kitty(&format!("a=T,f=24,s=1,v=1,i=2,C=0,q=2;{px}")),
+            &kitty(&format!("a=T,f=24,s=1,v=1,i=2,C=1,q=2;{px}")),
         );
         assert_eq!(meta.images.snapshot().len(), 1);
         assert!(
@@ -2414,7 +2811,7 @@ mod tests {
             &mut p,
             &mut meta,
             &mut carry,
-            &kitty(&format!("a=T,f=24,s=1,v=1,C=0,q=2;{px}")),
+            &kitty(&format!("a=T,f=24,s=1,v=1,C=1,q=2;{px}")),
         );
         feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[2J");
         assert_eq!(meta.images.placement_count(), 0, "ED 2 clears the screen");
@@ -2425,7 +2822,7 @@ mod tests {
             &mut p,
             &mut meta,
             &mut carry,
-            &kitty(&format!("a=T,f=24,s=1,v=1,C=0,q=2;{px}")),
+            &kitty(&format!("a=T,f=24,s=1,v=1,C=1,q=2;{px}")),
         );
         feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[4;1H\n");
         assert_eq!(
@@ -2593,7 +2990,7 @@ mod tests {
             rgba: Arc::from(vec![0u8; 16]),
         };
         let clip = (10, 20, 80, 40);
-        let sprites = crate::render::image_sprites(clip, 10.0, 10.0, 0, 0, &[snap]);
+        let sprites = crate::render::image_sprites(clip, 10.0, 10.0, 0, 0, 80, |_| false, &[snap]);
         assert_eq!(sprites.len(), 1);
         assert_eq!(sprites[0].verts.len(), 6);
         for v in &sprites[0].verts {
@@ -2620,6 +3017,328 @@ mod tests {
             height: 1,
             rgba: Arc::from(vec![0u8; 4]),
         };
-        assert!(crate::render::image_sprites(clip, 10.0, 10.0, 0, 0, &[below]).is_empty());
+        assert!(
+            crate::render::image_sprites(clip, 10.0, 10.0, 0, 0, 80, |_| false, &[below])
+                .is_empty()
+        );
+        // An RTL row mirrors the logical column to the other edge.
+        let rtl = ImageSnap {
+            cookie: 3,
+            line: 0,
+            col: 0,
+            cols: 2,
+            rows: 1,
+            width: 1,
+            height: 1,
+            rgba: Arc::from(vec![0u8; 4]),
+        };
+        let mirrored =
+            crate::render::image_sprites((0, 0, 400, 40), 10.0, 10.0, 0, 0, 40, |_| true, &[rtl]);
+        assert_eq!(mirrored[0].verts[0].pos[0], 380.0);
+    }
+
+    #[test]
+    fn resize_keeps_images_unless_the_column_count_changes() {
+        use crate::term::column_reflow;
+        assert_eq!(column_reflow(40, 8, TermSize { cols: 40, rows: 8 }), None);
+        assert_eq!(
+            column_reflow(40, 8, TermSize { cols: 40, rows: 4 }),
+            Some(false)
+        );
+        assert_eq!(
+            column_reflow(40, 8, TermSize { cols: 20, rows: 4 }),
+            Some(true)
+        );
+
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        let px = b64(&[1, 2, 3]);
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            &kitty(&format!("a=T,f=24,s=1,v=1,C=1,q=2;{px}")),
+        );
+        assert_eq!(meta.images.placement_count(), 1);
+        // Same size: Session::resize returns before after_resize.
+        t.resize(TermSize { cols: 40, rows: 8 });
+        assert_eq!(meta.images.placement_count(), 1);
+        // Rows only: no reflow, the absolute line still names the image.
+        t.resize(TermSize { cols: 40, rows: 4 });
+        assert_eq!(meta.images.placement_count(), 1);
+        // Columns: reflow drops the anchor.
+        t.resize(TermSize { cols: 10, rows: 4 });
+        after_resize(&mut meta);
+        assert_eq!(meta.images.placement_count(), 0);
+    }
+
+    #[test]
+    fn image_on_the_last_row_scrolls_instead_of_being_overwritten() {
+        for kind in ["iterm", "sixel", "kitty"] {
+            let (mut t, mut p, mut meta, mut carry) = fresh_sized(20, 8, 30);
+            for _ in 0..7 {
+                feed(&mut t, &mut p, &mut meta, &mut carry, b"\n");
+            }
+            assert_eq!(t.grid().cursor.point.line.0, 7);
+            let before = t.grid().history_size();
+            match kind {
+                "kitty" => {
+                    let px = b64(&[9, 9, 9]);
+                    feed(
+                        &mut t,
+                        &mut p,
+                        &mut meta,
+                        &mut carry,
+                        &kitty(&format!("a=T,f=24,s=1,v=1,r=3,c=1,i=1,q=2;{px}")),
+                    );
+                }
+                "sixel" => {
+                    // three bands of one red pixel column: 18 pixels tall → 2 cells at 16px, but
+                    // we force the move by the decoded cell span. A short sixel still moves.
+                    feed(&mut t, &mut p, &mut meta, &mut carry, red_green_sixel());
+                }
+                _ => {
+                    let mut png = Vec::new();
+                    image::codecs::png::PngEncoder::new(&mut png)
+                        .write_image(&[1, 2, 3, 255], 1, 1, image::ExtendedColorType::Rgba8)
+                        .unwrap();
+                    let seq = format!("\x1b]1337;File=inline=1;width=1;height=3:{}\x07", b64(&png));
+                    feed(&mut t, &mut p, &mut meta, &mut carry, seq.as_bytes());
+                }
+            }
+            let rows = meta.images.placements()[0].rows;
+            assert!(
+                t.grid().history_size() >= before + rows,
+                "{kind}: history {} did not grow by {rows} from {before}",
+                t.grid().history_size()
+            );
+            let anchor = meta.images.placements()[0].line;
+            feed(&mut t, &mut p, &mut meta, &mut carry, b"NEXT");
+            let (line, _) = crate::bidi_ctl::cursor_abs(&t, meta.evicted);
+            assert!(
+                line >= anchor + rows as u64,
+                "{kind}: next text at {line} overlaps image at {anchor}+{rows}"
+            );
+        }
+    }
+
+    #[test]
+    fn kitty_matches_the_graphics_protocol() {
+        let px = b64(&[255, 0, 0]);
+        // Default and C=0 move the cursor. C=1 does not.
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            &kitty(&format!("a=T,f=24,s=1,v=1,r=3,c=1,i=1;{px}")),
+        );
+        assert_eq!(t.grid().cursor.point.line.0, 3);
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            &kitty(&format!("a=T,f=24,s=1,v=1,r=3,c=1,C=1,i=1;{px}")),
+        );
+        assert_eq!(t.grid().cursor.point.line.0, 0);
+        assert_eq!(t.grid().cursor.point.column.0, 0);
+
+        // Default action is transmit, not display. A later chunk that omits `a` stays transmit.
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        let encoded = b64(&[0, 255, 0]);
+        let (head, tail) = encoded.split_at(2);
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            &kitty(&format!("a=t,f=24,s=1,v=1,i=4,m=1;{head}")),
+        );
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            &kitty(&format!("m=0;{tail}")),
+        );
+        assert_eq!(meta.images.placement_count(), 0);
+        assert!(meta.images.pane_bytes() > 0);
+
+        // No `i` means no reply, even for a successful display or a bad command.
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        let ev = feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            &kitty(&format!("a=T,f=24,s=1,v=1;{px}")),
+        );
+        assert!(ev.pty_replies.is_empty(), "{:?}", ev.pty_replies);
+        let ev = feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            b"\x1b_Gnot-a-command\x1b\\",
+        );
+        assert!(ev.pty_replies.is_empty(), "{:?}", ev.pty_replies);
+
+        // A query with an id is OK and stores nothing.
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        let ev = feed(&mut t, &mut p, &mut meta, &mut carry, &kitty("a=q,i=31"));
+        assert!(
+            ev.pty_replies
+                .iter()
+                .any(|r| r.contains("i=31") && r.contains("OK")),
+            "{:?}",
+            ev.pty_replies
+        );
+        assert_eq!(meta.images.placement_count(), 0);
+        assert_eq!(meta.images.pane_bytes(), 0);
+
+        // d=p deletes the placement at cell (x, y), and keeps the pixels.
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            &kitty(&format!("a=T,f=24,s=1,v=1,i=9,C=1;{px}")),
+        );
+        assert_eq!(meta.images.placement_count(), 1);
+        let ev = feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            &kitty("a=d,d=p,x=1,y=1,i=9"),
+        );
+        assert!(ev.pty_replies.iter().any(|r| r.contains("OK")));
+        assert_eq!(meta.images.placement_count(), 0);
+        assert!(
+            meta.images.pane_bytes() > 0,
+            "lowercase d=p keeps the pixels"
+        );
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            &kitty("a=p,i=9,C=1,z=3"),
+        );
+        assert_eq!(meta.images.placement_count(), 1);
+        // d=q is the same cell, and it also matches z. A different z misses.
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            &kitty("a=d,d=q,x=1,y=1,z=1,i=9"),
+        );
+        assert_eq!(meta.images.placement_count(), 1);
+        let ev = feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            &kitty("a=d,d=Q,x=1,y=1,z=3,i=9"),
+        );
+        assert!(ev.pty_replies.iter().any(|r| r.contains("OK")));
+        assert_eq!(meta.images.placement_count(), 0);
+        assert_eq!(
+            meta.images.pane_bytes(),
+            0,
+            "uppercase d=Q frees an image with no placements left"
+        );
+    }
+
+    #[test]
+    fn sixel_does_not_preallocate_or_scan_every_row() {
+        let limits = ImageLimits::default();
+        assert!(decode_sixel(0, b"\"1;1;4096;1280", &limits).is_none());
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            b"\x1bPq\"1;1;4096;1280\x1b\\",
+        );
+        assert_eq!(meta.images.pane_bytes(), 0);
+
+        let mut data = Vec::new();
+        for _ in 0..213 {
+            data.extend_from_slice(b"#1!4096~-");
+        }
+        let started = std::time::Instant::now();
+        let img = decode_sixel(0, &data, &limits).expect("pixels were drawn");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(2000),
+            "4096x{} took {elapsed:?}; the row scan is quadratic again",
+            img.h
+        );
+        assert_eq!(img.rgba.len(), img.w as usize * img.h as usize * 4);
+        assert!(img.w > 0 && img.h > 0);
+    }
+
+    #[test]
+    fn full_pane_evicts_the_oldest_image_and_el_spares_kitty() {
+        let limits = ImageLimits {
+            max_images: 2,
+            max_session_images: 8,
+            ..ImageLimits::default()
+        };
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        meta.set_image_limits(limits);
+        let px = b64(&[4, 5, 6]);
+        for id in 1..=3 {
+            feed(
+                &mut t,
+                &mut p,
+                &mut meta,
+                &mut carry,
+                &kitty(&format!("a=T,f=24,s=1,v=1,i={id},C=1,q=2;{px}")),
+            );
+        }
+        assert_eq!(meta.images.placement_count(), 2);
+        assert!(meta.images.placements().iter().all(|p| p.image != 1));
+
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            &kitty(&format!("a=T,f=24,s=1,v=1,i=1,C=1,q=2;{px}")),
+        );
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[K");
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[1K");
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[0J");
+        assert_eq!(
+            meta.images.placement_count(),
+            1,
+            "EL and partial ED keep Kitty graphics"
+        );
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[2J");
+        assert_eq!(meta.images.placement_count(), 0);
+
+        meta.images.set_cell_px(16, 16);
+        let wide = vec![7u8; 16 * 16 * 3];
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            &kitty(&format!("a=T,f=24,s=16,v=16,C=1,q=2;{}", b64(&wide))),
+        );
+        assert_eq!(
+            meta.images.placements()[0].cols,
+            1,
+            "16px cell, not the fixed 8px cell"
+        );
     }
 }
