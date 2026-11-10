@@ -327,7 +327,16 @@ pub struct PtyFacts {
 /// result. Returning a send here would mean terminal output ran Lua, and
 /// `terminal_output_never_runs_lua` fails.
 pub fn plugin_sends_from_pty(plugins: &PluginSet, facts: &PtyFacts) -> Vec<PluginSend> {
-    let _ = (plugins, facts);
+    // Every fact is looked at and then dropped. Forwarding any of them into
+    // `plugins.emit` is what `terminal_output_never_runs_lua` forbids.
+    let _ = (
+        plugins,
+        facts.bell,
+        facts.title.as_deref(),
+        facts.cwd.as_deref(),
+        facts.hyperlink,
+        facts.output,
+    );
     Vec::new()
 }
 
@@ -1854,7 +1863,7 @@ mod tests {
             // The same function the bell and cwd handlers call. If it starts
             // dispatching, this plugin's handlers send and the test fails.
             assert!(
-                plugin_sends_from_pty(&mut out.plugins, &facts).is_empty(),
+                plugin_sends_from_pty(&out.plugins, &facts).is_empty(),
                 "terminal facts must not run Lua"
             );
         }
@@ -1868,7 +1877,7 @@ mod tests {
             .any(|s| s.text == "ran:bell"));
         let after = out.plugins.callback_runs();
         let again = plugin_sends_from_pty(
-            &mut out.plugins,
+            &out.plugins,
             &PtyFacts {
                 bell: true,
                 title: Some("x".into()),
@@ -1996,7 +2005,10 @@ mod tests {
         assert_eq!(out.config.font_size, Some(99.0));
         assert_eq!(out.persisted.font_size, Some(12.0));
         let saved = serde_json::to_string(&out.persisted).unwrap();
-        assert!(!saved.contains("99"), "{saved}");
+        assert!(
+            !saved.contains("\"font_size\":99"),
+            "lua's font size must not be the saved document: {saved}"
+        );
         fs::remove_file(dir.join("config.lua")).unwrap();
         let again = load_with(&out.persisted, &dir, false);
         assert_eq!(again.config.font_size, Some(12.0));

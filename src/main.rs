@@ -5277,7 +5277,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Bell(id) => {
                 // Terminal output does not run Lua. The helper's result is empty.
                 let _ = lua_host::plugin_sends_from_pty(
-                    &mut self.lua_plugins,
+                    &self.lua_plugins,
                     &lua_host::PtyFacts {
                         bell: true,
                         ..lua_host::PtyFacts::default()
@@ -5376,7 +5376,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::Cwd(id, cwd) => {
                 let _ = lua_host::plugin_sends_from_pty(
-                    &mut self.lua_plugins,
+                    &self.lua_plugins,
                     &lua_host::PtyFacts {
                         cwd: Some(cwd.clone()),
                         title: Some(cwd.clone()),
