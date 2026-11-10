@@ -428,6 +428,7 @@ impl SessionMeta {
         self.images.attach(budget);
     }
 
+    #[cfg(test)]
     pub fn set_image_limits(&mut self, limits: crate::images::ImageLimits) {
         self.share_image_budget(Arc::new(crate::images::ImageBudget::new(limits)));
     }
@@ -1811,10 +1812,7 @@ fn next_grid_op(data: &[u8]) -> Option<(usize, usize, GridOp)> {
         }
         match data.get(i + 1) {
             Some(b']') | Some(b'P') | Some(b'_') | Some(b'X') | Some(b'^') => {
-                match skip_string(data, i + 2) {
-                    Some(end) => i = end,
-                    None => return None,
-                }
+                i = skip_string(data, i + 2)?;
             }
             Some(b'[') => match classify_grid_csi(data, i) {
                 Some((end, Some(op))) => return Some((i, end, op)),
@@ -2364,6 +2362,9 @@ impl Drop for Session {
 }
 
 impl Session {
+    // The shared image budget is the eighth argument. Folding it into a
+    // config struct would hide that every pane charges the same counter.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         size: TermSize,
         proxy: EventLoopProxy<UserEvent>,

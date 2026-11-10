@@ -612,6 +612,7 @@ mod tests {
         assert!(limits.max_pane_bytes <= limits.max_session_bytes);
     }
 
+    #[test]
     fn kitty_keyboard_config_defaults_off_and_fallback_on() {
         let d = UserConfig::default();
         assert!(!d.kitty_protocol_on());

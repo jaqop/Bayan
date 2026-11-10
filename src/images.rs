@@ -138,6 +138,7 @@ impl ImageBudget {
         self.limits
     }
 
+    #[cfg(test)]
     pub fn charged_bytes(&self) -> usize {
         self.bytes.load(Ordering::Relaxed)
     }
@@ -211,6 +212,7 @@ pub struct ImageSnap {
     pub rgba: Arc<[u8]>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlacementInfo {
     pub line: u64,
@@ -322,18 +324,17 @@ impl ImageStore {
         self.budget = budget;
     }
 
-    pub fn limits(&self) -> ImageLimits {
-        self.limits
-    }
-
+    #[cfg(test)]
     pub fn pane_bytes(&self) -> usize {
         self.pane_bytes
     }
 
+    #[cfg(test)]
     pub fn placement_count(&self) -> usize {
         self.placements.len()
     }
 
+    #[cfg(test)]
     pub fn placements(&self) -> Vec<PlacementInfo> {
         self.placements
             .iter()
@@ -348,6 +349,7 @@ impl ImageStore {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn on_alt(&self) -> bool {
         self.on_alt
     }
@@ -407,7 +409,7 @@ impl ImageStore {
         self.gc();
     }
 
-    pub fn clear_display(&mut self, kind: ClearKind, at: PlaceAt) {
+    fn clear_display(&mut self, kind: ClearKind, at: PlaceAt) {
         let alt = self.on_alt;
         self.placements
             .retain(|p| p.alt != alt || !hits_clear(p, kind, &at));
@@ -1471,7 +1473,8 @@ fn finish_kitty(p: &PendingKitty, limits: &ImageLimits) -> Option<Raster> {
 
 fn expand_rgb(rgb: &[u8], w: u32, h: u32) -> Raster {
     let mut rgba = vec![255u8; rgb.len() / 3 * 4];
-    for (i, px) in rgb.chunks_exact(3).enumerate() {
+    let (chunks, _) = rgb.as_chunks::<3>();
+    for (i, px) in chunks.iter().enumerate() {
         let o = i * 4;
         rgba[o] = px[0];
         rgba[o + 1] = px[1];
@@ -2448,12 +2451,14 @@ mod tests {
 
     #[test]
     fn caps_drop_oversize_input_without_growing_memory() {
-        let mut limits = ImageLimits::default();
-        limits.max_width = 1;
-        limits.max_height = 1;
-        limits.max_bytes = 8;
-        limits.max_pane_bytes = 8;
-        limits.max_session_bytes = 8;
+        let limits = ImageLimits {
+            max_width: 1,
+            max_height: 1,
+            max_bytes: 8,
+            max_pane_bytes: 8,
+            max_session_bytes: 8,
+            ..ImageLimits::default()
+        };
         let (mut t, mut p, mut meta, mut carry) = fresh();
         meta.set_image_limits(limits);
         let wide = b64(&[255, 0, 0, 0, 255, 0]);
@@ -2489,10 +2494,12 @@ mod tests {
 
         // Session budget is shared. One RGBA pixel fills 4 bytes; the other
         // pane's copy is dropped and the total does not grow.
-        let mut tight = limits;
-        tight.max_bytes = 4;
-        tight.max_pane_bytes = 4;
-        tight.max_session_bytes = 4;
+        let tight = ImageLimits {
+            max_bytes: 4,
+            max_pane_bytes: 4,
+            max_session_bytes: 4,
+            ..limits
+        };
         let budget = Arc::new(ImageBudget::new(tight));
         let (mut t1, mut p1, mut m1, mut c1) = fresh();
         let (mut t2, mut p2, mut m2, mut c2) = fresh();
