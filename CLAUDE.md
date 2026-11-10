@@ -23,6 +23,7 @@ selection and BiDi paths must do.
 | `osc7.rs` | OSC 7 cwd reports, parsed then gated by `term::accept_local_cwd` |
 | `mouse.rs` | mouse tracking modes 1000/1002/1003, SGR vs X10, focus events (1004), who owns a right-click (menu, paste, program) |
 | `keybinds.rs` | action registry + chord map |
+| `copymode.rs` | copy mode: keys → alacritty vi-mode motions and selections; horizontal keys swap on RTL cells |
 | `lang.rs` | interface language (Arabic default, English): `tr("عربي", "English")` pairs at the point of use, `rtl()`, `lead_x`/`trail_x` for which edge text starts from |
 | `keys.rs` | keyboard → VT byte sequences (ported from EasyTer) |
 | `kitty.rs` | kitty keyboard protocol encoder, layout-aware alternate keys |
@@ -37,7 +38,7 @@ selection and BiDi paths must do.
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-473 tests across the tree. `term.rs` (76), `link.rs` (61) and `render.rs` (61)
+483 tests across the tree. `term.rs` (76), `link.rs` (61) and `render.rs` (62)
 carry the most; `localpath.rs` has 19.
 
 ## Invariants — do not "simplify" these
