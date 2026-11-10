@@ -644,7 +644,10 @@ mod tests {
             ..Hits::default()
         });
         assert_eq!(press, LeftPress::Resize(ResizeDirection::East));
-        assert_eq!(cursor_for_press(press, None, false), CursorIcon::EwResize);
+        assert_eq!(
+            cursor_for_press(press, None, false),
+            CursorIcon::from(ResizeDirection::East)
+        );
         // the corner of that same button still resizes
         assert_eq!(
             left_press(&Hits {
@@ -835,7 +838,7 @@ mod tests {
                 agree(Some(ResizeDirection::North), caption),
                 (
                     LeftPress::Resize(ResizeDirection::North),
-                    CursorIcon::NsResize
+                    CursorIcon::from(ResizeDirection::North)
                 )
             );
         }
@@ -843,7 +846,7 @@ mod tests {
             agree(Some(ResizeDirection::East), Some(2)),
             (
                 LeftPress::Resize(ResizeDirection::East),
-                CursorIcon::EwResize
+                CursorIcon::from(ResizeDirection::East)
             )
         );
         assert_eq!(
