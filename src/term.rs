@@ -2296,6 +2296,7 @@ impl Session {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        crate::prof::output_read();
                         let (ev, out, sync_deadline) = {
                             // term, then meta, then parser. reset_keyboard
                             // on the UI thread takes the same order. The
@@ -5385,5 +5386,135 @@ mod tests {
         assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
         p.advance(&mut t, b"Z");
         assert_eq!(cell(&t, 0), 'Z');
+    }
+}
+
+/// Throughput and memory probes. `#[ignore]`d: they feed hundreds of MB and
+/// mean something only in release. Run them with
+/// `cargo test --release -- --ignored measure_ --nocapture --test-threads=1`.
+/// They print `PROBE` lines and assert only what must hold on any machine.
+#[cfg(test)]
+mod measure_probes {
+    use super::*;
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::term::Config;
+
+    fn corpus(kind: &str, bytes: usize) -> Vec<u8> {
+        let line: String = match kind {
+            "ascii" => format!("{}\r\n", "build: compiling crate v0.1.0 ".repeat(4)),
+            "sgr" => (0..12)
+                .map(|i| format!("\x1b[38;5;{}m word{i} \x1b[0m", 16 + i * 17))
+                .chain(std::iter::once("\r\n".to_string()))
+                .collect(),
+            "arabic" => format!("{}\r\n", "مرحبا بالعالم هذا سطر عربي ".repeat(4)),
+            _ => unreachable!(),
+        };
+        line.as_bytes()
+            .iter()
+            .copied()
+            .cycle()
+            .take(bytes)
+            .collect()
+    }
+
+    fn private_mb() -> f64 {
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: a plain C struct of integers; all zeroes is a valid value.
+        let mut c: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+        // SAFETY: `c` is a live, writable PROCESS_MEMORY_COUNTERS_EX whose
+        // size is passed, and the pseudo-handle of this process needs no close.
+        let ok = unsafe {
+            GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                (&mut c as *mut PROCESS_MEMORY_COUNTERS_EX).cast::<PROCESS_MEMORY_COUNTERS>(),
+                std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+            )
+        };
+        assert_ne!(ok, 0, "GetProcessMemoryInfo failed");
+        c.PrivateUsage as f64 / (1024.0 * 1024.0)
+    }
+
+    fn term(scrollback: usize) -> Term<VoidListener> {
+        let config = Config {
+            scrolling_history: scrollback,
+            ..Config::default()
+        };
+        Term::new(
+            config,
+            &TermSize {
+                cols: 120,
+                rows: 40,
+            },
+            VoidListener,
+        )
+    }
+
+    /// MB/s through `process_chunk` (Bayan's whole per-read path) and through
+    /// the bare vte parser, in PTY_READ-sized reads.
+    #[test]
+    #[ignore]
+    fn measure_reader_throughput() {
+        const BYTES: usize = 64 * 1024 * 1024;
+        for kind in ["ascii", "sgr", "arabic"] {
+            let data = corpus(kind, BYTES);
+            let mb = data.len() as f64 / (1024.0 * 1024.0);
+
+            let mut t = term(10_000);
+            let mut p: Processor = Processor::new();
+            let started = Instant::now();
+            for chunk in data.chunks(PTY_READ) {
+                p.advance(&mut t, chunk);
+            }
+            let raw = mb / started.elapsed().as_secs_f64();
+
+            let mut t = term(10_000);
+            let (mut p, mut meta, mut carry) =
+                (Processor::new(), SessionMeta::default(), Vec::new());
+            let started = Instant::now();
+            for chunk in data.chunks(PTY_READ) {
+                let _ = process_chunk(&mut p, &mut t, &mut meta, &mut carry, chunk);
+            }
+            let full = mb / started.elapsed().as_secs_f64();
+            eprintln!(
+                "PROBE throughput {kind:6} {mb:.0} MB: process_chunk {full:7.1} MB/s, vte alone {raw:7.1} MB/s ({:.0}% of vte)",
+                100.0 * full / raw
+            );
+            assert_eq!(t.grid().history_size(), 10_000, "{kind}: scrollback filled");
+        }
+    }
+
+    /// Private bytes after filling the scrollback, and again after the same
+    /// amount once more: a bounded grid stops growing once it is full.
+    #[test]
+    #[ignore]
+    fn measure_scrollback_memory() {
+        let data = corpus("ascii", 32 * 1024 * 1024); // ~260k lines of 122 bytes
+        for scrollback in [10_000, 100_000] {
+            let before = private_mb();
+            let mut t = term(scrollback);
+            let (mut p, mut meta, mut carry) =
+                (Processor::new(), SessionMeta::default(), Vec::new());
+            let mut feed = |t: &mut Term<VoidListener>| {
+                for chunk in data.chunks(PTY_READ) {
+                    let _ = process_chunk(&mut p, t, &mut meta, &mut carry, chunk);
+                }
+            };
+            feed(&mut t);
+            let full = private_mb() - before;
+            feed(&mut t);
+            let again = private_mb() - before;
+            eprintln!(
+                "PROBE scrollback {scrollback:6} lines x 120 cols: +{full:6.1} MB once full, +{again:6.1} MB after as much again (history {})",
+                t.grid().history_size()
+            );
+            assert_eq!(t.grid().history_size(), scrollback);
+            assert!(
+                again < full * 1.1 + 8.0,
+                "{scrollback}: memory kept growing after the scrollback was full ({full:.1} -> {again:.1} MB)"
+            );
+        }
     }
 }
