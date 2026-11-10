@@ -877,14 +877,16 @@ specification; `src/keys.rs` carries the same key-encoding tests.
 - [x] **Shell integration for bash, WSL and cmd** — the PowerShell OSC 133
       wrapper is no longer the only one. Git Bash and MSYS bash get a temp
       `--rcfile`, WSL bash the same file after the distro's login shell is
-      read from passwd, WSL zsh a `ZDOTDIR`, and cmd a `PROMPT` of `$E`
-      marks. The sequences are the ones PowerShell already emits (`D` with
-      the exit code, `A`, `B`, all carrying the session nonce), so prompt
-      jump, command blocks, "at prompt" drops and the exit-code gutter see
-      the same marks. Bash and zsh also emit `C` at command start; the
-      parser ignores it as a boundary. cmd cannot: `A` and `B` only, exit
-      stays unknown, and the nonce remains inside the `PROMPT` variable
-      because cmd has no other place for it. Unknown shells are not
+      read from passwd, WSL zsh a `ZDOTDIR`, and cmd its own `PROMPT`
+      wrapped in `$E` marks. The bash and zsh sequences are the ones
+      PowerShell already emits (`D` with the exit code, `A`, `B`, all
+      carrying the session nonce), so prompt jump, command blocks, "at
+      prompt" drops and the exit-code gutter see the same marks. Bash and
+      zsh also emit `C` at command start; the parser ignores it as a
+      boundary. cmd cannot: `A` and `B` only, and no nonce, because every
+      program cmd starts inherits `PROMPT` and could read it back. Its marks
+      are untrusted: they reset a leftover BiDi mode and do nothing else, so
+      cmd keeps the features it had without them. Unknown shells are not
       injected. `"shell_integration": false` turns it off, including for
       PowerShell. User rc files are never rewritten. An elevated token does
       not source them (and does not init oh-my-posh from the profile); the
@@ -949,12 +951,14 @@ tmux keep the user's directory. fish, dash, or any other default shell is
 exec'd with no rcfile. Windows paths become Linux paths through `WSLENV`
 (`/up`) and, if the value still looks like `C:\…`, `wslpath -u`. OSC 7
 percent-encodes the path as UTF-8 bytes, including spaces and Arabic, and
-`cygpath`/`wslpath` run once per directory. cmd's `PROMPT` uses `$E` for
-`A` and `B` only. cmd has no hook that runs when a command starts, and no
-way to report `ERRORLEVEL` as that command's exit, so the gutter stays
-unknown and a `D` mark is not invented. The nonce travels in
-`BAYAN_PROMPT_NONCE` and is removed before a child inherits it, except
-that cmd has to keep the expanded value inside `PROMPT` itself. An
+`cygpath`/`wslpath` run once per directory, a directory that does not
+convert included. cmd's `PROMPT` keeps the user's own text and adds `$E`
+marks for `A` and `B` only. cmd has no hook that runs when a command
+starts, and no way to report `ERRORLEVEL` as that command's exit, so the
+gutter stays unknown and a `D` mark is not invented. The nonce travels in
+`BAYAN_PROMPT_NONCE` and is removed before a child inherits it. cmd never
+receives it: it would have to live in `PROMPT`, which every child
+inherits, so cmd's marks carry no nonce and are not trusted. An
 elevated token (Run as administrator) does not source user rc files, sets
 `INPUTRC` and `HISTFILE` to `/dev/null` so `~/.inputrc` cannot run a
 macro, still reads `/etc/profile` (Git's copy is not user-writable; without
@@ -1036,8 +1040,8 @@ only that A arms the report, so a spoofed `133;D` from `cat` cannot. Bash
 and zsh emit the same D/A/B bytes (and a C from `PS0` / `preexec`, which
 the parser does not treat as a prompt boundary), plus OSC 9;9 and OSC 7
 when the directory converts to a Windows path. cmd emits A and B with ST
-(`ESC \`) and no exit code. An idle OSC 7 with no 133 — clink, or cmd
-when shell integration is off — is still stored. A new tab calls
+(`ESC \`), no exit code and no nonce, so they arm nothing. An idle OSC 7
+with no trusted 133 (clink in cmd) is still stored. A new tab calls
 `GetDriveTypeW` on the drive root and rejects a remote drive, and it
 rejects a reparse point without following it, before `is_dir`.
 

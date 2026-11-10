@@ -9,7 +9,8 @@
 //! zsh, after a launcher that reads the distro's login shell — a distro
 //! whose shell is neither bash nor zsh is started as itself, with no
 //! injection. cmd only has `PROMPT`, so it can emit A and B and cannot
-//! report an exit code.
+//! report an exit code. Its marks carry no nonce and are untrusted, because
+//! every child of cmd inherits `PROMPT`.
 //!
 //! The nonce travels in `BAYAN_PROMPT_NONCE`, the same variable PowerShell
 //! uses, and the scripts unset it before a command runs. It is not written
@@ -92,7 +93,7 @@ pub(crate) fn plan(command: &str, enabled: bool, elevated: bool, nonce: &str) ->
     match kind {
         ShellKind::Bash => bash_plan(&args, elevated, env),
         ShellKind::Wsl => wsl_plan(&args, elevated, env),
-        ShellKind::Cmd => Some(cmd_plan(&args, env)),
+        ShellKind::Cmd => Some(cmd_plan(&args)),
         ShellKind::PowerShell | ShellKind::Unknown => None,
     }
 }
@@ -175,13 +176,15 @@ fn wsl_plan(args: &[String], elevated: bool, mut env: Vec<(String, String)>) -> 
     })
 }
 
-fn cmd_plan(args: &[String], env: Vec<(String, String)>) -> Plan {
+/// No nonce in the environment: cmd would have to keep it in `PROMPT`,
+/// which every child inherits.
+fn cmd_plan(args: &[String]) -> Plan {
     Plan {
         kind: ShellKind::Cmd,
         args: cmd_args(args, &cmd_setup()),
         files: Vec::new(),
         path_env: Vec::new(),
-        env,
+        env: Vec::new(),
         wslenv_path: Vec::new(),
         wslenv_plain: Vec::new(),
         elevated: false,
@@ -304,16 +307,26 @@ fn cmd_args(original: &[String], setup: &str) -> Vec<String> {
     out
 }
 
-/// `chcp` keeps Arabic paths readable. `$E` is ESC. cmd has no BEL in
-/// `PROMPT`, so the terminator is ST (`ESC \`). There is no `D` and no `C`:
-/// cmd prints `PROMPT` only when it draws the next prompt, and it has no
-/// hook that runs as a command starts or that can see `ERRORLEVEL` without
-/// the user typing it. `%BAYAN_PROMPT_NONCE%` expands once, into `PROMPT`,
-/// and the variable is then cleared so a child does not inherit it under
-/// that name. `PROMPT` itself still contains the nonce — cmd has nowhere
-/// else to keep it — so a program in that pane can read it back.
+/// `chcp` is the same UTF-8 code page `term.rs` gives a cmd pane without
+/// marks, so Arabic paths stay readable either way. `$E` is ESC. cmd has no
+/// BEL in `PROMPT`, so the terminator is ST (`ESC \`). There is no `D` and
+/// no `C`: cmd prints `PROMPT` only when it draws the next prompt, and it
+/// has no hook that runs as a command starts or that can see `ERRORLEVEL`
+/// without the user typing it.
+///
+/// The marks carry no nonce. `PROMPT` is inherited by every program the
+/// pane runs, so a nonce in it could be read back and used to forge trusted
+/// marks. `term.rs` treats these exactly like a forged mark: A resets a BiDi
+/// mode the last command left on, and that is all. No block, exit, prompt
+/// state or cwd trust comes from them. The user's `PROMPT` is wrapped, not replaced (cmd defines
+/// `$P$G` itself when none is set).
+///
+/// No `"` and no trailing `\`: portable-pty quotes this argument and would
+/// turn either into a backslash cmd keeps. shortcut: a raw `&` or `|` in the
+/// user's `PROMPT` (rather than `$A`/`$B`) splits this line; quote it if
+/// portable-pty ever passes an argument verbatim.
 fn cmd_setup() -> String {
-    "chcp 65001>nul&prompt $E]133;A;%BAYAN_PROMPT_NONCE%$E\\$P$G$E]133;B;%BAYAN_PROMPT_NONCE%$E\\&set BAYAN_PROMPT_NONCE=".to_string()
+    r"prompt $E]133;A$E\%PROMPT%$E]133;B$E\&chcp 65001>nul".to_string()
 }
 
 /// `login` sources `/etc/profile` and, when `user` is set, the first of
@@ -412,6 +425,10 @@ __bayan_report_cwd() {
     printf '%s' "${__bayan_osc_cache-}"
     return 0
   fi
+  # Cache misses too: a WSL home or a failed cygpath reports nothing, and
+  # asking again on every prompt would fork a converter each time.
+  __bayan_pwd_cache=$PWD
+  __bayan_osc_cache=
   local __bayan_win="$PWD"
   if command -v cygpath >/dev/null 2>&1; then
     __bayan_win=$(cygpath -w "$PWD" 2>/dev/null) || return 0
@@ -429,7 +446,6 @@ __bayan_report_cwd() {
   local __bayan_enc
   __bayan_enc=$(__bayan_pct "$__bayan_p")
   __bayan_osc_cache="$(printf '\033]9;9;%s\007\033]7;file:///%s\007' "$__bayan_win" "$__bayan_enc")"
-  __bayan_pwd_cache=$PWD
   printf '%s' "$__bayan_osc_cache"
 }
 
@@ -576,6 +592,9 @@ __bayan_report_cwd() {
     print -rn -- ${__bayan_osc_cache-}
     return 0
   fi
+  # Cache misses too, so a Linux home does not fork wslpath every prompt.
+  __bayan_pwd_cache=$PWD
+  __bayan_osc_cache=
   local win="$PWD"
   if (( $+commands[cygpath] )); then
     win="$(cygpath -w "$PWD" 2>/dev/null)" || return 0
@@ -593,7 +612,6 @@ __bayan_report_cwd() {
   local enc
   enc=$(__bayan_pct "$p")
   __bayan_osc_cache="$(printf '\033]9;9;%s\007\033]7;file:///%s\007' "$win" "$enc")"
-  __bayan_pwd_cache=$PWD
   print -rn -- "$__bayan_osc_cache"
 }
 
@@ -743,12 +761,13 @@ pub(crate) fn command_started_mark(nonce: &str) -> Vec<u8> {
 }
 
 /// cmd's `PROMPT`. ST (`ESC \`) rather than BEL, because `$E` can emit ESC
-/// and `\` is an ordinary prompt character. No D, so the block has no exit.
+/// and `\` is an ordinary prompt character. No D, so the block has no exit,
+/// and no nonce (see [`cmd_setup`]).
 #[cfg(test)]
-pub(crate) fn cmd_prompt_frame(nonce: &str, prompt: &str) -> Vec<u8> {
-    let mut v = format!("\x1b]133;A;{nonce}\x1b\\").into_bytes();
+pub(crate) fn cmd_prompt_frame(prompt: &str) -> Vec<u8> {
+    let mut v = b"\x1b]133;A\x1b\\".to_vec();
     v.extend(prompt.as_bytes());
-    v.extend(format!("\x1b]133;B;{nonce}\x1b\\").into_bytes());
+    v.extend(b"\x1b]133;B\x1b\\");
     v
 }
 
@@ -1768,13 +1787,10 @@ mod tests {
         assert!(got.files.is_empty(), "cmd does not need a script file");
         assert_eq!(got.args[0], "/K");
         let setup = &got.args[1];
-        assert!(setup.contains("chcp 65001"), "{setup}");
-        assert!(setup.contains("$E]133;A;%BAYAN_PROMPT_NONCE%"), "{setup}");
-        assert!(setup.contains("$E]133;B;%BAYAN_PROMPT_NONCE%"), "{setup}");
-        assert!(setup.contains("set BAYAN_PROMPT_NONCE="), "{setup}");
+        assert!(setup.contains(r"$E]133;A$E\"), "{setup}");
+        assert!(setup.contains(r"$E]133;B$E\"), "{setup}");
         assert!(!setup.contains("133;D"), "cmd cannot report an exit code");
         assert!(!setup.contains("133;C"), "cmd has no command-start hook");
-        assert!(!setup.contains(NONCE), "the nonce stays in the environment");
         // an existing /K is extended, not given a second /K
         let again = plan(
             r"C:\Windows\System32\cmd.exe /K echo hi",
@@ -1785,7 +1801,44 @@ mod tests {
         .unwrap();
         assert_eq!(again.args[0], "/K");
         assert!(again.args[1].contains("echo hi"));
-        assert!(again.args[1].starts_with("chcp 65001"));
+        assert!(again.args[1].starts_with(&cmd_setup()));
+    }
+
+    /// Every child of cmd inherits `PROMPT`. A nonce in it, or in a
+    /// variable cmd expands into it, is readable by any program in the
+    /// pane, which could then mint trusted marks.
+    #[test]
+    fn cmd_never_carries_the_nonce() {
+        for line in ["cmd.exe", "cmd.exe /K echo hi"] {
+            let got = plan(line, true, false, NONCE).unwrap();
+            let joined = got.args.join(" ");
+            assert!(!joined.contains(NONCE), "{joined}");
+            assert!(!joined.contains(NONCE_ENV), "{joined}");
+            assert!(
+                got.env.iter().all(|(k, v)| k != NONCE_ENV && v != NONCE),
+                "{:?}",
+                got.env
+            );
+        }
+    }
+
+    /// The user's own `PROMPT` sits between A and B (cmd defines `$P$G`
+    /// when none is set, so `%PROMPT%` always expands). The code page is
+    /// the one Bayan already gives every cmd pane, not an extra one.
+    #[test]
+    fn cmd_wraps_the_users_prompt_and_keeps_the_pane_code_page() {
+        let setup = cmd_setup();
+        let a = setup.find("133;A").unwrap();
+        let user = setup.find("%PROMPT%").expect("the user's PROMPT is kept");
+        let b = setup.find("133;B").unwrap();
+        assert!(a < user && user < b, "{setup}");
+        assert!(!setup.contains("$P$G"), "do not replace the user's prompt");
+        // portable-pty's argv quoting escapes `"` and doubles a final `\`
+        assert!(!setup.contains('"') && !setup.ends_with('\\'), "{setup}");
+        assert_eq!(setup.matches("chcp").count(), 1, "{setup}");
+        assert!(setup.ends_with("&chcp 65001>nul"), "{setup}");
+        let term = include_str!("term.rs");
+        assert!(term.contains(r#"cmd.args(["/K", "chcp 65001>nul"])"#));
     }
 
     #[test]
@@ -1985,6 +2038,15 @@ mod tests {
         let zsh = file(&wsl, "zsh/.zshrc");
         assert!(zsh.contains("__bayan_pct"));
         assert!(zsh.contains("__bayan_pwd_cache"));
+        // A miss is cached too: a WSL home (`\\wsl.localhost\…`) or a
+        // failed cygpath must not fork a converter on every prompt.
+        for (name, body) in [("bash", rc), ("zsh", zsh)] {
+            let f = body.split("__bayan_report_cwd() {").nth(1).unwrap();
+            let f = &f[..f.find("\n}\n").unwrap()];
+            let stored = f.find("__bayan_pwd_cache=$PWD").expect(name);
+            let first_return = f.find("|| return 0").expect(name);
+            assert!(stored < first_return, "{name} caches only hits:\n{f}");
+        }
     }
 
     #[test]
@@ -2049,10 +2111,16 @@ mod tests {
         let rc_path = home.join("bayan-rc.sh");
         let rc = bash_rc(false, true);
         std::fs::write(&rc_path, &rc).unwrap();
+        // A non-login bash keeps the Windows PATH, which need not hold
+        // Git's usr\bin (cygpath, od). A login shell's /etc/profile adds it.
+        let mut path = std::ffi::OsString::from(bash.parent().unwrap());
+        path.push(";");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
         let mut child = std::process::Command::new(&bash)
             .arg("--rcfile")
             .arg(&rc_path)
             .arg("-i")
+            .env("PATH", &path)
             .env("HOME", &home)
             .env("USERPROFILE", &home)
             .env("BAYAN_PROMPT_NONCE", "n0nce")

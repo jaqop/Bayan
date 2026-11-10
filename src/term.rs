@@ -101,8 +101,9 @@ fn is_under(path: &str, root: &str) -> bool {
 }
 
 /// The PowerShell family gets UTF-8, the prompt theme and OSC 133 marks.
-/// Git Bash, WSL bash/zsh and cmd get the same marks from `shellint`
-/// (cmd without an exit code). Anything else launches bare, and the
+/// Git Bash and WSL bash/zsh get the same marks from `shellint`; cmd gets
+/// A and B with no exit code and no nonce, so they are untrusted. Anything
+/// else launches bare, and the
 /// mark-driven features degrade gracefully.
 fn is_powershell(shell: &str) -> bool {
     // `shell` is a COMMAND LINE now, not a program name: detection emits
@@ -196,8 +197,8 @@ const PS_END: &str = "$([char]7)\"}}}; __by_wrap";
 /// the same nonce, so a spoofed `133;D` cannot authorize the OSC 7 that
 /// follows it. Hex is safe inside the double-quoted prompt string. An empty
 /// nonce keeps the old "any A/D" rule for tests. cmd's `PROMPT` emits A and
-/// B only, so a clink OSC 7 with no 133 is still accepted while the pane
-/// is already idle.
+/// B only, without the nonce, so a clink OSC 7 is still accepted while the
+/// pane is already idle and never on the strength of those marks.
 pub(crate) fn shell_integration_ps(nonce: &str) -> String {
     // `nonce` is spliced in as text: the live session passes NONCE_PS_EXPR,
     // tests pass a literal
@@ -638,8 +639,20 @@ fn osc_terminated_end(data: &[u8], s: usize) -> Option<(usize, usize)> {
     }
 }
 
+/// Jumps between occurrences of the needle's first byte (an ESC for every
+/// OSC prefix) instead of comparing a window at each position, which cost
+/// SGR-heavy output most: ESC there is every few bytes.
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
+    let (&first, rest) = needle.split_first()?;
+    let mut i = 0;
+    while let Some(p) = hay.get(i..)?.iter().position(|&b| b == first) {
+        let s = i + p;
+        if hay[s + 1..].starts_with(rest) {
+            return Some(s);
+        }
+        i = s + 1;
+    }
+    None
 }
 
 /// Commands shorter than this end silently (EasyTer's threshold).
@@ -1576,7 +1589,13 @@ fn process_bytes<T: EventListener>(
     if contains_ris(&buf) {
         meta.saw_ris = true;
     }
-    ev.clipboard = scan_osc52(&buf);
+    // Each OSC scanner below finds its sequence by an `ESC ]` prefix, and
+    // the read most often has none (SGR-heavy output above all): one search
+    // instead of five full passes.
+    let has_osc = find(&buf, b"\x1b]").is_some();
+    if has_osc {
+        ev.clipboard = scan_osc52(&buf);
+    }
     // OSC 7 and OSC 9;9 are trusted only at a shell prompt: no command
     // running, Enter not still pending, and not the alt screen. A report
     // that sits after a trusted OSC 133 A in this same slice is trusted
@@ -1586,19 +1605,31 @@ fn process_bytes<T: EventListener>(
     // directory already stored.
     let nonce = meta.prompt_nonce.clone();
     let command_active = !meta.running_cmd.is_empty() || meta.cmd_pending;
-    if let Some(cwd) = trusted_cwd(
-        &buf,
-        command_active,
-        t.mode().contains(TermMode::ALT_SCREEN),
-        &nonce,
-    ) {
+    if let Some(cwd) = has_osc
+        .then(|| {
+            trusted_cwd(
+                &buf,
+                command_active,
+                t.mode().contains(TermMode::ALT_SCREEN),
+                &nonce,
+            )
+        })
+        .flatten()
+    {
         meta.cwd = Some(cwd.clone());
         ev.cwd = Some(cwd);
     }
-    ev.notify = scan_notify(&buf);
-    ev.progress = scan_progress(&buf);
+    if has_osc {
+        ev.notify = scan_notify(&buf);
+        ev.progress = scan_progress(&buf);
+    }
+    let marks = if has_osc {
+        find_osc133(&buf, &nonce)
+    } else {
+        Vec::new()
+    };
     let mut pos = 0;
-    for (s, e, kind, exit, trusted) in find_osc133(&buf, &nonce) {
+    for (s, e, kind, exit, trusted) in marks {
         feed_counted(parser, t, meta, &buf[pos..s], &mut ev.pty_replies);
         handle_osc133(t, meta, kind, exit, trusted, &mut ev);
         // A new prompt means the previous program is gone. A crashed TUI
@@ -2350,6 +2381,7 @@ impl Session {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        crate::prof::output_read();
                         let (ev, out, sync_deadline) = {
                             // term, then meta, then parser. reset_keyboard
                             // on the UI thread takes the same order. The
@@ -3462,6 +3494,30 @@ mod tests {
     }
 
     use alacritty_terminal::event::VoidListener;
+
+    #[test]
+    fn find_locates_the_first_full_match() {
+        let esc = |s: &str| s.replace('E', "\x1b").into_bytes();
+        assert_eq!(find(&esc("abE]52;x"), &esc("E]52;")), Some(2));
+        assert_eq!(
+            find(&esc("EEE]5E]52;"), &esc("E]52;")),
+            Some(5),
+            "repeated first bytes"
+        );
+        assert_eq!(
+            find(&esc("xE]52"), &esc("E]52;")),
+            None,
+            "cut short at the end"
+        );
+        assert_eq!(find(b"ab", b"abc"), None, "needle longer than the haystack");
+        assert_eq!(
+            find(&esc("E]52;"), &esc("E]52;")),
+            Some(0),
+            "the whole haystack"
+        );
+        assert_eq!(find(b"", b"a"), None);
+        assert_eq!(find(b"abc", b""), None);
+    }
 
     fn test_term() -> (Term<VoidListener>, Processor, SessionMeta, Vec<u8>) {
         let size = TermSize { cols: 40, rows: 6 };
@@ -4963,19 +5019,34 @@ mod tests {
         }
     }
 
-    /// cmd emits A and B with ST, and never a D. The block exists so prompt
-    /// jump still has a row, and the exit stays unknown.
+    /// cmd emits A and B with ST, no D and no nonce, so they are exactly as
+    /// untrusted as bytes any program in the pane could print: A resets the
+    /// BiDi mode the last command left on, and nothing else. No block, no
+    /// "at a prompt", the running command stays, and an OSC 7 after them
+    /// is not accepted.
     #[test]
-    fn cmd_marks_open_a_block_without_an_exit_code() {
-        let mut bytes = crate::shellint::cmd_prompt_frame("n0nce", "> ");
+    fn cmd_marks_are_untrusted() {
+        let mut bytes = crate::shellint::cmd_prompt_frame("> ");
         bytes.extend(b"dir\r\n");
-        bytes.extend(crate::shellint::cmd_prompt_frame("n0nce", "> "));
+        bytes.extend(crate::shellint::cmd_prompt_frame("> "));
         let state = mark_state(&bytes);
-        assert!(state.at_prompt);
-        assert_eq!(state.exits, vec![None, None]);
+        assert!(!state.at_prompt);
+        assert!(state.exits.is_empty(), "{:?}", state.exits);
         assert!(state.screen.contains('>'));
         assert!(!state.screen.contains("133"), "{:?}", state.screen);
         assert!(!state.screen.contains('\u{1b}'));
+
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.prompt_nonce = "n0nce".into();
+        meta.running_cmd = "evil".into();
+        meta.bidi_mut().mode = crate::bidi_ctl::BidiMode::Explicit;
+        let mut forged = crate::shellint::cmd_prompt_frame("> ");
+        forged.extend(osc7_of("file:///C:/evil"));
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &forged);
+        assert!(ev.cwd.is_none());
+        assert_eq!(meta.running_cmd, "evil");
+        assert!(!meta.at_prompt);
+        assert_eq!(meta.bidi.mode, crate::bidi_ctl::BidiMode::Implicit);
     }
 
     #[test]
@@ -5518,5 +5589,218 @@ mod tests {
         assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
         p.advance(&mut t, b"Z");
         assert_eq!(cell(&t, 0), 'Z');
+    }
+}
+
+/// Throughput and memory probes. `#[ignore]`d: they feed hundreds of MB and
+/// mean something only in release. Run them with
+/// `cargo test --release -- --ignored measure_ --nocapture --test-threads=1`.
+/// They print `PROBE` lines and assert only what must hold on any machine.
+#[cfg(test)]
+mod measure_probes {
+    use super::*;
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::term::Config;
+
+    fn corpus(kind: &str, bytes: usize) -> Vec<u8> {
+        let line: String = match kind {
+            "ascii" => format!("{}\r\n", "build: compiling crate v0.1.0 ".repeat(4)),
+            "sgr" => (0..12)
+                .map(|i| format!("\x1b[38;5;{}m word{i} \x1b[0m", 16 + i * 17))
+                .chain(std::iter::once("\r\n".to_string()))
+                .collect(),
+            "arabic" => format!("{}\r\n", "مرحبا بالعالم هذا سطر عربي ".repeat(4)),
+            _ => unreachable!(),
+        };
+        line.as_bytes()
+            .iter()
+            .copied()
+            .cycle()
+            .take(bytes)
+            .collect()
+    }
+
+    fn private_mb() -> f64 {
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: a plain C struct of integers; all zeroes is a valid value.
+        let mut c: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+        // SAFETY: `c` is a live, writable PROCESS_MEMORY_COUNTERS_EX whose
+        // size is passed, and the pseudo-handle of this process needs no close.
+        let ok = unsafe {
+            GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                (&mut c as *mut PROCESS_MEMORY_COUNTERS_EX).cast::<PROCESS_MEMORY_COUNTERS>(),
+                std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+            )
+        };
+        assert_ne!(ok, 0, "GetProcessMemoryInfo failed");
+        c.PrivateUsage as f64 / (1024.0 * 1024.0)
+    }
+
+    fn term(scrollback: usize) -> Term<VoidListener> {
+        let config = Config {
+            scrolling_history: scrollback,
+            ..Config::default()
+        };
+        Term::new(
+            config,
+            &TermSize {
+                cols: 120,
+                rows: 40,
+            },
+            VoidListener,
+        )
+    }
+
+    /// MB/s through `process_chunk` (Bayan's whole per-read path) and through
+    /// the bare vte parser, in PTY_READ-sized reads.
+    #[test]
+    #[ignore]
+    fn measure_reader_throughput() {
+        const BYTES: usize = 64 * 1024 * 1024;
+        for kind in ["ascii", "sgr", "arabic"] {
+            let data = corpus(kind, BYTES);
+            let mb = data.len() as f64 / (1024.0 * 1024.0);
+
+            let mut t = term(10_000);
+            let mut p: Processor = Processor::new();
+            let started = Instant::now();
+            for chunk in data.chunks(PTY_READ) {
+                p.advance(&mut t, chunk);
+            }
+            let raw = mb / started.elapsed().as_secs_f64();
+
+            let mut t = term(10_000);
+            let (mut p, mut meta, mut carry) =
+                (Processor::new(), SessionMeta::default(), Vec::new());
+            let started = Instant::now();
+            for chunk in data.chunks(PTY_READ) {
+                let _ = process_chunk(&mut p, &mut t, &mut meta, &mut carry, chunk);
+            }
+            let full = mb / started.elapsed().as_secs_f64();
+            eprintln!(
+                "PROBE throughput {kind:6} {mb:.0} MB: process_chunk {full:7.1} MB/s, vte alone {raw:7.1} MB/s ({:.0}% of vte)",
+                100.0 * full / raw
+            );
+            assert_eq!(t.grid().history_size(), 10_000, "{kind}: scrollback filled");
+        }
+    }
+
+    /// Time of each pass `process_chunk` makes over a read, alone, so a slow
+    /// one shows up by name. Same corpora and read size as the throughput probe.
+    #[test]
+    #[ignore]
+    fn measure_reader_stages() {
+        const BYTES: usize = 64 * 1024 * 1024;
+        fn kitty_scan(bytes: &[u8]) -> usize {
+            let (mut i, mut segments) = (0, 0);
+            while i < bytes.len() {
+                if let Some(seq) = kitty_seq_at(bytes, i) {
+                    i = seq.end;
+                    continue;
+                }
+                let mut j = i + 1;
+                while j < bytes.len() {
+                    if bytes[j] == 0x1b && kitty_seq_at(bytes, j).is_some() {
+                        break;
+                    }
+                    j += 1;
+                }
+                segments += 1;
+                i = j;
+            }
+            segments
+        }
+        for kind in ["ascii", "sgr", "arabic"] {
+            let data = corpus(kind, BYTES);
+            let mb = data.len() as f64 / (1024.0 * 1024.0);
+            let time = |name: &str, f: &mut dyn FnMut(&[u8])| {
+                let started = Instant::now();
+                for chunk in data.chunks(PTY_READ) {
+                    f(chunk);
+                }
+                let secs = started.elapsed().as_secs_f64();
+                eprintln!(
+                    "PROBE stage {kind:6} {name:22} {:8.1} ms ({:7.0} MB/s)",
+                    secs * 1000.0,
+                    mb / secs
+                );
+            };
+            let mut filter = SessionMeta::default().esc_filter;
+            time("bidi_ctl filter", &mut |c| {
+                std::hint::black_box(filter.pull(c));
+            });
+            time("incomplete_tail_start", &mut |c| {
+                std::hint::black_box(incomplete_tail_start(c));
+            });
+            time("contains_ris", &mut |c| {
+                std::hint::black_box(contains_ris(c));
+            });
+            time("scan_osc52", &mut |c| {
+                std::hint::black_box(scan_osc52(c));
+            });
+            time("trusted_cwd", &mut |c| {
+                std::hint::black_box(trusted_cwd(c, false, false, "n0nce"));
+            });
+            time("scan_notify", &mut |c| {
+                std::hint::black_box(scan_notify(c));
+            });
+            time("scan_progress", &mut |c| {
+                std::hint::black_box(scan_progress(c));
+            });
+            time("find_osc133", &mut |c| {
+                std::hint::black_box(find_osc133(c, "n0nce"));
+            });
+            time("contains_alt_screen_csi", &mut |c| {
+                std::hint::black_box(contains_alt_screen_csi(c));
+            });
+            time("kitty scan", &mut |c| {
+                std::hint::black_box(kitty_scan(c));
+            });
+            let mut t = term(10_000);
+            let mut p: Processor = Processor::new();
+            time("vte advance", &mut |c| p.advance(&mut t, c));
+            let mut t = term(10_000);
+            let (mut p, mut meta) = (Processor::new(), SessionMeta::default());
+            let mut replies = Vec::new();
+            time("feed_counted", &mut |c| {
+                feed_counted(&mut p, &mut t, &mut meta, c, &mut replies);
+            });
+        }
+    }
+
+    /// Private bytes after filling the scrollback, and again after the same
+    /// amount once more: a bounded grid stops growing once it is full.
+    #[test]
+    #[ignore]
+    fn measure_scrollback_memory() {
+        let data = corpus("ascii", 32 * 1024 * 1024); // ~260k lines of 122 bytes
+        for scrollback in [10_000, 100_000] {
+            let before = private_mb();
+            let mut t = term(scrollback);
+            let (mut p, mut meta, mut carry) =
+                (Processor::new(), SessionMeta::default(), Vec::new());
+            let mut feed = |t: &mut Term<VoidListener>| {
+                for chunk in data.chunks(PTY_READ) {
+                    let _ = process_chunk(&mut p, t, &mut meta, &mut carry, chunk);
+                }
+            };
+            feed(&mut t);
+            let full = private_mb() - before;
+            feed(&mut t);
+            let again = private_mb() - before;
+            eprintln!(
+                "PROBE scrollback {scrollback:6} lines x 120 cols: +{full:6.1} MB once full, +{again:6.1} MB after as much again (history {})",
+                t.grid().history_size()
+            );
+            assert_eq!(t.grid().history_size(), scrollback);
+            assert!(
+                again < full * 1.1 + 8.0,
+                "{scrollback}: memory kept growing after the scrollback was full ({full:.1} -> {again:.1} MB)"
+            );
+        }
     }
 }
