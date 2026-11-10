@@ -40,9 +40,13 @@
 //! zero-width characters are rejected, and the text is capped at the same
 //! length as a JSON action.
 //!
-//! `bayan.spawn(program, args)` runs `program` with `args` (a list of
-//! strings) and no shell. It is absent unless this plugin's allowlist entry
-//! sets `"spawn": true`.
+//! `bayan.spawn(program, args)` starts `program` with `args` and no shell,
+//! then returns. The wait, the output cap, and the kill happen on a worker.
+//! It is absent unless this plugin's allowlist entry sets `"spawn": true`.
+//!
+//! Each call into a plugin — loading it, a key binding, an event — gets its
+//! own instruction budget and its own deadline. A loop is cut off. The next
+//! call starts clean.
 //!
 //! Strings crossing the boundary are UTF-8. Arabic round-trips unchanged.
 //!
@@ -102,7 +106,8 @@ impl Limits {
 }
 
 struct Fuel {
-    start: Instant,
+    /// Reset before every entry from the host. The hook reads it.
+    start: Mutex<Instant>,
     steps: AtomicU64,
     stride: u64,
     instructions: u64,
@@ -111,13 +116,48 @@ struct Fuel {
 }
 
 impl Fuel {
+    fn new(limits: &Limits) -> Arc<Self> {
+        Arc::new(Self {
+            start: Mutex::new(Instant::now()),
+            steps: AtomicU64::new(0),
+            stride: u64::from(limits.stride),
+            instructions: limits.instructions,
+            deadline: limits.deadline,
+            exhausted: AtomicBool::new(false),
+        })
+    }
+
+    /// A fresh deadline and a fresh instruction budget for this call only.
+    fn reset(&self) {
+        let mut start = self.start.lock().unwrap_or_else(|e| e.into_inner());
+        *start = Instant::now();
+        self.steps.store(0, Ordering::Relaxed);
+        self.exhausted.store(false, Ordering::Release);
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.start
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .elapsed()
+    }
+
     fn over(&self) -> bool {
         if self.exhausted.load(Ordering::Acquire) {
             return true;
         }
         let steps = self.steps.load(Ordering::Relaxed);
-        steps.saturating_mul(self.stride) > self.instructions
-            || self.start.elapsed() > self.deadline
+        steps.saturating_mul(self.stride) > self.instructions || self.elapsed() > self.deadline
+    }
+
+    fn mark_if_over(&self, steps: u64) -> bool {
+        let over = self.exhausted.load(Ordering::Acquire)
+            || steps.saturating_mul(self.stride) > self.instructions
+            || self.elapsed() > self.deadline;
+        if over {
+            self.exhausted.store(true, Ordering::Release);
+        }
+        over
     }
 }
 
@@ -134,9 +174,15 @@ pub struct PendingScript {
     pub role: ScriptRole,
     pub path: PathBuf,
     pub hash: String,
-    /// Source the card shows, plus the hash. The approval is of the full
-    /// file, not of this preview.
+    /// What the card is showing. Short files are the whole source. A longer
+    /// file starts as a head plus the hash and size; [`Self::reveal`] replaces
+    /// it with the whole source before Enter may approve.
     pub preview: String,
+    full: String,
+    bytes: usize,
+    line_count: usize,
+    /// True only when `preview` contains the entire source.
+    complete: bool,
 }
 
 impl PendingScript {
@@ -146,9 +192,26 @@ impl PendingScript {
             ScriptRole::Plugin { name, .. } => name.as_str(),
         };
         format!(
-            "{} — {which}",
-            crate::lang::tr("تشغيل سكربت لوا", "Run a Lua script")
+            "{} — {which} — {} {}",
+            crate::lang::tr("تشغيل سكربت لوا", "Run a Lua script"),
+            self.bytes,
+            crate::lang::tr("بايت", "bytes"),
         )
+    }
+
+    /// Enter may approve only a card that already shows the whole file.
+    pub fn shows_everything(&self) -> bool {
+        self.complete
+    }
+
+    /// Replace the truncated card with the full source, the hash, and the size.
+    pub fn reveal(mut self) -> Self {
+        self.preview = format!(
+            "sha256:{}\n{} bytes · {} lines\n{}",
+            self.hash, self.bytes, self.line_count, self.full
+        );
+        self.complete = true;
+        self
     }
 }
 
@@ -172,6 +235,7 @@ struct LoadedPlugin {
     handlers: Rc<RefCell<Vec<(String, mlua::RegistryKey)>>>,
     sends: Arc<Mutex<Vec<String>>>,
     runs: Arc<AtomicU64>,
+    fuel: Arc<Fuel>,
     lua: Lua,
 }
 
@@ -245,11 +309,26 @@ impl PluginSet {
             .map(|p| p.runs.load(Ordering::Relaxed))
             .sum()
     }
+}
 
-    /// The PTY reader must not hand bytes to Lua. Tests pass the bytes the
-    /// emulator just parsed; the body deliberately does not dispatch.
-    #[cfg(test)]
-    pub fn observe_terminal(&mut self, _bytes: &[u8]) {}
+/// Facts parsed out of terminal output. They are not plugin events.
+#[derive(Clone, Debug, Default)]
+pub struct PtyFacts {
+    pub bell: bool,
+    pub title: Option<String>,
+    pub cwd: Option<String>,
+    pub hyperlink: bool,
+    pub output: bool,
+}
+
+/// What a PTY fact is allowed to do to plugins: nothing.
+///
+/// The bell, title, cwd, and notify handlers call this and ignore the
+/// result. Returning a send here would mean terminal output ran Lua, and
+/// `terminal_output_never_runs_lua` fails.
+pub fn plugin_sends_from_pty(plugins: &PluginSet, facts: &PtyFacts) -> Vec<PluginSend> {
+    let _ = (plugins, facts);
+    Vec::new()
 }
 
 fn call_binding(plugin: &LoadedPlugin, index: usize) {
@@ -266,6 +345,7 @@ fn call_binding(plugin: &LoadedPlugin, index: usize) {
             }
         }
     };
+    plugin.fuel.reset();
     plugin.runs.fetch_add(1, Ordering::Relaxed);
     if let Err(err) = func.call::<()>(()) {
         log_line(&format!("{}: binding: {err}", plugin.name));
@@ -286,6 +366,7 @@ fn call_handler(plugin: &LoadedPlugin, index: usize, event: &str, fields: &[(&st
             }
         }
     };
+    plugin.fuel.reset();
     plugin.runs.fetch_add(1, Ordering::Relaxed);
     let info = match plugin.lua.create_table() {
         Ok(t) => t,
@@ -325,9 +406,17 @@ pub const ELEVATED_NOTICE: &str = "سكربتات لوا والإضافات مت
 
 /// Result of loading `config.lua` and the executable plugins.
 pub struct Outcome {
+    /// Runtime settings: JSON plus an approved `config.lua`.
     pub config: UserConfig,
+    /// The document to write back. Lua overrides are not in it, so deleting
+    /// `config.lua` drops them on the next load.
+    pub persisted: UserConfig,
+    /// Technical failures. Logged, not shown.
     pub errors: Vec<String>,
-    /// A policy notice, not a script failure. Set when the token is elevated.
+    /// Arabic sentences for the window. The technical text stays in `errors`.
+    pub shown: Vec<String>,
+    /// A policy notice, not a script failure. Set when the token is elevated
+    /// and the user actually has a script or a plugin.
     pub notice: Option<String>,
     pub pending: Vec<PendingScript>,
     pub plugins: PluginSet,
@@ -339,49 +428,12 @@ pub fn scripts_enabled(elevated: bool) -> bool {
     !elevated
 }
 
-/// Whether this process token is elevated. That includes `--elevated` after
-/// UAC and Explorer's Run as administrator. A failed query is not elevated:
-/// the token bit is the only signal. Tests do not call this; they pass the
-/// boolean into [`load_with`].
+/// Whether this process token is elevated. The query lives in [`crate::elevate`]
+/// so a later merge with the `--elevated` relaunch uses one check. A failed
+/// query is elevated (scripts stay off). Tests pass the boolean into
+/// [`load_with`] instead of calling this.
 pub fn is_elevated() -> bool {
-    #[cfg(windows)]
-    {
-        token_is_elevated()
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
-
-#[cfg(windows)]
-fn token_is_elevated() -> bool {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::Security::{
-        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
-    };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    // SAFETY: GetCurrentProcess returns a pseudo-handle that is not closed.
-    // OpenProcessToken writes one token handle, and CloseHandle releases it.
-    // GetTokenInformation writes into `elevation`; the size is the struct's.
-    unsafe {
-        let mut token = std::ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-            return false;
-        }
-        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
-        let mut written = 0u32;
-        let ok = GetTokenInformation(
-            token,
-            TokenElevation,
-            &mut elevation as *mut TOKEN_ELEVATION as *mut _,
-            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-            &mut written,
-        );
-        let _ = CloseHandle(token);
-        ok != 0 && elevation.TokenIsElevated != 0
-    }
+    crate::elevate::is_elevated()
 }
 
 /// Load Lua beside `dir`'s config.json. Unapproved and changed files are
@@ -397,16 +449,23 @@ pub fn load_at(cfg: &UserConfig, dir: &Path) -> Outcome {
 /// exist under `dir` or `lua_plugins_dir`.
 pub fn load_with(cfg: &UserConfig, dir: &Path, elevated: bool) -> Outcome {
     if !scripts_enabled(elevated) {
-        log_line(ELEVATED_NOTICE);
+        let notice = user_has_scripts(cfg, dir).then(|| {
+            log_line(ELEVATED_NOTICE);
+            ELEVATED_NOTICE.to_string()
+        });
         return Outcome {
             config: cfg.clone(),
+            persisted: cfg.clone(),
             errors: Vec::new(),
-            notice: Some(ELEVATED_NOTICE.to_string()),
+            shown: Vec::new(),
+            notice,
             pending: Vec::new(),
             plugins: PluginSet::default(),
         };
     }
+    let persisted = cfg.clone();
     let mut errors = Vec::new();
+    let mut shown = Vec::new();
     let mut pending = Vec::new();
     let mut config = cfg.clone();
 
@@ -421,26 +480,30 @@ pub fn load_with(cfg: &UserConfig, dir: &Path, elevated: bool) -> Outcome {
             pending.push(script);
         }
         ConfigLua::Failed(err) => {
-            log_line(&format!("config.lua: {err}"));
-            errors.push(format!("config.lua: {err}"));
+            let err = format!("config.lua: {err}");
+            log_line(&err);
+            shown.push(arabic_notice(&err));
+            errors.push(err);
         }
         ConfigLua::Applied(merged) => config = *merged,
     }
 
     // Allowlist, directory, and approvals come from the JSON config, not
     // from whatever config.lua just merged.
-    let plugins = load_plugins(cfg, dir, &mut pending, &mut errors);
+    let plugins = load_plugins(cfg, dir, &mut pending, &mut errors, &mut shown);
     Outcome {
         config,
+        persisted,
         errors,
+        shown,
         notice: None,
         pending,
         plugins,
     }
 }
 
-/// The name a config watcher should call. Same rules as [`load_at`],
-/// including the elevation gate: a changed file is not run, and an
+/// What the config watcher (PR #52) must call when that lands. It must not
+/// run Lua itself. A new or changed file comes back in `pending`, and an
 /// elevated token runs nothing.
 pub fn reload(cfg: &UserConfig, dir: &Path) -> Outcome {
     load_at(cfg, dir)
@@ -514,25 +577,72 @@ fn approved(cfg: &UserConfig, hash: &str) -> bool {
 }
 
 fn pending_script(role: ScriptRole, path: &Path, text: &str, hash: String) -> PendingScript {
-    let mut preview: String = text.chars().take(12 * 56).collect();
-    if text.chars().count() > preview.chars().count() {
-        preview.push('\n');
-        preview.push('…');
-    }
-    preview.push_str("\nsha256:");
-    preview.push_str(&hash);
+    let bytes = text.len();
+    let line_count = text.lines().count().max(1);
+    let chars = text.chars().count();
+    let header = format!("sha256:{hash}\n{bytes} bytes · {line_count} lines\n");
+    // 12 card rows. A longer file is not approvable until reveal() shows it all.
+    let complete = chars <= 12 * 56;
+    let preview = if complete {
+        format!("{header}{text}")
+    } else {
+        let head: String = text.chars().take(12 * 56).collect();
+        format!("{header}{head}\n…")
+    };
     PendingScript {
         role,
         path: path.to_path_buf(),
         hash,
         preview,
+        full: text.to_string(),
+        bytes,
+        line_count,
+        complete,
     }
+}
+
+fn arabic_notice(technical: &str) -> String {
+    let t = technical.to_ascii_lowercase();
+    if t.contains("limit") {
+        "تجاوز السكربت حد الوقت أو التعليمات.".into()
+    } else if t.contains("memory") || t.contains("not enough memory") {
+        "تجاوز السكربت حد الذاكرة.".into()
+    } else if t.contains("syntax") || t.contains("unexpected") || t.contains("near") {
+        "في السكربت خطأ صياغة.".into()
+    } else if t.contains("symlink") {
+        "لن يُشغَّل اختصار رمزي.".into()
+    } else {
+        "تعذر تشغيل السكربت. التفاصيل في سجل lua.log.".into()
+    }
+}
+
+/// True when an elevated window has something to refuse. An empty home
+/// does not get the notice.
+fn user_has_scripts(cfg: &UserConfig, dir: &Path) -> bool {
+    if dir.join("config.lua").is_file() || !cfg.lua_plugins.is_empty() {
+        return true;
+    }
+    if dir_has_plugins(&dir.join("plugins")) {
+        return true;
+    }
+    plugins_root(cfg, dir).is_some_and(|root| dir_has_plugins(&root))
+}
+
+fn dir_has_plugins(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(|e| e.ok()).any(|e| {
+        e.path()
+            .extension()
+            .is_some_and(|x| x.eq_ignore_ascii_case("lua") || x.eq_ignore_ascii_case("json"))
+    })
 }
 
 fn apply_config_lua(cfg: &UserConfig, bytes: &[u8]) -> Result<UserConfig, String> {
     let source = source_text(bytes)?;
     let original = serde_json::to_value(cfg).map_err(|e| e.to_string())?;
-    let lua = open_sandbox(Limits::production())?;
+    let (lua, fuel) = open_sandbox(Limits::production())?;
     let table = json_to_lua(&lua, &original)?;
     let Value::Table(config_table) = table else {
         return Err("config did not become a table".into());
@@ -541,6 +651,7 @@ fn apply_config_lua(cfg: &UserConfig, bytes: &[u8]) -> Result<UserConfig, String
         .set("config", config_table)
         .map_err(|e| e.to_string())?;
     // No bayan table. spawn, bind, on, and send are not installed.
+    fuel.reset();
     let returned: Value = lua
         .load(source)
         .set_mode(ChunkMode::Text)
@@ -568,6 +679,7 @@ fn load_plugins(
     bayan_dir: &Path,
     pending: &mut Vec<PendingScript>,
     errors: &mut Vec<String>,
+    shown: &mut Vec<String>,
 ) -> PluginSet {
     if cfg.lua_plugins.is_empty() {
         return PluginSet::default();
@@ -575,6 +687,7 @@ fn load_plugins(
     let Some(root) = plugins_root(cfg, bayan_dir) else {
         let msg = "lua_plugins is set but lua_plugins_dir is not; no executable plugin ran";
         log_line(msg);
+        shown.push(arabic_notice(msg));
         errors.push(msg.into());
         return PluginSet::default();
     };
@@ -584,8 +697,10 @@ fn load_plugins(
             Ok(OnePlugin::Pending(script)) => pending.push(script),
             Ok(OnePlugin::Loaded(plugin)) => set.plugins.push(plugin),
             Err(err) => {
-                log_line(&format!("{}: {err}", allow.name));
-                errors.push(format!("{}: {err}", allow.name));
+                let err = format!("{}: {err}", allow.name);
+                log_line(&err);
+                shown.push(arabic_notice(&err));
+                errors.push(err);
             }
         }
     }
@@ -663,7 +778,7 @@ fn stem_ok(name: &str) -> bool {
 }
 
 fn exec_plugin(allow: &LuaPluginAllow, source: &str) -> Result<LoadedPlugin, String> {
-    let lua = open_sandbox(Limits::production())?;
+    let (lua, fuel) = open_sandbox(Limits::production())?;
     let regs = PluginRegs {
         bindings: Rc::new(RefCell::new(Vec::new())),
         handlers: Rc::new(RefCell::new(Vec::new())),
@@ -671,6 +786,7 @@ fn exec_plugin(allow: &LuaPluginAllow, source: &str) -> Result<LoadedPlugin, Str
         runs: Arc::new(AtomicU64::new(0)),
     };
     install_plugin_api(&lua, allow.spawn, &regs)?;
+    fuel.reset();
     lua.load(source)
         .set_mode(ChunkMode::Text)
         .set_name(&allow.name)
@@ -682,6 +798,7 @@ fn exec_plugin(allow: &LuaPluginAllow, source: &str) -> Result<LoadedPlugin, Str
         handlers: regs.handlers,
         sends: regs.sends,
         runs: regs.runs,
+        fuel,
         lua,
     })
 }
@@ -785,46 +902,112 @@ fn strings_from_table(t: mlua::Table) -> mlua::Result<Vec<String>> {
 }
 
 fn spawn_process(program: &str, args: &[String]) -> Result<String, String> {
-    let mut child = std::process::Command::new(program)
-        .args(args)
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| e.to_string())?;
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: a console program must not flash a console.
+        cmd.creation_flags(0x0800_0000);
+    }
+    // Starting the process is the only work on the caller. The wait, the
+    // output cap, and the kill run on a worker so the UI thread returns.
+    let child = cmd.spawn().map_err(|e| e.to_string())?;
+    std::thread::spawn(move || supervise_child(child));
+    Ok(String::new())
+}
+
+fn supervise_child(mut child: std::process::Child) {
+    let job = tie_to_job(&child);
     let stdout = child.stdout.take();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut out) = stdout {
-            let _ = out.read_to_end(&mut buf);
+            let mut tmp = [0u8; 4096];
+            while buf.len() < 64 * 1024 {
+                match out.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let room = 64 * 1024 - buf.len();
+                        buf.extend_from_slice(&tmp[..n.min(room)]);
+                    }
+                }
+            }
         }
-        let _ = tx.send(buf);
+        let _ = tx.send(());
     });
-    let start = Instant::now();
-    loop {
-        match rx.try_recv() {
-            Ok(buf) => {
-                let _ = child.wait();
-                let n = buf.len().min(64 * 1024);
-                return String::from_utf8(buf[..n].to_vec())
-                    .map_err(|_| "spawn output is not utf-8".to_string());
+    let _ = rx.recv_timeout(Duration::from_secs(2));
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(job);
+}
+
+/// A job that kills the process and anything it spawned when the handle
+/// closes. Absent off Windows, and best-effort if the job cannot be made.
+fn tie_to_job(_child: &std::process::Child) -> Option<JobGuard> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        };
+        // SAFETY: CreateJobObjectW and OpenProcess return handles this function
+        // either closes or hands to JobGuard. The information pointer is a
+        // local struct that outlives SetInformationJobObject, and the length
+        // is that struct's size.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return None;
             }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("spawn produced no output".into());
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty)
-                if start.elapsed() > Duration::from_secs(2) =>
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                std::mem::size_of_val(&info) as u32,
+            ) == 0
             {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("spawn timed out".into());
+                let _ = CloseHandle(job);
+                return None;
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                std::thread::sleep(Duration::from_millis(10));
+            let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, _child.id());
+            if proc.is_null() || AssignProcessToJobObject(job, proc) == 0 {
+                if !proc.is_null() {
+                    let _ = CloseHandle(proc);
+                }
+                let _ = CloseHandle(job);
+                return None;
             }
+            let _ = CloseHandle(proc);
+            Some(JobGuard(job))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = _child;
+        None
+    }
+}
+
+struct JobGuard(#[cfg(windows)] windows_sys::Win32::Foundation::HANDLE);
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        unsafe {
+            // SAFETY: the handle came from CreateJobObjectW and has not been closed.
+            let _ = windows_sys::Win32::Foundation::CloseHandle(self.0);
         }
     }
 }
@@ -851,7 +1034,7 @@ fn send_char_forbidden(c: char) -> bool {
 /// library (`luaopen_base` in mlua 0.12.2), so `load`, `loadfile`, `dofile`,
 /// and `require` are removed here, and `load` is replaced with a function
 /// that forces text mode.
-fn open_sandbox(limits: Limits) -> Result<Lua, String> {
+fn open_sandbox(limits: Limits) -> Result<(Lua, Arc<Fuel>), String> {
     let libs = StdLib::STRING | StdLib::TABLE | StdLib::MATH | StdLib::UTF8;
     // LuaOptions::default() in 0.12.2 (async feature off) is
     // catch_rust_panics: true. Panics in a callback become Lua errors
@@ -860,24 +1043,13 @@ fn open_sandbox(limits: Limits) -> Result<Lua, String> {
     lua.set_memory_limit(limits.memory)
         .map_err(|e| e.to_string())?;
 
-    let fuel = Arc::new(Fuel {
-        start: Instant::now(),
-        steps: AtomicU64::new(0),
-        stride: u64::from(limits.stride),
-        instructions: limits.instructions,
-        deadline: limits.deadline,
-        exhausted: AtomicBool::new(false),
-    });
+    let fuel = Fuel::new(&limits);
     let hook_fuel = Arc::clone(&fuel);
     lua.set_global_hook(
         HookTriggers::new().every_nth_instruction(limits.stride),
         move |_lua, _dbg| {
             let steps = hook_fuel.steps.fetch_add(1, Ordering::Relaxed) + 1;
-            let over = hook_fuel.exhausted.load(Ordering::Acquire)
-                || steps.saturating_mul(hook_fuel.stride) > hook_fuel.instructions
-                || hook_fuel.start.elapsed() > hook_fuel.deadline;
-            if over {
-                hook_fuel.exhausted.store(true, Ordering::Release);
+            if hook_fuel.mark_if_over(steps) {
                 Err(mlua::Error::runtime("lua execution limit exceeded"))
             } else {
                 Ok(VmState::Continue)
@@ -887,7 +1059,7 @@ fn open_sandbox(limits: Limits) -> Result<Lua, String> {
     .map_err(|e| e.to_string())?;
 
     harden(&lua, &fuel)?;
-    Ok(lua)
+    Ok((lua, fuel))
 }
 
 fn harden(lua: &Lua, fuel: &Arc<Fuel>) -> Result<(), String> {
@@ -1165,7 +1337,8 @@ fn probe(src: &str) -> Result<String, String> {
 
 #[cfg(test)]
 fn probe_with(src: &str, limits: Limits) -> Result<String, String> {
-    let lua = open_sandbox(limits)?;
+    let (lua, fuel) = open_sandbox(limits)?;
+    fuel.reset();
     let value: Value = lua
         .load(src)
         .set_mode(ChunkMode::Text)
@@ -1410,7 +1583,7 @@ mod tests {
 
     #[test]
     fn the_memory_limit_rejects_a_huge_string() {
-        let lua = open_sandbox(Limits {
+        let (lua, _) = open_sandbox(Limits {
             memory: 32 * 1024 * 1024,
             ..Limits::production()
         })
@@ -1433,7 +1606,7 @@ mod tests {
 
     #[test]
     fn arabic_strings_round_trip() {
-        let lua = open_sandbox(Limits::production()).unwrap();
+        let (lua, _) = open_sandbox(Limits::production()).unwrap();
         let s = "السلام عليكم — بيان";
         lua.globals().set("s", s).unwrap();
         let back: String = lua.globals().get("s").unwrap();
@@ -1671,24 +1844,40 @@ mod tests {
         ];
         for sample in samples {
             feed_terminal(sample);
-            out.plugins.observe_terminal(sample);
+            let facts = PtyFacts {
+                bell: sample.contains(&0x07),
+                title: Some("بيان".into()),
+                cwd: Some("C:/Users/someone".into()),
+                hyperlink: sample.windows(6).any(|w| w == b"\x1b]8;;"),
+                output: true,
+            };
+            // The same function the bell and cwd handlers call. If it starts
+            // dispatching, this plugin's handlers send and the test fails.
+            assert!(
+                plugin_sends_from_pty(&mut out.plugins, &facts).is_empty(),
+                "terminal facts must not run Lua"
+            );
         }
         assert_eq!(out.plugins.callback_runs(), runs);
         assert_eq!(out.plugins.fire("ctrl+alt+g").len(), 1);
-        // The fire above is the control: the binding still works, so the
-        // silence was the sequences, not a plugin that failed to load.
+        // The binding still works, so the silence was the sequences.
         assert!(out
             .plugins
             .emit("bell", &[])
             .iter()
             .any(|s| s.text == "ran:bell"));
-        // And the sequences themselves still did not emit. Re-feed after
-        // the explicit emit and require the run count to stay put.
         let after = out.plugins.callback_runs();
-        for sample in samples {
-            feed_terminal(sample);
-            out.plugins.observe_terminal(sample);
-        }
+        let again = plugin_sends_from_pty(
+            &mut out.plugins,
+            &PtyFacts {
+                bell: true,
+                title: Some("x".into()),
+                cwd: Some("y".into()),
+                hyperlink: true,
+                output: true,
+            },
+        );
+        assert!(again.is_empty());
         assert_eq!(out.plugins.callback_runs(), after);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1748,6 +1937,157 @@ mod tests {
         // The live token, whatever this process is. Scripts follow it.
         let live = is_elevated();
         assert_eq!(scripts_enabled(live), !live);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_callback_still_runs_after_the_deadline() {
+        let dir = scratch("budget");
+        let plugins = dir.join("plugins");
+        fs::create_dir_all(&plugins).unwrap();
+        let src = "bayan.bind('f12', function() bayan.send('ok') end)\n";
+        fs::write(plugins.join("hello.lua"), src).unwrap();
+        let mut cfg = plugin_cfg(&plugins, "hello", false);
+        approve(&mut cfg, src.as_bytes());
+        let mut out = load_with(&cfg, &dir, false);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        std::thread::sleep(Duration::from_millis(150));
+        let sends = out.plugins.fire("f12");
+        assert_eq!(sends.len(), 1, "the budget must reset for each call");
+        assert_eq!(sends[0].text, "ok");
+        for _ in 0..50 {
+            assert_eq!(out.plugins.fire("f12")[0].text, "ok");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_runaway_callback_is_cut_off_and_the_next_call_works() {
+        let dir = scratch("runaway");
+        let plugins = dir.join("plugins");
+        fs::create_dir_all(&plugins).unwrap();
+        let src = r#"
+            bayan.bind("f12", function() while true do end end)
+            bayan.bind("f11", function() bayan.send("ok") end)
+        "#;
+        fs::write(plugins.join("hello.lua"), src).unwrap();
+        let mut cfg = plugin_cfg(&plugins, "hello", false);
+        approve(&mut cfg, src.as_bytes());
+        let mut out = load_with(&cfg, &dir, false);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let start = Instant::now();
+        assert!(out.plugins.fire("f12").is_empty());
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "a loop must still be killed"
+        );
+        assert_eq!(out.plugins.fire("f11")[0].text, "ok");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lua_values_are_not_what_gets_saved() {
+        let dir = scratch("persist");
+        let src = "config.font_size = 99\n";
+        fs::write(dir.join("config.lua"), src).unwrap();
+        let mut cfg = json_cfg(r#"{"font_size":12.0}"#);
+        approve(&mut cfg, src.as_bytes());
+        let out = load_with(&cfg, &dir, false);
+        assert_eq!(out.config.font_size, Some(99.0));
+        assert_eq!(out.persisted.font_size, Some(12.0));
+        let saved = serde_json::to_string(&out.persisted).unwrap();
+        assert!(!saved.contains("99"), "{saved}");
+        fs::remove_file(dir.join("config.lua")).unwrap();
+        let again = load_with(&out.persisted, &dir, false);
+        assert_eq!(again.config.font_size, Some(12.0));
+        assert!(again.notice.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_long_script_is_not_approved_until_the_card_shows_it_all() {
+        let body = format!("-- {}\nconfig.font_size = 12\n", "x".repeat(2000));
+        let script = pending_script(
+            ScriptRole::Config,
+            Path::new("config.lua"),
+            &body,
+            content_hash(body.as_bytes()),
+        );
+        assert!(!script.shows_everything());
+        assert!(script.preview.contains(&script.hash));
+        assert!(script.preview.contains("bytes"));
+        assert!(!script.preview.contains(&"x".repeat(2000)));
+        let revealed = script.reveal();
+        assert!(revealed.shows_everything());
+        assert!(revealed.preview.contains(&"x".repeat(2000)));
+    }
+
+    #[test]
+    fn a_script_error_shown_to_the_user_is_arabic() {
+        let dir = scratch("arabic-err");
+        let src = "function (\n";
+        fs::write(dir.join("config.lua"), src).unwrap();
+        let mut cfg = json_cfg(r#"{"font_size":12.0}"#);
+        approve(&mut cfg, src.as_bytes());
+        let out = load_with(&cfg, &dir, false);
+        assert!(!out.errors.is_empty());
+        assert!(!out.shown.is_empty());
+        assert!(
+            out.shown[0]
+                .chars()
+                .any(|c| ('\u{0600}'..='\u{06FF}').contains(&c)),
+            "the window text is Arabic: {}",
+            out.shown[0]
+        );
+        assert!(
+            !out.shown[0].contains("function"),
+            "the window text stays Arabic: {}",
+            out.shown[0]
+        );
+        assert!(
+            out.errors[0].contains("syntax") || out.errors[0].contains("function"),
+            "the log keeps the technical error: {}",
+            out.errors[0]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_elevated_window_without_scripts_stays_quiet() {
+        let dir = scratch("quiet");
+        let cfg = json_cfg(r#"{"font_size":12.0}"#);
+        let out = load_with(&cfg, &dir, true);
+        assert!(out.notice.is_none(), "{:?}", out.notice);
+        assert_eq!(out.config.font_size, Some(12.0));
+        assert_eq!(out.plugins.callback_runs(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spawn_returns_without_waiting_for_the_process() {
+        let dir = scratch("spawn-fast");
+        let plugins = dir.join("plugins");
+        fs::create_dir_all(&plugins).unwrap();
+        let src = r#"
+            bayan.bind("f12", function()
+              local ok = pcall(bayan.spawn, "ping.exe", {"-n", "15", "127.0.0.1"})
+              if ok then bayan.send("fast") else bayan.send("err") end
+            end)
+        "#;
+        fs::write(plugins.join("hello.lua"), src).unwrap();
+        let mut cfg = plugin_cfg(&plugins, "hello", true);
+        approve(&mut cfg, src.as_bytes());
+        let mut out = load_with(&cfg, &dir, false);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let start = Instant::now();
+        let sends = out.plugins.fire("f12");
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "spawn blocked the caller for {:?}",
+            start.elapsed()
+        );
+        assert_eq!(sends[0].text, "fast");
         let _ = fs::remove_dir_all(&dir);
     }
 

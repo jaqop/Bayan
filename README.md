@@ -943,15 +943,23 @@ bells, program output — do not enter Lua.
 The sandbox is Lua 5.4 via mlua, with `string`, `table`, `math`, and
 `utf8` only. `io`, `os`, `debug`, and `package` are absent. `require`,
 `loadfile`, `dofile`, and `string.dump` are removed, and `load` accepts
-text chunks only. A memory cap and an instruction hook with a deadline
-cut off a loop that would otherwise hang the window. Strings are UTF-8;
-Arabic round-trips.
+text chunks only. Each call into Lua gets its own instruction budget and
+its own short deadline, so one callback cannot spend the next one's time.
+A loop is still cut off. Strings are UTF-8; Arabic round-trips.
+
+`bayan.spawn` starts the program and returns without waiting for it. A
+worker caps what it reads, and on Windows the process is created with
+`CREATE_NO_WINDOW` inside a job that ends the process tree when the job
+closes. The values `config.lua` changes are not written back to
+`config.json`. A script longer than the card shows its size and hash
+first; Enter reveals the rest before it can approve.
 
 An elevated token does not run any of it. That is `--elevated` after the
 UAC prompt and Explorer's Run as administrator: the process token, not a
 flag Bayan has to be the one to set. `config.lua`, executable plugins, and
 the declarative JSON plugins are left unread. The window keeps the plain
-JSON settings and shows «سكربتات لوا والإضافات متوقفة لأن النافذة تعمل كمسؤول.»
+JSON settings. When a `config.lua` or a plugin is actually present, the
+window shows «سكربتات لوا والإضافات متوقفة لأن النافذة تعمل كمسؤول.»
 
 ## BiDi controls and the current directory
 

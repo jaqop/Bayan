@@ -51,6 +51,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_ProcessStatus", # EnumProcessModules in the planted-conpty.dll test
     "Win32_System_Threading", # GetCurrentProcess for that module walk
     "Win32_Security", # TokenElevation: an elevated token does not run Lua
+    "Win32_System_JobObjects", # spawn: kill child processes when the job closes
     "Win32_System_SystemInformation", # GetSystemDirectoryW: loaded kernel32 must sit under System32
     "Win32_System_IO", # DeviceIoControl: read a link's target without following it (localpath.rs)
 ] }

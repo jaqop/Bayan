@@ -12,6 +12,7 @@ mod bidi_ctl;
 mod chrome;
 mod config;
 mod copymode;
+mod elevate;
 mod gpu;
 mod groups;
 mod input;
@@ -1479,6 +1480,8 @@ struct App {
     auto_follow: bool,
     claude_manual: bool,
     config: config::UserConfig,
+    /// The config.json document. Lua overrides live only in `config`.
+    json_config: config::UserConfig,
     config_load_error: Option<String>,
     startup_error: Option<String>,
     /// Executable Lua plugins that passed the allowlist and the hash approval.
@@ -1577,10 +1580,13 @@ impl App {
             } else {
                 plugins::registry().themes[idx - builtin].name.clone()
             };
-            self.config.theme = Some(name);
-            self.config.bg = Some(hex(t.bg));
-            self.config.fg = Some(hex(t.fg));
-            self.config.palette = Some(t.palette.iter().map(|&c| hex(c)).collect());
+            self.remember(name, |c, v| c.theme = Some(v));
+            self.remember(hex(t.bg), |c, v| c.bg = Some(v));
+            self.remember(hex(t.fg), |c, v| c.fg = Some(v));
+            self.remember(
+                t.palette.iter().map(|&c| hex(c)).collect::<Vec<_>>(),
+                |c, v| c.palette = Some(v),
+            );
             self.rebuild_renderer();
             self.request_redraw();
         }
@@ -1589,14 +1595,14 @@ impl App {
     fn change_font_size(&mut self, delta: i32) {
         let s = (self.config.font_size.unwrap_or(render::DEFAULT_FONT_SIZE) + delta as f32)
             .clamp(8.0, 40.0);
-        self.config.font_size = Some(s);
+        self.remember(s, |c, v| c.font_size = Some(v));
         self.rebuild_renderer();
         self.request_redraw();
     }
 
     fn toggle_ligatures(&mut self) {
         let v = !self.config.ligatures.unwrap_or(true);
-        self.config.ligatures = Some(v);
+        self.remember(v, |c, v| c.ligatures = Some(v));
         self.rebuild_renderer();
         self.request_redraw();
     }
@@ -1614,7 +1620,7 @@ impl App {
         let cur = r.family();
         let i = choices.iter().position(|c| c == cur).unwrap_or(0);
         let next = choices[keyroute::cycle(i, dir, choices.len())].clone();
-        self.config.font_family = Some(next);
+        self.remember(next, |c, v| c.font_family = Some(v));
         self.rebuild_renderer();
         self.request_redraw();
     }
@@ -1626,18 +1632,20 @@ impl App {
         };
         let choices = r.arabic_font_choices();
         let current = r.arabic_family().map(str::to_string);
-        self.config.arabic_font = step_arabic_font(&choices, current.as_deref(), dir);
+        let next = step_arabic_font(&choices, current.as_deref(), dir);
+        self.remember(next, |c, v| c.arabic_font = v);
         self.rebuild_renderer();
         self.request_redraw();
     }
 
     fn set_cursor_style(&mut self, s: config::CursorStyle) {
-        self.config.cursor_style = Some(s.as_str().to_string());
+        self.remember(s.as_str().to_string(), |c, v| c.cursor_style = Some(v));
         self.request_redraw(); // read per-frame; no rebuild needed
     }
 
     fn toggle_blink(&mut self) {
-        self.config.cursor_blink = Some(!self.config.cursor_blink_on());
+        let on = !self.config.cursor_blink_on();
+        self.remember(on, |c, v| c.cursor_blink = Some(v));
         self.last_input = Instant::now(); // preview the blink right away
         self.request_redraw();
     }
@@ -1646,17 +1654,19 @@ impl App {
     /// terminal convention — live sessions keep their buffer).
     fn change_scrollback(&mut self, dir: i32) {
         let cur = self.config.scrollback_lines();
-        self.config.scrollback = Some(step_preset(&config::SCROLLBACK_STEPS, cur, dir) as u32);
+        let n = step_preset(&config::SCROLLBACK_STEPS, cur, dir) as u32;
+        self.remember(n, |c, v| c.scrollback = Some(v));
         self.request_redraw();
     }
 
     fn toggle_copy_on_select(&mut self) {
-        self.config.copy_on_select = Some(!self.config.copy_on_select_on());
+        let on = !self.config.copy_on_select_on();
+        self.remember(on, |c, v| c.copy_on_select = Some(v));
         self.request_redraw();
     }
 
     fn set_bell(&mut self, mode: config::BellMode) {
-        self.config.bell = Some(mode.as_str().to_string());
+        self.remember(mode.as_str().to_string(), |c, v| c.bell = Some(v));
         if mode == config::BellMode::Sound {
             beep(); // preview the mode you just picked
         }
@@ -1671,24 +1681,25 @@ impl App {
         }
         let cur = self.config.shell_program();
         let i = shells::index_of(choices, &cur).unwrap_or(0);
-        self.config.shell = Some(
-            choices[keyroute::cycle(i, dir, choices.len())]
-                .command
-                .clone(),
-        );
+        let command = choices[keyroute::cycle(i, dir, choices.len())]
+            .command
+            .clone();
+        self.remember(command, |c, v| c.shell = Some(v));
         self.request_redraw();
     }
 
     fn change_padding(&mut self, dir: i32) {
         let cur = self.config.padding_px() as u32;
-        self.config.padding = Some(step_preset(&config::PADDING_STEPS, cur, dir));
+        let n = step_preset(&config::PADDING_STEPS, cur, dir);
+        self.remember(n, |c, v| c.padding = Some(v));
         self.relayout_active(); // pane rects (and PTY sizes) follow the inset
         self.request_redraw();
     }
 
     fn change_opacity(&mut self, dir: i32) {
         let cur = (self.config.opacity_level() * 100.0).round() as u32;
-        self.config.opacity = Some(step_preset(&config::OPACITY_STEPS, cur, dir) as f32 / 100.0);
+        let n = step_preset(&config::OPACITY_STEPS, cur, dir) as f32 / 100.0;
+        self.remember(n, |c, v| c.opacity = Some(v));
         self.apply_opacity();
         self.request_redraw();
     }
@@ -1801,19 +1812,21 @@ impl App {
     }
 
     fn toggle_hide_bar(&mut self) {
-        self.config.hide_single_tab = Some(!self.config.hide_single_tab_on());
+        let on = !self.config.hide_single_tab_on();
+        self.remember(on, |c, v| c.hide_single_tab = Some(v));
         self.relayout_active(); // the content area gains/loses the bar strip
         self.request_redraw();
     }
 
     fn toggle_confirm_close(&mut self) {
-        self.config.confirm_close = Some(!self.config.confirm_close_on());
+        let on = !self.config.confirm_close_on();
+        self.remember(on, |c, v| c.confirm_close = Some(v));
         self.request_redraw();
     }
 
     fn toggle_notifications(&mut self) {
         let on = !self.config.notifications_on();
-        self.config.notifications = Some(on);
+        self.remember(on, |c, v| c.notifications = Some(v));
         if on {
             // preview the toast you just turned on
             if let Some(h) = self.hwnd() {
@@ -2325,6 +2338,7 @@ impl App {
         if self.config.keybinds.as_ref().is_some_and(|m| m.is_empty()) {
             self.config.keybinds = None;
         }
+        self.json_config.keybinds = self.config.keybinds.clone();
         self.keymap = keybinds::effective_map(&self.config);
         self.request_redraw();
     }
@@ -2336,6 +2350,7 @@ impl App {
                 self.config.keybinds = None;
             }
         }
+        self.json_config.keybinds = self.config.keybinds.clone();
         self.keymap = keybinds::effective_map(&self.config);
         self.request_redraw();
     }
@@ -2414,7 +2429,7 @@ impl App {
     /// mirrored, with the button now naming the way back.
     fn switch_language(&mut self) {
         let next = self.config.lang().other();
-        self.config.language = Some(next.id().to_string());
+        self.remember(next.id().to_string(), |c, v| c.language = Some(v));
         lang::set(next);
         self.save_config();
         self.request_redraw();
@@ -2431,12 +2446,19 @@ impl App {
         self.request_redraw();
     }
 
+    /// A panel edit lands in the runtime config and in the JSON document.
+    /// Lua-only values stay on `config` and are not copied here.
+    fn remember<T: Clone>(&mut self, value: T, write: impl Fn(&mut config::UserConfig, T)) {
+        write(&mut self.config, value.clone());
+        write(&mut self.json_config, value);
+    }
+
     fn save_config(&mut self) {
         if self.config_load_error.is_some() {
             self.report_config_load_error();
             return;
         }
-        if let Err(error) = config::save(&self.config) {
+        if let Err(error) = config::save(&self.json_config) {
             self.report_error(
                 tr("تعذر حفظ الإعدادات", "Could not save settings"),
                 &error.to_string(),
@@ -4418,31 +4440,38 @@ impl App {
         let Some(script) = card.lua else {
             return;
         };
+        if !script.shows_everything() {
+            self.raise_lua_card(script.reveal());
+            self.request_redraw();
+            return;
+        }
         match lua_host::unchanged(&script) {
             Ok(()) => {
-                lua_host::grant(&mut self.config, &script.hash);
+                lua_host::grant(&mut self.json_config, &script.hash);
                 self.save_config();
-                let outcome = lua_host::reload(&self.config, &config::bayan_dir());
+                let outcome = lua_host::reload(&self.json_config, &config::bayan_dir());
                 self.apply_lua_outcome(outcome);
             }
             Err(err) => {
+                eprintln!("bayan: {err}");
                 self.report_error(
                     tr("تعذر اعتماد السكربت", "Could not approve the script"),
-                    &err,
+                    "تغيّر الملف ويحتاج اعتمادًا جديدًا.",
                 );
-                let outcome = lua_host::reload(&self.config, &config::bayan_dir());
+                let outcome = lua_host::reload(&self.json_config, &config::bayan_dir());
                 self.apply_lua_outcome(outcome);
             }
         }
     }
 
     fn apply_lua_outcome(&mut self, outcome: lua_host::Outcome) {
+        self.json_config = outcome.persisted;
         self.config = outcome.config;
         self.keymap = keybinds::effective_map(&self.config);
         lang::set(self.config.lang());
         self.lua_plugins = outcome.plugins;
         self.lua_pending = outcome.pending;
-        self.lua_errors = outcome.errors;
+        self.lua_errors = outcome.shown;
         self.lua_notice = outcome.notice;
         if self.renderer.is_some() && !self.renderer_building {
             self.rebuild_renderer();
@@ -5246,6 +5275,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Bell(id) => {
+                // Terminal output does not run Lua. The helper's result is empty.
+                let _ = lua_host::plugin_sends_from_pty(
+                    &mut self.lua_plugins,
+                    &lua_host::PtyFacts {
+                        bell: true,
+                        ..lua_host::PtyFacts::default()
+                    },
+                );
                 // the cockpit signal: a pane you're NOT looking at wants you
                 let mode = self.config.bell_mode();
                 if mode == config::BellMode::Silent {
@@ -5338,6 +5375,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Cwd(id, cwd) => {
+                let _ = lua_host::plugin_sends_from_pty(
+                    &mut self.lua_plugins,
+                    &lua_host::PtyFacts {
+                        cwd: Some(cwd.clone()),
+                        title: Some(cwd.clone()),
+                        ..lua_host::PtyFacts::default()
+                    },
+                );
                 let base = cwd.rsplit(['\\', '/']).next().unwrap_or(&cwd).to_string();
                 if let Some((ti, pi)) = self.find_pane(id) {
                     // the tab is named after its FOCUSED pane's directory
@@ -5694,8 +5739,9 @@ fn run() -> Result<(), String> {
     }
     let lua_pending = lua.pending;
     let lua_plugins = lua.plugins;
-    let lua_errors = lua.errors;
+    let lua_errors = lua.shown;
     let lua_notice = lua.notice;
+    let json_config = lua.persisted;
     cfg = lua.config;
     // debug hook: BAYAN_ARABIC_FONT=<family> draws terminal Arabic in that
     // font for this run only (config.json is not written unless a setting
@@ -5774,6 +5820,7 @@ fn run() -> Result<(), String> {
         auto_follow: true,
         claude_manual: false,
         config: cfg,
+        json_config,
         config_load_error,
         startup_error: None,
         lua_plugins,
