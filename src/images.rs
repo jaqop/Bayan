@@ -260,7 +260,7 @@ struct Placement {
     z: i32,
 }
 
-struct Raster {
+pub(crate) struct Raster {
     w: u32,
     h: u32,
     rgba: Vec<u8>,
@@ -390,10 +390,22 @@ impl ImageStore {
     }
 
     /// Charge or release the open-sequence buffer so it counts toward the caps.
-    pub(crate) fn sync_inflight(&mut self, carry: usize) {
+    /// `false` means the pane could not hold it; the caller drops the carry
+    /// and this drops an unpaid kitty upload.
+    pub(crate) fn sync_inflight(&mut self, carry: usize) -> bool {
         self.set_charged(true, carry);
         let pending = self.pending.as_ref().map(|p| p.b64.len()).unwrap_or(0);
         self.set_charged(false, pending);
+        let carry_ok = self.inflight_carry == carry;
+        let pending_ok = self.inflight_pending == pending;
+        if !pending_ok {
+            self.pending = None;
+            self.set_charged(false, 0);
+        }
+        if !carry_ok {
+            self.set_charged(true, 0);
+        }
+        carry_ok && pending_ok
     }
 
     /// The kitty base64 is about to become pixels (or was dropped). Release
@@ -798,7 +810,11 @@ impl ImageStore {
         }
         let extra = piece.chars().filter(|c| !c.is_ascii_whitespace()).count();
         let cap = self.limits.max_bytes.saturating_mul(4) / 3 + 8;
-        if extra > self.inflight_room() || pending.b64.len().saturating_add(extra) > cap {
+        // A finished command is charged as pixels, so the base64 length is not
+        // compared with the decoded budget. An open `m=1` chunk is held, and
+        // its decoded size has to fit in the room that is left.
+        let held = fields.more && (extra.saturating_mul(3) / 4) > self.inflight_room();
+        if held || pending.b64.len().saturating_add(extra) > cap {
             self.pending = None;
             return self.kitty_fail(&fields);
         }
@@ -1065,6 +1081,8 @@ impl ImageStore {
         })
     }
 
+    // image, placement id, anchor, cols, rows, cursor policy, protocol, z
+    #[allow(clippy::too_many_arguments)]
     fn add_placement(
         &mut self,
         image: u32,
@@ -2055,8 +2073,6 @@ pub struct ImageFilter {
     sixel_p2: u8,
     /// Probe or in-progress payload held from the previous read.
     carry: Vec<u8>,
-    /// Maximum carry length for this pull, including bytes already held.
-    carry_limit: usize,
 }
 
 impl Default for ImageFilter {
@@ -2068,7 +2084,6 @@ impl Default for ImageFilter {
             overflow: false,
             sixel_p2: 0,
             carry: Vec::new(),
-            carry_limit: usize::MAX,
         }
     }
 }
@@ -2083,13 +2098,20 @@ impl ImageFilter {
     }
 
     pub fn pull(&mut self, input: &[u8]) -> Vec<Inbound> {
-        self.pull_within(input, usize::MAX / 4)
+        self.pull_limited(input)
     }
 
-    /// `extra` is how many more payload bytes the pane budget still allows.
-    pub fn pull_within(&mut self, input: &[u8], extra: usize) -> Vec<Inbound> {
-        self.carry_limit = self.carry.len().saturating_add(extra);
-        self.pull_limited(input)
+    /// The pane could not budget the bytes still in `carry`. Drop them and
+    /// ignore the rest of this sequence.
+    pub fn abandon(&mut self) {
+        self.carry.clear();
+        self.carry.shrink_to_fit();
+        if matches!(
+            self.phase,
+            Phase::Osc(StrKind::Take) | Phase::Dcs(StrKind::Take) | Phase::Apc(StrKind::Take)
+        ) {
+            self.overflow = true;
+        }
     }
 
     fn pull_limited(&mut self, input: &[u8]) -> Vec<Inbound> {
@@ -2287,7 +2309,7 @@ impl ImageFilter {
                 if self.overflow {
                     return;
                 }
-                if held.len() >= self.raw_cap() || held.len() >= self.carry_limit {
+                if held.len() >= self.raw_cap() {
                     self.overflow = true;
                     held.clear();
                     held.shrink_to_fit();

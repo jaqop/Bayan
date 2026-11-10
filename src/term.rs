@@ -1666,6 +1666,10 @@ fn process_bytes<T: EventListener>(
 ///
 /// `merge_chunk` joins those `Bytes` items and extends `pty_replies`, so a
 /// kitty `CSI ? u` answer is kept when the filter splits the read.
+///
+/// The PTY reader does not call this. It decodes images before taking the
+/// terminal lock, then applies the same pieces. Tests share this entry.
+#[cfg(test)]
 pub(crate) fn process_chunk<T: EventListener>(
     parser: &mut Processor,
     t: &mut Term<T>,
@@ -1677,17 +1681,21 @@ pub(crate) fn process_chunk<T: EventListener>(
     // bytes (the terminator) and are larger than the BiDi filter's hold,
     // so the filter never sees them. What remains is the stream BDSM, SCP,
     // and OSC 133 already understand.
-    let room = meta.images.inflight_room();
-    let mut pieces = meta.image_in.pull_within(data, room);
+    let mut pieces = meta.image_in.pull(data);
     // Sixel and PNG are decoded before the rest of the chunk mutates the
     // grid. The reader calls the same warm step with the locks released.
     crate::images::warm_inbound(&mut pieces, &meta.images.limits());
     // The completed payload has left the carry. Charge only what is still open
-    // before the decoded image itself is charged.
-    meta.images.sync_inflight(meta.image_in.carry_len());
+    // before the decoded image itself is charged. A carry the budget cannot
+    // hold is dropped rather than kept for free.
+    if !meta.images.sync_inflight(meta.image_in.carry_len()) {
+        meta.image_in.abandon();
+    }
     let ev = apply_image_pieces(parser, t, meta, carry, pieces);
     // A chunked upload now sits in `pending`. Charge it before the next read.
-    meta.images.sync_inflight(meta.image_in.carry_len());
+    if !meta.images.sync_inflight(meta.image_in.carry_len()) {
+        meta.image_in.abandon();
+    }
     ev
 }
 
@@ -2567,10 +2575,9 @@ impl Session {
                         // thread, which draws under that lock.
                         let (filter, pieces) = {
                             let mut m = meta2.lock_or_recover();
-                            let room = m.images.inflight_room();
                             let limits = m.images.limits();
                             let mut filter = std::mem::take(&mut m.image_in);
-                            let mut pieces = filter.pull_within(&buf[..n], room);
+                            let mut pieces = filter.pull(&buf[..n]);
                             // Drop the meta guard before decoding.
                             drop(m);
                             crate::images::warm_inbound(&mut pieces, &limits);
@@ -2586,12 +2593,16 @@ impl Session {
                             let mut p = parser2.lock_or_recover();
                             m.image_in = filter;
                             let carry_len = m.image_in.carry_len();
-                            m.images.sync_inflight(carry_len);
+                            if !m.images.sync_inflight(carry_len) {
+                                m.image_in.abandon();
+                            }
                             batch.lock_or_recover().begin();
                             let mut ev =
                                 apply_image_pieces(&mut p, &mut t, &mut m, &mut carry, pieces);
                             let open = m.image_in.carry_len();
-                            m.images.sync_inflight(open);
+                            if !m.images.sync_inflight(open) {
+                                m.image_in.abandon();
+                            }
                             let replies = std::mem::take(&mut ev.pty_replies);
                             let out = batch.lock_or_recover().finish(ev.clean_claude, replies);
                             (ev, out, p.sync_timeout().sync_timeout())
