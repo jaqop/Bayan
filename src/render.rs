@@ -2938,17 +2938,6 @@ impl Renderer {
         // never to `cell_geometry`. Selection and search draw one rect per
         // span of `cell_geometry`; a second box there darkens the cell twice.
         if !claude {
-            if let Some((pane, row)) = self.mapping_context {
-                self.row_shape.insert(
-                    (pane, row),
-                    RowShape {
-                        key: key.clone(),
-                        cells: cell_bytes.clone(),
-                        text_x0,
-                        scale,
-                    },
-                );
-            }
             if let Some(col) = cursor_col.filter(|col| *col < text_end_col) {
                 if let Some(&(_, b0, b1)) = cell_bytes.iter().find(|cell| cell.0 == col) {
                     if let Some((x, w)) = self.ink_box(&key, b0, b1) {
@@ -2965,6 +2954,18 @@ impl Renderer {
                         }
                     }
                 }
+            }
+            // moved, not cloned: this runs for every bidi row every frame
+            if let Some((pane, row)) = self.mapping_context {
+                self.row_shape.insert(
+                    (pane, row),
+                    RowShape {
+                        key,
+                        cells: cell_bytes,
+                        text_x0,
+                        scale,
+                    },
+                );
             }
         }
         backgrounds.sort_unstable();
