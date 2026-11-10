@@ -1004,6 +1004,13 @@ end
 Bayan now starts with one fresh tab. To opt into reopening saved tabs and panes,
 set `"restore_tabs": true` in config. Window position and size still persist.
 
+`bayan -d <folder>` (or `--cwd <folder>`, `--cwd=<folder>`) opens the first tab
+in that folder; a relative one is taken from the current folder. It goes through
+the same gate as every start folder, and a UNC path, a mapped network drive or a
+missing folder stops Bayan with an error instead of opening somewhere else. With
+`restore_tabs` on, the saved tabs come back and the folder opens as the active
+extra tab.
+
 The default terminal font is 18; settings and tab controls use independent UI
 metrics so a small terminal font does not shrink the controls. Ctrl+V pastes in
 shells and TUIs; Ctrl+C copies a selection or sends the interrupt when no text
