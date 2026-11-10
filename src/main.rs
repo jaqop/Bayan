@@ -25,6 +25,7 @@ mod link;
 mod localpath;
 mod mouse;
 mod mru;
+mod mux;
 mod osc7;
 mod persist;
 mod plugins;
@@ -33,6 +34,7 @@ mod process;
 mod pty_writer;
 mod render;
 mod shells;
+mod ssh;
 mod term;
 mod toast;
 
@@ -461,6 +463,14 @@ struct Pane {
     last_output: Option<Instant>,
     /// the program's OSC 9;4 progress report, until it clears it
     progress: Option<term::Progress>,
+    /// Set when the ConPTY lives in the mux server. `armed` is cleared to
+    /// detach: the session's kill hook then leaves the remote process running.
+    mux: Option<MuxBind>,
+}
+
+struct MuxBind {
+    id: u64,
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -936,6 +946,18 @@ enum PaletteRow {
     OpenShellMenu,
     /// name the active group; `None` gives it back its number
     RenameGroup(Option<String>),
+    /// open the SSH host list
+    OpenSsh,
+    /// one host from that list (the token ssh receives after `--`)
+    SshHost(String),
+    /// detach the focused mux session
+    DetachSession,
+    /// list sessions the server is still running
+    OpenDetached,
+    /// bring a detached session back into a tab
+    Reattach(u64),
+    /// end a detached session
+    KillSession(u64),
 }
 
 /// Rows of the right-click menu, most used first. Each one is a keymap
@@ -1300,6 +1322,10 @@ struct Palette {
     /// the menu lists the installed shells (`shell_menu_rows`) instead of
     /// the pane actions: a right-click on the tab bar
     shells_menu: bool,
+    /// the rows are SSH hosts
+    ssh_menu: bool,
+    /// the rows are detached mux sessions
+    detached_menu: bool,
     sel: usize,
     extras: Vec<(PaletteRow, String)>,
     pressed: Option<(usize, PaletteRow)>,
@@ -1408,6 +1434,10 @@ struct App {
     spawn_group: Option<u32>,
     /// the command palette, when open
     palette: Option<Palette>,
+    /// Live connection to `bayan --mux-server`. Absent unless `mux.enabled`
+    /// and a mux action has already needed it. Closing the window does not
+    /// kill this process when a session was detached.
+    mux_client: Option<mux::MuxClient>,
     shell_profiles: Vec<shells::Shell>,
     shell_profiles_ready: bool,
     startup_pending: bool,
@@ -1939,12 +1969,19 @@ impl App {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let extras = palette_extras(&self.shell_profiles, &links);
+        let mut extras = palette_extras(&self.shell_profiles, &links);
+        extras.push((PaletteRow::OpenSsh, ssh::label_open().to_string()));
+        if self.config.mux_enabled() {
+            extras.push((PaletteRow::DetachSession, mux::label_detach().to_string()));
+            extras.push((PaletteRow::OpenDetached, mux::label_reattach().to_string()));
+        }
         self.palette = Some(Palette {
             query,
             rename: None,
             menu: None,
             shells_menu: false,
+            ssh_menu: false,
+            detached_menu: false,
             sel: 0,
             extras,
             pressed: None,
@@ -2027,6 +2064,22 @@ impl App {
         if let Some(target) = self.palette.as_ref().and_then(|p| p.rename) {
             return rename_rows(target, query);
         }
+        if self
+            .palette
+            .as_ref()
+            .is_some_and(|p| p.ssh_menu || p.detached_menu)
+        {
+            let q = query.trim().to_lowercase();
+            return self
+                .palette
+                .as_ref()
+                .unwrap()
+                .extras
+                .iter()
+                .filter(|(_, label)| q.is_empty() || label.to_lowercase().contains(&q))
+                .cloned()
+                .collect();
+        }
         if self.palette.as_ref().is_some_and(|p| p.menu.is_some()) {
             let q = query.trim().to_lowercase();
             let rows = if self.palette.as_ref().is_some_and(|p| p.shells_menu) {
@@ -2102,6 +2155,12 @@ impl App {
             PaletteRow::OpenRenameGroup => self.open_rename_group(),
             PaletteRow::OpenShellMenu => self.open_shell_menu(),
             PaletteRow::RenameGroup(name) => self.rename_group(name),
+            PaletteRow::OpenSsh => self.open_ssh_menu(),
+            PaletteRow::SshHost(token) => self.open_ssh_host(&token),
+            PaletteRow::DetachSession => self.detach_focused(el),
+            PaletteRow::OpenDetached => self.open_detached_menu(),
+            PaletteRow::Reattach(id) => self.reattach_session(id),
+            PaletteRow::KillSession(id) => self.kill_detached(id),
             PaletteRow::InsertCommand(text) => {
                 self.pending_paste = Some(PendingPaste {
                     kind: PendingKind::Paste,
@@ -2700,6 +2759,7 @@ impl App {
                 command: command.to_string(),
                 last_output: None,
                 progress: None,
+                mux: None,
             }),
             Err(e) => {
                 eprintln!("bayan: spawn failed: {e}");
@@ -2713,6 +2773,19 @@ impl App {
     }
 
     fn spawn_tab_command(&mut self, cwd: Option<String>, command: &str) {
+        self.spawn_tab_named(cwd, command, None);
+    }
+
+    fn spawn_tab_named(&mut self, cwd: Option<String>, command: &str, name: Option<String>) {
+        let cwd_for_spawn = cwd.as_deref().and_then(term::accept_local_cwd);
+        if let Some(pane) = self.spawn_pane_command(cwd_for_spawn.as_deref(), command) {
+            self.adopt_tab(cwd, pane, name);
+        }
+    }
+
+    /// Put `pane` in a new tab in the group on screen. `name` wins over the
+    /// folder title (an SSH tab is named for the host).
+    fn adopt_tab(&mut self, cwd: Option<String>, pane: Pane, name: Option<String>) {
         // Same gate as spawn: a restored UNC path must not become the tab
         // title either. accept_local_cwd does not touch the filesystem.
         let cwd = cwd.and_then(|c| term::accept_local_cwd(&c));
@@ -2725,26 +2798,288 @@ impl App {
             .spawn_group
             .take()
             .unwrap_or_else(|| self.active_group());
-        if let Some(pane) = self.spawn_pane_command(cwd.as_deref(), command) {
-            // this becomes the active tab without switch_tab, so a button
-            // held on the previous tab has to go up first
-            self.abandon_mouse();
-            self.tabs.push(Tab {
-                group,
-                panes: vec![pane],
-                layout: layout::Node::single(),
-                focused: 0,
-                title,
-                name: None,
-                attention: false,
-                broadcast: false,
-                zoomed: false,
+        // this becomes the active tab without switch_tab, so a button
+        // held on the previous tab has to go up first
+        self.abandon_mouse();
+        self.tabs.push(Tab {
+            group,
+            panes: vec![pane],
+            layout: layout::Node::single(),
+            focused: 0,
+            title,
+            name: name.and_then(|n| clean_tab_name(&n)),
+            attention: false,
+            broadcast: false,
+            zoomed: false,
+        });
+        self.active = self.tabs.len() - 1;
+        self.mru.touch(self.active);
+        self.enter_tab();
+        self.relayout_active();
+        self.sync_focus(None);
+    }
+
+    /// `mux.enabled` is the only way here. While it is false this returns
+    /// before any pipe probe or `bayan --mux-server` spawn, the same branch
+    /// `connect_if_enabled` tests.
+    fn ensure_mux(&mut self) -> bool {
+        if !self.config.mux_enabled() {
+            return false;
+        }
+        if self.mux_client.as_ref().is_some_and(|c| c.is_alive()) {
+            return true;
+        }
+        self.mux_client = mux::connect_or_spawn(true).ok();
+        self.mux_client.as_ref().is_some_and(|c| c.is_alive())
+    }
+
+    fn open_ssh_menu(&mut self) {
+        let hosts = ssh::host_list(&self.config.ssh_hosts, &ssh::read_user_config());
+        if hosts.is_empty() {
+            self.blocked_link = Some(BlockedLink {
+                reason: tr("لا مضيفين محفوظين", "No saved hosts").into(),
+                shown: tr(
+                    "أضف المضيف في الإعداد أو في ملف الإعداد",
+                    "Add a host in config.json or in the ssh config file",
+                )
+                .into(),
+                confirm_uri: None,
+                is_app_error: false,
             });
-            self.active = self.tabs.len() - 1;
-            self.mru.touch(self.active);
-            self.enter_tab();
-            self.relayout_active();
-            self.sync_focus(None);
+            return;
+        }
+        self.open_palette(String::new());
+        if let Some(p) = self.palette.as_mut() {
+            p.ssh_menu = true;
+            p.extras = hosts
+                .into_iter()
+                .map(|h| {
+                    (
+                        PaletteRow::SshHost(h.token),
+                        format!("{} — {}", ssh::label_open(), h.title),
+                    )
+                })
+                .collect();
+        }
+    }
+
+    fn open_ssh_host(&mut self, token: &str) {
+        let dir = ssh::system32_dir();
+        let launch = match ssh::prepare_launch(dir.as_deref(), |p| p.is_file(), token) {
+            Ok(launch) => launch,
+            Err(ssh::SshError::NoClient) => {
+                self.blocked_link = Some(BlockedLink {
+                    reason: tr(
+                        "تعذر العثور على عميل الاتصال",
+                        "Could not find the OpenSSH client",
+                    )
+                    .into(),
+                    shown: tr(
+                        "العميل يأتي من مجلد النظام",
+                        "The client comes from the system directory",
+                    )
+                    .into(),
+                    confirm_uri: None,
+                    is_app_error: false,
+                });
+                return;
+            }
+            Err(ssh::SshError::BadHost) => {
+                self.blocked_link = Some(BlockedLink {
+                    reason: tr("اسم المضيف مرفوض", "That host name was rejected").into(),
+                    shown: String::new(),
+                    confirm_uri: None,
+                    is_app_error: false,
+                });
+                return;
+            }
+        };
+        let cwd = self
+            .session()
+            .and_then(|s| s.meta.lock_or_recover().spawn_cwd());
+        if self.config.mux_enabled() && self.spawn_mux_command(cwd.clone(), &launch) {
+            return;
+        }
+        let before = self.tabs.len();
+        self.spawn_tab_named(cwd, &launch.command_line, Some(launch.title));
+        if self.tabs.len() == before && self.blocked_link.is_none() {
+            self.blocked_link = Some(BlockedLink {
+                reason: tr("تعذر تشغيل الاتصال", "Could not start the connection").into(),
+                shown: link::preview(&launch.command_line, 240),
+                confirm_uri: None,
+                is_app_error: false,
+            });
+        }
+    }
+
+    /// Start `launch` inside the mux server and attach a tab to it.
+    /// False means the server was not used; the caller starts a local tab.
+    fn spawn_mux_command(&mut self, cwd: Option<String>, launch: &ssh::SshLaunch) -> bool {
+        if !self.ensure_mux() {
+            return false;
+        }
+        let Some(client) = self.mux_client.clone() else {
+            return false;
+        };
+        let spec = mux::SpawnSpec {
+            title: launch.title.clone(),
+            cwd: cwd.clone().unwrap_or_default(),
+            program: launch.program.display().to_string(),
+            args: launch.args.clone(),
+            cols: self.size.cols.max(1) as u16,
+            rows: self.size.rows.max(1) as u16,
+        };
+        let attached = match client.spawn(spec) {
+            Ok(attached) => attached,
+            Err(error) => {
+                eprintln!("bayan: mux spawn failed: {error}");
+                return false;
+            }
+        };
+        let title = launch.title.clone();
+        let command = launch.command_line.clone();
+        let Some(pane) = self.pane_from_attached(attached, &command) else {
+            return false;
+        };
+        self.adopt_tab(cwd, pane, Some(title));
+        true
+    }
+
+    fn pane_from_attached(&mut self, attached: mux::Attached, command: &str) -> Option<Pane> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let remote = attached.id;
+        let armed = std::sync::Arc::clone(&attached.armed);
+        let session = term::Session::from_parts(term::SessionArgs {
+            size: self.size,
+            proxy: self.proxy.clone(),
+            id,
+            scrollback: self.config.scrollback_lines(),
+            shell: command.to_string(),
+            kitty_protocol: self.config.kitty_protocol_on(),
+            prompt_nonce: term::NONCE_OFF.to_string(),
+            io: term::SessionIo {
+                reader: attached.reader,
+                writer: attached.writer,
+                master: None,
+                child: None,
+                on_resize: Some(attached.on_resize),
+                on_kill: Some(attached.on_kill),
+            },
+        })
+        .map_err(|error| {
+            eprintln!("bayan: mux pane failed: {error}");
+            error
+        })
+        .ok()?;
+        Some(Pane {
+            id,
+            session,
+            command: command.to_string(),
+            last_output: None,
+            progress: None,
+            mux: Some(MuxBind { id: remote, armed }),
+        })
+    }
+
+    fn focused_is_mux(&self) -> bool {
+        self.tabs
+            .get(self.active)
+            .and_then(|t| t.panes.get(t.focused))
+            .is_some_and(|p| p.mux.is_some())
+    }
+
+    fn detach_focused(&mut self, el: &ActiveEventLoop) {
+        if !self.ensure_mux() {
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let Some(pane) = tab.panes.get_mut(tab.focused) else {
+            return;
+        };
+        let Some(bind) = pane.mux.as_ref() else {
+            return;
+        };
+        bind.armed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let remote = bind.id;
+        let pi = tab.focused;
+        if let Some(client) = &self.mux_client {
+            let _ = client.detach(remote);
+        }
+        self.remove_pane(self.active, pi, el);
+    }
+
+    fn open_detached_menu(&mut self) {
+        if !self.ensure_mux() {
+            return;
+        }
+        let sessions = self
+            .mux_client
+            .as_ref()
+            .and_then(|c| c.list().ok())
+            .unwrap_or_default();
+        if sessions.is_empty() {
+            self.blocked_link = Some(BlockedLink {
+                reason: tr("لا جلسات مفصولة", "No detached sessions").into(),
+                shown: String::new(),
+                confirm_uri: None,
+                is_app_error: false,
+            });
+            return;
+        }
+        self.open_palette(String::new());
+        if let Some(p) = self.palette.as_mut() {
+            p.detached_menu = true;
+            p.extras = sessions
+                .into_iter()
+                .flat_map(|s| {
+                    let title = if s.title.is_empty() {
+                        s.command.clone()
+                    } else {
+                        s.title.clone()
+                    };
+                    [
+                        (
+                            PaletteRow::Reattach(s.id),
+                            format!("{} — {title}", mux::label_reattach()),
+                        ),
+                        (
+                            PaletteRow::KillSession(s.id),
+                            format!("{} — {title}", mux::label_kill()),
+                        ),
+                    ]
+                })
+                .collect();
+        }
+    }
+
+    fn reattach_session(&mut self, id: u64) {
+        if !self.ensure_mux() {
+            return;
+        }
+        let Some(client) = self.mux_client.clone() else {
+            return;
+        };
+        let attached = match client.reattach(id) {
+            Ok(attached) => attached,
+            Err(error) => {
+                eprintln!("bayan: reattach failed: {error}");
+                return;
+            }
+        };
+        let title = attached.title.clone();
+        let command = attached.command.clone();
+        if let Some(pane) = self.pane_from_attached(attached, &command) {
+            self.adopt_tab(None, pane, Some(title));
+        }
+    }
+
+    fn kill_detached(&mut self, id: u64) {
+        if let Some(client) = &self.mux_client {
+            client.kill_remote(id);
         }
     }
 
@@ -4165,7 +4500,15 @@ impl App {
             self.tabs.get(self.active).map_or((1, false, false), |t| {
                 (t.panes.len(), t.zoomed, t.broadcast)
             });
-        context_menu_rows(self.has_selection(), panes, zoomed, broadcast)
+        let mut rows = context_menu_rows(self.has_selection(), panes, zoomed, broadcast);
+        rows.push((PaletteRow::OpenSsh, ssh::label_open().to_string()));
+        if self.config.mux_enabled() {
+            rows.push((PaletteRow::OpenDetached, mux::label_reattach().to_string()));
+            if self.focused_is_mux() {
+                rows.push((PaletteRow::DetachSession, mux::label_detach().to_string()));
+            }
+        }
+        rows
     }
 
     /// Right-click: the menu opens under the pointer, on the pane that was
@@ -5463,7 +5806,11 @@ fn cli_start_dir(
 
 fn run() -> Result<(), String> {
     harden_dll_search();
-    let start_dir = cli_start_dir(std::env::args_os().skip(1))?;
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if args.iter().any(|a| a == "--mux-server") {
+        return mux::run_mux_server();
+    }
+    let start_dir = cli_start_dir(args)?;
     prof::init();
     prof::mark("main start");
     use winit::platform::windows::EventLoopBuilderExtWindows;
@@ -5530,6 +5877,7 @@ fn run() -> Result<(), String> {
         groups: groups::Groups::new(),
         spawn_group: None,
         palette: None,
+        mux_client: None,
         shell_profiles: Vec::new(),
         shell_profiles_ready: false,
         startup_pending: true,

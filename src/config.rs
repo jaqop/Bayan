@@ -127,6 +127,14 @@ pub struct UserConfig {
     /// [`KeyboardConfig`].
     #[serde(default, skip_serializing_if = "KeyboardConfig::is_default")]
     pub keyboard: KeyboardConfig,
+    /// Host aliases listed in the SSH palette, in addition to `~/.ssh/config`.
+    /// There is no password field: the ssh client uses the agent and keys.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_hosts: Vec<String>,
+    /// Local session multiplexer. Off unless explicitly enabled, so a
+    /// normal launch never starts `bayan --mux-server`.
+    #[serde(default, skip_serializing_if = "MuxConfig::is_default")]
+    pub mux: MuxConfig,
 }
 
 /// How Bayan treats BDSM from the application.
@@ -181,6 +189,22 @@ impl Default for KeyboardConfig {
             kitty_protocol: false,
             kitty_base_layout_fallback: true,
         }
+    }
+}
+
+/// Opt-in multiplexer. `enabled` defaults to false: detach, reattach and
+/// the per-user pipe server stay off until config.json says otherwise.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct MuxConfig {
+    pub enabled: bool,
+}
+
+impl MuxConfig {
+    /// An untouched mux block is not written back. Saving a config the
+    /// user never pointed at the multiplexer must not mint `"mux"`.
+    pub fn is_default(&self) -> bool {
+        !self.enabled
     }
 }
 
@@ -354,6 +378,13 @@ impl UserConfig {
 
     pub fn kitty_base_layout_fallback_on(&self) -> bool {
         self.keyboard.kitty_base_layout_fallback
+    }
+
+    /// The mux server is off unless config.json sets `mux.enabled` to true.
+    /// Anything else, including a missing `mux` object, keeps today's
+    /// local ConPTY tabs and does not start a server.
+    pub fn mux_enabled(&self) -> bool {
+        self.mux.enabled
     }
 }
 
@@ -550,6 +581,28 @@ mod tests {
         .unwrap();
         assert!(c.kitty_protocol_on());
         assert!(!c.kitty_base_layout_fallback_on());
+    }
+
+    #[test]
+    fn mux_defaults_off_and_is_omitted_from_a_default_save() {
+        let d = UserConfig::default();
+        assert!(!d.mux_enabled());
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(
+            json, "{}",
+            "mux and ssh_hosts stay out of a fresh file: {json}"
+        );
+        let on: UserConfig = serde_json::from_str(r#"{"mux":{"enabled":true}}"#).unwrap();
+        assert!(on.mux_enabled());
+        // an empty object still gets the field default: off
+        let empty: UserConfig = serde_json::from_str(r#"{"mux":{}}"#).unwrap();
+        assert!(!empty.mux_enabled());
+        let hosts: UserConfig =
+            serde_json::from_str(r#"{"ssh_hosts":["example.com"],"ssh_password":"nope"}"#).unwrap();
+        assert_eq!(hosts.ssh_hosts, vec!["example.com".to_string()]);
+        let saved = serde_json::to_string(&hosts).unwrap();
+        assert!(!saved.contains("password"), "{saved}");
+        assert!(!saved.contains("nope"), "{saved}");
     }
 
     #[test]

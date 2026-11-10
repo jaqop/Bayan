@@ -2,7 +2,7 @@
 //! alacritty_terminal. Mirrors EasyTer's proven architecture: a reader thread
 //! feeds the emulator behind a mutex and nudges the UI thread to repaint.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
@@ -2091,8 +2091,12 @@ pub struct Session {
     write_error: Arc<AtomicBool>,
     proxy: EventLoopProxy<UserEvent>,
     id: u64,
-    master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
+    master: Option<Box<dyn MasterPty + Send>>,
+    child: Option<Box<dyn Child + Send + Sync>>,
+    /// Once, on kill. A mux pane tells the server; detach clears the armed
+    /// flag inside the hook so the remote process keeps running.
+    on_kill: Option<Box<dyn FnOnce() + Send>>,
+    on_resize: Option<Box<dyn Fn(u16, u16) + Send + Sync>>,
     /// Command line this pane was spawned with. Drag-drop quoting follows it,
     /// not whatever the settings say now — the live shell is the one reading.
     shell: String,
@@ -2123,8 +2127,31 @@ impl<T> LockExt<T> for Mutex<T> {
 /// it. Killing a child that already exited is a harmless error.
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        self.kill();
     }
+}
+
+/// The pipes and the optional process behind a [`Session`]. A local ConPTY
+/// fills `master` and `child`. A mux view leaves them empty and sets the hooks.
+pub struct SessionIo {
+    pub reader: Box<dyn Read + Send>,
+    pub writer: Box<dyn Write + Send>,
+    pub master: Option<Box<dyn MasterPty + Send>>,
+    pub child: Option<Box<dyn Child + Send + Sync>>,
+    pub on_resize: Option<Box<dyn Fn(u16, u16) + Send + Sync>>,
+    pub on_kill: Option<Box<dyn FnOnce() + Send>>,
+}
+
+/// Everything [`Session::from_parts`] needs besides the byte streams.
+pub struct SessionArgs {
+    pub size: TermSize,
+    pub proxy: EventLoopProxy<UserEvent>,
+    pub id: u64,
+    pub scrollback: usize,
+    pub shell: String,
+    pub kitty_protocol: bool,
+    pub prompt_nonce: String,
+    pub io: SessionIo,
 }
 
 impl Session {
@@ -2214,11 +2241,51 @@ impl Session {
             // UTF-8 code page so Arabic paths survive; no OSC 133 marks
             cmd.args(["/K", "chcp 65001>nul"]);
         }
-        let mut reader = pair.master.try_clone_reader()?;
+        let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
-        let mut child = pair.slave.spawn_command(cmd)?;
+        let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
+        Self::from_parts(SessionArgs {
+            size,
+            proxy,
+            id,
+            scrollback,
+            shell: shell.to_string(),
+            kitty_protocol,
+            prompt_nonce,
+            io: SessionIo {
+                reader,
+                writer,
+                master: Some(pair.master),
+                child: Some(child),
+                on_resize: None,
+                on_kill: None,
+            },
+        })
+    }
 
+    /// A pane fed by `io` instead of a ConPTY this process opened. Local
+    /// spawn and a mux reattach share the reader thread, so VT handling
+    /// does not fork.
+    pub fn from_parts(args: SessionArgs) -> Result<Self, Box<dyn std::error::Error>> {
+        let SessionArgs {
+            size,
+            proxy,
+            id,
+            scrollback,
+            shell,
+            kitty_protocol,
+            prompt_nonce,
+            io,
+        } = args;
+        let SessionIo {
+            mut reader,
+            writer,
+            master,
+            mut child,
+            on_resize,
+            mut on_kill,
+        } = io;
         let config = Config {
             scrolling_history: scrollback,
             // Off unless the user opted in. The flag gates every stack
@@ -2266,7 +2333,12 @@ impl Session {
         ) {
             Ok(writer) => writer,
             Err(error) => {
-                let _ = child.kill();
+                if let Some(child) = child.as_mut() {
+                    let _ = child.kill();
+                }
+                if let Some(hook) = on_kill.take() {
+                    hook();
+                }
                 return Err(error.into());
             }
         };
@@ -2371,9 +2443,11 @@ impl Session {
             write_error,
             proxy: input_proxy,
             id,
-            master: pair.master,
+            master,
             child,
-            shell: shell.to_string(),
+            on_kill,
+            on_resize,
+            shell,
             parser,
         })
     }
@@ -2384,8 +2458,15 @@ impl Session {
     }
 
     /// Terminate the shell (closing a tab must not leave orphans).
+    /// A mux pane's hook runs once; detach disarms it first so this does
+    /// not kill the server-side process.
     pub fn kill(&mut self) {
-        let _ = self.child.kill();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+        }
+        if let Some(hook) = self.on_kill.take() {
+            hook();
+        }
     }
 
     /// Clear the current screen's keyboard-mode stack (Ctrl+Shift+K, a
@@ -2415,12 +2496,17 @@ impl Session {
     }
 
     pub fn resize(&mut self, size: TermSize) {
-        let _ = self.master.resize(PtySize {
-            rows: size.rows as u16,
-            cols: size.cols as u16,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        if let Some(master) = &self.master {
+            let _ = master.resize(PtySize {
+                rows: size.rows as u16,
+                cols: size.cols as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        }
+        if let Some(hook) = &self.on_resize {
+            hook(size.cols as u16, size.rows as u16);
+        }
         // Drop the term lock before meta. A resize reflows rows, so SCP
         // stamps no longer name the text they were written on.
         self.term.lock().resize(size);
