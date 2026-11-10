@@ -842,6 +842,34 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       walk goes through it in place and checks every component below it,
       while a link to a folder inside a volume is still refused. A
       link swapped between the walk and the open (TOCTOU) is not covered.
+- [x] **Copy mode** (Ctrl+Shift+X, WezTerm's chord) — select and copy
+      scrollback without the mouse. It runs on alacritty_terminal's vi
+      mode, which already moves the cursor, scrolls the view after it and
+      stretches the selection; `copymode.rs` only maps keys to it. Arrows
+      or h j k l move, w b e by word (Shift for whitespace words), 0 and $
+      (or Home and End) to the line's ends, g and Shift+G to the top and
+      bottom of the scrollback, PageUp/PageDown by a screen. v starts a
+      selection, Shift+V a line selection, Ctrl+V a block; pressing the
+      same one again drops it. y, Enter or Ctrl+C copies and leaves; Esc or
+      q leaves without copying, and leaving returns the view to the prompt.
+      Keys resolve by physical key, so the Arabic layout keeps every one,
+      and no key reaches the shell while the mode is on. The cursor is a
+      solid block that does not blink, and the top-right bar (the search
+      bar's slot) reads «وضع النسخ: v تحديد · y نسخ · Esc خروج». On a cell
+      laid right to left the horizontal keys swap, so Left still moves
+      left; the renderer's shaped layout answers which way a cell runs
+      (`Renderer::cell_rtl`), never the column index. A cursor that would
+      sit past the end of an Arabic row snaps back onto its last character:
+      the shaped path lays the row out to the cursor's column, and in a
+      right-to-left line those blanks go visually left, so the word jumped
+      toward the cursor (seen live before the fix). The action is in the
+      shortcuts editor and the palette. Proven by 10 tests (the key map on
+      an Arabic layout, motions and selections on a real `Term`, the snap,
+      the bar) and live: real scan-code keys in a debug build copied a
+      line to the clipboard, and PrintWindow captures showed the hint, the
+      selection, the RTL arrow and a clean prompt after Esc. There is no
+      vim count prefix, `gg` is a single g, and the column is not
+      remembered across short lines.
 
 ## Settings
 
