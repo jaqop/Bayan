@@ -1563,7 +1563,8 @@ struct App {
 
 /// What a reload does to the session's config and its load error.
 /// A rejected file leaves the config alone and blocks the next save.
-/// A missing file arrives as an applied default, which clears the error.
+/// A missing file keeps the config; after an error it arrives as the same
+/// config applied, which clears the error.
 struct AbsorbedReload {
     config: config::UserConfig,
     load_error: Option<String>,
@@ -2573,12 +2574,8 @@ impl App {
         let rebuild = absorbed.plan.font || absorbed.plan.colors;
         if rebuild {
             self.rebuild_renderer();
-        } else {
-            if absorbed.plan.padding || absorbed.plan.hide_bar {
-                self.relayout_active();
-            }
-            // Nothing is waiting on a renderer build, so this config is live.
-            self.config_watch.commit_applied(&self.config);
+        } else if absorbed.plan.padding || absorbed.plan.hide_bar {
+            self.relayout_active();
         }
         self.config_notice =
             config_watch::deferred_notice(&absorbed.deferred).map(|text| ConfigNotice {
@@ -5356,8 +5353,6 @@ impl ApplicationHandler<UserEvent> for App {
                 // from the config the session wants now.
                 if self.config_build.finish(self.font_delta) {
                     self.rebuild_renderer();
-                } else {
-                    self.config_watch.commit_applied(&self.config);
                 }
                 if let Some(text) = self.debug_paste.take() {
                     self.debug_right_click_paste(text);
@@ -5883,30 +5878,23 @@ mod tests {
             ..config::UserConfig::default()
         };
         // An earlier bad file is blocking saves. Deleting the file is not
-        // another bad file: it is the default config, and a save may write it.
-        let mut blocked = absorb_reload(
-            current.clone(),
-            config_watch::reload_from_bytes(
-                current.clone(),
-                &config::encode(&current).unwrap(),
-                b"{oops",
-            )
-            .unwrap(),
-        );
+        // another bad file: the running config stays, and a save writes it
+        // back, never defaults over the user's settings.
+        let [bad, deleted] = config_watch::reload_bad_then_missing(current.clone(), b"{oops");
+        let mut blocked = absorb_reload(current.clone(), bad.unwrap());
         assert!(blocked.load_error.is_some());
-        let deleted = config_watch::reload_missing(current).expect("delete is noticed");
-        blocked = absorb_reload(blocked.config, deleted);
+        blocked = absorb_reload(blocked.config, deleted.expect("delete is noticed"));
         assert!(
             blocked.load_error.is_none(),
             "a missing file must not block save_config"
         );
-        assert_eq!(blocked.config, config::UserConfig::default());
+        assert_eq!(blocked.config, current);
         let bytes = save_bytes(&blocked.load_error, &blocked.config).unwrap();
         let dir = temp_dir("deleted");
         let path = dir.join("config.json");
         config::write_bytes_at(&path, &bytes).unwrap();
         let restored = config::parse_bytes(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(restored, config::UserConfig::default());
+        assert_eq!(restored, current);
         assert!(path.is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }

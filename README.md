@@ -910,6 +910,9 @@ cursor, opacity, and the other live settings apply without a restart.
 A save from the settings panel is recognized as Bayan's own write, so
 it is not loaded again. A file that does not parse is left alone: the
 last good settings stay in effect and a small notice shows the error.
+A read that fails because another program holds the file is retried
+for about 150 ms first. Deleting or renaming the file keeps the running
+settings (not defaults), so a later panel save writes them back.
 Scrollback applies to new panes, the shell to new tabs, restoring tabs
 on the next launch, the plugin list after a restart, and the kitty
 keyboard protocol in new panes. When one of those changes, the notice

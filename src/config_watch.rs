@@ -115,7 +115,7 @@ pub enum ReloadMsg {
         plan: ApplyPlan,
         deferred: Vec<DeferredSetting>,
     },
-    /// The file is missing, unreadable, or not JSON. `config` in the watcher
+    /// The file is unreadable (after retries) or not JSON. `config` in the watcher
     /// is still the previous good one.
     Rejected { error: String },
 }
@@ -241,6 +241,9 @@ enum Seen {
 }
 
 struct WatchState {
+    /// The last config handed to the session (or saved by the panel). Reads
+    /// diff against this, not against what the renderer has landed, so a
+    /// quick A -> B -> A still sends A; `RendererSlot` catches the renderer up.
     last_good: UserConfig,
     seen: Option<Seen>,
     /// Hash of the bytes the panel is writing. One read of that exact
@@ -288,17 +291,6 @@ impl WatchState {
         }
     }
 
-    /// The running session has the config on screen. Until this, a parsed
-    /// file is only a proposal: `last_good` stays at the last one applied.
-    fn commit_applied(&mut self, config: &UserConfig) {
-        self.last_good = config.clone();
-        self.had_error = false;
-    }
-
-    fn ingest_file(&mut self, path: &Path) -> Option<ReloadMsg> {
-        self.ingest_result(std::fs::read(path))
-    }
-
     fn ingest_result(&mut self, read: std::io::Result<Vec<u8>>) -> Option<ReloadMsg> {
         if self.write_in_progress {
             return None;
@@ -315,21 +307,17 @@ impl WatchState {
             return None;
         }
         self.seen = Some(Seen::Missing);
-        // Deleting the file is the same as never having one: defaults, and
-        // the panel may save them back. It is not a parse error, so it must
-        // not block that save. `last_good` moves only when the session
-        // applies this.
-        let defaults = UserConfig::default();
-        let (plan, deferred) = diff(&self.last_good, &defaults);
-        let was_error = self.had_error;
-        self.had_error = false;
-        if !was_error && defaults == self.last_good {
+        // A delete or a rename away keeps the running config: applying
+        // defaults would let the next panel save overwrite the user's file
+        // with them. Nothing is left to protect, so an earlier parse error
+        // stops blocking saves; the save writes the running config back.
+        if !std::mem::take(&mut self.had_error) {
             return None;
         }
         Some(ReloadMsg::Applied {
-            config: Box::new(defaults),
-            plan,
-            deferred,
+            config: Box::new(self.last_good.clone()),
+            plan: ApplyPlan::default(),
+            deferred: Vec::new(),
         })
     }
 
@@ -379,9 +367,7 @@ impl WatchState {
                 if !was_error && cfg == self.last_good {
                     return None;
                 }
-                // Leave last_good. The session commits it when the new
-                // config is actually on screen, so a renderer build that
-                // is still in flight cannot strand a newer file.
+                self.last_good = cfg.clone();
                 Some(ReloadMsg::Applied {
                     config: Box::new(cfg),
                     plan,
@@ -390,6 +376,24 @@ impl WatchState {
             }
         }
     }
+}
+
+/// Read `path` and feed the result to `state`. A read error other than
+/// NotFound is usually an editor or scanner holding the file for a moment
+/// (a sharing violation mid-save), so it is retried before it is reported.
+/// The lock is not held while sleeping, so a panel save never waits on it.
+fn ingest_path(state: &Mutex<WatchState>, path: &Path) -> Option<ReloadMsg> {
+    const BACKOFF_MS: [u64; 4] = [10, 20, 40, 80];
+    for wait in BACKOFF_MS {
+        let mut state = lock(state);
+        match std::fs::read(path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {}
+            read => return state.ingest_result(read),
+        }
+        drop(state);
+        std::thread::sleep(Duration::from_millis(wait));
+    }
+    lock(state).ingest_result(std::fs::read(path))
 }
 
 fn lock(state: &Mutex<WatchState>) -> MutexGuard<'_, WatchState> {
@@ -421,12 +425,6 @@ impl ConfigWatcher {
 
     pub fn finish_self_write(&self, wrote: bool) {
         lock(&self.state).finish_self_write(wrote);
-    }
-
-    /// The config is on screen (the renderer caught up, or nothing visual
-    /// had to be rebuilt). Further reads diff against this.
-    pub fn commit_applied(&self, config: &UserConfig) {
-        lock(&self.state).commit_applied(config);
     }
 
     /// Block until the directory watch is installed, or the thread has exited.
@@ -588,7 +586,7 @@ fn watch_loop(
         return;
     }
     loop {
-        if let Some(msg) = lock(&state).ingest_file(&path) {
+        if let Some(msg) = ingest_path(&state, &path) {
             on_reload(msg);
         }
         ready.store(true, Ordering::Relaxed);
@@ -603,7 +601,7 @@ fn watch_loop(
                     Ok(wake) => wake,
                     Err(RecvTimeoutError::Timeout) => {
                         if debounce.take(Instant::now()) {
-                            if let Some(msg) = lock(&state).ingest_file(&path) {
+                            if let Some(msg) = ingest_path(&state, &path) {
                                 on_reload(msg);
                             }
                         }
@@ -635,16 +633,15 @@ fn watch_loop(
     }
 }
 
+/// A session running `baseline` reads `bad`, then finds config.json gone.
 #[cfg(test)]
-pub fn reload_missing(baseline: UserConfig) -> Option<ReloadMsg> {
+pub fn reload_bad_then_missing(baseline: UserConfig, bad: &[u8]) -> [Option<ReloadMsg>; 2] {
     let bytes = crate::config::encode(&baseline).unwrap();
-    let mut state = WatchState::new(baseline.clone());
+    let mut state = WatchState::new(baseline);
     state.prime(Some(&bytes));
-    state.commit_applied(&baseline);
-    state.ingest_result(Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "deleted",
-    )))
+    let first = state.ingest(bad);
+    let gone = std::io::Error::new(std::io::ErrorKind::NotFound, "deleted");
+    [first, state.ingest_result(Err(gone))]
 }
 
 /// Read `next` as a new config.json over a session already running `baseline`
@@ -801,7 +798,6 @@ mod tests {
         state.prime(Some(b"{}"));
         let good = br##"{"font_size":22.0,"bg":"#112233","cursor_style":"bar","osc52":"copy"}"##;
         let (config, _, _) = applied(state.ingest(good).unwrap());
-        state.commit_applied(&config);
         assert_eq!(config.font_size, Some(22.0));
         assert!(config.osc52_copy_enabled());
 
@@ -822,7 +818,6 @@ mod tests {
         assert!(state.ingest(b"{oops").is_none());
 
         let (config, plan, _) = applied(state.ingest(br##"{"font_size":22.0,"bg":"#112233","cursor_style":"underline","osc52":"copy"}"##).unwrap());
-        state.commit_applied(&config);
         assert_eq!(config.cursor(), CursorStyle::Underline);
         assert!(plan.cursor);
         assert_eq!(config.font_size, Some(22.0));
@@ -1140,22 +1135,97 @@ mod tests {
             &latest,
             "the installed renderer is the latest file, not the one in flight"
         );
+    }
 
-        // last_good stays on the previous applied config until that renderer
-        // is actually installed.
+    /// An editor holding config.json open without read sharing (a write
+    /// before its rename, or a scanner) makes `fs::read` fail with a sharing
+    /// violation for a moment. That is not a bad file.
+    #[cfg(windows)]
+    #[test]
+    fn a_sharing_violation_is_retried_and_a_later_good_read_clears_the_error() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let fixture = Fixture::new();
+        let path = fixture.0.join("config.json");
+        std::fs::write(&path, br#"{"font_size":21.0}"#).unwrap();
         let mut state = WatchState::new(UserConfig::default());
         state.prime(Some(b"{}"));
-        let bytes = config::encode(&latest).unwrap();
-        let (parsed, plan, _) = applied(state.ingest(&bytes).unwrap());
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        assert!(std::fs::read(&path).is_err(), "the file must be locked");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            drop(held);
+        });
+        let state = Mutex::new(state);
+        let msg = ingest_path(&state, &path).expect("the locked save is read once it is free");
+        release.join().unwrap();
+        let (config, plan, _) = applied(msg);
+        assert_eq!(config.font_size, Some(21.0));
         assert!(plan.font);
-        assert!(plan.colors);
-        assert_eq!(
-            state.last_good.font_size, None,
-            "parsing the file must not pretend the renderer already has it"
+
+        // Every retry failed: the error is reported. The next read that
+        // works clears it even though the bytes did not change.
+        let mut state = state.into_inner().unwrap();
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            state.ingest_result(Err(denied)),
+            Some(ReloadMsg::Rejected { .. })
+        ));
+        let state = Mutex::new(state);
+        let (config, plan, _) = applied(ingest_path(&state, &path).expect("the error is cleared"));
+        assert_eq!(config.font_size, Some(21.0));
+        assert_eq!(plan, ApplyPlan::default());
+    }
+
+    /// A -> B -> A inside one renderer build: the session was handed B, so
+    /// going back to A is a change, whatever is on screen yet.
+    #[test]
+    fn reverting_before_the_build_lands_still_applies() {
+        let a = UserConfig {
+            font_size: Some(14.0),
+            ..UserConfig::default()
+        };
+        let b = UserConfig {
+            font_size: Some(30.0),
+            ..UserConfig::default()
+        };
+        let a_bytes = config::encode(&a).unwrap();
+        let mut state = WatchState::new(a.clone());
+        state.prime(Some(&a_bytes));
+        let (got, _, _) = applied(state.ingest(&config::encode(&b).unwrap()).unwrap());
+        assert_eq!(got, b);
+        let (got, plan, _) = applied(
+            state
+                .ingest(&a_bytes)
+                .expect("the revert to A must reach the session"),
         );
-        state.commit_applied(slot.rendered().unwrap());
-        assert_eq!(state.last_good, parsed);
-        assert_eq!(state.last_good, latest);
+        assert_eq!(got, a);
+        assert!(plan.font, "B -> A changes the font back");
+    }
+
+    /// Deleting or renaming config.json keeps the running settings, so a
+    /// later panel save writes them back rather than defaults.
+    #[test]
+    fn a_missing_file_keeps_the_current_config() {
+        let mut state = primed_rich();
+        let gone = || std::io::Error::new(std::io::ErrorKind::NotFound, "deleted");
+        assert!(state.ingest_result(Err(gone())).is_none());
+        assert_eq!(state.last_good, rich_settings());
+
+        // A bad file then a delete: the error clears (there is nothing left
+        // to protect) and the config is still the running one.
+        let mut state = primed_rich();
+        assert!(matches!(
+            state.ingest(b"{oops"),
+            Some(ReloadMsg::Rejected { .. })
+        ));
+        let (config, plan, deferred) = applied(state.ingest_result(Err(gone())).unwrap());
+        assert_eq!(config, rich_settings());
+        assert_eq!(plan, ApplyPlan::default());
+        assert!(deferred.is_empty());
     }
 
     #[test]
