@@ -22,7 +22,7 @@ use winit::keyboard::ModifiersState;
 use winit::window::{CursorIcon, ResizeDirection};
 
 use crate::chrome::{self, Caption, LeftPress, TabControl};
-use crate::keyroute::{cursor_area_reset, CursorAreaEvent};
+use crate::keyroute::CursorAreaEvent;
 use crate::{
     blur_forgets_held_keys, consume_guard_release, keybinds, link, mouse, prepare_window_close,
     render, term, App, Orientation,
@@ -540,12 +540,12 @@ impl App {
             // Focus drops and rebuilds the IME context. The candidate
             // window is back at the origin until the cursor box is sent
             // again, even when the cell has not moved (winit#2569).
-            if cursor_area_reset(CursorAreaEvent::FocusGained) {
-                self.ime_area_reset = true;
-            }
+            self.note_cursor_area(CursorAreaEvent::FocusGained);
             self.request_redraw();
         } else {
-            // Alt+Tab with the button down must not keep dragging
+            // A blur does not rebuild the candidate window. Alt+Tab with
+            // the button down must not keep dragging.
+            self.note_cursor_area(CursorAreaEvent::FocusLost);
             self.abandon_mouse();
         }
         // The event bit, not has_focus: that query can still say true

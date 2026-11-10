@@ -264,17 +264,19 @@ impl App {
 
     /// IME composition and commits: CJK input, the emoji panel, dictation.
     pub(crate) fn ime_input(&mut self, ime: Ime) {
+        let area = match &ime {
+            Ime::Enabled => CursorAreaEvent::ImeEnabled,
+            Ime::Preedit(_, _) => CursorAreaEvent::ImePreedit,
+            Ime::Commit(_) => CursorAreaEvent::ImeCommit,
+            Ime::Disabled => CursorAreaEvent::ImeDisabled,
+        };
+        // Only Enabled rebuilds the IME context. The other phases leave
+        // the candidate window where it is (winit#2569).
+        self.note_cursor_area(area);
         match ime {
             Ime::Preedit(text, _) => self.set_preedit(Some(text)),
             Ime::Disabled => self.set_preedit(None),
-            // The IME context was just (re)built. Windows has forgotten
-            // the composition window, so the same cursor box has to be
-            // sent again (winit#2569).
-            Ime::Enabled => {
-                if cursor_area_reset(CursorAreaEvent::ImeEnabled) {
-                    self.ime_area_reset = true;
-                }
-            }
+            Ime::Enabled => {}
             Ime::Commit(text) => {
                 self.set_preedit(None);
                 match commit_target(key_owner(&self.open_overlays())) {
@@ -285,6 +287,13 @@ impl App {
             }
         }
         self.request_redraw();
+    }
+
+    /// Ask for `set_ime_cursor_area` again when `event` rebuilt the context.
+    pub(crate) fn note_cursor_area(&mut self, event: CursorAreaEvent) {
+        if cursor_area_reset(event) {
+            self.ime_area_reset = true;
+        }
     }
 
     fn set_preedit(&mut self, text: Option<String>) {
