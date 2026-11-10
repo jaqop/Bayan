@@ -1494,6 +1494,8 @@ struct App {
     /// BAYAN_PASTE's text, waiting for the first renderer: a right click
     /// needs cell metrics to land on a pane.
     debug_paste: Option<String>,
+    /// `--cwd`'s folder, already gated, until the first tab opens in it.
+    start_dir: Option<String>,
 }
 
 impl App {
@@ -3208,7 +3210,19 @@ impl App {
         // start it immediately with a default grid; the exact grid follows
         // once cell metrics exist (EasyTer starts 110x32 the same way).
         // Start one fresh tab unless saved-tab restoration is explicitly enabled.
-        self.restore_state();
+        match self.start_dir.take() {
+            // `--cwd` adds the active tab; saved tabs still come back first,
+            // so the next save does not drop them
+            Some(dir) => {
+                if self.config.restore_tabs.unwrap_or(false)
+                    && load_saved_state().is_some_and(|s| !s.tabs.is_empty())
+                {
+                    self.restore_state();
+                }
+                self.spawn_tab(Some(dir));
+            }
+            None => self.restore_state(),
+        }
         // debug hook: BAYAN_SPLIT=1 opens the first tab pre-split, so the
         // pane machinery can be verified without injecting any input
         if dev_hook("BAYAN_SPLIT").is_some() {
@@ -5408,8 +5422,48 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// `-d <folder>`, `--cwd <folder>` or `--cwd=<folder>`: where the first tab
+/// opens. A relative folder is taken from the current one. The folder goes
+/// through the start-directory gate, and a refused one is an error rather
+/// than a quiet fall back to home: the user named it.
+fn cli_start_dir(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<Option<String>, String> {
+    const USAGE: &str = "usage: bayan [-d | --cwd <folder>]";
+    let text = |a: std::ffi::OsString| {
+        a.into_string()
+            .map_err(|_| format!("an argument is not valid Unicode\n{USAGE}"))
+    };
+    let mut args = args.into_iter();
+    let mut raw = None;
+    while let Some(a) = args.next() {
+        let a = text(a)?;
+        raw = Some(match a.as_str() {
+            "-d" | "--cwd" => text(
+                args.next()
+                    .ok_or_else(|| format!("{a} needs a folder\n{USAGE}"))?,
+            )?,
+            _ => match a.strip_prefix("--cwd=") {
+                Some(v) => v.to_string(),
+                None => return Err(format!("unknown argument {a:?}\n{USAGE}")),
+            },
+        });
+    }
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    // GetFullPathNameW: string work only, so a UNC name is not opened here
+    std::path::absolute(&raw)
+        .ok()
+        .and_then(|p| p.to_str().and_then(term::accept_local_cwd))
+        .filter(|d| term::usable_spawn_dir(d))
+        .map(Some)
+        .ok_or_else(|| format!("--cwd {raw:?} is not a local folder Bayan can open"))
+}
+
 fn run() -> Result<(), String> {
     harden_dll_search();
+    let start_dir = cli_start_dir(std::env::args_os().skip(1))?;
     prof::init();
     prof::mark("main start");
     use winit::platform::windows::EventLoopBuilderExtWindows;
@@ -5531,6 +5585,7 @@ fn run() -> Result<(), String> {
         normal_geom: None,
         keys_held_away: Vec::new(),
         debug_paste: None,
+        start_dir,
     };
     let result = event_loop.run_app(&mut app);
     if let Some(error) = app.startup_error {
@@ -5553,6 +5608,38 @@ fn osc52_pane_is_focused(tabs: &[(usize, &[u64])], active: usize, source: u64) -
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn the_cwd_argument_opens_a_local_folder_and_refuses_the_rest() {
+        let os = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert_eq!(cli_start_dir(os(&[])), Ok(None));
+        let tmp = std::env::temp_dir();
+        let tmp = tmp.to_str().expect("temp dir is Unicode");
+        let want = term::accept_local_cwd(tmp);
+        assert!(want.is_some());
+        for args in [vec!["-d", tmp], vec!["--cwd", tmp]] {
+            assert_eq!(cli_start_dir(os(&args)), Ok(want.clone()), "{args:?}");
+        }
+        let joined = format!("--cwd={tmp}");
+        assert_eq!(cli_start_dir(os(&[&joined])), Ok(want.clone()));
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(
+            cli_start_dir(os(&["-d", "."])),
+            Ok(term::accept_local_cwd(here.to_str().unwrap())),
+            "a relative folder is taken from the current one"
+        );
+        // UNC and device forms are refused before anything is opened
+        for bad in [
+            r"\\server\share",
+            "//server/share",
+            r"\\?\C:\Windows",
+            r"C:\no\such\bayan-cwd-arg",
+        ] {
+            assert!(cli_start_dir(os(&["-d", bad])).is_err(), "{bad}");
+        }
+        assert!(cli_start_dir(os(&["-d"])).is_err(), "a flag with no folder");
+        assert!(cli_start_dir(os(&["--bogus"])).is_err(), "an unknown flag");
+    }
 
     #[test]
     fn confirm_cards_send_only_into_the_pane_they_were_raised_for() {
