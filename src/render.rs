@@ -2119,17 +2119,15 @@ impl Renderer {
                 hit
             } else if let Some(hit) = inks.iter().copied().min_by_key(|hit| (hit.1, hit.2)) {
                 hit
-            } else if let Some(hit) = self.row_hits.get(&(pane, row)).and_then(|spans| {
-                spans
-                    .iter()
-                    .take_while(|s| s.0 as f64 <= x)
-                    .filter(|s| contains(s.0, s.1))
-                    .min_by_key(|s| (s.1, s.2))
-                    .copied()
-            }) {
-                hit
             } else {
-                return None;
+                self.row_hits.get(&(pane, row)).and_then(|spans| {
+                    spans
+                        .iter()
+                        .take_while(|s| s.0 as f64 <= x)
+                        .filter(|s| contains(s.0, s.1))
+                        .min_by_key(|s| (s.1, s.2))
+                        .copied()
+                })?
             };
         let right_half = x >= left as f64 + width as f64 / 2.0;
         Some((
