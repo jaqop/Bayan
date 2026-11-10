@@ -12,7 +12,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Column;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::{Handler, Processor};
+use alacritty_terminal::vte::ansi::Processor;
 use base64::Engine;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use winit::event_loop::EventLoopProxy;
@@ -1389,7 +1389,7 @@ const ESU_SEQ: &[u8] = b"\x1b[?2026l";
 /// [`replay_deferred_bidi`] instead, so `stop_sync` must not apply them twice.
 struct DiscardSync;
 
-impl Handler for DiscardSync {}
+impl alacritty_terminal::vte::ansi::Handler for DiscardSync {}
 
 fn slice_has_esu(mirror: &[u8], bytes: &[u8]) -> bool {
     if bytes.windows(ESU_SEQ.len()).any(|w| w == ESU_SEQ) {
@@ -1469,18 +1469,32 @@ fn advance_for_sync<T: EventListener>(
     {
         release_sync_for_bidi(parser, t, meta);
     }
+    let was_open = parser.sync_timeout().sync_timeout().is_some();
+    // Captured before `advance` replaces the mirror. An ESU split across
+    // the boundary is still this update's end.
+    let ends_update = was_open && slice_has_esu(&meta.sync_mirror, bytes);
     let before = parser.sync_bytes_count();
     parser.advance(t, bytes);
-    if parser.sync_timeout().sync_timeout().is_some() {
-        let after = parser.sync_bytes_count();
-        if after > before {
-            let added = after - before;
-            let start = bytes.len().saturating_sub(added);
-            meta.sync_mirror.extend_from_slice(&bytes[start..]);
-        }
-    } else {
+    if parser.sync_timeout().sync_timeout().is_none() {
         meta.sync_mirror.clear();
         meta.sync_bidi.clear();
+        return;
+    }
+    let after = parser.sync_bytes_count();
+    if ends_update {
+        // ESU and a new BSU in this chunk. vte applied the old frame and
+        // kept only the new buffer, which is the last `after` bytes of
+        // this chunk — the bytes after the final BSU. `after == before`
+        // used to leave the old frame in the mirror, so the next SCP
+        // replayed it and dropped the start of the new frame.
+        let start = bytes.len().saturating_sub(after);
+        meta.sync_mirror.clear();
+        meta.sync_mirror.extend_from_slice(&bytes[start..]);
+        meta.sync_bidi.clear();
+    } else if after > before {
+        let added = after - before;
+        let start = bytes.len().saturating_sub(added);
+        meta.sync_mirror.extend_from_slice(&bytes[start..]);
     }
 }
 
@@ -3847,6 +3861,158 @@ mod tests {
         process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?2026l");
         assert!(screen_has(&t, "HIDDEN"));
         assert!(search_has(&mut t, "HIDDEN"));
+    }
+
+    fn screen_flat(t: &Term<VoidListener>) -> String {
+        let mut text = String::new();
+        for line in 0..t.screen_lines() {
+            let row = &t.grid()[alacritty_terminal::index::Line(line as i32)];
+            for col in 0..t.columns() {
+                text.push(row[Column(col)].c);
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn esu_then_bsu_in_one_chunk_does_not_replay_the_old_frame() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.running_cmd = "app".into();
+        // Ten bytes, so a new ten-byte buffer does not change the count.
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[?2026hAAAAAAAAAA",
+        );
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[?2026l\x1b[?2026hBBBBBBBBBB",
+        );
+        assert!(
+            screen_flat(&t).contains("AAAAAAAAAA"),
+            "closing the first frame paints it"
+        );
+        assert!(
+            !screen_flat(&t).contains("BBBBBBBBBB"),
+            "the new frame stays held"
+        );
+        assert!(
+            !meta.sync_mirror.windows(10).any(|w| w == b"AAAAAAAAAA"),
+            "the mirror dropped the old frame"
+        );
+        assert!(
+            meta.sync_mirror.windows(10).any(|w| w == b"BBBBBBBBBB"),
+            "the mirror kept the new frame"
+        );
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[2 k");
+        let deadline = p.sync_timeout().sync_timeout().expect("second frame");
+        assert_eq!(
+            expire_sync_update(&mut p, &mut t, &mut meta, deadline),
+            None
+        );
+        let flat = screen_flat(&t);
+        assert_eq!(
+            flat.matches("AAAAAAAAAA").count(),
+            1,
+            "the old frame was not replayed"
+        );
+        assert_eq!(
+            flat.matches("BBBBBBBBBB").count(),
+            1,
+            "the new frame is intact"
+        );
+        assert!(flat.contains("AAAAAAAAAABBBBBBBBBB"));
+        assert_eq!(
+            meta.bidi.direction_at(1),
+            crate::bidi_ctl::ParagraphDir::Rtl
+        );
+    }
+
+    #[test]
+    fn esu_while_scp_is_deferred_does_not_draw_the_frame_twice() {
+        // No CUP: a second draw continues after the first and the row
+        // becomes ABAB. Home would paint the copy on top of the original.
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.running_cmd = "app".into();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?2026hAB");
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[2 k");
+        assert_eq!(meta.sync_bidi.len(), 1, "the mark waits for the flush");
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?2026l");
+        let row = &t.grid()[alacritty_terminal::index::Line(0)];
+        let text: String = (0..8).map(|c| row[Column(c)].c).collect();
+        assert_eq!(text, "AB      ");
+        assert_eq!(
+            meta.bidi.direction_at(0),
+            crate::bidi_ctl::ParagraphDir::Default
+        );
+        assert_eq!(
+            meta.bidi.direction_at(1),
+            crate::bidi_ctl::ParagraphDir::Rtl
+        );
+    }
+
+    #[test]
+    fn forced_flush_keeps_an_arabic_line_with_its_scp_mark() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.running_cmd = "app".into();
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            "\x1b[?2026h\r\n\x1b[2 kمرحبا".as_bytes(),
+        );
+        let deadline = p.sync_timeout().sync_timeout().expect("open update");
+        assert_eq!(
+            expire_sync_update(&mut p, &mut t, &mut meta, deadline),
+            None
+        );
+        let row = &t.grid()[alacritty_terminal::index::Line(1)];
+        let text: String = (0..5).map(|c| row[Column(c)].c).collect();
+        assert_eq!(text, "مرحبا");
+        assert_eq!(
+            meta.bidi.direction_at(1),
+            crate::bidi_ctl::ParagraphDir::Rtl
+        );
+        assert_eq!(
+            meta.bidi.direction_at(0),
+            crate::bidi_ctl::ParagraphDir::Default
+        );
+    }
+
+    #[test]
+    fn forced_flush_after_resize_stamps_scp_on_the_new_grid() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.running_cmd = "app".into();
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[?2026hHELLO\r\n",
+        );
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[2 k");
+        // Same order as Session::resize: reflow, then drop stamps that
+        // named the old rows. The flush recomputes the mark.
+        t.resize(TermSize { cols: 20, rows: 10 });
+        meta.bidi_mut().on_resize();
+        let deadline = p.sync_timeout().sync_timeout().expect("open update");
+        assert_eq!(
+            expire_sync_update(&mut p, &mut t, &mut meta, deadline),
+            None
+        );
+        let flat = screen_flat(&t);
+        assert_eq!(flat.matches("HELLO").count(), 1);
+        assert_eq!(
+            meta.bidi.direction_at(1),
+            crate::bidi_ctl::ParagraphDir::Rtl
+        );
     }
 
     #[test]
