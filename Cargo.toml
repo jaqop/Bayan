@@ -26,6 +26,10 @@ cosmic-text = "0.19"
 arboard = "3"
 # OSC 52 payloads (programs setting the clipboard, e.g. yank over SSH)
 base64 = "0.23"
+# Kitty f=100 and iTerm2 inline images. PNG only: sixel has its own decoder,
+# and raw RGB/RGBA never touches this crate. JPEG and the default image
+# codecs stay out so the dependency stays on the png crate.
+image = { version = "0.25", default-features = false, features = ["png"] }
 # session persistence (~/.bayan/session.json)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

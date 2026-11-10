@@ -5,6 +5,7 @@
 //! already used, so translucent overlays blend identically.
 
 use crate::render::ATLAS_SIZE;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use winit::window::Window;
@@ -78,6 +79,23 @@ pub struct Gpu {
     globals_buf: wgpu::Buffer,
     atlas_tex: wgpu::Texture,
     layers: u32,
+    /// Inline-image textures, keyed by the store's cookie. Dropped when a
+    /// frame no longer shows that image.
+    images: HashMap<u64, CachedImage>,
+}
+
+struct CachedImage {
+    _texture: wgpu::Texture,
+    bind: wgpu::BindGroup,
+}
+
+/// One image draw. The vertices are already clipped to the pane.
+pub struct ImageQuad<'a> {
+    pub cookie: u64,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: &'a [u8],
+    pub verts: &'a [Vertex],
 }
 
 impl Gpu {
@@ -237,6 +255,7 @@ impl Gpu {
             globals_buf,
             atlas_tex,
             layers,
+            images: HashMap::new(),
         })
     }
 
@@ -342,8 +361,96 @@ impl Gpu {
         }
     }
 
-    /// Render one frame of quads (painter's order). BG is the clear color.
-    pub fn render(&mut self, verts: &[Vertex], bg: (u8, u8, u8)) -> bool {
+    /// Upload any image the cache does not have yet, and drop the rest.
+    /// A bad buffer (wrong length, zero size) is skipped rather than
+    /// submitted: a corrupt placement must not fail the frame.
+    fn sync_images(&mut self, images: &[ImageQuad<'_>]) {
+        let live: Vec<u64> = images.iter().map(|img| img.cookie).collect();
+        self.images.retain(|cookie, _| live.contains(cookie));
+        for img in images {
+            if img.verts.is_empty()
+                || img.width == 0
+                || img.height == 0
+                || self.images.contains_key(&img.cookie)
+            {
+                continue;
+            }
+            let pixels = (img.width as usize)
+                .saturating_mul(img.height as usize)
+                .saturating_mul(4);
+            if img.rgba.len() != pixels {
+                continue;
+            }
+            let Some(cached) = self.upload_image(img) else {
+                continue;
+            };
+            self.images.insert(img.cookie, cached);
+        }
+    }
+
+    fn upload_image(&self, img: &ImageQuad<'_>) -> Option<CachedImage> {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("inline image"),
+            size: wgpu::Extent3d {
+                width: img.width,
+                height: img.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        // write_texture rows must be 256-aligned. Padding is not sampled:
+        // the quad's uvs stay inside the real width.
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let tight = img.width.saturating_mul(4);
+        let bpr = tight.div_ceil(align) * align;
+        let padded;
+        let bytes: &[u8] = if bpr == tight {
+            img.rgba
+        } else {
+            padded = pad_rows(img.rgba, img.width, img.height, bpr);
+            &padded
+        };
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bpr),
+                rows_per_image: Some(img.height),
+            },
+            wgpu::Extent3d {
+                width: img.width,
+                height: img.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let bind = Self::bind_group(
+            &self.device,
+            &self.bgl,
+            &self.globals_buf,
+            &texture,
+            &self.sampler,
+        );
+        Some(CachedImage {
+            _texture: texture,
+            bind,
+        })
+    }
+
+    /// Render one frame of quads (painter's order). Images are drawn first,
+    /// with the same pipeline, so cell text and the cursor stay on top.
+    /// BG is the clear color.
+    pub fn render(&mut self, verts: &[Vertex], images: &[ImageQuad<'_>], bg: (u8, u8, u8)) -> bool {
         use wgpu::util::DeviceExt;
         // wgpu 30 replaced Result<SurfaceTexture, SurfaceError> with an enum.
         // Suboptimal still carries a usable texture — render it rather than
@@ -368,6 +475,21 @@ impl Gpu {
         };
         self.queue
             .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
+        self.sync_images(images);
+        let image_bufs: Vec<(u64, wgpu::Buffer, u32)> = images
+            .iter()
+            .filter(|img| !img.verts.is_empty() && self.images.contains_key(&img.cookie))
+            .map(|img| {
+                let buf = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("image quad"),
+                        contents: bytemuck::cast_slice(img.verts),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                (img.cookie, buf, img.verts.len() as u32)
+            })
+            .collect();
         let vbuf = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -400,8 +522,15 @@ impl Gpu {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            pass.set_pipeline(&self.pipeline);
+            for (cookie, buf, n) in &image_bufs {
+                if let Some(cached) = self.images.get(cookie) {
+                    pass.set_bind_group(0, &cached.bind, &[]);
+                    pass.set_vertex_buffer(0, buf.slice(..));
+                    pass.draw(0..*n, 0..1);
+                }
+            }
             if !verts.is_empty() {
-                pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, vbuf.slice(..));
                 pass.draw(0..verts.len() as u32, 0..1);
@@ -412,4 +541,15 @@ impl Gpu {
         self.queue.present(frame);
         true
     }
+}
+
+fn pad_rows(rgba: &[u8], width: u32, height: u32, bpr: u32) -> Vec<u8> {
+    let tight = width as usize * 4;
+    let mut buf = vec![0u8; bpr as usize * height as usize];
+    for row in 0..height as usize {
+        let src = row * tight;
+        let dst = row * bpr as usize;
+        buf[dst..dst + tight].copy_from_slice(&rgba[src..src + tight]);
+    }
+    buf
 }

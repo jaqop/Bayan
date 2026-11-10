@@ -14,6 +14,7 @@ mod config;
 mod copymode;
 mod gpu;
 mod groups;
+mod images;
 mod input;
 mod keybinds;
 mod keyroute;
@@ -1470,6 +1471,9 @@ struct App {
     auto_follow: bool,
     claude_manual: bool,
     config: config::UserConfig,
+    /// Pixel budget shared by every pane. Caps are the ones from config at
+    /// startup; a later edit applies to the next launch, like scrollback.
+    image_budget: Arc<images::ImageBudget>,
     config_load_error: Option<String>,
     startup_error: Option<String>,
     /// every rebindable action's effective chord (defaults + config)
@@ -2693,6 +2697,7 @@ impl App {
             self.config.scrollback_lines(),
             command,
             self.config.kitty_protocol_on(),
+            Arc::clone(&self.image_budget),
         ) {
             Ok(session) => Some(Pane {
                 id,
@@ -4568,6 +4573,7 @@ impl App {
             return;
         }
         let mut verts: Vec<gpu::Vertex> = Vec::new();
+        let mut sprites: Vec<render::ImageSprite> = Vec::new();
         match (self.renderer.as_mut(), self.tabs.get(self.active)) {
             (Some(renderer), Some(tab)) if !rects.is_empty() => {
                 renderer.begin_frame();
@@ -4597,6 +4603,7 @@ impl App {
                             m.claude_from_abs,
                         )
                     };
+                    let image_snaps = pane.session.meta.lock_or_recover().images.snapshot();
                     let t = pane.session.term.lock();
                     // Explicit BDSM suppresses reordering for the whole pane,
                     // Claude restoration included, and only while the command
@@ -4624,6 +4631,14 @@ impl App {
                     }
                     let history = t.grid().history_size() as u64;
                     let off = t.grid().display_offset() as u64;
+                    sprites.extend(render::image_sprites(
+                        *rect,
+                        renderer.cell_w,
+                        renderer.cell_h,
+                        evicted.saturating_add(history),
+                        off,
+                        &image_snaps,
+                    ));
                     let line_dir: Vec<bidi_ctl::ParagraphDir> = if use_stamps {
                         (0..t.screen_lines())
                             .map(|li| {
@@ -4854,14 +4869,27 @@ impl App {
         // differential redraw: an identical quad set + unchanged atlas means
         // the frame is pixel-for-pixel the last one — skip the submit. (An
         // atlas upload this frame always redraws; so does a heal.)
-        let frame_bytes = bytemuck::cast_slice::<gpu::Vertex, u8>(&verts);
-        let unchanged =
-            self.last_frame_size == Some(px) && !heal && frame_bytes == self.last_frame.as_slice();
+        let mut frame_key = bytemuck::cast_slice::<gpu::Vertex, u8>(&verts).to_vec();
+        for sprite in &sprites {
+            frame_key.extend_from_slice(&sprite.cookie.to_le_bytes());
+            frame_key.extend_from_slice(bytemuck::cast_slice(&sprite.verts));
+        }
+        let unchanged = self.last_frame_size == Some(px) && !heal && frame_key == self.last_frame;
         if unchanged {
             return;
         }
         let bg = self.renderer.as_ref().map_or(render::BG, |r| r.bg);
-        if !gpu.render(&verts, bg) {
+        let quads: Vec<gpu::ImageQuad<'_>> = sprites
+            .iter()
+            .map(|sprite| gpu::ImageQuad {
+                cookie: sprite.cookie,
+                width: sprite.width,
+                height: sprite.height,
+                rgba: &sprite.rgba,
+                verts: &sprite.verts,
+            })
+            .collect();
+        if !gpu.render(&verts, &quads, bg) {
             // Retry once after reconfiguring, without spinning on occlusion.
             self.last_frame_size = None;
             if surface_resized || heal {
@@ -4870,7 +4898,7 @@ impl App {
             return;
         }
         self.last_frame.clear();
-        self.last_frame.extend_from_slice(frame_bytes);
+        self.last_frame.extend_from_slice(&frame_key);
         self.last_frame_size = Some(px);
         if heal {
             window.request_redraw();
@@ -5573,6 +5601,7 @@ fn run() -> Result<(), String> {
         clipboard: None,
         auto_follow: true,
         claude_manual: false,
+        image_budget: Arc::new(images::ImageBudget::new(cfg.images.limits())),
         config: cfg,
         config_load_error,
         startup_error: None,

@@ -200,6 +200,7 @@ dependencies = [
  "base64 0.23.0",
  "bytemuck",
  "cosmic-text",
+ "image",
  "pollster",
  "portable-pty",
  "serde",

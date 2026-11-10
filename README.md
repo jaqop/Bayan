@@ -909,6 +909,44 @@ only (there is no settings-panel row). Leave it out or set `"off"`.
 focused pane; no value enables a clipboard read. The decode backstop is
 64 KiB, and one scan sees about 48–51 KiB.
 
+## Inline images
+
+Sixel (`DCS q`), Kitty graphics (`APC _G`) and iTerm2 (`OSC 1337 ; File=`
+with `inline=1`) are placed on the grid cell under the cursor. They scroll
+with that row, leave when the row leaves the scrollback, and clear with
+ED/EL, RIS, and a resize (a resize reflows rows, so the anchor would no
+longer name the text). The alt screen has its own placements; leaving it
+drops those and shows the primary screen's images again. Rows that also
+contain Arabic still take the whole-line shaper.
+
+```json
+{
+  "images": {
+    "enabled": true,
+    "max_bytes": 20971520,
+    "max_width": 4096,
+    "max_height": 4096,
+    "max_pane_bytes": 67108864,
+    "max_session_bytes": 134217728
+  }
+}
+```
+
+`enabled` defaults to true. Over-cap or malformed input is dropped.
+Kitty `t=f`, `t=t` and `t=s` (file, temp file, shared memory) are always
+rejected: nothing in this path opens a local path, and there is no setting
+that turns them on. Direct transmission (`t=d`) accepts raw RGB (`f=24`),
+RGBA (`f=32`) and PNG (`f=100`), including chunked `m=1` / `m=0`. iTerm2
+payloads are PNG.
+
+ConPTY is created **without** `PSEUDOCONSOLE_PASSTHROUGH_MODE` (`0x8`).
+The flags are inherit-cursor, the resize quirk, and Win32 input mode
+(`vendor/portable-pty/src/win/psuedocon.rs`). In that mode conhost parses
+DCS and APC and does not forward them, so a real Windows console host will
+not deliver Sixel or Kitty graphics. OSC is forwarded, which is why OSC 7,
+9, 52 and 133 already work, and why iTerm2 inline images can arrive. The
+parsers and the quad builder are covered by unit tests either way.
+
 ## BiDi controls and the current directory
 
 Two escape sequences from ECMA-48 / the terminal-wg "BiDi in Terminal
