@@ -325,10 +325,21 @@ impl UserConfig {
         self.disabled_plugins.clone().unwrap_or_default()
     }
 
-    /// Content inset. Default 10: text pressed flat against the window edge
-    /// reads as unfinished, and every modern terminal ships a gutter.
+    /// Content inset in logical pixels. Default 10. The settings stepper
+    /// shows this, not the DPI-scaled size.
     pub fn padding_px(&self) -> i32 {
         self.padding.unwrap_or(10).min(32) as i32
+    }
+
+    /// [`padding_px`] in physical pixels, so a 150% display does not clip
+    /// the scrollbar down to an unscaled gutter.
+    pub fn padding_px_at(&self, scale: f32) -> i32 {
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        ((self.padding_px() as f32) * scale).round().max(0.0) as i32
     }
 
     pub fn notifications_on(&self) -> bool {
@@ -508,6 +519,11 @@ mod tests {
         let wild: UserConfig = serde_json::from_str(r#"{"opacity":0.05,"padding":500}"#).unwrap();
         assert_eq!(wild.opacity_level(), 0.5);
         assert_eq!(wild.padding_px(), 32);
+        assert_eq!(d.padding_px_at(1.0), 10);
+        assert_eq!(d.padding_px_at(1.5), 15);
+        assert_eq!(d.padding_px_at(2.0), 20);
+        assert_eq!(d.padding_px_at(0.0), 10);
+        assert!(d.padding_px_at(1.5) >= d.scrollbar.width_px_at(1.5));
     }
 
     #[test]

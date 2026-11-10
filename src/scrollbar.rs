@@ -812,9 +812,9 @@ mod tests {
     fn a_side_split_at_1280_costs_one_column_per_pane() {
         use crate::layout::{Gaps, Node};
         use crate::Orientation::Row;
-        // padding 10, cell 11. A 1px seam is 57/57. The 8px scrollbar seam
-        // is 56/56: one column each, and not two (the bar is not subtracted
-        // again from the grid).
+        // Locks the seam cost at this size: a 1px gap is 57/57, the 8px
+        // scrollbar seam is 56/56. Dropping the seam makes this fail.
+        // It does not detect the older overlay (that is the hit-rect tests).
         let pad = 10;
         let content = (pad, 0, 1280 - pad * 2, 400);
         let cell = 11.0;

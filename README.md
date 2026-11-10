@@ -905,14 +905,17 @@ and capped. Bayan's own toasts (a long command finished, the bell) follow
 
 `scrollbar.position` is `right` (the default, in Arabic and in English),
 `left`, or `hidden`. `scrollbar.width` is the thickness in logical pixels,
-clamped to 2–24, default 8, then multiplied by the display scale. It is
-also capped by `padding`: an 8px bar in the default 10px padding stays
-8px, and padding 0 hides the outer bar (there is no gutter to draw in).
-`scrollbar.autohide` (default on) drops the bar one second after the last
-scroll or hover. The bar is drawn in the window padding, or in the
+clamped to 2–24, default 8, then multiplied by the display scale. `padding`
+scales the same way, so at 150% an 8px bar (12 physical pixels) still fits
+in the default padding (15) and is not clipped to an unscaled 10. The drawn
+width is still capped by that physical padding, and padding 0 hides the
+outer bar. `scrollbar.autohide` (default on) drops the bar one second after
+the last scroll or hover. The bar is drawn in the window padding, or in the
 side-by-side seam, never on a grid cell, so the last column stays visible
-and clickable. The outer 2px of the window and the corners still resize;
-the thumb does not. The ConPTY column count is the grid width divided by
+and clickable. The resize grip on the bar's side is 2–6px and never wider
+than the old edge. A press on the thumb drags the bar even where that grip
+overlaps the track; the corners still resize the window, and the cursor
+matches the press. The ConPTY column count is the grid width divided by
 the cell width. A side-by-side split widens the seam to the bar, which can
 cost one column per pane: at 1280px with 11px cells the two panes are
 56 and 56, where a 1px seam was 57 and 57. It is hidden with no scrollback

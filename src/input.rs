@@ -426,10 +426,13 @@ impl App {
             // The gutter is not a resize edge and not a divider, even where
             // the old 6px band or the seam's grab would have said so.
             let on_bar = self.bars.hover.is_some();
-            let edge = if on_bar {
-                None
-            } else {
-                self.resize_edge_at(position)
+            let raw_edge = self.resize_edge_at(position);
+            // A corner still resizes, so the cursor matches the press.
+            // A side grip under the thumb does not.
+            let edge = match raw_edge {
+                Some(dir) if chrome::edge_is_corner(dir) => Some(dir),
+                _ if on_bar => None,
+                other => other,
             };
             let divider = if on_bar || edge.is_some() {
                 None
@@ -734,6 +737,9 @@ impl App {
                 }
                 self.request_redraw();
             }
+            LeftPress::Scrollbar => {
+                let _ = self.on_scrollbar(MouseButton::Left);
+            }
             LeftPress::Divider(i) => {
                 // The seam is the scrollbar. The divider stays grabbable from
                 // the cell-edge slop, which is inside a pane and not on the bar.
@@ -875,7 +881,7 @@ impl App {
             )
         };
         let content = self.content_rect()?;
-        let room = scrollbar::room_px(index, &rects, side, content, self.config.padding_px());
+        let room = scrollbar::room_px(index, &rects, side, content, self.padding_physical());
         let place = scrollbar::Place::new(total, viewport, offset);
         let geom = scrollbar::layout(rect, side, self.scrollbar_width_px(), room, place, alt)?;
         Some(SbTarget {
@@ -885,6 +891,10 @@ impl App {
             viewport,
             max_offset: total - viewport,
         })
+    }
+
+    pub(crate) fn pointer_on_scrollbar(&self, x: f64, y: f64) -> bool {
+        self.scrollbar_at(x, y).is_some()
     }
 
     fn scrollbar_at(&self, x: f64, y: f64) -> Option<(SbTarget, scrollbar::Part)> {
