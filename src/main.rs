@@ -32,6 +32,7 @@ mod posh;
 mod process;
 mod pty_writer;
 mod render;
+mod scroll;
 mod shells;
 mod term;
 mod toast;
@@ -831,7 +832,7 @@ fn state_path() -> Option<std::path::PathBuf> {
 
 /// Multi-click detection: 1 = simple, 2 = word (semantic), 3 = line.
 struct ClickTracker {
-    last: Option<(Instant, (usize, usize))>,
+    last: Option<(Instant, (i32, usize))>,
     count: u8,
 }
 
@@ -843,7 +844,7 @@ impl ClickTracker {
         }
     }
 
-    fn click(&mut self, now: Instant, cell: (usize, usize)) -> u8 {
+    fn click(&mut self, now: Instant, cell: (i32, usize)) -> u8 {
         const DOUBLE_MS: u128 = 400;
         self.count = match self.last {
             Some((t, c)) if now.duration_since(t).as_millis() <= DOUBLE_MS && c == cell => {
@@ -1463,6 +1464,11 @@ struct App {
     focused: bool,
     clicks: ClickTracker,
     wheel_accum: f32,
+    /// Per-pane sub-line scroll. Empty unless `scroll.smooth` is on, so a
+    /// disabled wheel never shifts a row.
+    smooth: std::collections::HashMap<u64, scroll::PaneScroll>,
+    /// Last time an easing notch was sampled. None while nothing is pending.
+    smooth_at: Option<Instant>,
     search: Option<SearchState>,
     clipboard: Option<arboard::Clipboard>,
     /// Claude mode follows (alt screen + claude command) automatically;
@@ -2643,6 +2649,9 @@ impl App {
                 t.scroll_display(Scroll::Delta(new_off as i32 - off as i32));
             }
         }
+        if let Some(id) = self.focused_pane_id() {
+            self.drop_smooth(id);
+        }
         self.invalidate_focused_links();
         self.request_redraw();
     }
@@ -3500,22 +3509,36 @@ impl App {
 
     /// Pixel position -> (pane index, viewport row, col, cell side).
     /// None inside the tab bar, the padding, or a divider gap.
-    fn pane_cell_at(&self, pos: PhysicalPosition<f64>) -> Option<(usize, usize, usize, Side)> {
+    fn pane_cell_at(&self, pos: PhysicalPosition<f64>) -> Option<(usize, i32, usize, Side)> {
         let r = self.renderer.as_ref()?;
-        let hit = mouse::cell_at(
-            pos.x,
-            pos.y,
-            &self.pane_rects(),
-            r.cell_w as f64,
+        let rects = self.pane_rects();
+        let hit = mouse::cell_at(pos.x, pos.y, &rects, r.cell_w as f64, r.cell_h as f64)?;
+        let rect = rects.get(hit.pane).copied()?;
+        let rows = ((rect.3 as f64 / r.cell_h as f64).floor() as usize).max(1);
+        let pane_id = self.tabs.get(self.active)?.panes.get(hit.pane)?.id;
+        let alt = self.mode_of(pane_id).contains(TermMode::ALT_SCREEN);
+        let offset_px = if alt || !self.config.smooth_scroll_on() {
+            0
+        } else {
+            let sub = self.smooth.get(&pane_id).map(|s| s.subline).unwrap_or(0.0);
+            scroll::offset_px(sub, r.cell_h)
+        };
+        let row = scroll::selection_row(
+            pos.y - rect.1 as f64,
             r.cell_h as f64,
-        )?;
-        let side = if hit.left { Side::Left } else { Side::Right };
-        if let Some(rect) = self.pane_rects().get(hit.pane) {
-            if let Some((col, side)) = r.hit_cell(*rect, hit.row, pos.x) {
-                return Some((hit.pane, hit.row, col, side));
-            }
+            offset_px as f64,
+            rows,
+        );
+        let geom_row = if row < 0 {
+            scroll::PEEK_ROW
+        } else {
+            row as usize
+        };
+        if let Some((col, side)) = r.hit_cell(rect, geom_row, pos.x) {
+            return Some((hit.pane, row, col, side));
         }
-        Some((hit.pane, hit.row, hit.col, side))
+        let side = if hit.left { Side::Left } else { Side::Right };
+        Some((hit.pane, row, hit.col, side))
     }
 
     fn mode_of(&self, id: u64) -> TermMode {
@@ -4355,6 +4378,9 @@ impl App {
     }
 
     fn scroll_lines(&mut self, n: i32) {
+        if let Some(id) = self.focused_pane_id() {
+            self.drop_smooth(id);
+        }
         if let Some(s) = self.session() {
             s.term.lock().scroll_display(Scroll::Delta(n));
         }
@@ -4387,6 +4413,9 @@ impl App {
             }
             m
         };
+        if let Some(id) = self.focused_pane_id() {
+            self.drop_smooth(id);
+        }
         self.invalidate_focused_links();
         if let (Some(st), Some(m)) = (self.search.as_mut(), found) {
             st.hl = Some(m);
@@ -4669,6 +4698,12 @@ impl App {
                         marks: &marks,
                         link_hover,
                         link_tip,
+                        scroll_px: if alt || !self.config.smooth_scroll_on() {
+                            0
+                        } else {
+                            let sub = self.smooth.get(&pane.id).map(|s| s.subline).unwrap_or(0.0);
+                            scroll::offset_px(sub, renderer.cell_h)
+                        },
                     };
                     renderer.draw_pane(&mut verts, &view, &t);
                 }
@@ -5267,6 +5302,9 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(b) = blink_wake {
             wake = Some(wake.map_or(b, |w| w.min(b)));
         }
+        if let Some(t) = self.tick_smooth_scroll() {
+            wake = Some(wake.map_or(t, |w| w.min(t)));
+        }
         match wake {
             Some(t) => el.set_control_flow(ControlFlow::WaitUntil(t)),
             None => el.set_control_flow(ControlFlow::Wait),
@@ -5569,6 +5607,8 @@ fn run() -> Result<(), String> {
         focused: false,
         clicks: ClickTracker::new(),
         wheel_accum: 0.0,
+        smooth: std::collections::HashMap::new(),
+        smooth_at: None,
         search: None,
         clipboard: None,
         auto_follow: true,

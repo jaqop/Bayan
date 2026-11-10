@@ -352,6 +352,9 @@ impl App {
     pub(crate) fn toggle_copy_mode(&mut self) {
         let entering = !self.term_mode().contains(TermMode::VI);
         if entering {
+            if let Some(id) = self.focused_pane_id() {
+                self.snap_smooth(id);
+            }
             if let Some(s) = self.session() {
                 let mut t = s.term.lock();
                 t.selection = None;
@@ -367,6 +370,9 @@ impl App {
     /// Leave copy mode: the selection goes and the view returns to the
     /// prompt, where typing would have taken it anyway.
     fn exit_copy_mode(&mut self) {
+        if let Some(id) = self.focused_pane_id() {
+            self.drop_smooth(id);
+        }
         if let Some(s) = self.session() {
             let mut t = s.term.lock();
             if t.mode().contains(TermMode::VI) {
@@ -399,7 +405,11 @@ impl App {
                 self.exit_copy_mode();
                 return;
             }
-            _ => {}
+            _ => {
+                if let Some(id) = self.focused_pane_id() {
+                    self.snap_smooth(id);
+                }
+            }
         }
         if let Some(s) = self.session() {
             copymode::apply(&mut s.term.lock(), cmd);
@@ -560,6 +570,8 @@ impl App {
             let Some(other) = self.encode_key_event_for(event, false, mode) else {
                 continue;
             };
+            let id = self.tabs[self.active].panes[pi].id;
+            self.drop_smooth(id);
             let session = &mut self.tabs[self.active].panes[pi].session;
             {
                 let mut t = session.term.lock();
@@ -567,6 +579,9 @@ impl App {
                 t.scroll_display(Scroll::Bottom);
             }
             session.write(&other);
+        }
+        if let Some(id) = self.focused_pane_id() {
+            self.drop_smooth(id);
         }
         if let Some(s) = self.session_mut() {
             {
