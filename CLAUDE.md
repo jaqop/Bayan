@@ -35,11 +35,12 @@ selection and BiDi paths must do.
 | `posh.rs` | oh-my-posh theme picker with a live ANSI preview |
 | `plugins.rs` | declarative JSON plugin host (`~/.bayan/plugins/`) |
 | `config.rs` | `~/.bayan/config.json`, optional and BOM-tolerant |
+| `theme.rs` | Windows light/dark: `system`/`dark`/`light`, the palette pair, and the theme-change event |
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-494 tests across the tree. `term.rs` (81), `link.rs` (61) and `render.rs` (64)
-carry the most; `localpath.rs` has 21.
+499 tests across the tree. `term.rs` (81), `link.rs` (61) and `render.rs` (65)
+carry the most; `localpath.rs` has 21 and `theme.rs` has 4.
 
 ## Invariants — do not "simplify" these
 

@@ -34,6 +34,7 @@ mod pty_writer;
 mod render;
 mod shells;
 mod term;
+mod theme;
 mod toast;
 
 #[cfg(test)]
@@ -124,6 +125,8 @@ fn beep() {
 static QUAKE_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// A toast/tray click wants the window raised (summon, never hide).
 static SUMMON_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `WM_SETTINGCHANGE` / `ImmersiveColorSet`: the app theme changed.
+static THEME_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const QUAKE_ID: usize = 0xB1AA;
 
 /// The letter a Ctrl+<letter> event represents, resolved the way real
@@ -1526,22 +1529,19 @@ impl App {
 
     // ---- settings panel ----
 
-    /// Index of the active theme in the gallery order (built-ins, then
-    /// plugin themes) — the index the panel highlights and apply_theme takes.
-    fn active_theme(&self) -> usize {
-        let name = self
-            .config
-            .theme
-            .as_deref()
-            .unwrap_or(render::DEFAULT_THEME);
+    /// Index of the active named theme in the gallery order (built-ins, then
+    /// plugin themes). `None` while the user is on system/dark/light, so a
+    /// mode word does not light a tile it does not name.
+    fn active_theme(&self) -> Option<usize> {
+        let name = self.config.theme.as_deref()?;
         if let Some(i) = render::THEMES.iter().position(|t| t.name == name) {
-            return i;
+            return Some(i);
         }
         plugins::registry()
             .themes
             .iter()
             .position(|t| t.name == name)
-            .map_or(0, |i| render::THEMES.len() + i)
+            .map(|i| render::THEMES.len() + i)
     }
 
     /// Apply theme `idx` (copy its colors into the config), live.
@@ -1560,9 +1560,51 @@ impl App {
             self.config.bg = Some(hex(t.bg));
             self.config.fg = Some(hex(t.fg));
             self.config.palette = Some(t.palette.iter().map(|&c| hex(c)).collect());
-            self.rebuild_renderer();
-            self.request_redraw();
+            self.push_colors();
         }
+    }
+
+    /// النظام / داكن / فاتح. Clears a named scheme and hand-set colours so
+    /// the pair can show; that clear is the user's new choice.
+    fn set_appearance(&mut self, choice: theme::ThemeChoice) {
+        self.config.bg = None;
+        self.config.fg = None;
+        self.config.palette = None;
+        self.config.theme = match choice {
+            theme::ThemeChoice::System => None,
+            theme::ThemeChoice::Dark => Some("dark".into()),
+            theme::ThemeChoice::Light => Some("light".into()),
+        };
+        self.push_colors();
+    }
+
+    /// Paint the colours `resolved_colors` names, and match the caption to them.
+    fn push_colors(&mut self) {
+        let colors = render::resolved_colors(&self.config);
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_colors(colors.bg, colors.fg, colors.palette);
+        }
+        self.set_title_bar_dark(colors.title_bar_dark);
+        self.request_redraw();
+    }
+
+    fn theme_surface(&self) -> theme::ThemeSurface {
+        theme::ThemeSurface {
+            colors: render::resolved_colors(&self.config),
+            follows_system: render::follows_system_theme(&self.config),
+        }
+    }
+
+    /// A Windows theme signal. The tested `apply_event` decides the palette
+    /// and the caption flag; an explicit scheme comes back unchanged.
+    fn on_system_theme(&mut self, event: theme::SystemThemeEvent) {
+        let after = self.theme_surface().apply_event(event);
+        self.config.system_apps_light = Some(event.is_light());
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_colors(after.colors.bg, after.colors.fg, after.colors.palette);
+        }
+        self.set_title_bar_dark(after.colors.title_bar_dark);
+        self.request_redraw();
     }
 
     fn change_font_size(&mut self, delta: i32) {
@@ -1751,12 +1793,16 @@ impl App {
     }
 
     fn apply_window_frame(&self) {
+        self.set_title_bar_dark(render::resolved_colors(&self.config).title_bar_dark);
+    }
+
+    fn set_title_bar_dark(&self, title_bar_dark: bool) {
         let Some(hwnd) = self.hwnd() else { return };
         use windows_sys::Win32::Graphics::Dwm::{
             DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
             DWMWCP_ROUND,
         };
-        let dark = 1i32;
+        let dark = i32::from(title_bar_dark);
         let corner = DWMWCP_ROUND;
         // Windows 10 ignores unsupported corner preferences; the native
         // resize frame and shadow remain available there.
@@ -2526,6 +2572,12 @@ impl App {
             self.toggle_hide_bar();
         } else if render::rect_hit(lay.close_toggle, px, py) {
             self.toggle_confirm_close();
+        } else if let Some(i) = lay
+            .appearance_btns
+            .iter()
+            .position(|&b| render::rect_hit(b, px, py))
+        {
+            self.set_appearance(theme::APPEARANCE_SEGMENTS[i]);
         }
     }
 
@@ -4698,6 +4750,7 @@ impl App {
                         px.height as usize,
                         &render::SettingsView {
                             theme: settings_theme,
+                            appearance: theme::appearance_highlight(&self.config),
                             font_family: &settings_family,
                             font_size: settings_size,
                             arabic_font: &settings_arabic,
@@ -5168,8 +5221,14 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::RendererReady(r) => {
                 crate::prof::mark("renderer ready");
-                self.renderer = Some(*r);
+                // The build cloned the config when it started. A theme
+                // signal during that build has a newer sample; paint it.
+                let mut r = *r;
+                let colors = render::resolved_colors(&self.config);
+                r.set_colors(colors.bg, colors.fg, colors.palette);
+                self.renderer = Some(r);
                 self.renderer_building = false;
+                self.apply_window_frame();
                 // now that cell metrics exist, snap every pane to its rect
                 self.relayout_active();
                 // the zoom moved again while this build ran: chase it
@@ -5224,6 +5283,14 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        if THEME_HIT.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            // A failed read must not force dark over the winit fallback.
+            if let Some(value) = theme::read_apps_use_light_theme() {
+                self.on_system_theme(theme::SystemThemeEvent::ImmersiveColorSet {
+                    apps_use_light_theme: Some(value),
+                });
+            }
+        }
         // quake toggle: summon Bayan from anywhere / tuck it away again
         if QUAKE_HIT.swap(false, std::sync::atomic::Ordering::Relaxed) {
             if let Some(w) = &self.window {
@@ -5304,6 +5371,14 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::KeyboardInput { event, .. } => self.key_input(&event, el),
             WindowEvent::Ime(ime) => self.ime_input(ime),
             WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::ThemeChanged(theme) => {
+                // The registry is the app theme. winit's value covers a
+                // read that fails (the key is missing, or this is not Windows).
+                let light = theme::read_apps_use_light_theme()
+                    .map(|v| theme::apps_use_light_theme(Some(v)))
+                    .unwrap_or(matches!(theme, winit::window::Theme::Light));
+                self.on_system_theme(theme::SystemThemeEvent::Winit { light });
+            }
             _ => {}
         }
     }
@@ -5473,6 +5548,11 @@ fn run() -> Result<(), String> {
             // SAFETY: winit's msg hook is handed a pointer to the MSG being
             // dispatched, valid for the duration of the callback. It is only read.
             let m = unsafe { &*(msg as *const MSG) };
+            if m.message == windows_sys::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE
+                && theme::setting_change_is_immersive(m.lParam)
+            {
+                THEME_HIT.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             if m.message == WM_HOTKEY && m.wParam == QUAKE_ID {
                 QUAKE_HIT.store(true, std::sync::atomic::Ordering::Relaxed);
                 return true; // consumed
@@ -5500,6 +5580,7 @@ fn run() -> Result<(), String> {
         Ok(cfg) => (cfg, None),
         Err(error) => (config::UserConfig::default(), Some(error.to_string())),
     };
+    cfg.system_apps_light = theme::read_apps_use_light_theme().map(|v| v == 1);
     // debug hook: BAYAN_ARABIC_FONT=<family> draws terminal Arabic in that
     // font for this run only (config.json is not written unless a setting
     // is changed in the panel), so the setting is screenshot-verifiable

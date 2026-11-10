@@ -36,6 +36,8 @@ use crate::gpu::Vertex;
 // #eefbfa marks keywords. Everything else is a muted derivation, because the
 // original uses almost no other hue and loud fillers would break it.
 pub const BG: (u8, u8, u8) = (0x06, 0x26, 0x26);
+/// Measured foreground tan. The renderer reads a theme; tests pin this.
+#[cfg(test)]
 pub const FG: (u8, u8, u8) = (0xc2, 0xb7, 0x96);
 pub const DEFAULT_THEME: &str = "بيان (الأزرق)";
 
@@ -94,6 +96,76 @@ fn plugin_theme(p: &crate::plugins::PluginTheme) -> Theme {
         fg: p.fg,
         palette: p.palette,
     }
+}
+
+fn color_overrides(cfg: &crate::config::UserConfig) -> bool {
+    cfg.bg.is_some() || cfg.fg.is_some() || cfg.palette.is_some()
+}
+
+fn apply_color_overrides(
+    mut colors: crate::theme::Colors,
+    cfg: &crate::config::UserConfig,
+) -> crate::theme::Colors {
+    if let Some(c) = cfg.bg.as_deref().and_then(crate::config::parse_hex) {
+        colors.bg = c;
+    }
+    if let Some(c) = cfg.fg.as_deref().and_then(crate::config::parse_hex) {
+        colors.fg = c;
+    }
+    if let Some(p) = &cfg.palette {
+        for (slot, hex) in colors.palette.iter_mut().zip(p.iter()) {
+            if let Some(c) = crate::config::parse_hex(hex) {
+                *slot = c;
+            }
+        }
+    }
+    colors.title_bar_dark = crate::theme::title_bar_dark_for(colors.bg);
+    colors
+}
+
+/// Colours the user pinned: a named scheme, an unknown scheme name (kept on
+/// the default scheme, as before), or any hand-set bg/fg/palette. `None`
+/// means the system/dark/light pair is in charge.
+fn pinned_colors(cfg: &crate::config::UserConfig) -> Option<crate::theme::Colors> {
+    let word = crate::theme::is_mode_word(cfg.theme.as_deref());
+    let named = if word {
+        None
+    } else {
+        cfg.theme.as_deref().and_then(theme_by_name)
+    };
+    let unknown = cfg.theme.is_some() && !word && named.is_none();
+    if named.is_none() && !unknown && !color_overrides(cfg) {
+        return None;
+    }
+    let base = if let Some(t) = named {
+        crate::theme::Colors::from_parts(t.bg, t.fg, t.palette)
+    } else if unknown {
+        let t = theme_by_name(DEFAULT_THEME).expect("built-in default theme");
+        crate::theme::Colors::from_parts(t.bg, t.fg, t.palette)
+    } else {
+        crate::theme::pair(
+            crate::theme::choice_of(cfg.theme.as_deref()),
+            cfg.system_apps_light,
+        )
+    };
+    Some(apply_color_overrides(base, cfg))
+}
+
+/// True when a Windows theme change may replace the colours and the caption.
+pub fn follows_system_theme(cfg: &crate::config::UserConfig) -> bool {
+    crate::theme::choice_of(cfg.theme.as_deref()) == crate::theme::ThemeChoice::System
+        && pinned_colors(cfg).is_none()
+}
+
+/// bg/fg/palette the renderer should show for this config, including the
+/// Windows sample in `system_apps_light` when the user is following it.
+pub fn resolved_colors(cfg: &crate::config::UserConfig) -> crate::theme::Colors {
+    pinned_colors(cfg).unwrap_or_else(|| {
+        crate::theme::pair(
+            crate::theme::choice_of(cfg.theme.as_deref()),
+            cfg.system_apps_light,
+        )
+    })
 }
 
 /// A theme by name (used to resolve the config's `theme` field). Built-ins
@@ -879,6 +951,9 @@ pub struct SettingsLayout {
     pub bar_toggle: Rect,
     pub close_label_y: i32,
     pub close_toggle: Rect,
+    pub appearance_label_y: i32,
+    /// segmented control, left→right: النظام، داكن، فاتح
+    pub appearance_btns: [Rect; 3],
 }
 
 /// Move a group of rects to the mirror-image position across the card
@@ -917,6 +992,7 @@ impl SettingsLayout {
         }
         mirror_group(&mut self.cursor_btns, x, w);
         mirror_group(&mut self.bell_btns, x, w);
+        mirror_group(&mut self.appearance_btns, x, w);
         for t in [
             &mut self.blink_toggle,
             &mut self.copy_toggle,
@@ -940,7 +1016,10 @@ pub const BELL_SEGMENTS: [crate::config::BellMode; 3] = [
 
 /// Everything the settings panel displays (current values of each control).
 pub struct SettingsView<'a> {
-    pub theme: usize,
+    /// Gallery tile to ring, when a named scheme is selected.
+    pub theme: Option<usize>,
+    /// النظام / داكن / فاتح, when no named scheme is selected.
+    pub appearance: Option<crate::theme::ThemeChoice>,
     pub font_family: &'a str,
     pub font_size: i32,
     /// the Arabic font's name, or the "Auto" label
@@ -1749,30 +1828,8 @@ impl Renderer {
             .map(|r| r.line_w)
             .filter(|w| *w > 1.0)
             .unwrap_or(size * 0.6);
-        // start from a named theme (if any), then let explicit config
-        // bg/fg/palette override individual colors on top of it
-        let theme = cfg
-            .theme
-            .as_deref()
-            .and_then(theme_by_name)
-            .or_else(|| theme_by_name(DEFAULT_THEME));
-        let (mut bg, mut fg, mut palette) = match theme {
-            Some(t) => (t.bg, t.fg, t.palette),
-            None => (BG, FG, PALETTE),
-        };
-        if let Some(c) = cfg.bg.as_deref().and_then(crate::config::parse_hex) {
-            bg = c;
-        }
-        if let Some(c) = cfg.fg.as_deref().and_then(crate::config::parse_hex) {
-            fg = c;
-        }
-        if let Some(p) = &cfg.palette {
-            for (slot, hex) in palette.iter_mut().zip(p.iter()) {
-                if let Some(c) = crate::config::parse_hex(hex) {
-                    *slot = c;
-                }
-            }
-        }
+        let colors = resolved_colors(cfg);
+        let (bg, fg, palette) = (colors.bg, colors.fg, colors.palette);
         Self {
             cell_geometry: std::collections::HashMap::new(),
             row_hits: std::collections::HashMap::new(),
@@ -1804,6 +1861,13 @@ impl Renderer {
             hover_tab: None,
             title_fit: std::collections::HashMap::new(),
         }
+    }
+
+    /// Swap the terminal colours without rebuilding the font system.
+    pub fn set_colors(&mut self, bg: (u8, u8, u8), fg: (u8, u8, u8), palette: [(u8, u8, u8); 16]) {
+        self.bg = bg;
+        self.fg = fg;
+        self.palette = palette;
     }
 
     /// The app resolves "hide the bar with a single tab" each layout pass.
@@ -3336,7 +3400,7 @@ impl Renderer {
         let w = ((self.ui_cell_w() * 52.0) as i32).clamp(430, fw as i32 - 60);
         let head_h = (self.ui_cell_h() + 18.0 * self.dpi_scale) as i32;
         let foot_h = (self.ui_cell_h() + 18.0 * self.dpi_scale) as i32;
-        // 15 rows since the Arabic-font row: at the roomy height the card
+        // 16 rows since the system-theme row: at the roomy height the card
         // ran past a 700px window's bottom edge, so rows tighten to fit the
         // window, down to a floor that still holds a control around text
         let bar = self.tab_bar_h() as i32;
@@ -3344,7 +3408,8 @@ impl Renderer {
         let roomy = (self.ui_cell_h() + 12.0 * self.dpi_scale) as i32;
         let tight = (self.ui_cell_h() + 6.0 * self.dpi_scale) as i32;
         let room = fh as i32 - bar - 24 - head_h - 6 - theme_h - foot_h;
-        let rowh = (room / 15).clamp(tight, roomy);
+        const SETTINGS_ROWS: i32 = 16;
+        let rowh = (room / SETTINGS_ROWS).clamp(tight, roomy);
         let ctl = rowh - 4;
         // the theme row obeys the same grammar: tiles left, label right,
         // so the strip leaves room for the "المظهر" label
@@ -3355,7 +3420,7 @@ impl Renderer {
         let tile_w = ((w - pad * 2 - label_reserve - 6 * (n_tiles - 1)) / n_tiles).max(30);
         let tile_h = (self.ui_cell_h() * 1.3) as i32;
         let theme_rowh = tile_h + 14;
-        let h = head_h + 6 + theme_rowh + rowh * 15 + foot_h;
+        let h = head_h + 6 + theme_rowh + rowh * SETTINGS_ROWS + foot_h;
         let x = (fw as i32 - w) / 2;
         // a third of the spare height above, but never past the bottom
         let y = (bar + (fh as i32 - h) / 3)
@@ -3451,6 +3516,20 @@ impl Renderer {
         let close_y = row_y(14);
         let close_toggle = (x + pad, pcy(close_y), pill_w, pill_h);
 
+        // system / dark / light. «النظام» is wider than the bell's «صامت»;
+        // English "System" needs the same extra room the bell's "Silent" does.
+        let appearance_y = row_y(15);
+        let appear_cells = if crate::lang::rtl() { 6.5 } else { 8.0 };
+        let appear_w = (self.ui_cell_w() * appear_cells) as i32;
+        let appearance_btns = [0, 1, 2].map(|i| {
+            (
+                x + pad + i * (appear_w + 6),
+                cy(appearance_y),
+                appear_w,
+                ctl,
+            )
+        });
+
         let mut lay = SettingsLayout {
             card: (x, y, w, h),
             head_h,
@@ -3495,6 +3574,8 @@ impl Renderer {
             bar_toggle,
             close_label_y: close_y,
             close_toggle,
+            appearance_label_y: appearance_y,
+            appearance_btns,
         };
         if !crate::lang::rtl() {
             lay.mirror(x, w);
@@ -3627,9 +3708,9 @@ impl Renderer {
         for (i, tile) in lay.theme_tiles.iter().enumerate() {
             let (tx, ty, tw2, th) = *tile;
             let Some(t) = all.get(i) else { continue };
-            let edge = if i == v.theme { GREEN } else { EDGE };
+            let edge = if v.theme == Some(i) { GREEN } else { EDGE };
             bordered(out, (tx, ty, tw2, th), t.bg, edge);
-            if i == v.theme {
+            if v.theme == Some(i) {
                 // second border ring so the active tile reads at a glance
                 push_rect(out, whole, tx, ty, tw2, 2, c4(GREEN, 255));
                 push_rect(out, whole, tx, ty + th - 2, tw2, 2, c4(GREEN, 255));
@@ -4010,6 +4091,42 @@ impl Renderer {
         );
         leader(out, &[lay.close_toggle], ll, lay.close_label_y);
         draw_toggle(out, lay.close_toggle, v.confirm_close);
+
+        // ---- Windows light/dark: النظام / داكن / فاتح ----
+        let ll = label(
+            self,
+            out,
+            crate::lang::tr("سمة النظام", "System theme"),
+            lay.appearance_label_y,
+        );
+        leader(out, &lay.appearance_btns, ll, lay.appearance_label_y);
+        for (i, &(bx, by, bw, bh)) in lay.appearance_btns.iter().enumerate() {
+            let mode = crate::theme::APPEARANCE_SEGMENTS[i];
+            let active = v.appearance == Some(mode);
+            bordered(
+                out,
+                (bx, by, bw, bh),
+                if active { GREEN_DIM } else { CTL_BG },
+                if active { GREEN } else { EDGE },
+            );
+            let fg = if active { (0xff, 0xff, 0xff) } else { MUTED };
+            let seg = [Seg {
+                text: mode.label().into(),
+                fg,
+                style: if active { ST_BOLD } else { 0 },
+            }];
+            let lw = self.measure(&seg, true);
+            let gy = by + ((bh as f32 - self.cell_h) / 2.0) as i32;
+            self.draw_run(
+                &seg,
+                true,
+                out,
+                whole,
+                bx as f32 + (bw as f32 - lw) / 2.0,
+                gy,
+                1.0,
+            );
+        }
 
         // footer: hairline + hint
         push_rect(
@@ -5272,15 +5389,18 @@ impl Renderer {
             let bar_h = (self.cell_h + 10.0) as i32;
             let bx = width as i32 - bar_w - 10;
             let by = oy + 6;
-            push_rect(
-                out,
-                whole,
-                bx,
-                by,
-                bar_w,
-                bar_h,
-                c4((0x1c, 0x21, 0x28), 255),
-            );
+            // Dark pages keep the original slate. A light page uses a
+            // slightly darker paper so the bar is not a dark hole.
+            let search_bg = if crate::theme::title_bar_dark_for(self.bg) {
+                (0x1c, 0x21, 0x28)
+            } else {
+                (
+                    self.bg.0.saturating_sub(12),
+                    self.bg.1.saturating_sub(12),
+                    self.bg.2.saturating_sub(12),
+                )
+            };
+            push_rect(out, whole, bx, by, bar_w, bar_h, c4(search_bg, 255));
             push_rect(
                 out,
                 whole,
@@ -7584,6 +7704,40 @@ mod cache_tests {
         assert_eq!(saved.bg.as_deref(), Some("#123456"));
     }
 
+    /// A system light sample reaches the renderer. A named scheme, and an
+    /// explicit dark/light word, do not move when that sample disagrees.
+    #[test]
+    fn system_light_reaches_the_renderer_unless_the_user_locked_a_theme() {
+        let mut cfg = crate::config::UserConfig {
+            system_apps_light: Some(true),
+            ..Default::default()
+        };
+        let r = Renderer::new(1.0, &cfg, 0.0);
+        assert_eq!(r.bg, crate::theme::LIGHT.bg);
+        assert_eq!(r.fg, crate::theme::LIGHT.fg);
+        assert_eq!(r.palette, crate::theme::LIGHT.palette);
+
+        cfg.theme = Some("Dracula".into());
+        let locked = Renderer::new(1.0, &cfg, 0.0);
+        assert_eq!(locked.bg, theme_by_name("Dracula").unwrap().bg);
+
+        cfg.theme = Some("dark".into());
+        let forced = Renderer::new(1.0, &cfg, 0.0);
+        assert_eq!(forced.bg, crate::theme::DARK.bg);
+        assert_eq!(forced.palette, crate::theme::DARK.palette);
+
+        // The event path's new colours land on the renderer the app paints.
+        let mut live = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let before = crate::theme::ThemeSurface {
+            colors: resolved_colors(&crate::config::UserConfig::default()),
+            follows_system: true,
+        };
+        let after = before.apply_event(crate::theme::SystemThemeEvent::Winit { light: true });
+        live.set_colors(after.colors.bg, after.colors.fg, after.colors.palette);
+        assert_eq!(live.palette, crate::theme::LIGHT.palette);
+        assert!(!after.colors.title_bar_dark);
+    }
+
     /// The ligatures toggle picks a Mono-leading font family when off (so a
     /// ligature-capable default doesn't sneak substitutions in later).
     #[test]
@@ -7670,6 +7824,7 @@ mod cache_tests {
         ];
         controls.extend(lay.cursor_btns);
         controls.extend(lay.bell_btns);
+        controls.extend(lay.appearance_btns);
         for (i, &(rx, ry, rw, rh)) in controls.iter().enumerate() {
             assert!(
                 rx >= cx && rx + rw <= cx + cw && ry >= cy && ry + rh <= cy + ch,
