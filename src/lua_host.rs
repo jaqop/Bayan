@@ -95,10 +95,19 @@ const EVENTS: [&str; 4] = ["tab-opened", "title-changed", "bell", "osc7-cwd"];
 const MAX_HANDLERS_PER_EVENT: usize = 32;
 /// Processes `bayan.spawn` may have started and not yet reaped.
 const MAX_SPAWNS: usize = 4;
-/// `string.find` and its siblings. A short subject with a chain of `.-`
-/// is otherwise free to run for hundreds of milliseconds with no hook.
-const MAX_PATTERN_SUBJECT: usize = 1024;
-const MAX_PATTERN: usize = 64;
+/// `string.find` and its siblings match in one C call, which the hook cannot
+/// interrupt. A call whose worst case (`pattern_cost`) is over this many
+/// matcher steps is refused before it starts.
+const PATTERN_BUDGET: f64 = 1e7;
+/// `string.rep` and `table.move` loop in C too. `string.rep("", n)` copies
+/// zero bytes n times, so the memory limit never stops it.
+const MAX_REP: u128 = 1 << 20;
+const MAX_MOVE: i128 = 1 << 20;
+/// config.lua's tables become JSON by Rust recursion, outside the hook.
+/// A cycle or deep nesting would overflow the stack on every launch, and
+/// shared subtables would be copied once per path.
+const MAX_CONFIG_DEPTH: usize = 32;
+const MAX_CONFIG_VALUES: usize = 100_000;
 
 struct Limits {
     memory: usize,
@@ -1189,10 +1198,10 @@ fn harden(lua: &Lua, fuel: &Arc<Fuel>) -> Result<(), String> {
     ] {
         g.set(name, Value::Nil).map_err(|e| e.to_string())?;
     }
-    let fuel = Arc::clone(fuel);
+    let pcall_fuel = Arc::clone(fuel);
     g.set(
         "pcall",
-        lua.create_function(move |lua, args: MultiValue| guarded_pcall(lua, &fuel, args))
+        lua.create_function(move |lua, args: MultiValue| guarded_pcall(lua, &pcall_fuel, args))
             .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
@@ -1246,27 +1255,51 @@ fn harden(lua: &Lua, fuel: &Arc<Fuel>) -> Result<(), String> {
         .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    cap_pattern_functions(lua, &string)?;
+    // The string metatable's __index is this same table, so `s:find(...)`
+    // reaches these wrappers too.
+    cap_pattern_functions(lua, &string, fuel)?;
+    cap_c_loops(lua, &string, &g, fuel)?;
     Ok(())
 }
 
-fn cap_pattern_functions(lua: &Lua, string: &mlua::Table) -> Result<(), String> {
+/// The hook runs every `INSTRUCTION_STRIDE` instructions, and a loop body
+/// calling a C function is a handful of them, so each capped call checks
+/// the deadline itself. The overrun is then one call, not hundreds.
+fn checkpoint(fuel: &Fuel) -> mlua::Result<()> {
+    if fuel.mark_if_over(fuel.steps.load(Ordering::Relaxed)) {
+        return Err(mlua::Error::runtime("lua execution limit exceeded"));
+    }
+    Ok(())
+}
+
+fn cap_pattern_functions(lua: &Lua, string: &mlua::Table, fuel: &Arc<Fuel>) -> Result<(), String> {
     for name in ["find", "match", "gmatch", "gsub"] {
         let orig: mlua::Function = string.get(name).map_err(|e| e.to_string())?;
+        let fuel = Arc::clone(fuel);
         string
             .set(
                 name,
-                lua.create_function(move |_, args: MultiValue| {
+                lua.create_function(move |lua, args: MultiValue| {
+                    checkpoint(&fuel)?;
                     let args = args.into_vec();
-                    if let Some(Value::String(s)) = args.first() {
-                        if s.as_bytes().len() > MAX_PATTERN_SUBJECT {
-                            return Err(mlua::Error::runtime("string is too long"));
-                        }
-                    }
-                    if let Some(Value::String(p)) = args.get(1) {
-                        let pat = p.as_bytes();
-                        if pat.len() > MAX_PATTERN || dot_repeats(&pat) > 3 {
-                            return Err(mlua::Error::runtime("pattern is rejected"));
+                    let subject = arg_string(lua, &args, 0)?;
+                    let pattern = arg_string(lua, &args, 1)?;
+                    if let (Some(s), Some(p)) = (subject, pattern) {
+                        let plain = name == "find"
+                            && !matches!(
+                                args.get(3),
+                                None | Some(Value::Nil | Value::Boolean(false))
+                            );
+                        let cost = pattern_cost(
+                            s.as_bytes().len(),
+                            &p.as_bytes(),
+                            plain,
+                            name != "gmatch",
+                        );
+                        if cost > PATTERN_BUDGET {
+                            return Err(mlua::Error::runtime(
+                                "pattern is too costly for this string",
+                            ));
                         }
                     }
                     orig.call::<MultiValue>(MultiValue::from_vec(args))
@@ -1278,11 +1311,163 @@ fn cap_pattern_functions(lua: &Lua, string: &mlua::Table) -> Result<(), String> 
     Ok(())
 }
 
-fn dot_repeats(pattern: &[u8]) -> usize {
-    pattern
-        .windows(2)
-        .filter(|w| w == b".-" || w == b".*" || w == b".+")
-        .count()
+/// `string.rep` and `table.move`, bounded by how many times their C loop runs.
+fn cap_c_loops(
+    lua: &Lua,
+    string: &mlua::Table,
+    g: &mlua::Table,
+    fuel: &Arc<Fuel>,
+) -> Result<(), String> {
+    let orig_rep: mlua::Function = string.get("rep").map_err(|e| e.to_string())?;
+    let rep_fuel = Arc::clone(fuel);
+    let rep = lua
+        .create_function(move |lua, args: MultiValue| {
+            checkpoint(&rep_fuel)?;
+            let args = args.into_vec();
+            let s = arg_string(lua, &args, 0)?.map(|s| s.as_bytes().len() as u128);
+            let n = arg_integer(lua, &args, 1)?;
+            let sep = arg_string(lua, &args, 2)?.map_or(0, |s| s.as_bytes().len() as u128);
+            if let (Some(l), Some(n)) = (s, n) {
+                if n > 0 {
+                    let n = n as u128;
+                    let total = n * l + (n - 1) * sep;
+                    if total > MAX_REP {
+                        return Err(mlua::Error::runtime("string.rep result is too long"));
+                    }
+                    if total == 0 {
+                        return Ok(Value::String(lua.create_string("")?));
+                    }
+                }
+            }
+            orig_rep.call::<Value>(MultiValue::from_vec(args))
+        })
+        .map_err(|e| e.to_string())?;
+    string.set("rep", rep).map_err(|e| e.to_string())?;
+
+    let table: mlua::Table = g.get("table").map_err(|e| e.to_string())?;
+    let orig_move: mlua::Function = table.get("move").map_err(|e| e.to_string())?;
+    let move_fuel = Arc::clone(fuel);
+    let mv = lua
+        .create_function(move |lua, args: MultiValue| {
+            checkpoint(&move_fuel)?;
+            let args = args.into_vec();
+            if let (Some(f), Some(e)) = (arg_integer(lua, &args, 1)?, arg_integer(lua, &args, 2)?) {
+                if i128::from(e) - i128::from(f) >= MAX_MOVE {
+                    return Err(mlua::Error::runtime("table.move: too many elements"));
+                }
+            }
+            orig_move.call::<Value>(MultiValue::from_vec(args))
+        })
+        .map_err(|e| e.to_string())?;
+    table.set("move", mv).map_err(|e| e.to_string())
+}
+
+/// Argument `i` as Lua's C side would read it; `None` lets the original
+/// function raise its own type error.
+fn arg_string(lua: &Lua, args: &[Value], i: usize) -> mlua::Result<Option<mlua::LuaString>> {
+    match args.get(i) {
+        Some(v @ (Value::String(_) | Value::Integer(_) | Value::Number(_))) => {
+            lua.coerce_string(v.clone())
+        }
+        _ => Ok(None),
+    }
+}
+
+fn arg_integer(lua: &Lua, args: &[Value], i: usize) -> mlua::Result<Option<i64>> {
+    match args.get(i) {
+        Some(v @ (Value::String(_) | Value::Integer(_) | Value::Number(_))) => {
+            lua.coerce_integer(v.clone())
+        }
+        _ => Ok(None),
+    }
+}
+
+/// An upper bound on the steps of Lua 5.4's backtracking matcher
+/// (`lstrlib.c` `match`) over a subject of `n` bytes. Each start position
+/// tries every split of the subject among the `q` quantified items
+/// (`*` `+` `-` `?`). Their counts sum to at most `n`, so a start sees at
+/// most C(n+q, q) splits, each walking at most `m` pattern bytes over q+1
+/// nodes. `%b` and back-references rescan up to `n` bytes each. Plain
+/// `find` is a memory search, `n * m`.
+fn pattern_cost(n: usize, pat: &[u8], plain: bool, can_anchor: bool) -> f64 {
+    let n1 = n as f64 + 1.0;
+    let m = pat.len().max(1) as f64;
+    if plain {
+        return n1 * m;
+    }
+    let mut starts = n1;
+    let mut i = 0;
+    if can_anchor && pat.first() == Some(&b'^') {
+        starts = 1.0;
+        i = 1;
+    }
+    let (mut q, mut rescans) = (0u32, 0i32);
+    while i < pat.len() {
+        let end = match pat[i] {
+            b'(' | b')' => {
+                i += 1;
+                continue;
+            }
+            b'%' => match pat.get(i + 1) {
+                Some(b'b') => {
+                    rescans += 1;
+                    i += 4;
+                    continue;
+                }
+                Some(b'f') => {
+                    let Some(e) = set_end(pat, i + 2) else {
+                        return f64::INFINITY;
+                    };
+                    i = e;
+                    continue;
+                }
+                Some(d) if d.is_ascii_digit() => {
+                    rescans += 1;
+                    i += 2;
+                    continue;
+                }
+                _ => i + 2,
+            },
+            b'[' => match set_end(pat, i) {
+                Some(e) => e,
+                None => return f64::INFINITY,
+            },
+            _ => i + 1,
+        };
+        if matches!(pat.get(end), Some(b'*' | b'+' | b'-' | b'?')) {
+            q += 1;
+            i = end + 1;
+        } else {
+            i = end;
+        }
+    }
+    let mut splits = 1.0;
+    for k in 1..=q {
+        splits = splits * (n as f64 + f64::from(k)) / f64::from(k);
+    }
+    starts * splits * f64::from(q + 1) * m * n1.powi(rescans)
+}
+
+/// Just past the `]` that closes the set opening at `pat[i]` (`classEnd`).
+/// `None` is a malformed set, which Lua would reject anyway.
+fn set_end(pat: &[u8], i: usize) -> Option<usize> {
+    if pat.get(i) != Some(&b'[') {
+        return None;
+    }
+    let mut p = i + 1;
+    if pat.get(p) == Some(&b'^') {
+        p += 1;
+    }
+    loop {
+        let c = *pat.get(p)?;
+        p += 1;
+        if c == b'%' {
+            p += 1;
+        }
+        if *pat.get(p)? == b']' {
+            return Some(p + 1);
+        }
+    }
 }
 
 /// `pcall` that re-raises once the instruction or time limit has tripped.
@@ -1404,6 +1589,20 @@ fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> Result<Value, String> {
 }
 
 fn lua_to_json(value: Value) -> Result<serde_json::Value, String> {
+    to_json(value, &mut Vec::new(), &mut 0)
+}
+
+/// `path` holds the tables between the root and this value; `count` is
+/// every value converted so far.
+fn to_json(
+    value: Value,
+    path: &mut Vec<*const std::ffi::c_void>,
+    count: &mut usize,
+) -> Result<serde_json::Value, String> {
+    *count += 1;
+    if *count > MAX_CONFIG_VALUES {
+        return Err("config has too many values".into());
+    }
     match value {
         Value::Nil => Ok(serde_json::Value::Null),
         Value::Boolean(b) => Ok(serde_json::Value::Bool(b)),
@@ -1415,18 +1614,34 @@ fn lua_to_json(value: Value) -> Result<serde_json::Value, String> {
             let text = s.to_str().map_err(|_| "lua string is not utf-8")?;
             Ok(serde_json::Value::String(text.to_string()))
         }
-        Value::Table(t) => table_to_json(&t),
+        Value::Table(t) => {
+            let ptr = t.to_pointer();
+            if path.contains(&ptr) {
+                return Err("config table contains itself".into());
+            }
+            if path.len() >= MAX_CONFIG_DEPTH {
+                return Err("config tables nest too deep".into());
+            }
+            path.push(ptr);
+            let json = table_to_json(&t, path, count);
+            path.pop();
+            json
+        }
         other => Err(format!("config.lua produced {other:?}")),
     }
 }
 
-fn table_to_json(t: &mlua::Table) -> Result<serde_json::Value, String> {
+fn table_to_json(
+    t: &mlua::Table,
+    path: &mut Vec<*const std::ffi::c_void>,
+    count: &mut usize,
+) -> Result<serde_json::Value, String> {
     if is_sequence(t)? {
         let n = t.raw_len();
         let mut items = Vec::with_capacity(n);
         for i in 1..=n {
             let v: Value = t.get(i).map_err(|e| e.to_string())?;
-            items.push(lua_to_json(v)?);
+            items.push(to_json(v, path, count)?);
         }
         return Ok(serde_json::Value::Array(items));
     }
@@ -1440,7 +1655,7 @@ fn table_to_json(t: &mlua::Table) -> Result<serde_json::Value, String> {
         if matches!(v, Value::Nil) {
             continue;
         }
-        map.insert(key.to_string(), lua_to_json(v)?);
+        map.insert(key.to_string(), to_json(v, path, count)?);
     }
     Ok(serde_json::Value::Object(map))
 }
@@ -2388,6 +2603,121 @@ mod tests {
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(out.config.font_size, Some(15.0));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// config.lua errors here; it must not take the process down.
+    fn config_lua_fails(src: &str) -> String {
+        let dir = scratch("tables");
+        fs::write(dir.join("config.lua"), src).unwrap();
+        let mut cfg = json_cfg(r#"{"font_size":12.0}"#);
+        approve(&mut cfg, src.as_bytes());
+        let out = load_with(&cfg, &dir, false);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(out.config.font_size, Some(12.0), "{src}");
+        assert_eq!(out.errors.len(), 1, "{src}: {:?}", out.errors);
+        out.errors[0].clone()
+    }
+
+    #[test]
+    fn a_config_table_that_contains_itself_is_an_error() {
+        let err = config_lua_fails("local t = {} t.x = t config.foo = t");
+        assert!(err.contains("contains itself"), "{err}");
+        let err = config_lua_fails("local t = {} t[1] = t return { foo = t }");
+        assert!(err.contains("contains itself"), "{err}");
+    }
+
+    #[test]
+    fn deeply_nested_config_tables_are_an_error() {
+        let err =
+            config_lua_fails("local t = {} for i = 1, 100000 do t = { t } end config.foo = t");
+        assert!(err.contains("nest too deep"), "{err}");
+    }
+
+    #[test]
+    fn shared_config_subtables_cannot_multiply() {
+        // 2^20 leaves from 21 tables: the walk would build every copy.
+        let err = config_lua_fails(
+            "local t = {} for i = 1, 20 do t = { a = t, b = t } end config.foo = t",
+        );
+        assert!(err.contains("too many values"), "{err}");
+    }
+
+    #[test]
+    fn a_pattern_too_costly_for_its_subject_is_refused_before_it_runs() {
+        // Short pattern, no dots, subject under 1 KiB: n^4 steps in one C call.
+        for src in [
+            r#"return select(2, pcall(function() return ("a"):rep(1000):find("a*a*a*b") end))"#,
+            r#"return select(2, pcall(string.match, ("a"):rep(1000), "%a-%a-%a-b"))"#,
+            r#"return select(2, pcall(function() return ("a"):rep(1e5):find(".-.-.-.-.-b") end))"#,
+            r#"return select(2, pcall(function() for _ in ("a"):rep(600):gmatch("(a*)(a*)b") do end end))"#,
+            r#"return select(2, pcall(string.gsub, ("a"):rep(600), "a+a+b", ""))"#,
+            r#"return select(2, pcall(string.find, ("a"):rep(1e6), ("a"):rep(1e5) .. "b", 1, true))"#,
+        ] {
+            let err = probe(src).unwrap();
+            assert!(err.contains("too costly"), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_loop_of_admitted_patterns_stops_at_the_deadline() {
+        // Each call is under the budget (a few ms), and ~200 of them fit
+        // between two hook runs. The call itself must check the deadline.
+        let src = r#"
+            local s = ("a"):rep(1200)
+            for i = 1, 1e9 do s:find("a*b") end
+        "#;
+        let start = Instant::now();
+        let err = probe(src).unwrap_err();
+        let took = start.elapsed();
+        assert!(err.contains("limit exceeded"), "{err}");
+        assert!(took < Duration::from_millis(400), "took {took:?}");
+    }
+
+    #[test]
+    fn ordinary_patterns_still_match() {
+        assert_eq!(
+            probe(r#"return ("key=value"):match("(%w+)=(%w+)")"#).unwrap(),
+            "key"
+        );
+        assert_eq!(
+            probe(r#"return (("  pad me  "):rep(8)):match("^%s*(.-)%s*$"):sub(1, 6)"#).unwrap(),
+            "pad me"
+        );
+        let path = format!(
+            "return (\"C:\\\\{}\"):gsub(\"\\\\\", \"/\")",
+            "x".repeat(4000)
+        );
+        assert!(probe(&path).unwrap().starts_with("C:/x"));
+        assert_eq!(
+            probe(r#"return select(2, ("a b c"):gsub("%s+", "_"))"#).unwrap(),
+            "2"
+        );
+        assert_eq!(probe(r#"return ("[x]"):find("[]]")"#).unwrap(), "3");
+    }
+
+    #[test]
+    fn rep_and_move_cannot_loop_in_c() {
+        // Zero bytes copied n times: the memory limit never trips.
+        assert_eq!(
+            probe(r#"return #string.rep("", math.maxinteger)"#).unwrap(),
+            "0"
+        );
+        assert_eq!(
+            probe(r#"return #string.rep("", math.maxinteger, "")"#).unwrap(),
+            "0"
+        );
+        let err = probe(r#"return select(2, pcall(string.rep, "ab", 1e7))"#).unwrap();
+        assert!(err.contains("too long"), "{err}");
+        assert_eq!(probe(r#"return #("ab"):rep(3, ",")"#).unwrap(), "8");
+        // Moving nils into a plain table allocates nothing either.
+        let err =
+            probe(r#"return select(2, pcall(table.move, {}, 1, math.maxinteger - 1, 1, {}))"#)
+                .unwrap();
+        assert!(err.contains("too many elements"), "{err}");
+        assert_eq!(
+            probe(r#"return table.concat(table.move({1, 2, 3}, 1, 3, 2), ",")"#).unwrap(),
+            "1,1,2,3"
+        );
     }
 
     #[test]

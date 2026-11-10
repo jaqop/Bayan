@@ -945,9 +945,25 @@ The sandbox is Lua 5.4 via mlua, with `string`, `table`, `math`, and
 `utf8` only. `io`, `os`, `debug`, and `package` are absent. `require`,
 `loadfile`, `dofile`, and `string.dump` are removed, and `load` accepts
 text chunks only. A metatable with `__gc` is rejected, because Lua 5.4
-runs finalizers with the instruction hook switched off. `string.find`,
-`match`, `gmatch`, and `gsub` refuse a long subject, a long pattern, or
-a pattern with a long chain of `.-` / `.*`. Each call into Lua gets its
+runs finalizers with the instruction hook switched off. The hook also
+cannot interrupt one C call, so `string.find`, `match`, `gmatch`, and
+`gsub` first bound the matcher's worst case for that subject and pattern
+(start positions times the ways the subject splits among the `*` `+` `-`
+`?` items, times the pattern length, with `%b` and back-references
+rescanning) and refuse a call over 10^7 steps. The first fix here capped
+subject and pattern length and counted `.-` chains; `("a"):rep(1000)
+:find("a*a*a*b")` passed all three and had not returned after 60 s. Measured in
+a debug build, the costliest admitted calls take about 5 ms. These calls,
+`string.rep`, and `table.move` also check the deadline themselves, since
+a loop body calling one is only a few instructions and the hook runs every
+thousand. `string.rep` refuses a result over 1 MiB and answers an empty
+one directly: `string.rep("", math.maxinteger)` copies zero bytes 2^63
+times, so the memory limit never stops it. `table.move` refuses more than
+2^20 elements, because moving nils allocates nothing either. config.lua's
+tables become JSON by Rust recursion outside the hook, so a table that
+contains itself, nesting past 32 levels, or more than 100,000 values in
+all is a config.lua error instead of a stack overflow on every launch.
+Each call into Lua gets its
 own instruction budget and its own short deadline, so one callback cannot
 spend the next one's time. A loop is still cut off. Strings are UTF-8;
 Arabic round-trips.
