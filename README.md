@@ -79,7 +79,10 @@ specification; `src/keys.rs` carries the same key-encoding tests.
 - [x] **M9** — the shaped-run cache: the paint loop now re-shapes only
       CHANGED lines (generational LRU, EasyTer's dirty-row lesson) — a
       fully-cached frame's shaping cost dropped from ~1.5ms to ~4µs
-      (~340×), which is the honest 80% of what a GPU renderer buys; full
+      (~340×, release build, 40 rows, at 43017b0; `cargo test --release
+      measure_cache_speedup_probe -- --nocapture` prints the two figures
+      without asserting them, and on 4a570b7 it gave 1.14ms and 5.1µs,
+      ~220×); full
       layout persistence: every tab's panes, split axis, weights and focus
       survive a restart (pre-M9 session files still restore)
 - [x] **M10** — the wgpu renderer: every frame is one draw call of quads
@@ -87,8 +90,9 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       texel), WGSL pipeline with straight-alpha blending, vsync'd present,
       DX12-first with GL fallback; Arabic shapes through the same cosmic-text
       cache and rasterizes into the atlas — verified pixel-identical to the
-      CPU renderer. The window stays hidden until the first frame (~0.4s,
-      GPU init) so there's no white flash.
+      CPU renderer. The window stays hidden until the first frame (GPU
+      init, about 0.4s on the development machine; not measured by any
+      test) so there's no white flash.
 - [x] **M11** — cap-proof command marks WITHOUT upstream changes: Grid's
       scroll_up advances a non-zero display_offset by exactly the scrolled
       amount, so the feed parks the offset at 1, reads how far it moved,
@@ -911,7 +915,7 @@ Two escape sequences from ECMA-48 / the terminal-wg "BiDi in Terminal
 Emulators" recommendation, which `alacritty_terminal` 0.26 does not act on
 (mode 8 is an unknown SM/RM parameter; `CSI Ps SP k` is not in its CSI
 dispatch). Bayan strips them from the PTY stream before the parser, including
-when a sequence is split across reads. The tree has 224 unit tests.
+when a sequence is split across reads.
 
 - **BDSM** — `CSI 8 h` implicit (Bayan applies UAX#9; this is the initial
   state, so a shell that never sends BDSM still gets Arabic), `CSI 8 l`
