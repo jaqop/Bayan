@@ -3012,7 +3012,7 @@ mod tests {
             rgba: Arc::from(vec![0u8; 16]),
         };
         let clip = (10, 20, 80, 40);
-        let sprites = crate::render::image_sprites(clip, 10.0, 10.0, 0, 0, 80, |_| false, &[snap]);
+        let sprites = crate::render::image_sprites(clip, 10.0, 10.0, 0, 0, &[snap]);
         assert_eq!(sprites.len(), 1);
         assert_eq!(sprites[0].verts.len(), 6);
         for v in &sprites[0].verts {
@@ -3039,24 +3039,66 @@ mod tests {
             height: 1,
             rgba: Arc::from(vec![0u8; 4]),
         };
-        assert!(
-            crate::render::image_sprites(clip, 10.0, 10.0, 0, 0, 80, |_| false, &[below])
-                .is_empty()
+        assert!(crate::render::image_sprites(clip, 10.0, 10.0, 0, 0, &[below]).is_empty());
+    }
+
+    #[test]
+    fn rtl_paragraph_does_not_flip_image_pixels() {
+        // Left pixel red, right pixel blue. Reversing the texture would swap them.
+        let px = b64(&[255, 0, 0, 0, 0, 255]);
+        let cmd = kitty(&format!("a=T,f=24,s=2,v=1,c=2,r=1,C=1,q=2;{px}"));
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        feed(&mut t, &mut p, &mut meta, &mut carry, &cmd);
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[1;10H");
+        feed(&mut t, &mut p, &mut meta, &mut carry, "مرحبا".as_bytes());
+        assert_eq!(cell(&t, 0, 9), 'م', "the row is an RTL paragraph");
+        let on_rtl = meta.images.snapshot();
+        assert_eq!(on_rtl.len(), 1);
+        assert_eq!(on_rtl[0].col, 0, "placement stays on the cursor cell");
+        assert_eq!(
+            &on_rtl[0].rgba[..],
+            &[255, 0, 0, 255, 0, 0, 255, 255],
+            "stored pixels stay left to right"
         );
-        // An RTL row mirrors the logical column to the other edge.
-        let rtl = ImageSnap {
-            cookie: 3,
-            line: 0,
-            col: 0,
-            cols: 2,
-            rows: 1,
-            width: 1,
-            height: 1,
-            rgba: Arc::from(vec![0u8; 4]),
+
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        feed(&mut t, &mut p, &mut meta, &mut carry, &cmd);
+        let on_ltr = meta.images.snapshot();
+        assert_eq!(on_ltr[0].rgba, on_rtl[0].rgba);
+        assert_eq!(on_ltr[0].col, on_rtl[0].col);
+
+        let quad = |snaps: &[ImageSnap]| {
+            crate::render::image_sprites((0, 0, 400, 80), 10.0, 20.0, 0, 0, snaps)
         };
-        let mirrored =
-            crate::render::image_sprites((0, 0, 400, 40), 10.0, 10.0, 0, 0, 40, |_| true, &[rtl]);
-        assert_eq!(mirrored[0].verts[0].pos[0], 380.0);
+        let rtl_quad = quad(&on_rtl);
+        let ltr_quad = quad(&on_ltr);
+        assert_eq!(rtl_quad[0].rgba, ltr_quad[0].rgba);
+        let left = rtl_quad[0]
+            .verts
+            .iter()
+            .map(|v| v.pos[0])
+            .fold(f32::MAX, f32::min);
+        let right = rtl_quad[0]
+            .verts
+            .iter()
+            .map(|v| v.pos[0])
+            .fold(f32::MIN, f32::max);
+        assert_eq!(left, 0.0, "the quad is not moved to the right edge");
+        assert!(right > left);
+        for v in &rtl_quad[0].verts {
+            if v.pos[0] == left {
+                assert_eq!(v.uv[0], 0.0, "the left edge samples the red pixel");
+            }
+            if v.pos[0] == right {
+                assert_eq!(v.uv[0], 1.0, "the right edge samples the blue pixel");
+            }
+        }
+        let ltr_left = ltr_quad[0]
+            .verts
+            .iter()
+            .map(|v| v.pos[0])
+            .fold(f32::MAX, f32::min);
+        assert_eq!(ltr_left, left);
     }
 
     #[test]

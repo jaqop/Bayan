@@ -918,7 +918,9 @@ ED 2, ED 3, and RIS. EL and a partial ED leave Kitty graphics in place.
 A resize drops them only when the column count changes, which is when rows
 reflow; switching tabs does not. The alt screen has its own placements; leaving it
 drops those and shows the primary screen's images again. Rows that also
-contain Arabic still take the whole-line shaper.
+contain Arabic still take the whole-line shaper. Image pixels are never
+reversed on an RTL line. Where to anchor the quad in an RTL paragraph is
+left for a later decision; this build keeps the image on the cursor cell.
 
 ```json
 {

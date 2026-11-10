@@ -4646,8 +4646,6 @@ impl App {
                         renderer.cell_h,
                         evicted.saturating_add(history),
                         off,
-                        t.columns(),
-                        |vrow| reorder && viewport_row_is_rtl(&t, off, vrow),
                         &image_snaps,
                     ));
                     let line_dir: Vec<bidi_ctl::ParagraphDir> = if use_stamps {
@@ -5640,19 +5638,6 @@ fn run() -> Result<(), String> {
         return Err(error);
     }
     result.map_err(|error| format!("The event loop failed: {error}"))
-}
-
-/// A viewport row whose cells include an RTL letter. Used to mirror an image
-/// onto the visual side of a shaped row without changing how the text is shaped.
-fn viewport_row_is_rtl<T: alacritty_terminal::event::EventListener>(
-    term: &alacritty_terminal::term::Term<T>,
-    display_offset: u64,
-    vrow: usize,
-) -> bool {
-    use alacritty_terminal::index::{Column, Line};
-    let line = vrow as i32 - display_offset as i32;
-    let row = &term.grid()[Line(line)];
-    (0..term.columns()).any(|c| render::is_rtl(row[Column(c)].c))
 }
 
 /// OSC 52 writes only from the focused pane of the active tab.
