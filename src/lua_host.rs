@@ -238,6 +238,7 @@ impl PluginSet {
     }
 
     /// How many plugin callbacks have run. Terminal intake does not move it.
+    #[cfg(test)]
     pub fn callback_runs(&self) -> u64 {
         self.plugins
             .iter()
@@ -245,8 +246,9 @@ impl PluginSet {
             .sum()
     }
 
-    /// The PTY reader must not hand bytes to Lua. This exists so the intake
-    /// path has a function that accepts them and does not dispatch.
+    /// The PTY reader must not hand bytes to Lua. Tests pass the bytes the
+    /// emulator just parsed; the body deliberately does not dispatch.
+    #[cfg(test)]
     pub fn observe_terminal(&mut self, _bytes: &[u8]) {}
 }
 
@@ -1156,10 +1158,12 @@ fn log_line(msg: &str) {
     }
 }
 
+#[cfg(test)]
 fn probe(src: &str) -> Result<String, String> {
     probe_with(src, Limits::production())
 }
 
+#[cfg(test)]
 fn probe_with(src: &str, limits: Limits) -> Result<String, String> {
     let lua = open_sandbox(limits)?;
     let value: Value = lua
