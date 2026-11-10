@@ -2852,17 +2852,25 @@ impl Renderer {
                 if ci.c != ' ' {
                     let mut s = String::new();
                     ci.push_text(&mut s);
+                    // A lone Arabic letter is an RTL paragraph. Shaped with
+                    // no alignment it sits at the far end of the 1_000_000 px
+                    // buffer and the clip throws it away, so `bidi.mode = off`
+                    // (and explicit BDSM, which also takes this path) drew
+                    // nothing. Pin it to the cell: storage order, left to
+                    // right, no reordering across cells. LTR glyphs already
+                    // start at 0 either way and keep the old alignment.
+                    let align_left = s.chars().any(is_rtl);
                     let seg = [Seg {
                         text: s,
                         fg: ci.fg,
                         style: ci.style,
                     }];
-                    let natw = self.measure(&seg, false);
+                    let natw = self.measure(&seg, align_left);
                     let boxw = ci.w as f32 * self.cell_w;
                     let scale = if natw > boxw + 0.5 { boxw / natw } else { 1.0 };
                     self.draw_run(
                         &seg,
-                        false,
+                        align_left,
                         out,
                         clip,
                         x0 as f32 + ci.col as f32 * self.cell_w,
