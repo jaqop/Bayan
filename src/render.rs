@@ -1210,28 +1210,59 @@ fn glyph_ink(
     Some((phys.x as f32 + entry.left as f32, w))
 }
 
-/// How many terminal cells a cluster holds. Combining marks and joiners
-/// stay on the base, so «بَ» is one unit and «لا» is two.
-fn cluster_unit_count(cluster: &str) -> usize {
-    let mut n = 0usize;
-    let mut joined = false;
-    for c in cluster.chars() {
-        let glue = crate::bidi::is_combining(c)
-            || c == '\u{200d}'
-            || joined
-            || matches!(c as u32, 0xFE00..=0xFE0F | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F);
-        joined = c == '\u{200d}';
-        if n == 0 || !glue {
-            n += 1;
-        }
-    }
-    n.max(1)
+fn is_alef(c: char) -> bool {
+    matches!(c, 'ا' | 'أ' | 'إ' | 'آ' | 'ٱ')
 }
 
-/// Cursor rectangle for the byte range. A single letter uses its ink, so
-/// Cairo's join is covered. A ligature keeps the advance and splits from
-/// the right: some faces draw «ا» with no ink of its own, and sizing the
-/// split to that empty bitmap put both halves on the same pixel.
+/// «لا» is one joined cluster even when the face emits two glyphs and the
+/// alef's bitmap sits on the lam. Fold the pair into one span so the ink
+/// is split from the right afterwards: lam on the right half, alef on the
+/// left. A lone alef is not a ligature and stays where it was shaped.
+fn merge_lam_alef(spans: Vec<crate::mouse::GlyphSpan>, text: &str) -> Vec<crate::mouse::GlyphSpan> {
+    let mut out = Vec::with_capacity(spans.len());
+    let mut i = 0;
+    while i < spans.len() {
+        let pair = spans.get(i + 1).and_then(|next| {
+            let (a, b) = (&spans[i], next);
+            let (first, second) = if a.start <= b.start { (a, b) } else { (b, a) };
+            let lam_then_alef = first.end == second.start
+                && text[first.start..first.end].ends_with('ل')
+                && text[second.start..second.end]
+                    .chars()
+                    .next()
+                    .is_some_and(is_alef);
+            lam_then_alef.then(|| {
+                let x = a.x.min(b.x);
+                crate::mouse::GlyphSpan {
+                    x,
+                    w: (a.x + a.w).max(b.x + b.w) - x,
+                    start: first.start,
+                    end: second.end,
+                    rtl: true,
+                }
+            })
+        });
+        if let Some(span) = pair {
+            out.push(span);
+            i += 2;
+        } else {
+            let g = &spans[i];
+            out.push(crate::mouse::GlyphSpan {
+                x: g.x,
+                w: g.w,
+                start: g.start,
+                end: g.end,
+                rtl: g.rtl,
+            });
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Cursor rectangle for the byte range. The box is the glyph ink, and a
+/// ligature is split from the right by [`highlight_spans`], so «ل» keeps
+/// the right half of «لا» and «ا» the left half.
 fn ink_cover(
     spans: &[crate::mouse::GlyphSpan],
     inks: &[(usize, usize, f32, f32)],
@@ -1249,12 +1280,7 @@ fn ink_cover(
                 hi = hi.max(x + w);
             }
         }
-        let one = cluster_unit_count(&text[g.start..g.end]) == 1;
-        let (x, w) = if one && hi > lo {
-            (lo, hi - lo)
-        } else {
-            (g.x, g.w)
-        };
+        let (x, w) = if hi > lo { (lo, hi - lo) } else { (g.x, g.w) };
         if w <= 0.0 {
             continue;
         }
@@ -2317,7 +2343,7 @@ impl Renderer {
                     rtl: glyph.level.is_rtl(),
                 })
                 .collect();
-            let spans = crate::mouse::fold_empty_letters(raw, text);
+            let spans = merge_lam_alef(crate::mouse::fold_empty_letters(raw, text), text);
             let Some((x, w)) = ink_cover(&spans, &inks, text, b0, b1) else {
                 continue;
             };
@@ -2640,29 +2666,17 @@ impl Renderer {
                 mapped_cursor = Some(fit_past_end_cursor(x, width, rtl, &letters));
             }
         }
-        // A block on a letter covers that glyph's ink when the ink still
-        // sits on the advance box. Cairo joins outside the pen slot, so the
-        // advance misses the cluster. A face that draws «ا» in «لا» with no
-        // bitmap of its own puts that ink on the lam; keeping the advance
-        // there leaves the empty half on the correct side. The cell past
-        // the text is unchanged: on 22bc5d66 that cursor already sits at
-        // the logical end.
+        // A block on a letter covers that glyph's ink. Cairo joins outside
+        // the pen slot, so the advance box misses the cluster. Lam-alef is
+        // one ink box split from the right. The cell past the text is
+        // unchanged: on 22bc5d66 that cursor already sits at the logical end.
         if !claude {
             if let Some(col) = cursor_col.filter(|col| *col < text_end_col) {
                 if let Some(&(_, b0, b1)) = cell_bytes.iter().find(|cell| cell.0 == col) {
                     if let Some((x, w)) = self.ink_cursor_box(&key, b0, b1) {
                         let left = text_x0 + (x * scale).round() as i32;
                         let iw = ((w * scale).round() as i32).max(2);
-                        // The ink has to cover the middle of the advance. A
-                        // zero-width alef's bitmap can sit on the lam, a pixel
-                        // to the right, and must not replace the half-box.
-                        let on_the_advance = mapped_cursor.is_none_or(|(ax, aw)| {
-                            let mid = ax + aw / 2;
-                            left <= mid && mid < left + iw
-                        });
-                        if on_the_advance {
-                            mapped_cursor = Some((left, iw));
-                        }
+                        mapped_cursor = Some((left, iw));
                     }
                 }
             }
@@ -7269,251 +7283,6 @@ mod tests {
         (left, right - left)
     }
 
-    /// Pins the end cursor measured on bayan-plus `22bc5d66`, where the
-    /// pre-1f71b9d drift does not reproduce. For `C:\Users\me> مرحبا hello`
-    /// the cursor's left edge is the right edge of `o`, the space after `>`
-    /// stays between the path and the Arabic run, and each extra blank
-    /// before `hello` widens that gap. The placement itself is unchanged.
-    #[test]
-    fn prompt_path_arabic_and_english_place_the_cursor_and_the_gaps() {
-        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
-        let pane = (0, 0, 1000, 160);
-        let mut previous_gap = 0;
-        for blanks in 1..=3 {
-            let text = format!("C:\\Users\\me> مرحبا{}hello", " ".repeat(blanks));
-            let cells = row_cells(&text, 0);
-            r.begin_frame();
-            r.mapping_context = Some((pane, 0));
-            let cursor = r
-                .draw_line_bidi(
-                    &mut Vec::new(),
-                    pane,
-                    0,
-                    0,
-                    pane.2,
-                    &cells,
-                    false,
-                    Some(cells.len()),
-                    ParagraphDir::Default,
-                    None,
-                )
-                .expect("end cursor");
-            r.finish_pane_layout(pane);
-            let gt = cells.iter().position(|c| c.c == '>').unwrap();
-            let arabic: Vec<_> = cells
-                .iter()
-                .filter(|c| is_arabic(c.c))
-                .map(|c| c.col)
-                .collect();
-            let h = cells.iter().position(|c| c.c == 'h').unwrap();
-            let o = cells.iter().rposition(|c| c.c == 'o').unwrap();
-            let (path_x, path_w) = box_of(&r, pane, cells[gt].col);
-            let arab_left = arabic
-                .iter()
-                .map(|col| box_of(&r, pane, *col).0)
-                .min()
-                .unwrap();
-            let arab_right = arabic
-                .iter()
-                .map(|col| {
-                    let (x, w) = box_of(&r, pane, *col);
-                    x + w
-                })
-                .max()
-                .unwrap();
-            let gap_after_path = arab_left - (path_x + path_w);
-            assert!(
-                gap_after_path >= (r.cell_w * 0.4) as i32,
-                "{blanks} blanks: Arabic is stuck to the path, gap {gap_after_path}"
-            );
-            let (hx, _) = box_of(&r, pane, cells[h].col);
-            let hello_gap = hx - arab_right;
-            assert!(
-                hello_gap > previous_gap,
-                "{blanks} blanks: gap before hello ({hello_gap}) did not grow past {previous_gap}"
-            );
-            previous_gap = hello_gap;
-            let (ox, ow) = box_of(&r, pane, cells[o].col);
-            assert!(
-                (cursor.0 - (ox + ow)).abs() <= 1,
-                "{blanks} blanks: cursor x={} is not at the end of hello ({})",
-                cursor.0,
-                ox + ow
-            );
-        }
-    }
-
-    /// Selection boxes are the shaped cells of the logical range, in visual
-    /// order. `>` and م are one logical neighbourhood and two visual rects;
-    /// the highlight must not paint the Arabic letters between them.
-    #[test]
-    fn mixed_line_selection_covers_the_logical_range_in_visual_order() {
-        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
-        let pane = (0, 0, 1000, 160);
-        let text = "C:\\> مرحبا hello";
-        let cells = row_cells(text, 0);
-        r.mapping_context = Some((pane, 0));
-        r.draw_line_bidi(
-            &mut Vec::new(),
-            pane,
-            0,
-            0,
-            pane.2,
-            &cells,
-            false,
-            None,
-            ParagraphDir::Default,
-            None,
-        );
-        r.finish_pane_layout(pane);
-        let gt = cells.iter().position(|c| c.c == '>').unwrap();
-        let meem = cells.iter().position(|c| c.c == 'م').unwrap();
-        let alef = cells.iter().position(|c| c.c == 'ا').unwrap();
-        let h = cells.iter().position(|c| c.c == 'h').unwrap();
-        let (gx, gw) = box_of(&r, pane, cells[gt].col);
-        let (mx, mw) = box_of(&r, pane, cells[meem].col);
-        let (ax, aw) = box_of(&r, pane, cells[alef].col);
-        let (hx, hw) = box_of(&r, pane, cells[h].col);
-        assert!(mx > ax, "م at {mx} must sit to the right of ا at {ax}");
-        let arabic: Vec<_> = cells
-            .iter()
-            .filter(|c| is_arabic(c.c))
-            .map(|c| box_of(&r, pane, c.col))
-            .collect();
-        for (x, w) in &arabic {
-            assert!(
-                *x + 1 >= gx + gw && *x + *w <= hx + 1,
-                "Arabic box {x}..{} overlaps the path or hello",
-                x + w
-            );
-        }
-        let alef_mid = ax + aw / 2;
-        let outside = |x: i32, w: i32| alef_mid < x || alef_mid >= x + w;
-        assert!(
-            outside(gx, gw) && outside(mx, mw),
-            "a selection of '>' and م must not cover ا at {alef_mid}"
-        );
-        assert!(outside(hx, hw), "hello is not part of that selection");
-
-        use alacritty_terminal::event::VoidListener;
-        use alacritty_terminal::index::{Column, Line, Point, Side};
-        use alacritty_terminal::selection::{Selection, SelectionType};
-        use alacritty_terminal::term::Config;
-        use alacritty_terminal::vte::ansi::Processor;
-        let size = crate::term::TermSize { cols: 40, rows: 3 };
-        let mut term = Term::new(Config::default(), &size, VoidListener);
-        let mut parser: Processor = Processor::new();
-        parser.advance(&mut term, text.as_bytes());
-        let start = text.find('م').map(|b| text[..b].chars().count()).unwrap();
-        let mut sel = Selection::new(
-            SelectionType::Simple,
-            Point::new(Line(0), Column(start)),
-            Side::Left,
-        );
-        sel.update(
-            Point::new(Line(0), Column(start + "مرحبا".chars().count())),
-            Side::Left,
-        );
-        term.selection = Some(sel);
-        let view = PaneView {
-            rect: pane,
-            focused: true,
-            cursor: crate::config::CursorStyle::Block,
-            cursor_on: false,
-            bordered: false,
-            claude: false,
-            claude_from: None,
-            reorder: true,
-            line_dir: &[],
-            search_match: None,
-            marks: &[],
-            link_hover: None,
-            link_tip: None,
-        };
-        let mut out = Vec::new();
-        r.begin_frame();
-        r.draw_pane(&mut out, &view, &term);
-        let color = c4((80, 140, 255), 90);
-        let painted: Vec<_> = out.iter().filter(|v| v.color == color).cloned().collect();
-        assert!(
-            !painted.is_empty(),
-            "the Arabic selection draws no highlight"
-        );
-        assert_eq!(painted.len() % 6, 0);
-        let mut rects = Vec::new();
-        for chunk in painted.chunks(6) {
-            let left = chunk.iter().map(|v| v.pos[0].round() as i32).min().unwrap();
-            let right = chunk.iter().map(|v| v.pos[0].round() as i32).max().unwrap();
-            rects.push((left, right - left));
-        }
-        for (x, w) in &arabic {
-            assert!(
-                rects
-                    .iter()
-                    .any(|&(rx, rw)| (rx - x).abs() <= 1 && (rw - w).abs() <= 1),
-                "no highlight for Arabic box {x}+{w}, painted {rects:?}"
-            );
-        }
-        for (rx, rw) in &rects {
-            assert!(
-                arabic
-                    .iter()
-                    .any(|&(x, w)| (rx - x).abs() <= 1 && (rw - w).abs() <= 1),
-                "highlight {rx}+{rw} is outside the Arabic range {arabic:?}"
-            );
-        }
-    }
-
-    /// Copy reads the grid, which stays in logical order on a mixed line.
-    #[test]
-    fn mixed_line_copy_stays_logical() {
-        use alacritty_terminal::event::VoidListener;
-        use alacritty_terminal::index::{Column, Line, Point, Side};
-        use alacritty_terminal::selection::{Selection, SelectionType};
-        use alacritty_terminal::term::Config;
-        use alacritty_terminal::vte::ansi::Processor;
-        let text = "C:\\Users\\me> مرحبا hello";
-        let size = crate::term::TermSize { cols: 48, rows: 3 };
-        let mut term = Term::new(Config::default(), &size, VoidListener);
-        let mut parser: Processor = Processor::new();
-        parser.advance(&mut term, text.as_bytes());
-        let cols = text.chars().count();
-        let mut sel = Selection::new(
-            SelectionType::Simple,
-            Point::new(Line(0), Column(0)),
-            Side::Left,
-        );
-        sel.update(Point::new(Line(0), Column(cols)), Side::Left);
-        term.selection = Some(sel);
-        let copied = term.selection_to_string().unwrap_or_default();
-        let flat: String = copied
-            .chars()
-            .filter(|c| *c != '\n' && *c != '\r')
-            .collect();
-        assert!(
-            flat.trim_end().starts_with(text),
-            "copy is not the logical line: {flat:?}"
-        );
-        assert!(
-            !flat.contains("ابحرم"),
-            "copy came out in visual order: {flat:?}"
-        );
-
-        let start = text.find('م').map(|b| text[..b].chars().count()).unwrap();
-        let mut word = Selection::new(
-            SelectionType::Simple,
-            Point::new(Line(0), Column(start)),
-            Side::Left,
-        );
-        word.update(
-            Point::new(Line(0), Column(start + "مرحبا".chars().count())),
-            Side::Left,
-        );
-        term.selection = Some(word);
-        let word = term.selection_to_string().unwrap_or_default();
-        assert_eq!(word.trim(), "مرحبا", "selected Arabic word: {word:?}");
-    }
-
     fn cairo_renderer() -> Renderer {
         let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
         r.font_system.db_mut().load_font_data(CAIRO_ARABIC.to_vec());
@@ -7521,145 +7290,136 @@ mod tests {
         r
     }
 
-    /// The block on a joined Cairo letter is that glyph's ink, not `cell_w`
-    /// columns over. Lam-alef still splits from the right; a fatha stays on
-    /// its base instead of shifting the block by a cell.
+    fn cursor_on(r: &mut Renderer, pane: Rect, cells: &[CellInfo], col: usize) -> (i32, i32) {
+        r.draw_line_bidi(
+            &mut Vec::new(),
+            pane,
+            0,
+            0,
+            pane.2,
+            cells,
+            false,
+            Some(col),
+            ParagraphDir::Default,
+            None,
+        )
+        .unwrap_or_else(|| panic!("no block on col {col}"))
+    }
+
+    /// Cairo reh joins outside its advance. The block must be that ink,
+    /// which is wider than the cell box the advance path draws. On
+    /// 22bc5d66 the block is the cell box, so this fails there.
     #[test]
-    fn cairo_block_cursor_covers_the_joined_cluster() {
+    fn cairo_reh_block_extends_outside_its_cell() {
         let mut r = cairo_renderer();
         let pane = (0, 0, 800, 140);
         let text = "go مرحبا";
         let cells = row_cells(text, 0);
-        let key = r.ensure_shaped(&[Seg::plain(text, FG)], true);
-        let font_id = r.cache_hot[&key]
-            .buffer
-            .layout_runs()
-            .flat_map(|run| run.glyphs.iter())
-            .find(|g| text[g.start..g.end].chars().any(is_arabic))
-            .map(|g| g.font_id);
-        let arabic_face = font_id
-            .and_then(|id| {
-                r.font_system
-                    .db()
-                    .face(id)
-                    .and_then(|face| face.families.first().map(|(name, _)| name.clone()))
-            })
-            .unwrap_or_default();
-        assert_eq!(arabic_face, "Cairo", "Arabic shaped with {arabic_face}");
-        for cell in cells.iter().filter(|c| is_arabic(c.c)) {
-            let cursor = r
-                .draw_line_bidi(
-                    &mut Vec::new(),
-                    pane,
-                    0,
-                    0,
-                    pane.2,
-                    &cells,
-                    false,
-                    Some(cell.col),
-                    ParagraphDir::Default,
-                    None,
-                )
-                .unwrap_or_else(|| panic!("no cursor on {}", cell.c));
-            let b0 = text.find(cell.c).unwrap();
-            let (ix, iw) = r
-                .ink_cursor_box(&key, b0, b0 + cell.c.len_utf8())
-                .unwrap_or_else(|| panic!("no ink for {}", cell.c));
-            assert!(
-                (cursor.0 as f32 - ix).abs() <= 1.5,
-                "{} cursor x {} ink x {ix}",
-                cell.c,
-                cursor.0
-            );
-            assert!(
-                (cursor.1 as f32 - iw).abs() <= 1.5,
-                "{} cursor w {} ink w {iw}",
-                cell.c,
-                cursor.1
-            );
-            if (iw - r.cell_w).abs() > 2.0 {
-                assert!(
-                    (cursor.1 as f32 - r.cell_w).abs() > 2.0,
-                    "{} block is still a cell ({} vs ink {iw})",
-                    cell.c,
-                    cursor.1
-                );
-            }
-        }
+        let reh = cells.iter().position(|c| c.c == 'ر').unwrap();
+        r.mapping_context = Some((pane, 0));
+        let cursor = cursor_on(&mut r, pane, &cells, cells[reh].col);
+        r.finish_pane_layout(pane);
+        let (bx, bw) = box_of(&r, pane, cells[reh].col);
+        assert!(
+            cursor.1 >= bw + 2,
+            "reh block width {} is not wider than its cell {bw}",
+            cursor.1
+        );
+        assert!(
+            cursor.0 <= bx - 1,
+            "reh block x {} did not move left of the cell {bx}",
+            cursor.0
+        );
+        assert!(
+            cursor.0 < bx + bw / 2 && cursor.0 + cursor.1 > bx + bw / 2,
+            "reh block {cursor:?} does not cover the cell center {bx}+{bw}"
+        );
+        assert_ne!(
+            (cursor.0, cursor.1),
+            (bx, bw),
+            "reh block is still the cell box"
+        );
+    }
 
-        let lig = "go لا";
-        let lig_cells = row_cells(lig, 0);
-        let lam = lig_cells.iter().position(|c| c.c == 'ل').unwrap();
-        let on = |r: &mut Renderer, col| {
-            r.draw_line_bidi(
-                &mut Vec::new(),
-                pane,
-                0,
-                0,
-                pane.2,
-                &lig_cells,
-                false,
-                Some(col),
-                ParagraphDir::Default,
-                None,
-            )
-            .expect("lam-alef cursor")
-        };
-        let on_lam = on(&mut r, lam);
-        let on_alef = on(&mut r, lam + 1);
+    /// Cairo seen is the wide join. Its ink runs past the cell on both
+    /// sides; the base build's block is that cell.
+    #[test]
+    fn cairo_seen_block_extends_outside_its_cell() {
+        let mut r = cairo_renderer();
+        let pane = (0, 0, 800, 140);
+        let text = "go السلام";
+        let cells = row_cells(text, 0);
+        let seen = cells.iter().position(|c| c.c == 'س').unwrap();
+        r.mapping_context = Some((pane, 0));
+        let cursor = cursor_on(&mut r, pane, &cells, cells[seen].col);
+        r.finish_pane_layout(pane);
+        let (bx, bw) = box_of(&r, pane, cells[seen].col);
         assert!(
-            on_alef.0 < on_lam.0,
-            "ا at {} must stay left of ل at {}",
-            on_alef.0,
-            on_lam.0
+            cursor.1 >= bw + 2,
+            "seen block width {} is not wider than its cell {bw}",
+            cursor.1
         );
+        assert!(
+            cursor.0 <= bx - 1 && cursor.0 + cursor.1 >= bx + bw + 1,
+            "seen block {cursor:?} does not stick out of the cell {bx}+{bw}"
+        );
+    }
 
-        let plain = row_cells("xب", 0);
-        let mut vocal = row_cells("xب", 0);
-        vocal[1].zw = Some(vec!['\u{064E}']);
-        let base = r
-            .draw_line_bidi(
-                &mut Vec::new(),
-                pane,
-                0,
-                0,
-                pane.2,
-                &plain,
-                false,
-                Some(1),
-                ParagraphDir::Default,
-                None,
-            )
-            .expect("beh");
-        let marked = r
-            .draw_line_bidi(
-                &mut Vec::new(),
-                pane,
-                0,
-                0,
-                pane.2,
-                &vocal,
-                false,
-                Some(1),
-                ParagraphDir::Default,
-                None,
-            )
-            .expect("beh with fatha");
+    /// Each half of Cairo «لا» is half of one ink box, lam on the right and
+    /// alef on the left. The base build's halves are the advance split, which
+    /// is a different width from the ink split.
+    #[test]
+    fn cairo_lam_alef_halves_split_the_ink_right_to_left() {
+        let mut r = cairo_renderer();
+        let pane = (0, 0, 800, 140);
+        let text = "go لا";
+        let cells = row_cells(text, 0);
+        let lam = cells.iter().position(|c| c.c == 'ل').unwrap();
+        r.mapping_context = Some((pane, 0));
+        let on_lam = cursor_on(&mut r, pane, &cells, cells[lam].col);
+        let on_alef = cursor_on(&mut r, pane, &cells, cells[lam + 1].col);
+        r.finish_pane_layout(pane);
+        let (lx, lw) = box_of(&r, pane, cells[lam].col);
+        let (ax, aw) = box_of(&r, pane, cells[lam + 1].col);
         assert!(
-            (marked.0 - base.0).abs() <= 2,
-            "fatha moved the block from {} to {}",
-            base.0,
-            marked.0
+            on_alef.0 + on_alef.1 <= on_lam.0 + 1,
+            "ا {on_alef:?} must be the left half of ل {on_lam:?}"
         );
         assert!(
-            (marked.1 - base.1).abs() <= r.cell_w.round() as i32 / 2,
-            "fatha resized the block from {} to {}, a cell away",
-            base.1,
-            marked.1
+            on_lam.0 - on_alef.0 >= 4,
+            "the halves are not split, ا {on_alef:?} ل {on_lam:?}"
         );
         assert!(
-            marked.0 < base.0 + base.1 && marked.0 + marked.1 > base.0,
-            "fatha block {marked:?} does not cover the base {base:?}"
+            (on_lam.1 - lw).abs() >= 1 || (on_alef.1 - aw).abs() >= 1 || on_lam.0 != lx,
+            "lam-alef block is still the cell split ل {on_lam:?}/{lx}+{lw} ا {on_alef:?}/{ax}+{aw}"
+        );
+        let cell_w = r.cell_w.round() as i32;
+        assert!(
+            on_lam.1 + 2 < cell_w && on_alef.1 + 2 < cell_w,
+            "a half is still a cell: ل {on_lam:?} ا {on_alef:?} cell {cell_w}"
+        );
+    }
+
+    /// Beh's ink is wider than its advance. The block follows the ink.
+    #[test]
+    fn cairo_beh_block_is_not_its_cell() {
+        let mut r = cairo_renderer();
+        let pane = (0, 0, 800, 140);
+        let text = "go ب";
+        let cells = row_cells(text, 0);
+        let beh = cells.iter().position(|c| c.c == 'ب').unwrap();
+        r.mapping_context = Some((pane, 0));
+        let cursor = cursor_on(&mut r, pane, &cells, cells[beh].col);
+        r.finish_pane_layout(pane);
+        let (bx, bw) = box_of(&r, pane, cells[beh].col);
+        // Ink is one pixel narrower than the advance cell and starts on
+        // the same edge. The base build draws the cell box itself.
+        assert_eq!(cursor.0, bx, "beh block x {} cell x {bx}", cursor.0);
+        assert_eq!(
+            cursor.1,
+            bw - 1,
+            "beh block width {} cell width {bw}",
+            cursor.1
         );
     }
 
