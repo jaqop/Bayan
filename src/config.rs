@@ -89,9 +89,26 @@ pub struct UserConfig {
     /// Padding in px between the window edges and the terminal content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub padding: Option<u32>,
-    /// Plugin file-stems to skip loading.
+    /// Plugin file-stems to skip loading. This is the declarative JSON
+    /// host. Executable Lua plugins are not controlled by this list.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_plugins: Option<Vec<String>>,
+    /// SHA-256 (hex, lowercase) of Lua files the confirm card has approved.
+    /// `config.lua` and an executable plugin run only when the hash of their
+    /// current bytes is here. A changed file is a different hash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lua_approvals: Vec<String>,
+    /// Executable Lua plugins that may run, by file stem. Empty means none
+    /// run, even if `lua_plugins_dir` contains scripts. `spawn` is a separate
+    /// opt-in and defaults off. `config.lua` cannot grant these: the loader
+    /// keeps the values from config.json.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lua_plugins: Vec<LuaPluginAllow>,
+    /// Directory executable Lua plugins are read from. Absolute, or relative
+    /// to the directory that holds config.json. Absent means no executable
+    /// plugin is loaded — there is no default directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lua_plugins_dir: Option<String>,
     /// Native toast when a long command finishes while Bayan is unfocused
     /// (default on). Windows quiet hours are respected regardless.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -173,6 +190,17 @@ impl KeyboardConfig {
     fn is_default(&self) -> bool {
         *self == Self::default()
     }
+}
+
+/// One executable Lua plugin named in `lua_plugins`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LuaPluginAllow {
+    /// File stem of `<name>.lua` inside [`UserConfig::lua_plugins_dir`].
+    pub name: String,
+    /// When true, that plugin's Lua state is given `bayan.spawn`. Off unless
+    /// the key is exactly `true`. `config.lua` never receives `spawn`.
+    #[serde(default)]
+    pub spawn: bool,
 }
 
 impl Default for KeyboardConfig {

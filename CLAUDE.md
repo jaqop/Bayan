@@ -34,6 +34,7 @@ selection and BiDi paths must do.
 | `shells.rs` | installed-shell detection (ported from EasyTer's `profiles.py`) |
 | `posh.rs` | oh-my-posh theme picker with a live ANSI preview |
 | `plugins.rs` | declarative JSON plugin host (`~/.bayan/plugins/`) |
+| `lua_host.rs` | sandboxed `config.lua` and allowlisted executable plugins |
 | `config.rs` | `~/.bayan/config.json`, optional and BOM-tolerant |
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |

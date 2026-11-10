@@ -909,6 +909,50 @@ only (there is no settings-panel row). Leave it out or set `"off"`.
 focused pane; no value enables a clipboard read. The decode backstop is
 64 KiB, and one scan sees about 48–51 KiB.
 
+## Lua config and executable plugins
+
+`~/.bayan/config.lua`, next to `config.json`, is optional. Bayan runs it
+only after the confirm card has approved that file's SHA-256. The script
+receives the JSON config as the global `config` and may change it or
+return a table; either way the result is merged over the JSON. On a
+syntax or runtime error Bayan logs `~/.bayan/lua.log`, shows the message,
+and keeps the JSON. The three keys `lua_approvals`, `lua_plugins`, and
+`lua_plugins_dir` stay as they are in config.json.
+
+Executable plugins are `<name>.lua` files in the directory
+`lua_plugins_dir` names (absolute, or relative to the config directory).
+Nothing in that directory runs until `lua_plugins` lists the stem, and
+each file still needs its own hash on the confirm card. A changed file
+is a new hash. There is no default directory and no default allowlist.
+
+```json
+{
+  "lua_plugins_dir": "plugins",
+  "lua_plugins": [ { "name": "hello", "spawn": false } ]
+}
+```
+
+The plugin API is `bayan.bind(chord, fn)`, `bayan.on(event, fn)`, and
+`bayan.send(text)`. `bayan.spawn(program, args)` exists only when that
+entry's `spawn` is true, and `config.lua` never has it. `send` waits on
+the same confirm card as a JSON plugin action. Events are `tab-opened`,
+`title-changed`, `bell`, and `osc7-cwd`. Opening a tab dispatches
+`tab-opened`. Bytes from the pane — escape sequences, OSC, hyperlinks,
+bells, program output — do not enter Lua.
+
+The sandbox is Lua 5.4 via mlua, with `string`, `table`, `math`, and
+`utf8` only. `io`, `os`, `debug`, and `package` are absent. `require`,
+`loadfile`, `dofile`, and `string.dump` are removed, and `load` accepts
+text chunks only. A memory cap and an instruction hook with a deadline
+cut off a loop that would otherwise hang the window. Strings are UTF-8;
+Arabic round-trips.
+
+An elevated token does not run any of it. That is `--elevated` after the
+UAC prompt and Explorer's Run as administrator: the process token, not a
+flag Bayan has to be the one to set. `config.lua`, executable plugins, and
+the declarative JSON plugins are left unread. The window keeps the plain
+JSON settings and shows «سكربتات لوا والإضافات متوقفة لأن النافذة تعمل كمسؤول.»
+
 ## BiDi controls and the current directory
 
 Two escape sequences from ECMA-48 / the terminal-wg "BiDi in Terminal

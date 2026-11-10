@@ -331,7 +331,7 @@ impl App {
             KeyOwner::PasteGuard => {
                 match enter_or_escape(&event.logical_key) {
                     Some(true) => self.confirm_pending(),
-                    Some(false) => self.pending_paste = None,
+                    Some(false) => self.dismiss_paste_card(),
                     None => {}
                 }
                 self.request_redraw();
@@ -471,6 +471,14 @@ impl App {
         let alt_screen = self.term_mode().contains(TermMode::ALT_SCREEN);
         let Some(action) = keybinds::resolve(&self.keymap, chord, alt_screen, self.has_selection())
         else {
+            // A plain Ctrl+letter on the alt screen belongs to the TUI, the
+            // same rule as the built-in map. Any other chord may be a Lua
+            // plugin binding. The binding's send still waits on the card.
+            if !(alt_screen && chord.is_plain_ctrl_letter())
+                && self.fire_lua_chord(&chord.to_config())
+            {
+                return true;
+            }
             return false;
         };
         if is_plain_ctrl_c_copy(action, chord) {

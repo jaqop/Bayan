@@ -1649,6 +1649,9 @@ fn process_bytes<T: EventListener>(
 ///
 /// `merge_chunk` joins those `Bytes` items and extends `pty_replies`, so a
 /// kitty `CSI ? u` answer is kept when the filter splits the read.
+///
+/// This is the PTY intake. It does not call into Lua: escape sequences,
+/// OSC, hyperlinks, bells, and program text stay terminal data.
 pub(crate) fn process_chunk<T: EventListener>(
     parser: &mut Processor,
     t: &mut Term<T>,

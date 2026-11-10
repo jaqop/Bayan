@@ -23,6 +23,7 @@ mod lang;
 mod layout;
 mod link;
 mod localpath;
+mod lua_host;
 mod mouse;
 mod mru;
 mod osc7;
@@ -435,6 +436,9 @@ enum PendingKind {
     /// A plugin action's command (BAYAN-007): the focused pane only,
     /// unbracketed, so a trailing CR still runs it.
     Command,
+    /// config.lua or an executable plugin, approved by content hash.
+    /// Enter does not type the source into the shell.
+    ApproveLua,
 }
 
 /// Text held for the confirm card: the bytes to send, and why the card is up.
@@ -448,6 +452,8 @@ struct PendingPaste {
     lines: usize,
     chars: usize,
     reason: String,
+    /// Set when Enter approves a Lua file instead of typing `text`.
+    lua: Option<lua_host::PendingScript>,
 }
 
 /// One terminal pane (a tab holds one or more).
@@ -1187,7 +1193,9 @@ const CARD_ROW_CHARS: usize = 56;
 /// rows, with CR as ␍. The 512-char cap stays within ten rows because
 /// plugin load rejects every character this preview would expand.
 fn card_preview(kind: PendingKind, text: &str) -> Vec<String> {
-    if kind != PendingKind::Command {
+    // A plugin command and a Lua file show every character the card is
+    // holding (R-03). A paste stays one elided row.
+    if !matches!(kind, PendingKind::Command | PendingKind::ApproveLua) {
         return vec![term::paste_preview(text, 48)];
     }
     let full = term::paste_preview(text, usize::MAX);
@@ -1239,6 +1247,7 @@ fn plugin_pending(label: &str, send: &str, pane: Option<u64>) -> PendingPaste {
             "{} — {label}",
             tr("إضافة تريد كتابة نص", "A plugin wants to type text")
         ),
+        lua: None,
     }
 }
 
@@ -1472,6 +1481,18 @@ struct App {
     config: config::UserConfig,
     config_load_error: Option<String>,
     startup_error: Option<String>,
+    /// Executable Lua plugins that passed the allowlist and the hash approval.
+    lua_plugins: lua_host::PluginSet,
+    /// config.lua and plugins the confirm card has not approved yet.
+    lua_pending: Vec<lua_host::PendingScript>,
+    /// Hashes dismissed this session, so a reload does not raise them again.
+    lua_skipped: Vec<String>,
+    /// Text a Lua callback wants typed. Shown on the plugin confirm card.
+    lua_send_queue: std::collections::VecDeque<lua_host::PluginSend>,
+    /// Lua failures to show once the window exists. Never fatal.
+    lua_errors: Vec<String>,
+    /// Set when the token is elevated and scripts were left unloaded.
+    lua_notice: Option<String>,
     /// every rebindable action's effective chord (defaults + config)
     keymap: Vec<(keybinds::Action, keybinds::Chord)>,
     /// the shortcuts editor overlay, when open
@@ -2114,6 +2135,7 @@ impl App {
                         "Insert a command from the palette",
                     )
                     .into(),
+                    lua: None,
                 });
             }
             PaletteRow::Plugin(i) => {
@@ -2745,6 +2767,9 @@ impl App {
             self.enter_tab();
             self.relayout_active();
             self.sync_focus(None);
+            let index = self.active.to_string();
+            // A tab the user opened, not bytes from the pane.
+            self.emit_lua_event("tab-opened", &[("index", &index)]);
         }
     }
 
@@ -4284,6 +4309,7 @@ impl App {
             match kind {
                 PendingKind::Paste => self.send_paste(&txt),
                 PendingKind::Drop | PendingKind::Command => self.send_focused(kind, &txt),
+                PendingKind::ApproveLua => {}
             }
             return;
         };
@@ -4300,6 +4326,7 @@ impl App {
             lines,
             chars,
             reason,
+            lua: None,
         });
         self.request_redraw();
     }
@@ -4310,6 +4337,12 @@ impl App {
         let Some(p) = self.pending_paste.take() else {
             return;
         };
+        if p.kind == PendingKind::ApproveLua {
+            self.approve_lua(p);
+            self.after_confirm_card();
+            self.request_redraw();
+            return;
+        }
         if !card_still_targets(p.pane, self.focused_pane_id()) {
             self.request_redraw();
             return;
@@ -4317,8 +4350,151 @@ impl App {
         match p.kind {
             PendingKind::Paste => self.send_paste(&p.text),
             PendingKind::Drop | PendingKind::Command => self.send_focused(p.kind, &p.text),
+            PendingKind::ApproveLua => {}
+        }
+        self.after_confirm_card();
+        self.request_redraw();
+    }
+
+    /// Esc on the confirm card. A Lua file that was refused stays unapproved
+    /// for this session; the next waiting file is raised.
+    pub(crate) fn dismiss_paste_card(&mut self) {
+        if let Some(hash) = self
+            .pending_paste
+            .as_ref()
+            .and_then(|p| p.lua.as_ref())
+            .map(|s| s.hash.clone())
+        {
+            self.lua_skipped.push(hash);
+        }
+        self.pending_paste = None;
+        self.after_confirm_card();
+        self.request_redraw();
+    }
+
+    fn after_confirm_card(&mut self) {
+        if self.pending_paste.is_some() {
+            return;
+        }
+        self.show_next_lua_card();
+        if self.pending_paste.is_none() {
+            self.pump_lua_sends();
+        }
+    }
+
+    fn show_next_lua_card(&mut self) {
+        if self.pending_paste.is_some() {
+            return;
+        }
+        let skipped = self.lua_skipped.clone();
+        let Some(index) = self
+            .lua_pending
+            .iter()
+            .position(|p| !skipped.iter().any(|h| h == &p.hash))
+        else {
+            return;
+        };
+        let script = self.lua_pending.remove(index);
+        self.raise_lua_card(script);
+    }
+
+    fn raise_lua_card(&mut self, script: lua_host::PendingScript) {
+        let reason = script.reason();
+        let text = script.preview.clone();
+        let lines = text.lines().count().max(1);
+        let chars = text.chars().count();
+        self.pending_paste = Some(PendingPaste {
+            kind: PendingKind::ApproveLua,
+            pane: None,
+            text,
+            lines,
+            chars,
+            reason,
+            lua: Some(script),
+        });
+    }
+
+    fn approve_lua(&mut self, card: PendingPaste) {
+        let Some(script) = card.lua else {
+            return;
+        };
+        match lua_host::unchanged(&script) {
+            Ok(()) => {
+                lua_host::grant(&mut self.config, &script.hash);
+                self.save_config();
+                let outcome = lua_host::reload(&self.config, &config::bayan_dir());
+                self.apply_lua_outcome(outcome);
+            }
+            Err(err) => {
+                self.report_error(
+                    tr("تعذر اعتماد السكربت", "Could not approve the script"),
+                    &err,
+                );
+                let outcome = lua_host::reload(&self.config, &config::bayan_dir());
+                self.apply_lua_outcome(outcome);
+            }
+        }
+    }
+
+    fn apply_lua_outcome(&mut self, outcome: lua_host::Outcome) {
+        self.config = outcome.config;
+        self.keymap = keybinds::effective_map(&self.config);
+        lang::set(self.config.lang());
+        self.lua_plugins = outcome.plugins;
+        self.lua_pending = outcome.pending;
+        self.lua_errors = outcome.errors;
+        self.lua_notice = outcome.notice;
+        if self.renderer.is_some() && !self.renderer_building {
+            self.rebuild_renderer();
+        }
+        self.apply_opacity();
+        self.report_lua_errors();
+    }
+
+    fn report_lua_errors(&mut self) {
+        if let Some(notice) = self.lua_notice.take() {
+            self.report_error(tr("مسؤول", "Administrator"), &notice);
+        }
+        if self.lua_errors.is_empty() {
+            return;
+        }
+        let detail = self.lua_errors.join("\n");
+        self.lua_errors.clear();
+        self.report_error(tr("تعذر تشغيل لوا", "Lua did not run"), &detail);
+    }
+
+    fn fire_lua_chord(&mut self, chord: &str) -> bool {
+        if !self.lua_plugins.has_binding(chord) {
+            return false;
+        }
+        let sends = self.lua_plugins.fire(chord);
+        self.lua_send_queue.extend(sends);
+        if self.pending_paste.is_none() {
+            self.pump_lua_sends();
         }
         self.request_redraw();
+        true
+    }
+
+    fn pump_lua_sends(&mut self) {
+        if self.pending_paste.is_some() {
+            return;
+        }
+        if let Some(send) = self.lua_send_queue.pop_front() {
+            let pane = self.focused_pane_id();
+            self.pending_paste = Some(plugin_pending(&send.plugin, &send.text, pane));
+        }
+    }
+
+    fn emit_lua_event(&mut self, event: &str, fields: &[(&str, &str)]) {
+        let sends = self.lua_plugins.emit(event, fields);
+        if sends.is_empty() {
+            return;
+        }
+        self.lua_send_queue.extend(sends);
+        if self.pending_paste.is_none() {
+            self.pump_lua_sends();
+        }
     }
 
     /// A drop or a plugin command into the FOCUSED pane only. A drop keeps
@@ -4721,6 +4897,8 @@ impl App {
                 }
                 if let Some(p) = &self.pending_paste {
                     let preview = card_preview(p.kind, &p.text);
+                    let heading = (p.kind == PendingKind::ApproveLua)
+                        .then(|| tr("تشغيل سكربت لوا؟", "Run this Lua script?"));
                     renderer.draw_paste_guard(
                         &mut verts,
                         px.width as usize,
@@ -4730,6 +4908,7 @@ impl App {
                             chars: p.chars,
                             reason: &p.reason,
                             preview: &preview,
+                            heading,
                         },
                     );
                 }
@@ -4957,6 +5136,8 @@ impl ApplicationHandler<UserEvent> for App {
         self.gpu = Some(gpu);
         self.window = Some(window.clone());
         self.report_config_load_error();
+        self.report_lua_errors();
+        self.show_next_lua_card();
         self.apply_opacity(); // the configured window alpha, from frame one
         self.apply_window_frame();
         if let Some(h) = self.hwnd() {
@@ -5500,6 +5681,22 @@ fn run() -> Result<(), String> {
         Ok(cfg) => (cfg, None),
         Err(error) => (config::UserConfig::default(), Some(error.to_string())),
     };
+    // config.lua merges over JSON only when its bytes are already approved
+    // and the token is not elevated. An elevated token (UAC or Explorer's
+    // Run as administrator) keeps the JSON and runs no script and no plugin.
+    let elevated = lua_host::is_elevated();
+    let lua = lua_host::load_with(&cfg, &config::bayan_dir(), elevated);
+    for err in &lua.errors {
+        eprintln!("bayan: {err}");
+    }
+    if let Some(notice) = &lua.notice {
+        eprintln!("bayan: {notice}");
+    }
+    let lua_pending = lua.pending;
+    let lua_plugins = lua.plugins;
+    let lua_errors = lua.errors;
+    let lua_notice = lua.notice;
+    cfg = lua.config;
     // debug hook: BAYAN_ARABIC_FONT=<family> draws terminal Arabic in that
     // font for this run only (config.json is not written unless a setting
     // is changed in the panel), so the setting is screenshot-verifiable
@@ -5507,14 +5704,17 @@ fn run() -> Result<(), String> {
         cfg.arabic_font = v.to_str().map(str::to_string);
     }
     // plugins load once, before the first renderer, so a plugin theme named in
-    // the config resolves on the very first frame
-    let plug = plugins::init(&cfg.disabled_plugins());
-    if !plug.failed.is_empty() {
-        eprintln!(
-            "bayan: {} plugin(s) failed — see {}",
-            plug.failed.len(),
-            config::bayan_dir().join("plugins.log").display()
-        );
+    // the config resolves on the very first frame. An elevated token skips
+    // the directory: JSON plugins are files the user can write.
+    if lua_host::scripts_enabled(elevated) {
+        let plug = plugins::init(&cfg.disabled_plugins());
+        if !plug.failed.is_empty() {
+            eprintln!(
+                "bayan: {} plugin(s) failed — see {}",
+                plug.failed.len(),
+                config::bayan_dir().join("plugins.log").display()
+            );
+        }
     }
     lang::set(cfg.lang());
     // debug hook: BAYAN_LANG=en starts in English without touching
@@ -5576,6 +5776,12 @@ fn run() -> Result<(), String> {
         config: cfg,
         config_load_error,
         startup_error: None,
+        lua_plugins,
+        lua_pending,
+        lua_skipped: Vec::new(),
+        lua_send_queue: std::collections::VecDeque::new(),
+        lua_errors,
+        lua_notice,
         keymap,
         shortcuts: None,
         atlas_generation: 0,
@@ -5669,6 +5875,7 @@ mod tests {
                 lines: 1,
                 chars: 8,
                 reason: "test".into(),
+                lua: None,
             })
         };
         let mut pending = card(Some(7));
