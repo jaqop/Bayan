@@ -220,6 +220,36 @@ impl StreamFilter {
             return vec![StreamItem::Bytes(input.to_vec())];
         }
         let mut items = Vec::new();
+        let mut out = Vec::with_capacity(input.len());
+        let mut i = 0;
+        while i < input.len() {
+            if self.phase == Phase::Ground {
+                // In Ground only ESC changes state; `step` would push every
+                // other byte to `out` one at a time.
+                let run = input[i..]
+                    .iter()
+                    .position(|&b| b == 0x1b)
+                    .unwrap_or(input.len() - i);
+                out.extend_from_slice(&input[i..i + run]);
+                i += run;
+                if i == input.len() {
+                    break;
+                }
+            }
+            self.step(input[i], &mut items, &mut out);
+            i += 1;
+        }
+        if !out.is_empty() {
+            items.push(StreamItem::Bytes(out));
+        }
+        items
+    }
+
+    /// The loop `pull` had before the Ground fast path: every byte through
+    /// `step`. Kept as the reference the fast path is tested against.
+    #[cfg(test)]
+    fn pull_bytewise(&mut self, input: &[u8]) -> Vec<StreamItem> {
+        let mut items = Vec::new();
         let mut out = Vec::new();
         for &b in input {
             self.step(b, &mut items, &mut out);
@@ -388,6 +418,20 @@ impl StreamFilter {
     fn finish_csi(&mut self, final_byte: u8, items: &mut Vec<StreamItem>, out: &mut Vec<u8>) {
         let raw = std::mem::take(&mut self.held);
         self.phase = Phase::Ground;
+        self.dispatch_csi(&raw, final_byte, items, out);
+        // The buffer goes back: one allocation for the filter's life rather
+        // than one per CSI, which SGR-heavy output pays dozens of times a line.
+        self.held = raw;
+        self.held.clear();
+    }
+
+    fn dispatch_csi(
+        &mut self,
+        raw: &[u8],
+        final_byte: u8,
+        items: &mut Vec<StreamItem>,
+        out: &mut Vec<u8>,
+    ) {
         // raw = ESC [ body final
         let body = &raw[2..raw.len() - 1];
         let inter_at = body
@@ -434,12 +478,12 @@ impl StreamFilter {
                 // A numeric parameter we don't know: still SCP-shaped, so it
                 // must not fall through into the grid as text. Direction stays.
                 None if scp_params_are_numeric(params) => self.seal_osc(out),
-                None => self.emit_raw(&raw, out),
+                None => self.emit_raw(raw, out),
             }
             return;
         }
 
-        self.emit_raw(&raw, out);
+        self.emit_raw(raw, out);
     }
 }
 
@@ -1054,5 +1098,65 @@ mod tests {
         }
         assert!(saw_ris, "seeded streams contained no RIS");
         assert!(saw_alt, "seeded streams contained no alt-screen CSI");
+    }
+
+    /// The Ground fast path in `pull` emits exactly what the byte-at-a-time
+    /// loop did, read by read, for streams dense in our sequences, OSC
+    /// terminators, C0, a lone ESC and split reads.
+    #[test]
+    fn the_ground_fast_path_matches_the_bytewise_filter() {
+        let pieces: &[&[u8]] = &[
+            b"plain text ",
+            "مرحبا ".as_bytes(),
+            b"\x1b[8h",
+            b"\x1b[8l",
+            b"\x1b[2 k",
+            b"\x1b[1 k",
+            b"\x1b[ k",
+            b"\x1bc",
+            b"\x1b\x1bc",
+            b"\x1b[31m",
+            b"\x1b[?1049h",
+            b"\x1b]0;title\x07",
+            b"\x1b]8;;https://a\x1b\\",
+            b"\x1b]52;c;",
+            b"\x1b",
+            b"[",
+            b"]",
+            b"\x07",
+            b"\\",
+            b"\x18",
+            b"\x00",
+            b"\x9b",
+            b" ",
+        ];
+        let mut rng = 0x5EED_u64;
+        let mut next = move |n: usize| {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((rng >> 33) as usize) % n
+        };
+        let mut compared = 0;
+        for case in 0..400 {
+            let stream: Vec<u8> = (0..60)
+                .flat_map(|_| pieces[next(pieces.len())].iter().copied())
+                .collect();
+            let (mut fast, mut slow) = (StreamFilter::default(), StreamFilter::default());
+            let mut at = 0;
+            while at < stream.len() {
+                let end = (at + 1 + next(48)).min(stream.len());
+                let read = &stream[at..end];
+                assert_eq!(
+                    fast.pull(read),
+                    slow.pull_bytewise(read),
+                    "case {case}, read {at}..{end} of {stream:?}"
+                );
+                assert_eq!(fast.phase, slow.phase, "case {case}: phase after {end}");
+                compared += 1;
+                at = end;
+            }
+        }
+        assert!(compared > 1000, "only {compared} reads compared");
     }
 }

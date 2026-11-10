@@ -254,6 +254,7 @@ impl App {
     }
 
     fn key_pressed(&mut self, event: &KeyEvent, el: &ActiveEventLoop) {
+        let arrived = Instant::now();
         // Assume the press is swallowed until bytes actually go out. Every
         // early return above the write leaves the key here, so its release
         // stays out of the PTY too.
@@ -311,7 +312,7 @@ impl App {
                 return;
             }
         }
-        self.type_key(event);
+        self.type_key(event, arrived);
     }
 
     fn overlay_key(
@@ -553,7 +554,8 @@ impl App {
     /// encode_input (Arabic: Ctrl+C interrupts even though the C key's
     /// logical char is "ؤ"). A child that pushed kitty flags gets CSI u
     /// instead, from the same call.
-    fn type_key(&mut self, event: &KeyEvent) {
+    /// `arrived`: when winit delivered the key, for `BAYAN_PROFILE` latency.
+    fn type_key(&mut self, event: &KeyEvent, arrived: Instant) {
         let Some(bytes) = self.encode_key_event(event, false) else {
             return;
         };
@@ -590,6 +592,7 @@ impl App {
                 t.scroll_display(Scroll::Bottom);
             }
             s.write(&bytes);
+            crate::prof::key_sent(arrived);
         }
         self.invalidate_focused_links();
     }
