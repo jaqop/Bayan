@@ -1225,19 +1225,31 @@ fn merge_lam_alef(spans: Vec<crate::mouse::GlyphSpan>, text: &str) -> Vec<crate:
         let pair = spans.get(i + 1).and_then(|next| {
             let (a, b) = (&spans[i], next);
             let (first, second) = if a.start <= b.start { (a, b) } else { (b, a) };
-            let lam_then_alef = first.end == second.start
-                && without_trailing_marks(&text[first.start..first.end]).ends_with('ل')
-                && text[second.start..second.end]
+            let alef = |span: &crate::mouse::GlyphSpan| {
+                text[span.start..span.end]
                     .chars()
                     .find(|c| !crate::bidi::is_combining(*c))
-                    .is_some_and(is_alef);
-            lam_then_alef.then(|| {
+                    .is_some_and(is_alef)
+            };
+            // Adjacent: «لا» and «لَا», lam's cluster ends where alef's starts.
+            let adjacent = first.end == second.start
+                && without_trailing_marks(&text[first.start..first.end]).ends_with('ل')
+                && alef(second);
+            // Contained: Amiri «لاً». Tanween on the alef makes HarfBuzz give
+            // the lam bytes (3, 9) and the alef (5, 9), so the ranges share
+            // an end and the adjacent test rejects the pair. The alef block
+            // then overlaps the lam.
+            let contained = second.start > first.start
+                && second.end == first.end
+                && alef(second)
+                && is_lam_alef_cluster(&text[first.start..first.end]);
+            (adjacent || contained).then(|| {
                 let x = a.x.min(b.x);
                 crate::mouse::GlyphSpan {
                     x,
                     w: (a.x + a.w).max(b.x + b.w) - x,
                     start: first.start,
-                    end: second.end,
+                    end: first.end.max(second.end),
                     rtl: true,
                 }
             })
@@ -1258,6 +1270,14 @@ fn merge_lam_alef(spans: Vec<crate::mouse::GlyphSpan>, text: &str) -> Vec<crate:
         }
     }
     out
+}
+
+/// «لا» plus any marks on either letter, and nothing after the alef.
+/// «لاً» and «لَا» both match; a longer word does not.
+fn is_lam_alef_cluster(text: &str) -> bool {
+    let text = without_trailing_marks(text);
+    let mut bases = text.chars().filter(|c| !crate::bidi::is_combining(*c));
+    bases.next() == Some('ل') && bases.next().is_some_and(is_alef) && bases.next().is_none()
 }
 
 /// Drop tashkeel that sits on the last base, so «لَ» still reads as lam.
@@ -1742,6 +1762,20 @@ impl Seg {
 struct ShapedRun {
     buffer: Buffer,
     natw: f32,
+    /// Ink box per cell byte range. Filled for the cursor during a frame and
+    /// for the other cells on click. A new `RunKey` (the line changed) starts
+    /// empty, so a stale box cannot outlive the text it was measured on.
+    ink: std::collections::HashMap<(usize, usize), Option<(f32, f32)>>,
+}
+
+/// What a frame drew for one bidi row, so a later click can measure ink
+/// without shaping the line again. Not read by selection or search.
+#[derive(Clone)]
+struct RowShape {
+    key: RunKey,
+    cells: Vec<(usize, usize, usize)>,
+    text_x0: i32,
+    scale: f32,
 }
 
 /// Cache key: the exact rich-text content (text + color + style) + alignment.
@@ -1757,6 +1791,14 @@ const CACHE_CAP: usize = 4096;
 pub struct Renderer {
     cell_geometry: std::collections::HashMap<(Rect, usize, usize), CellGeometry>,
     row_hits: std::collections::HashMap<(Rect, usize), Vec<RowHit>>,
+    /// Ink union for clicks and the cursor block. Never copied into
+    /// `cell_geometry`: selection and search draw one rect per span there,
+    /// and a second box on an Arabic cell darkens it twice.
+    click_boxes: std::collections::HashMap<(Rect, usize, usize), (i32, i32, bool)>,
+    row_shape: std::collections::HashMap<(Rect, usize), RowShape>,
+    /// Cells whose ink was measured since `begin_frame`. A paint measures
+    /// the cursor cell only; the rest wait for a click.
+    ink_cells: u32,
     mapping_context: Option<(Rect, usize)>,
     /// which caption button the pointer is over (0..2) — hover feedback
     pub hover_caption: Option<usize>,
@@ -1924,6 +1966,9 @@ impl Renderer {
         Self {
             cell_geometry: std::collections::HashMap::new(),
             row_hits: std::collections::HashMap::new(),
+            click_boxes: std::collections::HashMap::new(),
+            row_shape: std::collections::HashMap::new(),
+            ink_cells: 0,
             mapping_context: None,
             hover_caption: None,
             hover_gear: false,
@@ -1997,6 +2042,9 @@ impl Renderer {
     pub fn begin_frame(&mut self) {
         self.cell_geometry.clear();
         self.row_hits.clear();
+        self.click_boxes.clear();
+        self.row_shape.clear();
+        self.ink_cells = 0;
         self.mapping_context = None;
         self.ime_spot = None;
     }
@@ -2050,12 +2098,39 @@ impl Renderer {
         x: f64,
     ) -> Option<(usize, alacritty_terminal::index::Side)> {
         use alacritty_terminal::index::Side;
-        let spans = self.row_hits.get(&(pane, row))?;
-        let &(left, width, col, rtl) = spans
-            .iter()
-            .take_while(|s| s.0 as f64 <= x)
-            .filter(|s| x < (s.0 + s.1) as f64)
-            .min_by_key(|s| (s.1, s.2))?;
+        let contains = |bx: i32, bw: i32| bx as f64 <= x && x < (bx + bw) as f64;
+        let advance_contains = |col: usize| {
+            self.cell_geometry
+                .get(&(pane, row, col))
+                .is_some_and(|spans| spans.iter().any(|&(bx, bw, _)| contains(bx, bw)))
+        };
+        // Ink that also covers its own cell wins over a neighbor's ink that
+        // merely reaches in («م» must not take the left of «ك»). Ink that
+        // sticks out of its cell is what a click there hits (reh's overhang).
+        let mut inks = Vec::new();
+        for (&(p, r, col), &(bx, bw, rtl)) in &self.click_boxes {
+            if p == pane && r == row && contains(bx, bw) {
+                inks.push((bx, bw, col, rtl));
+            }
+        }
+        let on_own_cell = inks.iter().copied().filter(|hit| advance_contains(hit.2));
+        let (left, width, col, rtl) =
+            if let Some(hit) = on_own_cell.min_by_key(|hit| (hit.1, hit.2)) {
+                hit
+            } else if let Some(hit) = inks.iter().copied().min_by_key(|hit| (hit.1, hit.2)) {
+                hit
+            } else if let Some(hit) = self.row_hits.get(&(pane, row)).and_then(|spans| {
+                spans
+                    .iter()
+                    .take_while(|s| s.0 as f64 <= x)
+                    .filter(|s| contains(s.0, s.1))
+                    .min_by_key(|s| (s.1, s.2))
+                    .copied()
+            }) {
+                hit
+            } else {
+                return None;
+            };
         let right_half = x >= left as f64 + width as f64 / 2.0;
         Some((
             col,
@@ -2228,8 +2303,14 @@ impl Renderer {
         if self.cache_hot.len() >= CACHE_CAP {
             self.cache_cold = std::mem::take(&mut self.cache_hot);
         }
-        self.cache_hot
-            .insert(key.clone(), ShapedRun { buffer, natw });
+        self.cache_hot.insert(
+            key.clone(),
+            ShapedRun {
+                buffer,
+                natw,
+                ink: std::collections::HashMap::new(),
+            },
+        );
         key
     }
 
@@ -2351,35 +2432,35 @@ impl Renderer {
         (fg, bg, style)
     }
 
-    /// One shaped line's ink, rasterized once, then a box per cell. The
-    /// click target and the block share these boxes.
-    fn ink_covers(
-        &mut self,
-        key: &RunKey,
-        cells: &[(usize, usize, usize)],
-    ) -> Vec<(usize, f32, f32)> {
+    /// Ink box of one cell. A cache hit does not rasterize. A miss rasterizes
+    /// only the glyphs that belong to this cell (both halves of «لا»), and
+    /// counts the cell in `ink_cells`.
+    fn ink_box(&mut self, key: &RunKey, b0: usize, b1: usize) -> Option<(f32, f32)> {
+        if let Some(hit) = self
+            .cache_hot
+            .get(key)
+            .and_then(|run| run.ink.get(&(b0, b1)))
+        {
+            return *hit;
+        }
+        self.ink_cells += 1;
+        let cover = self.measure_cell_ink(key, b0, b1);
+        if let Some(run) = self.cache_hot.get_mut(key) {
+            run.ink.insert((b0, b1), cover);
+        }
+        cover
+    }
+
+    fn measure_cell_ink(&mut self, key: &RunKey, b0: usize, b1: usize) -> Option<(f32, f32)> {
         let extracted: Vec<(String, Vec<cosmic_text::LayoutGlyph>)> = {
-            let Some(buffer) = self.cache_hot.get(key).map(|run| &run.buffer) else {
-                return Vec::new();
-            };
+            let buffer = &self.cache_hot.get(key)?.buffer;
             buffer
                 .layout_runs()
                 .map(|run| (run.text.to_string(), run.glyphs.to_vec()))
                 .collect()
         };
-        let mut prepared = Vec::new();
+        let mut cover: Option<(f32, f32)> = None;
         for (text, glyphs) in &extracted {
-            let mut inks = Vec::new();
-            for glyph in glyphs {
-                if let Some((x, w)) = glyph_ink(
-                    &mut self.atlas,
-                    &mut self.font_system,
-                    &mut self.cache,
-                    glyph,
-                ) {
-                    inks.push((glyph.start, glyph.end, x, w));
-                }
-            }
             let raw: Vec<_> = glyphs
                 .iter()
                 .map(|glyph| crate::mouse::GlyphSpan {
@@ -2391,29 +2472,82 @@ impl Renderer {
                 })
                 .collect();
             let spans = merge_lam_alef(crate::mouse::fold_empty_letters(raw, text), text);
-            prepared.push((text, spans, inks));
-        }
-        let mut out = Vec::new();
-        for &(col, b0, b1) in cells {
-            let mut cover: Option<(f32, f32)> = None;
-            for (text, spans, inks) in &prepared {
-                let Some((x, w)) = ink_cover(spans, inks, text, b0, b1) else {
+            let relevant: Vec<_> = spans
+                .iter()
+                .filter(|g| g.start < b1 && b0 < g.end)
+                .copied()
+                .collect();
+            if relevant.is_empty() {
+                continue;
+            }
+            let mut inks = Vec::new();
+            for glyph in glyphs {
+                let overlaps = relevant
+                    .iter()
+                    .any(|g| glyph.start < g.end && g.start < glyph.end);
+                if !overlaps {
                     continue;
-                };
-                cover = Some(match cover {
-                    Some((left, width)) => {
-                        let right = (left + width).max(x + w);
-                        let left = left.min(x);
-                        (left, right - left)
-                    }
-                    None => (x, w),
-                });
+                }
+                if let Some((x, w)) = glyph_ink(
+                    &mut self.atlas,
+                    &mut self.font_system,
+                    &mut self.cache,
+                    glyph,
+                ) {
+                    inks.push((glyph.start, glyph.end, x, w));
+                }
             }
-            if let Some((x, w)) = cover {
-                out.push((col, x, w));
-            }
+            let Some((x, w)) = ink_cover(&spans, &inks, text, b0, b1) else {
+                continue;
+            };
+            cover = Some(match cover {
+                Some((left, width)) => {
+                    let right = (left + width).max(x + w);
+                    let left = left.min(x);
+                    (left, right - left)
+                }
+                None => (x, w),
+            });
         }
-        out
+        cover
+    }
+
+    /// Round both edges the way the cell quads do. Rounding the width alone
+    /// leaves the block a pixel narrower than the cell. A ligature half is
+    /// already ink-only, so this must not grow it back to the advance.
+    fn snap_ink_box(&self, text_x0: i32, scale: f32, x: f32, w: f32) -> (i32, i32) {
+        let left = text_x0 + (x * scale).round() as i32;
+        let right = text_x0 + ((x + w) * scale).round() as i32;
+        (left, (right - left).max(2))
+    }
+
+    /// Measure ink for every cell of a row the last frame shaped, and store
+    /// the boxes where clicks read them. Selection never sees this map.
+    /// Cached per shaped line: a second click does not rasterize again.
+    pub fn warm_row_ink(&mut self, pane: Rect, row: usize) {
+        let pending = self.row_shape.get(&(pane, row)).is_some_and(|shape| {
+            shape
+                .cells
+                .iter()
+                .any(|(col, _, _)| !self.click_boxes.contains_key(&(pane, row, *col)))
+        });
+        if !pending {
+            return;
+        }
+        let shape = self.row_shape[&(pane, row)].clone();
+        for (col, b0, b1) in shape.cells {
+            let Some((x, w)) = self.ink_box(&shape.key, b0, b1) else {
+                continue;
+            };
+            let (left, iw) = self.snap_ink_box(shape.text_x0, shape.scale, x, w);
+            let rtl = self
+                .cell_geometry
+                .get(&(pane, row, col))
+                .and_then(|spans| spans.first())
+                .map(|span| span.2)
+                .unwrap_or(false);
+            self.click_boxes.insert((pane, row, col), (left, iw, rtl));
+        }
     }
 
     /// A row containing Arabic: shape the WHOLE line so cosmic-text applies
@@ -2725,31 +2859,40 @@ impl Renderer {
         }
         // A single letter's block is the union of its cell and its ink, so
         // reh and seen stick out and a thin `l` or alef does not shrink into
-        // a bar. Lam-alef stays an ink split. The same box is the click
-        // target. The cell past the text is unchanged: on 22bc5d66 that
-        // cursor already sits at the logical end.
+        // a bar. Lam-alef stays an ink split. The cell past the text is
+        // unchanged: on 22bc5d66 that cursor already sits at the logical end.
+        //
+        // Only the cursor cell is measured while painting. The other cells
+        // wait for a click (`warm_row_ink`), and the box goes to `click_boxes`,
+        // never to `cell_geometry`. Selection and search draw one rect per
+        // span of `cell_geometry`; a second box there darkens the cell twice.
         if !claude {
-            let covers = self.ink_covers(&key, &cell_bytes);
-            for (col, x, w) in covers {
-                let left = text_x0 + (x * scale).round() as i32;
-                let iw = ((w * scale).round() as i32).max(2);
-                if let Some((pane, row)) = self.mapping_context {
-                    let rtl = self
-                        .cell_geometry
-                        .get(&(pane, row, col))
-                        .and_then(|spans| spans.first())
-                        .map(|span| span.2)
-                        .unwrap_or(false);
-                    // Keep the advance span at [0]. The ink union is added
-                    // beside it so a click on the overhang still hits this
-                    // cell, without moving the edge the end cursor uses.
-                    self.cell_geometry
-                        .entry((pane, row, col))
-                        .or_default()
-                        .push((left, iw, rtl));
-                }
-                if cursor_col == Some(col) {
-                    mapped_cursor = Some((left, iw));
+            if let Some((pane, row)) = self.mapping_context {
+                self.row_shape.insert(
+                    (pane, row),
+                    RowShape {
+                        key: key.clone(),
+                        cells: cell_bytes.clone(),
+                        text_x0,
+                        scale,
+                    },
+                );
+            }
+            if let Some(col) = cursor_col.filter(|col| *col < text_end_col) {
+                if let Some(&(_, b0, b1)) = cell_bytes.iter().find(|cell| cell.0 == col) {
+                    if let Some((x, w)) = self.ink_box(&key, b0, b1) {
+                        let (left, iw) = self.snap_ink_box(text_x0, scale, x, w);
+                        mapped_cursor = Some((left, iw));
+                        if let Some((pane, row)) = self.mapping_context {
+                            let rtl = self
+                                .cell_geometry
+                                .get(&(pane, row, col))
+                                .and_then(|spans| spans.first())
+                                .map(|span| span.2)
+                                .unwrap_or(false);
+                            self.click_boxes.insert((pane, row, col), (left, iw, rtl));
+                        }
+                    }
                 }
             }
         }
@@ -7349,6 +7492,9 @@ mod tests {
     const CAIRO_ARABIC: &[u8] = include_bytes!("../tests/fixtures/Cairo-Arabic.ttf");
 
     fn box_of(r: &Renderer, pane: Rect, col: usize) -> (i32, i32) {
+        if let Some(&(x, w, _)) = r.click_boxes.get(&(pane, 0, col)) {
+            return (x, w);
+        }
         let spans = &r.cell_geometry[&(pane, 0, col)];
         let left = spans.iter().map(|s| s.0).min().unwrap();
         let right = spans.iter().map(|s| s.0 + s.1).max().unwrap();
@@ -7417,23 +7563,22 @@ mod tests {
             cursor,
             "a click on reh must use the same box as the block"
         );
-        if cursor.0 < bx {
-            let x = (cursor.0 as f64 + bx as f64) / 2.0;
-            assert_eq!(
-                r.hit_cell(pane, 0, x).map(|hit| hit.0),
-                Some(cells[reh].col),
-                "clicking the ink left of the cell missed reh"
-            );
-        }
-        assert!(
-            cursor.1 >= bw + 2,
-            "reh block width {} is not wider than its cell {bw}",
-            cursor.1
-        );
         assert!(
             cursor.0 < bx,
             "reh block x {} did not move left of the cell {bx}",
             cursor.0
+        );
+        let overhang = (cursor.0..bx).find(|&x| {
+            r.hit_cell(pane, 0, x as f64 + 0.5).map(|hit| hit.0) == Some(cells[reh].col)
+        });
+        assert!(
+            overhang.is_some(),
+            "no point of the ink left of the cell hits reh"
+        );
+        assert!(
+            cursor.1 >= bw + 2,
+            "reh block width {} is not wider than its cell {bw}",
+            cursor.1
         );
         assert!(
             cursor.0 < bx + bw / 2 && cursor.0 + cursor.1 > bx + bw / 2,
@@ -7616,6 +7761,230 @@ mod tests {
             on_lam.0 - on_alef.0 >= 4,
             "Amiri halves are not split, ا {on_alef:?} ل {on_lam:?}"
         );
+    }
+
+    /// Amiri puts tanween on the alef inside the lam's cluster, so the two
+    /// byte ranges share an end. They still have to merge, or the alef block
+    /// overlaps the lam. «أهلاً» and «مثلاً» are the same cluster.
+    #[test]
+    fn lam_alef_with_tanween_is_one_cluster() {
+        let text = "abcلاً";
+        assert_eq!("abc".len(), 3, "the lam cluster starts at byte 3");
+        let lam_cluster = crate::mouse::GlyphSpan {
+            x: 37.0,
+            w: 7.0,
+            start: 3,
+            end: 9,
+            rtl: true,
+        };
+        let alef_cluster = crate::mouse::GlyphSpan {
+            x: 30.0,
+            w: 11.0,
+            start: 5,
+            end: 9,
+            rtl: true,
+        };
+        let merged = merge_lam_alef(vec![lam_cluster, alef_cluster], text);
+        assert_eq!(
+            merged.len(),
+            1,
+            "tanween kept lam and alef apart: {merged:?}"
+        );
+        assert_eq!(merged[0].start, 3);
+        assert_eq!(merged[0].end, 9);
+        assert!(merged[0].rtl);
+    }
+
+    /// The live Amiri face: «لاً» splits with alef on the left and the two
+    /// blocks do not overlap.
+    #[test]
+    fn amiri_lam_alef_tanween_halves_do_not_overlap() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        r.font_system.db_mut().load_font_data(AMIRI.to_vec());
+        r.arabic_family = Some("Amiri".into());
+        let pane = (0, 0, 800, 140);
+        let text = "go لاً";
+        let cells = row_cells(text, 0);
+        let lam = cells.iter().position(|c| c.c == 'ل').unwrap();
+        let on_lam = cursor_on(&mut r, pane, &cells, cells[lam].col);
+        let on_alef = cursor_on(&mut r, pane, &cells, cells[lam + 1].col);
+        assert!(
+            on_alef.0 < on_lam.0,
+            "Amiri اً {on_alef:?} is not left of ل {on_lam:?}"
+        );
+        assert!(
+            on_alef.0 + on_alef.1 <= on_lam.0 + 1,
+            "Amiri اً {on_alef:?} overlaps ل {on_lam:?}"
+        );
+    }
+
+    /// A click in the left quarter of «ك» belongs to «ك» even when «م»'s ink
+    /// reaches it. The advance wins; ink is only the overhang.
+    #[test]
+    fn amiri_click_on_the_left_of_kaf_stays_on_kaf() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        r.font_system.db_mut().load_font_data(AMIRI.to_vec());
+        r.arabic_family = Some("Amiri".into());
+        let pane = (0, 0, 800, 140);
+        let text = "مرحبا بكم";
+        let cells = row_cells(text, 0);
+        let kaf = cells.iter().position(|c| c.c == 'ك').unwrap();
+        let meem = cells.iter().rposition(|c| c.c == 'م').unwrap();
+        r.begin_frame();
+        r.mapping_context = Some((pane, 0));
+        r.draw_line_bidi(
+            &mut Vec::new(),
+            pane,
+            0,
+            0,
+            pane.2,
+            &cells,
+            false,
+            None,
+            ParagraphDir::Default,
+            None,
+        );
+        r.finish_pane_layout(pane);
+        r.warm_row_ink(pane, 0);
+        let (kx, kw, _) = r.cell_geometry[&(pane, 0, cells[kaf].col)][0];
+        let x = kx as f64 + (kw as f64 / 8.0);
+        let meem_box = r.click_boxes[&(pane, 0, cells[meem].col)];
+        assert!(
+            (meem_box.0 as f64) <= x && x < (meem_box.0 + meem_box.1) as f64,
+            "meem ink {meem_box:?} does not cover the left quarter of kaf at {x} ({kx}+{kw})"
+        );
+        assert_eq!(
+            r.hit_cell(pane, 0, x).map(|hit| hit.0),
+            Some(cells[kaf].col),
+            "the left of kaf was given to meem"
+        );
+    }
+
+    /// Paint measures ink for the cursor cell and no other. The next frame
+    /// reuses the box cached on the shaped line.
+    #[test]
+    fn ink_is_measured_only_for_the_cursor_cell() {
+        let mut r = cairo_renderer();
+        let pane = (0, 0, 1600, 140);
+        let text = "مرحبا بالعالم مرحبا بالعالم مرحبا بالعالم";
+        let cells = row_cells(text, 0);
+        assert!(
+            cells.len() > 8,
+            "the line has to be long enough to show the old cost"
+        );
+        let draw = |r: &mut Renderer, col: Option<usize>| {
+            r.begin_frame();
+            r.mapping_context = Some((pane, 0));
+            r.draw_line_bidi(
+                &mut Vec::new(),
+                pane,
+                0,
+                0,
+                pane.2,
+                &cells,
+                false,
+                col,
+                ParagraphDir::Default,
+                None,
+            );
+        };
+        draw(&mut r, None);
+        assert_eq!(r.ink_cells, 0, "a frame with no cursor measured ink");
+        draw(&mut r, Some(cells[0].col));
+        assert_eq!(
+            r.ink_cells, 1,
+            "a frame measured ink for cells other than the cursor"
+        );
+        draw(&mut r, Some(cells[0].col));
+        assert_eq!(
+            r.ink_cells, 0,
+            "the cursor cell was measured again instead of using the shaped line"
+        );
+        draw(&mut r, Some(cells[4].col));
+        assert_eq!(
+            r.ink_cells, 1,
+            "moving the cursor measured more than that cell"
+        );
+    }
+
+    /// Selection (and search, which reads the same spans) draws one rect per
+    /// cell. On 80e64f0 the ink box was stored next to the advance, so an
+    /// Arabic line went from 78 rect-vertices to 156 and a mixed line from
+    /// 114 to 228.
+    #[test]
+    fn selection_on_arabic_and_mixed_lines_is_one_rect_per_cell() {
+        fn rects_for(text: &str) -> usize {
+            use alacritty_terminal::{
+                event::VoidListener,
+                index::{Column, Point, Side},
+                selection::{Selection, SelectionType},
+                term::{Config, Term},
+                vte::ansi::Processor,
+            };
+            let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+            let size = crate::term::TermSize { cols: 80, rows: 3 };
+            let mut t = Term::new(Config::default(), &size, VoidListener);
+            let mut p: Processor = Processor::new();
+            p.advance(&mut t, text.as_bytes());
+            let n = text.chars().count();
+            let mut sel = Selection::new(
+                SelectionType::Simple,
+                Point::new(alacritty_terminal::index::Line(0), Column(0)),
+                Side::Left,
+            );
+            sel.update(
+                Point::new(alacritty_terminal::index::Line(0), Column(n - 1)),
+                Side::Right,
+            );
+            t.selection = Some(sel);
+            let pane = (0, 0, 2400, 400);
+            let view = PaneView {
+                rect: pane,
+                focused: true,
+                cursor: crate::config::CursorStyle::Block,
+                cursor_on: true,
+                bordered: false,
+                claude: false,
+                claude_from: None,
+                reorder: true,
+                line_dir: &[],
+                search_match: None,
+                marks: &[],
+                link_hover: None,
+                link_tip: None,
+            };
+            let mut out = Vec::new();
+            r.begin_frame();
+            r.draw_pane(&mut out, &view, &t);
+            let color = c4(SELECTION_RGBA.0, SELECTION_RGBA.1 as u8);
+            let verts = out.iter().filter(|v| v.color == color).count();
+            assert_eq!(verts % 6, 0, "{text}: a selection rect is 6 vertices");
+            let rects = verts / 6;
+            let spans: usize = r
+                .cell_geometry
+                .iter()
+                .filter(|((p, row, col), _)| *p == pane && *row == 0 && *col < n)
+                .map(|(_, spans)| spans.len())
+                .sum();
+            // A Latin row is a grid: it has no shaped spans and the overlay
+            // draws one rect per cell anyway. An Arabic or mixed row stores
+            // the spans the overlay walks, and there must be one per cell.
+            if spans > 0 {
+                assert_eq!(spans, n, "{text}: overlay source has one span per cell");
+            }
+            assert!(
+                r.ink_cells <= 1,
+                "{text}: painting measured ink for {} cells",
+                r.ink_cells
+            );
+            rects
+        }
+        let arabic = "مرحبا بالعالم";
+        let mixed = r"C:\Users\me.l>مرحبا";
+        let latin = "hello world abc";
+        assert_eq!(rects_for(arabic), arabic.chars().count());
+        assert_eq!(rects_for(mixed), mixed.chars().count());
+        assert_eq!(rects_for(latin), latin.chars().count());
     }
 
     /// The line classifier: Arabic rows take the BiDi path, others the grid.

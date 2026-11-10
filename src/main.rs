@@ -3679,9 +3679,12 @@ impl App {
         let mapped = rects
             .get(hit.pane)
             .and_then(|rect| {
-                self.renderer
-                    .as_ref()
-                    .and_then(|r| r.hit_cell(*rect, row, pos.x))
+                self.renderer.as_mut().and_then(|r| {
+                    // Ink for the row is measured here, on the click, not
+                    // while the frame was painted.
+                    r.warm_row_ink(*rect, row);
+                    r.hit_cell(*rect, row, pos.x)
+                })
             })
             .map(|h| h.0);
         let col = if let Some(col) = mapped {
