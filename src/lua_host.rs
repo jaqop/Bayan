@@ -424,7 +424,7 @@ pub fn load_with(cfg: &UserConfig, dir: &Path, elevated: bool) -> Outcome {
             log_line(&format!("config.lua: {err}"));
             errors.push(format!("config.lua: {err}"));
         }
-        ConfigLua::Applied(merged) => config = merged,
+        ConfigLua::Applied(merged) => config = *merged,
     }
 
     // Allowlist, directory, and approvals come from the JSON config, not
@@ -483,7 +483,7 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 enum ConfigLua {
     Absent,
     Pending(PendingScript),
-    Applied(UserConfig),
+    Applied(Box<UserConfig>),
     Failed(String),
 }
 
@@ -504,7 +504,7 @@ fn consider_config(cfg: &UserConfig, path: &Path) -> ConfigLua {
         return ConfigLua::Pending(pending_script(ScriptRole::Config, path, &text, hash));
     }
     match apply_config_lua(cfg, &bytes) {
-        Ok(merged) => ConfigLua::Applied(merged),
+        Ok(merged) => ConfigLua::Applied(Box::new(merged)),
         Err(err) => ConfigLua::Failed(err),
     }
 }
@@ -1764,12 +1764,13 @@ mod tests {
     }
 
     fn plugin_cfg(dir: &Path, name: &str, spawn: bool) -> UserConfig {
-        let mut cfg = UserConfig::default();
-        cfg.lua_plugins_dir = Some(dir.display().to_string());
-        cfg.lua_plugins.push(LuaPluginAllow {
-            name: name.to_string(),
-            spawn,
-        });
-        cfg
+        UserConfig {
+            lua_plugins_dir: Some(dir.display().to_string()),
+            lua_plugins: vec![LuaPluginAllow {
+                name: name.to_string(),
+                spawn,
+            }],
+            ..UserConfig::default()
+        }
     }
 }
