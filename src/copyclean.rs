@@ -5,6 +5,11 @@
 //! indentation, those trailing spaces, and a hard break at every wrap
 //! (Claude Code #18170). `copy.clean` strips the chrome.
 //!
+//! Chrome is only the TUI's: on a Claude row, the spaces inside its
+//! two-column margin and a gutter marker. Indentation past the margin, and
+//! everything on a shell row, is text, so a selected block of code keeps
+//! its absolute and relative indent and `tree` keeps its border.
+//!
 //! A soft wrap is the grid's `WRAPLINE` flag on that row. A row without it
 //! is a real newline and stays one. Cells are read in grid order, never by
 //! visual x. Claude stores each row in visual order, so clean copy restores
@@ -24,11 +29,13 @@ use alacritty_terminal::term::Term;
 /// One selected grid row, top to bottom, in stored cell order.
 ///
 /// `wrapped` is that row's `WRAPLINE` flag: the next selected row continues
-/// this one. A row without the flag ends a real line.
+/// this one. A row without the flag ends a real line. `col` is the grid
+/// column `text` starts at, so a row picked up past the margin has none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CopyRow {
     pub text: String,
     pub wrapped: bool,
+    pub col: usize,
 }
 
 /// What `copy.clean` in config.json means.
@@ -78,6 +85,11 @@ impl CleanCopy {
 /// part of the marker: `│hello` is text that happens to start with a bar.
 const GUTTERS: [&str; 2] = ["⎿ ", "│ "];
 
+/// Columns Claude Code keeps blank left of its transcript text (the width of
+/// its `● ` bullet). Only spaces inside these columns are chrome; any indent
+/// past them belongs to the text, so code keeps its absolute indentation.
+const TUI_MARGIN: usize = 2;
+
 /// Clipboard text for one selection.
 ///
 /// `clean == false` returns `raw` exactly, apart from Claude mode's existing
@@ -97,35 +109,67 @@ pub(crate) fn clipboard_text(raw: &str, rows: &[CopyRow], clean: bool, claude: b
             .map(|text| CopyRow {
                 text: text.to_string(),
                 wrapped: false,
+                col: 0,
             })
             .collect::<Vec<_>>()
     } else {
         rows.to_vec()
     };
-    // Gutter characters sit in column 0. Strip them before a Claude row is
+    // Gutter characters sit at the margin. Strip them before a Claude row is
     // restored, or an RTL line moves the marker to the other end.
-    assemble(&logical_rows(&source, claude))
+    assemble(&logical_rows(&source, claude), claude)
 }
 
-/// Claude visual rows become logical one row at a time. A shell row is
-/// already logical and stays byte for byte apart from the later trim.
+/// Claude visual rows lose the TUI margin and gutter, then become logical
+/// one row at a time. A shell row is already logical and has no chrome: it
+/// stays byte for byte apart from the later trim, so `tree` keeps its `│ `.
 fn logical_rows(rows: &[CopyRow], claude: bool) -> Vec<CopyRow> {
-    let texts = strip_uniform_gutter(&rows.iter().map(|row| row.text.clone()).collect::<Vec<_>>());
-    texts
-        .into_iter()
-        .zip(rows.iter())
-        .map(|(text, row)| {
-            let text = if claude {
-                crate::bidi::restore_bidi_line(&text).unwrap_or(text)
-            } else {
-                text
+    if !claude {
+        return rows.to_vec();
+    }
+    // The gutter sits just inside the margin.
+    let bare: Vec<String> = rows
+        .iter()
+        .map(|row| strip_tui_margin(&row.text, row.col).to_string())
+        .collect();
+    let gutter = uniform_gutter(&bare);
+    rows.iter()
+        .zip(bare)
+        .map(|(row, bare)| {
+            let Some(gutter) = gutter else {
+                return CopyRow {
+                    text: restore_claude_row(&row.text, row.col),
+                    ..row.clone()
+                };
             };
+            let text = strip_one_gutter(&bare, gutter);
             CopyRow {
-                text,
-                wrapped: row.wrapped,
+                text: crate::bidi::restore_bidi_line(&text).unwrap_or(text),
+                ..row.clone()
             }
         })
         .collect()
+}
+
+/// One Claude row to logical order without its margin. An RTL row is
+/// reversed whole: its margin ends up trailing (trimmed later) and its
+/// logical-leading spaces are the row's visual-right padding, so they go.
+/// Stripping the margin first would also eat a space the visual order put
+/// at the left. An LTR row keeps its margin in front, so it comes off there.
+fn restore_claude_row(text: &str, col: usize) -> String {
+    let logical = crate::bidi::restore_bidi_line(text).unwrap_or_else(|| text.to_string());
+    if crate::bidi::line_is_rtl_visual(text) {
+        logical.trim_start_matches(' ').to_string()
+    } else {
+        strip_tui_margin(&logical, col).to_string()
+    }
+}
+
+/// Drop the leading spaces that fall inside the TUI margin of a row whose
+/// text starts at grid column `col`.
+fn strip_tui_margin(text: &str, col: usize) -> &str {
+    let n = leading_spaces(text).min(TUI_MARGIN.saturating_sub(col));
+    strip_indent(text, n)
 }
 
 fn restore_block(text: &str, claude: bool) -> String {
@@ -136,13 +180,13 @@ fn restore_block(text: &str, claude: bool) -> String {
     }
 }
 
-/// Join soft wraps and remove only the indent every logical line shares.
-/// Rows are already in logical order. Trailing spaces are the end of that
-/// string: a wrapped row that ends in spaces joins the next with one space
-/// when the continuation does not already start with one, and a row that
-/// ends on a character joins mid-word. Extra spaces on a continuation are
-/// relative indent and stay.
-fn assemble(rows: &[CopyRow]) -> String {
+/// Join soft wraps. Rows are already in logical order, with the TUI margin
+/// gone. Trailing spaces are the end of that string: a wrapped row that ends
+/// in spaces joins the next with one space when the continuation does not
+/// already start with one, and a row that ends on a character joins
+/// mid-word. A Claude continuation repeats its line's indent, which comes
+/// off; a shell continuation's leading spaces are text and stay.
+fn assemble(rows: &[CopyRow], claude: bool) -> String {
     let mut lines: Vec<String> = Vec::new();
     let mut buf = String::new();
     let mut indent = 0usize;
@@ -156,7 +200,11 @@ fn assemble(rows: &[CopyRow]) -> String {
             indent = leading_spaces(trimmed);
             buf.push_str(trimmed);
         } else {
-            let cont = strip_margin(trimmed, indent);
+            let cont = if claude {
+                strip_margin(trimmed, indent)
+            } else {
+                trimmed
+            };
             if prev_ended_with_space
                 && !buf.is_empty()
                 && !cont.is_empty()
@@ -177,25 +225,7 @@ fn assemble(rows: &[CopyRow]) -> String {
             prev_ended_with_space = ended_with_space;
         }
     }
-    let n = common_indent(&lines);
-    if n > 0 {
-        for line in &mut lines {
-            if !line.is_empty() {
-                *line = strip_indent(line, n).to_string();
-            }
-        }
-    }
     lines.join("\n")
-}
-
-fn strip_uniform_gutter(lines: &[String]) -> Vec<String> {
-    let Some(gutter) = uniform_gutter(lines) else {
-        return lines.to_vec();
-    };
-    lines
-        .iter()
-        .map(|line| strip_one_gutter(line, gutter))
-        .collect()
 }
 
 /// The gutter every non-blank line starts with, if there is exactly one
@@ -230,17 +260,6 @@ fn strip_one_gutter(line: &str, gutter: &str) -> String {
 
 fn leading_spaces(text: &str) -> usize {
     text.chars().take_while(|&c| c == ' ').count()
-}
-
-/// Spaces shared by every non-empty logical line, the first line included.
-/// A later line's extra spaces are its own indent and are not part of this.
-fn common_indent(lines: &[String]) -> usize {
-    lines
-        .iter()
-        .filter(|line| !line.is_empty())
-        .map(|line| leading_spaces(line))
-        .min()
-        .unwrap_or(0)
 }
 
 /// Drop `n` leading characters. Callers only pass a line that has at least
@@ -292,6 +311,7 @@ pub(crate) fn selection_rows<T: EventListener>(term: &Term<T>) -> Vec<CopyRow> {
         rows.push(CopyRow {
             text: cells_to_string(term, line, start_col, end_col),
             wrapped,
+            col: start_col.0,
         });
     }
     rows
@@ -341,6 +361,7 @@ mod tests {
         CopyRow {
             text: text.to_string(),
             wrapped,
+            col: 0,
         }
     }
 
@@ -349,38 +370,31 @@ mod tests {
     }
 
     #[test]
-    fn common_leading_indentation_comes_off_every_line() {
-        let rows = [row("    alpha", false), row("     beta", false)];
-        assert_eq!(clean(&rows), "alpha\n beta");
-        // a line with no indent means there is no shared margin
-        let mixed = [row("    alpha", false), row("beta", false)];
-        assert_eq!(clean(&mixed), "    alpha\nbeta");
-        // blank lines stay, and they do not count as zero indent
+    fn the_claude_margin_comes_off_each_row() {
+        // a line with no margin (the bullet row) does not stop the others
+        let mixed = [row("● alpha", false), row("  beta", false)];
+        assert_eq!(claude(&mixed), "● alpha\nbeta");
+        // blank lines stay
         let blank = [row("  alpha", false), row("", false), row("  beta", false)];
-        assert_eq!(clean(&blank), "alpha\n\nbeta");
-        // A whole function body: only the margin every line shares comes
-        // off. The body's extra indent, and a nested line's extra indent,
-        // stay. The first line counts, so a signature at column 0 keeps
-        // the body where it was.
+        assert_eq!(claude(&blank), "alpha\n\nbeta");
+        // A whole function body: the margin comes off, the body's indent
+        // and a nested line's extra indent stay.
         let body = [
-            row("    fn body() {", false),
-            row("        let x = 1;", false),
-            row("            nested();", false),
-            row("    }", false),
+            row("  fn body() {", false),
+            row("      let x = 1;", false),
+            row("          nested();", false),
+            row("  }", false),
         ];
         assert_eq!(
-            clean(&body),
+            claude(&body),
             "fn body() {\n    let x = 1;\n        nested();\n}"
         );
-        let with_signature = [
-            row("fn body() {", false),
-            row("    let x = 1;", false),
-            row("}", false),
-        ];
-        assert_eq!(clean(&with_signature), "fn body() {\n    let x = 1;\n}");
         // A soft wrap must not eat the continuation's extra indent.
-        let wrapped_body = [row("    let x = ", true), row("        1;", false)];
-        assert_eq!(clean(&wrapped_body), format!("let x ={}1;", " ".repeat(4)));
+        let wrapped_body = [row("  let x = ", true), row("      1;", false)];
+        assert_eq!(claude(&wrapped_body), format!("let x ={}1;", " ".repeat(4)));
+        // A shell's soft-wrapped continuation: its leading spaces are text.
+        let shell_wrap = [row("    let x =", true), row("    1;", false)];
+        assert_eq!(clean(&shell_wrap), "    let x =    1;");
     }
 
     #[test]
@@ -406,11 +420,11 @@ mod tests {
         // trailing spaces on a real line do not glue it to the next
         let kept = [row("hello   ", false), row("world", false)];
         assert_eq!(clean(&kept), "hello\nworld");
-        // a wrapped continuation repeats the TUI's left margin
-        let margin = [row("    hello ", true), row("    world", false)];
-        assert_eq!(clean(&margin), "hello world");
-        let mid = [row("    hel", true), row("    lo", false)];
-        assert_eq!(clean(&mid), "hello");
+        // a wrapped Claude continuation repeats the TUI's left margin
+        let margin = [row("  hello ", true), row("  world", false)];
+        assert_eq!(claude(&margin), "hello world");
+        let mid = [row("  hel", true), row("  lo", false)];
+        assert_eq!(claude(&mid), "hello");
     }
 
     #[test]
@@ -418,19 +432,19 @@ mod tests {
         // stored order is already logical (a shell, not Claude): cleaning
         // must not reverse the Arabic or swap it with the English
         let mixed = [row("    مرحبا hello   ", false)];
-        assert_eq!(clean(&mixed), "مرحبا hello");
+        assert_eq!(clean(&mixed), "    مرحبا hello");
         let wrapped = [row("    مرحبا hel", true), row("lo   ", false)];
-        assert_eq!(clean(&wrapped), "مرحبا hello");
+        assert_eq!(clean(&wrapped), "    مرحبا hello");
         let lines = [row("مرحبا", false), row("hello", false)];
         assert_eq!(clean(&lines), "مرحبا\nhello");
         // Claude stored the visual order. The existing restore runs on the
-        // joined line, and the margin comes off without touching the letters.
-        let visual = [row("    What are you working on ؟كتدعاسم   ", false)];
+        // row, and the margin comes off without touching the letters.
+        let visual = [row("  What are you working on ؟كتدعاسم   ", false)];
         assert_eq!(
             clipboard_text("RAW", &visual, true, true),
             "What are you working on مساعدتك؟"
         );
-        let arabic = [row("    ابحرم   ", false)];
+        let arabic = [row("  ابحرم   ", false)];
         assert_eq!(clipboard_text("RAW", &arabic, true, true), "مرحبا");
     }
 
@@ -587,35 +601,35 @@ mod tests {
     #[test]
     fn a_gutter_comes_off_only_when_every_line_has_it() {
         assert_eq!(
-            clean(&[row("│ alpha", false), row("│ beta", false)]),
+            claude(&[row("│ alpha", false), row("│ beta", false)]),
             "alpha\nbeta"
         );
         assert_eq!(
-            clean(&[row("⎿ alpha", false), row("⎿ beta", false)]),
+            claude(&[row("⎿ alpha", false), row("⎿ beta", false)]),
             "alpha\nbeta"
         );
         // one plain line keeps the marker on the lines that have it
         assert_eq!(
-            clean(&[row("│ alpha", false), row("beta", false)]),
+            claude(&[row("│ alpha", false), row("beta", false)]),
             "│ alpha\nbeta"
         );
         assert_eq!(
-            clean(&[row("│ alpha", false), row("⎿ beta", false)]),
+            claude(&[row("│ alpha", false), row("⎿ beta", false)]),
             "│ alpha\n⎿ beta"
         );
         // a blank line does not block a marker the others share
         assert_eq!(
-            clean(&[row("│ alpha", false), row("", false), row("│ beta", false)]),
+            claude(&[row("│ alpha", false), row("", false), row("│ beta", false)]),
             "alpha\n\nbeta"
         );
         // the space belongs to the marker: a bar glued to a word stays
         assert_eq!(
-            clean(&[row("│alpha", false), row("│beta", false)]),
+            claude(&[row("│alpha", false), row("│beta", false)]),
             "│alpha\n│beta"
         );
         // wrapped rows that each carry the gutter lose it, then join
-        let wrapped = [row("│    hel", true), row("│    lo", false)];
-        assert_eq!(clean(&wrapped), "hello");
+        let wrapped = [row("│ hel", true), row("│ lo", false)];
+        assert_eq!(claude(&wrapped), "hello");
     }
 
     #[test]
@@ -680,6 +694,67 @@ mod tests {
             Side::Right,
         );
         term.selection = Some(sel);
+    }
+
+    fn claude(rows: &[CopyRow]) -> String {
+        clipboard_text("RAW", rows, true, true)
+    }
+
+    /// Only the TUI's own margin comes off. Code indentation, absolute and
+    /// relative, is the text.
+    #[test]
+    fn a_tui_margin_comes_off_and_indented_code_keeps_its_indent() {
+        // Claude's prose sits two columns in: that margin is chrome.
+        let prose = [row("  alpha", false), row("   beta", false)];
+        assert_eq!(claude(&prose), "alpha\n beta");
+        // The body of an indented block in Claude's output: the margin
+        // goes, the four spaces of the block's own indent stay.
+        let body = [
+            row("      if x:", false),
+            row("          return 1", false),
+            row("", false),
+            row("      y = 2", false),
+        ];
+        assert_eq!(claude(&body), "    if x:\n        return 1\n\n    y = 2");
+        // A shell's indented code is copied as it stands.
+        let shell = [row("    if x:", false), row("        return 1", false)];
+        assert_eq!(clean(&shell), "    if x:\n        return 1");
+        let yaml = [row("  a:", false), row("    b: 1", false)];
+        assert_eq!(clean(&yaml), "  a:\n    b: 1");
+
+        // A drag that starts on the text, past the margin, has no margin on
+        // its first row. The rows after it start at column 0 and do.
+        let mut term = grid(20, 2);
+        put(&mut term, 0, "  def foo():", false);
+        put(&mut term, 1, "      return 1", false);
+        let mut sel = Selection::new(
+            SelectionType::Simple,
+            Point::new(Line(0), Column(2)),
+            Side::Left,
+        );
+        sel.update(Point::new(Line(1), Column(19)), Side::Right);
+        term.selection = Some(sel);
+        let raw = term.selection_to_string().expect("selection");
+        let rows = selection_rows(&term);
+        assert_eq!(
+            clipboard_text(&raw, &rows, true, true),
+            "def foo():\n    return 1"
+        );
+    }
+
+    #[test]
+    fn a_shell_tree_keeps_its_border() {
+        let tree = [
+            row("│   ├── a.rs", false),
+            row("│   └── b.rs", false),
+            row("│ ", false),
+        ];
+        assert_eq!(clean(&tree), "│   ├── a.rs\n│   └── b.rs\n│");
+        // Claude's own gutter still comes off its rows.
+        assert_eq!(
+            claude(&[row("│ alpha", false), row("│ beta", false)]),
+            "alpha\nbeta"
+        );
     }
 
     #[test]

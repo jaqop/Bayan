@@ -414,10 +414,11 @@ mod tests {
             crate::copyclean::clipboard_text(&raw, &rows, false, false),
             raw
         );
-        // setting on: the wrap joins, the margin goes, the hard break stays
+        // setting on: the wrap joins and the hard break stays. A shell's
+        // indent is its text, so it stays too.
         assert_eq!(
             crate::copyclean::clipboard_text(&raw, &rows, true, false),
-            "hello world this is long\nnext"
+            "    hello world this is long\n    next"
         );
     }
 
