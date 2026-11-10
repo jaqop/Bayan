@@ -414,8 +414,8 @@ impl App {
     /// the logical cell `locate` mapped through column_for_click.
     fn hover(&mut self, position: PhysicalPosition<f64>) {
         self.update_scrollbar_hover(position.x, position.y);
-        // The strip is the bar's, even while it is faded. The cell under it
-        // is not a link and not a motion report.
+        // The gutter is the bar's, even while it is faded. A cell, including
+        // the last column, is not in that gutter.
         let cell = if self.bars.hover.is_some() {
             self.clear_link_hover();
             None
@@ -723,7 +723,13 @@ impl App {
                 }
                 self.request_redraw();
             }
-            LeftPress::Divider(i) => self.drag_divider = Some(i),
+            LeftPress::Divider(i) => {
+                // The seam is the scrollbar. The divider stays grabbable from
+                // the cell-edge slop, which is inside a pane and not on the bar.
+                if !self.on_scrollbar(MouseButton::Left) {
+                    self.drag_divider = Some(i);
+                }
+            }
             LeftPress::Tab(i) => self.switch_tab(i),
             LeftPress::CloseTab(i) => self.request_close_tab(i, el),
             LeftPress::NextGroup => self.perform_action(keybinds::Action::NextGroup, el),
@@ -857,8 +863,17 @@ impl App {
                 pane.id,
             )
         };
+        let content = self.content_rect()?;
+        let room = scrollbar::room_px(index, &rects, side, content, self.config.padding_px());
         let place = scrollbar::Place::new(total, viewport, offset);
-        let geom = scrollbar::layout(rect, side, self.config.scrollbar.width_px(), place, alt)?;
+        let geom = scrollbar::layout(
+            rect,
+            side,
+            self.config.scrollbar.width_px(),
+            room,
+            place,
+            alt,
+        )?;
         Some(SbTarget {
             index,
             id,

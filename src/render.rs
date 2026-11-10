@@ -3142,8 +3142,8 @@ impl Renderer {
     }
 
     /// The pane's scrollbar: a faint track and a thumb, both solid quads on
-    /// the same pipeline as the cells. `clip` is the pane, so the bar cannot
-    /// bleed into a neighbour. Geometry comes from `scrollbar`; this only paints.
+    /// the same pipeline as the cells. `clip` is the gutter outside the grid,
+    /// so the bar cannot land on a cell. Geometry comes from `scrollbar`.
     pub fn draw_scrollbar(
         &self,
         out: &mut Vec<Vertex>,

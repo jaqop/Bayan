@@ -14,8 +14,31 @@
 use crate::render::Rect;
 use crate::Orientation;
 
-/// Pixels between two panes.
+/// Pixels between two panes when nothing else needs the seam. A scrollbar
+/// widens the side-by-side seam; the stacked seam stays this hairline.
 const GAP: i32 = 1;
+
+/// How wide each seam is. `beside` is the vertical gap between side-by-side
+/// panes (where a vertical scrollbar sits). `stacked` is the horizontal gap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gaps {
+    pub beside: i32,
+    pub stacked: i32,
+}
+
+impl Gaps {
+    pub const HAIRLINE: Self = Self {
+        beside: GAP,
+        stacked: GAP,
+    };
+
+    fn on(self, axis: Orientation) -> i32 {
+        match axis {
+            Orientation::Row => self.beside.max(1),
+            Orientation::Column => self.stacked.max(1),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Node {
@@ -89,14 +112,16 @@ impl Node {
         walk(self, &mut seen) && seen.iter().all(|s| *s)
     }
 
-    /// Pane rects, indexed by pane.
-    pub fn rects(&self, content: Rect, panes: usize) -> Vec<Rect> {
+    /// Pane rects with explicit seams, indexed by pane. The cell rects
+    /// exclude the seam, so a scrollbar drawn there does not cover a column
+    /// and the column count stays `grid width / cell`.
+    pub fn rects_spaced(&self, content: Rect, panes: usize, gaps: Gaps) -> Vec<Rect> {
         let mut out = vec![(content.0, content.1, 0, 0); panes];
-        self.place(content, &mut out);
+        self.place(content, &mut out, gaps);
         out
     }
 
-    fn place(&self, rect: Rect, out: &mut Vec<Rect>) {
+    fn place(&self, rect: Rect, out: &mut Vec<Rect>, gaps: Gaps) {
         match self {
             Node::Leaf(i) => {
                 if let Some(slot) = out.get_mut(*i) {
@@ -108,8 +133,12 @@ impl Node {
                 children,
                 weights,
             } => {
-                for (child, r) in children.iter().zip(split_rect(rect, weights, *axis)) {
-                    child.place(r, out);
+                for (child, r) in
+                    children
+                        .iter()
+                        .zip(split_gap(rect, weights, *axis, gaps.on(*axis)))
+                {
+                    child.place(r, out, gaps);
                 }
             }
         }
@@ -241,13 +270,19 @@ impl Node {
     }
 
     /// Every divider in `content`, outermost splits first.
-    pub fn dividers(&self, content: Rect) -> Vec<Divider> {
+    pub fn dividers_spaced(&self, content: Rect, gaps: Gaps) -> Vec<Divider> {
         let mut out = Vec::new();
-        self.collect_dividers(content, &mut Vec::new(), &mut out);
+        self.collect_dividers(content, &mut Vec::new(), &mut out, gaps);
         out
     }
 
-    fn collect_dividers(&self, rect: Rect, path: &mut Vec<usize>, out: &mut Vec<Divider>) {
+    fn collect_dividers(
+        &self,
+        rect: Rect,
+        path: &mut Vec<usize>,
+        out: &mut Vec<Divider>,
+        gaps: Gaps,
+    ) {
         let Node::Split {
             axis,
             children,
@@ -256,11 +291,12 @@ impl Node {
         else {
             return;
         };
-        let rs = split_rect(rect, weights, *axis);
+        let gap = gaps.on(*axis);
+        let rs = split_gap(rect, weights, *axis, gap);
         for (k, r) in rs.iter().enumerate().take(rs.len().saturating_sub(1)) {
             let line = match axis {
-                Orientation::Row => (r.0 + r.2, rect.1, GAP, rect.3),
-                Orientation::Column => (rect.0, r.1 + r.3, rect.2, GAP),
+                Orientation::Row => (r.0 + r.2, rect.1, gap, rect.3),
+                Orientation::Column => (rect.0, r.1 + r.3, rect.2, gap),
             };
             out.push(Divider {
                 path: path.clone(),
@@ -271,7 +307,7 @@ impl Node {
         }
         for (k, (c, r)) in children.iter().zip(rs).enumerate() {
             path.push(k);
-            c.collect_dividers(r, path, out);
+            c.collect_dividers(r, path, out, gaps);
             path.pop();
         }
     }
@@ -279,14 +315,14 @@ impl Node {
     /// Move divider `d` to pointer `p` (x for a side-by-side split, y for a
     /// stacked one): the two children either side of it trade size, each
     /// keeping at least ~80px.
-    pub fn drag(&mut self, d: &Divider, content: Rect, p: f64) {
-        let Some((node, rect)) = self.at_path(&d.path, content) else {
+    pub fn drag_spaced(&mut self, d: &Divider, content: Rect, p: f64, gaps: Gaps) {
+        let Some((node, rect)) = self.at_path(&d.path, content, gaps) else {
             return;
         };
         let Node::Split { axis, weights, .. } = node else {
             return;
         };
-        let rs = split_rect(rect, weights, *axis);
+        let rs = split_gap(rect, weights, *axis, gaps.on(*axis));
         let i = d.index;
         if i + 1 >= rs.len() {
             return;
@@ -306,7 +342,7 @@ impl Node {
         weights[i + 1] = pair - weights[i];
     }
 
-    fn at_path(&mut self, path: &[usize], rect: Rect) -> Option<(&mut Node, Rect)> {
+    fn at_path(&mut self, path: &[usize], rect: Rect, gaps: Gaps) -> Option<(&mut Node, Rect)> {
         let Some((&k, rest)) = path.split_first() else {
             return Some((self, rect));
         };
@@ -318,8 +354,8 @@ impl Node {
         else {
             return None;
         };
-        let r = *split_rect(rect, weights, *axis).get(k)?;
-        children.get_mut(k)?.at_path(rest, r)
+        let r = *split_gap(rect, weights, *axis, gaps.on(*axis)).get(k)?;
+        children.get_mut(k)?.at_path(rest, r, gaps)
     }
 }
 
@@ -348,15 +384,16 @@ fn usable_weights(weights: &[f32], n: usize) -> bool {
         && weights.iter().sum::<f32>().is_finite()
 }
 
-/// `rect` cut along `axis` by `weights`, GAP pixels between pieces; the last
-/// piece absorbs the rounding.
-pub fn split_rect(rect: Rect, weights: &[f32], axis: Orientation) -> Vec<Rect> {
+/// `rect` cut along `axis` by `weights`, `gap` pixels between pieces; the
+/// last piece absorbs the rounding.
+fn split_gap(rect: Rect, weights: &[f32], axis: Orientation, gap: i32) -> Vec<Rect> {
+    let gap = gap.max(0);
     let (x, y, w, h) = rect;
     let n = weights.len().max(1) as i32;
     let total: f32 = weights.iter().sum::<f32>().max(f32::EPSILON);
     let avail = match axis {
-        Orientation::Row => w - GAP * (n - 1),
-        Orientation::Column => h - GAP * (n - 1),
+        Orientation::Row => w - gap * (n - 1),
+        Orientation::Column => h - gap * (n - 1),
     }
     .max(0) as f32;
     let mut out = Vec::with_capacity(weights.len());
@@ -378,7 +415,7 @@ pub fn split_rect(rect: Rect, weights: &[f32], axis: Orientation) -> Vec<Rect> {
             Orientation::Row => (cursor, y, len, h),
             Orientation::Column => (x, cursor, w, len),
         });
-        cursor += len + GAP;
+        cursor += len + gap;
     }
     out
 }
@@ -396,7 +433,7 @@ mod tests {
         let mut t = Node::single();
         t.split(0, Row, 1);
         t.split(1, Column, 2);
-        let r = t.rects(C, 3);
+        let r = t.rects_spaced(C, 3, Gaps::HAIRLINE);
         assert_eq!(r[0], (0, 0, 200, 201), "left pane keeps full height");
         assert_eq!(r[1], (201, 0, 200, 100), "right top");
         assert_eq!(r[2], (201, 101, 200, 100), "right bottom");
@@ -417,7 +454,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         // the split pane and its new sibling share the split pane's size
-        let r = t.rects(C, 3);
+        let r = t.rects_spaced(C, 3, Gaps::HAIRLINE);
         assert!((r[0].2 - 200).abs() <= 1, "{r:?}");
         assert!((r[1].2 - r[2].2).abs() <= 2, "{r:?}");
     }
@@ -488,7 +525,7 @@ mod tests {
         let mut t = Node::single();
         t.split(0, Row, 1);
         t.split(1, Column, 2);
-        let ds = t.dividers(C);
+        let ds = t.dividers_spaced(C, Gaps::HAIRLINE);
         assert_eq!(ds.len(), 2);
         assert_eq!((ds[0].axis, ds[0].path.clone()), (Row, vec![]));
         assert_eq!((ds[1].axis, ds[1].path.clone()), (Column, vec![1]));
@@ -503,25 +540,28 @@ mod tests {
         );
         // drag the inner divider down: only the right column changes
         let d = ds[1].clone();
-        t.drag(&d, C, 150.0);
-        let r = t.rects(C, 3);
+        t.drag_spaced(&d, C, 150.0, Gaps::HAIRLINE);
+        let r = t.rects_spaced(C, 3, Gaps::HAIRLINE);
         assert_eq!(r[0], (0, 0, 200, 201));
         assert!(r[1].3 > r[2].3, "top grew: {r:?}");
         // drag the outer one: the left pane narrows, the column widens
-        let d = t.dividers(C)[0].clone();
-        t.drag(&d, C, 120.0);
-        let r = t.rects(C, 3);
+        let d = t.dividers_spaced(C, Gaps::HAIRLINE)[0].clone();
+        t.drag_spaced(&d, C, 120.0, Gaps::HAIRLINE);
+        let r = t.rects_spaced(C, 3, Gaps::HAIRLINE);
         assert!(r[0].2 < r[1].2, "{r:?}");
         // the drag never makes a pane unusably small
-        let d = t.dividers(C)[0].clone();
-        t.drag(&d, C, 0.0);
-        assert!(t.rects(C, 3)[0].2 >= 79);
+        let d = t.dividers_spaced(C, Gaps::HAIRLINE)[0].clone();
+        t.drag_spaced(&d, C, 0.0, Gaps::HAIRLINE);
+        assert!(t.rects_spaced(C, 3, Gaps::HAIRLINE)[0].2 >= 79);
     }
 
     #[test]
     fn flat_reads_old_session_files_and_rejects_bad_weights() {
         let t = Node::flat(Column, &[3.0, 1.0], 2);
-        assert_eq!(t.rects((0, 0, 100, 401), 2)[0].3, 300);
+        assert_eq!(
+            t.rects_spaced((0, 0, 100, 401), 2, Gaps::HAIRLINE)[0].3,
+            300
+        );
         assert_eq!(
             Node::flat(Row, &[f32::NAN, 1.0], 2),
             Node::flat(Row, &[1.0, 1.0], 2)
@@ -570,7 +610,7 @@ mod tests {
         // reaches `flat`, not `valid_for`; an infinite total makes NaN rects
         let flat = Node::flat(Row, &[f32::MAX, f32::MAX], 2);
         assert_eq!(flat, Node::flat(Row, &[], 2));
-        for (x, y, w, h) in flat.rects(C, 2) {
+        for (x, y, w, h) in flat.rects_spaced(C, 2, Gaps::HAIRLINE) {
             assert!(x >= 0 && y >= 0 && w > 0 && h > 0, "{:?}", (x, y, w, h));
         }
         // a large but finite sum is still the user's split
@@ -582,5 +622,28 @@ mod tests {
                 weights: vec![3.0, 1.0],
             }
         );
+    }
+
+    #[test]
+    fn a_side_by_side_seam_holds_a_scrollbar_between_the_grids() {
+        let mut t = Node::single();
+        t.split(0, Row, 1);
+        let gaps = Gaps {
+            beside: 8,
+            stacked: 1,
+        };
+        let r = t.rects_spaced(C, 2, gaps);
+        let seam = r[1].0 - (r[0].0 + r[0].2);
+        assert_eq!(seam, 8);
+        assert!(r[0].0 + r[0].2 <= r[1].0);
+        // the hairline layout is unchanged, so a hidden bar does not move columns
+        let hair = t.rects_spaced(C, 2, Gaps::HAIRLINE);
+        assert_eq!(hair[1].0 - (hair[0].0 + hair[0].2), 1);
+        let stacked = {
+            let mut s = Node::single();
+            s.split(0, Column, 1);
+            s.rects_spaced((0, 0, 100, 401), 2, gaps)
+        };
+        assert_eq!(stacked[1].1 - (stacked[0].1 + stacked[0].3), 1);
     }
 }

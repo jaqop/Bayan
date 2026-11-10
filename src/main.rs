@@ -2766,6 +2766,34 @@ impl App {
         ))
     }
 
+    /// Side-by-side seam, wide enough for the scrollbar when one is shown.
+    /// A hidden bar, or no padding to sit in, keeps the one-pixel seam so
+    /// the grid (and the ConPTY column count) does not move.
+    pub(crate) fn split_gaps(&self) -> layout::Gaps {
+        let room = self.scrollbar_gutter();
+        if room <= 1 {
+            layout::Gaps::HAIRLINE
+        } else {
+            layout::Gaps {
+                beside: room,
+                stacked: 1,
+            }
+        }
+    }
+
+    /// Bar thickness that fits in the padding. Never wider than the padding,
+    /// so the outer bar cannot enter the grid.
+    pub(crate) fn scrollbar_gutter(&self) -> i32 {
+        if self.config.scrollbar.side() == scrollbar::Side::Hidden {
+            return 0;
+        }
+        let pad = self.config.padding_px();
+        if pad <= 0 {
+            return 0;
+        }
+        self.config.scrollbar.width_px().min(pad)
+    }
+
     /// Pane rects for the active tab within the window's content area.
     fn pane_rects(&self) -> Vec<render::Rect> {
         let (Some(content), Some(t)) = (self.content_rect(), self.tabs.get(self.active)) else {
@@ -2774,7 +2802,8 @@ impl App {
         if t.zoomed && t.panes.len() > 1 {
             zoom_rects(content, t.panes.len(), t.focused)
         } else {
-            t.layout.rects(content, t.panes.len())
+            t.layout
+                .rects_spaced(content, t.panes.len(), self.split_gaps())
         }
     }
 
@@ -2782,7 +2811,7 @@ impl App {
     pub(crate) fn dividers(&self) -> Vec<layout::Divider> {
         match (self.content_rect(), self.tabs.get(self.active)) {
             (Some(content), Some(t)) if t.panes.len() > 1 && !t.zoomed => {
-                t.layout.dividers(content)
+                t.layout.dividers_spaced(content, self.split_gaps())
             }
             _ => Vec::new(),
         }
@@ -2797,6 +2826,7 @@ impl App {
         let Some(content) = self.content_rect() else {
             return;
         };
+        let gaps = self.split_gaps();
         let Some(t) = self.tabs.get_mut(self.active) else {
             return;
         };
@@ -2804,7 +2834,7 @@ impl App {
             Orientation::Row => pos.x,
             Orientation::Column => pos.y,
         };
-        t.layout.drag(&d, content, p);
+        t.layout.drag_spaced(&d, content, p, gaps);
         self.relayout_active();
         self.request_redraw();
     }
@@ -2830,7 +2860,9 @@ impl App {
                     continue; // zoomed away: keep the size it had
                 }
                 let g = TermSize {
-                    cols: ((rect.2 as f32 / cw) as usize).max(10),
+                    // the grid only: the scrollbar lives in the padding or
+                    // the seam, so it is not a column
+                    cols: scrollbar::grid_columns(rect.2, cw),
                     rows: ((rect.3 as f32 / ch) as usize).max(3),
                 };
                 pane.session.resize(g);
@@ -4549,6 +4581,8 @@ impl App {
             }
         });
         let rects = self.pane_rects();
+        let sb_content = self.content_rect();
+        let sb_pad = self.config.padding_px();
         // the bar shows the active group's tabs only
         let tab_infos: Vec<render::TabInfo> = self
             .visible_tabs()
@@ -4685,13 +4719,19 @@ impl App {
                     let side = self.config.scrollbar.side();
                     let width = self.config.scrollbar.width_px();
                     let autohide = self.config.scrollbar.autohide_on();
+                    let room = sb_content
+                        .map(|c| scrollbar::room_px(pi, &rects, side, c, sb_pad))
+                        .unwrap_or(0);
                     let now = Instant::now();
                     self.bars.observe(pane.id, off as usize, now);
                     let engaged = self.bars.hover == Some(pane.id) || self.bars.dragging(pane.id);
                     if scrollbar::shown(autohide, engaged, self.bars.last_of(pane.id), now) {
-                        if let Some(geom) = scrollbar::layout(*rect, side, width, place, alt) {
-                            renderer
-                                .draw_scrollbar(&mut verts, *rect, geom.track, geom.thumb, engaged);
+                        if let Some(geom) = scrollbar::layout(*rect, side, width, room, place, alt)
+                        {
+                            // clip to the gutter, so a quad cannot land on a cell
+                            renderer.draw_scrollbar(
+                                &mut verts, geom.track, geom.track, geom.thumb, engaged,
+                            );
                             self.bars.mark_painted(pane.id);
                         }
                     }

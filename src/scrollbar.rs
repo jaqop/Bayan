@@ -1,4 +1,4 @@
-//! A thin scrollbar on the edge of each pane.
+//! A thin scrollbar beside each pane, in the padding or the split seam.
 //!
 //! The thumb is a pure function of how much history exists, how many lines
 //! the viewport shows, and `display_offset` (0 is the live bottom, the same
@@ -7,10 +7,12 @@
 //! as its per-pane remainder. Zero, the default, leaves the thumb on the
 //! whole line, so this module does not need to know about pixels.
 //!
-//! The bar is hidden when there is nothing to scroll, on the alternate
-//! screen, and when `scrollbar.position` is `"hidden"`. It is drawn by the
-//! window with the ordinary quad pipeline. A press on the bar scrolls;
-//! a press anywhere else is left to the program, including mouse reports.
+//! The bar is never drawn on a grid cell. It sits in the gutter just outside
+//! the pane: the window padding on an outer edge (the default 10px holds the
+//! default 8px bar), or the widened seam between side-by-side panes. It is
+//! hidden when there is nothing to scroll, on the alternate screen, and when
+//! `scrollbar.position` is `"hidden"`. A press on the bar scrolls; a press
+//! on a cell, including the last column, is left to the program.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -21,6 +23,8 @@ pub const IDLE: Duration = Duration::from_secs(1);
 pub const DEFAULT_WIDTH: i32 = 8;
 pub const MIN_WIDTH: i32 = 2;
 pub const MAX_WIDTH: i32 = 24;
+/// A long history must still leave a thumb you can grab.
+pub const MIN_THUMB: i32 = 16;
 
 /// Pixel rect: x, y, width, height. The same tuple the renderer uses.
 pub type Rect = (i32, i32, i32, i32);
@@ -126,16 +130,18 @@ impl Place {
     }
 
     /// Thumb top and height inside a track that starts at `track_y`.
-    /// Height is `track * viewport / total`. Offset 0 pins the thumb to the
+    /// Height is `track * viewport / total`, and at least `min_px` (the
+    /// caller passes `max(16, bar width)`). Offset 0 pins the thumb to the
     /// bottom; the maximum offset pins it to the top.
-    pub fn thumb(self, track_y: i32, track_h: i32) -> Option<(i32, i32)> {
+    pub fn thumb(self, track_y: i32, track_h: i32, min_px: i32) -> Option<(i32, i32)> {
         let max_off = self.max_offset()?;
         if track_h <= 1 {
             return None;
         }
+        let min_px = min_px.max(1).min(track_h - 1);
         let mut thumb_h =
             (track_h as f32 * self.viewport as f32 / self.total as f32).round() as i32;
-        thumb_h = thumb_h.clamp(1, track_h - 1);
+        thumb_h = thumb_h.clamp(min_px, track_h - 1);
         let pos = (self.display_offset as f32 + self.fraction()).clamp(0.0, max_off as f32);
         let travel = (track_h - thumb_h) as f32;
         let y = if pos <= 0.0 {
@@ -157,27 +163,103 @@ pub struct Geom {
     pub thumb: Rect,
 }
 
-/// The bar for one pane, or `None` when it must not be drawn: no scrollback,
-/// the alternate screen, a hidden position, or a pane too small to hold it.
-pub fn layout(pane: Rect, side: Side, width: i32, place: Place, alt_screen: bool) -> Option<Geom> {
-    if alt_screen || side == Side::Hidden || width <= 0 {
+/// True when the two rects share any pixel. Empty rects do not.
+pub fn intersects(a: Rect, b: Rect) -> bool {
+    let (ax, ay, aw, ah) = a;
+    let (bx, by, bw, bh) = b;
+    aw > 0
+        && ah > 0
+        && bw > 0
+        && bh > 0
+        && ax < bx + bw
+        && bx < ax + aw
+        && ay < by + bh
+        && by < ay + ah
+}
+
+/// Pixels of gutter on `side` of pane `index`: the seam until the next
+/// pane, or the window padding when this pane is the outer one. `content`
+/// is the cell area; `pad` is the padding outside it.
+pub fn room_px(index: usize, panes: &[Rect], side: Side, content: Rect, pad: i32) -> i32 {
+    let Some(&(x, y, w, h)) = panes.get(index) else {
+        return 0;
+    };
+    if w <= 0 || h <= 0 {
+        return 0;
+    }
+    let pad = pad.max(0);
+    let overlaps = |pane: Rect| pane.1 < y + h && y < pane.1 + pane.3;
+    match side {
+        Side::Hidden => 0,
+        Side::Right => {
+            let edge = x + w;
+            let mut limit = content.0 + content.2 + pad;
+            for (i, pane) in panes.iter().copied().enumerate() {
+                if i == index || pane.2 <= 0 || pane.3 <= 0 || !overlaps(pane) {
+                    continue;
+                }
+                if pane.0 >= edge {
+                    limit = limit.min(pane.0);
+                }
+            }
+            (limit - edge).max(0)
+        }
+        Side::Left => {
+            let mut limit = content.0 - pad;
+            for (i, pane) in panes.iter().copied().enumerate() {
+                if i == index || pane.2 <= 0 || pane.3 <= 0 || !overlaps(pane) {
+                    continue;
+                }
+                if pane.0 + pane.2 <= x {
+                    limit = limit.max(pane.0 + pane.2);
+                }
+            }
+            (x - limit).max(0)
+        }
+    }
+}
+
+/// ConPTY columns for a grid of `grid_px`. The scrollbar is not in that
+/// width, so it does not change the count.
+pub fn grid_columns(grid_px: i32, cell_w: f32) -> usize {
+    if cell_w <= 0.0 {
+        return 10;
+    }
+    ((grid_px as f32 / cell_w) as usize).max(10)
+}
+
+/// The bar for one pane, drawn in the `room` pixels just outside `grid`.
+/// `None` when it must not be drawn: no scrollback, the alternate screen, a
+/// hidden position, or no gutter (the bar is never placed on a cell).
+pub fn layout(
+    grid: Rect,
+    side: Side,
+    width: i32,
+    room: i32,
+    place: Place,
+    alt_screen: bool,
+) -> Option<Geom> {
+    if alt_screen || side == Side::Hidden || width <= 0 || room <= 0 {
         return None;
     }
-    let (x, y, w, h) = pane;
+    let (x, y, w, h) = grid;
     if w <= 1 || h <= 1 {
         return None;
     }
-    let (thumb_y, thumb_h) = place.thumb(y, h)?;
-    let width = width.min(w);
+    let used = width.min(room);
+    let min_thumb = MIN_THUMB.max(used);
+    let (thumb_y, thumb_h) = place.thumb(y, h, min_thumb)?;
     let track_x = match side {
-        Side::Left => x,
-        Side::Right => x + w - width,
+        Side::Left => x - used,
+        Side::Right => x + w,
         Side::Hidden => return None,
     };
-    Some(Geom {
-        track: (track_x, y, width, h),
-        thumb: (track_x, thumb_y, width, thumb_h),
-    })
+    let track = (track_x, y, used, h);
+    let thumb = (track_x, thumb_y, used, thumb_h);
+    if intersects(track, grid) || intersects(thumb, grid) {
+        return None;
+    }
+    Some(Geom { track, thumb })
 }
 
 /// What a pointer on the bar is over.
@@ -365,6 +447,7 @@ mod tests {
             (10, 20, 200, 100),
             Side::Right,
             8,
+            10,
             place(100, 25, offset),
             false,
         )
@@ -374,9 +457,11 @@ mod tests {
     #[test]
     fn thumb_height_is_viewport_over_total_and_the_ends_pin() {
         let bottom = bar(0);
-        assert_eq!(bottom.track, (202, 20, 8, 100));
-        // 100 * 25/100 = 25, flush with the bottom of the pane.
-        assert_eq!(bottom.thumb, (202, 95, 8, 25));
+        // just outside the grid, in the padding: grid ends at x = 210
+        assert_eq!(bottom.track, (210, 20, 8, 100));
+        assert!(!intersects(bottom.track, (10, 20, 200, 100)));
+        // 100 * 25/100 = 25, flush with the bottom of the track.
+        assert_eq!(bottom.thumb, (210, 95, 8, 25));
         let top = bar(75);
         assert_eq!(top.thumb.1, 20, "the oldest line puts the thumb at the top");
         assert_eq!(top.thumb.3, 25);
@@ -388,46 +473,59 @@ mod tests {
     fn no_scrollback_and_the_alternate_screen_and_hidden_draw_nothing() {
         let pane = (0, 0, 200, 100);
         let full = place(40, 40, 0);
-        assert_eq!(layout(pane, Side::Right, 8, full, false), None);
-        assert_eq!(layout(pane, Side::Right, 8, place(10, 40, 0), false), None);
-        assert_eq!(layout(pane, Side::Right, 8, place(0, 0, 0), false), None);
+        assert_eq!(layout(pane, Side::Right, 8, 10, full, false), None);
         assert_eq!(
-            layout(pane, Side::Right, 8, place(100, 25, 10), true),
+            layout(pane, Side::Right, 8, 10, place(10, 40, 0), false),
+            None
+        );
+        assert_eq!(
+            layout(pane, Side::Right, 8, 10, place(0, 0, 0), false),
+            None
+        );
+        assert_eq!(
+            layout(pane, Side::Right, 8, 10, place(100, 25, 10), true),
             None,
             "the alternate screen has no scrollbar"
         );
         assert_eq!(
-            layout(pane, Side::Hidden, 8, place(100, 25, 10), false),
+            layout(pane, Side::Hidden, 8, 10, place(100, 25, 10), false),
             None
         );
         assert_eq!(
-            layout((0, 0, 0, 0), Side::Right, 8, place(100, 25, 0), false),
+            layout((0, 0, 0, 0), Side::Right, 8, 10, place(100, 25, 0), false),
             None
+        );
+        assert_eq!(
+            layout(pane, Side::Right, 8, 0, place(100, 25, 10), false),
+            None,
+            "no gutter means no bar, rather than a bar on the cells"
         );
     }
 
     #[test]
-    fn the_bar_sits_on_the_configured_edge() {
+    fn the_bar_sits_in_the_gutter_beside_the_configured_edge() {
         let pane = (10, 20, 200, 100);
         let p = place(100, 25, 0);
-        let left = layout(pane, Side::Left, 8, p, false).unwrap();
-        assert_eq!(left.track.0, 10);
-        assert_eq!(left.thumb.0, 10);
-        let right = layout(pane, Side::Right, 8, p, false).unwrap();
-        assert_eq!(right.track.0, 202);
-        // a wide setting cannot leave the pane
-        let wide = layout(pane, Side::Left, 500, p, false).unwrap();
-        assert_eq!(wide.track.2, 200);
+        let left = layout(pane, Side::Left, 8, 10, p, false).unwrap();
+        assert_eq!(left.track, (2, 20, 8, 100));
+        assert!(!intersects(left.track, pane));
+        let right = layout(pane, Side::Right, 8, 10, p, false).unwrap();
+        assert_eq!(right.track.0, 210);
+        // wider than the gutter: stay inside the padding, never on the cells
+        let wide = layout(pane, Side::Left, 500, 10, p, false).unwrap();
+        assert_eq!(wide.track, (0, 20, 10, 100));
+        assert!(!intersects(wide.track, pane));
     }
 
     #[test]
     fn a_zero_fraction_matches_the_integer_offset_and_a_remainder_moves_the_thumb() {
         let pane = (0, 0, 80, 100);
-        let whole = layout(pane, Side::Right, 4, place(10, 5, 0), false).unwrap();
+        let whole = layout(pane, Side::Right, 4, 10, place(10, 5, 0), false).unwrap();
         let explicit = layout(
             pane,
             Side::Right,
             4,
+            10,
             place(10, 5, 0).with_fraction(0.0),
             false,
         )
@@ -439,12 +537,13 @@ mod tests {
             pane,
             Side::Right,
             4,
+            10,
             place(10, 5, 0).with_fraction(0.5),
             false,
         )
         .unwrap();
         assert_eq!(frac.thumb.1, 45);
-        let next = layout(pane, Side::Right, 4, place(10, 5, 1), false).unwrap();
+        let next = layout(pane, Side::Right, 4, 10, place(10, 5, 1), false).unwrap();
         assert_eq!(next.thumb.1, 40);
         assert!(frac.thumb.1 > next.thumb.1 && frac.thumb.1 < whole.thumb.1);
         // 1.0 was already carried into the offset; NaN is not a position.
@@ -452,6 +551,7 @@ mod tests {
             pane,
             Side::Right,
             4,
+            10,
             place(10, 5, 0).with_fraction(1.0),
             false,
         )
@@ -461,6 +561,7 @@ mod tests {
             pane,
             Side::Right,
             4,
+            10,
             place(10, 5, 0).with_fraction(f32::NAN),
             false,
         )
@@ -470,7 +571,7 @@ mod tests {
 
     #[test]
     fn an_offset_past_the_top_still_pins_the_thumb_there() {
-        let geom = layout((0, 0, 80, 100), Side::Right, 4, place(10, 5, 99), false).unwrap();
+        let geom = layout((0, 0, 80, 100), Side::Right, 4, 10, place(10, 5, 99), false).unwrap();
         assert_eq!(geom.thumb.1, 0);
     }
 
@@ -480,23 +581,23 @@ mod tests {
         let geom = bar(37);
         let (thumb_y, thumb_h) = (geom.thumb.1, geom.thumb.3);
         assert!(thumb_y > geom.track.1 && thumb_y + thumb_h < geom.track.1 + geom.track.3);
-        assert_eq!(hit(&geom, 202.0, thumb_y as f64 + 1.0), Some(Part::Thumb));
-        assert_eq!(hit(&geom, 209.9, thumb_y as f64 - 1.0), Some(Part::Above));
+        assert_eq!(hit(&geom, 210.0, thumb_y as f64 + 1.0), Some(Part::Thumb));
+        assert_eq!(hit(&geom, 217.9, thumb_y as f64 - 1.0), Some(Part::Above));
         assert_eq!(
-            hit(&geom, 205.0, (thumb_y + thumb_h) as f64 + 1.0),
+            hit(&geom, 214.0, (thumb_y + thumb_h) as f64 + 1.0),
             Some(Part::Below)
         );
         // one pixel into the cells: the program keeps that click
-        assert_eq!(hit(&geom, 201.9, thumb_y as f64 + 1.0), None);
-        assert_eq!(hit(&geom, 210.0, 70.0), None);
-        assert_eq!(hit(&geom, 205.0, 19.0), None);
+        assert_eq!(hit(&geom, 209.9, thumb_y as f64 + 1.0), None);
+        assert_eq!(hit(&geom, 218.0, 70.0), None);
+        assert_eq!(hit(&geom, 214.0, 19.0), None);
         // flush with an end, that side of the track is gone
         let at_bottom = bar(0);
-        assert_eq!(hit(&at_bottom, 205.0, 100.0), Some(Part::Thumb));
-        assert_eq!(hit(&at_bottom, 205.0, 30.0), Some(Part::Above));
+        assert_eq!(hit(&at_bottom, 214.0, 100.0), Some(Part::Thumb));
+        assert_eq!(hit(&at_bottom, 214.0, 30.0), Some(Part::Above));
         let at_top = bar(75);
-        assert_eq!(hit(&at_top, 205.0, 20.0), Some(Part::Thumb));
-        assert_eq!(hit(&at_top, 205.0, 90.0), Some(Part::Below));
+        assert_eq!(hit(&at_top, 214.0, 20.0), Some(Part::Thumb));
+        assert_eq!(hit(&at_top, 214.0, 90.0), Some(Part::Below));
     }
 
     #[test]
@@ -610,5 +711,79 @@ mod tests {
                 wake: None
             }
         );
+    }
+
+    #[test]
+    fn a_click_on_the_last_column_reaches_that_cell_shown_or_hidden() {
+        let grid = (0, 0, 100, 80);
+        let cell_w = 10.0;
+        let cell_h = 16.0;
+        let cols = (grid.2 as f64 / cell_w).floor() as usize;
+        let x = (cols as f64 - 0.5) * cell_w;
+        let y = cell_h * 0.5;
+        let cell = crate::mouse::cell_at(x, y, &[grid], cell_w, cell_h).unwrap();
+        assert_eq!(cell.col, cols - 1);
+        assert_eq!(cell.row, 0);
+        let shown = layout(grid, Side::Right, 8, 10, place(200, 20, 40), false).unwrap();
+        assert!(
+            !intersects(shown.track, grid),
+            "the hit rect is not on the grid"
+        );
+        assert!(!intersects(shown.thumb, grid));
+        // Visible and auto-hidden share this gutter. Neither claims the cell.
+        assert_eq!(hit(&shown, x, y), None, "visible");
+        assert_eq!(hit(&shown, x, y), None, "auto-hidden");
+        assert!(layout(grid, Side::Hidden, 8, 10, place(200, 20, 40), false).is_none());
+        // the padding just outside the last column is the bar
+        assert!(hit(&shown, grid.2 as f64 + 1.0, y).is_some());
+    }
+
+    #[test]
+    fn the_gutter_is_the_padding_or_the_seam_and_misses_the_grid() {
+        let content = (10, 10, 208, 100);
+        let panes = [(10, 10, 100, 100), (118, 10, 100, 100)];
+        assert_eq!(room_px(0, &panes, Side::Right, content, 10), 8);
+        assert_eq!(room_px(1, &panes, Side::Right, content, 10), 10);
+        assert_eq!(room_px(1, &panes, Side::Left, content, 10), 8);
+        assert_eq!(room_px(0, &panes, Side::Left, content, 10), 10);
+        let left_bar = layout(panes[0], Side::Right, 8, 8, place(80, 20, 10), false).unwrap();
+        let right_bar = layout(panes[1], Side::Right, 8, 10, place(80, 20, 10), false).unwrap();
+        assert!(!intersects(left_bar.track, panes[0]));
+        assert!(!intersects(left_bar.track, panes[1]));
+        assert!(!intersects(right_bar.track, panes[0]));
+        assert!(!intersects(right_bar.track, panes[1]));
+    }
+
+    #[test]
+    fn a_long_history_keeps_a_thumb_at_least_sixteen_or_the_bar_width() {
+        let slim = layout(
+            (0, 0, 80, 400),
+            Side::Right,
+            8,
+            10,
+            place(100_000, 40, 0),
+            false,
+        )
+        .unwrap();
+        assert_eq!(slim.thumb.3, MIN_THUMB);
+        assert!(slim.thumb.3 >= 8);
+        let wide = layout(
+            (0, 0, 80, 400),
+            Side::Right,
+            20,
+            24,
+            place(100_000, 40, 0),
+            false,
+        )
+        .unwrap();
+        assert_eq!(wide.thumb.3, 20);
+        assert!(!intersects(slim.track, (0, 0, 80, 400)));
+    }
+
+    #[test]
+    fn columns_follow_the_grid_width_and_ignore_the_bar() {
+        assert_eq!(grid_columns(800, 10.0), 80);
+        assert_eq!(grid_columns(8, 10.0), 10, "the floor stays ten");
+        assert_eq!(grid_columns(100, 0.0), 10);
     }
 }

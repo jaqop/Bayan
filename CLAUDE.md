@@ -27,19 +27,20 @@ selection and BiDi paths must do.
 | `lang.rs` | interface language (Arabic default, English): `tr("عربي", "English")` pairs at the point of use, `rtl()`, `lead_x`/`trail_x` for which edge text starts from |
 | `keys.rs` | keyboard → VT byte sequences (ported from EasyTer) |
 | `kitty.rs` | kitty keyboard protocol encoder, layout-aware alternate keys |
-| `layout.rs` | a tab's split tree: side-by-side and stacked splits nest in any mix; leaves index the tab's flat pane list |
+| `layout.rs` | a tab's split tree: side-by-side and stacked splits nest in any mix; leaves index the tab's flat pane list. The side-by-side seam widens to hold a scrollbar |
 | `groups.rs` | tab groups: a group id TAG on each tab (tabs never move in the flat list), the group order and labels, the stay-in-group close rule |
 | `localpath.rs` | no-follow walk: is a drive path local in every component, links read but not followed (link probe, new-tab cwd) |
 | `mru.rs` | most-recently-used tab order for Ctrl+Tab, walkable within one group |
 | `shells.rs` | installed-shell detection (ported from EasyTer's `profiles.py`) |
 | `posh.rs` | oh-my-posh theme picker with a live ANSI preview |
 | `plugins.rs` | declarative JSON plugin host (`~/.bayan/plugins/`) |
-| `config.rs` | `~/.bayan/config.json`, optional and BOM-tolerant |
+| `scrollbar.rs` | per-pane scrollbar in the padding or the split seam: thumb from viewport/total and `display_offset`, hit-tested only outside the grid |
+| `config.rs` | `~/.bayan/config.json`, optional and BOM-tolerant. `scrollbar.position` (`right`/`left`/`hidden`), `scrollbar.width`, `scrollbar.autohide` |
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-494 tests across the tree. `term.rs` (81), `link.rs` (61) and `render.rs` (64)
-carry the most; `localpath.rs` has 21.
+509 tests across the tree. `term.rs` (81), `link.rs` (61) and `render.rs` (64)
+carry the most; `localpath.rs` has 21. `scrollbar.rs` has 14.
 
 ## Invariants — do not "simplify" these
 

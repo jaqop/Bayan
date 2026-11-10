@@ -891,7 +891,8 @@ key falls back to a sane default:
   "hide_single_tab": true, "confirm_close": true, "osc52": "off",
   "editor": "code -g {file}:{line}:{col}", "tab_switch": "recent",
   "keybinds": { "new-tab": "ctrl+shift+n" },
-  "keyboard": { "kitty_protocol": false, "kitty_base_layout_fallback": true }
+  "keyboard": { "kitty_protocol": false, "kitty_base_layout_fallback": true },
+  "scrollbar": { "position": "right", "width": 8, "autohide": true }
 }
 ```
 
@@ -901,6 +902,17 @@ those sequences (an ssh host, a `cat`'d file, an install script). When on,
 the toast's title is always «بيان · tab» and the program's text is cleaned
 and capped. Bayan's own toasts (a long command finished, the bell) follow
 `notifications` and need no opt-in.
+
+`scrollbar.position` is `right` (the default, in Arabic and in English),
+`left`, or `hidden`. `scrollbar.width` is the thickness in pixels, clamped
+to 2–24, default 8. `scrollbar.autohide` (default on) drops the bar one
+second after the last scroll or hover. The bar is drawn in the window
+padding, or in the side-by-side seam, never on a grid cell, so the last
+column stays visible and clickable. The ConPTY column count is still the
+grid width divided by the cell width. It is hidden with no scrollback and
+on the alternate screen. The thumb is at least 16px, or the bar's width
+when that is wider. A sub-line `fraction` on the scroll position defaults
+to 0 so smooth scroll can pass its remainder later.
 
 Shell and scrollback apply to new tabs (no terminal restarts a live
 session); everything else applies immediately. `osc52` is config-file
