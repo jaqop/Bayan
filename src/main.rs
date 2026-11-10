@@ -5154,6 +5154,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::RendererReady(r) => {
                 crate::prof::mark("renderer ready");
+                term::set_query_colors(r.query_colors());
                 self.renderer = Some(*r);
                 self.renderer_building = false;
                 // now that cell metrics exist, snap every pane to its rect
