@@ -10,9 +10,29 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-/// Shown by `--help`. The directory spellings are `#45`'s; the rest is new.
+/// Shown by `--help`. Arabic first, then the same switches in English.
+/// The directory spellings are `#45`'s; the rest is new.
 pub const HELP: &str = concat!(
-    "Bayan (بيان) ",
+    "بيان ",
+    env!("CARGO_PKG_VERSION"),
+    "\n\n",
+    "\
+الاستخدام:
+  bayan [-d | --cwd <مجلد>] [-p | --profile <اسم>] [-- <أمر>...]
+  bayan --register-context-menu
+  bayan --unregister-context-menu
+
+  -d, --cwd <مجلد>       مجلد التبويب الذي يفتحه هذا الأمر
+  -p, --profile <اسم>    صدفة ذلك التبويب (اسمها أو أمرها)
+  -- <أمر>...            تشغيل هذا البرنامج بدل الصدفة
+  --register-context-menu
+                         إضافة «افتح بيان هنا» للمستخدم الحالي
+  --unregister-context-menu
+                         إزالة ذلك البند من المستكشف
+  -h, --help             هذه المساعدة
+  -V, --version          رقم الإصدار
+
+Bayan ",
     env!("CARGO_PKG_VERSION"),
     "\n\n",
     "\
@@ -27,7 +47,7 @@ usage:
       --profile=<name>     The same, as one argument
       -- <command>...      Run this program in that tab instead of the shell
       --register-context-menu
-                           Add \"Open Bayan here\" for the current user
+                           Add «افتح بيان هنا» for the current user
       --unregister-context-menu
                            Remove that Explorer entry
   -h, --help               Show this help
@@ -41,10 +61,11 @@ come back first and this tab is the active one.
 
 Explorer registration writes only
 HKCU\\Software\\Classes\\Directory\\shell\\Bayan and
-Directory\\Background\\shell\\Bayan. It does not write HKLM and does not
-ask for an administrator. Windows 11's top-level menu needs package
-identity (MSIX, a later installer); this entry shows under
-\"Show more options\".
+Directory\\Background\\shell\\Bayan. The command is
+\"<exe>\" -d \"%V\\.\" so a drive root does not end in a backslash before
+the closing quote. It does not write HKLM and does not ask for an
+administrator. Windows 11's top-level menu needs package identity
+(MSIX, a later installer); this entry shows under \"Show more options\".
 "
 );
 
@@ -137,7 +158,7 @@ where
                     args.next()
                         .ok_or_else(|| format!("{a} needs a folder\n{USAGE}"))?,
                 )?;
-                directory = Some(v);
+                directory = Some(normalize_start_dir(&v));
             }
             "-p" | "--profile" => {
                 let v = text(
@@ -150,7 +171,7 @@ where
                 profile = Some(v);
             }
             _ => match a.strip_prefix("--cwd=") {
-                Some(v) => directory = Some(v.to_string()),
+                Some(v) => directory = Some(normalize_start_dir(v)),
                 None => match a.strip_prefix("--profile=") {
                     Some(v) if !v.trim().is_empty() => profile = Some(v.to_string()),
                     Some(_) => {
@@ -182,10 +203,38 @@ where
     }))
 }
 
-/// `#45`'s folder gate, unchanged: `std::path::absolute` (string work, so a
-/// UNC name is not opened here), then `accept_local_cwd`, then
-/// `usable_spawn_dir`. A refused folder is an error, not a fall back to home.
+/// Undo the two ways a drive root arrives broken.
+///
+/// `"<exe>" -d "%V"` at `C:\` is parsed by `CommandLineToArgvW` as `C:"`
+/// (the backslash escapes the closing quote). The registered form
+/// `"<exe>" -d "%V\."` expands that same root to `C:\\.` (the slash in `%V`
+/// plus the slash in the template). A stray trailing quote is dropped, `X:`
+/// after that quote is the drive root, and a repeated backslash on a drive
+/// path is collapsed. A path that starts with `\\` is left alone so a UNC
+/// folder is still refused.
+pub fn normalize_start_dir(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let stripped = trimmed.strip_suffix('"').unwrap_or(trimmed);
+    let bytes = stripped.as_bytes();
+    if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return format!("{}:\\", stripped.chars().next().unwrap_or('C'));
+    }
+    if stripped.starts_with('\\') || stripped.starts_with('/') {
+        return stripped.to_string();
+    }
+    let mut collapsed = stripped.to_string();
+    while collapsed.contains("\\\\") {
+        collapsed = collapsed.replace("\\\\", "\\");
+    }
+    collapsed
+}
+
+/// `#45`'s folder gate: [`normalize_start_dir`], then `std::path::absolute`
+/// (string work, so a UNC name is not opened here), then `accept_local_cwd`,
+/// then `usable_spawn_dir`. A refused folder is an error, not a fall back to home.
 pub fn gate_start_dir(raw: &str) -> Result<String, String> {
+    let raw_owned = normalize_start_dir(raw);
+    let raw = raw_owned.as_str();
     std::path::absolute(raw)
         .ok()
         .and_then(|p| p.to_str().and_then(crate::term::accept_local_cwd))
@@ -424,6 +473,56 @@ mod tests {
         assert!(command.command_line.contains("arg with space"));
     }
 
+    /// CommandLineToArgvW: backslashes are literal unless they precede a quote.
+    /// An odd run before a quote emits a literal quote and does not close it,
+    /// which is how `"C:\"` arrives as `C:"`.
+    fn split_windows_command_line(cmd: &str) -> Vec<String> {
+        let chars: Vec<char> = cmd.chars().collect();
+        let mut i = 0;
+        let mut args = Vec::new();
+        while i < chars.len() {
+            while i < chars.len() && (chars[i] == ' ' || chars[i] == '\t') {
+                i += 1;
+            }
+            if i >= chars.len() {
+                break;
+            }
+            let mut cur = String::new();
+            let mut in_quotes = false;
+            while i < chars.len() {
+                if chars[i] == '\\' {
+                    let start = i;
+                    while i < chars.len() && chars[i] == '\\' {
+                        i += 1;
+                    }
+                    let slashes = i - start;
+                    if i < chars.len() && chars[i] == '"' {
+                        cur.extend(std::iter::repeat_n('\\', slashes / 2));
+                        if slashes % 2 == 1 {
+                            cur.push('"');
+                            i += 1;
+                        }
+                    } else {
+                        cur.extend(std::iter::repeat_n('\\', slashes));
+                    }
+                    continue;
+                }
+                if chars[i] == '"' {
+                    in_quotes = !in_quotes;
+                    i += 1;
+                    continue;
+                }
+                if (chars[i] == ' ' || chars[i] == '\t') && !in_quotes {
+                    break;
+                }
+                cur.push(chars[i]);
+                i += 1;
+            }
+            args.push(cur);
+        }
+        args
+    }
+
     #[test]
     fn the_menu_command_quotes_spaces_arabic_and_a_verbatim_prefix() {
         assert_eq!(
@@ -431,5 +530,59 @@ mod tests {
             r"C:\Program Files\بيان\bayan.exe"
         );
         assert!(exe_display(Path::new("C:\\a\"b\\bayan.exe")).is_err());
+    }
+
+    #[test]
+    fn windows_argv_of_a_drive_root_a_spaced_path_a_unc_path_and_a_folder() {
+        // `"C:\"` is what Explorer handed `-d "%V"` at a drive root.
+        let broken = split_windows_command_line(r#""C:\bayan.exe" -d "C:\""#);
+        assert_eq!(broken[2], "C:\"");
+        assert_eq!(normalize_start_dir(&broken[2]), r"C:\");
+        assert_eq!(gate_start_dir(&broken[2]).unwrap(), r"C:\");
+        assert_eq!(launch(&["-d", "C:\""]).directory.as_deref(), Some(r"C:\"));
+
+        // `%V\.` at `C:\` is `C:\\.` (the root's own slash plus the template's).
+        let registered = crate::context_menu::context_menu_command(Path::new(r"C:\bayan.exe"))
+            .unwrap()
+            .replace("%V", r"C:\");
+        let root = split_windows_command_line(&registered);
+        assert_eq!(root[2], r"C:\\.");
+        assert_eq!(normalize_start_dir(&root[2]), r"C:\.");
+        assert_eq!(gate_start_dir(&root[2]).unwrap(), r"C:\");
+
+        let spaced = split_windows_command_line(
+            r#""C:\Program Files\Bayan\bayan.exe" -d "C:\Program Files\مشروع""#,
+        );
+        assert_eq!(spaced[0], r"C:\Program Files\Bayan\bayan.exe");
+        assert_eq!(spaced[2], r"C:\Program Files\مشروع");
+        assert_eq!(normalize_start_dir(&spaced[2]), r"C:\Program Files\مشروع");
+        assert_eq!(
+            crate::term::accept_local_cwd(&spaced[2]).as_deref(),
+            Some(r"C:\Program Files\مشروع")
+        );
+        let spaced_menu =
+            crate::context_menu::context_menu_command(Path::new(r"C:\Program Files\bayan.exe"))
+                .unwrap()
+                .replace("%V", r"C:\Program Files");
+        let spaced_root = split_windows_command_line(&spaced_menu);
+        assert_eq!(spaced_root[2], r"C:\Program Files\.");
+        assert_eq!(
+            crate::term::accept_local_cwd(&normalize_start_dir(&spaced_root[2])).as_deref(),
+            Some(r"C:\Program Files")
+        );
+
+        let unc = split_windows_command_line(r#""C:\bayan.exe" -d "\\server\share\secret""#);
+        assert_eq!(unc[2], r"\\server\share\secret");
+        assert!(
+            gate_start_dir(&unc[2]).is_err(),
+            "a UNC folder is still refused"
+        );
+
+        let normal = split_windows_command_line(r#""C:\bayan.exe" -d "C:\Windows""#);
+        assert_eq!(normal[2], r"C:\Windows");
+        assert_eq!(
+            gate_start_dir(&normal[2]).unwrap(),
+            crate::term::accept_local_cwd(r"C:\Windows").unwrap()
+        );
     }
 }

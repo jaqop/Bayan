@@ -1014,9 +1014,10 @@ profile, by its name or its command (`PowerShell`, `PowerShell سريع`,
 `cmd.exe`). `-- <command>...` runs that program in the tab instead.
 `--help` and `--version` print and exit. An unknown argument is an error.
 
-`bayan --register-context-menu` adds **Open Bayan here** for the current user
+`bayan --register-context-menu` adds **افتح بيان هنا** for the current user
 under `HKCU\Software\Classes\Directory\shell\Bayan` and
-`Directory\Background\shell\Bayan`, with the command `"<exe>" -d "%V"`.
+`Directory\Background\shell\Bayan`, with the command `"<exe>" -d "%V\."`.
+The `\.` keeps a drive root from arriving as `C:"`.
 `--unregister-context-menu` removes both. This does not write HKLM and does
 not ask for an administrator. Windows 11's top-level menu needs package
 identity (MSIX, later); until then the entry is under **Show more options**.

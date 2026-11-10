@@ -5598,7 +5598,8 @@ fn run(startup: Startup) -> Result<(), String> {
     // Optional installer / settings hook: the key is absent unless someone
     // set it. Failure here must not stop the terminal from opening.
     if let Some(enabled) = cfg.explorer_context_menu {
-        if let Err(error) = context_menu::set_enabled(enabled) {
+        // Skip the write when the verbs already match this exe, or are already gone.
+        if let Err(error) = context_menu::sync_enabled(enabled) {
             eprintln!("bayan: Explorer menu: {error}");
         }
     }
