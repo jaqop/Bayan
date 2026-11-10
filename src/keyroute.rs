@@ -16,7 +16,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 
 use crate::input::zoomed;
-use crate::{key_letter, keybinds, keyboard_zoom, link, App};
+use crate::{copymode, key_letter, keybinds, keyboard_zoom, link, App};
 
 /// Which open overlay a key press belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +33,8 @@ pub(crate) enum KeyOwner {
     Settings,
     Cockpit,
     Search,
+    /// The focused pane is in copy mode (`copymode.rs`).
+    CopyMode,
 }
 
 /// The overlays that are open right now.
@@ -47,6 +49,7 @@ pub(crate) struct Open {
     pub settings: bool,
     pub cockpit: bool,
     pub search: bool,
+    pub copy_mode: bool,
 }
 
 /// The guards first, then the link card, then the panels from the most
@@ -62,6 +65,7 @@ pub(crate) fn key_owner(open: &Open) -> Option<KeyOwner> {
         (open.settings, KeyOwner::Settings),
         (open.cockpit, KeyOwner::Cockpit),
         (open.search, KeyOwner::Search),
+        (open.copy_mode, KeyOwner::CopyMode),
     ]
     .into_iter()
     .find_map(|(is_open, owner)| is_open.then_some(owner))
@@ -163,6 +167,7 @@ impl App {
             settings: self.settings.is_some(),
             cockpit: self.cockpit,
             search: self.search.is_some(),
+            copy_mode: self.term_mode().contains(TermMode::VI),
         }
     }
 
@@ -252,7 +257,90 @@ impl App {
             KeyOwner::Settings => self.settings_input(event),
             KeyOwner::Cockpit => self.cockpit_input(event),
             KeyOwner::Search => self.search_input(event, shift),
+            KeyOwner::CopyMode => self.copy_mode_key(event, shift),
         }
+    }
+
+    /// Ctrl+Shift+X: the focused pane enters copy mode with the cursor where
+    /// the shell's is, or leaves it.
+    pub(crate) fn toggle_copy_mode(&mut self) {
+        let entering = !self.term_mode().contains(TermMode::VI);
+        if entering {
+            if let Some(s) = self.session() {
+                let mut t = s.term.lock();
+                t.selection = None;
+                t.toggle_vi_mode();
+            }
+            self.clear_link_hover();
+            self.request_redraw();
+        } else {
+            self.exit_copy_mode();
+        }
+    }
+
+    /// Leave copy mode: the selection goes and the view returns to the
+    /// prompt, where typing would have taken it anyway.
+    fn exit_copy_mode(&mut self) {
+        if let Some(s) = self.session() {
+            let mut t = s.term.lock();
+            if t.mode().contains(TermMode::VI) {
+                t.toggle_vi_mode();
+            }
+            t.selection = None;
+            t.scroll_display(Scroll::Bottom);
+        }
+        self.invalidate_focused_links();
+        self.request_redraw();
+    }
+
+    /// A press while the focused pane is in copy mode. Nothing reaches the
+    /// PTY: a key copy mode does not know is swallowed.
+    fn copy_mode_key(&mut self, event: &KeyEvent, shift: bool) {
+        use copymode::Cmd;
+        let ctrl = self.modifiers.control_key();
+        let rtl = self.copy_cursor_rtl();
+        let Some(cmd) = copymode::command(event.physical_key, &event.logical_key, ctrl, shift, rtl)
+        else {
+            return;
+        };
+        match cmd {
+            Cmd::CopyAndExit => {
+                self.copy_selection(false);
+                self.exit_copy_mode();
+                return;
+            }
+            Cmd::Exit => {
+                self.exit_copy_mode();
+                return;
+            }
+            _ => {}
+        }
+        if let Some(s) = self.session() {
+            copymode::apply(&mut s.term.lock(), cmd);
+        }
+        self.invalidate_focused_links();
+        self.request_redraw();
+    }
+
+    /// Whether the copy-mode cursor sits on a cell the last frame laid right
+    /// to left. It asks the shaped layout, never the column index, because on
+    /// an RTL row the logical column is not the visual x.
+    fn copy_cursor_rtl(&self) -> bool {
+        let (Some(r), Some(t)) = (self.renderer.as_ref(), self.tabs.get(self.active)) else {
+            return false;
+        };
+        let Some(rect) = self.pane_rects().get(t.focused).copied() else {
+            return false;
+        };
+        let Some(s) = self.session() else {
+            return false;
+        };
+        let (row, col) = {
+            let t = s.term.lock();
+            let p = t.vi_mode_cursor.point;
+            (p.line.0 + t.grid().display_offset() as i32, p.column.0)
+        };
+        row >= 0 && r.cell_rtl(rect, row as usize, col)
     }
 
     /// Esc dismisses. Enter dismisses a refusal and opens only a confirm
@@ -441,7 +529,7 @@ mod tests {
     use winit::keyboard::SmolStr;
 
     #[test]
-    fn guards_beat_cards_which_beat_panels_and_search_comes_last() {
+    fn guards_beat_cards_which_beat_panels_and_copy_mode_comes_last() {
         assert_eq!(key_owner(&Open::default()), None);
         let all = Open {
             close_guard: true,
@@ -453,6 +541,7 @@ mod tests {
             settings: true,
             cockpit: true,
             search: true,
+            copy_mode: true,
         };
         let order = [
             KeyOwner::CloseGuard,
@@ -464,6 +553,7 @@ mod tests {
             KeyOwner::Settings,
             KeyOwner::Cockpit,
             KeyOwner::Search,
+            KeyOwner::CopyMode,
         ];
         // close each owner in turn: the next one in line takes over
         let mut open = all;
@@ -479,6 +569,7 @@ mod tests {
                 KeyOwner::Settings => open.settings = false,
                 KeyOwner::Cockpit => open.cockpit = false,
                 KeyOwner::Search => open.search = false,
+                KeyOwner::CopyMode => open.copy_mode = false,
             }
         }
         assert_eq!(key_owner(&open), None);

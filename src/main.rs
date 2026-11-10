@@ -11,6 +11,7 @@ mod bidi;
 mod bidi_ctl;
 mod chrome;
 mod config;
+mod copymode;
 mod gpu;
 mod groups;
 mod input;
@@ -561,6 +562,15 @@ fn tab_label(base: &str, broadcast: bool, hidden: usize) -> String {
         label.push_str(&format!(" +{hidden}"));
     }
     label
+}
+
+/// The top-right bar: the search query while searching (search owns the
+/// keys then, even in copy mode), else the copy-mode hint, else nothing.
+fn bar_text(search: Option<&str>, copy_mode: bool) -> Option<String> {
+    match search {
+        Some(q) => Some(format!("{}: {q}_", tr("بحث", "Search"))),
+        None => copy_mode.then(|| copymode::hint().to_string()),
+    }
 }
 
 /// Which panes besides the focused one hear typed input. Broadcast with a
@@ -2190,6 +2200,7 @@ impl App {
             NewGroup => self.new_group(),
             NextGroup => self.step_group(false),
             PrevGroup => self.step_group(true),
+            CopyMode => self.toggle_copy_mode(),
         }
     }
 
@@ -4539,6 +4550,7 @@ impl App {
                 let bordered = tab.panes.len() > 1 && !tab.zoomed;
                 let (auto_follow, claude_manual) = (self.auto_follow, self.claude_manual);
                 let mut focused_claude = false;
+                let mut focused_copy = false;
                 for (pi, (pane, rect)) in tab.panes.iter().zip(&rects).enumerate() {
                     if !rect_visible(rect) {
                         continue; // a pane zoomed away is not drawn
@@ -4579,8 +4591,12 @@ impl App {
                         } else {
                             bidi::cmd_is_claude(&running_cmd)
                         };
+                    // copy mode: a solid block that does not blink, so the
+                    // cursor reads as the selection's, not the shell's
+                    let copy_mode = t.mode().contains(TermMode::VI);
                     if focused {
                         focused_claude = claude_pane;
+                        focused_copy = copy_mode;
                     }
                     let history = t.grid().history_size() as u64;
                     let off = t.grid().display_offset() as u64;
@@ -4604,8 +4620,12 @@ impl App {
                     let view = render::PaneView {
                         rect: *rect,
                         focused,
-                        cursor: cursor_style,
-                        cursor_on,
+                        cursor: if copy_mode {
+                            config::CursorStyle::Block
+                        } else {
+                            cursor_style
+                        },
+                        cursor_on: cursor_on || copy_mode,
                         bordered,
                         claude: claude_pane,
                         claude_from: if alt || !auto_follow {
@@ -4634,7 +4654,8 @@ impl App {
                     px.width as usize,
                     px.height as usize,
                     &tab_infos,
-                    self.search.as_ref().map(|s| s.query.as_str()),
+                    bar_text(self.search.as_ref().map(|s| s.query.as_str()), focused_copy)
+                        .as_deref(),
                     focused_claude,
                 );
                 if self.cockpit {
