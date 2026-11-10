@@ -11,7 +11,7 @@
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::TermMode;
 use std::time::Instant;
-use winit::event::{ElementState, KeyEvent};
+use winit::event::{ElementState, Ime, KeyEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 
@@ -65,6 +65,33 @@ pub(crate) fn key_owner(open: &Open) -> Option<KeyOwner> {
     ]
     .into_iter()
     .find_map(|(is_open, owner)| is_open.then_some(owner))
+}
+
+/// Where IME-committed text goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitTo {
+    Pane,
+    Search,
+    /// A guard, card or panel owns the keys: text must not reach the PTY
+    /// behind it, and these overlays have no text field that takes it.
+    Drop,
+}
+
+pub(crate) fn commit_target(owner: Option<KeyOwner>) -> CommitTo {
+    match owner {
+        None => CommitTo::Pane,
+        Some(KeyOwner::Search) => CommitTo::Search,
+        Some(
+            KeyOwner::CloseGuard
+            | KeyOwner::PasteGuard
+            | KeyOwner::LinkCard
+            | KeyOwner::Posh
+            | KeyOwner::Palette
+            | KeyOwner::Shortcuts
+            | KeyOwner::Settings
+            | KeyOwner::Cockpit,
+        ) => CommitTo::Drop,
+    }
 }
 
 /// Enter is `Some(true)`, Esc `Some(false)`, anything else `None`.
@@ -166,11 +193,68 @@ impl App {
         }
     }
 
+    /// IME composition and commits: CJK input, the emoji panel, dictation.
+    pub(crate) fn ime_input(&mut self, ime: Ime) {
+        match ime {
+            Ime::Preedit(text, _) => self.set_preedit(Some(text)),
+            Ime::Disabled => self.set_preedit(None),
+            Ime::Enabled => {}
+            Ime::Commit(text) => {
+                self.set_preedit(None);
+                match commit_target(key_owner(&self.open_overlays())) {
+                    CommitTo::Pane => self.send_text(text.as_bytes()),
+                    CommitTo::Search => self.search_push(&text),
+                    CommitTo::Drop => {}
+                }
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn set_preedit(&mut self, text: Option<String>) {
+        if let Some(r) = self.renderer.as_mut() {
+            r.preedit = text.filter(|t| !t.is_empty());
+        }
+    }
+
+    fn composing(&self) -> bool {
+        self.renderer.as_ref().is_some_and(|r| r.preedit.is_some())
+    }
+
+    /// Committed text to the focused pane and the broadcast targets, as
+    /// typing would send it: snap to the bottom, drop the selection.
+    fn send_text(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.last_input = Instant::now();
+        let mut targets = self.broadcast_targets();
+        if let Some(t) = self.tabs.get(self.active) {
+            targets.push(t.focused);
+        }
+        for pi in targets {
+            let Some(pane) = self.tabs[self.active].panes.get_mut(pi) else {
+                continue;
+            };
+            {
+                let mut t = pane.session.term.lock();
+                t.selection = None;
+                t.scroll_display(Scroll::Bottom);
+            }
+            pane.session.write(bytes);
+        }
+        self.invalidate_focused_links();
+    }
+
     fn key_pressed(&mut self, event: &KeyEvent, el: &ActiveEventLoop) {
         // Assume the press is swallowed until bytes actually go out. Every
         // early return above the write leaves the key here, so its release
         // stays out of the PTY too.
         self.note_held_away(event);
+        // the IME owns every key while it composes
+        if self.composing() {
+            return;
+        }
         let m = self.modifiers;
         let (ctrl, shift, alt) = (m.control_key(), m.shift_key(), m.alt_key());
         // BAYAN-010: that a key went down, and its modifiers — never which
@@ -439,6 +523,28 @@ impl App {
 mod tests {
     use super::*;
     use winit::keyboard::SmolStr;
+
+    #[test]
+    fn ime_text_reaches_the_pane_or_search_and_nothing_behind_a_guard() {
+        assert_eq!(commit_target(None), CommitTo::Pane);
+        assert_eq!(commit_target(Some(KeyOwner::Search)), CommitTo::Search);
+        for owner in [
+            KeyOwner::CloseGuard,
+            KeyOwner::PasteGuard,
+            KeyOwner::LinkCard,
+            KeyOwner::Palette,
+            KeyOwner::Settings,
+        ] {
+            assert_eq!(commit_target(Some(owner)), CommitTo::Drop, "{owner:?}");
+        }
+        // a pending paste beats search: the commit must not slip past it
+        let both = Open {
+            paste_guard: true,
+            search: true,
+            ..Open::default()
+        };
+        assert_eq!(commit_target(key_owner(&both)), CommitTo::Drop);
+    }
 
     #[test]
     fn guards_beat_cards_which_beat_panels_and_search_comes_last() {

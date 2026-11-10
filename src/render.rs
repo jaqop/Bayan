@@ -1605,6 +1605,13 @@ pub struct Renderer {
     pub hover_caption: Option<usize>,
     /// pointer over the settings gear
     pub hover_gear: bool,
+    /// IME composition text, drawn at the focused cursor. winit keeps the
+    /// IME's own composition window hidden, so this is the only place
+    /// the text being composed shows.
+    pub preedit: Option<String>,
+    /// The focused cursor's box from the last frame (x, y, w, h): where
+    /// the IME candidate window should sit.
+    pub ime_spot: Option<(i32, i32, i32, i32)>,
     font_system: FontSystem,
     cache: SwashCache,
     metrics: Metrics,
@@ -1763,6 +1770,8 @@ impl Renderer {
             mapping_context: None,
             hover_caption: None,
             hover_gear: false,
+            preedit: None,
+            ime_spot: None,
             font_system,
             cache: SwashCache::new(),
             metrics,
@@ -1832,6 +1841,7 @@ impl Renderer {
         self.cell_geometry.clear();
         self.row_hits.clear();
         self.mapping_context = None;
+        self.ime_spot = None;
     }
 
     fn ui_cell_w(&self) -> f32 {
@@ -3019,10 +3029,33 @@ impl Renderer {
             }
         }
 
+        // IME: the candidate window follows the focused cursor, and the
+        // composition text covers it, blink or not
+        let mut composing = false;
+        if view.focused && cursor_vrow >= 0 && (cursor_vrow as usize) < rows {
+            let (x0, wpx) = cursor_rect.unwrap_or((
+                px + (ccol as f32 * self.cell_w).round() as i32,
+                self.cell_w.round() as i32,
+            ));
+            let y0 = py + (cursor_vrow as f32 * self.cell_h).round() as i32;
+            let hpx = self.cell_h.round() as i32;
+            self.ime_spot = Some((x0, y0, wpx, hpx));
+            if let Some(text) = self.preedit.clone().filter(|t| !t.is_empty()) {
+                let segs = [Seg::plain(text, self.fg)];
+                let w = self.measure(&segs, true).ceil() as i32;
+                push_rect(out, clip, x0, y0, w, hpx, c4(self.bg, 255));
+                self.draw_run(&segs, true, out, clip, x0 as f32, y0, 1.0);
+                let uh = ((self.cell_h * 0.08).round() as i32).max(1);
+                push_rect(out, clip, x0, y0 + hpx - uh, w, uh, c4(self.fg, 230));
+                composing = true;
+            }
+        }
+
         // cursor: only the focused pane shows it (the block is translucent,
         // so the glyph stays legible); grid rows are column-exact, Arabic
         // rows map through the shaped layout
         if view.focused
+            && !composing
             && view.cursor_on
             && cursor.shape != alacritty_terminal::vte::ansi::CursorShape::Hidden
             && cursor_vrow >= 0
@@ -6129,6 +6162,82 @@ mod tests {
                 "{text}: cursor {cursor:?} must sit left of the whole line (x={left})"
             );
         }
+    }
+
+    #[test]
+    fn ime_composition_covers_the_cursor_and_anchors_the_candidates() {
+        use alacritty_terminal::{
+            event::VoidListener,
+            term::{Config, Term},
+            vte::ansi::Processor,
+        };
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 40, rows: 3 };
+        let mut t = Term::new(Config::default(), &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        p.advance(&mut t, b"ab");
+        let pane = (0, 0, 600, 120);
+        let view = PaneView {
+            rect: pane,
+            focused: true,
+            cursor: crate::config::CursorStyle::Block,
+            cursor_on: true,
+            bordered: false,
+            claude: false,
+            claude_from: None,
+            reorder: true,
+            line_dir: &[],
+            search_match: None,
+            marks: &[],
+            link_hover: None,
+            link_tip: None,
+        };
+        let block = c4(r.fg, 170);
+        let opaque_bg = c4(r.bg, 255);
+        let spot = (
+            (2.0 * r.cell_w).round() as i32,
+            0,
+            r.cell_w.round() as i32,
+            r.cell_h.round() as i32,
+        );
+
+        let mut plain = Vec::new();
+        r.begin_frame();
+        r.draw_pane(&mut plain, &view, &t);
+        assert_eq!(r.ime_spot, Some(spot), "the candidates sit at the cursor");
+        assert!(plain.iter().any(|v| v.color == block));
+
+        r.preedit = Some("日本".into());
+        let mut composing = Vec::new();
+        r.begin_frame();
+        r.draw_pane(&mut composing, &view, &t);
+        assert_eq!(r.ime_spot, Some(spot));
+        assert!(
+            !composing.iter().any(|v| v.color == block),
+            "the cursor block gives way to the composition"
+        );
+        let cover = composing
+            .iter()
+            .filter(|v| v.color == opaque_bg)
+            .map(|v| v.pos[0])
+            .fold(f32::MIN, f32::max);
+        assert!(
+            cover >= spot.0 as f32 + 2.0 * r.cell_w - 1.0,
+            "the backing reaches past both wide glyphs ({cover})"
+        );
+        assert!(
+            composing.len() > plain.len(),
+            "the composed glyphs are drawn"
+        );
+
+        // blink off: the composition still shows
+        let off = PaneView {
+            cursor_on: false,
+            ..view
+        };
+        let mut blink = Vec::new();
+        r.draw_pane(&mut blink, &off, &t);
+        assert!(blink.iter().any(|v| v.color == opaque_bg));
     }
 
     #[test]
