@@ -36,10 +36,11 @@ selection and BiDi paths must do.
 | `plugins.rs` | declarative JSON plugin host (`~/.bayan/plugins/`) |
 | `config.rs` | `~/.bayan/config.json`, optional and BOM-tolerant |
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
+| `a11y.rs` | screen-reader tree: each pane is a document in logical order, with the caret, the selection, and a coalesced live region (AccessKit, which speaks UIA on Windows) |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-494 tests across the tree. `term.rs` (81), `link.rs` (61) and `render.rs` (64)
-carry the most; `localpath.rs` has 21.
+502 tests across the tree. `term.rs` (81), `link.rs` (61) and `render.rs` (64)
+carry the most; `localpath.rs` has 21; `a11y.rs` has 8.
 
 ## Invariants — do not "simplify" these
 
@@ -141,6 +142,17 @@ because Explorer and the Start menu often hand a process `System32`, and
 except when it is Bayan's own folder (Explorer's default cwd — a pane opened
 in Downloads would let cmd run a planted `git.bat`). It passes the same
 `accept_local_cwd` + `usable_spawn_dir` gate as every other start directory.
+
+**The accessibility tree stays off the paint hot path.** AccessKit does not
+call the builder until a screen reader connects (`update_if_active` is a
+no-op otherwise). The terminal lock is held only long enough to copy the
+visible cells; Claude restoration and the node tree happen after it is
+dropped. Pane text is logical grid order, so Arabic is read as the program
+emitted it — not the visually reordered line the shaper draws. Claude rows
+use the same visual→logical map as copy. A burst of output is one
+announcement per 500ms (the tail, not every line), and an OSC 133 finish
+replaces that tail with the exit code. Do not build this tree from a
+redraw that has no reader, and do not hand it shaped glyphs.
 
 **Two performance properties are load-bearing.** The shaped-run cache reshapes
 only changed lines (~1.5ms → ~4µs on a cached frame). Differential redraw skips

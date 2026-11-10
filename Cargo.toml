@@ -46,6 +46,12 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_SystemInformation", # GetSystemDirectoryW: loaded kernel32 must sit under System32
     "Win32_System_IO", # DeviceIoControl: read a link's target without following it (localpath.rs)
 ] }
+# Screen readers (NVDA, JAWS, Narrator) via UI Automation. accesskit_winit's
+# Windows backend is accesskit_windows; default features stay off so the
+# Windows build does not pull the AT-SPI/unix adapter. The tree is built
+# only after a client connects (`Adapter::update_if_active`).
+accesskit = "0.25.2"
+accesskit_winit = { version = "0.34.2", default-features = false, features = ["rwh_06"] }
 
 [features]
 # BAYAN_* environment debug hooks (BAYAN_TYPE, BAYAN_PASTE, BAYAN_PROFILE, …)

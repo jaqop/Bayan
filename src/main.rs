@@ -7,6 +7,7 @@
 // release builds are pure GUI apps: no companion console window
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod a11y;
 mod bidi;
 mod bidi_ctl;
 mod chrome;
@@ -400,6 +401,15 @@ pub enum UserEvent {
         reason: String,
         shown: String,
     },
+    /// AccessKit: a reader connected, asked for an action, or disconnected.
+    /// The proxy path delivers these; the tree is built only on the first.
+    AccessKit(accesskit_winit::Event),
+}
+
+impl From<accesskit_winit::Event> for UserEvent {
+    fn from(event: accesskit_winit::Event) -> Self {
+        UserEvent::AccessKit(event)
+    }
 }
 
 /// The link under the pointer. Stable while the pointer stays inside it,
@@ -1496,6 +1506,26 @@ struct App {
     debug_paste: Option<String>,
     /// `--cwd`'s folder, already gated, until the first tab opens in it.
     start_dir: Option<String>,
+    /// UI Automation adapter. `None` until the window exists. Tree builds
+    /// run only inside `update_if_active`, which is a no-op with no reader.
+    a11y: Option<accesskit_winit::Adapter>,
+    /// Epoch for the announcer's millisecond clock.
+    a11y_origin: Instant,
+    /// When the held output burst may be spoken. `about_to_wait` wakes then.
+    a11y_deadline: Option<Instant>,
+    a11y_gate: a11y::OutputGate,
+    /// Document text last given to the tree. Held still across a flood.
+    a11y_bodies: Vec<a11y::PaneItem>,
+    /// Focused pane the gate is diffing. A change resets the gate.
+    a11y_pane: Option<u64>,
+    /// Last command line seen while it was running, for the finish sentence.
+    a11y_cmd: String,
+    /// OSC 133 mark already observed. A new absolute row is a new finish.
+    a11y_mark: Option<u64>,
+    /// The mark present when a reader first looked is not announced.
+    a11y_mark_ready: bool,
+    /// Last live-region name. Unchanged text does not raise another event.
+    a11y_live: Option<String>,
 }
 
 impl App {
@@ -3476,13 +3506,26 @@ impl App {
     /// both: the application already ordered the text, so this pane does
     /// not reorder.
     fn claude_active(&self) -> bool {
-        let Some(s) = self.session() else {
+        let Some(tab) = self.tabs.get(self.active) else {
             return false;
         };
-        // term first, then meta — the crate's lock order
-        let alt = s.term.lock().mode().contains(TermMode::ALT_SCREEN);
+        let Some(pane) = tab.panes.get(tab.focused) else {
+            return false;
+        };
+        self.pane_claude(pane)
+    }
+
+    /// Claude restoration for one pane. Term lock, then meta, never both:
+    /// the same order as every other pane read.
+    fn pane_claude(&self, pane: &Pane) -> bool {
+        let alt = pane
+            .session
+            .term
+            .lock()
+            .mode()
+            .contains(TermMode::ALT_SCREEN);
         let (bidi_state, running) = {
-            let m = s.meta.lock_or_recover();
+            let m = pane.session.meta.lock_or_recover();
             (m.bidi.clone(), m.running_cmd.clone())
         };
         // Idle explicit mode (a command that forgot to reset) must not
@@ -3496,6 +3539,200 @@ impl App {
             return self.claude_manual;
         }
         bidi::cmd_is_claude(&running)
+    }
+
+    fn close_message(&self, target: CloseTarget) -> String {
+        match target {
+            CloseTarget::Pane(ti, pi) => {
+                let cmd = chrome_text(&self.running_command(ti, pi).unwrap_or_default());
+                a11y::close_pane_message(&cmd)
+            }
+            CloseTarget::Tab(ti) => {
+                let n = self
+                    .tabs
+                    .get(ti)
+                    .map(|t| {
+                        t.panes
+                            .iter()
+                            .filter(|p| !p.session.meta.lock_or_recover().running_cmd.is_empty())
+                            .count()
+                    })
+                    .unwrap_or(0);
+                a11y::close_count_message(n, true)
+            }
+            CloseTarget::Window => a11y::close_count_message(self.running_count(), false),
+        }
+    }
+
+    /// Push a full tree if a screen reader is listening. The closure is not
+    /// called otherwise, so the grid is not walked and the lock is not taken.
+    fn publish_a11y(&mut self) {
+        let Some(mut adapter) = self.a11y.take() else {
+            return;
+        };
+        let now = self.a11y_origin.elapsed().as_millis() as u64;
+        adapter.update_if_active(|| self.a11y_update(now));
+        self.a11y = Some(adapter);
+    }
+
+    fn a11y_update(&mut self, now_ms: u64) -> accesskit::TreeUpdate {
+        let view = self.a11y_view(now_ms);
+        self.a11y_deadline = self
+            .a11y_gate
+            .flush_at_ms()
+            .map(|ms| self.a11y_origin + std::time::Duration::from_millis(ms));
+        a11y::build_tree(&view)
+    }
+
+    fn a11y_view(&mut self, now_ms: u64) -> a11y::View {
+        let (vis, _) = self.visible_tabs();
+        let tabs: Vec<a11y::TabItem> = vis
+            .iter()
+            .map(|&i| a11y::TabItem {
+                index: i,
+                name: self.tabs[i].label(),
+                selected: i == self.active,
+            })
+            .collect();
+        let active = self.active;
+        let focused = self.tabs.get(active).map(|t| t.focused).unwrap_or(0);
+        let mut bodies = Vec::new();
+        let mut focused_lines = Vec::new();
+        let mut focused_id = None;
+        let mut finished = None;
+        let mut running = String::new();
+        if let Some(tab) = self.tabs.get(active) {
+            let count = tab.panes.len();
+            for (pi, pane) in tab.panes.iter().enumerate() {
+                let claude = self.pane_claude(pane);
+                // Copy under the lock, then restore BiDi and build nodes
+                // after it is released. A reader must not stall the PTY.
+                let raw = {
+                    let term = pane.session.term.lock();
+                    a11y::copy_pane(&term)
+                };
+                let text = a11y::pane_text(raw, claude);
+                if pi == focused {
+                    focused_id = Some(pane.id);
+                    focused_lines = text.lines.iter().map(|line| line.text.clone()).collect();
+                    let meta = pane.session.meta.lock_or_recover();
+                    running = meta.running_cmd.clone();
+                    finished = meta
+                        .marks
+                        .iter()
+                        .rev()
+                        .find(|mark| mark.exit.is_some())
+                        .map(|mark| (mark.abs, mark.exit));
+                }
+                bodies.push(a11y::PaneItem {
+                    index: pi,
+                    name: a11y::pane_name(pi, count),
+                    text,
+                });
+            }
+        }
+        if focused_id != self.a11y_pane {
+            self.a11y_gate.reset();
+            self.a11y_pane = focused_id;
+            self.a11y_mark = None;
+            self.a11y_mark_ready = false;
+            self.a11y_cmd.clear();
+            self.a11y_bodies.clear();
+        }
+        if !running.is_empty() {
+            self.a11y_cmd = running;
+        }
+        if let Some((abs, exit)) = finished {
+            if self.a11y_mark != Some(abs) {
+                let announce = self.a11y_mark_ready;
+                self.a11y_mark = Some(abs);
+                if announce {
+                    self.a11y_gate
+                        .command_finished(exit, &self.a11y_cmd, now_ms);
+                }
+            }
+        }
+        self.a11y_mark_ready = true;
+        let update = self.a11y_gate.push(&focused_lines, now_ms);
+        // A selection is the user's, not the flood's: show it immediately.
+        let selecting = bodies.iter().any(|pane| pane.text.selection.is_some());
+        let panes =
+            if selecting || update.refresh_document || self.a11y_bodies.len() != bodies.len() {
+                self.a11y_bodies = bodies;
+                self.a11y_bodies.clone()
+            } else {
+                self.a11y_bodies.clone()
+            };
+        if let Some(live) = update.live.clone() {
+            self.a11y_live = Some(live);
+        }
+        let palette = self.palette.as_ref().map(|p| {
+            let menu = p.menu.is_some();
+            a11y::PaletteItem {
+                name: if menu {
+                    a11y::menu_name()
+                } else {
+                    a11y::palette_name()
+                }
+                .to_string(),
+                query: p.query.clone(),
+                rows: self
+                    .palette_rows(&p.query)
+                    .into_iter()
+                    .map(|(_, label)| label)
+                    .collect(),
+                selected: p.sel,
+                menu,
+            }
+        });
+        let dialog = self.a11y_dialog();
+        a11y::View {
+            tabs,
+            active_tab: active,
+            panes,
+            focused_pane: focused,
+            live: self
+                .a11y_live
+                .clone()
+                .unwrap_or_else(|| a11y::live_name().to_string()),
+            palette,
+            dialog,
+        }
+    }
+
+    fn a11y_dialog(&self) -> Option<a11y::DialogItem> {
+        if let Some(target) = self.pending_close {
+            let name = self.close_message(target);
+            return Some(a11y::DialogItem {
+                body: name.clone(),
+                name,
+            });
+        }
+        if let Some(block) = &self.blocked_link {
+            if block.is_app_error {
+                return Some(a11y::DialogItem {
+                    name: block.reason.clone(),
+                    body: block.shown.clone(),
+                });
+            }
+            let name = format!(
+                "{} — {}",
+                link::card_title_prefix(block.confirm_uri.is_some()),
+                block.reason
+            );
+            let (ar, en) = link::card_key_lines(block.confirm_uri.is_some());
+            return Some(a11y::DialogItem {
+                name,
+                body: format!("{}\n{ar}\n{en}", block.shown),
+            });
+        }
+        let paste = self.pending_paste.as_ref()?;
+        let preview = card_preview(paste.kind, &paste.text);
+        let shown = preview.first().map(String::as_str).unwrap_or("");
+        Some(a11y::DialogItem {
+            name: a11y::paste_dialog_name().to_string(),
+            body: format!("{}\n{shown}", paste.reason),
+        })
     }
 
     /// Pixel position -> (pane index, viewport row, col, cell side).
@@ -4439,6 +4676,9 @@ impl App {
     }
 
     fn redraw(&mut self) {
+        // A reader hears new output from this frame. With none connected the
+        // adapter returns before the closure, so the grid is not walked.
+        self.publish_a11y();
         // A scroll under a still pointer moves the link. Refresh only while
         // a hover is showing, and never during a drag: that path must not
         // redraw on every pixel.
@@ -4510,41 +4750,7 @@ impl App {
             let sel = p.sel.min(rows.len().saturating_sub(1));
             (p.query.clone(), rows, sel, p.menu)
         });
-        let close_msg: Option<String> = self.pending_close.map(|target| match target {
-            CloseTarget::Pane(ti, pi) => {
-                let cmd = chrome_text(&self.running_command(ti, pi).unwrap_or_default());
-                if lang::rtl() {
-                    format!("الأمر «{cmd}» ما يزال يعمل — إغلاق اللوحة؟")
-                } else {
-                    format!("“{cmd}” is still running — close the pane?")
-                }
-            }
-            CloseTarget::Tab(ti) => {
-                let n = self
-                    .tabs
-                    .get(ti)
-                    .map(|t| {
-                        t.panes
-                            .iter()
-                            .filter(|p| !p.session.meta.lock_or_recover().running_cmd.is_empty())
-                            .count()
-                    })
-                    .unwrap_or(0);
-                if lang::rtl() {
-                    format!("{n} أمر ما يزال يعمل — إغلاق التبويب؟")
-                } else {
-                    format!("{n} command(s) still running — close the tab?")
-                }
-            }
-            CloseTarget::Window => {
-                let n = self.running_count();
-                if lang::rtl() {
-                    format!("{n} أمر ما يزال يعمل — إغلاق بيان؟")
-                } else {
-                    format!("{n} command(s) still running — close Bayan?")
-                }
-            }
-        });
+        let close_msg = self.pending_close.map(|target| self.close_message(target));
         let rects = self.pane_rects();
         // the bar shows the active group's tabs only
         let tab_infos: Vec<render::TabInfo> = self
@@ -4893,8 +5099,9 @@ impl ApplicationHandler<UserEvent> for App {
         }
         // hidden until the GPU presents the first dark frame (~0.4s): a
         // fully-drawn window appearing beats a white flash while DX12 warms up.
-        // BAYAN_SHOW_NOW forces it visible at creation (for on-screen capture).
-        let visible = dev_hook("BAYAN_SHOW_NOW").is_some();
+        // BAYAN_SHOW_NOW shows it as soon as the accessibility adapter exists.
+        // AccessKit panics if the adapter is created on an already-visible window.
+        let show_now = dev_hook("BAYAN_SHOW_NOW").is_some();
         // The exe's embedded resource covers Explorer and the taskbar, but the
         // title bar and Alt-Tab read the WINDOW icon, which winit only sets if
         // we hand it pixels. Raw RGBA rather than a decoder: 16KB, no new crate,
@@ -4910,7 +5117,7 @@ impl ApplicationHandler<UserEvent> for App {
             .with_undecorated_shadow(true)
             .with_title("Bayan — بيان")
             .with_window_icon(icon)
-            .with_visible(visible)
+            .with_visible(false)
             .with_inner_size(LogicalSize::new(1100.0, 700.0));
         // yesterday's rectangle, if it is still on a connected monitor
         let monitors: Vec<(i32, i32, u32, u32)> = el
@@ -4941,6 +5148,16 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         crate::prof::mark("window created");
+        // Before the first show: a reader that connects later is answered
+        // from the UI thread, and nothing is built until then.
+        self.a11y = Some(accesskit_winit::Adapter::with_event_loop_proxy(
+            el,
+            &window,
+            self.proxy.clone(),
+        ));
+        if show_now {
+            window.set_visible(true);
+        }
         // winit turns the IME off on every new window: CJK input, the
         // emoji panel (Win+.) and dictation (Win+H) need it on
         window.set_ime_allowed(true);
@@ -5220,6 +5437,20 @@ impl ApplicationHandler<UserEvent> for App {
                 self.clear_link_hover();
                 self.request_redraw();
             }
+            UserEvent::AccessKit(event) => match event.window_event {
+                accesskit_winit::WindowEvent::InitialTreeRequested => self.publish_a11y(),
+                accesskit_winit::WindowEvent::AccessibilityDeactivated => {
+                    self.a11y_gate.reset();
+                    self.a11y_bodies.clear();
+                    self.a11y_pane = None;
+                    self.a11y_mark = None;
+                    self.a11y_mark_ready = false;
+                    self.a11y_deadline = None;
+                    self.a11y_live = None;
+                    self.a11y_cmd.clear();
+                }
+                accesskit_winit::WindowEvent::ActionRequested(_) => {}
+            },
         }
     }
 
@@ -5267,6 +5498,14 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(b) = blink_wake {
             wake = Some(wake.map_or(b, |w| w.min(b)));
         }
+        // The burst is spoken once the hold elapses, even if the pane has
+        // gone quiet and nothing else would redraw.
+        if self.a11y_deadline.is_some_and(|t| Instant::now() >= t) {
+            self.publish_a11y();
+        }
+        if let Some(at) = self.a11y_deadline {
+            wake = Some(wake.map_or(at, |w| w.min(at)));
+        }
         match wake {
             Some(t) => el.set_control_flow(ControlFlow::WaitUntil(t)),
             None => el.set_control_flow(ControlFlow::Wait),
@@ -5274,6 +5513,9 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if let (Some(adapter), Some(window)) = (self.a11y.as_mut(), self.window.as_ref()) {
+            adapter.process_event(window, &event);
+        }
         if self.modal_pointer(&event, el) {
             return;
         }
@@ -5586,6 +5828,16 @@ fn run() -> Result<(), String> {
         keys_held_away: Vec::new(),
         debug_paste: None,
         start_dir,
+        a11y: None,
+        a11y_origin: Instant::now(),
+        a11y_deadline: None,
+        a11y_gate: a11y::OutputGate::default(),
+        a11y_bodies: Vec::new(),
+        a11y_pane: None,
+        a11y_cmd: String::new(),
+        a11y_mark: None,
+        a11y_mark_ready: false,
+        a11y_live: None,
     };
     let result = event_loop.run_app(&mut app);
     if let Some(error) = app.startup_error {
