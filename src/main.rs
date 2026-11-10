@@ -14,9 +14,12 @@ mod cli;
 mod config;
 mod context_menu;
 mod copymode;
+mod elevate;
 mod gpu;
 mod groups;
+mod handoff;
 mod input;
+mod jumplist;
 mod keybinds;
 mod keyroute;
 mod keys;
@@ -1505,6 +1508,9 @@ struct App {
     start_profile_command: Option<String>,
     /// argv after `--`. When set, that program is the tab's process.
     start_command: Option<Vec<String>>,
+    /// This process token is elevated. Session restore and `config.shell`
+    /// are not consulted: both are files a standard user can write.
+    elevated: bool,
 }
 
 impl App {
@@ -1700,8 +1706,9 @@ impl App {
         if let Some(h) = self.hwnd() {
             toast::remove(h);
         }
-        // tabs + cwds greet you tomorrow
-        if !self.save_state() {
+        // tabs + cwds greet you tomorrow. An elevated window does not write
+        // session.json: that file is the next launch's command list.
+        if !self.elevated && !self.save_state() {
             // The window is about to close, so its error card cannot be seen.
             // An explicit save failure must be acknowledged before exit.
             if let Some(error) = &self.blocked_link {
@@ -2688,7 +2695,20 @@ impl App {
     }
 
     fn spawn_pane(&mut self, cwd: Option<&str>) -> Option<Pane> {
-        self.spawn_pane_command(cwd, &self.config.shell_program(), None)
+        let shell = self.spawn_shell();
+        self.spawn_pane_command(cwd, &shell, None)
+    }
+
+    /// The shell a new tab starts. Elevated windows use the profile this
+    /// process already resolved from its own detection, never `config.shell`.
+    fn spawn_shell(&self) -> String {
+        if self.elevated {
+            self.start_profile_command
+                .clone()
+                .unwrap_or_else(|| shells::elevated_default_command(&self.shell_profiles))
+        } else {
+            self.config.shell_program()
+        }
     }
 
     fn spawn_pane_command(
@@ -2724,7 +2744,8 @@ impl App {
     }
 
     fn spawn_tab(&mut self, cwd: Option<String>) {
-        self.spawn_tab_command(cwd, &self.config.shell_program(), None);
+        let shell = self.spawn_shell();
+        self.spawn_tab_command(cwd, &shell, None);
     }
 
     fn spawn_tab_command(&mut self, cwd: Option<String>, command: &str, raw: Option<&[String]>) {
@@ -3232,12 +3253,15 @@ impl App {
             || self.start_profile_command.is_some()
             || self.start_command.is_some();
         if explicit {
-            if self.config.restore_tabs.unwrap_or(false)
+            // Elevated: do not replay session.json. Its commands and folders
+            // were written by a process that was not elevated.
+            if !self.elevated
+                && self.config.restore_tabs.unwrap_or(false)
                 && load_saved_state().is_some_and(|s| !s.tabs.is_empty())
             {
                 self.restore_state();
             }
-            let default = self.config.shell_program();
+            let default = self.spawn_shell();
             let process = cli::launch_process(
                 self.start_profile_command.as_deref(),
                 self.start_command.as_deref(),
@@ -3248,6 +3272,9 @@ impl App {
                 &process.command_line,
                 process.raw_argv.as_deref(),
             );
+        } else if self.elevated {
+            let shell = self.spawn_shell();
+            self.spawn_tab_command(None, &shell, None);
         } else {
             self.restore_state();
         }
@@ -4709,6 +4736,7 @@ impl App {
                     bar_text(self.search.as_ref().map(|s| s.query.as_str()), focused_copy)
                         .as_deref(),
                     focused_claude,
+                    elevate::title_badge(self.elevated),
                 );
                 if self.cockpit {
                     renderer.draw_cockpit(
@@ -4936,7 +4964,7 @@ impl ApplicationHandler<UserEvent> for App {
             // caption buttons and handle drag/resize ourselves below.
             .with_decorations(false)
             .with_undecorated_shadow(true)
-            .with_title("Bayan — بيان")
+            .with_title(elevate::window_title(self.elevated))
             .with_window_icon(icon)
             .with_visible(visible)
             .with_inner_size(LogicalSize::new(1100.0, 700.0));
@@ -4992,6 +5020,14 @@ impl ApplicationHandler<UserEvent> for App {
             if !toast::init(h) {
                 eprintln!("bayan: tray icon registration failed — no toasts");
             }
+            if let Ok(exe) = std::env::current_exe() {
+                if let Ok(path) = cli::exe_display(&exe) {
+                    let app_id = jumplist::app_user_model_id(&path);
+                    if let Err(error) = jumplist::set_window_app_id(h, &app_id) {
+                        eprintln!("bayan: window AppUserModelID: {error}");
+                    }
+                }
+            }
         }
         // first frame NOW: a dark window on screen beats a frozen launcher.
         // The shell and the font system warm up behind it, in parallel.
@@ -5033,6 +5069,9 @@ impl ApplicationHandler<UserEvent> for App {
                             format!("{} — {}", tr("تبويب جديد", "New tab"), shell.label()),
                         )
                     }));
+                }
+                if let Err(error) = jumplist::refresh(&profiles) {
+                    eprintln!("bayan: jump list: {error}");
                 }
                 self.shell_profiles = profiles;
                 self.shell_profiles_ready = true;
@@ -5471,6 +5510,7 @@ struct Startup {
     /// `Some` when `-p` already ran shell detection, so the window does not
     /// detect a second time.
     shells: Option<Vec<shells::Shell>>,
+    elevated: bool,
 }
 
 fn main() -> std::process::ExitCode {
@@ -5504,26 +5544,82 @@ fn dispatch() -> Result<(), String> {
             present(context_menu::REMOVED_NOTE);
             Ok(())
         }
+        cli::CliAction::RegisterTerminalHandoff => {
+            handoff::set_enabled(true)?;
+            present(handoff::REGISTERED_NOTE);
+            Ok(())
+        }
+        cli::CliAction::UnregisterTerminalHandoff => {
+            handoff::set_enabled(false)?;
+            present(handoff::REMOVED_NOTE);
+            Ok(())
+        }
+        cli::CliAction::Handoff => handoff::serve(),
         cli::CliAction::Launch(launch) => {
-            // Gate the folder before shell detection: a refused path should
-            // not wait on `wsl.exe`.
-            let directory = match launch.directory {
-                Some(raw) => Some(cli::gate_start_dir(&raw)?),
-                None => None,
-            };
-            let (profile_command, shells) = match launch.profile {
-                Some(name) => {
+            let requested = launch.elevated;
+            // The badge follows the token, including a window Explorer
+            // started with "Run as administrator" and no `--elevated`.
+            // Only the flag relaunches. The token still refuses session.json
+            // and config.json's shell, which a standard user can write.
+            let elevated = requested || elevate::process_is_elevated();
+            // `--elevated` relaunches through UAC unless this process is
+            // already the elevated one. The child receives only the
+            // allowlisted argv, then resolves `-p` from its own detection.
+            let launch = if requested {
+                let forwarded = elevate::forward_args(&launch)?;
+                // A name that is not installed fails before the UAC prompt.
+                // The command that goes with it is not kept: the elevated
+                // process detects its shells again and matches the name.
+                if let Some(name) = launch.profile.as_deref() {
                     let found = shells::detect();
-                    let shell = shells::require_profile(&found, &name)?;
-                    (Some(shell.command.clone()), Some(found))
+                    shells::require_profile_by_name(&found, name)?;
                 }
-                None => (None, None),
+                if !elevate::process_is_elevated() {
+                    let exe = std::env::current_exe()
+                        .map_err(|error| format!("could not find bayan.exe: {error}"))?;
+                    elevate::relaunch(&exe, &forwarded)?;
+                    return Ok(());
+                }
+                match cli::parse(forwarded)? {
+                    cli::CliAction::Launch(clean) => clean,
+                    _ => {
+                        return Err("elevation relaunch was not a launch".into());
+                    }
+                }
+            } else {
+                launch
+            };
+            // Gate the folder before shell detection: a refused path should
+            // not wait on `wsl.exe`. An elevated launch has no folder.
+            let directory = match launch.directory {
+                Some(raw) if !elevated => Some(cli::gate_start_dir(&raw)?),
+                Some(_) | None => None,
+            };
+            let (profile_command, shells) = if elevated {
+                let found = shells::detect();
+                let command = match launch.profile.as_deref() {
+                    Some(name) => shells::require_profile_by_name(&found, name)?
+                        .command
+                        .clone(),
+                    None => shells::elevated_default_command(&found),
+                };
+                (Some(command), Some(found))
+            } else {
+                match launch.profile {
+                    Some(name) => {
+                        let found = shells::detect();
+                        let shell = shells::require_profile(&found, &name)?;
+                        (Some(shell.command.clone()), Some(found))
+                    }
+                    None => (None, None),
+                }
             };
             run(Startup {
                 directory,
                 profile_command,
-                command: launch.command,
+                command: if elevated { None } else { launch.command },
                 shells,
+                elevated,
             })
         }
     }
@@ -5540,6 +5636,14 @@ fn cli_start_dir(
 
 fn run(startup: Startup) -> Result<(), String> {
     harden_dll_search();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Ok(path) = cli::exe_display(&exe) {
+            let app_id = jumplist::app_user_model_id(&path);
+            if let Err(error) = jumplist::set_process_app_id(&app_id) {
+                eprintln!("bayan: AppUserModelID: {error}");
+            }
+        }
+    }
     prof::init();
     prof::mark("main start");
     use winit::platform::windows::EventLoopBuilderExtWindows;
@@ -5603,7 +5707,17 @@ fn run(startup: Startup) -> Result<(), String> {
             eprintln!("bayan: Explorer menu: {error}");
         }
     }
+    if let Some(enabled) = cfg.terminal_handoff {
+        if let Err(error) = handoff::set_enabled(enabled) {
+            eprintln!("bayan: terminal handoff: {error}");
+        }
+    }
     lang::set(cfg.lang());
+    if let Some(shells) = &startup.shells {
+        if let Err(error) = jumplist::refresh(shells) {
+            eprintln!("bayan: jump list: {error}");
+        }
+    }
     // debug hook: BAYAN_LANG=en starts in English without touching
     // config.json, so the English layout can be screenshot-verified
     if let Some(v) = dev_hook("BAYAN_LANG") {
@@ -5675,6 +5789,7 @@ fn run(startup: Startup) -> Result<(), String> {
         start_dir: startup.directory,
         start_profile_command: startup.profile_command,
         start_command: startup.command,
+        elevated: startup.elevated,
     };
     let result = event_loop.run_app(&mut app);
     if let Some(error) = app.startup_error {

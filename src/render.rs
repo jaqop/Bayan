@@ -5251,6 +5251,9 @@ impl Renderer {
     }
 
     /// Window-level chrome: tab bar, search bar, Claude badge.
+    /// The argument count is the frame's inputs; folding them into a struct
+    /// would touch every caller for one badge.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_chrome(
         &mut self,
         out: &mut Vec<Vertex>,
@@ -5259,6 +5262,7 @@ impl Renderer {
         tabs: &[TabInfo],
         bar_text: Option<&str>,
         claude: bool,
+        elevated_label: Option<&str>,
     ) {
         let oy = self.tab_bar_h().round() as i32;
         let whole: Rect = (0, 0, width as i32, height as i32);
@@ -5475,14 +5479,36 @@ impl Renderer {
             self.draw_title_tip(out, whole, width, tx, &full);
         }
 
+        let elevated_w = elevated_label
+            .map(|text| {
+                let segs = [Seg::plain(text, (0xf2, 0xcc, 0x60))];
+                self.measure(&segs, false).ceil() as i32 + 16
+            })
+            .unwrap_or(0);
+        let end = self
+            .tab_rects(width, &titles, active)
+            .last()
+            .map_or(0, |r| r.1 + r.2);
         if claude {
             let label = [Seg::plain("● Claude", (0x7e, 0xe7, 0x87))];
             let tw = self.measure(&label, false);
-            let x = self.tab_controls(width)[0].0 - tw.ceil() as i32 - 18;
-            let end = self
-                .tab_rects(width, &titles, active)
-                .last()
-                .map_or(0, |r| r.1 + r.2);
+            let x = self.tab_controls(width)[0].0 - tw.ceil() as i32 - 18 - elevated_w;
+            if x >= end + 12 {
+                self.draw_run(
+                    &label,
+                    false,
+                    out,
+                    whole,
+                    x as f32,
+                    (oy - self.cell_h.ceil() as i32) / 2,
+                    1.0,
+                );
+            }
+        }
+        if let Some(text) = elevated_label {
+            let label = [Seg::plain(text, (0xf2, 0xcc, 0x60))];
+            let tw = self.measure(&label, false);
+            let x = self.tab_controls(width)[0].0 - tw.ceil() as i32 - 12;
             if x >= end + 12 {
                 self.draw_run(
                     &label,
@@ -7894,7 +7920,7 @@ mod cache_tests {
         let by = r.tab_bar_h().round() + 6.0;
         let bar = |r: &mut Renderer, text: Option<&str>| -> Option<f32> {
             let mut out = Vec::new();
-            r.draw_chrome(&mut out, 1600, 600, &[], text, false);
+            r.draw_chrome(&mut out, 1600, 600, &[], text, false, None);
             out.chunks(6)
                 .find(|q| q[0].pos[1] == by)
                 .map(|q| q[1].pos[0] - q[0].pos[0])
@@ -7922,7 +7948,7 @@ mod cache_tests {
         let bar_y = r.tab_bar_h().round() - 3.0;
         let quads = |r: &mut Renderer, p: Option<Progress>| -> Vec<(f32, [f32; 4])> {
             let mut out = Vec::new();
-            r.draw_chrome(&mut out, 800, 400, &[tab(p)], None, false);
+            r.draw_chrome(&mut out, 800, 400, &[tab(p)], None, false, None);
             out.chunks(6)
                 .filter(|q| q[0].pos[1] == bar_y && q[5].pos[1] - q[0].pos[1] == 3.0)
                 .map(|q| (q[1].pos[0] - q[0].pos[0], q[0].color))

@@ -318,6 +318,52 @@ pub fn find_profile<'a>(installed: &'a [Shell], query: &str) -> Option<&'a Shell
         })
 }
 
+/// The shell an elevated `-p` name refers to.
+///
+/// Name only. A stored command (`powershell.exe`, a `wsl.exe` line, a path)
+/// does not match, even when [`find_profile`] would accept it: the elevated
+/// process must not trust a command line that arrived as text.
+pub fn find_profile_by_name<'a>(installed: &'a [Shell], query: &str) -> Option<&'a Shell> {
+    let query = query.trim();
+    if query.is_empty() {
+        return None;
+    }
+    let same = |candidate: &str| candidate == query || candidate.eq_ignore_ascii_case(query);
+    installed
+        .iter()
+        .find(|shell| same(&shell.name))
+        .or_else(|| {
+            installed
+                .iter()
+                .find(|shell| shell.command == FAST_POWERSHELL && same("PowerShell (fast)"))
+        })
+}
+
+/// [`find_profile_by_name`], or an error that names what is installed.
+pub fn require_profile_by_name<'a>(
+    installed: &'a [Shell],
+    query: &str,
+) -> Result<&'a Shell, String> {
+    find_profile_by_name(installed, query).ok_or_else(|| {
+        let names = installed
+            .iter()
+            .map(|shell| shell.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("unknown profile {query:?}; installed: {names}")
+    })
+}
+
+/// The shell an elevated window starts when no profile was named.
+/// The first entry `detect` itself offers, or PowerShell. Never a string
+/// read from config.json.
+pub fn elevated_default_command(installed: &[Shell]) -> String {
+    installed
+        .first()
+        .map(|shell| shell.command.clone())
+        .unwrap_or_else(|| crate::term::DEFAULT_SHELL.to_string())
+}
+
 /// [`find_profile`], or an error that names what is installed.
 pub fn require_profile<'a>(installed: &'a [Shell], query: &str) -> Result<&'a Shell, String> {
     find_profile(installed, query).ok_or_else(|| {
@@ -661,5 +707,48 @@ mod tests {
         assert!(find_profile(&installed, "no such shell").is_none());
         assert!(find_profile(&installed, "   ").is_none());
         assert!(require_profile(&installed, "nope").is_err());
+    }
+
+    #[test]
+    fn an_elevated_profile_matches_the_name_and_not_the_command() {
+        let installed = vec![
+            Shell::new("PowerShell", "powershell.exe"),
+            Shell::new("PowerShell سريع", FAST_POWERSHELL),
+            Shell::new("Calculator", "calc.exe"),
+            Shell::new("WSL · Ubuntu", r"C:\Windows\System32\wsl.exe -d Ubuntu"),
+        ];
+        assert_eq!(
+            find_profile_by_name(&installed, "PowerShell سريع").map(|s| s.command.as_str()),
+            Some(FAST_POWERSHELL)
+        );
+        assert_eq!(
+            find_profile_by_name(&installed, "PowerShell (fast)").map(|s| s.command.as_str()),
+            Some(FAST_POWERSHELL)
+        );
+        assert_eq!(
+            find_profile_by_name(&installed, "wsl · ubuntu").map(|s| s.name.as_str()),
+            Some("WSL · Ubuntu")
+        );
+        for command in [
+            "powershell.exe",
+            FAST_POWERSHELL,
+            "calc.exe",
+            r"C:\Windows\System32\wsl.exe -d Ubuntu",
+            r"D:\مجلد العمل\ملف.exe",
+        ] {
+            assert!(
+                find_profile_by_name(&installed, command).is_none(),
+                "{command} is a command, not a profile name"
+            );
+            assert!(require_profile_by_name(&installed, command).is_err());
+        }
+        // The ordinary -p path still accepts a command. Elevation must not.
+        assert!(find_profile(&installed, "calc.exe").is_some());
+        assert_eq!(
+            elevated_default_command(&installed),
+            "powershell.exe",
+            "config.json is not an argument of this function"
+        );
+        assert_eq!(elevated_default_command(&[]), crate::term::DEFAULT_SHELL);
     }
 }
