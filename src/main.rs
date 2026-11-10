@@ -3686,7 +3686,7 @@ impl App {
             .map(|h| h.0);
         let col = if let Some(col) = mapped {
             col
-        } else if reorder && cells.iter().any(|c| render::is_arabic(c.c)) {
+        } else if reorder && cells.iter().any(|c| render::is_rtl(c.c)) {
             let rect = rects.get(hit.pane).copied().unwrap_or((0, 0, 1, 1));
             let x = (pos.x - rect.0 as f64) as f32;
             self.renderer
