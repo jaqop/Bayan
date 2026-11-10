@@ -8055,6 +8055,8 @@ mod cache_tests {
             t
         };
         let pane = (0, 0, 800, 200);
+        type SpanBox = (i32, i32, bool);
+        type RowGeom = ((usize, usize), Vec<SpanBox>);
         let frame = |renderer: &mut Renderer, term: &Term<VoidListener>, scroll_px: i32| {
             let mut out = Vec::new();
             let view = PaneView {
@@ -8074,7 +8076,7 @@ mod cache_tests {
                 scroll_px,
             };
             renderer.draw_pane(&mut out, &view, term);
-            let mut geom: Vec<((usize, usize), Vec<(i32, i32, bool)>)> = renderer
+            let mut geom: Vec<RowGeom> = renderer
                 .cell_geometry
                 .iter()
                 .filter(|((_, row, _), _)| *row != crate::scroll::PEEK_ROW)
