@@ -1009,7 +1009,19 @@ in that folder; a relative one is taken from the current folder. It goes through
 the same gate as every start folder, and a UNC path, a mapped network drive or a
 missing folder stops Bayan with an error instead of opening somewhere else. With
 `restore_tabs` on, the saved tabs come back and the folder opens as the active
-extra tab.
+extra tab. `-p <name>` (or `--profile`) starts that tab in a detected shell
+profile, by its name or its command (`PowerShell`, `PowerShell سريع`,
+`cmd.exe`). `-- <command>...` runs that program in the tab instead.
+`--help` and `--version` print and exit. An unknown argument is an error.
+
+`bayan --register-context-menu` adds **Open Bayan here** for the current user
+under `HKCU\Software\Classes\Directory\shell\Bayan` and
+`Directory\Background\shell\Bayan`, with the command `"<exe>" -d "%V"`.
+`--unregister-context-menu` removes both. This does not write HKLM and does
+not ask for an administrator. Windows 11's top-level menu needs package
+identity (MSIX, later); until then the entry is under **Show more options**.
+`"explorer_context_menu": true` in `config.json` is the installer hook for
+the same registration (absent leaves the menu alone; there is no settings row).
 
 The default terminal font is 18; settings and tab controls use independent UI
 metrics so a small terminal font does not shrink the controls. Ctrl+V pastes in

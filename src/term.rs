@@ -2128,6 +2128,9 @@ impl Drop for Session {
 }
 
 impl Session {
+    // `raw_argv` is the one extra fact a `-- command` needs. The other seven
+    // arguments are the spawn this already had.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         size: TermSize,
         proxy: EventLoopProxy<UserEvent>,
@@ -2136,6 +2139,10 @@ impl Session {
         scrollback: usize,
         shell: &str,
         kitty_protocol: bool,
+        // `Some` when the user passed `-- command`: those arguments are the
+        // process, and Bayan does not append its PowerShell or cmd wrapper.
+        // `None` is every other launch, including a `-p` profile.
+        raw_argv: Option<&[String]>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let prompt_nonce = fresh_prompt_nonce();
         let pty = native_pty_system();
@@ -2146,8 +2153,17 @@ impl Session {
             pixel_height: 0,
         })?;
         // program + args, or a shell with switches would be spawned as one
-        // absurd filename ("powershell.exe -NoProfile" is not a program)
-        let (prog, args) = split_command(shell);
+        // absurd filename ("powershell.exe -NoProfile" is not a program).
+        // A `-- command` is already split, so a path with spaces stays one
+        // argument instead of going through that splitter again.
+        let (prog, args) = if let Some(argv) = raw_argv {
+            let Some(prog) = argv.first().filter(|prog| !prog.is_empty()) else {
+                return Err("missing command".into());
+            };
+            (prog.clone(), argv[1..].to_vec())
+        } else {
+            split_command(shell)
+        };
         // N-03: a saved `wsl.exe -d Ubuntu` must not search Bayan's folder.
         let Some(prog) = crate::shells::resolve_spawn_program(prog) else {
             return Err(
@@ -2176,7 +2192,9 @@ impl Session {
         if let Some(d) = dir {
             cmd.cwd(d);
         }
-        if is_powershell(shell) {
+        // A raw command is the program the user named. The PowerShell and
+        // cmd wrappers belong to a shell Bayan itself launched.
+        if raw_argv.is_none() && is_powershell(shell) {
             // -NoProfile: the profile is seconds of avoidable startup (it
             // re-runs oh-my-posh, chcp, modules). Self-provide what it gave
             // us: UTF-8 (Arabic!) and the user's prompt theme, auto-detected.
@@ -2210,7 +2228,7 @@ impl Session {
                 setup.push_str(&shell_integration_ps(NONCE_PS_EXPR));
             }
             cmd.arg(setup);
-        } else if shell_family(shell) == ShellFamily::Cmd {
+        } else if raw_argv.is_none() && shell_family(shell) == ShellFamily::Cmd {
             // UTF-8 code page so Arabic paths survive; no OSC 133 marks
             cmd.args(["/K", "chcp 65001>nul"]);
         }

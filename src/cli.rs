@@ -1,0 +1,435 @@
+//! Command line.
+//!
+//! `#45` already walks `argv` by hand for `-d` / `--cwd` / `--cwd=<folder>`
+//! and refuses anything it does not know. This module is that walk, extended
+//! with the profile, the command after `--`, `--help` / `--version`, and the
+//! Explorer-menu switches. A second parser (clap, lexopt) would fork the
+//! error text and the `--cwd=` form the existing test locks in, so the
+//! directory arms below are the same ones `#45` shipped.
+
+use std::ffi::OsString;
+use std::path::Path;
+
+/// Shown by `--help`. The directory spellings are `#45`'s; the rest is new.
+pub const HELP: &str = concat!(
+    "Bayan (بيان) ",
+    env!("CARGO_PKG_VERSION"),
+    "\n\n",
+    "\
+usage:
+  bayan [-d | --cwd <folder>] [-p | --profile <name>] [-- <command>...]
+  bayan --register-context-menu
+  bayan --unregister-context-menu
+
+  -d, --cwd <folder>       Folder for the tab this command opens
+      --cwd=<folder>       The same, as one argument
+  -p, --profile <name>     Shell profile for that tab (its name or its command)
+      --profile=<name>     The same, as one argument
+      -- <command>...      Run this program in that tab instead of the shell
+      --register-context-menu
+                           Add \"Open Bayan here\" for the current user
+      --unregister-context-menu
+                           Remove that Explorer entry
+  -h, --help               Show this help
+  -V, --version            Show the version
+
+-d and --cwd are the folder switch from the working-directory change: a
+relative folder is taken from the current one, and a UNC path, a device
+path, a remote drive or a missing folder stops startup. A profile or a
+command applies to that same tab. With saved tabs restored, those tabs
+come back first and this tab is the active one.
+
+Explorer registration writes only
+HKCU\\Software\\Classes\\Directory\\shell\\Bayan and
+Directory\\Background\\shell\\Bayan. It does not write HKLM and does not
+ask for an administrator. Windows 11's top-level menu needs package
+identity (MSIX, a later installer); this entry shows under
+\"Show more options\".
+"
+);
+
+const USAGE: &str = "\
+usage: bayan [-d | --cwd <folder>] [-p | --profile <name>] [-- <command>...]
+       bayan --register-context-menu | --unregister-context-menu
+       bayan --help | --version";
+
+/// What `argv` asked for, before the folder is checked on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CliAction {
+    Launch(Launch),
+    Help,
+    Version,
+    RegisterContextMenu,
+    UnregisterContextMenu,
+}
+
+/// A normal startup. `directory` is still the raw text; [`gate_start_dir`]
+/// is what accepts it. `profile` is the name the user typed, not a command
+/// line. `command` is set only when `--` was present.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Launch {
+    pub directory: Option<String>,
+    pub profile: Option<String>,
+    pub command: Option<Vec<String>>,
+}
+
+/// The process the launch tab starts. A `--` command is already split, so
+/// a path with spaces stays one argument. Otherwise the profile's command
+/// (or the configured shell) goes through the normal shell launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchProcess {
+    pub command_line: String,
+    pub raw_argv: Option<Vec<String>>,
+}
+
+pub fn parse<I, S>(args: I) -> Result<CliAction, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    let text = |a: OsString| -> Result<String, String> {
+        a.into_string()
+            .map_err(|_| format!("an argument is not valid Unicode\n{USAGE}"))
+    };
+    let mut args = args.into_iter().map(Into::into);
+    let mut directory = None;
+    let mut profile = None;
+    let mut command = None;
+    // `Some(true)` registers, `Some(false)` removes. Both at once is an error.
+    let mut menu: Option<bool> = None;
+
+    while let Some(a) = args.next() {
+        let a = text(a)?;
+        if a == "--" {
+            let mut cmd = Vec::new();
+            for rest in args.by_ref() {
+                cmd.push(text(rest)?);
+            }
+            if cmd.is_empty() || cmd[0].is_empty() {
+                return Err(format!("missing command after --\n{USAGE}"));
+            }
+            command = Some(cmd);
+            break;
+        }
+        match a.as_str() {
+            "-h" | "--help" => return Ok(CliAction::Help),
+            "-V" | "--version" => return Ok(CliAction::Version),
+            "--register-context-menu" => {
+                if menu.is_some() {
+                    return Err(format!(
+                        "--register-context-menu and --unregister-context-menu cannot be combined\n{USAGE}"
+                    ));
+                }
+                menu = Some(true);
+            }
+            "--unregister-context-menu" => {
+                if menu.is_some() {
+                    return Err(format!(
+                        "--register-context-menu and --unregister-context-menu cannot be combined\n{USAGE}"
+                    ));
+                }
+                menu = Some(false);
+            }
+            // `#45`: `-d <folder>` and `--cwd <folder>`. The next token is
+            // the folder even when it looks like a flag; a missing one errors.
+            "-d" | "--cwd" => {
+                let v = text(
+                    args.next()
+                        .ok_or_else(|| format!("{a} needs a folder\n{USAGE}"))?,
+                )?;
+                directory = Some(v);
+            }
+            "-p" | "--profile" => {
+                let v = text(
+                    args.next()
+                        .ok_or_else(|| format!("{a} needs a profile name\n{USAGE}"))?,
+                )?;
+                if v.trim().is_empty() {
+                    return Err(format!("{a} needs a profile name\n{USAGE}"));
+                }
+                profile = Some(v);
+            }
+            _ => match a.strip_prefix("--cwd=") {
+                Some(v) => directory = Some(v.to_string()),
+                None => match a.strip_prefix("--profile=") {
+                    Some(v) if !v.trim().is_empty() => profile = Some(v.to_string()),
+                    Some(_) => {
+                        return Err(format!("--profile needs a profile name\n{USAGE}"));
+                    }
+                    None => return Err(format!("unknown argument {a:?}\n{USAGE}")),
+                },
+            },
+        }
+    }
+
+    if let Some(enable) = menu {
+        if directory.is_some() || profile.is_some() || command.is_some() {
+            return Err(format!(
+                "--register-context-menu and --unregister-context-menu cannot be combined with other arguments\n{USAGE}"
+            ));
+        }
+        return Ok(if enable {
+            CliAction::RegisterContextMenu
+        } else {
+            CliAction::UnregisterContextMenu
+        });
+    }
+
+    Ok(CliAction::Launch(Launch {
+        directory,
+        profile,
+        command,
+    }))
+}
+
+/// `#45`'s folder gate, unchanged: `std::path::absolute` (string work, so a
+/// UNC name is not opened here), then `accept_local_cwd`, then
+/// `usable_spawn_dir`. A refused folder is an error, not a fall back to home.
+pub fn gate_start_dir(raw: &str) -> Result<String, String> {
+    std::path::absolute(raw)
+        .ok()
+        .and_then(|p| p.to_str().and_then(crate::term::accept_local_cwd))
+        .filter(|d| crate::term::usable_spawn_dir(d))
+        .ok_or_else(|| format!("--cwd {raw:?} is not a local folder Bayan can open"))
+}
+
+/// The directory half of [`parse`], gated. What the `#45` test calls.
+#[cfg(test)]
+pub fn start_directory<I, S>(args: I) -> Result<Option<String>, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    match parse(args)? {
+        CliAction::Launch(launch) => match launch.directory {
+            Some(raw) => gate_start_dir(&raw).map(Some),
+            None => Ok(None),
+        },
+        _ => Err(format!("that command does not open a folder\n{USAGE}")),
+    }
+}
+
+pub fn launch_process(
+    profile_command: Option<&str>,
+    command: Option<&[String]>,
+    default_shell: &str,
+) -> LaunchProcess {
+    if let Some(argv) = command {
+        LaunchProcess {
+            command_line: join_command(argv),
+            raw_argv: Some(argv.to_vec()),
+        }
+    } else {
+        LaunchProcess {
+            command_line: profile_command.unwrap_or(default_shell).to_string(),
+            raw_argv: None,
+        }
+    }
+}
+
+fn join_command(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| {
+            if arg.contains([' ', '\t', '"']) {
+                format!("\"{}\"", arg.replace('"', "\\\""))
+            } else {
+                arg.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Write `text` to the parent console when there is one (a `cmd` launch of
+/// the window-subsystem binary). `false` means the caller should show a dialog.
+pub fn write_console(text: &str) -> bool {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        AttachConsole, GetConsoleMode, GetStdHandle, WriteConsoleW, ATTACH_PARENT_PROCESS,
+        STD_ERROR_HANDLE,
+    };
+
+    // SAFETY: AttachConsole takes a process id and no pointers. Attaching
+    // fails harmlessly when this process already has a console, or when the
+    // parent has none (Explorer). GetStdHandle / GetConsoleMode / WriteConsoleW
+    // then use the standard error handle only if it is a real console.
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        let handle = GetStdHandle(STD_ERROR_HANDLE);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut mode = 0;
+        if GetConsoleMode(handle, &mut mode) == 0 {
+            return false;
+        }
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        if !text.ends_with('\n') {
+            wide.push('\n' as u16);
+        }
+        let mut written = 0u32;
+        WriteConsoleW(
+            handle,
+            wide.as_ptr(),
+            wide.len() as u32,
+            &mut written,
+            std::ptr::null(),
+        ) != 0
+    }
+}
+
+/// The executable path, without the `\\?\` prefix `current_exe` sometimes
+/// returns. A quote cannot be escaped inside the menu command.
+pub fn exe_display(exe: &Path) -> Result<String, String> {
+    let path = exe.to_str().ok_or("executable path is not valid Unicode")?;
+    let path = match path.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest,
+        _ => path,
+    };
+    if path.is_empty() || path.contains(['"', '\n', '\r']) {
+        return Err("executable path cannot be quoted safely".into());
+    }
+    Ok(path.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::windows::ffi::OsStringExt;
+
+    use super::*;
+
+    fn launch(args: &[&str]) -> Launch {
+        match parse(args.iter().copied()).unwrap() {
+            CliAction::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_command_help_and_version_parse() {
+        let folder = r"D:\مجلد العمل\مشروع";
+        let got = launch(&["-d", folder, "-p", "PowerShell سريع"]);
+        assert_eq!(got.directory.as_deref(), Some(folder));
+        assert_eq!(got.profile.as_deref(), Some("PowerShell سريع"));
+        assert!(got.command.is_none());
+
+        let got = launch(&["--cwd", folder, "--profile", "Command Prompt"]);
+        assert_eq!(got.directory.as_deref(), Some(folder));
+        assert_eq!(got.profile.as_deref(), Some("Command Prompt"));
+
+        let joined = format!("--cwd={folder}");
+        let profile = "--profile=PowerShell سريع".to_string();
+        let got = launch(&[&joined, &profile]);
+        assert_eq!(got.directory.as_deref(), Some(folder));
+        assert_eq!(got.profile.as_deref(), Some("PowerShell سريع"));
+
+        let script = r"C:\مسار فيه مسافة\ملف.py";
+        let got = launch(&[
+            "-p",
+            "PowerShell",
+            "--",
+            "python.exe",
+            script,
+            "arg with space",
+        ]);
+        assert_eq!(
+            got.command.as_deref(),
+            Some(
+                [
+                    "python.exe".to_string(),
+                    script.to_string(),
+                    "arg with space".to_string()
+                ]
+                .as_slice()
+            )
+        );
+        // `--` ends flags: `-d` here is the program, not a folder.
+        let got = launch(&["--", "-d", folder]);
+        assert!(got.directory.is_none());
+        assert_eq!(
+            got.command.as_deref(),
+            Some(["-d".to_string(), folder.to_string()].as_slice())
+        );
+
+        assert_eq!(parse(["--help"]).unwrap(), CliAction::Help);
+        assert_eq!(parse(["-h"]).unwrap(), CliAction::Help);
+        assert_eq!(parse(["--version"]).unwrap(), CliAction::Version);
+        assert_eq!(parse(["-V"]).unwrap(), CliAction::Version);
+        assert_eq!(
+            parse(["--register-context-menu"]).unwrap(),
+            CliAction::RegisterContextMenu
+        );
+        assert_eq!(
+            parse(["--unregister-context-menu"]).unwrap(),
+            CliAction::UnregisterContextMenu
+        );
+    }
+
+    #[test]
+    fn invalid_arguments_are_errors_and_do_not_panic() {
+        for args in [
+            vec!["--bogus"],
+            vec!["-x"],
+            vec!["-d"],
+            vec!["--cwd"],
+            vec!["-p"],
+            vec!["--profile"],
+            vec!["--profile="],
+            vec!["-p", "   "],
+            vec!["--"],
+            vec!["--", ""],
+            vec!["--register-context-menu", "--unregister-context-menu"],
+            vec!["--register-context-menu", "-d", r"C:\Windows"],
+            vec!["-p", "PowerShell", "--unregister-context-menu"],
+            vec!["not-a-flag"],
+        ] {
+            assert!(parse(args.iter().copied()).is_err(), "{args:?}");
+        }
+        // an unpaired surrogate is not Unicode; parsing reports it
+        let bad = OsString::from_wide(&[0xD800]);
+        assert!(parse([bad]).is_err());
+    }
+
+    #[test]
+    fn an_existing_folder_with_arabic_and_spaces_passes_the_cwd_gate() {
+        let dir = std::env::temp_dir().join("bayan cwd اختبار");
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.to_str().expect("temp path is Unicode");
+        let got = start_directory(["-d", raw]).unwrap();
+        assert_eq!(
+            got.as_deref(),
+            crate::term::accept_local_cwd(raw).as_deref()
+        );
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn the_launch_command_keeps_spaced_arguments_and_prefers_an_explicit_command() {
+        let plain = launch_process(None, None, "powershell.exe");
+        assert_eq!(plain.command_line, "powershell.exe");
+        assert!(plain.raw_argv.is_none());
+
+        let profile = launch_process(Some("pwsh.exe -NoLogo"), None, "powershell.exe");
+        assert_eq!(profile.command_line, "pwsh.exe -NoLogo");
+        assert!(profile.raw_argv.is_none());
+
+        let argv = vec![
+            "python.exe".into(),
+            r"C:\مجلد العمل\ملف.py".into(),
+            "arg with space".into(),
+        ];
+        let command = launch_process(Some("powershell.exe"), Some(&argv), "powershell.exe");
+        assert_eq!(command.raw_argv.as_deref(), Some(argv.as_slice()));
+        assert!(command.command_line.contains(r"مجلد العمل"));
+        assert!(command.command_line.contains("arg with space"));
+    }
+
+    #[test]
+    fn the_menu_command_quotes_spaces_arabic_and_a_verbatim_prefix() {
+        assert_eq!(
+            exe_display(Path::new(r"\\?\C:\Program Files\بيان\bayan.exe")).unwrap(),
+            r"C:\Program Files\بيان\bayan.exe"
+        );
+        assert!(exe_display(Path::new("C:\\a\"b\\bayan.exe")).is_err());
+    }
+}
