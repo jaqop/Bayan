@@ -789,10 +789,66 @@ impl PaletteLayout {
     }
 }
 
-/// One underline/strikethrough span on a grid row: (col_start, col_end, style, fg).
-type Deco = (usize, usize, u8, (u8, u8, u8));
-/// The same span resolved to pixels: (x0, x1, style, fg).
-type PxDeco = (i32, i32, u8, (u8, u8, u8));
+/// One underline/strikethrough span on a grid row:
+/// (col_start, col_end, style, fg, underline colour).
+type Deco = (usize, usize, u8, (u8, u8, u8), (u8, u8, u8));
+/// The same span resolved to pixels: (x0, x1, style, fg, underline colour).
+type PxDeco = (i32, i32, u8, (u8, u8, u8), (u8, u8, u8));
+
+/// Strikethrough and the underline in its SGR 4:x kind, over [dx0, dx1).
+/// Strike is drawn in fg, the underline in its own colour (SGR 58).
+#[allow(clippy::too_many_arguments)]
+fn push_deco(
+    out: &mut Vec<Vertex>,
+    clip: Rect,
+    dx0: i32,
+    dx1: i32,
+    y: i32,
+    cell_w: f32,
+    cell_h: f32,
+    (style, fg, ul): (u8, (u8, u8, u8), (u8, u8, u8)),
+) {
+    let th = (cell_h / 14.0).max(1.0) as i32;
+    if style & ST_UNDERLINE != 0 {
+        let uy = y + cell_h.round() as i32 - th - 1;
+        let c = c4(ul, 255);
+        match (style & UL_KIND) >> UL_SHIFT {
+            UL_DOUBLE => {
+                push_rect(out, clip, dx0, uy, dx1 - dx0, th, c);
+                push_rect(out, clip, dx0, uy - 2 * th, dx1 - dx0, th, c);
+            }
+            kind @ (UL_DOTTED | UL_DASHED) => {
+                let (on, off) = if kind == UL_DOTTED {
+                    (th, th)
+                } else {
+                    ((3 * th).max(3), (2 * th).max(2))
+                };
+                let mut x = dx0;
+                while x < dx1 {
+                    push_rect(out, clip, x, uy, on.min(dx1 - x), th, c);
+                    x += on + off;
+                }
+            }
+            UL_CURLY => {
+                // one wave per cell, stepped in th-wide columns
+                let amp = th as f32;
+                let mid = uy - th;
+                let mut x = dx0;
+                while x < dx1 {
+                    let phase = (x - dx0) as f32 / cell_w.max(1.0) * std::f32::consts::TAU;
+                    let dy = (amp * phase.sin()).round() as i32;
+                    push_rect(out, clip, x, mid + dy, th.min(dx1 - x), th, c);
+                    x += th;
+                }
+            }
+            _ => push_rect(out, clip, dx0, uy, dx1 - dx0, th, c),
+        }
+    }
+    if style & ST_STRIKE != 0 {
+        let sy = y + (cell_h * 0.55).round() as i32;
+        push_rect(out, clip, dx0, sy, dx1 - dx0, th, c4(fg, 255));
+    }
+}
 
 /// One row of the shortcuts editor.
 pub struct ShortcutRow {
@@ -1059,6 +1115,8 @@ struct CellInfo {
     fg: (u8, u8, u8),
     bg: (u8, u8, u8),
     style: u8,
+    /// underline colour (SGR 58), fg when the program set none
+    ul: (u8, u8, u8),
 }
 
 fn is_tui_row(cells: &[CellInfo]) -> bool {
@@ -1568,6 +1626,13 @@ pub(crate) const ST_BOLD: u8 = 1;
 pub(crate) const ST_ITALIC: u8 = 2;
 pub(crate) const ST_UNDERLINE: u8 = 4;
 pub(crate) const ST_STRIKE: u8 = 8;
+/// Underline kind beside ST_UNDERLINE: 0 single, then the SGR 4:x styles.
+const UL_SHIFT: u8 = 4;
+const UL_KIND: u8 = 0b0111 << UL_SHIFT;
+const UL_DOUBLE: u8 = 1;
+const UL_CURLY: u8 = 2;
+const UL_DOTTED: u8 = 3;
+const UL_DASHED: u8 = 4;
 
 /// One rich-text segment: text + color + style.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -2185,14 +2250,20 @@ impl Renderer {
         if flags.intersects(Flags::ITALIC) {
             style |= ST_ITALIC;
         }
-        if flags.intersects(
-            Flags::UNDERLINE
-                | Flags::DOUBLE_UNDERLINE
-                | Flags::UNDERCURL
-                | Flags::DOTTED_UNDERLINE
-                | Flags::DASHED_UNDERLINE,
-        ) {
+        if flags.intersects(Flags::ALL_UNDERLINES) {
             style |= ST_UNDERLINE;
+            let kind = if flags.contains(Flags::DOUBLE_UNDERLINE) {
+                UL_DOUBLE
+            } else if flags.contains(Flags::UNDERCURL) {
+                UL_CURLY
+            } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+                UL_DOTTED
+            } else if flags.contains(Flags::DASHED_UNDERLINE) {
+                UL_DASHED
+            } else {
+                0
+            };
+            style |= kind << UL_SHIFT;
         }
         if flags.intersects(Flags::STRIKEOUT) {
             style |= ST_STRIKE;
@@ -2240,10 +2311,12 @@ impl Renderer {
             cell_bytes.push((ci.col, b0, nbytes));
             if ci.style & (ST_UNDERLINE | ST_STRIKE) != 0 {
                 match decos.last_mut() {
-                    Some((_, e, st, fg)) if *e == b0 && *st == ci.style && *fg == ci.fg => {
+                    Some((_, e, st, fg, ul))
+                        if *e == b0 && *st == ci.style && *fg == ci.fg && *ul == ci.ul =>
+                    {
                         *e = nbytes;
                     }
-                    _ => decos.push((b0, nbytes, ci.style, ci.fg)),
+                    _ => decos.push((b0, nbytes, ci.style, ci.fg, ci.ul)),
                 }
             }
             match segs.last_mut() {
@@ -2283,7 +2356,7 @@ impl Renderer {
                     nbytes += c.len_utf8();
                     cell_bytes.push((ci.col, b0, nbytes));
                     if ci.style & (ST_UNDERLINE | ST_STRIKE) != 0 {
-                        decos.push((b0, nbytes, ci.style, ci.fg));
+                        decos.push((b0, nbytes, ci.style, ci.fg, ci.ul));
                     }
                     match segs.last_mut() {
                         Some(s) if s.fg == ci.fg && s.style == ci.style => s.text.push(c),
@@ -2305,7 +2378,7 @@ impl Renderer {
                 *start += n;
                 *finish += n;
             }
-            for (start, finish, _, _) in &mut decos {
+            for (start, finish, _, _, _) in &mut decos {
                 *start += n;
                 *finish += n;
             }
@@ -2527,28 +2600,21 @@ impl Renderer {
         // decorations through the shaped layout: each byte span becomes the
         // (possibly several, possibly reordered) glyph rects it occupies
         if !decos.is_empty() {
-            let th = (self.cell_h / 14.0).max(1.0) as i32;
             let key = self.ensure_shaped(&segs, true);
             let mut rects: Vec<PxDeco> = Vec::new();
             for run in self.cache_hot[&key].buffer.layout_runs() {
                 let glyphs = run_spans(&run);
-                for &(b0, b1, style, fg) in &decos {
+                for &(b0, b1, style, fg, ul) in &decos {
                     for (hx, hw) in highlight_spans(&glyphs, run.text, b0, b1) {
                         let dx0 = text_x0 + (hx * scale).round() as i32;
                         let dx1 = text_x0 + ((hx + hw) * scale).round() as i32;
-                        rects.push((dx0, dx1, style, fg));
+                        rects.push((dx0, dx1, style, fg, ul));
                     }
                 }
             }
-            for (dx0, dx1, style, fg) in rects {
-                if style & ST_UNDERLINE != 0 {
-                    let uy = y + self.cell_h.round() as i32 - th - 1;
-                    push_rect(out, clip, dx0, uy, dx1 - dx0, th, c4(fg, 255));
-                }
-                if style & ST_STRIKE != 0 {
-                    let sy = y + (self.cell_h * 0.55).round() as i32;
-                    push_rect(out, clip, dx0, sy, dx1 - dx0, th, c4(fg, 255));
-                }
+            for (dx0, dx1, style, fg, ul) in rects {
+                let (cw, ch) = (self.cell_w, self.cell_h);
+                push_deco(out, clip, dx0, dx1, y, cw, ch, (style, fg, ul));
             }
         }
         if mapped_cursor.is_some() {
@@ -2613,6 +2679,7 @@ impl Renderer {
                     fg,
                     bg,
                     style,
+                    ul: fg,
                 }
             })
             .collect();
@@ -2681,10 +2748,12 @@ impl Renderer {
                 return;
             }
             match decos.last_mut() {
-                Some((_, end, st, fg)) if *end == ci.col && *st == ci.style && *fg == ci.fg => {
+                Some((_, end, st, fg, ul))
+                    if *end == ci.col && *st == ci.style && *fg == ci.fg && *ul == ci.ul =>
+                {
                     *end = ci.col + ci.w;
                 }
-                _ => decos.push((ci.col, ci.col + ci.w, ci.style, ci.fg)),
+                _ => decos.push((ci.col, ci.col + ci.w, ci.style, ci.fg, ci.ul)),
             }
         };
         while i < n {
@@ -2773,18 +2842,11 @@ impl Renderer {
             }
         }
         // decoration lines over the text (underline hugs the cell bottom)
-        let th = (self.cell_h / 14.0).max(1.0) as i32;
-        for (c0, c1, style, fg) in decos {
+        for (c0, c1, style, fg, ul) in decos {
             let dx0 = x0 + (c0 as f32 * self.cell_w).round() as i32;
             let dx1 = x0 + (c1 as f32 * self.cell_w).round() as i32;
-            if style & ST_UNDERLINE != 0 {
-                let uy = y + self.cell_h.round() as i32 - th - 1;
-                push_rect(out, clip, dx0, uy, dx1 - dx0, th, c4(fg, 255));
-            }
-            if style & ST_STRIKE != 0 {
-                let sy = y + (self.cell_h * 0.55).round() as i32;
-                push_rect(out, clip, dx0, sy, dx1 - dx0, th, c4(fg, 255));
-            }
+            let (cw, ch) = (self.cell_w, self.cell_h);
+            push_deco(out, clip, dx0, dx1, y, cw, ch, (style, fg, ul));
         }
         // Grid rows are column-exact, so the hover underline is too.
         if let Some((h0, h1)) = hover {
@@ -2967,6 +3029,7 @@ impl Renderer {
                 hit_cells.push((li, col, w));
             }
             let zw = cell.zerowidth().map(|z| z.to_vec());
+            let ul = cell.underline_color().map_or(fg, |c| self.ansi_rgb(c));
             lines[li].push(CellInfo {
                 col,
                 w,
@@ -2975,6 +3038,7 @@ impl Renderer {
                 fg,
                 bg,
                 style,
+                ul,
             });
         }
 
@@ -6533,6 +6597,7 @@ mod tests {
                 fg: FG,
                 bg: BG,
                 style: 0,
+                ul: FG,
             })
             .collect()
     }
@@ -7074,6 +7139,7 @@ mod tests {
                     fg: (0, 0, 0),
                     bg: BG,
                     style: 0,
+                    ul: (0, 0, 0),
                 })
                 .collect()
         };
@@ -7118,6 +7184,7 @@ mod tests {
             fg: (0, 0, 0),
             bg: BG,
             style: 0,
+            ul: (0, 0, 0),
         });
         let plan = bidi_plan(&padded, false, (1, 1, 1), Some(0), ParagraphDir::Default).unwrap();
         assert_eq!(plan.first_blank, 5);
@@ -8056,6 +8123,86 @@ mod cache_tests {
         assert!(
             underlined > plain,
             "no underline quads on the Arabic row ({underlined} vs {plain})"
+        );
+    }
+
+    /// SGR 4:x draws its own shape and SGR 58 its own colour, on grid rows
+    /// and on BiDi rows alike. Strikethrough keeps the text colour.
+    #[test]
+    fn underline_kinds_and_colour_draw_their_own_shapes() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 30, rows: 3 };
+        // (y, colour) of every solid th-tall quad: underline and strike pieces
+        let quads = |r: &mut Renderer, bytes: &str| -> Vec<(i32, [f32; 4])> {
+            let mut t = Term::new(Config::default(), &size, VoidListener);
+            let mut p: Processor = Processor::new();
+            p.advance(&mut t, bytes.as_bytes());
+            let mut out = Vec::new();
+            let view = PaneView {
+                rect: (0, 0, 600, 90),
+                focused: false,
+                cursor: crate::config::CursorStyle::Block,
+                cursor_on: false,
+                bordered: false,
+                claude: false,
+                claude_from: None,
+                search_match: None,
+                marks: &[],
+                link_hover: None,
+                link_tip: None,
+                reorder: true,
+                line_dir: &[],
+            };
+            let th = (r.cell_h / 14.0).max(1.0) as i32;
+            r.draw_pane(&mut out, &view, &t);
+            out.chunks(6)
+                .filter(|q| {
+                    q[0].layer == 0.0
+                        && q[0].uv == [WHITE_UV, WHITE_UV]
+                        && (q[5].pos[1] - q[0].pos[1]).round() as i32 == th
+                })
+                .map(|q| (q[0].pos[1].round() as i32, q[0].color))
+                .collect()
+        };
+        let rows = |q: &[(i32, [f32; 4])]| {
+            let mut ys: Vec<i32> = q.iter().map(|&(y, _)| y).collect();
+            ys.sort_unstable();
+            ys.dedup();
+            ys.len()
+        };
+        let text = "abcdefgh\x1b[0m";
+        let single = quads(&mut r, &format!("\x1b[4m{text}"));
+        assert_eq!((single.len(), rows(&single)), (1, 1), "single: one bar");
+        let double = quads(&mut r, &format!("\x1b[4:2m{text}"));
+        assert_eq!((double.len(), rows(&double)), (2, 2), "double: two bars");
+        let curly = quads(&mut r, &format!("\x1b[4:3m{text}"));
+        assert!(rows(&curly) >= 2, "curly: the wave leaves one row");
+        let dotted = quads(&mut r, &format!("\x1b[4:4m{text}"));
+        let dashed = quads(&mut r, &format!("\x1b[4:5m{text}"));
+        assert_eq!((rows(&dotted), rows(&dashed)), (1, 1));
+        assert!(
+            dotted.len() > dashed.len() && dashed.len() > 1,
+            "dots outnumber dashes, both are broken ({} / {})",
+            dotted.len(),
+            dashed.len()
+        );
+
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let coloured = quads(&mut r, &format!("\x1b[4;58;2;255;0;0m{text}"));
+        assert!(!coloured.is_empty() && coloured.iter().all(|&(_, c)| c == red));
+        let struck = quads(&mut r, &format!("\x1b[9;58;2;255;0;0m{text}"));
+        assert!(!struck.is_empty() && struck.iter().all(|&(_, c)| c != red));
+        let arabic = quads(
+            &mut r,
+            "\x1b[4:3;58;2;255;0;0m\u{645}\u{631}\u{62d}\u{628}\u{627}\x1b[0m",
+        );
+        assert!(rows(&arabic) >= 2, "curly on the BiDi path");
+        assert!(
+            arabic.iter().all(|&(_, c)| c == red),
+            "colour on the BiDi path"
         );
     }
 
