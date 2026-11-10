@@ -39,7 +39,7 @@ selection and BiDi paths must do.
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 
-507 tests in `src` (`cargo test --all-targets` does not run the vendored
+510 tests in `src` (`cargo test --all-targets` does not run the vendored
 `portable-pty` crate). `term.rs` (84), `link.rs` (61) and `render.rs` (64)
 carry the most; `shellint.rs` has 13 and `localpath.rs` has 21.
 

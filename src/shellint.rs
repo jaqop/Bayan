@@ -224,28 +224,26 @@ fn bash_args(original: &[String], rc_token: &str) -> Vec<String> {
 fn cmd_args(original: &[String], setup: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
-    let mut installed = false;
     while i < original.len() {
         let a = &original[i];
-        if !installed && (a.eq_ignore_ascii_case("/k") || a.eq_ignore_ascii_case("/c")) {
+        if a.eq_ignore_ascii_case("/k") || a.eq_ignore_ascii_case("/c") {
+            // Everything after /K is one command. split_command broke
+            // `echo hi` into two argv words; joining them back is what cmd
+            // sees on a single command line.
             out.push(a.clone());
-            i += 1;
-            if i < original.len() {
-                out.push(format!("{setup}&{}", original[i]));
-                i += 1;
-            } else {
+            let rest = original[i + 1..].join(" ");
+            if rest.is_empty() {
                 out.push(setup.to_string());
+            } else {
+                out.push(format!("{setup}&{rest}"));
             }
-            installed = true;
-            continue;
+            return out;
         }
         out.push(a.clone());
         i += 1;
     }
-    if !installed {
-        out.push("/K".into());
-        out.push(setup.to_string());
-    }
+    out.push("/K".into());
+    out.push(setup.to_string());
     out
 }
 
@@ -796,15 +794,72 @@ pub(crate) fn integration_parent(elevated: bool) -> PathBuf {
 
 /// DACL Bayan puts on the directory and every file in it.
 ///
-/// Not elevated: the current user only, protected so the directory does not
-/// inherit a world-writable ACE. Elevated: SYSTEM and Administrators, plus
-/// a high integrity label with no-write-up, so the filtered token cannot
-/// rewrite the script the elevated shell is about to read.
-pub(crate) fn security_sddl(elevated: bool) -> &'static str {
+/// Not elevated: the current user's SID only, protected so the directory
+/// does not inherit a world-writable ACE. `CU` is not an SDDL alias
+/// (CreateDirectory returns error 1337), so the SID comes from the process
+/// token. Elevated: SYSTEM and Administrators, plus a high integrity label
+/// with no-write-up, so the filtered token cannot rewrite the script the
+/// elevated shell is about to read.
+pub(crate) fn security_sddl(elevated: bool) -> std::io::Result<String> {
     if elevated {
-        "D:P(A;;FA;;;SY)(A;;FA;;;BA)S:(ML;;NW;;;HI)"
+        Ok("D:P(A;;FA;;;SY)(A;;FA;;;BA)S:(ML;;NW;;;HI)".to_string())
     } else {
-        "D:P(A;;FA;;;CU)"
+        Ok(format!("D:P(A;;FA;;;{})", current_user_sid()?))
+    }
+}
+
+/// `S-1-…` form of the process token's user. That is the only SDDL trustee
+/// that means "this account and nobody else".
+fn current_user_sid() -> std::io::Result<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    // SAFETY: GetCurrentProcess is a pseudo-handle. OpenProcessToken writes
+    // one token, closed before return. The first GetTokenInformation sizes
+    // the buffer; the second writes into `buf`, which is pointer-aligned.
+    // TOKEN_USER.Sid points into that buffer and stays valid until
+    // ConvertSidToStringSidW copies it. LocalFree releases the copy.
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut needed = 0u32;
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+        if needed == 0 {
+            CloseHandle(token);
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut buf = vec![0u64; needed.div_ceil(8) as usize];
+        let ok = GetTokenInformation(
+            token,
+            TokenUser,
+            buf.as_mut_ptr().cast(),
+            (buf.len() * std::mem::size_of::<u64>()) as u32,
+            &mut needed,
+        );
+        CloseHandle(token);
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let user = &*buf.as_ptr().cast::<TOKEN_USER>();
+        let mut out = std::ptr::null_mut();
+        if ConvertSidToStringSidW(user.User.Sid, &mut out) == 0 || out.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut n = 0usize;
+        while *out.add(n) != 0 {
+            n += 1;
+        }
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(out, n));
+        LocalFree(out.cast());
+        if text.starts_with("S-1-") {
+            Ok(text)
+        } else {
+            Err(std::io::Error::other("token user was not an SDDL sid"))
+        }
     }
 }
 
@@ -1038,7 +1093,7 @@ fn with_security<T>(
     use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 
-    let sddl = wide_str(security_sddl(elevated));
+    let sddl = wide_str(&security_sddl(elevated)?);
     let mut sd = std::ptr::null_mut();
     // SAFETY: `sddl` is NUL-terminated and outlives the call. `sd` receives
     // one LocalAlloc'd descriptor. A zero return leaves `sd` unset. LocalFree
@@ -1367,18 +1422,19 @@ mod tests {
 
     #[test]
     fn integration_descriptors_are_not_world_writable() {
-        let user = security_sddl(false);
-        let admin = security_sddl(true);
-        for s in [user, admin] {
+        let user = security_sddl(false).expect("current user sid");
+        let admin = security_sddl(true).expect("elevated sddl");
+        for s in [&user, &admin] {
             assert!(s.contains("D:P"), "{s}");
             assert!(!s.contains("WD"), "Everyone must not be granted: {s}");
             assert!(!s.contains("AU"), "{s}");
             assert!(!s.contains("BU"), "{s}");
+            // `CU` is not an SDDL alias; CreateDirectory rejects it.
+            assert!(!s.contains(";;;CU)"), "{s}");
         }
-        assert!(user.contains("CU"), "{user}");
+        assert!(user.contains("S-1-"), "{user}");
         assert!(admin.contains("BA") && admin.contains("SY"), "{admin}");
         assert!(admin.contains("HI") && admin.contains("NW"), "{admin}");
-        assert!(!admin.contains("CU"), "{admin}");
     }
 
     #[test]
