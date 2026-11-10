@@ -1144,28 +1144,93 @@ fn strong_paragraph_char(c: char) -> Option<bool> {
     }
 }
 
-fn auto_paragraph_dir(cells: &[CellInfo]) -> ParagraphDir {
-    for cell in cells {
-        if let Some(rtl) = strong_paragraph_char(cell.c) {
-            return if rtl {
-                ParagraphDir::Rtl
+/// Direction of a row's first strong letter. `chars` is each cell's base
+/// char followed by its combining marks, in grid order.
+fn auto_paragraph_dir(chars: impl IntoIterator<Item = char>) -> ParagraphDir {
+    match chars.into_iter().find_map(strong_paragraph_char) {
+        Some(true) => ParagraphDir::Rtl,
+        Some(false) => ParagraphDir::Ltr,
+        None => ParagraphDir::Default,
+    }
+}
+
+/// The per-row direction decision, walked top to bottom over the viewport.
+/// `draw_pane` paints with it and the mouse hit-test replays it
+/// (`viewport_row_layout`), so a click resolves against the drawn layout.
+#[derive(Default)]
+struct ParagraphWalk {
+    /// Direction of the paragraph a soft wrap is still inside. A wrapped
+    /// row does not re-detect from its own first letter.
+    open: ParagraphDir,
+}
+
+impl ParagraphWalk {
+    /// `explicit` is the row's SCP stamp, `continued` whether the row above
+    /// soft-wrapped into it, `auto` its first strong letter. Returns the
+    /// row's direction, and whether it is the wrapped tail of an RTL
+    /// paragraph, which stays on the bidi path with no Arabic letter.
+    fn row(
+        &mut self,
+        explicit: ParagraphDir,
+        continued: bool,
+        auto: ParagraphDir,
+    ) -> (ParagraphDir, bool) {
+        let dir = if explicit != ParagraphDir::Default {
+            explicit
+        } else if continued && self.open != ParagraphDir::Default {
+            self.open
+        } else {
+            auto
+        };
+        if !continued || explicit != ParagraphDir::Default {
+            self.open = if explicit != ParagraphDir::Default {
+                explicit
             } else {
-                ParagraphDir::Ltr
+                auto
             };
         }
-        if let Some(marks) = &cell.zw {
-            for mark in marks {
-                if let Some(rtl) = strong_paragraph_char(*mark) {
-                    return if rtl {
-                        ParagraphDir::Rtl
-                    } else {
-                        ParagraphDir::Ltr
-                    };
-                }
-            }
-        }
+        (dir, continued && dir == ParagraphDir::Rtl)
     }
-    ParagraphDir::Default
+}
+
+/// How `draw_pane` lays out viewport row `row`: its paragraph direction,
+/// and whether the row takes the bidi path (an RTL letter, or the wrapped
+/// tail of an RTL paragraph) when the pane reorders. `explicit` gives each
+/// viewport row's SCP stamp, as `PaneView::line_dir` does.
+pub fn viewport_row_layout<T: alacritty_terminal::event::EventListener>(
+    term: &Term<T>,
+    row: usize,
+    explicit: impl Fn(usize) -> ParagraphDir,
+) -> (ParagraphDir, bool) {
+    use alacritty_terminal::index::{Column, Line};
+    let off = term.grid().display_offset() as i32;
+    let row = row.min(term.screen_lines().saturating_sub(1));
+    // the cells draw_pane collects: spacers skipped, HIDDEN drawn blank
+    let base_chars = |li: usize| {
+        let line = &term.grid()[Line(li as i32 - off)];
+        (0..term.columns())
+            .map(move |c| &line[Column(c)])
+            .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+            .map(|cell| {
+                let base = if cell.flags.intersects(Flags::HIDDEN) {
+                    ' '
+                } else {
+                    cell.c
+                };
+                (base, cell.zerowidth())
+            })
+    };
+    let mut walk = ParagraphWalk::default();
+    let mut dir = (ParagraphDir::Default, false);
+    for li in 0..=row {
+        let auto = auto_paragraph_dir(
+            base_chars(li)
+                .flat_map(|(c, zw)| std::iter::once(c).chain(zw.into_iter().flatten().copied())),
+        );
+        dir = walk.row(explicit(li), line_wrapped_into(term, li, off), auto);
+    }
+    let arabic = base_chars(row).any(|(c, _)| is_rtl(c));
+    (dir.0, arabic || dir.1)
 }
 
 /// The previous grid row ended in a soft wrap, so this viewport row is the
@@ -2792,8 +2857,8 @@ impl Renderer {
     }
 
     /// Logical grid column under a pane-local pixel, for a row that takes
-    /// the bidi path. `None` when the row has no Arabic — the caller's
-    /// `x / cell_w` column is already the cell the program stored.
+    /// the bidi path: the caller asks `viewport_row_layout` for that and for
+    /// `dir`. A grid row's `x / cell_w` column is already the stored cell.
     ///
     /// The shaped run is the one `draw_line_bidi` just cached, so the glyph
     /// under the pointer and the glyph on screen are the same box. Claude
@@ -2810,9 +2875,6 @@ impl Renderer {
         grid_cols: usize,
         align_edge: bool,
     ) -> Option<usize> {
-        if !cells.iter().any(|c| is_rtl(c.c)) {
-            return None;
-        }
         let infos: Vec<CellInfo> = cells
             .iter()
             .map(|c| {
@@ -3214,9 +3276,7 @@ impl Renderer {
         let cursor_vrow = cursor.point.line.0 + off;
         let ccol = cursor.point.column.0;
         let mut cursor_rect: Option<(i32, i32)> = None; // (x, w) via shaped layout
-                                                        // Direction of the paragraph a soft wrap is still inside. A wrapped
-                                                        // row does not re-detect from its own first letter.
-        let mut open_dir = ParagraphDir::Default;
+        let mut walk = ParagraphWalk::default();
         for (li, cells) in lines.iter().enumerate() {
             self.mapping_context = Some((view.rect, li));
             if cells.is_empty() {
@@ -3232,26 +3292,16 @@ impl Renderer {
             // whole-line shaper, with SCP's base direction if one was set.
             let explicit = view.line_dir.get(li).copied().unwrap_or_default();
             let continued = line_wrapped_into(term, li, off);
-            let auto = auto_paragraph_dir(cells);
-            let dir = if explicit != ParagraphDir::Default {
-                explicit
-            } else if continued && open_dir != ParagraphDir::Default {
-                open_dir
-            } else {
-                auto
-            };
-            if !continued || explicit != ParagraphDir::Default {
-                open_dir = if explicit != ParagraphDir::Default {
-                    explicit
-                } else {
-                    auto
-                };
-            }
-            let arabic = cells.iter().any(|ci| is_rtl(ci.c));
-            let row_claude = view.claude && view.claude_from.is_none_or(|start| li as i64 >= start);
+            let auto = auto_paragraph_dir(
+                cells
+                    .iter()
+                    .flat_map(|ci| std::iter::once(ci.c).chain(ci.zw.iter().flatten().copied())),
+            );
             // A wrapped tail of an RTL paragraph stays on the bidi path even
             // when this row itself has no Arabic letter.
-            let follow_rtl = continued && dir == ParagraphDir::Rtl;
+            let (dir, follow_rtl) = walk.row(explicit, continued, auto);
+            let arabic = cells.iter().any(|ci| is_rtl(ci.c));
+            let row_claude = view.claude && view.claude_from.is_none_or(|start| li as i64 >= start);
             if (arabic || follow_rtl) && view.reorder {
                 let on_row = cursor_vrow >= 0 && cursor_vrow as usize == li;
                 let col = if on_row { Some(ccol) } else { None };
@@ -8952,6 +9002,50 @@ mod paragraph_align {
             latin.windows(2).all(|w| w[0] < w[1]),
             "the Latin tail was reversed: {latin:?}"
         );
+    }
+
+    /// A click on the Latin tail of a wrapped RTL paragraph, resolved by the
+    /// shaping fallback (no recorded box), lands on the glyph drawn there:
+    /// the hit-test takes the row's direction and path from the same walk
+    /// `draw_pane` used, not from the SCP stamp alone.
+    #[test]
+    fn a_click_on_a_wrapped_rtl_tail_maps_through_the_drawn_layout() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let mut term = Term::new(
+            Config::default(),
+            &crate::term::TermSize { cols: 8, rows: 4 },
+            VoidListener,
+        );
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, "مرحبا hello".as_bytes());
+        let pane = (0, 0, 600, 160);
+        r.begin_frame();
+        r.draw_pane(&mut Vec::new(), &pane_view(pane, true), &term);
+        let no_stamp = |_| ParagraphDir::Default;
+        assert_eq!(
+            viewport_row_layout(&term, 1, no_stamp),
+            (ParagraphDir::Rtl, true),
+            "the Latin tail is drawn as an RTL bidi row"
+        );
+        assert_eq!(
+            viewport_row_layout(&term, 2, no_stamp),
+            (ParagraphDir::Default, false)
+        );
+        let (dir, _) = viewport_row_layout(&term, 1, no_stamp);
+        let snaps = snapshot_row(&term, 1);
+        for col in 0..3 {
+            let (x, w, _) = r.cell_geometry[&(pane, 1, col)][0];
+            let click = x as f32 + w as f32 / 2.0;
+            assert_eq!(
+                r.logical_column_for(&snaps, click, pane.2, false, dir, 8, true),
+                Some(col),
+                "a click on the drawn glyph of column {col} at x={click}"
+            );
+        }
     }
 
     /// ZWJ and ZWNJ travel with the Arabic. `full` still orders the word

@@ -951,8 +951,8 @@ tracked beside it for this decision and are not rewritten into `?1049`.
 `"off"` (0) does not reorder anywhere, so an agent that already ordered
 Arabic is not reversed a second time; Arabic shaping is unchanged. An
 explicit BDSM still disables reordering on top of `full` and of `alt_off`
-on the primary screen when `honor_bdsm` is true. F3 (rebindable,
-`bidi-toggle`) cycles the focused pane `full → alt_off → off`; other panes
+on the primary screen when `honor_bdsm` is true. Ctrl+Shift+F3
+(rebindable, `bidi-toggle`; bare F3 stays with htop and mc) cycles the focused pane `full → alt_off → off`; other panes
 stay as they are, and the corner chip reads `BiDi 1` or `BiDi 0` until the
 pane is back on `full`. An RTL paragraph (SCP 2, or auto when the first
 strong character is Arabic) is drawn flush with the pane's right edge on

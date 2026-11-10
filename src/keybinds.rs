@@ -153,10 +153,11 @@ impl Action {
             Action::PromptPrev => c(true, true, Up),
             Action::PromptNext => c(true, true, Down),
             Action::ClaudeToggle => c(false, false, F(2)),
-            // Next to Claude's F2. F3 cycles this pane's BiDi mode
-            // (full → alt screen off → off). Physical F3, so an Arabic
-            // layout still reaches it, and it can be rebound.
-            Action::BidiToggle => c(false, false, F(3)),
+            // Cycles this pane's BiDi mode (full → alt screen off → off).
+            // Ctrl+Shift, not bare F3: htop and mc search and view on F3.
+            // Physical F3, so an Arabic layout still reaches it, and it can
+            // be rebound.
+            Action::BidiToggle => c(true, true, F(3)),
             // Ctrl+Shift+K: the leaked-flags escape hatch. Physical K, so an
             // Arabic layout still reaches it.
             Action::ResetKeyboard => c(true, true, Letter('k')),
@@ -576,12 +577,14 @@ mod tests {
     }
 
     #[test]
-    fn bidi_toggle_defaults_to_f3() {
+    fn bidi_toggle_defaults_to_ctrl_shift_f3_and_leaves_f3_to_programs() {
         let map = effective_map(&crate::config::UserConfig::default());
         assert_eq!(
-            lookup(&map, Chord::parse("f3").unwrap()),
+            lookup(&map, Chord::parse("ctrl+shift+f3").unwrap()),
             Some(Action::BidiToggle)
         );
+        // htop and mc search on bare F3
+        assert_eq!(lookup(&map, Chord::parse("f3").unwrap()), None);
         assert_ne!(
             Action::BidiToggle.default_chord(),
             Action::ClaudeToggle.default_chord()

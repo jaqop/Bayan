@@ -3702,7 +3702,7 @@ impl App {
         let (auto, manual) = (self.auto_follow, self.claude_manual);
         let honor = self.config.honor_bdsm();
         let mode = pane_mode.unwrap_or_else(|| self.config.bidi_mode());
-        let (cols, row, cells, claude, vis, reorder, dir, align_edge) = {
+        let (cols, row, cells, claude, vis, reorder, dir, align_edge, bidi_row) = {
             let t = self.tabs[self.active].panes[hit.pane].session.term.lock();
             let cols = t.columns().max(1);
             let rows = t.screen_lines().max(1);
@@ -3728,13 +3728,18 @@ impl App {
                 let abs = bidi_ctl::viewport_line_abs(evicted, history, off, row as u64);
                 claude &= claude_from.is_none_or(|start| abs >= start);
             }
-            let dir = if use_stamps {
-                bidi_state.direction_at(bidi_ctl::viewport_line_abs(
-                    evicted, history, off, row as u64,
-                ))
-            } else {
-                bidi_ctl::ParagraphDir::Default
-            };
+            // The row's direction and path as draw_pane picks them: SCP
+            // stamp, then the wrapped paragraph's direction, then its own
+            // first strong letter. A wrapped RTL tail is bidi without Arabic.
+            let (dir, bidi_row) = render::viewport_row_layout(&t, row, |li| {
+                if use_stamps {
+                    bidi_state.direction_at(bidi_ctl::viewport_line_abs(
+                        evicted, history, off, li as u64,
+                    ))
+                } else {
+                    bidi_ctl::ParagraphDir::Default
+                }
+            });
             let cells = render::snapshot_row(&t, row);
             // Same split as draw_pane: TUI fields and the alternate screen
             // are not flush-right, so a click must not assume they are.
@@ -3748,6 +3753,7 @@ impl App {
                 reorder,
                 dir,
                 align_edge,
+                bidi_row,
             )
         };
         let mapped = rects
@@ -3760,7 +3766,7 @@ impl App {
             .map(|h| h.0);
         let col = if let Some(col) = mapped {
             col
-        } else if reorder && cells.iter().any(|c| render::is_rtl(c.c)) {
+        } else if reorder && bidi_row {
             let rect = rects.get(hit.pane).copied().unwrap_or((0, 0, 1, 1));
             let x = (pos.x - rect.0 as f64) as f32;
             self.renderer
@@ -4213,7 +4219,7 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// F3. Cycles the focused pane only: full → alt screen off → off.
+    /// Ctrl+Shift+F3. Cycles the focused pane only: full → alt screen off → off.
     /// The config stays the default for panes that have not been toggled.
     fn toggle_bidi_reorder(&mut self) {
         let config_mode = self.config.bidi_mode();
