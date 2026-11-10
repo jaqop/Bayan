@@ -82,6 +82,13 @@ pub(crate) fn wheel_plan(
 }
 
 impl PaneScroll {
+    pub(crate) fn with_subline(subline: f32) -> Self {
+        Self {
+            subline,
+            ..Self::default()
+        }
+    }
+
     /// Add `lines` (signed, fractional) to the position and carry whole
     /// lines into `offset`. The fraction stays in `subline`. Past either end
     /// of the scrollback the extra is dropped: the position clamps.

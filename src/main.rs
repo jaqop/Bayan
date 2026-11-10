@@ -7283,10 +7283,7 @@ mod scroll_app_tests {
     }
 
     fn stale_fraction(app: &mut App, id: u64) {
-        let mut st = scroll::PaneScroll {
-            subline: 0.4,
-            ..scroll::PaneScroll::default()
-        };
+        let mut st = scroll::PaneScroll::with_subline(0.4);
         let then = Instant::now()
             .checked_sub(Duration::from_millis(1_000))
             .unwrap_or_else(Instant::now);
@@ -7418,13 +7415,7 @@ mod scroll_app_tests {
             let r = app.renderer.as_ref().unwrap();
             (r.cell_w, r.cell_h)
         };
-        app.smooth.insert(
-            id,
-            scroll::PaneScroll {
-                subline: 0.4,
-                ..scroll::PaneScroll::default()
-            },
-        );
+        app.smooth.insert(id, scroll::PaneScroll::with_subline(0.4));
         let shift = scroll::offset_px(0.4, ch);
         assert!(shift >= 2, "cell {ch} shifted only {shift}px");
         let x = cw as f64 * 2.0 + 1.0;
@@ -7450,13 +7441,7 @@ mod scroll_app_tests {
         let (mut app, id, _) = host(true);
         feed(&app, b"\x1b[?1000h\x1b[?1006h");
         let ch = app.renderer.as_ref().unwrap().cell_h;
-        app.smooth.insert(
-            id,
-            scroll::PaneScroll {
-                subline: 0.4,
-                ..scroll::PaneScroll::default()
-            },
-        );
+        app.smooth.insert(id, scroll::PaneScroll::with_subline(0.4));
         let shift = scroll::offset_px(0.4, ch) as f64;
         let y = 1.0;
         assert!(shift > y, "no peek sliver: shift {shift}");
@@ -7471,13 +7456,7 @@ mod scroll_app_tests {
     fn history_row_click_keeps_the_grid_column_when_reordering_is_off() {
         let (mut app, id, _) = host(true);
         let ch = app.renderer.as_ref().unwrap().cell_h;
-        app.smooth.insert(
-            id,
-            scroll::PaneScroll {
-                subline: 0.5,
-                ..scroll::PaneScroll::default()
-            },
-        );
+        app.smooth.insert(id, scroll::PaneScroll::with_subline(0.5));
         let shift = scroll::offset_px(0.5, ch);
         assert!(shift >= 4, "cell {ch} shift {shift}");
         let rect = app.pane_rects()[0];
