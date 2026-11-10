@@ -2,16 +2,17 @@
 //! alacritty_terminal. Mirrors EasyTer's proven architecture: a reader thread
 //! feeds the emulator behind a mutex and nudges the UI thread to repaint.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::Instant;
 
-use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Column;
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{Config, Osc52, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use base64::Engine;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -764,9 +765,11 @@ fn last_osc_payload<'a>(data: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
 
 /// OSC 52: a program asked to set the clipboard.
 ///
-/// Write-only. A query (`?`) returns `None` and nothing in this process
-/// ever replies with clipboard bytes. The caller still has to pass
-/// [`allow_osc52_write`]: this function only parses.
+/// Write-only. A query (`?`) returns `None` here. The parser may still
+/// emit `ClipboardLoad`; [`EventProxy`] forwards that and
+/// [`clipboard_load_reply`] writes nothing unless the read flag is on —
+/// and even then this build does not read the clipboard. The caller still
+/// has to pass [`allow_osc52_write`] for a copy: this function only parses.
 fn scan_osc52(data: &[u8]) -> Option<String> {
     let payload = last_osc_payload(data, b"\x1b]52;")?;
     // skip the selection field ("c;", "p;", ...)
@@ -2102,18 +2105,146 @@ fn answer_color_query(event: Event, colors: Option<&QueryColors>) -> Option<Even
     }
 }
 
-impl EventListener for EventProxy {
-    fn send_event(&self, event: Event) {
-        // Answered here, on the reader thread, so the reply joins this
-        // read's batch and its 16 KiB cap: a flood of `OSC 11 ?` must not
-        // become one window event per query.
-        let event = {
+/// Cell size shared by every pane, and each pane's grid. `CSI 14 t` is
+/// rows × cell height by cols × cell width. Zero means the renderer has
+/// not measured a cell yet, and the query is then refused.
+struct TextArea {
+    cell_w: u16,
+    cell_h: u16,
+    grids: HashMap<u64, (u16, u16)>,
+}
+
+static TEXT_AREA: std::sync::LazyLock<RwLock<TextArea>> = std::sync::LazyLock::new(|| {
+    RwLock::new(TextArea {
+        cell_w: 0,
+        cell_h: 0,
+        grids: HashMap::new(),
+    })
+});
+
+/// OSC 52 read. Off unless the user set `osc52_read`. A reply is still
+/// refused while the read itself is unimplemented.
+static OSC52_READ: AtomicBool = AtomicBool::new(false);
+
+/// Publish the read flag. Default off. Called once at startup.
+pub fn set_osc52_read(enabled: bool) {
+    OSC52_READ.store(enabled, Ordering::Release);
+}
+
+/// The renderer's cell, in pixels. A non-finite or sub-pixel value counts
+/// as unknown.
+pub fn set_text_area_cell(cell_w: f32, cell_h: f32) {
+    let mut area = TEXT_AREA
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    area.cell_w = px_u16(cell_w);
+    area.cell_h = px_u16(cell_h);
+}
+
+/// This pane's grid, in cells. Paired with [`set_text_area_cell`].
+pub fn set_text_area_grid(id: u64, cols: usize, rows: usize) {
+    let mut area = TEXT_AREA
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    area.grids.insert(id, (u16_len(cols), u16_len(rows)));
+}
+
+pub(crate) fn clear_text_area_grid(id: u64) {
+    TEXT_AREA
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .grids
+        .remove(&id);
+}
+
+fn u16_len(n: usize) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
+}
+
+fn px_u16(v: f32) -> u16 {
+    if !v.is_finite() || v < 0.5 {
+        return 0;
+    }
+    let rounded = v.round();
+    if rounded > f32::from(u16::MAX) {
+        return u16::MAX;
+    }
+    // `rounded` is an integer in 1..=65535.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        rounded as u16
+    }
+}
+
+fn text_area_for(id: u64) -> Option<WindowSize> {
+    let area = TEXT_AREA
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let &(cols, rows) = area.grids.get(&id)?;
+    if area.cell_w == 0 || area.cell_h == 0 || cols == 0 || rows == 0 {
+        return None;
+    }
+    Some(WindowSize {
+        num_cols: cols,
+        num_lines: rows,
+        cell_width: area.cell_w,
+        cell_height: area.cell_h,
+    })
+}
+
+/// `CSI 14 t` answered from `area`, via alacritty's formatter
+/// (`CSI 4 ; height ; width t`). `None` when the window has no metrics yet.
+fn text_area_reply(
+    area: Option<WindowSize>,
+    format: &(dyn Fn(WindowSize) -> String + Sync + Send),
+) -> Option<String> {
+    area.map(|size| format(size))
+}
+
+/// Bytes to write for an OSC 52 read, or nothing.
+///
+/// Off is the default. This function never returns text: not the clipboard,
+/// and not an empty OSC 52. Reading the clipboard is a later change; until
+/// then an enabled flag still writes nothing.
+pub(crate) fn clipboard_load_reply(read_enabled: bool) -> Option<String> {
+    if !read_enabled {
+        return None;
+    }
+    None
+}
+
+/// Colour, text-area, and clipboard queries, before the batch. A `PtyWrite`
+/// joins the read's 16 KiB cap. `ClipboardLoad` stays a notice: the
+/// formatter is not called, so no clipboard bytes (and no empty OSC 52)
+/// are written. `None` drops the event.
+fn prepare_event(pane: u64, event: Event) -> Option<Event> {
+    match event {
+        Event::ColorRequest(index, format) => {
             let colors = QUERY_COLORS
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            answer_color_query(event, colors.as_ref())
-        };
-        let Some(event) = event else {
+            color_reply(colors.as_ref(), index, &*format).map(Event::PtyWrite)
+        }
+        Event::TextAreaSizeRequest(format) => {
+            text_area_reply(text_area_for(pane), &*format).map(Event::PtyWrite)
+        }
+        Event::ClipboardLoad(kind, format) => {
+            // `format(text)` is the OSC 52 reply. It is not called.
+            match clipboard_load_reply(OSC52_READ.load(Ordering::Acquire)) {
+                Some(text) => Some(Event::PtyWrite(text)),
+                None => Some(Event::ClipboardLoad(kind, format)),
+            }
+        }
+        other => Some(other),
+    }
+}
+
+impl EventListener for EventProxy {
+    fn send_event(&self, event: Event) {
+        // Answered here, on the reader thread, so a reply joins this
+        // read's batch and its 16 KiB cap: a flood of queries must not
+        // become one window event per query.
+        let Some(event) = prepare_event(self.1, event) else {
             return;
         };
         let Some(event) = self.2.lock_or_recover().absorb(event) else {
@@ -2126,6 +2257,8 @@ impl EventListener for EventProxy {
             // the cockpit's attention signal
             Event::Bell => UserEvent::Bell(self.1),
             Event::Exit => UserEvent::Exit(self.1),
+            // Forwarded, not answered. The formatter was dropped above.
+            Event::ClipboardLoad(kind, _) => UserEvent::ClipboardLoad(self.1, kind),
             _ => return,
         };
         let _ = self.0.send_event(mapped);
@@ -2173,6 +2306,7 @@ impl<T> LockExt<T> for Mutex<T> {
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.child.kill();
+        clear_text_area_grid(self.id);
     }
 }
 
@@ -2276,6 +2410,10 @@ impl Session {
             // a `:` sub-parameter). Queries while off are answered by
             // `process_chunk`, not by the parser.
             kitty_keyboard: kitty_protocol,
+            // A copy stays on Bayan's scanner (alacritty will not emit
+            // ClipboardStore). A query is delivered as ClipboardLoad so
+            // the proxy can forward it. The proxy writes no reply.
+            osc52: Osc52::OnlyPaste,
             ..Config::default()
         };
         let batch = Arc::new(Mutex::new(EventBatch::default()));
@@ -2472,8 +2610,11 @@ impl Session {
         });
         // Drop the term lock before meta. A resize reflows rows, so SCP
         // stamps no longer name the text they were written on.
+        // The text-area map is taken after both: a query on the reader
+        // already holds the term lock and then that map.
         self.term.lock().resize(size);
         self.meta.lock_or_recover().bidi_mut().on_resize();
+        set_text_area_grid(self.id, size.cols, size.rows);
     }
 }
 
@@ -4688,6 +4829,139 @@ mod tests {
         assert!(color_replies(None, b"\x1b]11;?\x07").is_empty());
         // a set is not a query
         assert!(color_replies(Some(sample_colors()), b"\x1b]11;#ffffff\x07").is_empty());
+    }
+
+    /// The reply is read when the query arrives, not when the listener was
+    /// built. That is the theme switch: `set_query_colors` replaces the
+    /// table, and the next OSC 11 hears the new background.
+    #[test]
+    fn a_theme_change_is_the_next_colour_reply() {
+        let table = Arc::new(Mutex::new(sample_colors()));
+        struct Live(Arc<Mutex<QueryColors>>, Arc<Mutex<Vec<String>>>);
+        impl EventListener for Live {
+            fn send_event(&self, event: Event) {
+                let colors = self.0.lock_or_recover().clone();
+                if let Some(Event::PtyWrite(text)) = answer_color_query(event, Some(&colors)) {
+                    self.1.lock_or_recover().push(text);
+                }
+            }
+        }
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let size = TermSize { cols: 40, rows: 6 };
+        let mut t = Term::new(
+            Config::default(),
+            &size,
+            Live(Arc::clone(&table), Arc::clone(&log)),
+        );
+        let mut p: Processor = Processor::new();
+        p.advance(&mut t, b"\x1b]11;?\x07");
+        assert_eq!(
+            log.lock_or_recover().as_slice(),
+            ["\x1b]11;rgb:0d0d/1111/1717\x07"]
+        );
+        let dracula = crate::render::theme_by_name("Dracula").unwrap();
+        assert_ne!(dracula.bg, (0x0d, 0x11, 0x17));
+        table.lock_or_recover()[257] = dracula.bg;
+        p.advance(&mut t, b"\x1b]11;?\x07");
+        let (r, g, b) = dracula.bg;
+        assert_eq!(
+            log.lock_or_recover().as_slice(),
+            [
+                "\x1b]11;rgb:0d0d/1111/1717\x07",
+                format!("\x1b]11;rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}\x07").as_str(),
+            ]
+        );
+    }
+
+    /// What EventProxy posts for one event, without the winit proxy.
+    struct HostProbe {
+        pane: u64,
+        writes: Arc<Mutex<Vec<String>>>,
+        loads: Arc<Mutex<Vec<alacritty_terminal::term::ClipboardType>>>,
+    }
+
+    impl EventListener for HostProbe {
+        fn send_event(&self, event: Event) {
+            let Some(event) = prepare_event(self.pane, event) else {
+                return;
+            };
+            match event {
+                Event::PtyWrite(text) => self.writes.lock_or_recover().push(text),
+                Event::ClipboardLoad(kind, _) => self.loads.lock_or_recover().push(kind),
+                _ => {}
+            }
+        }
+    }
+
+    fn host_feed(
+        pane: u64,
+        config: Config,
+        input: &[u8],
+    ) -> (Vec<String>, Vec<alacritty_terminal::term::ClipboardType>) {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let loads = Arc::new(Mutex::new(Vec::new()));
+        let size = TermSize { cols: 80, rows: 24 };
+        let mut t = Term::new(
+            config,
+            &size,
+            HostProbe {
+                pane,
+                writes: Arc::clone(&writes),
+                loads: Arc::clone(&loads),
+            },
+        );
+        let mut p: Processor = Processor::new();
+        p.advance(&mut t, input);
+        let writes = writes.lock_or_recover().clone();
+        let loads = loads.lock_or_recover().clone();
+        (writes, loads)
+    }
+
+    /// `CSI 14 t` is the text area in pixels, from the cell size and the
+    /// pane's grid. No metrics yet means no reply.
+    #[test]
+    fn text_area_size_comes_from_the_cell_grid() {
+        let pane = u64::MAX;
+        clear_text_area_grid(pane);
+        let (writes, _) = host_feed(pane, Config::default(), b"\x1b[14t");
+        assert!(writes.is_empty(), "no cell size yet: {writes:?}");
+
+        // 9.2px → 9, 18.6px → 19. 24×19 by 80×9.
+        set_text_area_cell(9.2, 18.6);
+        set_text_area_grid(pane, 80, 24);
+        let (writes, _) = host_feed(pane, Config::default(), b"\x1b[14t");
+        assert_eq!(writes, ["\x1b[4;456;720t"]);
+        clear_text_area_grid(pane);
+    }
+
+    /// Default config writes nothing for an OSC 52 read. When the emulator
+    /// does deliver `ClipboardLoad`, it is forwarded and still not answered
+    /// — not even with an empty OSC 52. The read flag does not change that
+    /// until the clipboard is actually read.
+    #[test]
+    fn osc52_query_writes_nothing_and_the_load_is_forwarded() {
+        use alacritty_terminal::term::ClipboardType;
+        assert!(!crate::config::UserConfig::default().osc52_read_enabled());
+        assert!(!OSC52_READ.load(Ordering::Acquire));
+        assert!(clipboard_load_reply(false).is_none());
+        assert!(clipboard_load_reply(true).is_none());
+
+        let (writes, loads) = host_feed(1, Config::default(), b"\x1b]52;c;?\x07");
+        assert!(
+            writes.is_empty(),
+            "default config must not PtyWrite an OSC 52 reply: {writes:?}"
+        );
+        assert!(loads.is_empty(), "OnlyCopy never emits the load");
+
+        // The live pane asks alacritty to deliver the load (OnlyPaste) and
+        // then refuses the reply.
+        let cfg = Config {
+            osc52: Osc52::OnlyPaste,
+            ..Config::default()
+        };
+        let (writes, loads) = host_feed(1, cfg, b"\x1b]52;c;?\x07");
+        assert!(writes.is_empty(), "{writes:?}");
+        assert_eq!(loads, vec![ClipboardType::Clipboard]);
     }
 
     struct KittyFixture {
