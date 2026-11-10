@@ -537,7 +537,7 @@ impl App {
 
     /// Sub-line scrollback for one pane. Pixel deltas move now; a wheel
     /// notch waits in `pending` for [`Self::tick_smooth_scroll`].
-    fn smooth_scroll_pane(&mut self, id: u64, lines: f32, pixel: bool) {
+    pub(crate) fn smooth_scroll_pane(&mut self, id: u64, lines: f32, pixel: bool) {
         let Some((ti, pi)) = self.find_pane(id) else {
             return;
         };

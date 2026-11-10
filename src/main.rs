@@ -1507,6 +1507,10 @@ struct App {
     debug_paste: Option<String>,
     /// `--cwd`'s folder, already gated, until the first tab opens in it.
     start_dir: Option<String>,
+    /// Replaces the window content rect in tests, so `locate` and the
+    /// wakeup path can run without a real window.
+    #[cfg(test)]
+    test_content: Option<render::Rect>,
 }
 
 impl App {
@@ -2765,6 +2769,10 @@ impl App {
 
     /// The window's content area: below the tab bar, inside the padding.
     pub(crate) fn content_rect(&self) -> Option<render::Rect> {
+        #[cfg(test)]
+        if let Some(rect) = self.test_content {
+            return Some(rect);
+        }
         let (r, w) = (self.renderer.as_ref()?, self.window.as_ref()?);
         let px = w.inner_size();
         let bar = r.tab_bar_h().round() as i32;
@@ -5024,6 +5032,48 @@ impl App {
             crate::prof::mark("first frame presented");
         }
     }
+
+    /// One PTY read. A live wheel or a touch still inside [`scroll::WHEEL_MS`]
+    /// is kept; only a stale fraction at the bottom is dropped.
+    fn wakeup(&mut self, id: u64) {
+        self.link_cache.invalidate_pane(id);
+        // The row that was hovered may have moved. Drop the tooltip
+        // and the click target together, or they can disagree.
+        if self.link_hover.as_ref().is_some_and(|h| h.pane_id == id) {
+            self.clear_link_hover();
+        }
+        if !self.first_output {
+            self.first_output = true;
+            crate::prof::mark("first pty output");
+        }
+        if let Some((ti, pi)) = self.find_pane(id) {
+            self.tabs[ti].panes[pi].last_output = Some(Instant::now());
+            let (alt, following) = {
+                let t = self.tabs[ti].panes[pi].session.term.lock();
+                (
+                    t.mode().contains(TermMode::ALT_SCREEN),
+                    t.grid().display_offset() == 0,
+                )
+            };
+            let was_alt = self.alt_seen.insert(id, alt).unwrap_or(false);
+            let now = Instant::now();
+            scroll::apply_alt_screen(&mut self.smooth, id, was_alt, alt);
+            scroll::apply_output(&mut self.smooth, id, following, now);
+            let ris = {
+                let mut meta = self.tabs[ti].panes[pi].session.meta.lock_or_recover();
+                let ris = meta.saw_ris;
+                meta.saw_ris = false;
+                ris
+            };
+            if ris {
+                self.mouse.note_ris(id);
+            }
+        }
+        // the chunk may have enabled focus reporting; tell the
+        // program whether the window is looking at it
+        self.sync_focus(None);
+        self.request_redraw();
+    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -5151,45 +5201,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.start_sessions();
                 self.request_redraw();
             }
-            UserEvent::Wakeup(id) => {
-                self.link_cache.invalidate_pane(id);
-                // The row that was hovered may have moved. Drop the tooltip
-                // and the click target together, or they can disagree.
-                if self.link_hover.as_ref().is_some_and(|h| h.pane_id == id) {
-                    self.clear_link_hover();
-                }
-                if !self.first_output {
-                    self.first_output = true;
-                    crate::prof::mark("first pty output");
-                }
-                if let Some((ti, pi)) = self.find_pane(id) {
-                    self.tabs[ti].panes[pi].last_output = Some(Instant::now());
-                    let (alt, following) = {
-                        let t = self.tabs[ti].panes[pi].session.term.lock();
-                        (
-                            t.mode().contains(TermMode::ALT_SCREEN),
-                            t.grid().display_offset() == 0,
-                        )
-                    };
-                    let was_alt = self.alt_seen.insert(id, alt).unwrap_or(false);
-                    let now = Instant::now();
-                    scroll::apply_alt_screen(&mut self.smooth, id, was_alt, alt);
-                    scroll::apply_output(&mut self.smooth, id, following, now);
-                    let ris = {
-                        let mut meta = self.tabs[ti].panes[pi].session.meta.lock_or_recover();
-                        let ris = meta.saw_ris;
-                        meta.saw_ris = false;
-                        ris
-                    };
-                    if ris {
-                        self.mouse.note_ris(id);
-                    }
-                }
-                // the chunk may have enabled focus reporting; tell the
-                // program whether the window is looking at it
-                self.sync_focus(None);
-                self.request_redraw();
-            }
+            UserEvent::Wakeup(id) => self.wakeup(id),
             UserEvent::PtyWrite(id, text) => {
                 if let Some((ti, pi)) = self.find_pane(id) {
                     self.tabs[ti].panes[pi].session.write(text.as_bytes());
@@ -5743,6 +5755,8 @@ fn run() -> Result<(), String> {
         keys_held_away: Vec::new(),
         debug_paste: None,
         start_dir,
+        #[cfg(test)]
+        test_content: None,
     };
     let result = event_loop.run_app(&mut app);
     if let Some(error) = app.startup_error {
@@ -7113,5 +7127,378 @@ mod m38_tests {
         );
         let old = r#"{"tabs":[{"cwds":[null]}],"active":0}"#;
         assert_eq!(parse_state(old).unwrap().tabs[0].name, None);
+    }
+}
+
+/// Smooth-scroll resets and pointer hits, through the `App` methods that
+/// own them. Deleting the call inside `wakeup`, `relayout_active`,
+/// `rebuild_renderer`, `locate`, or `try_report_press` fails one of these.
+#[cfg(test)]
+mod scroll_app_tests {
+    use super::*;
+    use std::sync::OnceLock;
+    use std::time::Duration;
+    use winit::event_loop::EventLoop;
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+
+    fn proxy() -> EventLoopProxy<UserEvent> {
+        static PROXY: OnceLock<EventLoopProxy<UserEvent>> = OnceLock::new();
+        PROXY
+            .get_or_init(|| {
+                let el = EventLoop::<UserEvent>::with_user_event()
+                    .with_any_thread(true)
+                    .build()
+                    .expect("event loop");
+                let proxy = el.create_proxy();
+                // The proxy posts to this loop's window. Keep the loop alive.
+                std::mem::forget(el);
+                proxy
+            })
+            .clone()
+    }
+
+    fn bare() -> App {
+        let cfg = config::UserConfig::default();
+        let keymap = keybinds::effective_map(&cfg);
+        App {
+            posh: None,
+            last_toast: None,
+            mru: mru::Mru::new(),
+            groups: groups::Groups::new(),
+            spawn_group: None,
+            palette: None,
+            shell_profiles: Vec::new(),
+            shell_profiles_ready: false,
+            startup_pending: false,
+            last_strip_click: None,
+            proxy: proxy(),
+            window: None,
+            gpu: None,
+            renderer: None,
+            tabs: Vec::new(),
+            active: 0,
+            next_id: 1,
+            size: TermSize { cols: 40, rows: 12 },
+            modifiers: ModifiersState::default(),
+            first_frame: false,
+            first_output: false,
+            last_frame: Vec::new(),
+            last_frame_size: None,
+            cursor_pos: PhysicalPosition::new(0.0, 0.0),
+            ime_spot: None,
+            mouse: mouse::Route::default(),
+            sel_pane: 0,
+            drag_divider: None,
+            cockpit: false,
+            cockpit_sel: 0,
+            pending_paste: None,
+            pending_close: None,
+            swallow_guard_release: false,
+            link_hover: None,
+            blocked_link: None,
+            link_cache: link::SpanCache::default(),
+            last_input: Instant::now(),
+            blink_drawn_on: true,
+            settings: None,
+            focused: false,
+            clicks: ClickTracker::new(),
+            wheel_accum: 0.0,
+            smooth: std::collections::HashMap::new(),
+            smooth_at: None,
+            alt_seen: std::collections::HashMap::new(),
+            search: None,
+            clipboard: None,
+            auto_follow: true,
+            claude_manual: false,
+            config: cfg,
+            config_load_error: None,
+            startup_error: None,
+            keymap,
+            shortcuts: None,
+            atlas_generation: 0,
+            font_delta: 0.0,
+            renderer_building: false,
+            inflight_delta: 0.0,
+            normal_geom: None,
+            keys_held_away: Vec::new(),
+            debug_paste: None,
+            start_dir: None,
+            test_content: None,
+        }
+    }
+
+    fn host(draw: bool) -> (App, u64, term::HeadlessWrite) {
+        let mut app = bare();
+        if draw {
+            app.renderer = Some(render::Renderer::new(1.0, &app.config, 0.0));
+        }
+        let (cw, ch) = app
+            .renderer
+            .as_ref()
+            .map(|r| (r.cell_w, r.cell_h))
+            .unwrap_or((8.0, 16.0));
+        let cols = 40usize;
+        let rows = 12usize;
+        app.test_content = Some((
+            0,
+            0,
+            (cw * cols as f32).ceil() as i32,
+            (ch * rows as f32).ceil() as i32,
+        ));
+        let (session, written) =
+            term::Session::headless(TermSize { cols, rows }, app.proxy.clone(), 0);
+        app.tabs.push(Tab {
+            panes: vec![Pane {
+                id: 0,
+                session,
+                command: String::new(),
+                last_output: None,
+                progress: None,
+            }],
+            layout: layout::Node::single(),
+            focused: 0,
+            title: "t".into(),
+            name: None,
+            attention: false,
+            broadcast: false,
+            zoomed: false,
+            group: 0,
+        });
+        (app, 0, written)
+    }
+
+    fn feed(app: &App, bytes: &[u8]) {
+        let mut t = app.tabs[0].panes[0].session.term.lock();
+        let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+        parser.advance(&mut *t, bytes);
+    }
+
+    fn display_offset(app: &App) -> usize {
+        app.tabs[0].panes[0]
+            .session
+            .term
+            .lock()
+            .grid()
+            .display_offset()
+    }
+
+    fn stale_fraction(app: &mut App, id: u64) {
+        let mut st = scroll::PaneScroll {
+            subline: 0.4,
+            ..scroll::PaneScroll::default()
+        };
+        let then = Instant::now()
+            .checked_sub(Duration::from_millis(1_000))
+            .unwrap_or_else(Instant::now);
+        st.note_motion(then);
+        app.smooth.insert(id, st);
+    }
+
+    fn fill_history(app: &App) {
+        feed(app, "x\r\n".repeat(40).as_bytes());
+    }
+
+    #[test]
+    fn new_output_at_the_bottom_clears_the_offset() {
+        let (mut app, id, _) = host(false);
+        stale_fraction(&mut app, id);
+        app.wakeup(id);
+        assert!(
+            app.smooth.is_empty(),
+            "a stale fraction at the bottom must go on output"
+        );
+    }
+
+    #[test]
+    fn new_output_while_scrolled_up_keeps_the_offset() {
+        let (mut app, id, _) = host(false);
+        fill_history(&app);
+        app.tabs[0].panes[0]
+            .session
+            .term
+            .lock()
+            .scroll_display(alacritty_terminal::grid::Scroll::Delta(3));
+        assert!(display_offset(&app) > 0);
+        stale_fraction(&mut app, id);
+        app.wakeup(id);
+        let sub = app.smooth.get(&id).map(|s| s.subline).unwrap_or(0.0);
+        assert!((sub - 0.4).abs() < 0.001, "scrolled-up offset was {sub}");
+    }
+
+    #[test]
+    fn entering_the_alt_screen_clears_a_resting_offset() {
+        let (mut app, id, _) = host(false);
+        // A live notch would survive output. Only the alt transition drops it.
+        app.smooth_scroll_pane(id, 3.0, false);
+        app.wakeup(id);
+        assert!(app.smooth.contains_key(&id), "output ate a live notch");
+        feed(&app, b"\x1b[?1049h");
+        app.wakeup(id);
+        assert!(
+            app.smooth.is_empty(),
+            "entering the alt screen left the offset"
+        );
+    }
+
+    #[test]
+    fn leaving_the_alt_screen_clears_a_resting_offset() {
+        let (mut app, id, _) = host(false);
+        feed(&app, b"\x1b[?1049h");
+        app.wakeup(id);
+        app.smooth_scroll_pane(id, 3.0, false);
+        app.wakeup(id);
+        assert!(app.smooth.contains_key(&id));
+        feed(&app, b"\x1b[?1049l");
+        app.wakeup(id);
+        assert!(
+            app.smooth.is_empty(),
+            "leaving the alt screen left the offset"
+        );
+    }
+
+    #[test]
+    fn resize_clears_the_offset() {
+        let mut app = bare();
+        stale_fraction(&mut app, 1);
+        stale_fraction(&mut app, 2);
+        app.relayout_active();
+        assert!(app.smooth.is_empty());
+    }
+
+    #[test]
+    fn font_change_clears_the_offset() {
+        let mut app = bare();
+        stale_fraction(&mut app, 1);
+        app.rebuild_renderer();
+        assert!(app.smooth.is_empty());
+    }
+
+    /// Wheel-up while output is streaming. On b3746d5 every wakeup at the
+    /// bottom called `drop_smooth`, so the notch never became a line.
+    #[test]
+    fn wheel_up_followed_by_output_wakeups_still_scrolls() {
+        let (mut app, id, _) = host(false);
+        fill_history(&app);
+        app.smooth_scroll_pane(id, 3.0, false);
+        for _ in 0..40 {
+            app.smooth_at = Some(Instant::now() - Duration::from_millis(16));
+            app.tick_smooth_scroll();
+            app.wakeup(id);
+        }
+        let offset = display_offset(&app);
+        assert!(
+            offset >= 1,
+            "output wiped the wheel; display offset stayed {offset}"
+        );
+    }
+
+    #[test]
+    fn a_slow_touchpad_drag_survives_output_at_the_bottom() {
+        let (mut app, id, _) = host(false);
+        fill_history(&app);
+        for _ in 0..20 {
+            app.smooth_scroll_pane(id, 0.1, true);
+            app.wakeup(id);
+        }
+        let offset = display_offset(&app);
+        assert!(
+            offset >= 1,
+            "slow touch motion was cleared before a line, offset {offset}"
+        );
+    }
+
+    #[test]
+    fn a_partial_offset_reports_the_shifted_row() {
+        let (mut app, id, written) = host(true);
+        feed(&app, b"\x1b[?1000h\x1b[?1006h");
+        let mode = app.mode_of(id);
+        assert!(mode.contains(TermMode::MOUSE_REPORT_CLICK));
+        assert!(mode.contains(TermMode::SGR_MOUSE));
+        let (cw, ch) = {
+            let r = app.renderer.as_ref().unwrap();
+            (r.cell_w, r.cell_h)
+        };
+        app.smooth.insert(
+            id,
+            scroll::PaneScroll {
+                subline: 0.4,
+                ..scroll::PaneScroll::default()
+            },
+        );
+        let shift = scroll::offset_px(0.4, ch);
+        assert!(shift >= 2, "cell {ch} shifted only {shift}px");
+        let x = cw as f64 * 2.0 + 1.0;
+        let y = ch as f64 + 1.0;
+        assert_eq!((x / cw as f64).floor() as usize, 2);
+        assert_eq!((y / ch as f64).floor() as usize, 1);
+        app.cursor_pos = PhysicalPosition::new(x, y);
+        let hit = app.locate(app.cursor_pos).unwrap();
+        assert_eq!(hit.2, 0, "locate ignored the offset");
+        assert!(app.try_report_press(mouse::Btn::Left));
+        assert_eq!(written.wait(), b"\x1b[<0;3;1M");
+
+        app.smooth.remove(&id);
+        app.cursor_pos = PhysicalPosition::new(x, y);
+        let hit = app.locate(app.cursor_pos).unwrap();
+        assert_eq!(hit.2, 1);
+        assert!(app.try_report_press(mouse::Btn::Left));
+        assert_eq!(written.wait(), b"\x1b[<0;3;2M");
+    }
+
+    #[test]
+    fn the_peek_sliver_is_not_reported_as_the_top_row() {
+        let (mut app, id, _) = host(true);
+        feed(&app, b"\x1b[?1000h\x1b[?1006h");
+        let ch = app.renderer.as_ref().unwrap().cell_h;
+        app.smooth.insert(
+            id,
+            scroll::PaneScroll {
+                subline: 0.4,
+                ..scroll::PaneScroll::default()
+            },
+        );
+        let shift = scroll::offset_px(0.4, ch) as f64;
+        let y = 1.0;
+        assert!(shift > y, "no peek sliver: shift {shift}");
+        assert_eq!((y / ch as f64).floor() as usize, 0);
+        app.cursor_pos = PhysicalPosition::new(4.0, y);
+        let hit = app.locate(app.cursor_pos).unwrap();
+        assert_eq!(hit.2, -1);
+        assert!(!app.try_report_press(mouse::Btn::Left));
+    }
+
+    #[test]
+    fn history_row_click_keeps_the_grid_column_when_reordering_is_off() {
+        let (mut app, id, _) = host(true);
+        let ch = app.renderer.as_ref().unwrap().cell_h;
+        app.smooth.insert(
+            id,
+            scroll::PaneScroll {
+                subline: 0.5,
+                ..scroll::PaneScroll::default()
+            },
+        );
+        let shift = scroll::offset_px(0.5, ch);
+        assert!(shift >= 4, "cell {ch} shift {shift}");
+        let rect = app.pane_rects()[0];
+        app.renderer
+            .as_mut()
+            .unwrap()
+            .plant_hit(rect, scroll::PEEK_ROW, 0, rect.2.max(1), 7);
+        {
+            let mut meta = app.tabs[0].panes[0].session.meta.lock_or_recover();
+            meta.running_cmd = "demo".into();
+        }
+        app.cursor_pos = PhysicalPosition::new(2.0, 1.0);
+        let on = app.locate(app.cursor_pos).unwrap();
+        assert_eq!(on.2, -1);
+        assert_eq!(on.3, 7, "implicit mode uses the shaped column");
+        {
+            let mut meta = app.tabs[0].panes[0].session.meta.lock_or_recover();
+            meta.bidi_mut().mode = bidi_ctl::BidiMode::Explicit;
+        }
+        let off = app.locate(app.cursor_pos).unwrap();
+        assert_eq!(off.2, -1);
+        assert_eq!(off.3, 0, "explicit BDSM stays on the grid column");
     }
 }

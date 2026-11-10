@@ -1946,6 +1946,16 @@ impl Renderer {
         }
     }
 
+    /// One shaped span, so a test can click a column `hit_cell` returns
+    /// without drawing a frame.
+    #[cfg(test)]
+    pub(crate) fn plant_hit(&mut self, pane: Rect, row: usize, x: i32, width: i32, col: usize) {
+        self.row_hits
+            .entry((pane, row))
+            .or_default()
+            .push((x, width, col, false));
+    }
+
     pub fn hit_cell(
         &self,
         pane: Rect,
