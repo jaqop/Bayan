@@ -359,17 +359,23 @@ impl Node {
     }
 }
 
-/// The divider under `(x, y)`, as an index into `dividers`: within `grab`
-/// pixels across the line, and inside its length.
+/// The divider under `(x, y)`, as an index into `dividers`. The grab is
+/// measured from the line's center and extends `grab` pixels past each
+/// edge, so a wide seam (the scrollbar gutter) is held from both panes,
+/// not only from the side where the line starts.
 pub fn divider_at(dividers: &[Divider], x: f64, y: f64, grab: f64) -> Option<usize> {
     dividers.iter().position(|d| {
         let (lx, ly, lw, lh) = d.line;
         match d.axis {
             Orientation::Row => {
-                (x - lx as f64).abs() <= grab && y >= ly as f64 && y < (ly + lh) as f64
+                let mid = lx as f64 + lw as f64 / 2.0;
+                let reach = grab + lw as f64 / 2.0;
+                (x - mid).abs() <= reach && y >= ly as f64 && y < (ly + lh) as f64
             }
             Orientation::Column => {
-                (y - ly as f64).abs() <= grab && x >= lx as f64 && x < (lx + lw) as f64
+                let mid = ly as f64 + lh as f64 / 2.0;
+                let reach = grab + lh as f64 / 2.0;
+                (y - mid).abs() <= reach && x >= lx as f64 && x < (lx + lw) as f64
             }
         }
     })
@@ -645,5 +651,27 @@ mod tests {
             s.rects_spaced((0, 0, 100, 401), 2, gaps)
         };
         assert_eq!(stacked[1].1 - (stacked[0].1 + stacked[0].3), 1);
+    }
+
+    #[test]
+    fn a_wide_seam_is_grabbed_from_its_center() {
+        let mut t = Node::single();
+        t.split(0, Row, 1);
+        let ds = t.dividers_spaced(
+            C,
+            Gaps {
+                beside: 8,
+                stacked: 1,
+            },
+        );
+        let (x, _, w, _) = ds[0].line;
+        let mid = x as f64 + w as f64 / 2.0;
+        assert_eq!(divider_at(&ds, mid, 40.0, 4.0), Some(0));
+        // 3px into each pane, past the seam: still the divider
+        assert_eq!(divider_at(&ds, x as f64 - 3.0, 40.0, 4.0), Some(0));
+        assert_eq!(divider_at(&ds, (x + w) as f64 + 3.0, 40.0, 4.0), Some(0));
+        // 6px into a pane is past the 4px slop
+        assert_eq!(divider_at(&ds, x as f64 - 6.0, 40.0, 4.0), None);
+        assert_eq!(divider_at(&ds, (x + w) as f64 + 6.0, 40.0, 4.0), None);
     }
 }

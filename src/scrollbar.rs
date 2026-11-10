@@ -76,6 +76,17 @@ impl ScrollbarConfig {
             .unwrap_or(DEFAULT_WIDTH)
     }
 
+    /// `width_px` in physical pixels. `scale` is the window's DPI scale
+    /// (1.0 at 100%). A non-positive or non-finite scale counts as 1.
+    pub fn width_px_at(&self, scale: f32) -> i32 {
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        ((self.width_px() as f32) * scale).round().max(1.0) as i32
+    }
+
     pub fn autohide_on(&self) -> bool {
         self.autohide.unwrap_or(true)
     }
@@ -239,7 +250,9 @@ pub fn layout(
     place: Place,
     alt_screen: bool,
 ) -> Option<Geom> {
-    if alt_screen || side == Side::Hidden || width <= 0 || room <= 0 {
+    // A 1px seam is the hairline divider, not a bar. Padding 0 leaves that
+    // seam and no outer gutter, so nothing is drawn on either.
+    if alt_screen || side == Side::Hidden || width <= 1 || room <= 1 {
         return None;
     }
     let (x, y, w, h) = grid;
@@ -500,6 +513,11 @@ mod tests {
             None,
             "no gutter means no bar, rather than a bar on the cells"
         );
+        assert_eq!(
+            layout(pane, Side::Right, 8, 1, place(100, 25, 10), false),
+            None,
+            "a 1px seam is the divider, not a bar"
+        );
     }
 
     #[test]
@@ -725,17 +743,27 @@ mod tests {
         assert_eq!(cell.col, cols - 1);
         assert_eq!(cell.row, 0);
         let shown = layout(grid, Side::Right, 8, 10, place(200, 20, 40), false).unwrap();
-        assert!(
-            !intersects(shown.track, grid),
-            "the hit rect is not on the grid"
+        assert_eq!(
+            shown.track.0,
+            grid.0 + grid.2,
+            "the track starts where the grid ends"
         );
-        assert!(!intersects(shown.thumb, grid));
-        // Visible and auto-hidden share this gutter. Neither claims the cell.
-        assert_eq!(hit(&shown, x, y), None, "visible");
-        assert_eq!(hit(&shown, x, y), None, "auto-hidden");
-        assert!(layout(grid, Side::Hidden, 8, 10, place(200, 20, 40), false).is_none());
-        // the padding just outside the last column is the bar
-        assert!(hit(&shown, grid.2 as f64 + 1.0, y).is_some());
+        assert!(
+            x < shown.track.0 as f64,
+            "the last column is left of the track"
+        );
+        assert!(
+            hit(&shown, x, y).is_none(),
+            "a shown bar does not take the cell"
+        );
+        assert!(
+            hit(&shown, shown.track.0 as f64 + 1.0, y).is_some(),
+            "the gutter beside that column is the bar"
+        );
+        assert!(
+            layout(grid, Side::Hidden, 8, 10, place(200, 20, 40), false).is_none(),
+            "a hidden bar has no track to hit"
+        );
     }
 
     #[test]
@@ -781,9 +809,43 @@ mod tests {
     }
 
     #[test]
-    fn columns_follow_the_grid_width_and_ignore_the_bar() {
-        assert_eq!(grid_columns(800, 10.0), 80);
-        assert_eq!(grid_columns(8, 10.0), 10, "the floor stays ten");
-        assert_eq!(grid_columns(100, 0.0), 10);
+    fn a_side_split_at_1280_costs_one_column_per_pane() {
+        use crate::layout::{Gaps, Node};
+        use crate::Orientation::Row;
+        // padding 10, cell 11. A 1px seam is 57/57. The 8px scrollbar seam
+        // is 56/56: one column each, and not two (the bar is not subtracted
+        // again from the grid).
+        let pad = 10;
+        let content = (pad, 0, 1280 - pad * 2, 400);
+        let cell = 11.0;
+        let mut t = Node::single();
+        t.split(0, Row, 1);
+        let cols = |r: Rect| grid_columns(r.2, cell);
+        let hair = t.rects_spaced(content, 2, Gaps::HAIRLINE);
+        assert_eq!((cols(hair[0]), cols(hair[1])), (57, 57));
+        let seam = t.rects_spaced(
+            content,
+            2,
+            Gaps {
+                beside: 8,
+                stacked: 1,
+            },
+        );
+        assert_eq!((cols(seam[0]), cols(seam[1])), (56, 56));
+    }
+
+    #[test]
+    fn width_scales_with_the_display() {
+        let d = ScrollbarConfig::default();
+        assert_eq!(d.width_px_at(1.0), 8);
+        assert_eq!(d.width_px_at(2.0), 16);
+        assert_eq!(d.width_px_at(1.5), 12);
+        assert_eq!(d.width_px_at(0.0), 8, "a bad scale does not erase the bar");
+        assert_eq!(d.width_px_at(f32::NAN), 8);
+        let wide = ScrollbarConfig {
+            width: Some(10),
+            ..ScrollbarConfig::default()
+        };
+        assert_eq!(wide.width_px_at(2.0), 20);
     }
 }

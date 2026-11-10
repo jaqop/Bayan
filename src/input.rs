@@ -423,8 +423,19 @@ impl App {
             self.refresh_link_hover(position)
         };
         if let Some(w) = &self.window {
-            let edge = self.resize_edge_at(position);
-            let divider = edge.is_none().then(|| self.divider_at(position)).flatten();
+            // The gutter is not a resize edge and not a divider, even where
+            // the old 6px band or the seam's grab would have said so.
+            let on_bar = self.bars.hover.is_some();
+            let edge = if on_bar {
+                None
+            } else {
+                self.resize_edge_at(position)
+            };
+            let divider = if on_bar || edge.is_some() {
+                None
+            } else {
+                self.divider_at(position)
+            };
             let on_divider = divider.is_some();
             // the cursor follows the divider under it: nested splits mix both
             let orientation = divider.and_then(|d| self.dividers().get(d).map(|d| d.axis));
@@ -866,14 +877,7 @@ impl App {
         let content = self.content_rect()?;
         let room = scrollbar::room_px(index, &rects, side, content, self.config.padding_px());
         let place = scrollbar::Place::new(total, viewport, offset);
-        let geom = scrollbar::layout(
-            rect,
-            side,
-            self.config.scrollbar.width_px(),
-            room,
-            place,
-            alt,
-        )?;
+        let geom = scrollbar::layout(rect, side, self.scrollbar_width_px(), room, place, alt)?;
         Some(SbTarget {
             index,
             id,

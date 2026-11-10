@@ -19,13 +19,16 @@ use crate::App;
 /// The smallest edge band that stays grabbable without stealing clicks
 /// from the content.
 const EDGE_BAND: f64 = 6.0;
+/// On the scrollbar's side the band shrinks, but the outer pixels and the
+/// corners stay a resize grip.
+const EDGE_RESIZE_MIN: f64 = 2.0;
 /// How far either side of a pane divider still grabs it.
 const DIVIDER_GRAB: f64 = 4.0;
 /// Two presses on the title strip this close together maximise.
 const STRIP_DOUBLE_MS: u128 = 400;
 
 /// Which window edge `(x, y)` is on, if any. A maximized window has no
-/// edges to drag.
+/// edges to drag. Both sides use [`EDGE_BAND`].
 pub(crate) fn resize_edge(
     x: f64,
     y: f64,
@@ -33,18 +36,46 @@ pub(crate) fn resize_edge(
     height: f64,
     maximized: bool,
 ) -> Option<ResizeDirection> {
-    if maximized {
+    resize_edge_beside_bar(x, y, width, height, maximized, EDGE_BAND, EDGE_BAND)
+}
+
+/// How wide the resize grip is on a side that has a scrollbar in the
+/// padding. The bar takes `used` pixels of `pad`; the grip is the padding
+/// left outside the bar, and at least [`EDGE_RESIZE_MIN`].
+pub(crate) fn bar_side_band(pad: f64, used: f64) -> f64 {
+    (pad - used).max(EDGE_RESIZE_MIN)
+}
+
+/// Like [`resize_edge`], but the left and right grips may be narrower so a
+/// scrollbar in the padding is not a window resize. Corners stay the full
+/// [`EDGE_BAND`]: a diagonal grip is not the thumb.
+pub(crate) fn resize_edge_beside_bar(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    maximized: bool,
+    left_band: f64,
+    right_band: f64,
+) -> Option<ResizeDirection> {
+    if maximized || width <= 0.0 || height <= 0.0 {
         return None;
     }
-    let l = x <= EDGE_BAND;
-    let r = x >= width - EDGE_BAND;
+    let l_corner = x <= EDGE_BAND;
+    let r_corner = x >= width - EDGE_BAND;
     let t = y <= EDGE_BAND;
     let b = y >= height - EDGE_BAND;
+    if (l_corner || r_corner) && (t || b) {
+        return Some(match (l_corner, r_corner, t, b) {
+            (true, _, true, _) => ResizeDirection::NorthWest,
+            (_, true, true, _) => ResizeDirection::NorthEast,
+            (true, _, _, true) => ResizeDirection::SouthWest,
+            _ => ResizeDirection::SouthEast,
+        });
+    }
+    let l = x <= left_band;
+    let r = x >= width - right_band;
     Some(match (l, r, t, b) {
-        (true, _, true, _) => ResizeDirection::NorthWest,
-        (_, true, true, _) => ResizeDirection::NorthEast,
-        (true, _, _, true) => ResizeDirection::SouthWest,
-        (_, true, _, true) => ResizeDirection::SouthEast,
         (true, ..) => ResizeDirection::West,
         (_, true, ..) => ResizeDirection::East,
         (_, _, true, _) => ResizeDirection::North,
@@ -259,13 +290,31 @@ impl App {
     pub(crate) fn resize_edge_at(&self, pos: PhysicalPosition<f64>) -> Option<ResizeDirection> {
         let w = self.window.as_ref()?;
         let s = w.inner_size();
-        resize_edge(
-            pos.x,
-            pos.y,
-            s.width as f64,
-            s.height as f64,
-            w.is_maximized(),
-        )
+        let (left, right) = self.resize_bands();
+        let (x, y) = (pos.x, pos.y);
+        let (width, height) = (s.width as f64, s.height as f64);
+        let maximized = w.is_maximized();
+        if left == EDGE_BAND && right == EDGE_BAND {
+            resize_edge(x, y, width, height, maximized)
+        } else {
+            resize_edge_beside_bar(x, y, width, height, maximized, left, right)
+        }
+    }
+
+    /// Left and right grip widths. The scrollbar's side keeps only the
+    /// padding outside the bar (at least 2px); the other side stays
+    /// [`EDGE_BAND`].
+    fn resize_bands(&self) -> (f64, f64) {
+        let full = EDGE_BAND;
+        let narrow = bar_side_band(
+            self.config.padding_px() as f64,
+            self.scrollbar_gutter() as f64,
+        );
+        match self.config.scrollbar.side() {
+            crate::scrollbar::Side::Left => (narrow, full),
+            crate::scrollbar::Side::Right => (full, narrow),
+            crate::scrollbar::Side::Hidden => (full, full),
+        }
     }
 
     /// Caption button under the pointer: 0 minimise, 1 maximise, 2 close.
@@ -461,6 +510,63 @@ mod tests {
         assert_eq!(edge(6.1, 300.0), None);
         assert_eq!(edge(400.0, 300.0), None);
         assert_eq!(resize_edge(0.0, 0.0, 800.0, 600.0, true), None);
+    }
+
+    #[test]
+    fn the_thumb_center_drags_the_scrollbar_and_corners_still_resize() {
+        // Defaults: padding 10, bar 8, window 1280×800. The plain 6px band
+        // claims the thumb center (W−6). Beside the bar that grip shrinks
+        // to the 2px of padding outside the track.
+        let w = 1280.0;
+        let h = 800.0;
+        let pad = 10.0;
+        let used = 8.0;
+        let band = bar_side_band(pad, used);
+        assert_eq!(band, 2.0);
+        let thumb_cx = (w - pad) + used / 2.0;
+        let y = 400.0;
+        assert!(
+            (thumb_cx - (w - EDGE_BAND)).abs() < 1e-6,
+            "defaults put the thumb center on the old grip"
+        );
+        assert_eq!(
+            resize_edge(thumb_cx, y, w, h, false),
+            Some(ResizeDirection::East),
+            "a 6px band resizes instead of dragging"
+        );
+        assert_eq!(
+            resize_edge_beside_bar(thumb_cx, y, w, h, false, EDGE_BAND, band),
+            None,
+            "the thumb center starts a scrollbar drag"
+        );
+        assert_eq!(
+            resize_edge_beside_bar(w - 1.0, y, w, h, false, EDGE_BAND, band),
+            Some(ResizeDirection::East),
+            "the last 2px still resize"
+        );
+        assert_eq!(
+            resize_edge_beside_bar(w - 1.0, 1.0, w, h, false, EDGE_BAND, band),
+            Some(ResizeDirection::NorthEast)
+        );
+        assert_eq!(
+            resize_edge_beside_bar(1.0, 1.0, w, h, false, EDGE_BAND, band),
+            Some(ResizeDirection::NorthWest)
+        );
+        assert_eq!(
+            resize_edge_beside_bar(w - 1.0, h - 1.0, w, h, false, EDGE_BAND, band),
+            Some(ResizeDirection::SouthEast)
+        );
+        // padding 4 used to swallow the whole bar inside the 6px band
+        let band4 = bar_side_band(4.0, 4.0);
+        let inside = w - 4.0 + 1.0;
+        assert_eq!(
+            resize_edge(inside, y, w, h, false),
+            Some(ResizeDirection::East)
+        );
+        assert_eq!(
+            resize_edge_beside_bar(inside, y, w, h, false, EDGE_BAND, band4),
+            None
+        );
     }
 
     #[test]

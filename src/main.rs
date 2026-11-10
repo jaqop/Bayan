@@ -2783,6 +2783,16 @@ impl App {
 
     /// Bar thickness that fits in the padding. Never wider than the padding,
     /// so the outer bar cannot enter the grid.
+    /// Configured thickness in physical pixels (`width` × the window scale).
+    pub(crate) fn scrollbar_width_px(&self) -> i32 {
+        let scale = self
+            .window
+            .as_ref()
+            .map(|w| w.scale_factor() as f32)
+            .unwrap_or(1.0);
+        self.config.scrollbar.width_px_at(scale)
+    }
+
     pub(crate) fn scrollbar_gutter(&self) -> i32 {
         if self.config.scrollbar.side() == scrollbar::Side::Hidden {
             return 0;
@@ -2791,7 +2801,11 @@ impl App {
         if pad <= 0 {
             return 0;
         }
-        self.config.scrollbar.width_px().min(pad)
+        let width = self.scrollbar_width_px();
+        if width <= 1 {
+            return 0;
+        }
+        width.min(pad)
     }
 
     /// Pane rects for the active tab within the window's content area.
@@ -4583,6 +4597,7 @@ impl App {
         let rects = self.pane_rects();
         let sb_content = self.content_rect();
         let sb_pad = self.config.padding_px();
+        let sb_width = self.scrollbar_width_px();
         // the bar shows the active group's tabs only
         let tab_infos: Vec<render::TabInfo> = self
             .visible_tabs()
@@ -4717,7 +4732,7 @@ impl App {
                     let place = scrollbar::Place::new(history as usize + rows, rows, off as usize)
                         .with_fraction(0.0);
                     let side = self.config.scrollbar.side();
-                    let width = self.config.scrollbar.width_px();
+                    let width = sb_width;
                     let autohide = self.config.scrollbar.autohide_on();
                     let room = sb_content
                         .map(|c| scrollbar::room_px(pi, &rects, side, c, sb_pad))
