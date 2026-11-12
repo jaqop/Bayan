@@ -175,7 +175,10 @@ give cmd the nonce in any form. `git-bash.exe`, `bash -c`, and
 `BAYAN_PROMPT_NONCE` and is unset before a child inherits it. Do not write
 the user's rc files. An elevated token must not source `~/.bashrc`,
 `~/.bash_profile`, `~/.inputrc`, or the zsh home files: set `INPUTRC` and
-`HISTFILE` to `/dev/null`, and still read `/etc/profile`. A failed
+`HISTFILE` to `/dev/null`. Elevated Git Bash is `--noprofile` and must
+not source `/etc/profile` (its `git-prompt.sh` runs user files); set
+`PATH` and `MSYSTEM` from the bash install. Elevated WSL bash still reads the
+distro profile with `HOME` pointed at the rcfile directory. A failed
 elevation query is treated as elevated. `shellint::is_elevated` is a copy
 of the check in PR #59; delete one of them when both are on `bayan-plus`.
 The script directory comes from `SHGetKnownFolderPath(FOLDERID_ProgramData)`

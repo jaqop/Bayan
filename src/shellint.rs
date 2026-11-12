@@ -105,19 +105,26 @@ fn bash_plan(args: &[String], elevated: bool, mut env: Vec<(String, String)>) ->
         return None;
     }
     // A real login shell reads /etc/profile and one user profile, and does
-    // not itself read ~/.bashrc. An elevated login still reads /etc/profile
-    // so PATH and MSYSTEM exist, but with HOME pointed at this rcfile's
-    // directory: Git's git-prompt.sh would otherwise run
-    // ~/.config/git/git-prompt.sh and ~/bash_completion.d/*.bash as admin.
+    // not itself read ~/.bashrc. An elevated login does not read
+    // /etc/profile: Git for Windows' copy runs git-prompt.sh, which
+    // executes files the user can write. PATH and MSYSTEM are set from
+    // this bash's install instead.
     let login = is_login(args) && !has_flag(args, "--noprofile");
     let user = !elevated && !has_flag(args, "--norc");
     if elevated {
         push_safe_readline(&mut env);
     }
+    let mut bash_argv = bash_args(args, "@file:bash.sh");
+    if elevated && !bash_argv.iter().any(|a| a == "--noprofile") {
+        // `--login` is already gone. `--noprofile` also stops a bash that
+        // still treats itself as a login shell from reading /etc/profile
+        // before the rcfile.
+        bash_argv.push("--noprofile".to_string());
+    }
     Some(Plan {
         kind: ShellKind::Bash,
-        args: bash_args(args, "@file:bash.sh"),
-        files: vec![("bash.sh".into(), bash_rc(login, user))],
+        args: bash_argv,
+        files: vec![("bash.sh".into(), bash_rc(login, user, elevated))],
         path_env: Vec::new(),
         env,
         wslenv_path: Vec::new(),
@@ -161,7 +168,7 @@ fn wsl_plan(args: &[String], elevated: bool, mut env: Vec<(String, String)>) -> 
         kind: ShellKind::Wsl,
         args: launch,
         files: vec![
-            ("bash.sh".into(), bash_rc(true, source_user)),
+            ("bash.sh".into(), bash_rc(true, source_user, false)),
             ("zsh/.zshenv".into(), zsh_env(source_user)),
             ("zsh/.zprofile".into(), zsh_profile(source_user)),
             ("zsh/.zshrc".into(), zsh_rc(source_user)),
@@ -335,11 +342,16 @@ fn cmd_setup() -> String {
 /// `~/.bash_profile`, `~/.bash_login`, `~/.profile`. It does not also source
 /// `~/.bashrc`: a login shell never does, and Ubuntu's profile already does,
 /// so a second source ran ssh-agent and PATH setup twice. Non-login sources
-/// `~/.bashrc` only, and only when `user` is set. When `user` is false the
-/// profile still runs, but `HOME` is the rcfile directory for that read.
-fn bash_rc(login: bool, user: bool) -> String {
+/// `~/.bashrc` only, and only when `user` is set. `windows_elevated` is Git
+/// Bash running as administrator: that profile is not read at all, because
+/// its `git-prompt.sh` runs files under the user's home. WSL elevated
+/// (`windows_elevated` false, `user` false) still reads the distro profile,
+/// with `HOME` pointed at the rcfile directory for that read.
+fn bash_rc(login: bool, user: bool, windows_elevated: bool) -> String {
     let mut s = String::from(BASH_PRELUDE);
-    if login {
+    if login && !user && windows_elevated {
+        s.push_str(BASH_ELEVATED_ENV);
+    } else if login {
         if user {
             s.push_str(BASH_SYSTEM_PROFILE);
             s.push_str(BASH_USER_PROFILE);
@@ -378,12 +390,9 @@ fi
 "#;
 
 const BASH_SYSTEM_PROFILE_SAFE_HOME: &str = r#"
-# --login cannot be combined with --rcfile (bash ignores the rcfile).
-# /etc/profile itself is not user-writable, but Git for Windows' copy runs
-# /etc/profile.d/git-prompt.sh, which sources ~/.config/git/git-prompt.sh
-# and ~/bash_completion.d/*.bash. Those are. HOME is this rcfile's directory
-# for that read (the protected integration directory when elevated), then
-# restored. PATH and MSYSTEM from the profile stay.
+# WSL elevated login. The distro's /etc/profile is not user-writable, but a
+# snippet in it can name a file under $HOME. HOME is this rcfile's directory
+# for that read (the protected integration directory), then restored.
 __bayan_real_home=$HOME
 HOME=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 export HOME
@@ -393,6 +402,67 @@ fi
 HOME=$__bayan_real_home
 export HOME
 unset __bayan_real_home
+"#;
+
+const BASH_ELEVATED_ENV: &str = r#"
+# Elevated Git Bash does not source /etc/profile. Git for Windows' copy
+# runs /etc/profile.d/git-prompt.sh, which sources ~/.config/git/git-prompt.sh
+# and ~/bash_completion.d/*.bash. Moving HOME for that read did not stop
+# the real profile from executing those files. PATH and MSYSTEM come from
+# this bash's own install.
+# A launcher that already chose MSYSTEM is kept.
+__bayan_bash=${BASH:-$(command -v bash 2>/dev/null)}
+case "$__bayan_bash" in
+  [A-Za-z]:*)
+    if command -v cygpath >/dev/null 2>&1; then
+      __bayan_bash=$(cygpath -u -- "$__bayan_bash" 2>/dev/null) || true
+    fi
+    ;;
+esac
+__bayan_bin=$(CDPATH= cd -- "$(dirname -- "$__bayan_bash")" && pwd) || __bayan_bin=
+__bayan_root=
+case "$__bayan_bin" in
+  */usr/bin)
+    __bayan_root=$(CDPATH= cd -- "$__bayan_bin/../.." && pwd) || __bayan_root=
+    ;;
+  ?*)
+    __bayan_root=$(CDPATH= cd -- "$__bayan_bin/.." && pwd) || __bayan_root=
+    ;;
+esac
+if [ -z "${MSYSTEM:-}" ]; then
+  if [ -n "$__bayan_root" ] && [ -d "$__bayan_root/mingw64/bin" ]; then
+    MSYSTEM=MINGW64
+  else
+    MSYSTEM=MSYS
+  fi
+fi
+# `$root/usr/bin` is `//usr/bin` when the install root is `/`, and MSYS
+# treats a leading `//` as a network path. Drop that extra slash.
+__bayan_slash() {
+  case "$1" in
+    //*) printf '%s\n' "${1#/}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+__bayan_prefix=
+case "$MSYSTEM" in
+  MINGW32) __bayan_prefix=$(__bayan_slash "$__bayan_root/mingw32") ;;
+  MINGW64) __bayan_prefix=$(__bayan_slash "$__bayan_root/mingw64") ;;
+  CLANGARM64) __bayan_prefix=$(__bayan_slash "$__bayan_root/clangarm64") ;;
+  CLANG64) __bayan_prefix=$(__bayan_slash "$__bayan_root/clang64") ;;
+  UCRT64) __bayan_prefix=$(__bayan_slash "$__bayan_root/ucrt64") ;;
+esac
+__bayan_usr=$(__bayan_slash "$__bayan_root/usr/bin")
+if [ -n "$__bayan_prefix" ] && [ -d "$__bayan_prefix/bin" ]; then
+  PATH="$__bayan_prefix/bin:$__bayan_usr${PATH:+:$PATH}"
+elif [ -n "$__bayan_root" ] && [ -d "$__bayan_usr" ]; then
+  PATH="$__bayan_usr${PATH:+:$PATH}"
+elif [ -n "$__bayan_bin" ]; then
+  PATH="$__bayan_bin${PATH:+:$PATH}"
+fi
+export MSYSTEM PATH
+unset __bayan_bash __bayan_bin __bayan_root __bayan_prefix __bayan_usr
+unset -f __bayan_slash
 "#;
 
 const BASH_USER_PROFILE: &str = r#"
@@ -1711,13 +1781,15 @@ mod tests {
             "elevated rc must not name a file under the user's home: {rc}"
         );
         assert!(
-            rc.contains("__bayan_real_home=$HOME"),
-            "profile runs with HOME pointed at the rcfile directory"
+            !rc.contains(". /etc/profile"),
+            "elevated Git Bash must not source /etc/profile: {rc}"
         );
-        let moved = rc.find("__bayan_real_home=$HOME").unwrap();
-        let sourced = rc.find(". /etc/profile").unwrap();
-        let restored = rc.find("HOME=$__bayan_real_home").unwrap();
-        assert!(moved < sourced && sourced < restored, "{rc}");
+        assert!(rc.contains("MSYSTEM=MINGW64"), "{rc}");
+        assert!(rc.contains("/mingw64"), "{rc}");
+        assert!(
+            plan.args.iter().any(|a| a == "--noprofile"),
+            "elevated bash must not be a profile login"
+        );
         assert!(!rc.contains(".bashrc"), "{rc}");
         assert!(rc.contains(r"printf '\033]133;D;%s;%s\007'"));
         assert_eq!(
@@ -2149,7 +2221,7 @@ mod tests {
         )
         .unwrap();
         let rc_path = home.join("bayan-rc.sh");
-        let rc = bash_rc(false, true);
+        let rc = bash_rc(false, true, false);
         std::fs::write(&rc_path, &rc).unwrap();
         // A non-login bash keeps the Windows PATH, which need not hold
         // Git's usr\bin (cygpath, od). A login shell's /etc/profile adds it.
@@ -2219,16 +2291,22 @@ mod tests {
     }
 
     #[test]
-    fn elevated_profile_points_home_at_the_rcfile_before_reading_it() {
-        let rc = bash_rc(true, false);
-        let moved = rc
-            .find("__bayan_real_home=$HOME")
-            .expect("save HOME before the profile");
-        let sourced = rc.find(". /etc/profile").expect("profile still runs");
-        let restored = rc.find("HOME=$__bayan_real_home").expect("HOME comes back");
-        assert!(moved < sourced && sourced < restored, "{rc}");
-        assert!(!rc.contains("$HOME/.config"), "{rc}");
-        assert!(!rc.contains("bash_completion.d"), "{rc}");
+    fn elevated_git_bash_sets_path_without_sourcing_profile() {
+        let rc = bash_rc(true, false, true);
+        assert!(
+            !rc.contains(". /etc/profile"),
+            "elevated Git Bash must not source /etc/profile: {rc}"
+        );
+        let msystem = rc.find("MSYSTEM=MINGW64").expect("MSYSTEM is set");
+        let prefix = rc.find("/mingw64").expect("mingw64 is on PATH");
+        let hooks = rc.find("printf '\\033]133;D;%s;%s\\007'").unwrap();
+        assert!(msystem < hooks && prefix < hooks, "{rc}");
+        // WSL elevated still reads the distro profile, with HOME moved first.
+        let wsl = bash_rc(true, false, false);
+        let moved = wsl.find("__bayan_real_home=$HOME").unwrap();
+        let sourced = wsl.find(". /etc/profile").unwrap();
+        let restored = wsl.find("HOME=$__bayan_real_home").unwrap();
+        assert!(moved < sourced && sourced < restored, "{wsl}");
     }
 
     #[test]
@@ -2258,9 +2336,9 @@ mod tests {
         assert!(sourced < cleared, "{body}");
     }
 
-    /// Elevated Git Bash still runs /etc/profile (PATH, MSYSTEM) but HOME
-    /// during that read is the rcfile directory, so git-prompt.sh cannot
-    /// execute ~/.config/git/git-prompt.sh. Skip when bash is absent; CI has it.
+    /// Elevated Git Bash must not run the user's git-prompt or completion
+    /// scripts. PATH and MSYSTEM are set without `/etc/profile`. Skip when
+    /// bash is absent; CI has it.
     #[test]
     fn real_git_bash_elevated_profile_does_not_run_user_git_prompt() {
         let Some(bash) = find_real_bash() else {
@@ -2290,8 +2368,9 @@ mod tests {
         )
         .unwrap();
         let rc_path = safe.join("bash.sh");
-        std::fs::write(&rc_path, bash_rc(true, false)).unwrap();
+        std::fs::write(&rc_path, bash_rc(true, false, true)).unwrap();
         let mut child = std::process::Command::new(&bash)
+            .arg("--noprofile")
             .arg("--rcfile")
             .arg(&rc_path)
             .arg("-i")
@@ -2316,6 +2395,11 @@ mod tests {
         use std::io::Write;
         writeln!(stdin, "printf 'MSYSTEM=%s\\n' \"$MSYSTEM\"").unwrap();
         writeln!(stdin, "printf 'AFTER=%s\\n' \"$HOME\"").unwrap();
+        writeln!(
+            stdin,
+            "command -v ls >/dev/null && printf 'LS=ok\\n' || printf 'LS=missing\\n'"
+        )
+        .unwrap();
         writeln!(stdin, "exit").unwrap();
         drop(stdin);
         let start = std::time::Instant::now();
@@ -2341,8 +2425,9 @@ mod tests {
         );
         assert!(
             text.contains("MSYSTEM=MINGW") || text.contains("MSYSTEM=MSYS"),
-            "profile did not set MSYSTEM:\n{text}"
+            "MSYSTEM was not set:\n{text}"
         );
+        assert!(text.contains("LS=ok"), "PATH has no ls:\n{text}");
         assert!(text.contains("AFTER="), "{text}");
         assert!(
             !text.contains("bayan-elev-rc-"),

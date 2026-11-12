@@ -961,12 +961,13 @@ receives it: it would have to live in `PROMPT`, which every child
 inherits, so cmd's marks carry no nonce and are not trusted. An
 elevated token (Run as administrator) does not source user rc files, sets
 `INPUTRC` and `HISTFILE` to `/dev/null` so `~/.inputrc` cannot run a
-macro. It still reads `/etc/profile` so `PATH` and `MSYSTEM` exist, but
-`HOME` for that read is the rcfile's directory: Git's `git-prompt.sh`
-would otherwise run `~/.config/git/git-prompt.sh` and
-`~/bash_completion.d/*.bash` as administrator. `HOME` is restored
-afterwards. Elevated zsh ends `.zlogin` with `unsetopt rcs`, so exit does
-not read `~/.zlogout`. oh-my-posh is not inited from the user
+macro. Elevated Git Bash is started with `--noprofile` and does not read
+`/etc/profile`: that file runs `git-prompt.sh`, which executes
+`~/.config/git/git-prompt.sh` and `~/bash_completion.d/*.bash` as
+administrator. `PATH` and `MSYSTEM` are set from the Git install instead. Elevated WSL bash still reads the
+distro's `/etc/profile`, with `HOME` pointed at the rcfile directory for
+that read and restored afterwards. Elevated zsh ends `.zlogin` with
+`unsetopt rcs`, so exit does not read `~/.zlogout`. oh-my-posh is not inited from the user
 profile. A failed elevation query is treated as elevated. Elevated scripts
 are created under the real ProgramData folder
 (`SHGetKnownFolderPath(FOLDERID_ProgramData)`, not the `PROGRAMDATA`
