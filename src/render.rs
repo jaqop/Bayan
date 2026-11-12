@@ -2421,6 +2421,7 @@ struct RowShape {
 /// Cache key: the exact rich-text content (text + color + style) + alignment.
 type RunKey = (Vec<Seg>, bool, bool, u32, bool);
 type ContrastCache = std::collections::HashMap<((u8, u8, u8), (u8, u8, u8)), (u8, u8, u8)>;
+const CONTRAST_CACHE_CAP: usize = 4096;
 type CellGeometry = Vec<(i32, i32, bool)>; // visual x, width, logical RTL
 type RowHit = (i32, i32, usize, bool); // x, width, column, logical RTL
 
@@ -2939,6 +2940,9 @@ impl Renderer {
     fn cached_cell_contrast(&mut self, fg: (u8, u8, u8), bg: (u8, u8, u8)) -> (u8, u8, u8) {
         if let Some(hit) = self.contrast_cache.get(&(fg, bg)).copied() {
             return hit;
+        }
+        if self.contrast_cache.len() > CONTRAST_CACHE_CAP {
+            self.contrast_cache.clear();
         }
         let adjusted = crate::a11y::ensure_contrast(fg, bg, crate::a11y::MIN_CELL_CONTRAST);
         self.contrast_cache.insert((fg, bg), adjusted);
@@ -7412,9 +7416,11 @@ impl Renderer {
             self.draw_title_tip(out, whole, width, tx, &full);
         }
 
+        // 4.6, not 4.5: the search stops on the threshold, and the light
+        // bar otherwise lands on 4.501.
         let elevated_color = self.ink_on_bar(
             crate::theme::bar_accent(crate::theme::BarAccent::Amber, page_dark),
-            crate::a11y::MIN_CELL_CONTRAST,
+            4.6,
         );
         let elevated_w = elevated_label
             .map(|text| {
@@ -10530,7 +10536,7 @@ mod cache_tests {
                 crate::theme::BarAccent::Amber,
                 page_dark,
             ));
-            let expected = crate::a11y::ensure_contrast(raw, bar, crate::a11y::MIN_CELL_CONTRAST);
+            let expected = crate::a11y::ensure_contrast(raw, bar, 4.6);
             if !high_contrast && !page_dark {
                 assert_ne!(bar, (255, 255, 255), "light contrast is against the bar");
             }
@@ -10568,10 +10574,7 @@ mod cache_tests {
             );
             for c in &found {
                 let ratio = crate::a11y::contrast_ratio(*c, bar);
-                assert!(
-                    ratio >= crate::a11y::MIN_CELL_CONTRAST,
-                    "{c:?} on the bar {bar:?} is {ratio}"
-                );
+                assert!(ratio >= 4.6, "{c:?} on the bar {bar:?} is {ratio}");
             }
             if !page_dark || high_contrast {
                 assert_ne!(
@@ -10605,6 +10608,30 @@ mod cache_tests {
         assert_eq!(r.contrast_cache.len(), 2);
         assert_eq!(r.cached_cell_contrast((255, 0, 0), white), other);
         assert!(crate::a11y::contrast_ratio(first, white) >= crate::a11y::MIN_CELL_CONTRAST);
+    }
+
+    #[test]
+    fn contrast_cache_drops_entries_past_4096_pairs() {
+        let mut r = Renderer::with_a11y(
+            1.0,
+            &crate::config::UserConfig::default(),
+            0.0,
+            crate::a11y::A11ySnapshot::neutral(),
+        );
+        let bg = (255, 255, 255);
+        for i in 0..=CONTRAST_CACHE_CAP {
+            let fg = (i as u8, (i >> 8) as u8, 1);
+            r.cached_cell_contrast(fg, bg);
+        }
+        assert_eq!(r.contrast_cache.len(), CONTRAST_CACHE_CAP + 1);
+        let extra = (0, 0, 2);
+        let drawn = r.cached_cell_contrast(extra, bg);
+        assert_eq!(r.contrast_cache.len(), 1);
+        assert_eq!(
+            drawn,
+            crate::a11y::ensure_contrast(extra, bg, crate::a11y::MIN_CELL_CONTRAST)
+        );
+        assert_eq!(r.cached_cell_contrast(extra, bg), drawn);
     }
 
     #[test]

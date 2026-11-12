@@ -153,6 +153,10 @@ static A11Y_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 const A11Y_SUBCLASS_ID: usize = 0xB1A5;
 static A11Y_HOOK: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+/// The top-level window that hook belongs to. `WH_CALLWNDPROC` sees every
+/// window on the thread, so only this hwnd's `WM_NCDESTROY` may remove it.
+static A11Y_HWND: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 const QUAKE_ID: usize = 0xB1AA;
 
 /// The letter a Ctrl+<letter> event represents, resolved the way real
@@ -7858,7 +7862,11 @@ unsafe extern "system" fn a11y_call_hook(
         // that lives for this call.
         let cwp = &*(lparam as *const windows_sys::Win32::UI::WindowsAndMessaging::CWPSTRUCT);
         note_a11y_message(cwp.message);
-        if cwp.message == windows_sys::Win32::UI::WindowsAndMessaging::WM_NCDESTROY {
+        let ours = A11Y_HWND.load(std::sync::atomic::Ordering::Relaxed);
+        if cwp.message == windows_sys::Win32::UI::WindowsAndMessaging::WM_NCDESTROY
+            && cwp.hwnd == ours
+            && !ours.is_null()
+        {
             unhook_a11y();
         }
     }
@@ -7877,6 +7885,7 @@ unsafe extern "system" fn a11y_call_hook(
 /// thread's `WH_CALLWNDPROC` hook is the path that still sees a sent
 /// `WM_SETTINGCHANGE`.
 fn install_a11y_watch(hwnd: windows_sys::Win32::Foundation::HWND) {
+    A11Y_HWND.store(hwnd, std::sync::atomic::Ordering::Relaxed);
     if try_set_window_subclass(hwnd) {
         return;
     }
@@ -8215,9 +8224,11 @@ mod tests {
     #[test]
     fn the_window_installs_the_accessibility_watch() {
         let src = include_str!("main.rs");
+        let head = src.split_once("mod tests").expect("test module").0;
+        let needle = concat!("install_a11y", "_watch(h);");
         assert!(
-            src.contains("install_a11y_watch(h)"),
-            "removing install_a11y_watch(h) leaves High Contrast stuck until restart"
+            head.contains(needle),
+            "the window never installs the accessibility watch"
         );
     }
 
