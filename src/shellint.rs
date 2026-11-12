@@ -433,17 +433,22 @@ case "$__bayan_bash" in
     fi
     ;;
 esac
-# No cd: the stage log showed `cd` of this path never returned.
+# No cd. cygpath may return //c/... and MSYS treats a leading // as a
+# network path, so a later [ -d ] waits on a host that does not exist.
 __bayan_bash="${__bayan_bash//\\//}"
+case "$__bayan_bash" in
+  //*) __bayan_bash="${__bayan_bash#/}" ;;
+esac
 __bayan_bin="${__bayan_bash%/*}"
 __bayan_root=
 case "$__bayan_bin" in
   */usr/bin) __bayan_root="${__bayan_bin%/usr/bin}" ;;
   ?*) __bayan_root="${__bayan_bin%/*}" ;;
 esac
-if [ -z "$__bayan_root" ]; then
-  __bayan_root=/
-fi
+case "$__bayan_root" in
+  "") __bayan_root=/ ;;
+  //*) __bayan_root="${__bayan_root#/}" ;;
+esac
 if [ -z "${MSYSTEM:-}" ]; then
   # Git for Windows 2.56 ships ucrt64 and no mingw64. usr/bin/bash does
   # not set MSYSTEM itself, so the first layout that exists wins.
