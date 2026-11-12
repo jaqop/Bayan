@@ -1980,7 +1980,10 @@ mod tests {
 
     /// Run `f` on another thread. A `__gc` or `__close` loop never returns,
     /// so the assertion has to fail on a timeout instead of wedging CI.
-    fn finish_within<T: Send>(limit: Duration, f: impl FnOnce() -> T + Send) -> T {
+    fn finish_within<T: Send + 'static>(
+        limit: Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
