@@ -499,6 +499,10 @@ BASH_COMPLETION_USER_DIR=$__bayan_completion_dir
 readonly BASH_COMPLETION_USER_DIR
 unset XDG_DATA_HOME
 unset __bayan_completion_dir
+# The system startup file already put a git prompt in PS1. That runs
+# git on every prompt, and git.exe waits when this process has no
+# console. A plain prompt still receives the OSC mark from the hooks.
+PS1='$ '
 "#;
 
 const BASH_USER_PROFILE: &str = r#"
