@@ -730,6 +730,21 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       after), shows the menu listing this machine's five detected shells
       with Git Bash marked default. Not verified on screen: a real mouse
       right-click, picking a row
+- [x] **Shell arrow** — a ▾ beside the tabs opens that same list without a
+      trip through Settings. Ctrl+Shift+Space opens it from anywhere (the
+      chord is rebindable). Alt+Down still moves pane focus, and a single
+      pane hands it to the program; Alt+Down and Enter open the menu only
+      while the arrow itself is focused, and that focus draws a ring.
+      In Arabic Left moves down the list and Right moves up; Enter opens a
+      new tab with the chosen shell; Esc closes and returns focus to the arrow.
+      Only installed shells are listed. A corrupt profile is skipped and
+      logged. An elevated window hides SSH and the mux and starts the chosen
+      shell through the existing elevated spawn, so Git Bash still gets the
+      pinned `HOME` and the integration environment. AccessKit exposes the
+      arrow as a button with a menu popup and each row as a menu item named
+      for the shell. Proven: `cargo test` (the menu builder and the
+      choose-a-row tab, plus the AccessKit roles). Not verified on screen:
+      a real click, Narrator speaking the row
 - [x] **English interface** — Bayan's own chrome can be English. The
       settings header has a language button written in the language it
       switches TO («English» in Arabic, «العربية» in English), so a reader
@@ -1522,6 +1537,22 @@ Its text keeps its own UI size when the terminal is zoomed.
 
 - Search `تبويب جديد` or a shell name to open that installed shell in a new tab
   without changing the default shell or interrupting the current tab.
+- The tab bar has a ▾ beside the tabs. Click it, or press **Ctrl+Shift+Space**
+  (rebindable), to open a menu of the shells that are actually installed:
+  PowerShell, Command Prompt, Git Bash, each WSL distro, and any profile the
+  `-p` lookup accepts. **Alt+Down** still moves between panes; it opens this
+  menu only while the arrow is focused, and so does **Enter**. A row opens a
+  **new** tab in that shell. **Esc** closes the menu and returns to the arrow
+  when the arrow is on screen (the focus ring shows it); if the bar is hidden
+  or there is no room for the arrow, Esc returns to the terminal. The ring
+  hides while the menu is open. The arrow sits just after the last tab (the strip
+  is not mirrored). In Arabic, Left moves to the next row, and the labels are
+  Arabic (`الطرفيات`, `اختر الطرفية`, `الافتراضية`). A profile with an empty
+  name, a control or bidi character,
+  or a command that is not installed is skipped and logged; it does not
+  remove the other rows. An administrator window uses the same elevated
+  spawn as every other new tab (Git Bash still pins `HOME` and sets the
+  integration environment) and does not list SSH or the mux.
 - Search `claude` to insert a start or continue command. Confirm the paste card
   to insert it, then press Enter to run it.
 - Search `نسخ` to copy a visible link or file path with the keyboard. The list

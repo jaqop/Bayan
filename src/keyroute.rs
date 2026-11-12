@@ -211,6 +211,28 @@ pub(crate) fn pane_step(key: &Key) -> Option<i32> {
     }
 }
 
+/// Where Alt+Down goes. The arrow owns it only while it is focused.
+/// Otherwise two or more panes take the pane step, and one pane leaves
+/// the key for the program (nano, fish). This is the decision
+/// `key_pressed` uses after the keymap, so a rebind of the shell menu
+/// cannot steal Alt+Down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AltDown {
+    OpenMenu,
+    PaneStep,
+    Program,
+}
+
+pub(crate) fn alt_down_owner(arrow_focused: bool, panes: usize) -> AltDown {
+    if arrow_focused {
+        AltDown::OpenMenu
+    } else if panes > 1 {
+        AltDown::PaneStep
+    } else {
+        AltDown::Program
+    }
+}
+
 /// `index` moved by `step` (±1) around a ring of `len`.
 pub(crate) fn cycle(index: usize, step: i32, len: usize) -> usize {
     let n = len as i32;
@@ -331,6 +353,18 @@ impl App {
         self.invalidate_focused_links();
     }
 
+    /// Alt+Down against the window as it is now: the arrow when it is
+    /// focused and the menu is closed, otherwise the pane step or the
+    /// program. `key_pressed` matches on this and does not decide again.
+    pub(crate) fn alt_down_route(&self) -> AltDown {
+        let panes = self
+            .tabs
+            .get(self.active)
+            .map(|tab| tab.panes.len())
+            .unwrap_or(0);
+        alt_down_owner(self.shell_arrow_focused && self.palette.is_none(), panes)
+    }
+
     fn key_pressed(&mut self, event: &KeyEvent, el: &ActiveEventLoop) {
         let arrived = Instant::now();
         // Assume the press is swallowed until bytes actually go out. Every
@@ -367,8 +401,44 @@ impl App {
             }
             None => {}
         }
+        // The rebindable shell-menu chord (Ctrl+Shift+Space) lives in the
+        // keymap, so it stays ahead of pane focus. Alt+Down is not that
+        // chord: with the arrow unfocused it remains the pane step, and a
+        // single pane hands it to the program.
         if self.keymap_key(event, ctrl, shift, alt, el) {
             return;
+        }
+        let down = event.physical_key == PhysicalKey::Code(KeyCode::ArrowDown);
+        if crate::shellmenu::alt_down_opens(alt, ctrl, shift, down) {
+            match self.alt_down_route() {
+                AltDown::OpenMenu => {
+                    self.open_shell_from_arrow();
+                    return;
+                }
+                // The same step `pane_step` gives ArrowDown. Returning here
+                // keeps the later Alt+arrow walk from moving focus twice.
+                AltDown::PaneStep => {
+                    if self.step_pane_focus(1) {
+                        return;
+                    }
+                }
+                AltDown::Program => {}
+            }
+        }
+        if self.shell_arrow_focused && self.palette.is_none() {
+            if matches!(event.logical_key, Key::Named(NamedKey::Enter)) {
+                self.open_shell_from_arrow();
+                return;
+            }
+            if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
+                self.shell_arrow_focused = false;
+                self.request_redraw();
+                return;
+            }
+            // Any other key leaves the arrow and is handled below, so a
+            // letter still reaches the shell. Alt+Down already returned
+            // above when the arrow owned it.
+            self.shell_arrow_focused = false;
         }
         let key = &event.logical_key;
         if alt && !ctrl {
@@ -592,6 +662,11 @@ impl App {
             }
             return false;
         };
+        // Another shortcut leaves the arrow. ShellMenu sets the flag
+        // itself, and only when the arrow is actually drawn.
+        if action != keybinds::Action::ShellMenu {
+            self.shell_arrow_focused = false;
+        }
         if is_plain_ctrl_c_copy(action, chord) {
             self.copy_selection(true);
             self.request_redraw();
@@ -892,6 +967,66 @@ mod tests {
         assert_eq!(enter_or_escape(&Key::Named(NamedKey::Escape)), Some(false));
         assert_eq!(enter_or_escape(&Key::Named(NamedKey::Space)), None);
         assert_eq!(enter_or_escape(&Key::Character(SmolStr::new("y"))), None);
+    }
+
+    #[test]
+    fn alt_down_moves_pane_focus_unless_the_shell_arrow_is_focused() {
+        assert_eq!(alt_down_owner(false, 2), AltDown::PaneStep);
+        assert_eq!(alt_down_owner(false, 1), AltDown::Program);
+        assert_eq!(alt_down_owner(true, 2), AltDown::OpenMenu);
+        assert_eq!(pane_step(&Key::Named(NamedKey::ArrowDown)), Some(1));
+        let map = crate::keybinds::effective_map(&crate::config::UserConfig::default());
+        let menu = crate::keybinds::Chord::parse("ctrl+shift+space").unwrap();
+        assert_eq!(
+            crate::keybinds::lookup(&map, menu),
+            Some(crate::keybinds::Action::ShellMenu)
+        );
+        let alt_down = crate::keybinds::Chord {
+            ctrl: false,
+            shift: false,
+            alt: true,
+            key: crate::keybinds::ChordKey::Down,
+        };
+        assert_eq!(crate::keybinds::lookup(&map, alt_down), None);
+        // The physical Space key, not a config string. Removing Space
+        // from `chord_from` makes this None.
+        let parsed =
+            crate::keybinds::chord_from(PhysicalKey::Code(KeyCode::Space), true, true, false)
+                .expect("ctrl+shift+space");
+        assert_eq!(
+            crate::keybinds::resolve(&map, parsed, false, false),
+            Some(crate::keybinds::Action::ShellMenu)
+        );
+        let alt_down_key =
+            crate::keybinds::chord_from(PhysicalKey::Code(KeyCode::ArrowDown), false, false, true)
+                .expect("alt+down is a chord");
+        assert_eq!(
+            crate::keybinds::resolve(&map, alt_down_key, false, false),
+            None,
+            "Alt+Down is not the shell-menu chord"
+        );
+
+        // The live window: no panes is the program, two panes step, and a
+        // focused arrow opens the menu.
+        let mut app = crate::session_app(crate::test_proxy(), false);
+        assert_eq!(app.alt_down_route(), AltDown::Program);
+        let size = app.size;
+        for id in 0..2 {
+            let (session, _written) = crate::term::Session::headless(size, app.proxy.clone(), id);
+            app.tabs[0].panes.push(crate::Pane {
+                id,
+                session,
+                command: String::new(),
+                last_output: None,
+                progress: None,
+                mux: None,
+            });
+        }
+        assert_eq!(app.alt_down_route(), AltDown::PaneStep);
+        app.tabs[0].panes.pop();
+        assert_eq!(app.alt_down_route(), AltDown::Program);
+        app.shell_arrow_focused = true;
+        assert_eq!(app.alt_down_route(), AltDown::OpenMenu);
     }
 
     #[test]

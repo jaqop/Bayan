@@ -36,10 +36,13 @@ pub enum Action {
     PrevGroup,
     CopyMode,
     CopyClean,
+    /// The tab-bar shell menu. Alt+arrows stay pane focus; this chord is
+    /// the one a user can rebind.
+    ShellMenu,
 }
 
 impl Action {
-    pub const ALL: [Action; 23] = [
+    pub const ALL: [Action; 24] = [
         Action::NewTab,
         Action::ClosePane,
         Action::Search,
@@ -63,6 +66,7 @@ impl Action {
         Action::PrevGroup,
         Action::CopyMode,
         Action::CopyClean,
+        Action::ShellMenu,
     ];
 
     /// The config.json key.
@@ -91,6 +95,7 @@ impl Action {
             Action::PrevGroup => "prev-group",
             Action::CopyMode => "copy-mode",
             Action::CopyClean => "copy-clean",
+            Action::ShellMenu => "shell-menu",
         }
     }
 
@@ -133,6 +138,7 @@ impl Action {
             Action::PrevGroup => crate::lang::pick(lang, "المجموعة السابقة", "Previous group"),
             Action::CopyMode => crate::lang::pick(lang, "وضع النسخ", "Copy mode"),
             Action::CopyClean => crate::lang::pick(lang, "نسخ نظيف", "Copy clean"),
+            Action::ShellMenu => crate::lang::pick(lang, "قائمة الطرفيات", "Shell menu"),
         }
     }
 
@@ -182,6 +188,10 @@ impl Action {
             Action::CopyMode => c(true, true, Letter('x')),
             // Y for yank, cleaned. X is copy mode.
             Action::CopyClean => c(true, true, Letter('y')),
+            // Windows Terminal's new-tab dropdown. Not Alt+Down: that
+            // chord moves pane focus, and a single pane hands it to the
+            // program (nano, fish).
+            Action::ShellMenu => c(true, true, Space),
         }
     }
 }
@@ -199,6 +209,7 @@ pub enum ChordKey {
     Right,
     PageUp,
     PageDown,
+    Space,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -245,6 +256,7 @@ impl Chord {
             ChordKey::Right => "right".into(),
             ChordKey::PageUp => "pageup".into(),
             ChordKey::PageDown => "pagedown".into(),
+            ChordKey::Space => "space".into(),
         });
         parts.join("+")
     }
@@ -263,6 +275,7 @@ impl Chord {
                 "right" => key = Some(ChordKey::Right),
                 "pageup" => key = Some(ChordKey::PageUp),
                 "pagedown" => key = Some(ChordKey::PageDown),
+                "space" => key = Some(ChordKey::Space),
                 p => {
                     let mut chars = p.chars();
                     match (chars.next(), chars.as_str()) {
@@ -321,6 +334,7 @@ impl Chord {
             ChordKey::Right => "→",
             ChordKey::PageUp => "PgUp",
             ChordKey::PageDown => "PgDn",
+            ChordKey::Space => "Space",
         });
         parts.join("+")
     }
@@ -353,6 +367,7 @@ pub fn chord_from(physical: PhysicalKey, ctrl: bool, shift: bool, alt: bool) -> 
         ArrowRight => ChordKey::Right,
         PageUp => ChordKey::PageUp,
         PageDown => ChordKey::PageDown,
+        Space => ChordKey::Space,
         _ => match crate::keys::pc101_unshifted(code)? {
             c @ 'a'..='z' => ChordKey::Letter(c),
             d @ '0'..='9' => ChordKey::Digit(d as u8 - b'0'),

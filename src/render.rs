@@ -2319,6 +2319,11 @@ pub struct Renderer {
     pub hover_caption: Option<usize>,
     /// pointer over the settings gear
     pub hover_gear: bool,
+    /// pointer over the shell-menu arrow beside the tabs
+    pub hover_shell_arrow: bool,
+    /// Esc returned focus to the shell-menu arrow. The ring is the only
+    /// sign that the next Enter opens the menu instead of the shell.
+    pub shell_arrow_focused: bool,
     /// IME composition text, drawn at the focused cursor. winit keeps the
     /// IME's own composition window hidden, so this is the only place
     /// the text being composed shows.
@@ -2428,6 +2433,21 @@ pub(crate) fn palette_hint(count: usize) -> String {
     } else {
         format!("{count} results · Enter run · ↑↓ move · Esc close")
     }
+}
+
+/// How far the tab-bar badges must stay clear of. The shell arrow, when
+/// it is drawn, extends past the last tab.
+pub(crate) fn chrome_occupied_end(tab_end: i32, arrow_right: Option<i32>) -> i32 {
+    match arrow_right {
+        Some(right) => tab_end.max(right),
+        None => tab_end,
+    }
+}
+
+/// A badge at `x` clears the occupied end with the same 12px gap the
+/// tab strip has always used.
+pub(crate) fn chrome_badge_fits(x: i32, occupied_end: i32) -> bool {
+    x >= occupied_end + 12
 }
 
 impl Renderer {
@@ -2547,6 +2567,8 @@ impl Renderer {
             mapping_context: None,
             hover_caption: None,
             hover_gear: false,
+            hover_shell_arrow: false,
+            shell_arrow_focused: false,
             preedit: None,
             ime_spot: None,
             font_system,
@@ -2731,6 +2753,16 @@ impl Renderer {
         } else {
             theme
         }
+    }
+
+    /// The shell-arrow focus ring. High Contrast uses the system highlight
+    /// from [`crate::a11y::map_chrome`]; otherwise the bar accent that
+    /// clears 3:1 on this page.
+    fn shell_arrow_focus_ink(&self) -> (u8, u8, u8) {
+        self.focus_color(crate::theme::bar_accent(
+            crate::theme::BarAccent::Green,
+            crate::theme::title_bar_dark_for(self.bg),
+        ))
     }
 
     fn chrome_fg(&self) -> (u8, u8, u8) {
@@ -7198,49 +7230,65 @@ impl Renderer {
             self.draw_title_tip(out, whole, width, tx, &full);
         }
 
-        let elevated_w = elevated_label
-            .map(|text| {
-                let segs = [Seg::plain(text, (0xf2, 0xcc, 0x60))];
-                self.measure(&segs, false).ceil() as i32 + 16
-            })
-            .unwrap_or(0);
-        let end = self
-            .tab_rects(width, &titles, active)
-            .last()
-            .map_or(0, |r| r.1 + r.2);
-        if claude {
-            let label = [Seg::plain(
-                "● Claude",
-                crate::theme::bar_accent(crate::theme::BarAccent::Green, page_dark),
-            )];
-            let tw = self.measure(&label, false);
-            let x = self.tab_controls(width)[0].0 - tw.ceil() as i32 - 18 - elevated_w;
-            if x >= end + 12 {
-                self.draw_run(
-                    &label,
-                    false,
+        let arrow = self.shell_arrow_rect(width, &titles, active);
+        if let Some((bx, by, bw, bh)) = arrow {
+            if self.hover_shell_arrow {
+                push_rect(
                     out,
                     whole,
-                    x as f32,
-                    (oy - self.cell_h.ceil() as i32) / 2,
-                    1.0,
+                    bx,
+                    by,
+                    bw,
+                    bh,
+                    c4(
+                        if self.high_contrast {
+                            self.chrome.card
+                        } else {
+                            caption_hover(self.bg, false)
+                        },
+                        255,
+                    ),
                 );
+            }
+            if self.shell_arrow_focused {
+                let ink = c4(self.shell_arrow_focus_ink(), 255);
+                let t = (2.0 * self.dpi_scale).round().max(2.0) as i32;
+                push_rect(out, whole, bx, by, bw, t, ink);
+                push_rect(out, whole, bx, by + bh - t, bw, t, ink);
+                push_rect(out, whole, bx, by, t, bh, ink);
+                push_rect(out, whole, bx + bw - t, by, t, bh, ink);
+            }
+            let seg = [Seg::plain("\u{25be}", self.chrome_fg())];
+            let gw = self.measure(&seg, false);
+            self.draw_run(
+                &seg,
+                false,
+                out,
+                whole,
+                bx as f32 + (bw as f32 - gw) / 2.0,
+                by + bh / 2 - self.cell_h as i32 / 2,
+                1.0,
+            );
+        }
+
+        // Both badges ask the same rectangles the hit test uses. A badge
+        // that only cleared the last tab would sit on the arrow, and a
+        // click there would open the shell menu.
+        if claude {
+            if let Some((x, y, _, _)) =
+                self.claude_badge_rect(width, &titles, active, elevated_label)
+            {
+                let label = [Seg::plain(
+                    "● Claude",
+                    crate::theme::bar_accent(crate::theme::BarAccent::Green, page_dark),
+                )];
+                self.draw_run(&label, false, out, whole, x as f32, y, 1.0);
             }
         }
         if let Some(text) = elevated_label {
-            let label = [Seg::plain(text, (0xf2, 0xcc, 0x60))];
-            let tw = self.measure(&label, false);
-            let x = self.tab_controls(width)[0].0 - tw.ceil() as i32 - 12;
-            if x >= end + 12 {
-                self.draw_run(
-                    &label,
-                    false,
-                    out,
-                    whole,
-                    x as f32,
-                    (oy - self.cell_h.ceil() as i32) / 2,
-                    1.0,
-                );
+            if let Some((x, y, _, _)) = self.elevated_badge_rect(width, &titles, active, text) {
+                let label = [Seg::plain(text, (0xf2, 0xcc, 0x60))];
+                self.draw_run(&label, false, out, whole, x as f32, y, 1.0);
             }
         }
 
@@ -7362,6 +7410,103 @@ impl Renderer {
             return None;
         }
         crate::chrome::rect_at(&self.tab_controls(width), px, py)
+    }
+
+    /// The shell-menu arrow beside the tabs, or nothing when it would
+    /// cover a tab or the ‹ › + cluster.
+    pub fn shell_arrow_rect(&self, width: usize, titles: &[&str], active: usize) -> Option<Rect> {
+        if self.bar_hidden {
+            return None;
+        }
+        let rects = self.tab_rects(width, titles, active);
+        let last_end = rects.last().map(|r| r.1 + r.2).unwrap_or(self.tabs_x0());
+        let controls_x = self.tab_controls(width)[0].0;
+        let size = (self.ui_cell_w() * 1.7).round().max(22.0 * self.dpi_scale) as i32;
+        let bar_h = self.tab_bar_h().round() as i32;
+        crate::shellmenu::arrow_box(last_end, controls_x, size, 4, bar_h)
+            .map(|b| (b.x, b.y, b.w, b.h))
+    }
+
+    /// Where «مسؤول» (or whatever the caller passes) is drawn. `None`
+    /// when that box would cover the shell arrow or the ‹ › + cluster.
+    /// `draw_chrome` paints this rectangle and nothing else.
+    pub fn elevated_badge_rect(
+        &mut self,
+        width: usize,
+        titles: &[&str],
+        active: usize,
+        label: &str,
+    ) -> Option<Rect> {
+        let segs = [Seg::plain(label, (0xf2, 0xcc, 0x60))];
+        let tw = self.measure(&segs, false).ceil() as i32;
+        let x = self.tab_controls(width)[0].0 - tw - 12;
+        self.badge_box(width, titles, active, x, tw)
+    }
+
+    /// Where «● Claude» is drawn. An elevated label reserves its own
+    /// width to the right of this one, the same gap the painter used
+    /// before the arrow existed.
+    pub fn claude_badge_rect(
+        &mut self,
+        width: usize,
+        titles: &[&str],
+        active: usize,
+        elevated_label: Option<&str>,
+    ) -> Option<Rect> {
+        let elevated_w = match elevated_label {
+            Some(text) => {
+                let segs = [Seg::plain(text, (0xf2, 0xcc, 0x60))];
+                self.measure(&segs, false).ceil() as i32 + 16
+            }
+            None => 0,
+        };
+        let label = [Seg::plain(
+            "● Claude",
+            crate::theme::bar_accent(crate::theme::BarAccent::Green, false),
+        )];
+        let tw = self.measure(&label, false).ceil() as i32;
+        let x = self.tab_controls(width)[0].0 - tw - 18 - elevated_w;
+        self.badge_box(width, titles, active, x, tw)
+    }
+
+    /// `x`/`tw` is the badge's ink. It is drawn only when it clears the
+    /// arrow as well as the last tab.
+    fn badge_box(
+        &self,
+        width: usize,
+        titles: &[&str],
+        active: usize,
+        x: i32,
+        tw: i32,
+    ) -> Option<Rect> {
+        if tw <= 0 {
+            return None;
+        }
+        let arrow = self.shell_arrow_rect(width, titles, active);
+        let tab_end = self
+            .tab_rects(width, titles, active)
+            .last()
+            .map_or(0, |r| r.1 + r.2);
+        let end = chrome_occupied_end(tab_end, arrow.map(|(ax, _, aw, _)| ax + aw));
+        if !chrome_badge_fits(x, end) {
+            return None;
+        }
+        let oy = self.tab_bar_h().round() as i32;
+        let h = self.cell_h.ceil() as i32;
+        let y = (oy - h) / 2;
+        Some((x, y, tw, h.max(1)))
+    }
+
+    pub fn shell_arrow_hit(
+        &self,
+        width: usize,
+        titles: &[&str],
+        active: usize,
+        px: f64,
+        py: f64,
+    ) -> bool {
+        self.shell_arrow_rect(width, titles, active)
+            .is_some_and(|r| rect_hit(r, px, py))
     }
 
     /// The longest prefix of `title` (with "…" when cut) whose shaped width
@@ -10469,6 +10614,154 @@ mod cache_tests {
             crate::theme::BarAccent::Green,
             true
         )));
+    }
+
+    fn ink_inside(out: &[crate::gpu::Vertex], color: (u8, u8, u8), rect: Rect) -> bool {
+        let (x, y, w, h) = rect;
+        out.iter().any(|v| {
+            vertex_rgb(v.color) == color
+                && v.pos[0] >= x as f32
+                && v.pos[0] <= (x + w) as f32
+                && v.pos[1] >= y as f32
+                && v.pos[1] <= (y + h) as f32
+        })
+    }
+
+    /// Esc leaves focus on the shell arrow. The ring is what makes that
+    /// visible, and it has to clear 3:1 on the bar, including High Contrast
+    /// where the ink is the system highlight from `map_chrome`.
+    #[test]
+    fn the_shell_arrow_focus_ring_clears_three_to_one() {
+        let tabs = vec![TabInfo {
+            title: "hi".into(),
+            busy: false,
+            attention: false,
+            active: true,
+            progress: None,
+        }];
+        for light in [false, true] {
+            let cfg = crate::config::UserConfig {
+                system_apps_light: Some(light),
+                theme: Some((if light { "light" } else { "dark" }).into()),
+                ..Default::default()
+            };
+            let mut r = Renderer::new(1.0, &cfg, 0.0);
+            r.use_ui_metrics(true);
+            let arrow = r.shell_arrow_rect(1200, &["hi"], 0).expect("arrow");
+            let mut out = Vec::new();
+            r.draw_chrome(&mut out, 1200, 800, &tabs, None, false, None);
+            let ink = r.shell_arrow_focus_ink();
+            assert!(
+                !ink_inside(&out, ink, arrow),
+                "no ring until the arrow is focused"
+            );
+            r.shell_arrow_focused = true;
+            out.clear();
+            r.draw_chrome(&mut out, 1200, 800, &tabs, None, false, None);
+            assert!(
+                ink_inside(&out, ink, arrow),
+                "the focus ring is on the arrow"
+            );
+            let ratio = crate::theme::contrast_ratio(ink, chrome_bar_bg(r.bg));
+            assert!(
+                ratio >= 3.0,
+                "focus ring is {ratio}:1 on {:?}, want >= 3",
+                r.bg
+            );
+        }
+        let sys = crate::a11y::SystemColors {
+            window: (0, 0, 0),
+            window_text: (255, 255, 255),
+            highlight: (0, 120, 215),
+            highlight_text: (255, 255, 255),
+            hotlight: (0, 102, 204),
+            gray_text: (128, 128, 128),
+            btn_face: (255, 255, 255),
+        };
+        let mut hc = Renderer::with_a11y(
+            1.0,
+            &crate::config::UserConfig::default(),
+            0.0,
+            crate::a11y::A11ySnapshot {
+                high_contrast: true,
+                colors: sys,
+                text_scale: 1.0,
+            },
+        );
+        hc.use_ui_metrics(true);
+        hc.shell_arrow_focused = true;
+        assert_eq!(hc.shell_arrow_focus_ink(), sys.highlight);
+        assert_eq!(hc.chrome.focus, sys.highlight);
+        let arrow = hc.shell_arrow_rect(1200, &["hi"], 0).expect("arrow");
+        let mut out = Vec::new();
+        hc.draw_chrome(&mut out, 1200, 800, &tabs, None, false, None);
+        assert!(ink_inside(&out, sys.highlight, arrow));
+        let ratio = crate::theme::contrast_ratio(sys.highlight, sys.window);
+        assert!(ratio >= 3.0, "high contrast ring is {ratio}:1");
+    }
+
+    fn rects_overlap(a: Rect, b: Rect) -> bool {
+        let (ax, ay, aw, ah) = a;
+        let (bx, by, bw, bh) = b;
+        ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by
+    }
+
+    /// The elevated and Claude badges use the rectangles `draw_chrome`
+    /// paints. Placing them from the last tab alone covers the arrow at
+    /// a run of widths; that placement must not come back.
+    #[test]
+    fn tab_badges_do_not_cover_the_shell_arrow() {
+        let tab_end = 400;
+        let arrow_right = 428;
+        assert_eq!(chrome_occupied_end(tab_end, Some(arrow_right)), arrow_right);
+        assert!(chrome_badge_fits(416, tab_end));
+        assert!(!chrome_badge_fits(416, arrow_right));
+
+        for dpi in [1.0, 1.5, 2.0] {
+            let mut r = Renderer::new(dpi, &crate::config::UserConfig::default(), 0.0);
+            r.use_ui_metrics(true);
+            for ntabs in [1usize, 3, 6] {
+                let titles: Vec<String> = (0..ntabs).map(|i| format!("tab-{i}")).collect();
+                let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+                let mut elevated_drawn = 0usize;
+                let mut claude_drawn = 0usize;
+                for width in 300usize..=2200 {
+                    let Some(arrow) = r.shell_arrow_rect(width, &refs, 0) else {
+                        continue;
+                    };
+                    if let Some(badge) = r.elevated_badge_rect(width, &refs, 0, "Admin") {
+                        assert!(
+                            !rects_overlap(badge, arrow),
+                            "dpi {dpi} tabs {ntabs} width {width}: Admin covers the arrow"
+                        );
+                        elevated_drawn += 1;
+                    }
+                    if let Some(badge) = r.elevated_badge_rect(width, &refs, 0, "مسؤول") {
+                        assert!(
+                            !rects_overlap(badge, arrow),
+                            "dpi {dpi} tabs {ntabs} width {width}: the elevated badge covers the arrow"
+                        );
+                    }
+                    if let Some(badge) = r.claude_badge_rect(width, &refs, 0, None) {
+                        assert!(
+                            !rects_overlap(badge, arrow),
+                            "dpi {dpi} tabs {ntabs} width {width}: Claude covers the arrow"
+                        );
+                        claude_drawn += 1;
+                    }
+                    if let Some(badge) = r.claude_badge_rect(width, &refs, 0, Some("Admin")) {
+                        assert!(
+                            !rects_overlap(badge, arrow),
+                            "dpi {dpi} tabs {ntabs} width {width}: Claude beside Admin covers the arrow"
+                        );
+                    }
+                }
+                assert!(
+                    elevated_drawn > 0 && claude_drawn > 0,
+                    "dpi {dpi} tabs {ntabs}: a wide window must still draw both badges"
+                );
+            }
+        }
     }
 
     #[test]

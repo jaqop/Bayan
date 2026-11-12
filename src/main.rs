@@ -48,6 +48,7 @@ mod screen_reader;
 mod scroll;
 mod scrollbar;
 mod shellint;
+mod shellmenu;
 mod shells;
 mod ssh;
 mod term;
@@ -1124,38 +1125,6 @@ fn context_menu_rows(
     rows
 }
 
-/// The shell menu's rows: every detected shell, in detection order
-/// (PowerShell, PowerShell 7, cmd, Git Bash, each WSL distro), the default
-/// for new tabs marked. Detection runs on a background thread at startup;
-/// until it reports, the two shells every Windows has stand in.
-fn shell_menu_rows(profiles: &[shells::Shell], default: &str) -> Vec<(PaletteRow, String)> {
-    let listed: Vec<(String, String)> = if profiles.is_empty() {
-        [
-            ("PowerShell", "powershell.exe"),
-            ("Command Prompt", "cmd.exe"),
-        ]
-        .iter()
-        .map(|(name, cmd)| (name.to_string(), cmd.to_string()))
-        .collect()
-    } else {
-        profiles
-            .iter()
-            .map(|s| (s.label(), s.command.clone()))
-            .collect()
-    };
-    listed
-        .into_iter()
-        .map(|(name, command)| {
-            let label = if command == default {
-                format!("{name} · {}", tr("الافتراضية", "default"))
-            } else {
-                name
-            };
-            (PaletteRow::Shell(command), label)
-        })
-        .collect()
-}
-
 /// The Arabic-font cycler's step: the ring is Auto (`None`), then each of
 /// `choices` in order, wrapping both ways. An unknown current counts as
 /// Auto.
@@ -1499,11 +1468,15 @@ struct Palette {
     /// the right-click menu: a popup at this window point instead of the
     /// centred palette, listing `context_rows`
     menu: Option<(f64, f64)>,
-    /// the menu lists the installed shells (`shell_menu_rows`) instead of
+    /// the menu lists the installed shells (`shellmenu::build`) instead of
     /// the pane actions: a right-click on the tab bar
     shells_menu: bool,
     /// the rows are SSH hosts
     ssh_menu: bool,
+    /// the shell menu was opened from the tab-bar arrow (not a right-click).
+    /// SSH and the mux are rows of that menu only, and only when this
+    /// window is not elevated.
+    shell_arrow: bool,
     /// the rows are detached mux sessions
     detached_menu: bool,
     sel: usize,
@@ -1614,6 +1587,10 @@ struct App {
     spawn_group: Option<u32>,
     /// the command palette, when open
     palette: Option<Palette>,
+    /// The shell-menu arrow has keyboard focus. Esc from the menu sets
+    /// this; Enter on the arrow opens the menu; a pick clears it so the
+    /// new tab takes focus.
+    shell_arrow_focused: bool,
     /// Live connection to `bayan --mux-server`. Absent unless `mux.enabled`
     /// and a mux action has already needed it. Closing the window does not
     /// kill this process when a session was detached.
@@ -1920,6 +1897,7 @@ impl App {
             groups: groups::Groups::new(),
             spawn_group: None,
             palette: None,
+            shell_arrow_focused: false,
             shell_profiles: Vec::new(),
             shell_profiles_ready: false,
             startup_pending: true,
@@ -2562,10 +2540,14 @@ impl App {
             })
             .unwrap_or_default();
         let mut extras = palette_extras(&self.shell_profiles, &links);
-        extras.push((PaletteRow::OpenSsh, ssh::label_open().to_string()));
-        if self.config.mux_enabled() {
-            extras.push((PaletteRow::DetachSession, mux::label_detach().to_string()));
-            extras.push((PaletteRow::OpenDetached, mux::label_reattach().to_string()));
+        // An elevated window does not list SSH or the mux. The same bit
+        // `elevate::process_is_elevated` stored at startup.
+        if !self.elevated {
+            extras.push((PaletteRow::OpenSsh, ssh::label_open().to_string()));
+            if self.config.mux_enabled() {
+                extras.push((PaletteRow::DetachSession, mux::label_detach().to_string()));
+                extras.push((PaletteRow::OpenDetached, mux::label_reattach().to_string()));
+            }
         }
         self.palette = Some(Palette {
             query,
@@ -2574,6 +2556,7 @@ impl App {
             shells_menu: false,
             ssh_menu: false,
             detached_menu: false,
+            shell_arrow: false,
             sel: 0,
             extras,
             pressed: None,
@@ -2592,6 +2575,7 @@ impl App {
         }
         if self.modifiers.control_key()
             && !self.modifiers.alt_key()
+            && !self.palette.as_ref().is_some_and(|p| p.shell_arrow)
             && event.physical_key
                 == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV)
         {
@@ -2605,42 +2589,90 @@ impl App {
             self.request_redraw();
             return;
         }
+        let arrow_menu = self.palette.as_ref().is_some_and(|p| p.shell_arrow);
         let Some(p) = self.palette.as_mut() else {
             return;
         };
         match &event.logical_key {
-            Key::Named(NamedKey::Escape) => self.palette = None,
-            Key::Named(NamedKey::Backspace) => {
+            Key::Named(NamedKey::Escape) => {
+                let close = matches!(
+                    shellmenu::menu_action(shellmenu::MenuKey::Escape, lang::rtl()),
+                    shellmenu::MenuAction::Close
+                );
+                if close {
+                    if arrow_menu {
+                        self.close_shell_menu();
+                    } else {
+                        self.palette = None;
+                    }
+                }
+            }
+            Key::Named(NamedKey::Backspace) if !p.shell_arrow => {
                 p.query.pop();
                 p.sel = 0;
             }
-            Key::Named(k @ (NamedKey::ArrowDown | NamedKey::ArrowUp)) => {
-                let step = if *k == NamedKey::ArrowUp { -1 } else { 1 };
-                let n = self
-                    .palette_rows(&self.palette.as_ref().unwrap().query.clone())
-                    .len();
-                if n > 0 {
-                    let p = self.palette.as_mut().unwrap();
-                    p.sel = keyroute::cycle(p.sel, step, n);
+            Key::Named(
+                k @ (NamedKey::ArrowDown
+                | NamedKey::ArrowUp
+                | NamedKey::ArrowLeft
+                | NamedKey::ArrowRight),
+            ) => {
+                let shells = self.palette.as_ref().is_some_and(|p| p.shells_menu);
+                let step = if shells {
+                    let menu_key = match k {
+                        NamedKey::ArrowUp => shellmenu::MenuKey::Up,
+                        NamedKey::ArrowLeft => shellmenu::MenuKey::Left,
+                        NamedKey::ArrowRight => shellmenu::MenuKey::Right,
+                        _ => shellmenu::MenuKey::Down,
+                    };
+                    match shellmenu::menu_action(menu_key, lang::rtl()) {
+                        shellmenu::MenuAction::Move(step) => step,
+                        _ => 0,
+                    }
+                } else if matches!(k, NamedKey::ArrowUp | NamedKey::ArrowDown) {
+                    if *k == NamedKey::ArrowUp {
+                        -1
+                    } else {
+                        1
+                    }
+                } else {
+                    0
+                };
+                if step != 0 {
+                    let n = self
+                        .palette_rows(&self.palette.as_ref().unwrap().query.clone())
+                        .len();
+                    if n > 0 {
+                        let p = self.palette.as_mut().unwrap();
+                        p.sel = keyroute::cycle(p.sel, step, n);
+                    }
                 }
             }
             Key::Named(NamedKey::Enter) => {
-                let q = p.query.clone();
-                let sel = p.sel;
-                if let Some((row, _)) = self.palette_rows(&q).into_iter().nth(sel) {
-                    self.palette_run(row, el);
-                    return;
+                let pick = !p.shells_menu
+                    || matches!(
+                        shellmenu::menu_action(shellmenu::MenuKey::Enter, lang::rtl()),
+                        shellmenu::MenuAction::Pick
+                    );
+                if pick {
+                    let q = p.query.clone();
+                    let sel = p.sel;
+                    if let Some((row, _)) = self.palette_rows(&q).into_iter().nth(sel) {
+                        self.palette_run(row, el);
+                        return;
+                    }
+                    self.palette = None;
                 }
-                self.palette = None;
             }
-            Key::Character(c) => {
+            Key::Character(c) if !p.shell_arrow => {
+                // The arrow's menu is a menu, not a search field.
                 p.query.push_str(c);
                 p.sel = 0; // a new filter invalidates the old position
             }
             // winit names the space bar; without this a label with a space
             // in it (most Arabic labels, every tab name of two words) could
             // not be typed
-            Key::Named(NamedKey::Space) => {
+            Key::Named(NamedKey::Space) if !p.shell_arrow => {
                 p.query.push(' ');
                 p.sel = 0;
             }
@@ -2675,7 +2707,17 @@ impl App {
         if self.palette.as_ref().is_some_and(|p| p.menu.is_some()) {
             let q = query.trim().to_lowercase();
             let rows = if self.palette.as_ref().is_some_and(|p| p.shells_menu) {
-                shell_menu_rows(&self.shell_profiles, &self.config.shell_program())
+                self.shell_picker_rows()
+                    .into_iter()
+                    .map(|row| {
+                        let action = match row.kind {
+                            shellmenu::Kind::Shell => PaletteRow::Shell(row.command),
+                            shellmenu::Kind::Ssh => PaletteRow::OpenSsh,
+                            shellmenu::Kind::Mux => PaletteRow::OpenDetached,
+                        };
+                        (action, row.label)
+                    })
+                    .collect()
             } else {
                 self.context_rows()
             };
@@ -2730,10 +2772,25 @@ impl App {
 
     fn palette_run(&mut self, row: PaletteRow, el: &ActiveEventLoop) {
         self.palette = None;
+        // A pick leaves the menu. Focus goes to the new tab, not the arrow.
+        if shellmenu::focus_after(true) == shellmenu::FocusAfter::Tab {
+            self.shell_arrow_focused = false;
+        }
         match row {
             // the SAME dispatch a keybinding uses, not a parallel copy
             PaletteRow::Builtin(a) => self.perform_action(a, el),
             PaletteRow::Shell(command) => {
+                let chosen = shellmenu::Row {
+                    kind: shellmenu::Kind::Shell,
+                    label: String::new(),
+                    announce: String::new(),
+                    command,
+                };
+                let mut opened = Vec::new();
+                if !shellmenu::open_tab(std::slice::from_ref(&chosen), 0, &mut opened) {
+                    return;
+                }
+                let command = opened.remove(0).command;
                 let cwd = self
                     .session()
                     .and_then(|s| s.meta.lock_or_recover().spawn_cwd());
@@ -2871,6 +2928,7 @@ impl App {
             CopyClean => {
                 self.copy_selection_clean();
             }
+            ShellMenu => self.open_shell_from_arrow(),
         }
     }
 
@@ -3594,6 +3652,9 @@ impl App {
     }
 
     fn open_ssh_menu(&mut self) {
+        if self.elevated {
+            return;
+        }
         let hosts = ssh::host_list(&self.config.ssh_hosts, &ssh::read_user_config());
         if hosts.is_empty() {
             self.blocked_link = Some(BlockedLink {
@@ -4943,24 +5004,57 @@ impl App {
                 .unwrap_or(screen_reader::live_name());
             self.reader_live = Some(screen_reader::live_label(on_screen, live));
         }
-        let palette = self.palette.as_ref().map(|p| {
-            let menu = p.menu.is_some();
+        let palette_snap = self.palette.as_ref().map(|p| {
+            (
+                p.menu.is_some(),
+                p.shells_menu,
+                p.shell_arrow,
+                p.query.clone(),
+                p.sel,
+            )
+        });
+        let palette = palette_snap.map(|(menu, shells_menu, shell_arrow, query, selected)| {
+            let (rows, row_names) = if shells_menu {
+                let built = self.shell_menu(shell_arrow).rows;
+                let q = query.trim().to_lowercase();
+                let built: Vec<_> = built
+                    .into_iter()
+                    .filter(|row| q.is_empty() || row.label.to_lowercase().contains(&q))
+                    .collect();
+                let names = built.iter().map(|row| row.announce.clone()).collect();
+                let labels = built.into_iter().map(|row| row.label).collect();
+                (labels, names)
+            } else {
+                (
+                    self.palette_rows(&query)
+                        .into_iter()
+                        .map(|(_, label)| label)
+                        .collect(),
+                    Vec::new(),
+                )
+            };
             screen_reader::PaletteItem {
-                name: if menu {
+                name: if shells_menu {
+                    shellmenu::menu_label()
+                } else if menu {
                     screen_reader::menu_name()
                 } else {
                     screen_reader::palette_name()
                 }
                 .to_string(),
-                query: p.query.clone(),
-                rows: self
-                    .palette_rows(&p.query)
-                    .into_iter()
-                    .map(|(_, label)| label)
-                    .collect(),
-                selected: p.sel,
+                query,
+                rows,
+                row_names,
+                selected,
                 menu,
+                shell_menu: shell_arrow,
             }
+        });
+        let shell_button = Some(screen_reader::ShellButton {
+            label: shellmenu::button_label().to_string(),
+            focused: self.shell_arrow_focused && self.palette.is_none(),
+            expanded: self.palette.as_ref().is_some_and(|p| p.shell_arrow),
+            bounds: self.shell_arrow_bounds(),
         });
         let dialog = self.reader_dialog();
         screen_reader::View {
@@ -4974,6 +5068,7 @@ impl App {
                 .unwrap_or_else(|| screen_reader::live_name().to_string()),
             palette,
             dialog,
+            shell_button,
         }
     }
 
@@ -5873,11 +5968,13 @@ impl App {
                 (t.panes.len(), t.zoomed, t.broadcast)
             });
         let mut rows = context_menu_rows(self.has_selection(), panes, zoomed, broadcast);
-        rows.push((PaletteRow::OpenSsh, ssh::label_open().to_string()));
-        if self.config.mux_enabled() {
-            rows.push((PaletteRow::OpenDetached, mux::label_reattach().to_string()));
-            if self.focused_is_mux() {
-                rows.push((PaletteRow::DetachSession, mux::label_detach().to_string()));
+        if !self.elevated {
+            rows.push((PaletteRow::OpenSsh, ssh::label_open().to_string()));
+            if self.config.mux_enabled() {
+                rows.push((PaletteRow::OpenDetached, mux::label_reattach().to_string()));
+                if self.focused_is_mux() {
+                    rows.push((PaletteRow::DetachSession, mux::label_detach().to_string()));
+                }
             }
         }
         rows
@@ -5899,11 +5996,107 @@ impl App {
     /// that shell in the group on screen, through the same `PaletteRow::Shell`
     /// path the palette's «تبويب جديد — …» rows take.
     fn open_shell_menu(&mut self) {
-        self.open_context_menu();
+        let at = (self.cursor_pos.x, self.cursor_pos.y);
+        self.open_shell_picker(false, at);
+    }
+
+    /// The tab-bar arrow, Enter while it is focused, or the shell-menu
+    /// chord (Ctrl+Shift+Space). Alt+Down opens it only in that focused
+    /// state; otherwise Alt+Down stays pane focus.
+    fn open_shell_from_arrow(&mut self) {
+        let at = self.shell_arrow_anchor();
+        // A hidden arrow (one tab with the bar hidden, or no room beside
+        // the tabs) cannot take focus: Esc would otherwise leave Enter
+        // and Esc bound to a button that is not on screen.
+        let drawn = self.shell_arrow_bounds().is_some();
+        self.open_shell_picker(true, at);
+        self.shell_arrow_focused = drawn;
+    }
+
+    /// Esc on the shell menu. Focus returns to the arrow only when that
+    /// arrow is drawn; otherwise it returns to the terminal.
+    fn close_shell_menu(&mut self) {
+        let arrow_menu = self.palette.as_ref().is_some_and(|p| p.shell_arrow);
+        self.palette = None;
+        self.shell_arrow_focused = arrow_menu
+            && self.shell_arrow_bounds().is_some()
+            && shellmenu::focus_after(false) == shellmenu::FocusAfter::Arrow;
+    }
+
+    fn open_shell_picker(&mut self, arrow: bool, at: (f64, f64)) {
+        let menu = self.shell_menu(arrow);
+        shellmenu::log_skips(&menu.skipped);
+        self.open_palette(String::new());
         if let Some(p) = self.palette.as_mut() {
+            p.menu = Some(at);
             p.shells_menu = true;
+            p.shell_arrow = arrow;
         }
         self.request_redraw();
+    }
+
+    /// Installed shells, plus any profile `shells::find_profile` accepts.
+    /// Elevated windows pass the bit from `elevate::process_is_elevated`
+    /// and do not list SSH or the mux.
+    fn shell_menu(&self, arrow: bool) -> shellmenu::Menu {
+        let default = if self.elevated {
+            shells::elevated_default_command(&self.shell_profiles)
+        } else {
+            self.config.shell_program()
+        };
+        // Detected shells are the profiles (`shells::detect` / `-p`).
+        // Bayan has no second profile file, so the extra slice stays
+        // empty: passing `shell_profiles` again would only log the same
+        // skip twice. `build` still skips a corrupt entry in the
+        // installed slice, and a caller with a real extra list uses the
+        // second argument.
+        shellmenu::build(
+            &self.shell_profiles,
+            &[],
+            &default,
+            self.elevated,
+            shellmenu::Offers {
+                ssh: arrow,
+                mux: arrow && self.config.mux_enabled(),
+            },
+        )
+    }
+
+    fn shell_picker_rows(&self) -> Vec<shellmenu::Row> {
+        let arrow = self.palette.as_ref().is_some_and(|p| p.shell_arrow);
+        self.shell_menu(arrow).rows
+    }
+
+    /// The point the menu hangs from: the arrow's bottom corner on the
+    /// side the menu opens toward.
+    fn shell_arrow_anchor(&self) -> (f64, f64) {
+        let Some((r, w)) = self.renderer.as_ref().zip(self.window.as_ref()) else {
+            return (self.cursor_pos.x, self.cursor_pos.y);
+        };
+        let pw = w.inner_size().width as usize;
+        let (labels, active) = self.visible_labels();
+        let titles: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let Some((x, y, bw, bh)) = r.shell_arrow_rect(pw, &titles, active) else {
+            return (self.cursor_pos.x, self.cursor_pos.y);
+        };
+        let ax = if lang::rtl() { x + bw } else { x };
+        (ax as f64, (y + bh) as f64)
+    }
+
+    /// The arrow's box for AccessKit, in window pixels. `None` when the
+    /// bar is hidden or the gap cannot hold the button.
+    fn shell_arrow_bounds(&self) -> Option<accesskit::Rect> {
+        let (r, w) = self.renderer.as_ref().zip(self.window.as_ref())?;
+        let pw = w.inner_size().width as usize;
+        let (labels, active) = self.visible_labels();
+        let titles: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let (x, y, bw, bh) = r.shell_arrow_rect(pw, &titles, active)?;
+        Some(accesskit::Rect {
+            x0: x as f64,
+            y0: y as f64,
+            x1: (x + bw) as f64,
+            y1: (y + bh) as f64,
+        })
     }
 
     /// Ctrl+Shift+R: the palette, in naming mode. Whatever is typed becomes
@@ -6675,6 +6868,8 @@ impl App {
                     }
                 }
                 renderer.use_ui_metrics(true);
+                renderer.shell_arrow_focused =
+                    shellmenu::show_focus_ring(self.shell_arrow_focused, self.palette.is_some());
                 renderer.draw_chrome(
                     &mut verts,
                     px.width as usize,
@@ -9533,8 +9728,17 @@ mod m38_tests {
             .collect();
         assert_eq!(&labels[..3], ["Copy selection", "Copy clean", "Paste"]);
         assert!(labels.iter().any(|l| l == "New tab with shell…"));
-        let rows = shell_menu_rows(&[], "cmd.exe");
-        assert_eq!(rows[1].1, "Command Prompt · default");
+        let rows = shellmenu::build(
+            &[],
+            &[],
+            "cmd.exe",
+            false,
+            shellmenu::Offers {
+                ssh: false,
+                mux: false,
+            },
+        );
+        assert_eq!(rows.rows[1].label, "Command Prompt · default");
         assert_eq!(broadcast_note(2).as_deref(), Some(" — goes to 3 panes"));
         assert_eq!(keybinds::Action::NextGroup.label(), "Next group");
         // nothing in the shortcuts registry is left in Arabic
@@ -9648,16 +9852,90 @@ mod m38_tests {
                 command: "wsl.exe -d Ubuntu".into(),
             },
         ];
-        let rows = shell_menu_rows(&detected, "cmd.exe");
-        assert_eq!(rows.len(), 4);
-        assert!(rows[2].0 == PaletteRow::Shell(detected[2].command.clone()));
-        assert_eq!(rows[1].1, "Command Prompt · الافتراضية");
-        assert_eq!(rows[3].1, "WSL · Ubuntu");
+        let menu = shellmenu::build(
+            &detected,
+            &[],
+            "cmd.exe",
+            false,
+            shellmenu::Offers {
+                ssh: false,
+                mux: false,
+            },
+        );
+        assert_eq!(menu.rows.len(), 4);
+        assert_eq!(menu.rows[2].command, detected[2].command);
+        assert_eq!(menu.rows[1].label, "Command Prompt · الافتراضية");
+        assert_eq!(menu.rows[3].label, "WSL · Ubuntu");
         // detection has not reported yet: PowerShell and cmd stand in
-        let early = shell_menu_rows(&[], "powershell.exe");
-        assert_eq!(early.len(), 2);
-        assert!(early[1].0 == PaletteRow::Shell("cmd.exe".into()));
-        assert_eq!(early[0].1, "PowerShell · الافتراضية");
+        let early = shellmenu::build(
+            &[],
+            &[],
+            "powershell.exe",
+            false,
+            shellmenu::Offers {
+                ssh: false,
+                mux: false,
+            },
+        );
+        assert_eq!(early.rows.len(), 2);
+        assert_eq!(early.rows[1].command, "cmd.exe");
+        assert_eq!(early.rows[0].label, "PowerShell · الافتراضية");
+    }
+
+    #[test]
+    fn closing_the_shell_menu_does_not_focus_a_hidden_arrow() {
+        let mut app = super::session_app(super::test_proxy(), false);
+        assert!(
+            app.shell_arrow_bounds().is_none(),
+            "session_app has no window, so the arrow is not drawn"
+        );
+        app.open_shell_from_arrow();
+        assert!(app.palette.as_ref().is_some_and(|p| p.shell_arrow));
+        assert!(!app.shell_arrow_focused);
+        app.close_shell_menu();
+        assert!(app.palette.is_none());
+        assert!(!app.shell_arrow_focused);
+    }
+
+    #[test]
+    fn an_elevated_window_hides_ssh_and_the_mux_from_its_menus() {
+        let mut elevated = super::session_app(super::test_proxy(), true);
+        elevated.config.mux.enabled = true;
+        elevated.config.ssh_hosts = vec!["example.com".into()];
+        assert!(
+            elevated.context_rows().iter().all(|(row, _)| !matches!(
+                row,
+                PaletteRow::OpenSsh | PaletteRow::OpenDetached | PaletteRow::DetachSession
+            )),
+            "the right-click menu must not offer SSH or the mux"
+        );
+        elevated.open_ssh_menu();
+        assert!(
+            elevated.palette.as_ref().is_none_or(|p| !p.ssh_menu),
+            "open_ssh_menu returns without a host list"
+        );
+        elevated.open_palette(String::new());
+        let extras = &elevated.palette.as_ref().unwrap().extras;
+        assert!(extras.iter().all(|(row, _)| !matches!(
+            row,
+            PaletteRow::OpenSsh | PaletteRow::OpenDetached | PaletteRow::DetachSession
+        )));
+        let menu = elevated.shell_menu(true);
+        assert!(menu
+            .rows
+            .iter()
+            .all(|row| row.kind == shellmenu::Kind::Shell));
+
+        let mut plain = super::session_app(super::test_proxy(), false);
+        plain.config.mux.enabled = true;
+        assert!(plain
+            .context_rows()
+            .iter()
+            .any(|(row, _)| matches!(row, PaletteRow::OpenSsh)));
+        assert!(plain
+            .context_rows()
+            .iter()
+            .any(|(row, _)| matches!(row, PaletteRow::OpenDetached)));
     }
 
     #[test]

@@ -454,11 +454,17 @@ impl App {
             } else {
                 None
             };
+            let shell_arrow = matches!(press, LeftPress::ShellArrow);
             if let Some(r) = self.renderer.as_mut() {
-                if r.hover_caption != cap || r.hover_gear != gear || r.hover_tab != tab {
+                if r.hover_caption != cap
+                    || r.hover_gear != gear
+                    || r.hover_tab != tab
+                    || r.hover_shell_arrow != shell_arrow
+                {
                     r.hover_caption = cap;
                     r.hover_gear = gear;
                     r.hover_tab = tab;
+                    r.hover_shell_arrow = shell_arrow;
                     self.request_redraw();
                 }
             }
@@ -772,7 +778,10 @@ impl App {
             self.request_redraw();
         } else {
             // A blur does not rebuild the candidate window. Alt+Tab with
-            // the button down must not keep dragging.
+            // the button down must not keep dragging. The arrow's focus
+            // goes with the window: Enter in another app must not be
+            // waiting to open the menu when this window returns.
+            self.shell_arrow_focused = false;
             self.note_cursor_area(CursorAreaEvent::FocusLost);
             self.abandon_mouse();
             self.clear_scrollbar_pointer();
@@ -898,7 +907,11 @@ impl App {
     /// The chrome first, in `chrome::left_press` order, then the terminal.
     fn left_press(&mut self, el: &ActiveEventLoop) {
         let pos = self.cursor_pos;
-        match chrome::left_press(&self.chrome_hits(pos)) {
+        let press = chrome::left_press(&self.chrome_hits(pos));
+        if !matches!(press, LeftPress::ShellArrow) {
+            self.shell_arrow_focused = false;
+        }
+        match press {
             LeftPress::Resize(dir) => {
                 if let Some(w) = self.window.as_ref() {
                     let _ = w.drag_resize_window(dir);
@@ -918,6 +931,7 @@ impl App {
             }
             LeftPress::Shortcuts => self.shortcuts_click(pos.x, pos.y),
             LeftPress::Settings => self.settings_click(pos.x, pos.y),
+            LeftPress::ShellArrow => self.open_shell_from_arrow(),
             LeftPress::TabControl(control) => {
                 // the arrows walk the group on screen, as the bar shows it
                 let (vis, pos) = self.visible_tabs();
