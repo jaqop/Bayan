@@ -11,7 +11,7 @@
 use std::time::Instant;
 
 use winit::dpi::PhysicalPosition;
-use winit::window::ResizeDirection;
+use winit::window::{CursorIcon, ResizeDirection};
 
 use crate::render::Rect;
 use crate::App;
@@ -19,13 +19,16 @@ use crate::App;
 /// The smallest edge band that stays grabbable without stealing clicks
 /// from the content.
 const EDGE_BAND: f64 = 6.0;
+/// On the scrollbar's side the band shrinks, but the outer pixels and the
+/// corners stay a resize grip.
+const EDGE_RESIZE_MIN: f64 = 2.0;
 /// How far either side of a pane divider still grabs it.
 const DIVIDER_GRAB: f64 = 4.0;
 /// Two presses on the title strip this close together maximise.
 const STRIP_DOUBLE_MS: u128 = 400;
 
 /// Which window edge `(x, y)` is on, if any. A maximized window has no
-/// edges to drag.
+/// edges to drag. Both sides use [`EDGE_BAND`].
 pub(crate) fn resize_edge(
     x: f64,
     y: f64,
@@ -33,18 +36,60 @@ pub(crate) fn resize_edge(
     height: f64,
     maximized: bool,
 ) -> Option<ResizeDirection> {
-    if maximized {
+    resize_edge_beside_bar(x, y, width, height, maximized, EDGE_BAND, EDGE_BAND)
+}
+
+/// How wide the resize grip is on a side that has a scrollbar in the
+/// padding. The bar takes `used` pixels of `pad`; the grip is what's left,
+/// never under [`EDGE_RESIZE_MIN`] and never over the ordinary [`EDGE_BAND`].
+/// A 24px padding must not grow the grip past the 6px the caption buttons
+/// were drawn against.
+pub(crate) fn bar_side_band(pad: f64, used: f64) -> f64 {
+    (pad - used).clamp(EDGE_RESIZE_MIN, EDGE_BAND)
+}
+
+/// A diagonal grip. Side edges are not corners: the close button and the
+/// scrollbar win those, and the corner still resizes.
+pub(crate) fn edge_is_corner(dir: ResizeDirection) -> bool {
+    matches!(
+        dir,
+        ResizeDirection::NorthWest
+            | ResizeDirection::NorthEast
+            | ResizeDirection::SouthWest
+            | ResizeDirection::SouthEast
+    )
+}
+
+/// Like [`resize_edge`], but the left and right grips may be narrower so a
+/// scrollbar in the padding is not a window resize. Corners stay the full
+/// [`EDGE_BAND`]: a diagonal grip is not the thumb.
+pub(crate) fn resize_edge_beside_bar(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    maximized: bool,
+    left_band: f64,
+    right_band: f64,
+) -> Option<ResizeDirection> {
+    if maximized || width <= 0.0 || height <= 0.0 {
         return None;
     }
-    let l = x <= EDGE_BAND;
-    let r = x >= width - EDGE_BAND;
+    let l_corner = x <= EDGE_BAND;
+    let r_corner = x >= width - EDGE_BAND;
     let t = y <= EDGE_BAND;
     let b = y >= height - EDGE_BAND;
+    if (l_corner || r_corner) && (t || b) {
+        return Some(match (l_corner, r_corner, t, b) {
+            (true, _, true, _) => ResizeDirection::NorthWest,
+            (_, true, true, _) => ResizeDirection::NorthEast,
+            (true, _, _, true) => ResizeDirection::SouthWest,
+            _ => ResizeDirection::SouthEast,
+        });
+    }
+    let l = x <= left_band;
+    let r = x >= width - right_band;
     Some(match (l, r, t, b) {
-        (true, _, true, _) => ResizeDirection::NorthWest,
-        (_, true, true, _) => ResizeDirection::NorthEast,
-        (true, _, _, true) => ResizeDirection::SouthWest,
-        (_, true, _, true) => ResizeDirection::SouthEast,
         (true, ..) => ResizeDirection::West,
         (_, true, ..) => ResizeDirection::East,
         (_, _, true, _) => ResizeDirection::North,
@@ -131,6 +176,8 @@ pub(crate) struct Hits {
     pub drag_strip: bool,
     /// A confirm card (paste, drop, plugin, link) is up.
     pub card_open: bool,
+    /// The pointer is on a scrollbar track. It beats a side resize, not a corner.
+    pub on_scrollbar: bool,
 }
 
 /// Who owns a left press, before the terminal gets a say.
@@ -163,14 +210,24 @@ pub(crate) enum LeftPress {
     Blocked,
     /// Nothing chrome-side. Link, program or local selection decide next.
     Terminal,
+    /// The scrollbar track. Not a corner, and not a caption button.
+    Scrollbar,
 }
 
-/// M24 order matters: edges are outermost, then the caption buttons, and
-/// only then the panels — otherwise a resize grab near the top-right would
-/// open settings instead. An open editor or settings panel hides the edges
-/// and caption buttons entirely.
+/// Corners first, then the scrollbar track, then every other edge, then the
+/// caption buttons. A side grip beats min/max/close, the way it did before
+/// the bar existed; only the track takes a side grip away from the window.
+/// [`cursor_for_press`] reads this same result, so the pointer and the click
+/// cannot disagree. An open editor or settings panel hides the edges, the
+/// buttons, and the bar.
 pub(crate) fn left_press(h: &Hits) -> LeftPress {
     if !h.shortcuts_open && !h.settings_open {
+        if let Some(dir) = h.edge.filter(|dir| edge_is_corner(*dir)) {
+            return LeftPress::Resize(dir);
+        }
+        if h.on_scrollbar {
+            return LeftPress::Scrollbar;
+        }
         if let Some(dir) = h.edge {
             return LeftPress::Resize(dir);
         }
@@ -221,6 +278,25 @@ pub(crate) fn left_press(h: &Hits) -> LeftPress {
     LeftPress::Terminal
 }
 
+/// The pointer shape for a [`left_press`] result. `divider_axis` is the
+/// seam under a divider press; `on_link` is a hyperlink when the press
+/// reached the terminal.
+pub(crate) fn cursor_for_press(
+    press: LeftPress,
+    divider_axis: Option<crate::Orientation>,
+    on_link: bool,
+) -> CursorIcon {
+    match press {
+        LeftPress::Resize(dir) => CursorIcon::from(dir),
+        LeftPress::Divider(_) => match divider_axis {
+            Some(crate::Orientation::Column) => CursorIcon::NsResize,
+            _ => CursorIcon::EwResize,
+        },
+        LeftPress::Terminal if on_link => CursorIcon::Pointer,
+        _ => CursorIcon::Default,
+    }
+}
+
 /// Who owns a right press.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RightPress {
@@ -259,13 +335,31 @@ impl App {
     pub(crate) fn resize_edge_at(&self, pos: PhysicalPosition<f64>) -> Option<ResizeDirection> {
         let w = self.window.as_ref()?;
         let s = w.inner_size();
-        resize_edge(
-            pos.x,
-            pos.y,
-            s.width as f64,
-            s.height as f64,
-            w.is_maximized(),
-        )
+        let (left, right) = self.resize_bands();
+        let (x, y) = (pos.x, pos.y);
+        let (width, height) = (s.width as f64, s.height as f64);
+        let maximized = w.is_maximized();
+        if left == EDGE_BAND && right == EDGE_BAND {
+            resize_edge(x, y, width, height, maximized)
+        } else {
+            resize_edge_beside_bar(x, y, width, height, maximized, left, right)
+        }
+    }
+
+    /// Left and right grip widths. The scrollbar's side keeps only the
+    /// padding outside the bar (at least 2px); the other side stays
+    /// [`EDGE_BAND`].
+    fn resize_bands(&self) -> (f64, f64) {
+        let full = EDGE_BAND;
+        let narrow = bar_side_band(
+            self.padding_physical() as f64,
+            self.scrollbar_gutter() as f64,
+        );
+        match self.config.scrollbar.side() {
+            crate::scrollbar::Side::Left => (narrow, full),
+            crate::scrollbar::Side::Right => (full, narrow),
+            crate::scrollbar::Side::Hidden => (full, full),
+        }
     }
 
     /// Caption button under the pointer: 0 minimise, 1 maximise, 2 close.
@@ -379,6 +473,7 @@ impl App {
             cockpit_open: self.cockpit,
             cockpit_row: self.cockpit_row_hit(pos),
             divider: self.divider_at(pos),
+            on_scrollbar: !self.overlay_blocks_mouse() && self.pointer_on_scrollbar(pos.x, pos.y),
             tab: self.tab_at(pos),
             tab_close: self.tab_close_at(pos),
             group_chip: self.group_chip_at(pos),
@@ -464,6 +559,181 @@ mod tests {
     }
 
     #[test]
+    fn the_thumb_center_drags_the_scrollbar_and_corners_still_resize() {
+        // Defaults: padding 10, bar 8, window 1280×800. The plain 6px band
+        // claims the thumb center (W−6). Beside the bar that grip shrinks
+        // to the 2px of padding outside the track.
+        let w = 1280.0;
+        let h = 800.0;
+        let pad = 10.0;
+        let used = 8.0;
+        let band = bar_side_band(pad, used);
+        assert_eq!(band, 2.0);
+        let thumb_cx = (w - pad) + used / 2.0;
+        let y = 400.0;
+        assert!(
+            (thumb_cx - (w - EDGE_BAND)).abs() < 1e-6,
+            "defaults put the thumb center on the old grip"
+        );
+        assert_eq!(
+            resize_edge(thumb_cx, y, w, h, false),
+            Some(ResizeDirection::East),
+            "a 6px band resizes instead of dragging"
+        );
+        assert_eq!(
+            resize_edge_beside_bar(thumb_cx, y, w, h, false, EDGE_BAND, band),
+            None,
+            "the thumb center starts a scrollbar drag"
+        );
+        assert_eq!(
+            resize_edge_beside_bar(w - 1.0, y, w, h, false, EDGE_BAND, band),
+            Some(ResizeDirection::East),
+            "the last 2px still resize"
+        );
+        assert_eq!(
+            resize_edge_beside_bar(w - 1.0, 1.0, w, h, false, EDGE_BAND, band),
+            Some(ResizeDirection::NorthEast)
+        );
+        assert_eq!(
+            resize_edge_beside_bar(1.0, 1.0, w, h, false, EDGE_BAND, band),
+            Some(ResizeDirection::NorthWest)
+        );
+        assert_eq!(
+            resize_edge_beside_bar(w - 1.0, h - 1.0, w, h, false, EDGE_BAND, band),
+            Some(ResizeDirection::SouthEast)
+        );
+        // padding 4 used to swallow the whole bar inside the 6px band.
+        // W−3 is inside the bar and outside the 2px grip; the center is not.
+        let band4 = bar_side_band(4.0, 4.0);
+        assert_eq!(band4, 2.0);
+        let inside = w - 3.0;
+        assert_eq!(
+            resize_edge_beside_bar(inside, y, w, h, false, EDGE_BAND, band4),
+            None
+        );
+    }
+
+    #[test]
+    fn padding_24_close_button_is_not_a_resize() {
+        // pad 24, bar 8: an uncapped grip is 16px and eats the close button.
+        // The cap is 6, and the button still wins that 6 except at a corner.
+        let w = 1280.0;
+        let h = 800.0;
+        let band = bar_side_band(24.0, 8.0);
+        assert_eq!(band, EDGE_BAND, "the grip never grows past 6px");
+        assert_eq!(
+            resize_edge_beside_bar(w - 10.0, 16.0, w, h, false, EDGE_BAND, band),
+            None,
+            "10px in from the edge is padding, not a grip"
+        );
+        // Outside the 6px grip the close button is a close. Inside it the
+        // edge wins, and the cursor is the same resize arrow the press uses.
+        assert_eq!(
+            left_press(&Hits {
+                edge: None,
+                caption: Some(2),
+                ..Hits::default()
+            }),
+            LeftPress::Caption(Caption::Close)
+        );
+        let edge = resize_edge_beside_bar(w - 3.0, 16.0, w, h, false, EDGE_BAND, band);
+        assert_eq!(edge, Some(ResizeDirection::East));
+        let press = left_press(&Hits {
+            edge,
+            caption: Some(2),
+            ..Hits::default()
+        });
+        assert_eq!(press, LeftPress::Resize(ResizeDirection::East));
+        assert_eq!(
+            cursor_for_press(press, None, false),
+            CursorIcon::from(ResizeDirection::East)
+        );
+        // the corner of that same button still resizes
+        assert_eq!(
+            left_press(&Hits {
+                edge: Some(ResizeDirection::NorthEast),
+                caption: Some(2),
+                ..Hits::default()
+            }),
+            LeftPress::Resize(ResizeDirection::NorthEast)
+        );
+    }
+
+    #[test]
+    fn padding_4_thumb_center_drags_through_left_press() {
+        // The 4px bar fills [W−4, W). Its center is W−2, on the 2px grip.
+        // The plain band says East; the press is the scrollbar.
+        let w = 1280.0;
+        let h = 800.0;
+        let pad = 4.0;
+        let used = 4.0;
+        let thumb_cx = (w - pad) + used / 2.0;
+        let y = 400.0;
+        let center_delta: f64 = thumb_cx - (w - 2.0);
+        assert!(center_delta.abs() < 1e-6);
+        let band = bar_side_band(pad, used);
+        let edge = resize_edge_beside_bar(thumb_cx, y, w, h, false, EDGE_BAND, band);
+        assert_eq!(edge, Some(ResizeDirection::East));
+        assert_eq!(
+            left_press(&Hits {
+                edge,
+                on_scrollbar: true,
+                ..Hits::default()
+            }),
+            LeftPress::Scrollbar
+        );
+    }
+
+    #[test]
+    fn scale_one_and_a_half_track_is_not_a_resize() {
+        // 8×1.5 = 12, padding 10×1.5 = 15. The bar is 12px of that 15, so it
+        // is not clipped to an unscaled 10. Any pixel of the track, including
+        // one the 2px grip would claim, is a scrollbar press.
+        let cfg = crate::config::UserConfig::default();
+        let pad = cfg.padding_px_at(1.5) as f64;
+        let width = cfg.scrollbar.width_px_at(1.5) as f64;
+        assert_eq!((pad, width), (15.0, 12.0));
+        assert!(width < pad, "scaled padding has room for the scaled bar");
+        let used = width.min(pad);
+        let w = 1280.0;
+        let h = 800.0;
+        let band = bar_side_band(pad, used);
+        assert!((EDGE_RESIZE_MIN..=EDGE_BAND).contains(&band));
+        let track_x0 = w - pad;
+        for i in 0..used as i32 {
+            let x = track_x0 + i as f64 + 0.5;
+            let edge = resize_edge_beside_bar(x, 400.0, w, h, false, EDGE_BAND, band);
+            assert_eq!(
+                left_press(&Hits {
+                    edge,
+                    on_scrollbar: true,
+                    ..Hits::default()
+                }),
+                LeftPress::Scrollbar,
+                "x={x} edge={edge:?}"
+            );
+        }
+        // A bar that fills its padding overlaps the 2px grip. The press
+        // follows the track; the corner does not.
+        assert_eq!(
+            left_press(&Hits {
+                edge: Some(ResizeDirection::East),
+                on_scrollbar: true,
+                ..Hits::default()
+            }),
+            LeftPress::Scrollbar
+        );
+        assert_eq!(
+            left_press(&Hits {
+                edge: Some(ResizeDirection::SouthEast),
+                on_scrollbar: true,
+                ..Hits::default()
+            }),
+            LeftPress::Resize(ResizeDirection::SouthEast)
+        );
+    }
+
+    #[test]
     fn rect_hits_are_half_open() {
         let rects = [(10, 0, 20, 10), (30, 0, 20, 10)];
         assert_eq!(rect_at(&rects, 10.0, 0.0), Some(0));
@@ -503,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn edges_beat_captions_and_both_beat_everything_else() {
+    fn corners_and_side_edges_beat_caption_buttons() {
         let h = Hits {
             edge: Some(ResizeDirection::NorthEast),
             caption: Some(2),
@@ -519,6 +789,23 @@ mod tests {
             left_press(&h),
             LeftPress::Resize(ResizeDirection::NorthEast)
         );
+        // a side edge, not only a corner, beats the button under it
+        assert_eq!(
+            left_press(&Hits {
+                edge: Some(ResizeDirection::East),
+                caption: Some(2),
+                ..Hits::default()
+            }),
+            LeftPress::Resize(ResizeDirection::East)
+        );
+        assert_eq!(
+            left_press(&Hits {
+                edge: Some(ResizeDirection::North),
+                caption: Some(0),
+                ..Hits::default()
+            }),
+            LeftPress::Resize(ResizeDirection::North)
+        );
         let h = Hits { edge: None, ..h };
         assert_eq!(left_press(&h), LeftPress::Caption(Caption::Close));
         let h = Hits {
@@ -531,6 +818,50 @@ mod tests {
             ..h
         };
         assert_eq!(left_press(&h), LeftPress::Caption(Caption::Maximize));
+    }
+
+    #[test]
+    fn cursor_and_press_agree_on_the_caption_buttons() {
+        // Top 6px over each caption button, clear of the corner: both say
+        // resize from the top. The right 2px (and the full 6px grip) beside
+        // close say resize from the side. Past the grip, both say close.
+        let agree = |edge, caption| {
+            let press = left_press(&Hits {
+                edge,
+                caption,
+                ..Hits::default()
+            });
+            (press, cursor_for_press(press, None, false))
+        };
+        for caption in [Some(0), Some(1), Some(2)] {
+            assert_eq!(
+                agree(Some(ResizeDirection::North), caption),
+                (
+                    LeftPress::Resize(ResizeDirection::North),
+                    CursorIcon::from(ResizeDirection::North)
+                )
+            );
+        }
+        assert_eq!(
+            agree(Some(ResizeDirection::East), Some(2)),
+            (
+                LeftPress::Resize(ResizeDirection::East),
+                CursorIcon::from(ResizeDirection::East)
+            )
+        );
+        assert_eq!(
+            agree(None, Some(2)),
+            (LeftPress::Caption(Caption::Close), CursorIcon::Default)
+        );
+        // the thumb still beats a side edge, and the cursor is not a grip
+        let press = left_press(&Hits {
+            edge: Some(ResizeDirection::East),
+            on_scrollbar: true,
+            caption: Some(2),
+            ..Hits::default()
+        });
+        assert_eq!(press, LeftPress::Scrollbar);
+        assert_eq!(cursor_for_press(press, None, false), CursorIcon::Default);
     }
 
     #[test]

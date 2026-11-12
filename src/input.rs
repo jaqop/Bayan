@@ -25,7 +25,7 @@ use crate::chrome::{self, Caption, LeftPress, TabControl};
 use crate::keyroute::CursorAreaEvent;
 use crate::{
     blur_forgets_held_keys, consume_guard_release, keybinds, link, mouse, prepare_window_close,
-    render, term, App, Orientation,
+    render, scrollbar, term, App, Orientation,
 };
 
 /// The font zoom range, in points on top of the configured size.
@@ -95,18 +95,14 @@ pub(crate) fn hover_cursor(
     orientation: Option<Orientation>,
     on_link: bool,
 ) -> CursorIcon {
-    if let Some(dir) = edge {
-        CursorIcon::from(dir)
+    let press = if let Some(dir) = edge {
+        chrome::LeftPress::Resize(dir)
     } else if on_divider {
-        match orientation {
-            Some(Orientation::Column) => CursorIcon::NsResize,
-            _ => CursorIcon::EwResize,
-        }
-    } else if on_link {
-        CursorIcon::Pointer
+        chrome::LeftPress::Divider(0)
     } else {
-        CursorIcon::Default
-    }
+        chrome::LeftPress::Terminal
+    };
+    chrome::cursor_for_press(press, orientation, on_link && edge.is_none() && !on_divider)
 }
 
 /// 1 click = simple drag anchor, 2 = word, 3 = line.
@@ -367,6 +363,13 @@ impl App {
     /// `WindowEvent::CursorMoved`, after the modals.
     pub(crate) fn cursor_moved(&mut self, position: PhysicalPosition<f64>) {
         self.cursor_pos = position;
+        // A divider drag wins: its grab is wider than the gap and sits next
+        // to the bar. A thumb drag otherwise owns the pointer, including
+        // once it leaves the strip.
+        if self.drag_divider.is_none() && self.bars.drag.is_some() {
+            self.drag_scrollbar(position.y);
+            return;
+        }
         match motion_route(
             self.drag_divider,
             self.mouse.selecting,
@@ -407,27 +410,46 @@ impl App {
     /// No button held. One hit-test: the hover and the 1003 report share
     /// the logical cell `locate` mapped through column_for_click.
     fn hover(&mut self, position: PhysicalPosition<f64>) {
-        let cell = self.refresh_link_hover(position);
+        self.update_scrollbar_hover(position.x, position.y);
+        // The gutter is the bar's, even while it is faded. A cell, including
+        // the last column, is not in that gutter.
+        let cell = if self.bars.hover.is_some() {
+            self.clear_link_hover();
+            None
+        } else {
+            self.refresh_link_hover(position)
+        };
         if let Some(w) = &self.window {
-            let edge = self.resize_edge_at(position);
-            let divider = edge.is_none().then(|| self.divider_at(position)).flatten();
-            let on_divider = divider.is_some();
-            // the cursor follows the divider under it: nested splits mix both
-            let orientation = divider.and_then(|d| self.dividers().get(d).map(|d| d.axis));
+            // The same `left_press` the click uses. A side edge over a
+            // caption button stays a resize, for the cursor and the press.
+            let hits = self.chrome_hits(position);
+            let press = chrome::left_press(&hits);
+            let edge = match press {
+                LeftPress::Resize(dir) => Some(dir),
+                _ => None,
+            };
+            let orientation = match press {
+                LeftPress::Divider(i) => self.dividers().get(i).map(|d| d.axis),
+                _ => None,
+            };
             w.set_cursor(hover_cursor(
                 edge,
-                on_divider,
+                matches!(press, LeftPress::Divider(_)),
                 orientation,
                 self.link_hover.is_some(),
             ));
-            // caption/gear hover feedback; a redraw only when it changed
-            let cap = self.caption_button_at(position);
+            // caption/gear hover feedback; a redraw only when it changed.
+            // Light the button only when the press will actually use it.
+            let cap = match press {
+                LeftPress::Caption(_) => hits.caption,
+                _ => None,
+            };
             let pw = w.inner_size().width as usize;
             let gear = self
                 .renderer
                 .as_ref()
                 .is_some_and(|r| r.settings_button_hit(pw, position.x, position.y));
-            let tab = if edge.is_none() && !on_divider {
+            let tab = if edge.is_none() && !matches!(press, LeftPress::Divider(_)) {
                 self.tab_at(position)
             } else {
                 None
@@ -738,6 +760,7 @@ impl App {
             // the button down must not keep dragging.
             self.note_cursor_area(CursorAreaEvent::FocusLost);
             self.abandon_mouse();
+            self.clear_scrollbar_pointer();
         }
         // The event bit, not has_focus: that query can still say true
         // after Focused(false) and would drop CSI O.
@@ -782,6 +805,9 @@ impl App {
                             return;
                         }
                     }
+                    if self.on_scrollbar(MouseButton::Middle) {
+                        return;
+                    }
                     let _ = self.try_report_press(b);
                 }
                 Press::Left => self.left_press(el),
@@ -803,7 +829,11 @@ impl App {
                 return;
             }
             chrome::RightPress::Ignore => return,
-            chrome::RightPress::Terminal => {}
+            chrome::RightPress::Terminal => {
+                if self.on_scrollbar(MouseButton::Right) {
+                    return;
+                }
+            }
         }
         match self.right_click_owner() {
             Some((_, mouse::RightClick::Program)) => {
@@ -898,7 +928,16 @@ impl App {
                 }
                 self.request_redraw();
             }
-            LeftPress::Divider(i) => self.drag_divider = Some(i),
+            LeftPress::Scrollbar => {
+                let _ = self.on_scrollbar(MouseButton::Left);
+            }
+            LeftPress::Divider(i) => {
+                // The seam is the scrollbar. The divider stays grabbable from
+                // the cell-edge slop, which is inside a pane and not on the bar.
+                if !self.on_scrollbar(MouseButton::Left) {
+                    self.drag_divider = Some(i);
+                }
+            }
             LeftPress::Tab(i) => self.switch_tab(i),
             LeftPress::CloseTab(i) => self.request_close_tab(i, el),
             LeftPress::NextGroup => self.perform_action(keybinds::Action::NextGroup, el),
@@ -924,6 +963,11 @@ impl App {
     /// (including the refused-link card) is neither a link open nor a
     /// selection. The cell is the one Route::press reports.
     fn terminal_left_press(&mut self) {
+        // Chrome, including a divider, already had this press. The bar is
+        // the one part of the pane a tracking program does not hear.
+        if self.on_scrollbar(MouseButton::Left) {
+            return;
+        }
         match self.left_click_owner() {
             link::ClickOwner::Blocked => return,
             link::ClickOwner::Link => {
@@ -967,6 +1011,10 @@ impl App {
     }
 
     fn mouse_release(&mut self, button: MouseButton) {
+        if button == MouseButton::Left && self.bars.drag.is_some() {
+            self.end_scrollbar_drag();
+            return;
+        }
         if self.drag_divider.take().is_some() {
             return; // a resize drag copies nothing
         }
@@ -984,6 +1032,207 @@ impl App {
         // always copy)
         if self.config.copy_on_select_on() {
             self.copy_selection(false);
+        }
+    }
+}
+
+/// One pane's bar, when it exists: not the alternate screen, not hidden,
+/// and not a viewport that already shows every line.
+struct SbTarget {
+    index: usize,
+    id: u64,
+    geom: scrollbar::Geom,
+    viewport: usize,
+    max_offset: usize,
+}
+
+impl App {
+    /// The bar for pane `index` of the active tab.
+    fn scrollbar_target(&self, index: usize) -> Option<SbTarget> {
+        let rects = self.pane_rects();
+        let rect = *rects.get(index)?;
+        if rect.2 <= 0 || rect.3 <= 0 {
+            return None;
+        }
+        let side = self.config.scrollbar.side();
+        if side == scrollbar::Side::Hidden {
+            return None;
+        }
+        let pane = self.tabs.get(self.active)?.panes.get(index)?;
+        let (alt, total, viewport, offset, id) = {
+            let t = pane.session.term.lock();
+            let viewport = t.screen_lines();
+            let history = t.grid().history_size();
+            (
+                t.mode().contains(TermMode::ALT_SCREEN),
+                history + viewport,
+                viewport,
+                t.grid().display_offset(),
+                pane.id,
+            )
+        };
+        let content = self.content_rect()?;
+        let room = scrollbar::room_px(index, &rects, side, content, self.padding_physical());
+        let place = scrollbar::Place::new(total, viewport, offset);
+        let geom = scrollbar::layout(rect, side, self.scrollbar_width_px(), room, place, alt)?;
+        Some(SbTarget {
+            index,
+            id,
+            geom,
+            viewport,
+            max_offset: total - viewport,
+        })
+    }
+
+    pub(crate) fn pointer_on_scrollbar(&self, x: f64, y: f64) -> bool {
+        self.scrollbar_at(x, y).is_some()
+    }
+
+    fn scrollbar_at(&self, x: f64, y: f64) -> Option<(SbTarget, scrollbar::Part)> {
+        let n = self.tabs.get(self.active)?.panes.len();
+        for index in 0..n {
+            let Some(target) = self.scrollbar_target(index) else {
+                continue;
+            };
+            if let Some(part) = scrollbar::hit(&target.geom, x, y) {
+                return Some((target, part));
+            }
+        }
+        None
+    }
+
+    fn scrollbar_for(&self, id: u64) -> Option<SbTarget> {
+        let tab = self.tabs.get(self.active)?;
+        let index = tab.panes.iter().position(|p| p.id == id)?;
+        self.scrollbar_target(index)
+    }
+
+    /// True when the press landed on a bar. Left drags the thumb or pages
+    /// the track. Any other button is consumed and not reported: the strip
+    /// is not a cell, and the rest of the pane still is.
+    fn on_scrollbar(&mut self, button: MouseButton) -> bool {
+        if self.overlay_blocks_mouse() {
+            return false;
+        }
+        let Some((target, part)) = self.scrollbar_at(self.cursor_pos.x, self.cursor_pos.y) else {
+            return false;
+        };
+        if button != MouseButton::Left {
+            return true;
+        }
+        self.focus_pane_at(target.index);
+        self.sync_focus(None);
+        let now = Instant::now();
+        self.bars.note(target.id, now);
+        match part {
+            scrollbar::Part::Thumb => {
+                let grab = self.cursor_pos.y - target.geom.thumb.1 as f64;
+                self.bars.drag = Some(scrollbar::Drag {
+                    pane: target.id,
+                    grab,
+                });
+            }
+            other => {
+                if let Some(delta) = scrollbar::page_lines(other, target.viewport) {
+                    self.scroll_pane_by(target.id, delta);
+                }
+            }
+        }
+        self.request_redraw();
+        true
+    }
+
+    fn drag_scrollbar(&mut self, pointer_y: f64) {
+        let Some(drag) = self.bars.drag else {
+            return;
+        };
+        let Some(target) = self.scrollbar_for(drag.pane) else {
+            return;
+        };
+        let offset =
+            scrollbar::offset_from_pointer(&target.geom, pointer_y, drag.grab, target.max_offset);
+        self.scroll_pane_to(drag.pane, offset);
+        self.bars.note(drag.pane, Instant::now());
+    }
+
+    fn end_scrollbar_drag(&mut self) {
+        let now = Instant::now();
+        if let Some(drag) = self.bars.drag.take() {
+            self.bars.note(drag.pane, now);
+        }
+        let id = self
+            .scrollbar_at(self.cursor_pos.x, self.cursor_pos.y)
+            .map(|(t, _)| t.id);
+        self.bars.set_hover(id, now);
+        self.request_redraw();
+    }
+
+    fn update_scrollbar_hover(&mut self, x: f64, y: f64) {
+        let id = self.scrollbar_at(x, y).map(|(t, _)| t.id);
+        if self.bars.hover == id {
+            return;
+        }
+        self.bars.set_hover(id, Instant::now());
+        self.request_redraw();
+    }
+
+    /// The pointer left the window, or the window lost focus. Drop the drag
+    /// and start the idle timer.
+    pub(crate) fn clear_scrollbar_pointer(&mut self) {
+        let hovered = self.bars.hover.take();
+        let dragged = self.bars.drag.take().map(|d| d.pane);
+        if hovered.is_none() && dragged.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(id) = dragged.or(hovered) {
+            self.bars.note(id, now);
+        }
+        self.request_redraw();
+    }
+
+    /// `Scroll::Delta`, the same call a wheel notch and Shift+Page use.
+    fn scroll_pane_by(&mut self, id: u64, delta: i32) {
+        if delta == 0 {
+            return;
+        }
+        let Some((ti, pi)) = self.find_pane(id) else {
+            return;
+        };
+        // a track click lands on a whole line: drop smooth scroll's
+        // sub-line remainder and any notch still easing
+        self.snap_smooth(id);
+        self.tabs[ti].panes[pi]
+            .session
+            .term
+            .lock()
+            .scroll_display(Scroll::Delta(delta));
+        self.link_cache.invalidate_pane(id);
+        self.request_redraw();
+    }
+
+    fn scroll_pane_to(&mut self, id: u64, offset: usize) {
+        let Some((ti, pi)) = self.find_pane(id) else {
+            return;
+        };
+        // the thumb names a whole line; an easing wheel notch must not
+        // keep moving the view under the drag
+        self.drop_smooth(id);
+        let changed = {
+            let mut term = self.tabs[ti].panes[pi].session.term.lock();
+            let cur = term.grid().display_offset();
+            let history = term.grid().history_size();
+            let next = offset.min(history);
+            if next == cur {
+                false
+            } else {
+                term.scroll_display(Scroll::Delta(next as i32 - cur as i32));
+                true
+            }
+        };
+        if changed {
+            self.link_cache.invalidate_pane(id);
+            self.request_redraw();
         }
     }
 }

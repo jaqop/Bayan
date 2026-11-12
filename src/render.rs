@@ -4050,20 +4050,6 @@ impl Renderer {
             );
         }
 
-        // scroll position indicator while in history (EasyTer's slim bar).
-        // A zero shift uses `off` alone, the same fraction as before.
-        if (off > 0 || shift > 0) && history > 0 {
-            let frac = if shift > 0 && cell_h > 0.0 {
-                (shift as f32 / cell_h).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let pos = off as f32 + frac;
-            let th = ((ph as f32 * rows as f32 / (history + rows) as f32) as i32).max(24);
-            let ty = py + ((ph - th) as f32 * (1.0 - pos / history as f32)) as i32;
-            push_rect(out, clip, px + pw - 7, ty, 4, th, c4(self.fg, 70));
-        }
-
         // pane border when split: green marks the focused pane (EasyTer)
         if view.bordered {
             let c = if view.focused {
@@ -4111,6 +4097,24 @@ impl Renderer {
         }
         push_rect(out, rect, bx, by, bw, bh, c4((0x1f, 0x3a, 0x5c), 230));
         self.draw_run(&segs, true, out, rect, (bx + pad) as f32, by, 1.0);
+    }
+
+    /// The pane's scrollbar: a faint track and a thumb, both solid quads on
+    /// the same pipeline as the cells. `clip` is the gutter outside the grid,
+    /// so the bar cannot land on a cell. Geometry comes from `scrollbar`.
+    pub fn draw_scrollbar(
+        &self,
+        out: &mut Vec<Vertex>,
+        clip: Rect,
+        track: Rect,
+        thumb: Rect,
+        hot: bool,
+    ) {
+        let (tx, ty, tw, th) = track;
+        let (ux, uy, uw, uh) = thumb;
+        push_rect(out, clip, tx, ty, tw, th, c4(self.fg, 40));
+        let alpha = if hot { 200 } else { 130 };
+        push_rect(out, clip, ux, uy, uw, uh, c4(self.fg, alpha));
     }
 
     /// The link under the pointer, pinned to the bottom of the pane so a

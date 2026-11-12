@@ -896,7 +896,8 @@ key falls back to a sane default:
   "editor": "code -g {file}:{line}:{col}", "tab_switch": "recent",
   "keybinds": { "new-tab": "ctrl+shift+n" },
   "keyboard": { "kitty_protocol": false, "kitty_base_layout_fallback": true },
-  "scroll": { "smooth": true }
+  "scroll": { "smooth": true },
+  "scrollbar": { "position": "right", "width": 8, "autohide": true }
 }
 ```
 
@@ -906,6 +907,30 @@ those sequences (an ssh host, a `cat`'d file, an install script). When on,
 the toast's title is always «بيان · tab» and the program's text is cleaned
 and capped. Bayan's own toasts (a long command finished, the bell) follow
 `notifications` and need no opt-in.
+
+`scrollbar.position` is `right` (the default, in Arabic and in English),
+`left`, or `hidden`. `scrollbar.width` is the thickness in logical pixels,
+clamped to 2–24, default 8, then multiplied by the display scale. `padding`
+scales the same way, so at 150% an 8px bar (12 physical pixels) still fits
+in the default padding (15) and is not clipped to an unscaled 10. The drawn
+width is still capped by that physical padding, and padding 0 hides the
+outer bar. `scrollbar.autohide` (default on) drops the bar one second after
+the last scroll or hover. The bar is drawn in the window padding, or in the
+side-by-side seam, never on a grid cell, so the last column stays visible
+and clickable. The resize grip on the bar's side is 2–6px and never wider
+than the old edge. Corners and that grip resize the window, including the
+top 6px of the caption buttons and the outer pixels of the close button;
+the pointer is the resize arrow there, because it is chosen from the same
+decision as the click. A scrollbar track beats a side grip, so the thumb
+drags instead. The ConPTY column count is the grid width divided by the
+cell width. Padding grows with the display scale, so at 150% and 200% the
+grid is narrower and a pane can lose a column even with the bar hidden. A
+side-by-side split widens the seam to the bar, which can cost one more
+column per pane: at 1280px with 11px cells the two panes are 56 and 56,
+where a 1px seam was 57 and 57. It is hidden with no scrollback
+and on the alternate screen. The thumb is at least 16px, or the bar's
+width when that is wider. A sub-line `fraction` on the scroll position
+defaults to 0 so smooth scroll can pass its remainder later.
 
 Shell and scrollback apply to new tabs (no terminal restarts a live
 session); everything else applies immediately. `osc52` is config-file

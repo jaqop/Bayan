@@ -40,6 +40,7 @@ mod process;
 mod pty_writer;
 mod render;
 mod scroll;
+mod scrollbar;
 mod shells;
 mod term;
 mod toast;
@@ -1518,6 +1519,8 @@ struct App {
     sel_pane: usize,
     /// divider being dragged (between pane i and i+1)
     drag_divider: Option<usize>,
+    /// Per-pane scrollbar: hover, thumb drag, and when it was last scrolled.
+    bars: scrollbar::Bars,
     /// the agent cockpit overlay (Ctrl+Shift+D): one glance at every tab
     cockpit: bool,
     cockpit_sel: usize,
@@ -1647,6 +1650,7 @@ impl App {
             mouse: mouse::Route::default(),
             sel_pane: 0,
             drag_divider: None,
+            bars: scrollbar::Bars::default(),
             cockpit: false,
             cockpit_sel: 0,
             pending_paste: None,
@@ -3035,13 +3039,64 @@ impl App {
         let px = w.inner_size();
         let bar = r.tab_bar_h().round() as i32;
         // the padding setting insets the whole content area evenly
-        let pad = self.config.padding_px();
+        let pad = self.padding_physical();
         Some((
             pad,
             bar + pad,
             (px.width as i32 - pad * 2).max(1),
             (px.height as i32 - bar - pad * 2).max(1),
         ))
+    }
+
+    /// Side-by-side seam, wide enough for the scrollbar when one is shown.
+    /// A hidden bar, or no padding to sit in, keeps the one-pixel seam so
+    /// the grid (and the ConPTY column count) does not move.
+    pub(crate) fn split_gaps(&self) -> layout::Gaps {
+        let room = self.scrollbar_gutter();
+        if room <= 1 {
+            layout::Gaps::HAIRLINE
+        } else {
+            layout::Gaps {
+                beside: room,
+                stacked: 1,
+            }
+        }
+    }
+
+    /// Configured thickness in physical pixels (`width` × the window scale).
+    pub(crate) fn scrollbar_width_px(&self) -> i32 {
+        let scale = self
+            .window
+            .as_ref()
+            .map(|w| w.scale_factor() as f32)
+            .unwrap_or(1.0);
+        self.config.scrollbar.width_px_at(scale)
+    }
+
+    /// Bar thickness that fits in the padding. Never wider than the padding,
+    /// so the outer bar cannot enter the grid.
+    pub(crate) fn scrollbar_gutter(&self) -> i32 {
+        if self.config.scrollbar.side() == scrollbar::Side::Hidden {
+            return 0;
+        }
+        let pad = self.padding_physical();
+        if pad <= 0 {
+            return 0;
+        }
+        let width = self.scrollbar_width_px();
+        if width <= 1 {
+            return 0;
+        }
+        width.min(pad)
+    }
+
+    fn padding_physical(&self) -> i32 {
+        let scale = self
+            .window
+            .as_ref()
+            .map(|w| w.scale_factor() as f32)
+            .unwrap_or(1.0);
+        self.config.padding_px_at(scale)
     }
 
     /// Pane rects for the active tab within the window's content area.
@@ -3052,7 +3107,8 @@ impl App {
         if t.zoomed && t.panes.len() > 1 {
             zoom_rects(content, t.panes.len(), t.focused)
         } else {
-            t.layout.rects(content, t.panes.len())
+            t.layout
+                .rects_spaced(content, t.panes.len(), self.split_gaps())
         }
     }
 
@@ -3060,7 +3116,7 @@ impl App {
     pub(crate) fn dividers(&self) -> Vec<layout::Divider> {
         match (self.content_rect(), self.tabs.get(self.active)) {
             (Some(content), Some(t)) if t.panes.len() > 1 && !t.zoomed => {
-                t.layout.dividers(content)
+                t.layout.dividers_spaced(content, self.split_gaps())
             }
             _ => Vec::new(),
         }
@@ -3075,6 +3131,7 @@ impl App {
         let Some(content) = self.content_rect() else {
             return;
         };
+        let gaps = self.split_gaps();
         let Some(t) = self.tabs.get_mut(self.active) else {
             return;
         };
@@ -3082,7 +3139,7 @@ impl App {
             Orientation::Row => pos.x,
             Orientation::Column => pos.y,
         };
-        t.layout.drag(&d, content, p);
+        t.layout.drag_spaced(&d, content, p, gaps);
         self.relayout_active();
         self.request_redraw();
     }
@@ -3113,7 +3170,9 @@ impl App {
                     continue; // zoomed away: keep the size it had
                 }
                 let g = TermSize {
-                    cols: ((rect.2 as f32 / cw) as usize).max(10),
+                    // the grid only: the scrollbar lives in the padding or
+                    // the seam, so it is not a column
+                    cols: scrollbar::grid_columns(rect.2, cw),
                     rows: ((rect.3 as f32 / ch) as usize).max(3),
                 };
                 pane.session.resize(g);
@@ -5086,6 +5145,9 @@ impl App {
             }
         });
         let rects = self.pane_rects();
+        let sb_content = self.content_rect();
+        let sb_pad = self.padding_physical();
+        let sb_width = self.scrollbar_width_px();
         // the bar shows the active group's tabs only
         let tab_infos: Vec<render::TabInfo> = self
             .visible_tabs()
@@ -5111,6 +5173,7 @@ impl App {
         match (self.renderer.as_mut(), self.tabs.get(self.active)) {
             (Some(renderer), Some(tab)) if !rects.is_empty() => {
                 renderer.begin_frame();
+                self.bars.begin_frame();
                 let bordered = tab.panes.len() > 1 && !tab.zoomed;
                 let (auto_follow, claude_manual) = (self.auto_follow, self.claude_manual);
                 let mut focused_claude = false;
@@ -5241,7 +5304,37 @@ impl App {
                             scroll::offset_px(sub, renderer.cell_h)
                         },
                     };
+                    let rows = t.screen_lines();
                     renderer.draw_pane(&mut verts, &view, &t);
+                    // Smooth scroll's sub-line remainder is the fraction's
+                    // unit: lines in [0, 1) added to display_offset. Zero on
+                    // the alternate screen and with smooth scroll off.
+                    let fraction = if view.scroll_px > 0 {
+                        self.smooth.get(&pane.id).map_or(0.0, |s| s.subline)
+                    } else {
+                        0.0
+                    };
+                    let place = scrollbar::Place::new(history as usize + rows, rows, off as usize)
+                        .with_fraction(fraction);
+                    let side = self.config.scrollbar.side();
+                    let width = sb_width;
+                    let autohide = self.config.scrollbar.autohide_on();
+                    let room = sb_content
+                        .map(|c| scrollbar::room_px(pi, &rects, side, c, sb_pad))
+                        .unwrap_or(0);
+                    let now = Instant::now();
+                    self.bars.observe(pane.id, off as usize, now);
+                    let engaged = self.bars.hover == Some(pane.id) || self.bars.dragging(pane.id);
+                    if scrollbar::shown(autohide, engaged, self.bars.last_of(pane.id), now) {
+                        if let Some(geom) = scrollbar::layout(*rect, side, width, room, place, alt)
+                        {
+                            // clip to the gutter, so a quad cannot land on a cell
+                            renderer.draw_scrollbar(
+                                &mut verts, geom.track, geom.track, geom.thumb, engaged,
+                            );
+                            self.bars.mark_painted(pane.id);
+                        }
+                    }
                 }
                 renderer.use_ui_metrics(true);
                 renderer.draw_chrome(
@@ -5895,6 +5988,17 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(t) = self.tick_smooth_scroll() {
             wake = Some(wake.map_or(t, |w| w.min(t)));
         }
+        // a scrollbar that auto-hides wakes once, then the next frame drops
+        // it and the window goes back to sleeping
+        let tick = self
+            .bars
+            .tick(self.config.scrollbar.autohide_on(), Instant::now());
+        if tick.redraw {
+            self.request_redraw();
+        }
+        if let Some(t) = tick.wake {
+            wake = Some(wake.map_or(t, |w| w.min(t)));
+        }
         match wake {
             Some(t) => el.set_control_flow(ControlFlow::WaitUntil(t)),
             None => el.set_control_flow(ControlFlow::Wait),
@@ -5921,6 +6025,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => self.cursor_moved(position),
             WindowEvent::CursorLeft { .. } => {
                 self.clear_link_hover();
+                self.clear_scrollbar_pointer();
                 if let Some(r) = self.renderer.as_mut() {
                     if r.hover_tab.take().is_some() {
                         self.request_redraw();
