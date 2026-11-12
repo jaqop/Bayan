@@ -267,7 +267,7 @@ fn open_console_is_loaded_only_from_the_exe_directory() {
 fn rejected_or_unstarted_open_console_falls_back_to_inbox() {
     use crate::conpty_resolve::{
         accept_bundled_host, capability_after_launch, hash_matches_pin, host_file_ok,
-        signature_is_trusted, ConptyCapability, HostFacts, OPEN_CONSOLE_SHA256,
+        ConptyCapability, HostFacts, OPEN_CONSOLE_SHA256,
     };
 
     let signed = HostFacts {
@@ -322,18 +322,21 @@ fn rejected_or_unstarted_open_console_falls_back_to_inbox() {
     let unsigned = dir.join("OpenConsole.exe");
     std::fs::write(&unsigned, b"MZ not a signed image").unwrap();
     let unsigned_str = unsigned.to_str().expect("temp path");
-    assert!(
-        !signature_is_trusted(unsigned_str),
-        "an unsigned file must not verify"
+    let unsigned_status = crate::conpty_resolve::signature_status(unsigned_str);
+    assert_ne!(
+        unsigned_status, 0,
+        "an unsigned file must not verify ({unsigned_status:#x})"
     );
     assert!(!host_file_ok(unsigned_str, false));
     let _ = std::fs::remove_dir_all(&dir);
 
     let conhost = system32_dir().join("conhost.exe");
     let conhost_str = conhost.to_str().expect("system32 path");
-    assert!(
-        signature_is_trusted(conhost_str),
-        "System32 conhost.exe should carry a trusted signature: {}",
+    let status = crate::conpty_resolve::signature_status(conhost_str);
+    assert_eq!(
+        status,
+        0,
+        "System32 conhost.exe should carry a trusted signature: {} status {status:#x}",
         conhost.display()
     );
 }

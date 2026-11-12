@@ -391,7 +391,11 @@ fn trustee_is_standard_user(trustee: &str, user_sid: &str) -> bool {
         || trustee.eq_ignore_ascii_case("BU")
         || trustee.eq_ignore_ascii_case("S-1-1-0")
         || trustee.eq_ignore_ascii_case("S-1-5-11")
-        || trustee.eq_ignore_ascii_case("S-1-5-32-545")
+        ||         trustee.eq_ignore_ascii_case("S-1-5-32-545")
+        // Local account (S-1-5-113). A temp file on a GitHub runner is
+        // granted to LA, and any local account can use that ACE.
+        || trustee.eq_ignore_ascii_case("LA")
+        || trustee.eq_ignore_ascii_case("S-1-5-113")
         || (!user_sid.is_empty() && trustee.eq_ignore_ascii_case(user_sid))
 }
 
@@ -435,6 +439,11 @@ pub(crate) fn plain_host_file(path: &str) -> bool {
 /// Trusted Authenticode signature, including catalog signatures of system
 /// files. Unsigned, untrusted, and missing files are `false`. No UI.
 pub(crate) fn signature_is_trusted(path: &str) -> bool {
+    signature_status(path) == 0
+}
+
+/// `WinVerifyTrust` status for `path`. `0` is a trusted signature.
+pub(crate) fn signature_status(path: &str) -> i32 {
     let mut wide: Vec<u16> = path.encode_utf16().collect();
     wide.push(0);
     let mut file = WintrustFileInfo {
@@ -455,7 +464,7 @@ pub(crate) fn signature_is_trusted(path: &str) -> bool {
         state_action: 1, // WTD_STATEACTION_VERIFY
         state_data: std::ptr::null_mut(),
         url_reference: std::ptr::null_mut(),
-        prov_flags: 0x1000, // WTD_CACHE_ONLY_URL_RETRIEVAL
+        prov_flags: 0,
         ui_context: 0,
         signature_settings: std::ptr::null_mut(),
     };
