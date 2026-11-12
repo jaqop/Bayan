@@ -433,16 +433,17 @@ case "$__bayan_bash" in
     fi
     ;;
 esac
-__bayan_bin=$(CDPATH= cd -- "$(dirname -- "$__bayan_bash")" && pwd) || __bayan_bin=
+# No cd: the stage log showed `cd` of this path never returned.
+__bayan_bash="${__bayan_bash//\\//}"
+__bayan_bin="${__bayan_bash%/*}"
 __bayan_root=
 case "$__bayan_bin" in
-  */usr/bin)
-    __bayan_root=$(CDPATH= cd -- "$__bayan_bin/../.." && pwd) || __bayan_root=
-    ;;
-  ?*)
-    __bayan_root=$(CDPATH= cd -- "$__bayan_bin/.." && pwd) || __bayan_root=
-    ;;
+  */usr/bin) __bayan_root="${__bayan_bin%/usr/bin}" ;;
+  ?*) __bayan_root="${__bayan_bin%/*}" ;;
 esac
+if [ -z "$__bayan_root" ]; then
+  __bayan_root=/
+fi
 if [ -z "${MSYSTEM:-}" ]; then
   # Git for Windows 2.56 ships ucrt64 and no mingw64. usr/bin/bash does
   # not set MSYSTEM itself, so the first layout that exists wins.
@@ -2589,8 +2590,8 @@ mod tests {
                     "export MSYSTEM PATH\nprintf 'path\\n' >> \"$BAYAN_STAGE\"\n",
                 )
                 .replace(
-                    "__bayan_bin=$(CDPATH=",
-                    "printf 'beforecd\\n' >> \"$BAYAN_STAGE\"\n__bayan_bin=$(CDPATH=",
+                    "__bayan_bin=\"${__bayan_bash%/*}\"",
+                    "printf 'bin\\n' >> \"$BAYAN_STAGE\"\n__bayan_bin=\"${__bayan_bash%/*}\"",
                 );
             marked.push_str(&body);
             marked.push_str("\nprintf 'end\\n' >> \"$BAYAN_STAGE\"\n");
