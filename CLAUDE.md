@@ -40,9 +40,9 @@ selection and BiDi paths must do.
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-531 tests in `src` (`cargo test --all-targets` does not run the vendored
+532 tests in `src` (`cargo test --all-targets` does not run the vendored
 `portable-pty` crate). `term.rs` (88), `link.rs` (61) and `render.rs` (65)
-carry the most; `shellint.rs` has 25 and `localpath.rs` has 21. Three more in
+carry the most; `shellint.rs` has 26 and `localpath.rs` has 21. Three more in
 `term.rs` are `#[ignore]`d probes, run by hand (see Measuring).
 
 ## Measuring
@@ -177,7 +177,9 @@ the user's rc files. An elevated token must not source `~/.bashrc`,
 `~/.bash_profile`, `~/.inputrc`, or the zsh home files: set `INPUTRC` and
 `HISTFILE` to `/dev/null`. Elevated Git Bash is `--noprofile` and must
 not source `/etc/profile` (its `git-prompt.sh` runs user files); set
-`PATH` and `MSYSTEM` from the bash install. Elevated WSL bash still reads the
+`PATH` and `MSYSTEM` from the bash install, and start with `HOME` and
+`USERPROFILE` on the integration directory. The first prompt restores
+them. Elevated WSL bash still reads the
 distro profile with `HOME` pointed at the rcfile directory. A failed
 elevation query is treated as elevated. `shellint::is_elevated` is a copy
 of the check in PR #59; delete one of them when both are on `bayan-plus`.

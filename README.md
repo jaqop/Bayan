@@ -964,7 +964,9 @@ elevated token (Run as administrator) does not source user rc files, sets
 macro. Elevated Git Bash is started with `--noprofile` and does not read
 `/etc/profile`: that file runs `git-prompt.sh`, which executes
 `~/.config/git/git-prompt.sh` and `~/bash_completion.d/*.bash` as
-administrator. `PATH` and `MSYSTEM` are set from the Git install instead. Elevated WSL bash still reads the
+administrator. `PATH` and `MSYSTEM` are set from the Git install
+instead, and `HOME` and `USERPROFILE` are the integration directory
+until the first prompt, which puts the real home back. Elevated WSL bash still reads the
 distro's `/etc/profile`, with `HOME` pointed at the rcfile directory for
 that read and restored afterwards. Elevated zsh ends `.zlogin` with
 `unsetopt rcs`, so exit does not read `~/.zlogout`. oh-my-posh is not inited from the user

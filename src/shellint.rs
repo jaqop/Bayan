@@ -555,6 +555,28 @@ __bayan_prompt_command() {
   # Anything after this line (printf, cygpath) would leave $? at 0, and
   # starship / oh-my-posh would paint a green mark on a failed command.
   local __bayan_ec=${?} __bayan_pipe=("${PIPESTATUS[@]}")
+  # Elevated Git Bash is started with HOME on the integration directory,
+  # so /etc/profile and git-prompt.sh cannot see the user's files. The
+  # real values come back here, after every startup file has run.
+  if [ -n "${BAYAN_REAL_HOME+x}" ]; then
+    case "$BAYAN_REAL_HOME" in
+      [A-Za-z]:*)
+        if command -v cygpath >/dev/null 2>&1; then
+          HOME=$(cygpath -u -- "$BAYAN_REAL_HOME" 2>/dev/null) || HOME=$BAYAN_REAL_HOME
+        else
+          HOME=$BAYAN_REAL_HOME
+        fi
+        ;;
+      *) HOME=$BAYAN_REAL_HOME ;;
+    esac
+    export HOME
+    unset BAYAN_REAL_HOME
+  fi
+  if [ -n "${BAYAN_REAL_USERPROFILE+x}" ]; then
+    USERPROFILE=$BAYAN_REAL_USERPROFILE
+    export USERPROFILE
+    unset BAYAN_REAL_USERPROFILE
+  fi
   printf '\033]133;D;%s;%s\007' "$__bayan_ec" "$__BAYAN_NONCE"
   printf '\033]133;A;%s\007' "$__BAYAN_NONCE"
   __bayan_report_cwd
@@ -930,8 +952,27 @@ pub(crate) fn materialize(plan: &Plan) -> Result<Materialized, String> {
         let path = resolve_rel(&dir, rel).ok_or_else(|| format!("refusing path {rel}"))?;
         env.push((key.clone(), path.display().to_string()));
     }
+    if elevated && plan.kind == ShellKind::Bash {
+        pin_elevated_bash_home(&mut env, &dir);
+    }
     let dir = cleanup.disarm();
     Ok(Materialized { args, env, dir })
+}
+
+/// Git for Windows reads `git-prompt.sh` from the home it sees at process
+/// start, before `--rcfile` and despite `--noprofile`. Point `HOME` and
+/// `USERPROFILE` at the integration directory for that read. The rcfile
+/// puts the real values back on the first prompt.
+fn pin_elevated_bash_home(env: &mut Vec<(String, String)>, safe_dir: &Path) {
+    let safe = safe_dir.display().to_string();
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        env.push(("BAYAN_REAL_HOME".into(), home));
+    }
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        env.push(("BAYAN_REAL_USERPROFILE".into(), profile));
+    }
+    env.push(("HOME".into(), safe.clone()));
+    env.push(("USERPROFILE".into(), safe));
 }
 
 fn resolve_rel(dir: &Path, rel: &str) -> Option<PathBuf> {
@@ -2291,6 +2332,30 @@ mod tests {
     }
 
     #[test]
+    fn elevated_bash_pins_home_to_the_script_directory() {
+        let dir = Path::new(r"C:\ProgramData\bayan-si-abc");
+        let mut env = Vec::new();
+        pin_elevated_bash_home(&mut env, dir);
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == "HOME")
+                .map(|(_, v)| v.as_str()),
+            Some(dir.to_str().unwrap())
+        );
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == "USERPROFILE")
+                .map(|(_, v)| v.as_str()),
+            Some(dir.to_str().unwrap())
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "BAYAN_REAL_HOME" && v != &dir.display().to_string()),
+            "the user's home must be kept aside"
+        );
+    }
+
+    #[test]
     fn elevated_git_bash_sets_path_without_sourcing_profile() {
         let rc = bash_rc(true, false, true);
         assert!(
@@ -2301,6 +2366,12 @@ mod tests {
         let prefix = rc.find("/mingw64").expect("mingw64 is on PATH");
         let hooks = rc.find("printf '\\033]133;D;%s;%s\\007'").unwrap();
         assert!(msystem < hooks && prefix < hooks, "{rc}");
+        let saved = rc.find("BAYAN_REAL_HOME").expect("real HOME is restored");
+        let user_pc = rc.find("eval \"$__bayan_cmd\"").unwrap();
+        assert!(
+            saved < user_pc,
+            "HOME must be back before the user's prompt command"
+        );
         // WSL elevated still reads the distro profile, with HOME moved first.
         let wsl = bash_rc(true, false, false);
         let moved = wsl.find("__bayan_real_home=$HOME").unwrap();
@@ -2374,8 +2445,10 @@ mod tests {
             .arg("--rcfile")
             .arg(&rc_path)
             .arg("-i")
-            .env("HOME", &home)
-            .env("USERPROFILE", &home)
+            .env("HOME", &safe)
+            .env("USERPROFILE", &safe)
+            .env("BAYAN_REAL_HOME", &home)
+            .env("BAYAN_REAL_USERPROFILE", &home)
             .env("BAYAN_PROMPT_NONCE", "n0nce")
             .env("INPUTRC", "/dev/null")
             .env("HISTFILE", "/dev/null")
@@ -2428,7 +2501,10 @@ mod tests {
             "MSYSTEM was not set:\n{text}"
         );
         assert!(text.contains("LS=ok"), "PATH has no ls:\n{text}");
-        assert!(text.contains("AFTER="), "{text}");
+        assert!(
+            text.contains("bayan-elev-home-"),
+            "HOME was not restored:\n{text}"
+        );
         assert!(
             !text.contains("bayan-elev-rc-"),
             "HOME was left on the rcfile directory:\n{text}"
