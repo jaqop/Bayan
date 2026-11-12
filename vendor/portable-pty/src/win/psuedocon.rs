@@ -78,24 +78,34 @@ fn load_kernel32() -> ConPtyFuncs {
     bind_api(resolved, plan.flags, plan.passthrough)
 }
 
-/// Absolute `<exe>\conpty.dll` when `<exe>\OpenConsole.exe` is beside it
-/// and the DLL version is the 1.22+ rewrite. Anything else is `None`:
-/// kernel32 is the host, and a planted DLL in the current directory or on
-/// `PATH` is never named.
+/// Absolute `<exe>\conpty.dll` when `<exe>\OpenConsole.exe` is that same
+/// directory, both files verify, and an elevated token is not about to run
+/// a user-writable copy. Anything else is `None`: kernel32 is the host.
+/// A bare name, PATH, and the current directory are never consulted.
 fn load_bundled() -> Option<ConPtyFuncs> {
     let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    let dll = dir.join("conpty.dll");
-    let console = dir.join("OpenConsole.exe");
+    let dll = conpty_resolve::bundled_host_path(&exe, "conpty.dll")?;
+    let console = conpty_resolve::bundled_host_path(&exe, "OpenConsole.exe")?;
     let dll_str = dll.to_str()?;
+    let console_str = console.to_str()?;
+    let elevated = conpty_resolve::running_elevated();
+    if !conpty_resolve::host_file_ok(console_str, elevated)
+        || !conpty_resolve::host_file_ok(dll_str, elevated)
+    {
+        log::debug!("conpty: bundled OpenConsole was not accepted; using kernel32");
+        return None;
+    }
+    if elevated {
+        let dir = exe.parent()?.to_str()?;
+        if conpty_resolve::path_user_writable(dir).unwrap_or(true) {
+            log::debug!("conpty: exe directory is user-writable; using kernel32");
+            return None;
+        }
+    }
     let probe = conpty_resolve::BundleProbe {
-        dll_is_file: dll.is_file(),
-        open_console_is_file: console.is_file(),
-        version: if dll.is_file() && console.is_file() {
-            conpty_resolve::read_file_version(dll_str)
-        } else {
-            None
-        },
+        dll_is_file: true,
+        open_console_is_file: true,
+        version: conpty_resolve::read_file_version(dll_str),
     };
     let capability = conpty_resolve::capability_from_probe(probe);
     if capability != conpty_resolve::ConptyCapability::BundledRewrite {
@@ -225,8 +235,10 @@ impl PsuedoCon {
             match open_with(bundle, size, &input, &output) {
                 Ok(con) => return Ok(con),
                 Err(hr) => {
-                    log::warn!(
-                        "bundled CreatePseudoConsole failed (HRESULT {hr:#x}); falling back to kernel32"
+                    // A host that did not start is inbox. No dialog, no panic.
+                    let fallback = conpty_resolve::capability_after_launch(true, false);
+                    log::debug!(
+                        "bundled CreatePseudoConsole failed (HRESULT {hr:#x}); {fallback:?}; using kernel32"
                     );
                 }
             }

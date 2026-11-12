@@ -226,6 +226,188 @@ fn passthrough_follows_conpty_version_and_unknown_stays_inbox() {
     assert_eq!(unknown, unsupported);
 }
 
+/// The only OpenConsole.exe Bayan will run is the absolute path beside the
+/// executable. A bare name (PATH), the current directory, and a copy in
+/// System32 are not that file.
+#[test]
+fn open_console_is_loaded_only_from_the_exe_directory() {
+    use crate::conpty_resolve::{bundled_host_path, path_is_beside_exe};
+
+    let exe = Path::new(r"C:\Program Files\Bayan\bayan.exe");
+    let cwd = Path::new(r"C:\Users\me\Downloads");
+    let beside = bundled_host_path(exe, "OpenConsole.exe").expect("exe-dir path");
+    assert!(beside.is_absolute(), "{beside:?}");
+    assert_eq!(
+        beside.file_name().and_then(|n| n.to_str()),
+        Some("OpenConsole.exe")
+    );
+    assert_eq!(beside.parent(), exe.parent());
+    assert!(path_is_beside_exe(exe, &beside));
+    assert!(path_is_beside_exe(
+        exe,
+        &bundled_host_path(exe, "conpty.dll").unwrap()
+    ));
+
+    assert!(bundled_host_path(exe, r"OpenConsole.exe").is_some());
+    assert!(bundled_host_path(exe, r"..\OpenConsole.exe").is_none());
+    assert!(bundled_host_path(exe, r"C:\OpenConsole.exe").is_none());
+    assert!(bundled_host_path(Path::new("bayan.exe"), "OpenConsole.exe").is_none());
+
+    let from_cwd = cwd.join("OpenConsole.exe");
+    let from_path = Path::new("OpenConsole.exe");
+    let from_system = Path::new(r"C:\Windows\System32\OpenConsole.exe");
+    assert!(!path_is_beside_exe(exe, &from_cwd));
+    assert!(!path_is_beside_exe(exe, from_path));
+    assert!(!path_is_beside_exe(exe, from_system));
+}
+
+/// Missing, unsigned, and a host that did not start all stay on inbox.
+/// The decision is a plan, not an error, so spawn does not fail closed.
+#[test]
+fn rejected_or_unstarted_open_console_falls_back_to_inbox() {
+    use crate::conpty_resolve::{
+        accept_bundled_host, capability_after_launch, hash_matches_pin, host_file_ok,
+        signature_is_trusted, ConptyCapability, HostFacts, OPEN_CONSOLE_SHA256,
+    };
+
+    let signed = HostFacts {
+        exists: true,
+        reparse: false,
+        signature_ok: true,
+        hash_ok: false,
+        elevated: false,
+        file_user_writable: false,
+        dir_user_writable: false,
+        acl_known: true,
+    };
+    assert!(accept_bundled_host(signed));
+    assert!(accept_bundled_host(HostFacts {
+        signature_ok: false,
+        hash_ok: true,
+        ..signed
+    }));
+    assert!(!accept_bundled_host(HostFacts {
+        exists: false,
+        ..signed
+    }));
+    assert!(!accept_bundled_host(HostFacts {
+        reparse: true,
+        ..signed
+    }));
+    assert!(!accept_bundled_host(HostFacts {
+        signature_ok: false,
+        hash_ok: false,
+        ..signed
+    }));
+    assert!(!hash_matches_pin("abc", ""));
+    assert!(hash_matches_pin("abc", "ABC"));
+    assert_eq!(OPEN_CONSOLE_SHA256, "");
+    assert_eq!(
+        capability_after_launch(true, false),
+        ConptyCapability::Inbox,
+        "CreatePseudoConsole failed"
+    );
+    assert_eq!(
+        capability_after_launch(false, false),
+        ConptyCapability::Inbox,
+        "verification failed"
+    );
+    assert_eq!(
+        capability_after_launch(true, true),
+        ConptyCapability::BundledRewrite
+    );
+
+    let dir = std::env::temp_dir().join(format!("bayan-oc-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let unsigned = dir.join("OpenConsole.exe");
+    std::fs::write(&unsigned, b"MZ not a signed image").unwrap();
+    let unsigned_str = unsigned.to_str().expect("temp path");
+    assert!(
+        !signature_is_trusted(unsigned_str),
+        "an unsigned file must not verify"
+    );
+    assert!(!host_file_ok(unsigned_str, false));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let conhost = system32_dir().join("conhost.exe");
+    let conhost_str = conhost.to_str().expect("system32 path");
+    assert!(
+        signature_is_trusted(conhost_str),
+        "System32 conhost.exe should carry a trusted signature: {}",
+        conhost.display()
+    );
+}
+
+/// Elevated Bayan refuses OpenConsole.exe when the file or its directory
+/// grants write to a standard user. A locked-down signed file is accepted.
+#[test]
+fn elevated_window_refuses_a_user_writable_open_console() {
+    use crate::conpty_resolve::{
+        accept_bundled_host, path_user_writable, user_can_write, HostFacts,
+    };
+
+    let sid = "S-1-5-21-1";
+    assert!(user_can_write("D:(A;;FA;;;WD)", sid));
+    assert!(user_can_write("D:(A;;FW;;;BU)", sid));
+    assert!(user_can_write("D:(A;;0x120116;;;AU)", sid));
+    assert!(user_can_write("D:(A;;FA;;;S-1-5-21-1)", sid));
+    assert!(
+        !user_can_write("D:(A;;FA;;;BA)(A;;0x1200a9;;;BU)", sid),
+        "read for Users and full control for Administrators is not user-writable"
+    );
+    assert!(
+        !user_can_write("D:(A;;FA;;;S-1-5-21-1)S:(ML;;NW;;;HI)", sid),
+        "no-write-up at high integrity blocks a medium token"
+    );
+
+    let signed = HostFacts {
+        exists: true,
+        reparse: false,
+        signature_ok: true,
+        hash_ok: false,
+        elevated: true,
+        file_user_writable: false,
+        dir_user_writable: false,
+        acl_known: true,
+    };
+    assert!(accept_bundled_host(signed));
+    assert!(!accept_bundled_host(HostFacts {
+        file_user_writable: true,
+        ..signed
+    }));
+    assert!(!accept_bundled_host(HostFacts {
+        dir_user_writable: true,
+        ..signed
+    }));
+    assert!(
+        !accept_bundled_host(HostFacts {
+            acl_known: false,
+            ..signed
+        }),
+        "an unreadable ACL is a refusal while elevated"
+    );
+    assert!(accept_bundled_host(HostFacts {
+        elevated: false,
+        file_user_writable: true,
+        dir_user_writable: true,
+        ..signed
+    }));
+
+    let dir = std::env::temp_dir().join(format!("bayan-acl-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("OpenConsole.exe");
+    std::fs::write(&file, b"x").unwrap();
+    let file_str = file.to_str().expect("temp path");
+    let sddl = crate::conpty_resolve::security_sddl(file_str);
+    assert_eq!(
+        path_user_writable(file_str),
+        Some(true),
+        "a file this user just created must read as user-writable: {sddl:?}"
+    );
+    let _ = crate::conpty_resolve::running_elevated();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn kernel32_file_version_is_readable() {
     let path = system32_dir().join("kernel32.dll");

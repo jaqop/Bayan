@@ -1216,7 +1216,13 @@ with kernel32 and Sixel is not advertised. Primary DA stays alacritty's
 VT102 reply (`CSI ? 6 c`) until that host is actually up; then it is
 `CSI ? 64 ; 4 c` (parameter 4 is Sixel, the `64` is the level). A DLL
 older than 1.22, or one with no version resource, is not passthrough
-and is not an error: the pane still opens on kernel32. Sixel and Kitty
+and is not an error: the pane still opens on kernel32. `OpenConsole.exe`
+is that directory's file only. Bayan does not search PATH or the current
+directory for it. The file has to carry a trusted Authenticode signature
+(the optional SHA-256 pin in the loader is empty, so a signature is
+required). An elevated window also leaves the pair unused when the file
+or the directory is writable by a standard user. A missing file, a failed
+check, or a host that does not start is kernel32, with no error shown. Sixel and Kitty
 use the same caps as iTerm2 (`max_bytes`, `max_width`, `max_height`, and
 the pane and session budgets). A mux reattach feeds the saved tail
 through the replay filter first, so a Kitty graphics query is dropped

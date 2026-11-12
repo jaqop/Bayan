@@ -54,7 +54,7 @@ selection and BiDi paths must do.
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, the passthrough flag choice, and vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-839 tests across the tree. `render.rs` and `term.rs` (100 each) and
+842 tests across the tree. `render.rs` and `term.rs` (100 each) and
 `link.rs` (66) carry the most; `lua_host.rs` has 46, `shellint.rs` 24,
 `images.rs` 23, `localpath.rs` 21, `mux.rs` 16, `config_watch.rs` 14,
 `screen_reader.rs` 11 and `ssh.rs` 7. Three more in `term.rs` are
@@ -199,7 +199,13 @@ LOAD_LIBRARY_SEARCH_SYSTEM32`). A DLL alone, a bare name, the current
 directory, and `PATH` are not a host. If that `CreatePseudoConsole` fails,
 the pane opens on kernel32. DA advertises Sixel (`CSI ? 64 ; 4 c`) only
 after a bundled pseudoconsole has been created. A missing or older
-version keeps the inbox flags and does not fail the spawn. The binaries
+version keeps the inbox flags and does not fail the spawn. `OpenConsole.exe`
+is only the absolute path beside `bayan.exe`: not PATH, not the current
+directory. It must have a trusted Authenticode signature (or match the
+pinned SHA-256, which is empty until one is set). An elevated window
+also refuses the file or its directory when a standard user can write
+them. A miss, a bad signature, or a host that does not start falls back
+to kernel32 with no error. The binaries
 are not in the repo. Image caps (`max_bytes`, `max_width`, `max_height`,
 the pane and session budgets) apply to Sixel and Kitty and are reapplied
 to open panes on reload. A mux reattach runs the tail through

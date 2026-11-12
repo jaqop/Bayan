@@ -7581,7 +7581,9 @@ fn blur_forgets_held_keys(focused: bool, held: &mut Vec<winit::keyboard::Physica
 /// ConPTY does not depend on this call. `CreatePseudoConsole`,
 /// `ResizePseudoConsole`, and `ClosePseudoConsole` come from `kernel32.dll`
 /// opened with `LoadLibraryExW(L"kernel32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32)`.
-/// `conpty.dll` is never passed to the loader.
+/// A bundled `conpty.dll` is loaded only by the absolute path beside this
+/// executable, and only after `OpenConsole.exe` in that same directory
+/// verifies. The bare name is never passed to the loader.
 ///
 /// NEW-04 (partly): the application directory still precedes System32 for a
 /// bare name, so a `d3d12.dll` planted beside `bayan.exe` (a Downloads
