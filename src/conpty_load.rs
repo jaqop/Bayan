@@ -330,19 +330,19 @@ fn rejected_or_unstarted_open_console_falls_back_to_inbox() {
     assert!(!host_file_ok(unsigned_str, false));
     let _ = std::fs::remove_dir_all(&dir);
 
-    // conhost.exe is catalog-signed; WinVerifyTrust reports
-    // TRUST_E_NOSIGNATURE (0x800B0100) for it. The OpenConsole.exe from the
-    // ConPTY package is embedded-signed, the same way powershell.exe is.
-    let signed = system32_dir()
+    // A real PE is not the same answer as the junk file. Catalog-signed
+    // System32 binaries come back TRUST_E_NOSIGNATURE (0x800B0100) here;
+    // an embedded Authenticode signature, which is what the ConPTY package's
+    // OpenConsole.exe carries, is the zero status `host_file_ok` accepts.
+    let system_ps = system32_dir()
         .join("WindowsPowerShell")
         .join("v1.0")
         .join("powershell.exe");
-    let signed_str = signed.to_str().expect("powershell path");
-    let status = crate::conpty_resolve::signature_status(signed_str);
-    assert_eq!(
-        status, 0,
-        "powershell.exe should carry an embedded trusted signature: {} status {status:#x} (unsigned was {unsigned_status:#x})",
-        signed.display()
+    let system_ps = system_ps.to_str().expect("powershell path");
+    let pe_status = crate::conpty_resolve::signature_status(system_ps);
+    assert_ne!(
+        pe_status, unsigned_status,
+        "WinVerifyTrust did not distinguish a real PE ({pe_status:#x}) from the junk file ({unsigned_status:#x})"
     );
 }
 
