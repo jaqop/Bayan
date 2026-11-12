@@ -3286,6 +3286,10 @@ impl Session {
             let _ = proxy.send_event(UserEvent::Exit(id));
         });
 
+        // `CSI 14 t` is answered from this map. `resize` returns early when
+        // the size did not change, so a pane that keeps the size it was
+        // spawned with would otherwise never be in it.
+        set_text_area_grid(id, size.cols, size.rows);
         Ok(Self {
             term,
             meta,
