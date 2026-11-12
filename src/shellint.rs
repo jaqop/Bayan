@@ -425,13 +425,6 @@ const BASH_ELEVATED_ENV: &str = r#"
 # the real profile from executing those files. PATH and MSYSTEM come from
 # this bash's own install.
 # A launcher that already chose MSYSTEM is kept.
-# Tab completion must not follow HOME back to the user's files.
-# Do not cd to this path: a Windows rcfile path can look like a network
-# share to MSYS and the cd then waits until the test kills it.
-__bayan_here=${BASH_SOURCE[0]}
-__bayan_here=${__bayan_here//\\//}
-__bayan_completion_dir="${__bayan_here%/*}/bash-completion"
-unset __bayan_here
 __bayan_bash=${BASH:-$(command -v bash 2>/dev/null)}
 case "$__bayan_bash" in
   [A-Za-z]:*)
@@ -494,6 +487,12 @@ fi
 export MSYSTEM PATH
 unset __bayan_bash __bayan_bin __bayan_root __bayan_prefix __bayan_usr
 unset -f __bayan_slash
+# Do not cd to the rcfile path: a Windows path can look like a network
+# share to MSYS and the cd then waits until the test kills it.
+__bayan_here="${BASH_SOURCE[0]}"
+__bayan_here="${__bayan_here//\\//}"
+__bayan_completion_dir="${__bayan_here%/*}/bash-completion"
+unset __bayan_here
 unset BASH_COMPLETION_USER_DIR
 BASH_COMPLETION_USER_DIR=$__bayan_completion_dir
 readonly BASH_COMPLETION_USER_DIR
@@ -2588,6 +2587,10 @@ mod tests {
                 .replace(
                     "export MSYSTEM PATH\n",
                     "export MSYSTEM PATH\nprintf 'path\\n' >> \"$BAYAN_STAGE\"\n",
+                )
+                .replace(
+                    "__bayan_bin=$(CDPATH=",
+                    "printf 'beforecd\\n' >> \"$BAYAN_STAGE\"\n__bayan_bin=$(CDPATH=",
                 );
             marked.push_str(&body);
             marked.push_str("\nprintf 'end\\n' >> \"$BAYAN_STAGE\"\n");
