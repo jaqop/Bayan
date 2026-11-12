@@ -2591,6 +2591,7 @@ mod tests {
             .env("BAYAN_PROMPT_NONCE", "n0nce")
             .env_remove("BASH_ENV")
             .env_remove("MSYSTEM")
+            .current_dir(&safe)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
@@ -2619,7 +2620,9 @@ mod tests {
             if start.elapsed() > std::time::Duration::from_secs(20) {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("bash did not exit");
+                let output = reader.join().unwrap_or_default();
+                let text = String::from_utf8_lossy(&output);
+                panic!("bash did not exit\n{text}");
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
