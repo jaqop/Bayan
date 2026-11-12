@@ -942,6 +942,27 @@ sends `CSI 8 l`:
 { "bidi": { "honor_bdsm": false } }
 ```
 
+`bidi.mode` is mintty's `Bidi=2/1/0`. `"full"` (2, the default) is the
+behavior above. `"alt_off"` (1) does not reorder while the program has
+entered the alternate screen with `?1049`, `?1047`, or `?47`, including
+when that CSI is split across reads, and reorders again after the reset.
+Only `?1049` changes alacritty's screen buffer. `?47` and `?1047` are
+tracked beside it for this decision and are not rewritten into `?1049`.
+`"off"` (0) does not reorder anywhere, so an agent that already ordered
+Arabic is not reversed a second time; Arabic shaping is unchanged. An
+explicit BDSM still disables reordering on top of `full` and of `alt_off`
+on the primary screen when `honor_bdsm` is true. Ctrl+Shift+F3
+(rebindable, `bidi-toggle`; bare F3 stays with htop and mc) cycles the focused pane `full → alt_off → off`; other panes
+stay as they are, and the corner chip reads `BiDi 1` or `BiDi 0` until the
+pane is back on `full`. An RTL paragraph (SCP 2, or auto when the first
+strong character is Arabic) is drawn flush with the pane's right edge on
+the primary screen. LTR paragraphs, TUI fields, and the alternate screen
+stay on the left.
+
+```json
+{ "bidi": { "mode": "alt_off" } }
+```
+
 **OSC 7** (`ESC ] 7 ; file://host/path ST`, BEL or `ESC \`) stores the pane's
 working directory next to the existing OSC 9;9 report. Only the `file` scheme
 is accepted. The path is percent-decoded, `/C:/x` becomes `C:\x`, and the host

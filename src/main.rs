@@ -65,6 +65,8 @@ type PaneSnap = (
     std::sync::Arc<bidi_ctl::BidiState>,
     u64,
     Option<u64>,
+    Option<bidi_ctl::BidiReorder>,
+    bool,
 );
 
 /// The Windows caret rhythm; kitty's idea on top: stop after 15s idle.
@@ -1051,7 +1053,7 @@ fn context_menu_rows(
         PaletteRow::OpenShellMenu,
         tr("تبويب جديد بطرفية…", "New tab with shell…").to_string(),
     ));
-    for a in [NewGroup, RenameTab, ClosePane, Settings] {
+    for a in [NewGroup, RenameTab, ClosePane, Settings, BidiToggle] {
         rows.push((PaletteRow::Builtin(a), a.label().to_string()));
     }
     rows
@@ -2149,9 +2151,17 @@ impl App {
         let q = query.trim().to_lowercase();
         let hit = |label: &str| q.is_empty() || label.to_lowercase().contains(&q);
         let mut rows: Vec<(PaletteRow, String)> = Vec::new();
+        let bidi_now = self.focused_bidi_mode();
         for a in keybinds::Action::ALL {
-            if hit(a.label()) {
-                rows.push((PaletteRow::Builtin(a), a.label().to_string()));
+            let label = if a == keybinds::Action::BidiToggle {
+                bidi_now.palette_label()
+            } else {
+                a.label().to_string()
+            };
+            // The live row names the current mode. The static label still
+            // matches, so a search for the shortcut's name finds it.
+            if hit(&label) || (a == keybinds::Action::BidiToggle && hit(a.label())) {
+                rows.push((PaletteRow::Builtin(a), label));
             }
         }
         let group_labels: Vec<(u32, String)> = self
@@ -2299,6 +2309,7 @@ impl App {
                 }
                 self.request_redraw();
             }
+            BidiToggle => self.toggle_bidi_reorder(),
             ResetKeyboard => {
                 if let Some(s) = self.session_mut() {
                     s.reset_keyboard();
@@ -3667,15 +3678,24 @@ impl App {
             return false;
         };
         // term first, then meta — the crate's lock order
-        let alt = s.term.lock().mode().contains(TermMode::ALT_SCREEN);
-        let (bidi_state, running) = {
+        let term_alt = s.term.lock().mode().contains(TermMode::ALT_SCREEN);
+        let (bidi_state, running, pane_mode, tracked_alt) = {
             let m = s.meta.lock_or_recover();
-            (m.bidi.clone(), m.running_cmd.clone())
+            (
+                m.bidi.clone(),
+                m.running_cmd.clone(),
+                m.bidi_reorder,
+                m.alt_track.on(),
+            )
         };
         // Idle explicit mode (a command that forgot to reset) must not
         // suppress restoration at the prompt. A live explicit mode still does.
+        // The pane's BiDi mode (off / alt screen) is the same kind of gate.
+        // `alt_off` also counts ?47 and ?1047, which do not set the term bit.
+        let mode = pane_mode.unwrap_or_else(|| self.config.bidi_mode());
+        let alt = mode.effective_alt(term_alt, tracked_alt);
         let (reorder, _) =
-            bidi_state.for_display(self.config.honor_bdsm(), !running.is_empty(), alt);
+            bidi_state.presentation(mode, self.config.honor_bdsm(), !running.is_empty(), alt);
         if !reorder {
             return false;
         }
@@ -3809,7 +3829,7 @@ impl App {
     ) -> Option<(u64, usize, usize)> {
         // copy what the locks need, then drop the pane borrow so the term
         // lock below can re-borrow the tab
-        let (pane_id, running, bidi_state, evicted, claude_from) = {
+        let (pane_id, running, bidi_state, evicted, claude_from, pane_mode, tracked_alt) = {
             let pane = self.tabs.get(self.active)?.panes.get(hit.pane)?;
             let m = pane.session.meta.lock_or_recover();
             (
@@ -3818,11 +3838,14 @@ impl App {
                 m.bidi.clone(),
                 m.evicted,
                 m.claude_from_abs,
+                m.bidi_reorder,
+                m.alt_track.on(),
             )
         };
         let (auto, manual) = (self.auto_follow, self.claude_manual);
         let honor = self.config.honor_bdsm();
-        let (cols, row, cells, claude, vis, reorder, dir) = {
+        let mode = pane_mode.unwrap_or_else(|| self.config.bidi_mode());
+        let (cols, row, cells, claude, vis, reorder, dir, align_edge, bidi_row) = {
             let t = self.tabs[self.active].panes[hit.pane].session.term.lock();
             let cols = t.columns().max(1);
             let rows = t.screen_lines().max(1);
@@ -3830,9 +3853,12 @@ impl App {
             // Explicit BDSM draws Arabic on the grid, so the click column
             // is x / cell_w. Implicit mode uses the same plan as the painter,
             // SCP mark included. Neither applies once the command has ended
-            // and the pane is back on the primary screen.
-            let alt = t.mode().contains(TermMode::ALT_SCREEN);
-            let (reorder, use_stamps) = bidi_state.for_display(honor, !running.is_empty(), alt);
+            // and the pane is back on the primary screen. `off` and
+            // `alt_off` on the alternate screen take the grid path too.
+            let term_alt = t.mode().contains(TermMode::ALT_SCREEN);
+            let alt = mode.effective_alt(term_alt, tracked_alt);
+            let (reorder, use_stamps) =
+                bidi_state.presentation(mode, honor, !running.is_empty(), alt);
             let mut claude = reorder
                 && if !auto {
                     manual
@@ -3845,14 +3871,22 @@ impl App {
                 let abs = bidi_ctl::viewport_line_abs(evicted, history, off, row as u64);
                 claude &= claude_from.is_none_or(|start| abs >= start);
             }
-            let dir = if use_stamps {
-                bidi_state.direction_at(bidi_ctl::viewport_line_abs(
-                    evicted, history, off, row as u64,
-                ))
-            } else {
-                bidi_ctl::ParagraphDir::Default
-            };
+            // The row's direction and path as draw_pane picks them: SCP
+            // stamp, then the wrapped paragraph's direction, then its own
+            // first strong letter. A wrapped RTL tail is bidi without Arabic.
+            let (dir, bidi_row) = render::viewport_row_layout(&t, row, |li| {
+                if use_stamps {
+                    bidi_state.direction_at(bidi_ctl::viewport_line_abs(
+                        evicted, history, off, li as u64,
+                    ))
+                } else {
+                    bidi_ctl::ParagraphDir::Default
+                }
+            });
             let cells = render::snapshot_row(&t, row);
+            // Same split as draw_pane: TUI fields and the alternate screen
+            // are not flush-right, so a click must not assume they are.
+            let align_edge = reorder && !alt && !((claude || alt) && render::snap_is_tui(&cells));
             (
                 cols,
                 row,
@@ -3861,6 +3895,8 @@ impl App {
                 hit.col.min(cols - 1),
                 reorder,
                 dir,
+                align_edge,
+                bidi_row,
             )
         };
         let mapped = rects
@@ -3876,12 +3912,14 @@ impl App {
             .map(|h| h.0);
         let col = if let Some(col) = mapped {
             col
-        } else if reorder && cells.iter().any(|c| render::is_rtl(c.c)) {
+        } else if reorder && bidi_row {
             let rect = rects.get(hit.pane).copied().unwrap_or((0, 0, 1, 1));
             let x = (pos.x - rect.0 as f64) as f32;
             self.renderer
                 .as_mut()
-                .and_then(|r| r.logical_column_for(&cells, x, rect.2, claude, dir, cols))
+                .and_then(|r| {
+                    r.logical_column_for(&cells, x, rect.2, claude, dir, cols, align_edge)
+                })
                 .unwrap_or(vis)
         } else {
             vis
@@ -4383,6 +4421,28 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Ctrl+Shift+F3. Cycles the focused pane only: full → alt screen off → off.
+    /// The config stays the default for panes that have not been toggled.
+    fn toggle_bidi_reorder(&mut self) {
+        let config_mode = self.config.bidi_mode();
+        let Some(session) = self.session_mut() else {
+            return;
+        };
+        let mut meta = session.meta.lock_or_recover();
+        let next = meta.bidi_reorder.unwrap_or(config_mode).cycle();
+        meta.bidi_reorder = Some(next);
+        drop(meta);
+        self.request_redraw();
+    }
+
+    /// The focused pane's effective BiDi mode: its toggle, or the config.
+    fn focused_bidi_mode(&self) -> bidi_ctl::BidiReorder {
+        let stored = self
+            .session()
+            .map(|s| s.meta.lock_or_recover().bidi_reorder);
+        stored.flatten().unwrap_or_else(|| self.config.bidi_mode())
+    }
+
     /// Ctrl+Shift+B. A tab with one pane has nobody to broadcast to.
     fn toggle_broadcast(&mut self) {
         if let Some(t) = self.tabs.get_mut(self.active) {
@@ -4828,7 +4888,15 @@ impl App {
                     let focused = pi == tab.focused;
                     // meta snapshot BEFORE the term lock (lock order term>meta
                     // only applies when holding both; here they don't overlap)
-                    let (marks, running_cmd, bidi_state, evicted, claude_from): PaneSnap = {
+                    let (
+                        marks,
+                        running_cmd,
+                        bidi_state,
+                        evicted,
+                        claude_from,
+                        pane_mode,
+                        tracked_alt,
+                    ): PaneSnap = {
                         let m = pane.session.meta.lock_or_recover();
                         (
                             // global -> grid space: subtract the evictions
@@ -4841,6 +4909,8 @@ impl App {
                             m.bidi.clone(),
                             m.evicted,
                             m.claude_from_abs,
+                            m.bidi_reorder,
+                            m.alt_track.on(),
                         )
                     };
                     let t = pane.session.term.lock();
@@ -4848,9 +4918,12 @@ impl App {
                     // Claude restoration included, and only while the command
                     // is running or the alt screen is up. honor_bdsm defaults on.
                     // The Arc is the frame's snapshot: cloning it does not copy
-                    // the stamp list.
-                    let alt = t.mode().contains(TermMode::ALT_SCREEN);
-                    let (reorder, use_stamps) = bidi_state.for_display(
+                    // the stamp list. alt_off also counts ?47 and ?1047.
+                    let term_alt = t.mode().contains(TermMode::ALT_SCREEN);
+                    let mode = pane_mode.unwrap_or_else(|| self.config.bidi_mode());
+                    let alt = mode.effective_alt(term_alt, tracked_alt);
+                    let (reorder, use_stamps) = bidi_state.presentation(
+                        mode,
                         self.config.honor_bdsm(),
                         !running_cmd.is_empty(),
                         alt,
@@ -4906,6 +4979,7 @@ impl App {
                             })
                         },
                         reorder,
+                        bidi_mode: mode,
                         line_dir: &line_dir,
                         search_match: if focused {
                             self.search.as_ref().and_then(|s| s.hl.as_ref())

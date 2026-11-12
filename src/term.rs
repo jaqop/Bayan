@@ -355,6 +355,13 @@ pub struct SessionMeta {
     /// The reader thread uses [`Self::bidi_mut`], which copies only when a
     /// frame still holds the previous snapshot.
     pub bidi: std::sync::Arc<crate::bidi_ctl::BidiState>,
+    /// This pane's reorder mode, when the user toggled it. `None` follows
+    /// `bidi.mode` in the config. Kept off `bidi` so an alt-screen reset,
+    /// which clears BDSM and SCP, does not forget the toggle.
+    pub bidi_reorder: Option<crate::bidi_ctl::BidiReorder>,
+    /// `?47` / `?1047` / `?1049` set and reset, for `bidi.mode = alt_off`
+    /// only. The parser's bytes are not rewritten from this.
+    pub alt_track: crate::bidi_ctl::AltScreenTrack,
     /// Half-parsed BDSM/SCP/RIS held across PTY reads.
     pub(crate) esc_filter: crate::bidi_ctl::StreamFilter,
     /// command blocks (OSC 133 A/D): gutter lights + prompt jumping
@@ -1812,6 +1819,10 @@ pub(crate) fn process_chunk<T: EventListener>(
     carry: &mut Vec<u8>,
     data: &[u8],
 ) -> ChunkEvents {
+    // `?47` / `?1047` / `?1049` for alt_off. Raw bytes, so a CSI split
+    // across reads stays open here. The parser still receives `data`
+    // unchanged (the filter below only strips BDSM and SCP).
+    meta.alt_track.observe(data);
     let items = meta.esc_filter.pull(data);
     let mut ev = ChunkEvents::default();
     for item in items {
