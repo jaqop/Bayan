@@ -164,10 +164,10 @@ pub enum BarAccent {
 /// the light bar (`background × 0.8`, `#c4c6c8`); the palette slots
 /// themselves sit at 2.96:1 and 2.84:1 there.
 ///
-/// Pull request 56 draws the elevated «مسؤول» badge with a hard-coded
-/// `#f2cc60`. After that work merges, the badge should call
-/// `bar_accent(BarAccent::Amber, title_bar_dark_for(bg))` instead, or the
-/// badge disappears on a light bar the same way «● Claude» did.
+/// Pull request 56 drew the elevated «مسؤول» badge with a hard-coded
+/// `#f2cc60`. The badge and the paused progress fill start here, then
+/// `ensure_contrast` lifts the result against the painted bar: `#9a5f00`
+/// is 3.06:1 on the light bar, under the 4.5 text floor.
 pub fn bar_accent(kind: BarAccent, dark: bool) -> (u8, u8, u8) {
     match (kind, dark) {
         (BarAccent::Green, true) => (0x7e, 0xe7, 0x87),

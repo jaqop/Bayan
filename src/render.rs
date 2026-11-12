@@ -2855,6 +2855,16 @@ impl Renderer {
         }
     }
 
+    /// A mark on the tab bar. Starts from the theme accent (the system
+    /// accent under High Contrast) and moves until it clears `minimum`
+    /// against the bar this frame paints. Caption text wants 4.5; a
+    /// non-text mark wants 3. The light amber `#9a5f00` is only 3.06:1
+    /// on that bar.
+    fn ink_on_bar(&self, theme: (u8, u8, u8), minimum: f32) -> (u8, u8, u8) {
+        let bar = self.window_fill(chrome_bar_bg(self.bg));
+        crate::a11y::ensure_contrast(self.accent_color(theme), bar, minimum)
+    }
+
     fn muted_color(&self, theme: (u8, u8, u8)) -> (u8, u8, u8) {
         if self.high_contrast {
             self.chrome.muted
@@ -7377,10 +7387,10 @@ impl Renderer {
             if let Some(p) = tab.progress.filter(|_| tw >= 28) {
                 let (bx, bw, by, bh) = (tx + 6, tabw - 12, oy - 3, 3);
                 let c = if p.state == crate::term::ProgressState::Paused {
-                    self.accent_color(crate::theme::bar_accent(
-                        crate::theme::BarAccent::Amber,
-                        page_dark,
-                    ))
+                    self.ink_on_bar(
+                        crate::theme::bar_accent(crate::theme::BarAccent::Amber, page_dark),
+                        3.0,
+                    )
                 } else {
                     progress_color(p)
                 };
@@ -7402,10 +7412,10 @@ impl Renderer {
             self.draw_title_tip(out, whole, width, tx, &full);
         }
 
-        let elevated_color = self.accent_color(crate::theme::bar_accent(
-            crate::theme::BarAccent::Amber,
-            page_dark,
-        ));
+        let elevated_color = self.ink_on_bar(
+            crate::theme::bar_accent(crate::theme::BarAccent::Amber, page_dark),
+            crate::a11y::MIN_CELL_CONTRAST,
+        );
         let elevated_w = elevated_label
             .map(|text| {
                 let segs = [Seg::plain(text, elevated_color)];
@@ -10476,41 +10486,60 @@ mod cache_tests {
         colors
     }
 
+    /// Light page, dark page, and High Contrast on a light window whose
+    /// hot accent does not yet clear the bar.
+    fn bar_cases() -> [(&'static str, bool, (u8, u8, u8)); 3] {
+        [
+            ("light", false, (0, 0, 128)),
+            ("dark", false, (0, 0, 128)),
+            ("light", true, (255, 220, 80)),
+        ]
+    }
+
+    fn renderer_for_bar(theme: &str, high_contrast: bool, hotlight: (u8, u8, u8)) -> Renderer {
+        let cfg = crate::config::UserConfig {
+            theme: Some(theme.into()),
+            ..crate::config::UserConfig::default()
+        };
+        let colors = crate::a11y::SystemColors {
+            window: (255, 255, 255),
+            window_text: (0, 0, 0),
+            hotlight,
+            ..crate::a11y::A11ySnapshot::neutral().colors
+        };
+        Renderer::with_a11y(
+            1.0,
+            &cfg,
+            0.0,
+            crate::a11y::A11ySnapshot {
+                high_contrast,
+                colors,
+                text_scale: 1.0,
+            },
+        )
+    }
+
     #[test]
     fn elevated_badge_keeps_contrast_on_light_dark_and_high_contrast() {
         let label = "مسؤول";
-        let cases = [
-            (None, false, (255, 255, 255)),
-            (None, true, (0x0d, 0x11, 0x17)),
-            (Some((0, 0, 128)), false, (255, 255, 255)),
-        ];
-        for (hotlight, _dark_page, bg) in cases {
-            let cfg = crate::config::UserConfig {
-                bg: Some(format!("#{:02x}{:02x}{:02x}", bg.0, bg.1, bg.2)),
-                ..crate::config::UserConfig::default()
-            };
-            let high_contrast = hotlight.is_some();
-            let mut colors = crate::a11y::A11ySnapshot::neutral().colors;
-            colors.window = (255, 255, 255);
-            colors.window_text = (0, 0, 0);
-            if let Some(hot) = hotlight {
-                colors.hotlight = hot;
-            }
-            let mut r = Renderer::with_a11y(
-                1.0,
-                &cfg,
-                0.0,
-                crate::a11y::A11ySnapshot {
-                    high_contrast,
-                    colors,
-                    text_scale: 1.0,
-                },
-            );
+        for (theme, high_contrast, hotlight) in bar_cases() {
+            let mut r = renderer_for_bar(theme, high_contrast, hotlight);
             let page_dark = crate::theme::title_bar_dark_for(r.bg);
-            let expected = r.accent_color(crate::theme::bar_accent(
+            let bar = r.window_fill(chrome_bar_bg(r.bg));
+            let raw = r.accent_color(crate::theme::bar_accent(
                 crate::theme::BarAccent::Amber,
                 page_dark,
             ));
+            let expected = crate::a11y::ensure_contrast(raw, bar, crate::a11y::MIN_CELL_CONTRAST);
+            if !high_contrast && !page_dark {
+                assert_ne!(bar, (255, 255, 255), "light contrast is against the bar");
+            }
+            if !page_dark {
+                assert!(
+                    crate::a11y::contrast_ratio(raw, bar) < crate::a11y::MIN_CELL_CONTRAST,
+                    "unadjusted {raw:?} already clears the bar {bar:?}; the test is aimed at the wrong surface"
+                );
+            }
             let mut out = Vec::new();
             r.use_ui_metrics(true);
             r.draw_chrome(
@@ -10537,30 +10566,22 @@ mod cache_tests {
                 found.iter().all(|c| *c == expected),
                 "measure and draw diverged: {found:?} expected {expected:?}"
             );
+            for c in &found {
+                let ratio = crate::a11y::contrast_ratio(*c, bar);
+                assert!(
+                    ratio >= crate::a11y::MIN_CELL_CONTRAST,
+                    "{c:?} on the bar {bar:?} is {ratio}"
+                );
+            }
             if !page_dark || high_contrast {
                 assert_ne!(
-                    expected,
+                    found[0],
                     (0xf2, 0xcc, 0x60),
                     "light or HC kept the hard-coded amber"
                 );
             }
-            let surface = if high_contrast {
-                colors.window
-            } else if page_dark {
-                chrome_bar_bg(r.bg)
-            } else {
-                (255, 255, 255)
-            };
-            assert!(
-                crate::a11y::contrast_ratio(expected, surface) >= 4.5,
-                "{expected:?} on {surface:?} is {}",
-                crate::a11y::contrast_ratio(expected, surface)
-            );
             let _ = out;
         }
-        // The dark page still uses the bright amber, which clears 4.5 on the dark bar.
-        let dark = crate::theme::bar_accent(crate::theme::BarAccent::Amber, true);
-        assert_eq!(dark, (0xf2, 0xcc, 0x60));
     }
 
     #[test]
@@ -10587,45 +10608,59 @@ mod cache_tests {
     }
 
     #[test]
-    fn paused_progress_bar_clears_three_to_one_on_white() {
-        let cfg = crate::config::UserConfig {
-            bg: Some("#ffffff".into()),
-            ..crate::config::UserConfig::default()
-        };
-        let mut r = Renderer::with_a11y(1.0, &cfg, 0.0, crate::a11y::A11ySnapshot::neutral());
-        let expected = r.accent_color(crate::theme::bar_accent(
-            crate::theme::BarAccent::Amber,
-            false,
-        ));
-        assert!(
-            crate::a11y::contrast_ratio(expected, (255, 255, 255)) >= 3.0,
-            "paused progress {expected:?} is under 3:1 on white"
-        );
-        assert_ne!(expected, (0xf2, 0xcc, 0x60));
-        let mut out = Vec::new();
-        r.use_ui_metrics(true);
-        r.draw_chrome(
-            &mut out,
-            1200,
-            600,
-            &[TabInfo {
-                title: "عمل".into(),
-                busy: false,
-                attention: false,
-                active: true,
-                progress: Some(crate::term::Progress {
-                    state: crate::term::ProgressState::Paused,
-                    percent: 40,
-                }),
-            }],
-            None,
-            false,
-            None,
-        );
-        assert!(
-            quad_has(&out, expected),
-            "the paused progress bar was not drawn in the readable amber"
-        );
+    fn paused_progress_bar_clears_three_to_one_on_the_bar() {
+        for (theme, high_contrast, hotlight) in bar_cases() {
+            let mut r = renderer_for_bar(theme, high_contrast, hotlight);
+            let page_dark = crate::theme::title_bar_dark_for(r.bg);
+            let bar = r.window_fill(chrome_bar_bg(r.bg));
+            let raw = r.accent_color(crate::theme::bar_accent(
+                crate::theme::BarAccent::Amber,
+                page_dark,
+            ));
+            let expected = crate::a11y::ensure_contrast(raw, bar, 3.0);
+            if !high_contrast && !page_dark {
+                assert_ne!(bar, (255, 255, 255), "progress contrast is against the bar");
+                assert!(
+                    crate::a11y::contrast_ratio((0xf2, 0xcc, 0x60), bar) < 3.0,
+                    "the old amber already clears the bar; the test is aimed at the wrong surface"
+                );
+            }
+            if high_contrast {
+                assert!(
+                    crate::a11y::contrast_ratio(raw, bar) < 3.0,
+                    "HC accent {raw:?} already clears the bar {bar:?}"
+                );
+            }
+            let ratio = crate::a11y::contrast_ratio(expected, bar);
+            assert!(
+                ratio >= 3.0,
+                "paused progress {expected:?} on the bar {bar:?} is {ratio}"
+            );
+            let mut out = Vec::new();
+            r.use_ui_metrics(true);
+            r.draw_chrome(
+                &mut out,
+                1200,
+                600,
+                &[TabInfo {
+                    title: "عمل".into(),
+                    busy: false,
+                    attention: false,
+                    active: true,
+                    progress: Some(crate::term::Progress {
+                        state: crate::term::ProgressState::Paused,
+                        percent: 40,
+                    }),
+                }],
+                None,
+                false,
+                None,
+            );
+            assert!(
+                quad_has(&out, expected),
+                "paused progress painted something other than {expected:?} on {bar:?}"
+            );
+        }
     }
 
     /// M20: cosmic-text 0.19 shapes through harfrust with default OpenType
