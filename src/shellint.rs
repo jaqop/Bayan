@@ -116,10 +116,10 @@ fn bash_plan(args: &[String], elevated: bool, mut env: Vec<(String, String)>) ->
     }
     let mut bash_argv = bash_args(args, "@file:bash.sh");
     if elevated && !bash_argv.iter().any(|a| a == "--noprofile") {
-        // `--login` is already gone. `--noprofile` also stops a bash that
-        // still treats itself as a login shell from reading /etc/profile
-        // before the rcfile.
-        bash_argv.push("--noprofile".to_string());
+        // Long options have to precede the first short option. bash
+        // rejects `--noprofile` after `-i` (`--: invalid option`, exit 2)
+        // and the pane never reaches a prompt.
+        bash_argv.insert(0, "--noprofile".into());
     }
     let mut files = vec![("bash.sh".into(), bash_rc(login, user, elevated))];
     let mut path_env = Vec::new();
@@ -173,8 +173,11 @@ fn wsl_plan(args: &[String], elevated: bool, mut env: Vec<(String, String)>) -> 
     launch.push(wsl_launcher());
     // WSL's own interactive start is a login shell. The rcfile imitates
     // that, because `-e` would otherwise skip `/etc/profile`. Elevated
-    // reads `/etc/profile` with HOME pointed at the rcfile directory, so a
-    // profile snippet cannot run a file from the user's home.
+    // reads that profile with HOME pointed at the rcfile directory.
+    // Inherited completion variables are cleared first: WSLENV can carry
+    // them from the user's environment. After HOME is restored,
+    // BASH_COMPLETION_USER_DIR stays on the integration directory so Tab
+    // does not source the user's completions.
     let source_user = !elevated;
     if elevated {
         push_safe_readline(&mut env);
@@ -413,15 +416,28 @@ const BASH_SYSTEM_PROFILE_SAFE_HOME: &str = r#"
 # WSL elevated login. The distro's /etc/profile is not user-writable, but a
 # snippet in it can name a file under $HOME. HOME is this rcfile's directory
 # for that read (the protected integration directory), then restored.
+# WSLENV can carry the user's completion directories into this process.
+# Clear them before the profile, or bash-completion sources those files.
+unset XDG_DATA_HOME
+unset XDG_DATA_DIRS
+unset XDG_CONFIG_HOME
+unset BASH_COMPLETION_USER_FILE
+unset BASH_COMPLETION_COMPAT_DIR
+unset BASH_COMPLETION_USER_DIR
 __bayan_real_home=$HOME
-HOME=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+__bayan_safe=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+__bayan_completion_dir=$__bayan_safe/bash-completion
+HOME=$__bayan_safe
 export HOME
 if [ -r /etc/profile ]; then
   . /etc/profile
 fi
 HOME=$__bayan_real_home
 export HOME
-unset __bayan_real_home
+unset __bayan_real_home __bayan_safe
+BASH_COMPLETION_USER_DIR=$__bayan_completion_dir
+readonly BASH_COMPLETION_USER_DIR
+unset __bayan_completion_dir
 "#;
 
 const BASH_ELEVATED_ENV: &str = r#"
@@ -431,59 +447,33 @@ const BASH_ELEVATED_ENV: &str = r#"
 # the same script for a non-login shell, and bash reads it before this
 # file, so HOME was an empty directory beside this file until now (it is
 # restored below). PATH and MSYSTEM come from this bash's own install.
-# A launcher that already chose MSYSTEM is kept.
-__bayan_bash=${BASH:-$(command -v bash 2>/dev/null)}
-case "$__bayan_bash" in
-  [A-Za-z]:*)
-    if command -v cygpath >/dev/null 2>&1; then
-      __bayan_bash=$(cygpath -u -- "$__bayan_bash" 2>/dev/null) || true
-    fi
-    ;;
-esac
-__bayan_bin=$(CDPATH= cd -- "$(dirname -- "$__bayan_bash")" && pwd) || __bayan_bin=
-__bayan_root=
-case "$__bayan_bin" in
-  */usr/bin)
-    __bayan_root=$(CDPATH= cd -- "$__bayan_bin/../.." && pwd) || __bayan_root=
-    ;;
-  ?*)
-    __bayan_root=$(CDPATH= cd -- "$__bayan_bin/.." && pwd) || __bayan_root=
-    ;;
-esac
+# A launcher that already chose MSYSTEM is kept. Paths are the MSYS
+# root (/), not a converted Windows path: //c/... is a network path and
+# [ -d ] waits on it. Git for Windows 2.56 has /ucrt64 and no /mingw64.
 if [ -z "${MSYSTEM:-}" ]; then
-  if [ -n "$__bayan_root" ] && [ -d "$__bayan_root/mingw64/bin" ]; then
+  if [ -d /ucrt64/bin ]; then
+    MSYSTEM=UCRT64
+  elif [ -d /mingw64/bin ]; then
     MSYSTEM=MINGW64
+  elif [ -d /clangarm64/bin ]; then
+    MSYSTEM=CLANGARM64
+  elif [ -d /mingw32/bin ]; then
+    MSYSTEM=MINGW32
+  elif [ -d /clang64/bin ]; then
+    MSYSTEM=CLANG64
   else
     MSYSTEM=MSYS
   fi
 fi
-# `$root/usr/bin` is `//usr/bin` when the install root is `/`, and MSYS
-# treats a leading `//` as a network path. Drop that extra slash.
-__bayan_slash() {
-  case "$1" in
-    //*) printf '%s\n' "${1#/}" ;;
-    *) printf '%s\n' "$1" ;;
-  esac
-}
-__bayan_prefix=
 case "$MSYSTEM" in
-  MINGW32) __bayan_prefix=$(__bayan_slash "$__bayan_root/mingw32") ;;
-  MINGW64) __bayan_prefix=$(__bayan_slash "$__bayan_root/mingw64") ;;
-  CLANGARM64) __bayan_prefix=$(__bayan_slash "$__bayan_root/clangarm64") ;;
-  CLANG64) __bayan_prefix=$(__bayan_slash "$__bayan_root/clang64") ;;
-  UCRT64) __bayan_prefix=$(__bayan_slash "$__bayan_root/ucrt64") ;;
+  MINGW32) PATH="/mingw32/bin:/usr/bin${PATH:+:$PATH}" ;;
+  MINGW64) PATH="/mingw64/bin:/usr/bin${PATH:+:$PATH}" ;;
+  CLANGARM64) PATH="/clangarm64/bin:/usr/bin${PATH:+:$PATH}" ;;
+  CLANG64) PATH="/clang64/bin:/usr/bin${PATH:+:$PATH}" ;;
+  UCRT64) PATH="/ucrt64/bin:/usr/bin${PATH:+:$PATH}" ;;
+  *) PATH="/usr/bin${PATH:+:$PATH}" ;;
 esac
-__bayan_usr=$(__bayan_slash "$__bayan_root/usr/bin")
-if [ -n "$__bayan_prefix" ] && [ -d "$__bayan_prefix/bin" ]; then
-  PATH="$__bayan_prefix/bin:$__bayan_usr${PATH:+:$PATH}"
-elif [ -n "$__bayan_root" ] && [ -d "$__bayan_usr" ]; then
-  PATH="$__bayan_usr${PATH:+:$PATH}"
-elif [ -n "$__bayan_bin" ]; then
-  PATH="$__bayan_bin${PATH:+:$PATH}"
-fi
 export MSYSTEM PATH
-unset __bayan_bash __bayan_bin __bayan_root __bayan_prefix __bayan_usr
-unset -f __bayan_slash
 # The user's home again: the HOME the launcher saved, else the profile
 # folder. A Windows path is converted now that cygpath is on PATH. If
 # neither is usable HOME stays on the empty directory.
@@ -503,6 +493,18 @@ if [ -n "$__bayan_home" ] && [ -d "$__bayan_home" ]; then
   export HOME
 fi
 unset __bayan_home
+# Tab completion must not follow HOME back to the user's files. The
+# directory is this rcfile's folder; do not cd there (a Windows path can
+# look like a network share).
+__bayan_here="${BASH_SOURCE[0]}"
+__bayan_here="${__bayan_here//\\//}"
+__bayan_completion_dir="${__bayan_here%/*}/bash-completion"
+unset __bayan_here
+unset BASH_COMPLETION_USER_DIR
+unset XDG_DATA_HOME
+BASH_COMPLETION_USER_DIR=$__bayan_completion_dir
+readonly BASH_COMPLETION_USER_DIR
+unset __bayan_completion_dir
 "#;
 
 const BASH_USER_PROFILE: &str = r#"
@@ -1786,11 +1788,21 @@ mod tests {
             !rc.contains(". /etc/profile"),
             "elevated Git Bash must not source /etc/profile: {rc}"
         );
+        assert!(rc.contains("MSYSTEM=UCRT64"), "{rc}");
         assert!(rc.contains("MSYSTEM=MINGW64"), "{rc}");
-        assert!(rc.contains("/mingw64"), "{rc}");
+        let ucrt = rc.find("MSYSTEM=UCRT64").unwrap();
+        let mingw = rc.find("MSYSTEM=MINGW64").unwrap();
+        assert!(ucrt < mingw, "ucrt64 is preferred over mingw64: {rc}");
+        let noprofile = plan
+            .args
+            .iter()
+            .position(|a| a == "--noprofile")
+            .expect("--noprofile");
+        let interactive = plan.args.iter().position(|a| a == "-i").expect("-i");
         assert!(
-            plan.args.iter().any(|a| a == "--noprofile"),
-            "elevated bash must not be a profile login"
+            noprofile < interactive,
+            "long options must precede -i, got {:?}",
+            plan.args
         );
         assert!(!rc.contains(".bashrc"), "{rc}");
         // The system-wide startup file runs before the rcfile, with HOME on
@@ -2303,16 +2315,77 @@ mod tests {
             !rc.contains(". /etc/profile"),
             "elevated Git Bash must not source /etc/profile: {rc}"
         );
-        let msystem = rc.find("MSYSTEM=MINGW64").expect("MSYSTEM is set");
-        let prefix = rc.find("/mingw64").expect("mingw64 is on PATH");
+        let msystem = rc.find("MSYSTEM=UCRT64").expect("MSYSTEM is set");
+        let prefix = rc.find("/ucrt64/bin").expect("ucrt64 bin is on PATH");
         let hooks = rc.find("printf '\\033]133;D;%s;%s\\007'").unwrap();
         assert!(msystem < hooks && prefix < hooks, "{rc}");
-        // WSL elevated still reads the distro profile, with HOME moved first.
-        let wsl = bash_rc(true, false, false);
-        let moved = wsl.find("__bayan_real_home=$HOME").unwrap();
-        let sourced = wsl.find(". /etc/profile").unwrap();
-        let restored = wsl.find("HOME=$__bayan_real_home").unwrap();
-        assert!(moved < sourced && sourced < restored, "{wsl}");
+    }
+
+    #[test]
+    fn elevated_git_bash_keeps_the_system_prompt() {
+        assert!(
+            !BASH_ELEVATED_ENV.contains("PS1="),
+            "elevated Git Bash must keep the prompt Git already set:\n{BASH_ELEVATED_ENV}"
+        );
+    }
+
+    #[test]
+    fn elevated_wsl_moves_home_before_reading_the_profile() {
+        let plan = plan(r"C:\Windows\System32\wsl.exe -d Ubuntu", true, true, NONCE).unwrap();
+        let wsl = file(&plan, "bash.sh");
+        let saved = wsl.find("__bayan_real_home=$HOME").expect("save HOME");
+        let safe = wsl
+            .find("__bayan_safe=$(CDPATH=")
+            .expect("rcfile directory");
+        let moved = wsl.find("HOME=$__bayan_safe").expect("HOME moves");
+        let sourced = wsl.find(". /etc/profile").expect("profile");
+        let restored = wsl
+            .find("HOME=$__bayan_real_home")
+            .expect("HOME comes back");
+        assert!(
+            saved < safe && safe < moved && moved < sourced && sourced < restored,
+            "{wsl}"
+        );
+    }
+
+    #[test]
+    fn elevated_wsl_clears_inherited_completion_paths() {
+        let plan = plan(r"C:\Windows\System32\wsl.exe -d Ubuntu", true, true, NONCE).unwrap();
+        let wsl = file(&plan, "bash.sh");
+        let sourced = wsl.find(". /etc/profile").expect("profile");
+        for var in [
+            "unset XDG_DATA_DIRS",
+            "unset XDG_CONFIG_HOME",
+            "unset BASH_COMPLETION_USER_FILE",
+            "unset BASH_COMPLETION_COMPAT_DIR",
+        ] {
+            let at = wsl.find(var).unwrap_or_else(|| panic!("missing {var}"));
+            assert!(
+                at < sourced,
+                "{var} must be cleared before the profile:\n{wsl}"
+            );
+        }
+    }
+
+    #[test]
+    fn elevated_completion_user_dir_is_the_integration_directory() {
+        let git_plan = plan(bash_git(), true, true, NONCE).unwrap();
+        let wsl_plan = plan(r"C:\Windows\System32\wsl.exe -d Ubuntu", true, true, NONCE).unwrap();
+        let git = file(&git_plan, "bash.sh");
+        let wsl = file(&wsl_plan, "bash.sh");
+        for (name, rc) in [("git", git), ("wsl", wsl)] {
+            assert!(
+                rc.contains("BASH_COMPLETION_USER_DIR=$__bayan_completion_dir"),
+                "{name}"
+            );
+            assert!(rc.contains("readonly BASH_COMPLETION_USER_DIR"), "{name}");
+            assert!(!rc.contains("BASH_COMPLETION_USER_DIR=$HOME"), "{name}");
+        }
+        assert!(
+            git.contains(r#"__bayan_completion_dir="${__bayan_here%/*}/bash-completion""#),
+            "{git}"
+        );
+        assert!(wsl.contains("__bayan_completion_dir=$__bayan_safe/bash-completion"));
     }
 
     #[test]
@@ -2376,25 +2449,44 @@ mod tests {
             format!("echo completion > '{marker_bash}'\n"),
         )
         .unwrap();
-        let rc_path = safe.join("bash.sh");
-        std::fs::write(&rc_path, bash_rc(true, false, true)).unwrap();
-        let mut child = std::process::Command::new(&bash)
-            .arg("--noprofile")
-            .arg("--rcfile")
-            .arg(&rc_path)
-            .arg("-i")
+        let planned = plan(bash_git(), true, true, NONCE).unwrap();
+        for (rel, body) in &planned.files {
+            let path = safe.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            // The product keeps Git's prompt (cwd, branch, window title).
+            // This test has no console, and git.exe in that prompt waits.
+            // Only this copy is plain.
+            let body = if rel == "bash.sh" {
+                body.replace("export MSYSTEM PATH\n", "export MSYSTEM PATH\nPS1='$ '\n")
+            } else {
+                body.clone()
+            };
+            std::fs::write(path, body).unwrap();
+        }
+        let mut child = std::process::Command::new(&bash);
+        for arg in &planned.args {
+            if let Some(rel) = arg.strip_prefix("@file:") {
+                child.arg(safe.join(rel));
+            } else {
+                child.arg(arg);
+            }
+        }
+        for (key, value) in &planned.env {
+            child.env(key, value);
+        }
+        child
             .env("HOME", &empty_home)
             .env(REAL_HOME_ENV, &home)
             .env("USERPROFILE", &home)
             .env("BAYAN_PROMPT_NONCE", "n0nce")
-            .env("INPUTRC", "/dev/null")
-            .env("HISTFILE", "/dev/null")
             .env_remove("BASH_ENV")
+            .env_remove("MSYSTEM")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn bash");
+            .stderr(std::process::Stdio::null());
+        let mut child = child.spawn().expect("spawn bash");
         let mut stdout = child.stdout.take().unwrap();
         let reader = std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -2403,40 +2495,58 @@ mod tests {
         });
         let mut stdin = child.stdin.take().unwrap();
         use std::io::Write;
-        writeln!(stdin, "printf 'MSYSTEM=%s\\n' \"$MSYSTEM\"").unwrap();
-        writeln!(stdin, "printf 'AFTER=%s\\n' \"$HOME\"").unwrap();
-        writeln!(
+        let _ = writeln!(stdin, "printf 'MSYSTEM=%s\\n' \"$MSYSTEM\"");
+        let _ = writeln!(stdin, "printf 'AFTER=%s\\n' \"$HOME\"");
+        let _ = writeln!(
             stdin,
             "command -v ls >/dev/null && printf 'LS=ok\\n' || printf 'LS=missing\\n'"
-        )
-        .unwrap();
-        writeln!(stdin, "exit").unwrap();
+        );
+        let _ = writeln!(stdin, "exit");
         drop(stdin);
         let start = std::time::Instant::now();
-        loop {
-            if child.try_wait().ok().flatten().is_some() {
-                break;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait") {
+                break status;
             }
             if start.elapsed() > std::time::Duration::from_secs(20) {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("bash did not exit");
+                let output = reader.join().unwrap_or_default();
+                let text = String::from_utf8_lossy(&output);
+                panic!("bash did not exit\n{text}");
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        };
         let output = reader.join().expect("stdout");
         let text = String::from_utf8_lossy(&output);
         let pwned = std::fs::read_to_string(&marker).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&safe);
         assert!(
+            status.success() && !text.contains("invalid option"),
+            "bash exited {status}: {text}"
+        );
+        assert!(
             pwned.is_empty(),
             "user git-prompt ran as the elevated shell: {pwned}\n{text}"
         );
-        assert!(
-            text.contains("MSYSTEM=MINGW") || text.contains("MSYSTEM=MSYS"),
-            "MSYSTEM was not set:\n{text}"
-        );
+        let bash_path = bash.to_string_lossy().to_ascii_lowercase();
+        if bash_path.contains("\\git\\") || bash_path.contains("/git/") {
+            assert!(
+                text.contains("MSYSTEM=UCRT")
+                    || text.contains("MSYSTEM=MINGW")
+                    || text.contains("MSYSTEM=CLANG"),
+                "Git install left MSYSTEM unset or MSYS:\n{text}"
+            );
+        } else {
+            assert!(
+                text.contains("MSYSTEM=UCRT")
+                    || text.contains("MSYSTEM=MINGW")
+                    || text.contains("MSYSTEM=CLANG")
+                    || text.contains("MSYSTEM=MSYS"),
+                "MSYSTEM was not set:\n{text}"
+            );
+        }
         assert!(text.contains("LS=ok"), "PATH has no ls:\n{text}");
         assert!(text.contains("AFTER="), "{text}");
         assert!(

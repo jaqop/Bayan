@@ -1098,12 +1098,18 @@ receives it: it would have to live in `PROMPT`, which every child
 inherits, so cmd's marks carry no nonce and are not trusted. An
 elevated token (Run as administrator) does not source user rc files, sets
 `INPUTRC` and `HISTFILE` to `/dev/null` so `~/.inputrc` cannot run a
-macro. Elevated Git Bash is started with `--noprofile` and does not read
-`/etc/profile`: that file runs `git-prompt.sh`, which executes
-`~/.config/git/git-prompt.sh` and `~/bash_completion.d/*.bash` as
-administrator. `PATH` and `MSYSTEM` are set from the Git install instead. Elevated WSL bash still reads the
-distro's `/etc/profile`, with `HOME` pointed at the rcfile directory for
-that read and restored afterwards. Elevated zsh ends `.zlogin` with
+macro. Elevated Git Bash is started with `--noprofile` before `-i` and
+does not read `/etc/profile`: that file runs `git-prompt.sh`, which
+executes `~/.config/git/git-prompt.sh` and `~/bash_completion.d/*.bash` as
+administrator. `HOME` is an empty directory in the integration folder
+until the rcfile restores it. `PATH` and `MSYSTEM` come from the Git
+install, preferring `/ucrt64` (Git for Windows 2.56) over `/mingw64`.
+Git's own prompt is kept. Elevated WSL bash still reads the distro's
+`/etc/profile`, with `HOME` pointed at the rcfile directory for that
+read. Inherited `XDG_DATA_DIRS`, `XDG_CONFIG_HOME`,
+`BASH_COMPLETION_USER_FILE` and `BASH_COMPLETION_COMPAT_DIR` are cleared
+first. After `HOME` returns, `BASH_COMPLETION_USER_DIR` stays on the
+integration directory so Tab does not source the user's completions. Elevated zsh ends `.zlogin` with
 `unsetopt rcs`, so exit does not read `~/.zlogout`. oh-my-posh is not inited from the user
 profile. A failed elevation query is treated as elevated. Elevated scripts
 are created under the real ProgramData folder
