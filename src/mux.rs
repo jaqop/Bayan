@@ -1746,10 +1746,15 @@ mod os {
     }
 
     fn connect_pipe() -> Result<File, String> {
-        let name = production_pipe_name()?;
-        let wide = wstr(&name);
+        open_and_verify(&production_pipe_name()?)
+    }
+
+    /// Open `name` and refuse it unless the owner and the server process
+    /// are the current user. This is the check `dial` runs.
+    fn open_and_verify(name: &str) -> Result<File, String> {
+        let wide = wstr(name);
         // SAFETY: `wide` is NUL-terminated and lives for the call. WaitNamedPipeW
-        // only reads the name.
+        // only reads the name. A miss is fine: CreateFileW reports it.
         unsafe {
             windows_sys::Win32::System::Pipes::WaitNamedPipeW(wide.as_ptr(), 200);
         }
@@ -1761,6 +1766,34 @@ mod os {
         let sid = current_user_sid()?;
         verify_server(&file, &sid)?;
         Ok(file)
+    }
+
+    /// Test hook: connect the listening instance. `ERROR_PIPE_CONNECTED`
+    /// means the client already attached, which is success.
+    #[cfg(test)]
+    pub(super) fn accept_one(file: &File) -> Result<(), String> {
+        use std::os::windows::io::AsRawHandle;
+        // SAFETY: `file` is the server end from CreateNamedPipeW. A null
+        // overlapped pointer is the synchronous connect.
+        let ok = unsafe {
+            windows_sys::Win32::System::Pipes::ConnectNamedPipe(
+                file.as_raw_handle() as _,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let err = last_error();
+            if err != 535 {
+                return Err(format!("ConnectNamedPipe failed ({err})"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Test hook: the same open the window uses, against a chosen name.
+    #[cfg(test)]
+    pub(super) fn dial_name(name: &str) -> Result<File, String> {
+        open_and_verify(name)
     }
 
     fn create_connected_pipe(first: bool) -> Result<File, String> {
@@ -2484,10 +2517,15 @@ mod tests {
             os::dacl_is_only(&pipe.file, &sid).expect("read the DACL"),
             "DACL must be one allow ACE for the token user and nobody else"
         );
-        assert!(
-            os::verify_server(&pipe.file, &sid).is_ok(),
-            "a pipe we created is owned by us"
-        );
+        let server = pipe.file.try_clone().expect("clone the server end");
+        let accept = std::thread::spawn(move || os::accept_one(&server));
+        let client = os::dial_name(&name).unwrap_or_else(|error| {
+            panic!("a pipe we created must pass the server check: {error}")
+        });
+        accept
+            .join()
+            .expect("accept thread")
+            .expect("ConnectNamedPipe");
         let mut foreign = sid.clone();
         let last = foreign.last_mut().unwrap();
         *last ^= 0xff;
@@ -2495,7 +2533,7 @@ mod tests {
             foreign.push(1);
         }
         assert!(
-            os::verify_server(&pipe.file, &foreign).is_err(),
+            os::verify_server(&client, &foreign).is_err(),
             "dial must refuse a pipe whose expected owner is not the client"
         );
     }
