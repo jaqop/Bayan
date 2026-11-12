@@ -2578,7 +2578,16 @@ mod tests {
             }
             // Bookends so a hang says whether the rcfile started.
             let mut marked = String::from("printf 'start\\n' >> \"$BAYAN_STAGE\"\n");
-            marked.push_str(body);
+            let body = body
+                .replace(
+                    "unset BAYAN_PROMPT_NONCE\n",
+                    "unset BAYAN_PROMPT_NONCE\nprintf 'nonce\\n' >> \"$BAYAN_STAGE\"\n",
+                )
+                .replace(
+                    "export MSYSTEM PATH\n",
+                    "export MSYSTEM PATH\nprintf 'path\\n' >> \"$BAYAN_STAGE\"\n",
+                );
+            marked.push_str(&body);
             marked.push_str("\nprintf 'end\\n' >> \"$BAYAN_STAGE\"\n");
             std::fs::write(path, marked).unwrap();
         }
