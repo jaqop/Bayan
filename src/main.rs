@@ -12,6 +12,7 @@ mod bidi_ctl;
 mod chrome;
 mod cli;
 mod config;
+mod config_watch;
 mod context_menu;
 mod copyclean;
 mod copymode;
@@ -463,6 +464,17 @@ pub enum UserEvent {
     LinkConfirm {
         path: String,
     },
+    /// `config.json` changed on disk (or failed to parse). Never a panel save.
+    ConfigReloaded(config_watch::ReloadMsg),
+}
+
+/// A one-line notice for a config reload. A parse error stays until the file
+/// is valid. A "takes effect later" line expires on its own. Neither blocks
+/// the terminal.
+#[derive(Clone)]
+struct ConfigNotice {
+    text: String,
+    until: Option<Instant>,
 }
 
 /// The link under the pointer. Stable while the pointer stays inside it,
@@ -1572,7 +1584,6 @@ struct App {
     /// Ctrl+wheel zoom, in points on top of the configured size.
     font_delta: f32,
     renderer_building: bool,
-    inflight_delta: f32,
     /// the last rectangle the window had while NOT maximized — what a
     /// maximized window restores down to, and what the session saves
     normal_geom: Option<WindowGeom>,
@@ -1601,6 +1612,114 @@ struct App {
     /// wakeup path can run without a real window.
     #[cfg(test)]
     test_content: Option<render::Rect>,
+    /// Watches config.json. A panel save tells it to ignore that write.
+    config_watch: config_watch::ConfigWatcher,
+    /// Which config the in-flight renderer build captured, and which one
+    /// the session wants. A reload during a build is finished when that
+    /// build lands.
+    config_build: config_watch::RendererSlot,
+    /// Parse error, or the list of settings that wait for a new pane.
+    config_notice: Option<ConfigNotice>,
+}
+
+/// What a reload does to the session. The watcher's plan is not kept:
+/// `plan` is `diff(live, merged)`.
+struct ReloadDecision {
+    config: config::UserConfig,
+    load_error: Option<String>,
+    plan: config_watch::ApplyPlan,
+    deferred: Vec<config_watch::DeferredSetting>,
+    /// Notice when the file overrode a value the open panel had edited.
+    replaced: Option<String>,
+}
+
+fn decide_reload(
+    live: &config::UserConfig,
+    panel_open: bool,
+    msg: config_watch::ReloadMsg,
+) -> ReloadDecision {
+    match msg {
+        config_watch::ReloadMsg::Rejected { error } => ReloadDecision {
+            config: live.clone(),
+            load_error: Some(error),
+            plan: config_watch::ApplyPlan::default(),
+            deferred: Vec::new(),
+            replaced: None,
+        },
+        config_watch::ReloadMsg::Applied { config, base, .. } => {
+            // File fields that moved since `base` win. Everything else stays
+            // as the panel left it. The plan is then live versus that merge,
+            // not live versus the raw file and not the watcher's disk diff.
+            let (merged, overrode) = config_watch::merge_reload(&base, live, &config);
+            let (plan, deferred) = plan_against_live(live, &merged);
+            let replaced = open_panel_file_notice(panel_open && overrode, live, &merged);
+            ReloadDecision {
+                config: merged,
+                load_error: None,
+                plan,
+                deferred,
+                replaced,
+            }
+        }
+    }
+}
+
+/// Bytes to write, or the load error that blocks the save. A missing file
+/// is not a load error: the caller can recreate config.json.
+fn save_bytes(load_error: &Option<String>, config: &config::UserConfig) -> Result<Vec<u8>, String> {
+    if let Some(error) = load_error {
+        return Err(error.clone());
+    }
+    config::encode(config).map_err(|error| error.to_string())
+}
+
+/// How an external reload meets an open settings panel.
+///
+/// `plan_against_live` is `diff(live, merged)`. It must stay that
+/// comparison: diffing the raw file against itself, or the live config
+/// against the raw file, either rebuilds a font the merge kept or skips
+/// a font the file actually changed.
+fn plan_against_live(
+    live: &config::UserConfig,
+    incoming: &config::UserConfig,
+) -> (config_watch::ApplyPlan, Vec<config_watch::DeferredSetting>) {
+    config_watch::diff(live, incoming)
+}
+
+/// Set when the open panel had edited a field and the file changed that
+/// same field to something else. The file's value is the one kept.
+fn open_panel_file_notice(
+    panel_open: bool,
+    live: &config::UserConfig,
+    incoming: &config::UserConfig,
+) -> Option<String> {
+    if panel_open && live != incoming {
+        Some(
+            tr(
+                "تغيّر ملف الإعدادات قيمة عدّلتها اللوحة، فصارت قيمة الملف هي المعتمدة.",
+                "The settings file changed a value the panel had edited, so the file's value is now in effect.",
+            )
+            .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+fn reload_notice(
+    replaced: Option<String>,
+    deferred: &[config_watch::DeferredSetting],
+) -> Option<ConfigNotice> {
+    let later = config_watch::deferred_notice(deferred);
+    let text = match (replaced, later) {
+        (Some(replaced), Some(later)) => format!("{replaced} {later}"),
+        (Some(text), None) | (None, Some(text)) => text,
+        (None, None) => return None,
+    };
+    Some(ConfigNotice {
+        text,
+        until: Some(Instant::now() + std::time::Duration::from_secs(8)),
+    })
 }
 
 impl App {
@@ -1617,6 +1736,10 @@ impl App {
         start_dir: Option<String>,
     ) -> Self {
         let keymap = keybinds::effective_map(&config);
+        // no thread and no file: `run` swaps in the real watcher, and a
+        // test never watches `~/.bayan`
+        let config_watch = config_watch::ConfigWatcher::idle(config.clone());
+        let config_build = config_watch::RendererSlot::new(config.clone());
         Self {
             posh: None,
             last_toast: None,
@@ -1680,7 +1803,6 @@ impl App {
             atlas_generation: 0,
             font_delta: 0.0,
             renderer_building: false,
-            inflight_delta: 0.0,
             normal_geom: None,
             keys_held_away: Vec::new(),
             debug_paste: None,
@@ -1690,6 +1812,9 @@ impl App {
             elevated: false,
             #[cfg(test)]
             test_content: None,
+            config_watch,
+            config_build,
+            config_notice: None,
         }
     }
 
@@ -1700,18 +1825,22 @@ impl App {
     }
 
     /// (Re)build the renderer off-thread for the current scale, config and
-    /// zoom. Debounced: one build in flight; a stale result triggers another.
+    /// zoom. One build runs at a time. A newer config that arrives while
+    /// it runs is kept by `config_build` and started from `RendererReady`.
     fn rebuild_renderer(&mut self) {
         scroll::apply_font_change(&mut self.smooth);
+        self.config_build.note_wanted(&self.config);
         if self.renderer_building {
             return;
         }
         let Some(w) = &self.window else { return };
+        if !self.config_build.try_begin(self.font_delta) {
+            return;
+        }
         self.renderer_building = true;
-        self.inflight_delta = self.font_delta;
         let proxy = self.proxy.clone();
         let scale = w.scale_factor() as f32;
-        let cfg = self.config.clone();
+        let cfg = self.config_build.snapshot().clone();
         let delta = self.font_delta;
         std::thread::spawn(move || {
             let r = render::Renderer::new(scale, &cfg, delta);
@@ -2668,16 +2797,74 @@ impl App {
             );
             return;
         }
-        if self.config_load_error.is_some() {
-            self.report_config_load_error();
-            return;
-        }
-        if let Err(error) = config::save(&self.config) {
+        let bytes = match save_bytes(&self.config_load_error, &self.config) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if self.config_load_error.is_some() {
+                    self.report_config_load_error();
+                } else {
+                    self.report_error(tr("تعذر حفظ الإعدادات", "Could not save settings"), &error);
+                }
+                return;
+            }
+        };
+        // Arm the watcher before the rename, so the event that rename
+        // produces is recognized as ours and not loaded back.
+        self.config_watch.note_self_write(&bytes);
+        if let Err(error) = config::write_bytes(&bytes) {
+            self.config_watch.finish_self_write(false);
             self.report_error(
                 tr("تعذر حفظ الإعدادات", "Could not save settings"),
                 &error.to_string(),
             );
+        } else {
+            self.config_watch.finish_self_write(true);
         }
+    }
+
+    /// Apply a config.json change that did not come from the settings panel.
+    ///
+    /// Fields the file changed since the last load take the file's value.
+    /// Every other field keeps the live panel value. The plan is
+    /// `diff(live, merged)` via [`decide_reload`]. A bad file leaves
+    /// `self.config` as it was. Font and color changes rebuild the renderer;
+    /// when that renderer arrives, `relayout_active` resizes every PTY.
+    /// Padding alone resizes with the metrics already on screen.
+    fn apply_config_reload(&mut self, msg: config_watch::ReloadMsg) {
+        let decision = decide_reload(&self.config, self.settings.is_some(), msg);
+        if let Some(error) = decision.load_error {
+            self.config_load_error = Some(error.clone());
+            self.config_notice = Some(ConfigNotice {
+                text: config_watch::parse_error_notice(&error),
+                until: None,
+            });
+            self.request_redraw();
+            return;
+        }
+        self.config_load_error = None;
+        let language = decision.plan.language && decision.config.lang() != self.config.lang();
+        // the bar's side and width decide the gutter, so the grid moves
+        let bar_moved = decision.config.scrollbar != self.config.scrollbar;
+        self.config = decision.config;
+        // published once at startup; a reload has to publish it again
+        term::set_osc52_read(self.config.osc52_read_enabled());
+        if language {
+            lang::set(self.config.lang());
+        }
+        if decision.plan.keybinds {
+            self.keymap = keybinds::effective_map(&self.config);
+        }
+        if decision.plan.opacity {
+            self.apply_opacity();
+        }
+        let rebuild = decision.plan.font || decision.plan.colors;
+        if rebuild {
+            self.rebuild_renderer();
+        } else if decision.plan.padding || decision.plan.hide_bar || bar_moved {
+            self.relayout_active();
+        }
+        self.config_notice = reload_notice(decision.replaced, &decision.deferred);
+        self.request_redraw();
     }
 
     fn report_config_load_error(&mut self) {
@@ -2686,8 +2873,8 @@ impl App {
                 "{}\n{}",
                 error,
                 tr(
-                    "أصلح ملف config.json ثم أعد تشغيل بيان لحفظ الإعدادات.",
-                    "Fix config.json and restart Bayan to save settings.",
+                    "أصلح ملف config.json. بيان يُبقي آخر إعدادات سليمة ويعيد التحميل عند إصلاح الملف.",
+                    "Fix config.json. Bayan is keeping the last good settings and will reload when the file is valid.",
                 )
             );
             self.report_error(
@@ -5162,6 +5349,7 @@ impl App {
                 progress: t.progress(),
             })
             .collect();
+        let config_notice = self.config_notice.clone();
         let Some(window) = self.window.as_ref() else {
             return;
         };
@@ -5473,6 +5661,17 @@ impl App {
             }
             // renderer still warming up on its thread: clear-only dark frame
             _ => {}
+        }
+        if let (Some(notice), Some(renderer)) = (&config_notice, self.renderer.as_mut()) {
+            renderer.use_ui_metrics(true);
+            renderer.draw_config_notice(
+                &mut verts,
+                px.width as i32,
+                px.height as i32,
+                &notice.text,
+                notice.until.is_none(),
+            );
+            renderer.use_ui_metrics(false);
         }
         // the IME candidate window sits at the focused cursor. After the
         // IME context is rebuilt the same box has to be sent again.
@@ -5876,8 +6075,10 @@ impl ApplicationHandler<UserEvent> for App {
                 self.renderer_building = false;
                 // now that cell metrics exist, snap every pane to its rect
                 self.relayout_active();
-                // the zoom moved again while this build ran: chase it
-                if (self.font_delta - self.inflight_delta).abs() > f32::EPSILON {
+                // A reload or a zoom that arrived while this build ran is
+                // not in the renderer we just installed. Start the next one
+                // from the config the session wants now.
+                if self.config_build.finish(self.font_delta) {
                     self.rebuild_renderer();
                 }
                 if let Some(text) = self.debug_paste.take() {
@@ -5938,6 +6139,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.clear_link_hover();
                 self.request_redraw();
             }
+            UserEvent::ConfigReloaded(msg) => self.apply_config_reload(msg),
         }
     }
 
@@ -5998,6 +6200,14 @@ impl ApplicationHandler<UserEvent> for App {
         }
         if let Some(t) = tick.wake {
             wake = Some(wake.map_or(t, |w| w.min(t)));
+        }
+        if let Some(until) = self.config_notice.as_ref().and_then(|notice| notice.until) {
+            if Instant::now() >= until {
+                self.config_notice = None;
+                self.request_redraw();
+            } else {
+                wake = Some(wake.map_or(until, |w| w.min(until)));
+            }
         }
         match wake {
             Some(t) => el.set_control_flow(ControlFlow::WaitUntil(t)),
@@ -6393,7 +6603,19 @@ fn run(startup: Startup) -> Result<(), String> {
         lang::set(lang::Lang::from_config(v.to_str()));
     }
     term::set_osc52_read(cfg.osc52_read_enabled());
+    let config_path = config::config_path();
+    let baseline_bytes = std::fs::read(&config_path).ok();
+    let reload_proxy = proxy.clone();
+    let config_watch = config_watch::spawn(
+        config_path,
+        cfg.clone(),
+        baseline_bytes.as_deref(),
+        move |msg| {
+            let _ = reload_proxy.send_event(UserEvent::ConfigReloaded(msg));
+        },
+    );
     let mut app = App::new(proxy, cfg, config_load_error, startup.directory);
+    app.config_watch = config_watch;
     app.shell_profiles = startup.shells.unwrap_or_default();
     app.shell_profiles_ready = shells_ready;
     app.start_profile_command = startup.profile_command;
@@ -6446,6 +6668,237 @@ fn osc52_pane_is_focused(tabs: &[(usize, &[u64])], active: usize, source: u64) -
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bayan-save-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn panel_cursor_survives_an_external_padding_edit() {
+        // The last loaded file has the default cursor. The open panel set
+        // the cursor to bar and has not saved. An external edit changes
+        // only padding. The cursor stays bar; padding comes from the file.
+        let base = config::UserConfig::default();
+        let disk = config::encode(&base).unwrap();
+        let from_editor = config::UserConfig {
+            padding: Some(16),
+            ..config::UserConfig::default()
+        };
+        let msg = config_watch::reload_from_bytes(
+            base.clone(),
+            &disk,
+            &config::encode(&from_editor).unwrap(),
+        )
+        .expect("padding edit reloads");
+        let config_watch::ReloadMsg::Applied {
+            base: loaded_base, ..
+        } = &msg
+        else {
+            panic!("padding edit parsed");
+        };
+        assert_eq!(
+            loaded_base.padding, None,
+            "the merge base is the previous file"
+        );
+        let live = config::UserConfig {
+            cursor_style: Some("bar".into()),
+            copy_on_select: Some(false),
+            ..config::UserConfig::default()
+        };
+        let decision = decide_reload(&live, true, msg);
+        assert_eq!(decision.config.cursor(), config::CursorStyle::Bar);
+        assert!(!decision.config.copy_on_select_on());
+        assert_eq!(decision.config.padding_px(), 16);
+        assert!(decision.plan.padding);
+        assert!(!decision.plan.cursor);
+        assert!(
+            decision.replaced.is_none(),
+            "the file did not touch the cursor, so it does not announce an override"
+        );
+        // The next reload's base is the file we just loaded, not the merge.
+        // A later file that still leaves the cursor unset keeps bar.
+        let again = config::UserConfig {
+            padding: Some(8),
+            ..from_editor.clone()
+        };
+        let second = config_watch::ReloadMsg::Applied {
+            config: Box::new(again),
+            base: Box::new(from_editor),
+            plan: config_watch::ApplyPlan::default(),
+            deferred: Vec::new(),
+        };
+        let decision = decide_reload(&decision.config, true, second);
+        assert_eq!(decision.config.cursor(), config::CursorStyle::Bar);
+        assert_eq!(decision.config.padding_px(), 8);
+    }
+
+    /// The panel and the file both changed the font. The file wins that
+    /// field. The panel's other unsaved edits stay.
+    #[test]
+    fn file_wins_when_the_panel_and_the_file_change_the_same_field() {
+        let base = config::UserConfig {
+            font_size: Some(14.0),
+            ..config::UserConfig::default()
+        };
+        let live = config::UserConfig {
+            font_size: Some(20.0),
+            cursor_style: Some("bar".into()),
+            ..base.clone()
+        };
+        let file = config::UserConfig {
+            font_size: Some(18.0),
+            ..base.clone()
+        };
+        let msg = config_watch::ReloadMsg::Applied {
+            config: Box::new(file),
+            base: Box::new(base),
+            plan: config_watch::ApplyPlan::default(),
+            deferred: Vec::new(),
+        };
+        let decision = decide_reload(&live, true, msg);
+        assert_eq!(
+            decision.config.font_size,
+            Some(18.0),
+            "the file's font wins the field both sides changed"
+        );
+        assert_eq!(decision.config.cursor(), config::CursorStyle::Bar);
+        assert!(decision.plan.font, "20 on screen versus 18 from the file");
+        assert!(decision.replaced.is_some());
+    }
+
+    /// `apply_config_reload` takes its plan from [`decide_reload`], which
+    /// diffs the live config against the merge. Comparing the raw file to
+    /// itself would drop the padding rebuild; comparing the live config to
+    /// the raw file would rebuild a font the merge kept.
+    #[test]
+    fn reload_plan_compares_the_live_config_with_the_merge() {
+        let base = config::UserConfig {
+            font_size: Some(14.0),
+            ..config::UserConfig::default()
+        };
+        let disk = config::encode(&base).unwrap();
+        let from_editor = config::UserConfig {
+            font_size: Some(14.0),
+            padding: Some(12),
+            ..config::UserConfig::default()
+        };
+        let msg =
+            config_watch::reload_from_bytes(base, &disk, &config::encode(&from_editor).unwrap())
+                .expect("padding edit reloads");
+        let config_watch::ReloadMsg::Applied {
+            plan: disk_plan,
+            config: file,
+            ..
+        } = &msg
+        else {
+            panic!("the external edit parsed");
+        };
+        assert!(!disk_plan.font);
+        assert!(disk_plan.padding);
+        let live = config::UserConfig {
+            font_size: Some(20.0),
+            ..config::UserConfig::default()
+        };
+        // The comparison this test guards. Dropping `live` (diffing the
+        // file with itself) makes padding false. Diffing `live` with the
+        // raw file makes font true.
+        let against_raw = plan_against_live(&live, file);
+        assert!(against_raw.0.font);
+        let decision = decide_reload(&live, false, msg);
+        assert_eq!(decision.config.font_size, Some(20.0));
+        assert_eq!(decision.config.padding_px(), 12);
+        assert!(
+            !decision.plan.font,
+            "the merge kept 20, which is already on screen"
+        );
+        assert!(decision.plan.padding);
+        assert!(decision.replaced.is_none());
+    }
+
+    #[test]
+    fn truncated_config_reload_blocks_saving() {
+        let current = config::UserConfig {
+            font_size: Some(22.0),
+            cursor_style: Some("bar".into()),
+            osc52: Some("copy".into()),
+            ..config::UserConfig::default()
+        };
+        let bytes = config::encode(&current).unwrap();
+        let msg = config_watch::reload_from_bytes(
+            current.clone(),
+            &bytes,
+            br#"{"font_size":99.0,"cursor_style":"underline""#,
+        )
+        .expect("a truncated file is a reload message");
+        let decision = decide_reload(&current, false, msg);
+        assert!(
+            decision.load_error.is_some(),
+            "truncated json is a load error"
+        );
+        assert_eq!(decision.config.font_size, Some(22.0));
+        assert_eq!(decision.config.cursor(), config::CursorStyle::Bar);
+        assert!(decision.config.osc52_copy_enabled());
+        assert!(save_bytes(&decision.load_error, &decision.config).is_err());
+        let dir = temp_dir("truncated");
+        let path = dir.join("config.json");
+        assert!(!path.exists(), "a blocked save must not create config.json");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_json_reload_blocks_saving() {
+        let current = config::UserConfig {
+            font_size: Some(22.0),
+            arabic_font: Some("Amiri".into()),
+            ..config::UserConfig::default()
+        };
+        let bytes = config::encode(&current).unwrap();
+        let msg = config_watch::reload_from_bytes(current.clone(), &bytes, b"{oops")
+            .expect("invalid json is a reload message");
+        let decision = decide_reload(&current, false, msg);
+        assert!(decision.load_error.is_some());
+        assert_eq!(decision.config.arabic_font.as_deref(), Some("Amiri"));
+        assert_eq!(decision.config.font_size, Some(22.0));
+        assert!(save_bytes(&decision.load_error, &decision.config).is_err());
+    }
+
+    #[test]
+    fn deleting_config_json_clears_the_load_error_and_save_recreates_the_file() {
+        let current = config::UserConfig {
+            font_size: Some(22.0),
+            cursor_style: Some("bar".into()),
+            ..config::UserConfig::default()
+        };
+        // An earlier bad file is blocking saves. Deleting the file is not
+        // another bad file: the running config stays, and a save writes it
+        // back, never defaults over the user's settings.
+        let [bad, deleted] = config_watch::reload_bad_then_missing(current.clone(), b"{oops");
+        let mut blocked = decide_reload(&current, false, bad.unwrap());
+        assert!(blocked.load_error.is_some());
+        blocked = decide_reload(&blocked.config, false, deleted.expect("delete is noticed"));
+        assert!(
+            blocked.load_error.is_none(),
+            "a missing file must not block save_config"
+        );
+        assert_eq!(blocked.config, current);
+        let bytes = save_bytes(&blocked.load_error, &blocked.config).unwrap();
+        let dir = temp_dir("deleted");
+        let path = dir.join("config.json");
+        config::write_bytes_at(&path, &bytes).unwrap();
+        let restored = config::parse_bytes(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(restored, current);
+        assert!(path.is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_cwd_argument_opens_a_local_folder_and_refuses_the_rest() {

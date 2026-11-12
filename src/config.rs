@@ -5,7 +5,7 @@
 //! { "font_family": "JetBrains Mono", "font_size": 17.0 }
 //! ```
 
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct UserConfig {
     /// Interface language: `"en"` for English (left to right); anything
@@ -556,27 +556,44 @@ pub fn bayan_dir() -> std::path::PathBuf {
     }
 }
 
+pub fn config_path() -> std::path::PathBuf {
+    bayan_dir().join("config.json")
+}
+
 pub fn load() -> std::io::Result<UserConfig> {
-    load_from(&bayan_dir().join("config.json"))
+    load_from(&config_path())
 }
 
 fn load_from(path: &std::path::Path) -> std::io::Result<UserConfig> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(UserConfig::default());
-        }
-        Err(error) => return Err(error),
-    };
+    match std::fs::read(path) {
+        Ok(bytes) => parse_bytes(&bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(UserConfig::default()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Parse config bytes. A UTF-8 BOM is ignored; invalid JSON or invalid
+/// UTF-8 is an error and must not be turned into defaults by the caller
+/// that is reloading a live session.
+pub fn parse_bytes(bytes: &[u8]) -> std::io::Result<UserConfig> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     // Windows editors can add a UTF-8 BOM, which serde_json rejects.
     serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(Into::into)
 }
 
-/// Persist the config (the in-app settings panel writes it on close).
-pub fn save(cfg: &UserConfig) -> std::io::Result<()> {
-    let path = bayan_dir().join("config.json");
-    let json = serde_json::to_vec_pretty(cfg)?;
-    crate::persist::write(&path, &json)
+/// The bytes the settings panel writes. It hands them to the file watcher
+/// before the rename so that write is not loaded again.
+pub fn encode(cfg: &UserConfig) -> std::io::Result<Vec<u8>> {
+    serde_json::to_vec_pretty(cfg).map_err(Into::into)
+}
+
+pub fn write_bytes_at(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    crate::persist::write(path, bytes)
+}
+
+pub fn write_bytes(bytes: &[u8]) -> std::io::Result<()> {
+    write_bytes_at(&config_path(), bytes)
 }
 
 #[cfg(test)]

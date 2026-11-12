@@ -929,11 +929,23 @@ side-by-side split widens the seam to the bar, which can cost one more
 column per pane: at 1280px with 11px cells the two panes are 56 and 56,
 where a 1px seam was 57 and 57. It is hidden with no scrollback
 and on the alternate screen. The thumb is at least 16px, or the bar's
-width when that is wider. A sub-line `fraction` on the scroll position
-defaults to 0 so smooth scroll can pass its remainder later.
+width when that is wider. The thumb follows smooth scroll's sub-line remainder.
 
-Shell and scrollback apply to new tabs (no terminal restarts a live
-session); everything else applies immediately. `osc52` is config-file
+`config.json` is watched while Bayan is running. A change is re-read
+after about 200 ms of quiet, including when an editor saves by renaming
+a temp file over the real one. Theme, colors, font family and size (the
+grid is laid out again and the PTY is resized), key bindings, padding,
+cursor, opacity, and the other live settings apply without a restart.
+A save from the settings panel is recognized as Bayan's own write, so
+it is not loaded again. A file that does not parse is left alone: the
+last good settings stay in effect and a small notice shows the error.
+A read that fails because another program holds the file is retried
+for about 150 ms first. Deleting or renaming the file keeps the running
+settings (not defaults), so a later panel save writes them back.
+Scrollback applies to new panes, the shell to new tabs, restoring tabs
+on the next launch, the plugin list after a restart, and the kitty
+keyboard protocol in new panes. When one of those changes, the notice
+names it. `osc52` is config-file
 only (there is no settings-panel row). Leave it out or set `"off"`.
 `"copy"` lets a focused window accept OSC 52 clipboard writes from the
 focused pane; no value enables a clipboard read. The decode backstop is
