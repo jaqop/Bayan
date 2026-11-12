@@ -191,11 +191,11 @@ pub(crate) fn file_version_from_fixed(info: &[u8]) -> Option<(u16, u16, u16, u16
 }
 
 fn low_word(v: u32) -> u16 {
-    u16::try_from(v & 0xffff).unwrap_or(0)
+    (v & 0xffff) as u16
 }
 
 fn high_word(v: u32) -> u16 {
-    u16::try_from(v >> 16).unwrap_or(0)
+    (v >> 16) as u16
 }
 
 /// File version of `path`, or `None` when the resource is missing.
