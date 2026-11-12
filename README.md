@@ -1024,6 +1024,59 @@ identity (MSIX, later); until then the entry is under **Show more options**.
 `"explorer_context_menu": true` in `config.json` is the installer hook for
 the same registration (absent leaves the menu alone; there is no settings row).
 
+The taskbar Jump List lists each detected shell as `"<exe>" -p <name>` (the
+profile's name, not its command line), then **نافذة جديدة** (`--new-window`)
+and **تشغيل كمسؤول** (`--elevated`). The process sets an explicit
+AppUserModelID (`Bayan.Terminal.` plus a hash of the exe path) before the
+window exists, and rewrites the list on startup when the detected profiles
+differ from the list it last committed. The remembered list is only that
+comparison. It is not what gets written back.
+
+`--elevated` is the only way Bayan asks for an administrator. It calls
+`ShellExecuteW` with the verb `runas` (the normal UAC prompt) and then exits.
+The elevated process is given `--elevated` and, when a profile was named,
+`-p <profile name>`. A folder and a command after `--` are refused, and a
+profile name that is a path is refused. The elevated process resolves the
+name against the shells it detects itself; a command string does not match.
+It does not restore `session.json` and it does not start `config.json`'s
+`shell` value, because both are files a standard user can write. The window
+title and the tab strip show **مسؤول** while the token is elevated. Cancelling
+UAC does not open a window. Bayan does not elevate on its own, and the
+executable manifest stays `asInvoker`. An elevated window, including one
+Explorer started with Run as administrator, does not load `~/.bayan/plugins`
+and does not inject oh-my-posh. The prompt picker does not open in that
+window, so it neither runs `oh-my-posh.exe` nor rewrites `$PROFILE`. It does
+not use `config.json`'s `editor` command. Ctrl+click looks for `Code.exe`
+only under Program Files and Program Files (x86), from the known-folder
+API, not from `PATH` or `%LOCALAPPDATA%`. If that copy is missing, a confirm
+card shows the full path. Enter on that card reveals the file in Explorer
+and does not open it by its file association. `explorer.exe` comes from
+`GetWindowsDirectoryW`, not from `WINDIR`. A host card remembers whether
+Enter browses or reveals, so `HTTPS://` still opens in the browser.
+`pwsh.exe` is started only from
+`Program Files\PowerShell\7`. `save_state` does not write `session.json`
+when the token is elevated, including a rename or a group change, and a
+settings change is not written either. The jump-list stamp is not written.
+The window says so in Arabic when it opens, and a config-load error keeps
+that notice on the same card.
+
+`"terminal_handoff": true` (absent means off; the same switches are
+`--register-terminal-handoff` and `--unregister-terminal-handoff`) registers
+one per-user COM class,
+`HKCU\Software\Classes\CLSID\{A7C3E1B2-4D58-4F0A-9E6C-1B8D5A2F7043}\LocalServer32`,
+command `"<exe>" --handoff`. That is the terminal half of Windows Terminal's
+handoff (`ITerminalHandoff`, `ITerminalHandoff2`, and `ITerminalHandoff3`).
+It does **not** make Bayan the Windows 11 default terminal. The Settings
+list is an AppExtension catalog
+(`com.microsoft.windows.console.host` and `com.microsoft.windows.terminal.host`
+in the same MSIX package). Inbox conhost activates `DelegationConsole` as
+`IConsoleHandoff`, which is OpenConsole, and only that process calls
+`ITerminalHandoff`, through `OpenConsoleProxy.dll`. Bayan ships neither, and
+it does not write `HKCU\Console\%%Startup`. `--handoff` registers the class
+and every `EstablishPtyHandoff` returns `E_NOTIMPL`: no shell is started and
+no handle is kept. A working default terminal still needs the MSIX package,
+OpenConsole, and the proxy DLL.
+
 The default terminal font is 18; settings and tab controls use independent UI
 metrics so a small terminal font does not shrink the controls. Ctrl+V pastes in
 shells and TUIs; Ctrl+C copies a selection or sends the interrupt when no text

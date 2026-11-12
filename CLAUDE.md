@@ -32,8 +32,11 @@ selection and BiDi paths must do.
 | `localpath.rs` | no-follow walk: is a drive path local in every component, links read but not followed (link probe, new-tab cwd) |
 | `mru.rs` | most-recently-used tab order for Ctrl+Tab, walkable within one group |
 | `shells.rs` | installed-shell detection (ported from EasyTer's `profiles.py`) |
-| `cli.rs` | argv: `#45`'s `-d`/`--cwd`, plus profile, `--` command, help, version |
+| `cli.rs` | argv: `#45`'s `-d`/`--cwd`, plus profile, `--` command, `--elevated`, handoff, help, version |
 | `context_menu.rs` | per-user Explorer "Open Bayan here" (HKCU only, behind `RegistryStore`) |
+| `elevate.rs` | `--elevated` → `ShellExecuteW` verb `runas` only; argv is `--elevated` and optional `-p <name>` |
+| `jumplist.rs` | taskbar Jump List (`ICustomDestinationList`) and the explicit AppUserModelID |
+| `handoff.rs` | per-user `ITerminalHandoff` COM class, default off; not the Windows default terminal |
 | `posh.rs` | oh-my-posh theme picker with a live ANSI preview |
 | `plugins.rs` | declarative JSON plugin host (`~/.bayan/plugins/`) |
 | `config.rs` | `~/.bayan/config.json`, optional and BOM-tolerant |
@@ -161,6 +164,24 @@ desktop behind the window — `LWA_ALPHA` blends the whole window uniformly and
 bypasses DWM's blur, so the layered-window transparency Bayan already has and
 the accent blur are mutually exclusive. The existing `opacity` setting is the
 only transparency available on this path.
+
+**Elevation is a UAC prompt and nothing else.** `--elevated` calls
+`ShellExecuteW` with verb `runas` and exits. The new process receives
+`--elevated` and, if a profile was named, `-p <name>` only. It resolves
+that name with `shells::find_profile_by_name` (the stored command does not
+match). It does not restore `session.json` and does not spawn
+`config.shell`. It does not load `~/.bayan/plugins`, does not inject oh-my-posh, and does
+not open the prompt picker. It does not use `config.json`'s `editor`
+template. `Code.exe` comes only from Program Files via
+`SHGetKnownFolderPath`. A missing editor is a reveal-only card: Enter runs
+`explorer.exe /select` and does not association-open. `explorer.exe` comes
+from `GetWindowsDirectoryW`, not `WINDIR`. A host card stores Browse or
+RevealOnly, so `HTTPS://` still opens in the browser. `pwsh.exe` is only
+`Program Files\PowerShell\7\pwsh.exe`. `save_state` does not write
+`session.json` while elevated. A failed elevation query is treated as
+elevated. No environment block, registry value,
+pipe, or file carries the request. The jump list's admin task is
+`--elevated` with no profile.
 
 **Start-directory precedence, in order:** a restored session's saved cwd, then
 the launcher's directory (a shortcut's "Start in"), then `USERPROFILE`. The

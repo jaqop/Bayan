@@ -93,6 +93,12 @@ pub struct UserConfig {
     /// row, the same way `osc52` is config-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explorer_context_menu: Option<bool>,
+    /// When set, startup registers (`true`) or removes (`false`) the
+    /// per-user `ITerminalHandoff` COM class. Absent: leave it alone.
+    /// Default off. This does not select Bayan as the Windows default
+    /// terminal; see `handoff`. HKCU only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_handoff: Option<bool>,
     /// Hide the tab bar while only one tab is open (default off).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hide_single_tab: Option<bool>,
@@ -630,5 +636,18 @@ mod tests {
         assert_eq!(on.explorer_context_menu, Some(true));
         let off: UserConfig = serde_json::from_str(r#"{"explorer_context_menu":false}"#).unwrap();
         assert_eq!(off.explorer_context_menu, Some(false));
+    }
+
+    #[test]
+    fn terminal_handoff_is_off_unless_the_config_says_so() {
+        assert!(UserConfig::default().terminal_handoff.is_none());
+        let absent: UserConfig = serde_json::from_str("{}").unwrap();
+        assert!(absent.terminal_handoff.is_none());
+        let on: UserConfig = serde_json::from_str(r#"{"terminal_handoff":true}"#).unwrap();
+        assert_eq!(on.terminal_handoff, Some(true));
+        let off: UserConfig = serde_json::from_str(r#"{"terminal_handoff":false}"#).unwrap();
+        assert_eq!(off.terminal_handoff, Some(false));
+        let saved = serde_json::to_string(&UserConfig::default()).unwrap();
+        assert!(!saved.contains("terminal_handoff"));
     }
 }

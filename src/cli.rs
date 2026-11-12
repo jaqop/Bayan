@@ -19,16 +19,26 @@ pub const HELP: &str = concat!(
     "\
 الاستخدام:
   bayan [-d | --cwd <مجلد>] [-p | --profile <اسم>] [-- <أمر>...]
+  bayan --new-window
+  bayan --elevated [-p <اسم>]
   bayan --register-context-menu
   bayan --unregister-context-menu
+  bayan --register-terminal-handoff
+  bayan --unregister-terminal-handoff
 
   -d, --cwd <مجلد>       مجلد التبويب الذي يفتحه هذا الأمر
   -p, --profile <اسم>    صدفة ذلك التبويب (اسمها أو أمرها)
   -- <أمر>...            تشغيل هذا البرنامج بدل الصدفة
+  --new-window           نافذة جديدة (قائمة شريط المهام)
+  --elevated             إعادة التشغيل كمسؤول. يُبقى -p <اسم> فقط
   --register-context-menu
                          إضافة «افتح بيان هنا» للمستخدم الحالي
   --unregister-context-menu
                          إزالة ذلك البند من المستكشف
+  --register-terminal-handoff
+                         تسجيل تسليم الطرفية للمستخدم الحالي
+  --unregister-terminal-handoff
+                         إزالة ذلك التسجيل
   -h, --help             هذه المساعدة
   -V, --version          رقم الإصدار
 
@@ -38,18 +48,31 @@ Bayan ",
     "\
 usage:
   bayan [-d | --cwd <folder>] [-p | --profile <name>] [-- <command>...]
+  bayan --new-window
+  bayan --elevated [-p | --profile <name>]
   bayan --register-context-menu
   bayan --unregister-context-menu
+  bayan --register-terminal-handoff
+  bayan --unregister-terminal-handoff
 
   -d, --cwd <folder>       Folder for the tab this command opens
       --cwd=<folder>       The same, as one argument
   -p, --profile <name>     Shell profile for that tab (its name or its command)
       --profile=<name>     The same, as one argument
       -- <command>...      Run this program in that tab instead of the shell
+      --new-window         Open a window (the taskbar jump list's \"New window\")
+      --elevated           Relaunch through UAC as administrator. Only an
+                           optional -p <profile name> is kept; a folder and
+                           a command after -- are refused
       --register-context-menu
                            Add «افتح بيان هنا» for the current user
       --unregister-context-menu
                            Remove that Explorer entry
+      --register-terminal-handoff
+                           Register the per-user ITerminalHandoff class
+      --unregister-terminal-handoff
+                           Remove that class
+      --handoff            COM local server. Windows appends -Embedding
   -h, --help               Show this help
   -V, --version            Show the version
 
@@ -59,6 +82,12 @@ path, a remote drive or a missing folder stops startup. A profile or a
 command applies to that same tab. With saved tabs restored, those tabs
 come back first and this tab is the active one.
 
+--elevated never elevates by itself on a normal launch. It asks Windows
+for a standard UAC prompt (ShellExecuteW verb \"runas\") and the elevated
+process receives only --elevated and, if it was named, -p <profile name>.
+The profile is resolved again from installed shells. Nothing is handed
+over through the environment, the registry, a pipe, or a config file.
+
 Explorer registration writes only
 HKCU\\Software\\Classes\\Directory\\shell\\Bayan and
 Directory\\Background\\shell\\Bayan. The command is
@@ -66,12 +95,20 @@ Directory\\Background\\shell\\Bayan. The command is
 the closing quote. It does not write HKLM and does not ask for an
 administrator. Windows 11's top-level menu needs package identity
 (MSIX, a later installer); this entry shows under \"Show more options\".
+
+Terminal handoff registration writes only the per-user COM class under
+HKCU\\Software\\Classes\\CLSID. It does not write HKLM and it does not set
+HKCU\\Console\\%%Startup, so it does not become the Windows default
+terminal. See the handoff module for what an MSIX package would still
+have to provide.
 "
 );
 
 const USAGE: &str = "\
 usage: bayan [-d | --cwd <folder>] [-p | --profile <name>] [-- <command>...]
+       bayan --new-window | --elevated [-p <name>]
        bayan --register-context-menu | --unregister-context-menu
+       bayan --register-terminal-handoff | --unregister-terminal-handoff
        bayan --help | --version";
 
 /// What `argv` asked for, before the folder is checked on disk.
@@ -82,6 +119,10 @@ pub enum CliAction {
     Version,
     RegisterContextMenu,
     UnregisterContextMenu,
+    RegisterTerminalHandoff,
+    UnregisterTerminalHandoff,
+    /// COM launched us (`--handoff`, and the `-Embedding` it appends).
+    Handoff,
 }
 
 /// A normal startup. `directory` is still the raw text; [`gate_start_dir`]
@@ -92,6 +133,9 @@ pub struct Launch {
     pub directory: Option<String>,
     pub profile: Option<String>,
     pub command: Option<Vec<String>>,
+    /// `--elevated`: relaunch through UAC. The elevated process keeps only
+    /// this flag and an optional profile name; see `elevate`.
+    pub elevated: bool,
 }
 
 /// The process the launch tab starts. A `--` command is already split, so
@@ -116,8 +160,12 @@ where
     let mut directory = None;
     let mut profile = None;
     let mut command = None;
+    let mut elevated = false;
+    let mut new_window = false;
+    let mut handoff = false;
     // `Some(true)` registers, `Some(false)` removes. Both at once is an error.
     let mut menu: Option<bool> = None;
+    let mut handoff_reg: Option<bool> = None;
 
     while let Some(a) = args.next() {
         let a = text(a)?;
@@ -151,6 +199,27 @@ where
                 }
                 menu = Some(false);
             }
+            "--register-terminal-handoff" => {
+                if handoff_reg.is_some() {
+                    return Err(format!(
+                        "--register-terminal-handoff and --unregister-terminal-handoff cannot be combined\n{USAGE}"
+                    ));
+                }
+                handoff_reg = Some(true);
+            }
+            "--unregister-terminal-handoff" => {
+                if handoff_reg.is_some() {
+                    return Err(format!(
+                        "--register-terminal-handoff and --unregister-terminal-handoff cannot be combined\n{USAGE}"
+                    ));
+                }
+                handoff_reg = Some(false);
+            }
+            "--handoff" | "-Embedding" => handoff = true,
+            "--elevated" => elevated = true,
+            // The jump list needs a non-empty argument list (AddUserTasks
+            // rejects a shell link with no arguments). The flag is a launch.
+            "--new-window" => new_window = true,
             // `#45`: `-d <folder>` and `--cwd <folder>`. The next token is
             // the folder even when it looks like a flag; a missing one errors.
             "-d" | "--cwd" => {
@@ -183,23 +252,46 @@ where
         }
     }
 
+    let exclusive = menu.is_some() as u8 + handoff_reg.is_some() as u8 + u8::from(handoff);
+    if exclusive > 1 {
+        return Err(format!("those commands cannot be combined\n{USAGE}"));
+    }
+    let launch_bits = directory.is_some() || profile.is_some() || command.is_some() || elevated;
+    if exclusive > 0 && (launch_bits || (new_window && (menu.is_some() || handoff_reg.is_some()))) {
+        return Err(format!(
+            "that command cannot be combined with other arguments\n{USAGE}"
+        ));
+    }
+    // `--new-window --handoff` is not a COM launch.
+    if handoff && new_window {
+        return Err(format!(
+            "that command cannot be combined with other arguments\n{USAGE}"
+        ));
+    }
+
     if let Some(enable) = menu {
-        if directory.is_some() || profile.is_some() || command.is_some() {
-            return Err(format!(
-                "--register-context-menu and --unregister-context-menu cannot be combined with other arguments\n{USAGE}"
-            ));
-        }
         return Ok(if enable {
             CliAction::RegisterContextMenu
         } else {
             CliAction::UnregisterContextMenu
         });
     }
+    if let Some(enable) = handoff_reg {
+        return Ok(if enable {
+            CliAction::RegisterTerminalHandoff
+        } else {
+            CliAction::UnregisterTerminalHandoff
+        });
+    }
+    if handoff {
+        return Ok(CliAction::Handoff);
+    }
 
     Ok(CliAction::Launch(Launch {
         directory,
         profile,
         command,
+        elevated,
     }))
 }
 
@@ -227,6 +319,44 @@ pub fn normalize_start_dir(raw: &str) -> String {
         collapsed = collapsed.replace("\\\\", "\\");
     }
     collapsed
+}
+
+/// One argument the way `CommandLineToArgvW` parses it. A profile name with
+/// spaces or Arabic stays one argument; a trailing backslash stays a
+/// backslash (it is doubled so the closing quote is not escaped).
+pub fn quote_windows_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|c| matches!(c, ' ' | '\t' | '\n' | '"')) {
+        return arg.to_string();
+    }
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            c => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes));
+                quoted.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+/// Join already-split arguments for `ShellExecuteW`'s parameter string.
+pub fn join_windows_args(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| quote_windows_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `#45`'s folder gate: [`normalize_start_dir`], then `std::path::absolute`
@@ -412,6 +542,29 @@ mod tests {
             parse(["--unregister-context-menu"]).unwrap(),
             CliAction::UnregisterContextMenu
         );
+        assert!(launch(&["--elevated"]).elevated);
+        let elevated = launch(&["--elevated", "-p", "PowerShell سريع"]);
+        assert!(elevated.elevated);
+        assert_eq!(elevated.profile.as_deref(), Some("PowerShell سريع"));
+        assert!(elevated.command.is_none());
+        assert!(elevated.directory.is_none());
+        let window = launch(&["--new-window"]);
+        assert!(!window.elevated);
+        assert!(window.profile.is_none());
+        assert_eq!(parse(["--handoff"]).unwrap(), CliAction::Handoff);
+        assert_eq!(parse(["-Embedding"]).unwrap(), CliAction::Handoff);
+        assert_eq!(
+            parse(["--handoff", "-Embedding"]).unwrap(),
+            CliAction::Handoff
+        );
+        assert_eq!(
+            parse(["--register-terminal-handoff"]).unwrap(),
+            CliAction::RegisterTerminalHandoff
+        );
+        assert_eq!(
+            parse(["--unregister-terminal-handoff"]).unwrap(),
+            CliAction::UnregisterTerminalHandoff
+        );
     }
 
     #[test]
@@ -430,6 +583,15 @@ mod tests {
             vec!["--register-context-menu", "--unregister-context-menu"],
             vec!["--register-context-menu", "-d", r"C:\Windows"],
             vec!["-p", "PowerShell", "--unregister-context-menu"],
+            vec!["--handoff", "-p", "PowerShell"],
+            vec!["--elevated", "--handoff"],
+            vec!["--new-window", "--handoff"],
+            vec![
+                "--register-terminal-handoff",
+                "--unregister-terminal-handoff",
+            ],
+            vec!["--register-context-menu", "--register-terminal-handoff"],
+            vec!["--register-terminal-handoff", "-d", r"C:\Windows"],
             vec!["not-a-flag"],
         ] {
             assert!(parse(args.iter().copied()).is_err(), "{args:?}");
@@ -584,5 +746,24 @@ mod tests {
             gate_start_dir(&normal[2]).unwrap(),
             crate::term::accept_local_cwd(r"C:\Windows").unwrap()
         );
+    }
+
+    #[test]
+    fn windows_quoting_keeps_arabic_spaces_and_a_trailing_backslash() {
+        assert_eq!(quote_windows_arg("PowerShell"), "PowerShell");
+        assert_eq!(quote_windows_arg("PowerShell سريع"), "\"PowerShell سريع\"");
+        assert_eq!(
+            quote_windows_arg(r"C:\مجلد العمل\bayan.exe"),
+            "\"C:\\مجلد العمل\\bayan.exe\""
+        );
+        // The closing quote must not eat the final backslash.
+        assert_eq!(
+            quote_windows_arg(r"C:\Program Files\"),
+            "\"C:\\Program Files\\\\\""
+        );
+        assert_eq!(quote_windows_arg("a\"b"), "\"a\\\"b\"");
+        let joined =
+            join_windows_args(&["--elevated".into(), "-p".into(), "PowerShell سريع".into()]);
+        assert_eq!(joined, "--elevated -p \"PowerShell سريع\"");
     }
 }

@@ -47,7 +47,26 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_IO", # DeviceIoControl: read a link's target without following it (localpath.rs)
     "Win32_System_Registry", # HKCU Explorer "Open Bayan here" (no HKLM)
     "Win32_System_Console", # --help / --version attach to the parent console
+    "Win32_Security", # TokenElevation: is this process already elevated?
 ] }
+
+# Jump List (ICustomDestinationList) and the terminal-handoff class
+# factory. windows-sys stays for the rest of the Win32 surface.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Storage_EnhancedStorage", # PKEY_Title, PKEY_AppUserModel_ID
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common", # IObjectCollection for jump-list tasks
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# The `implement` macro emits `windows_core::` paths, so the crate has to
+# be a direct dependency even though `windows` re-exports it.
+windows-core = "0.61"
 
 [features]
 # BAYAN_* environment debug hooks (BAYAN_TYPE, BAYAN_PASTE, BAYAN_PROFILE, …)

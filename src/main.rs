@@ -14,9 +14,12 @@ mod cli;
 mod config;
 mod context_menu;
 mod copymode;
+mod elevate;
 mod gpu;
 mod groups;
+mod handoff;
 mod input;
+mod jumplist;
 mod keybinds;
 mod keyroute;
 mod keys;
@@ -450,6 +453,11 @@ pub enum UserEvent {
         reason: String,
         shown: String,
     },
+    /// Elevated `path:line` with no Program Files `Code.exe`. The card shows
+    /// the full path; Enter reveals it in Explorer.
+    LinkConfirm {
+        path: String,
+    },
 }
 
 /// The link under the pointer. Stable while the pointer stays inside it,
@@ -463,13 +471,14 @@ struct LinkHover {
     target: link::StatusParts,
 }
 
-/// A Ctrl+click that was refused, or a userinfo URL waiting for Enter.
-/// Esc dismisses either. Enter opens only when `confirm_uri` is set;
-/// a refusal leaves it empty so Enter cannot launch the target.
+/// A Ctrl+click that was refused, or a confirm card waiting for Enter.
+/// Esc dismisses either. Enter runs `confirm` when it is set. A refusal
+/// leaves it empty so Enter cannot launch the target. The variant is the
+/// action: Enter does not guess from the text.
 struct BlockedLink {
     reason: String,
     shown: String,
-    confirm_uri: Option<String>,
+    confirm: Option<link::ConfirmOpen>,
     is_app_error: bool,
 }
 
@@ -871,12 +880,22 @@ fn restored_shell(saved: Option<String>, default: &str, installed: &[shells::She
 }
 
 fn state_path() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = SESSION_FILE.with(|slot| slot.borrow().clone()) {
+        return Some(path);
+    }
     let home = std::env::var("USERPROFILE").ok()?;
     Some(
         std::path::Path::new(&home)
             .join(".bayan")
             .join("session.json"),
     )
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static SESSION_FILE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Multi-click detection: 1 = simple, 2 = word (semantic), 3 = line.
@@ -1557,6 +1576,9 @@ struct App {
     start_profile_command: Option<String>,
     /// argv after `--`. When set, that program is the tab's process.
     start_command: Option<Vec<String>>,
+    /// This process token is elevated. Session restore and `config.shell`
+    /// are not consulted: both are files a standard user can write.
+    elevated: bool,
 }
 
 impl App {
@@ -1752,8 +1774,9 @@ impl App {
         if let Some(h) = self.hwnd() {
             toast::remove(h);
         }
-        // tabs + cwds greet you tomorrow
-        if !self.save_state() {
+        // tabs + cwds greet you tomorrow. An elevated window does not write
+        // session.json: that file is the next launch's command list.
+        if elevate::may_write_bayan(self.elevated) && !self.save_state() {
             // The window is about to close, so its error card cannot be seen.
             // An explicit save failure must be acknowledged before exit.
             if let Some(error) = &self.blocked_link {
@@ -1879,6 +1902,17 @@ impl App {
     /// ones it skipped, so coming back asks again. Closing or reopening
     /// stops the worker.
     fn open_posh(&mut self) {
+        if self.elevated {
+            let (title, body) = elevate::prompt_picker_notice();
+            self.blocked_link = Some(BlockedLink {
+                reason: title.to_string(),
+                shown: body.to_string(),
+                confirm: None,
+                is_app_error: true,
+            });
+            self.request_redraw();
+            return;
+        }
         use std::sync::atomic::Ordering;
         let names = posh::available();
         if names.is_empty() {
@@ -1978,9 +2012,19 @@ impl App {
             Key::Named(NamedKey::Enter) => {
                 let name = p.names[p.sel].clone();
                 self.close_posh();
-                match posh::set_theme(&name) {
-                    Ok(()) => eprintln!("bayan: prompt theme set to {name} (new tabs)"),
-                    Err(e) => eprintln!("bayan: prompt theme failed: {e}"),
+                if self.elevated {
+                    let (title, body) = elevate::prompt_picker_notice();
+                    self.blocked_link = Some(BlockedLink {
+                        reason: title.to_string(),
+                        shown: body.to_string(),
+                        confirm: None,
+                        is_app_error: true,
+                    });
+                } else {
+                    match posh::set_theme(&name) {
+                        Ok(()) => eprintln!("bayan: prompt theme set to {name} (new tabs)"),
+                        Err(e) => eprintln!("bayan: prompt theme failed: {e}"),
+                    }
                 }
             }
             _ => {}
@@ -2151,7 +2195,7 @@ impl App {
                     self.blocked_link = Some(BlockedLink {
                         reason: tr("تعذر تشغيل الطرفية", "Could not start the shell").into(),
                         shown: link::preview(&command, 240),
-                        confirm_uri: None,
+                        confirm: None,
                         is_app_error: false,
                     });
                 }
@@ -2464,13 +2508,42 @@ impl App {
         self.blocked_link = Some(BlockedLink {
             reason: reason.to_string(),
             shown: link::preview_with(detail, 240, |c| c != '\n' && link::is_forbidden(c)),
-            confirm_uri: None,
+            confirm: None,
             is_app_error: true,
         });
         self.request_redraw();
     }
 
+    /// The Arabic admin card. A config-load error already on the card stays;
+    /// the notice is appended instead of replacing it.
+    fn apply_admin_notice(&mut self) {
+        if !self.elevated {
+            return;
+        }
+        let (title, body) = elevate::admin_notice();
+        if let Some(block) = self.blocked_link.as_mut() {
+            block.shown = elevate::with_admin_notice(Some(&block.shown), title, body);
+        } else {
+            self.blocked_link = Some(BlockedLink {
+                reason: title.to_string(),
+                shown: body.to_string(),
+                confirm: None,
+                is_app_error: true,
+            });
+        }
+    }
+
     fn save_config(&mut self) {
+        if !elevate::may_write_bayan(self.elevated) {
+            self.report_error(
+                tr("نافذة مسؤول", "Administrator window"),
+                tr(
+                    "لا يُحفظ الإعداد من نافذة المسؤول.",
+                    "Settings are not saved from an administrator window.",
+                ),
+            );
+            return;
+        }
         if self.config_load_error.is_some() {
             self.report_config_load_error();
             return;
@@ -2740,7 +2813,19 @@ impl App {
     }
 
     fn spawn_pane(&mut self, cwd: Option<&str>) -> Option<Pane> {
-        self.spawn_pane_command(cwd, &self.config.shell_program(), None)
+        let shell = self.spawn_shell();
+        self.spawn_pane_command(cwd, &shell, None)
+    }
+
+    /// The shell a new tab starts. Elevated windows use the profile this
+    /// process already resolved from its own detection, never `config.shell`.
+    fn spawn_shell(&self) -> String {
+        elevate::spawn_shell_command(
+            self.elevated,
+            self.start_profile_command.as_deref(),
+            &self.shell_profiles,
+            &self.config.shell_program(),
+        )
     }
 
     fn spawn_pane_command(
@@ -2760,6 +2845,7 @@ impl App {
             command,
             self.config.kitty_protocol_on(),
             raw,
+            self.elevated,
         ) {
             Ok(session) => Some(Pane {
                 id,
@@ -2776,7 +2862,8 @@ impl App {
     }
 
     fn spawn_tab(&mut self, cwd: Option<String>) {
-        self.spawn_tab_command(cwd, &self.config.shell_program(), None);
+        let shell = self.spawn_shell();
+        self.spawn_tab_command(cwd, &shell, None);
     }
 
     fn spawn_tab_command(&mut self, cwd: Option<String>, command: &str, raw: Option<&[String]>) {
@@ -3174,6 +3261,11 @@ impl App {
     }
 
     fn save_state(&mut self) -> bool {
+        // Every caller (close, rename, group assign) comes through here.
+        // An elevated process must not create or replace session.json.
+        if !elevate::may_write_bayan(self.elevated) {
+            return true;
+        }
         // Closing while discovery is pending must not replace the saved
         // session with an empty window that has not restored it yet.
         if self.startup_pending {
@@ -3287,12 +3379,16 @@ impl App {
             || self.start_profile_command.is_some()
             || self.start_command.is_some();
         if explicit {
-            if self.config.restore_tabs.unwrap_or(false)
-                && load_saved_state().is_some_and(|s| !s.tabs.is_empty())
-            {
+            // Elevated: do not replay session.json. Its commands and folders
+            // were written by a process that was not elevated.
+            if elevate::may_restore_saved_tabs(
+                self.elevated,
+                self.config.restore_tabs.unwrap_or(false),
+                load_saved_state().is_some_and(|s| !s.tabs.is_empty()),
+            ) {
                 self.restore_state();
             }
-            let default = self.config.shell_program();
+            let default = self.spawn_shell();
             let process = cli::launch_process(
                 self.start_profile_command.as_deref(),
                 self.start_command.as_deref(),
@@ -3303,6 +3399,9 @@ impl App {
                 &process.command_line,
                 process.raw_argv.as_deref(),
             );
+        } else if self.elevated {
+            let shell = self.spawn_shell();
+            self.spawn_tab_command(None, &shell, None);
         } else {
             self.restore_state();
         }
@@ -3941,7 +4040,10 @@ impl App {
         let cwd = self.pane_link_cwd(id);
         // `exists` and `find_code_exe` run on the link thread. A disconnected
         // network drive must not stall this handler.
-        match span.activate(cwd.as_deref(), self.config.editor.as_deref()) {
+        match span.activate(
+            cwd.as_deref(),
+            elevate::configured_editor(self.elevated, self.config.editor.as_deref()),
+        ) {
             action @ (link::Action::Browse(_)
             | link::Action::OpenPath(_)
             | link::Action::Reveal(_)
@@ -3951,7 +4053,7 @@ impl App {
                 self.blocked_link = Some(BlockedLink {
                     reason: link::host_confirm().to_string(),
                     shown: link::confirm_card_shown(&host, &uri),
-                    confirm_uri: Some(uri),
+                    confirm: Some(link::confirm_open_from_uri(&uri)),
                     is_app_error: false,
                 });
                 self.clear_link_hover();
@@ -3981,11 +4083,25 @@ impl App {
         };
         let proxy = self.proxy.clone();
         let shown_for_fail = shown.clone();
+        let elevated = self.elevated;
         let spawned = std::thread::Builder::new()
             .name("bayan-link".into())
             .spawn(move || {
                 link::init_link_thread();
-                let action = link::settle_live(action);
+                let action = link::settle_live(action, elevated);
+                if let link::Action::Confirm { uri, host } = &action {
+                    if link::is_browser_uri(uri) {
+                        if !link::perform_open(&link::Action::Browse(uri.clone())) {
+                            let _ = proxy.send_event(UserEvent::LinkFailed {
+                                reason: link::RefuseReason::Editor.label().to_string(),
+                                shown: uri.clone(),
+                            });
+                        }
+                    } else {
+                        let _ = proxy.send_event(UserEvent::LinkConfirm { path: host.clone() });
+                    }
+                    return;
+                }
                 if let link::Action::Refuse { reason, shown } = &action {
                     let _ = proxy.send_event(UserEvent::LinkFailed {
                         reason: reason.label().to_string(),
@@ -4005,11 +4121,33 @@ impl App {
         }
     }
 
+    /// Explorer `/select` for a reveal-only card. This does not call
+    /// `settle`: an allowlisted extension would become an association open.
+    fn spawn_reveal_only(&mut self, path: &str) {
+        let path = path.to_string();
+        let proxy = self.proxy.clone();
+        let owned = path.clone();
+        let spawned = std::thread::Builder::new()
+            .name("bayan-link".into())
+            .spawn(move || {
+                link::init_link_thread();
+                if link::spawn_reveal(&owned).is_err() {
+                    let _ = proxy.send_event(UserEvent::LinkFailed {
+                        reason: link::RefuseReason::Editor.label().to_string(),
+                        shown: owned,
+                    });
+                }
+            });
+        if spawned.is_err() {
+            self.refuse_link(link::RefuseReason::Editor, &path);
+        }
+    }
+
     fn refuse_link(&mut self, reason: link::RefuseReason, shown: &str) {
         self.blocked_link = Some(BlockedLink {
             reason: reason.label().to_string(),
             shown: link::preview(shown, 160),
-            confirm_uri: None,
+            confirm: None,
             is_app_error: false,
         });
         self.clear_link_hover();
@@ -4764,6 +4902,7 @@ impl App {
                     bar_text(self.search.as_ref().map(|s| s.query.as_str()), focused_copy)
                         .as_deref(),
                     focused_claude,
+                    elevate::title_badge(self.elevated),
                 );
                 if self.cockpit {
                     renderer.draw_cockpit(
@@ -4832,7 +4971,7 @@ impl App {
                             px.height as usize,
                             &block.reason,
                             &block.shown,
-                            block.confirm_uri.is_some(),
+                            block.confirm.is_some(),
                         );
                     }
                 }
@@ -4995,7 +5134,7 @@ impl ApplicationHandler<UserEvent> for App {
             // caption buttons and handle drag/resize ourselves below.
             .with_decorations(false)
             .with_undecorated_shadow(true)
-            .with_title("Bayan — بيان")
+            .with_title(elevate::window_title(self.elevated))
             .with_window_icon(icon)
             .with_visible(visible)
             .with_inner_size(LogicalSize::new(1100.0, 700.0));
@@ -5044,12 +5183,21 @@ impl ApplicationHandler<UserEvent> for App {
         self.gpu = Some(gpu);
         self.window = Some(window.clone());
         self.report_config_load_error();
+        self.apply_admin_notice();
         self.apply_opacity(); // the configured window alpha, from frame one
         self.apply_window_frame();
         if let Some(h) = self.hwnd() {
             // the tray icon: toast anchor + summon target
             if !toast::init(h) {
                 eprintln!("bayan: tray icon registration failed — no toasts");
+            }
+            if let Ok(exe) = std::env::current_exe() {
+                if let Ok(path) = cli::exe_display(&exe) {
+                    let app_id = jumplist::app_user_model_id(&path);
+                    if let Err(error) = jumplist::set_window_app_id(h, &app_id) {
+                        eprintln!("bayan: window AppUserModelID: {error}");
+                    }
+                }
             }
         }
         // first frame NOW: a dark window on screen beats a frozen launcher.
@@ -5092,6 +5240,11 @@ impl ApplicationHandler<UserEvent> for App {
                             format!("{} — {}", tr("تبويب جديد", "New tab"), shell.label()),
                         )
                     }));
+                }
+                if let Err(error) =
+                    jumplist::refresh(&profiles, elevate::may_write_bayan(self.elevated))
+                {
+                    eprintln!("bayan: jump list: {error}");
                 }
                 self.shell_profiles = profiles;
                 self.shell_profiles_ready = true;
@@ -5307,7 +5460,21 @@ impl ApplicationHandler<UserEvent> for App {
                 self.blocked_link = Some(BlockedLink {
                     reason,
                     shown: link::preview(&shown, 160),
-                    confirm_uri: None,
+                    confirm: None,
+                    is_app_error: false,
+                });
+                self.clear_link_hover();
+                self.request_redraw();
+            }
+            UserEvent::LinkConfirm { path } => {
+                self.blocked_link = Some(BlockedLink {
+                    reason: tr(
+                        "لا يوجد محرّر في Program Files",
+                        "No editor under Program Files",
+                    )
+                    .to_string(),
+                    shown: path.clone(),
+                    confirm: Some(link::ConfirmOpen::RevealOnly(path)),
                     is_app_error: false,
                 });
                 self.clear_link_hover();
@@ -5536,6 +5703,7 @@ struct Startup {
     /// `Some` when `-p` already ran shell detection, so the window does not
     /// detect a second time.
     shells: Option<Vec<shells::Shell>>,
+    elevated: bool,
 }
 
 fn main() -> std::process::ExitCode {
@@ -5569,26 +5737,83 @@ fn dispatch() -> Result<(), String> {
             present(context_menu::REMOVED_NOTE);
             Ok(())
         }
+        cli::CliAction::RegisterTerminalHandoff => {
+            handoff::set_enabled(true)?;
+            present(handoff::REGISTERED_NOTE);
+            Ok(())
+        }
+        cli::CliAction::UnregisterTerminalHandoff => {
+            handoff::set_enabled(false)?;
+            present(handoff::REMOVED_NOTE);
+            Ok(())
+        }
+        cli::CliAction::Handoff => handoff::serve(),
         cli::CliAction::Launch(launch) => {
-            // Gate the folder before shell detection: a refused path should
-            // not wait on `wsl.exe`.
-            let directory = match launch.directory {
-                Some(raw) => Some(cli::gate_start_dir(&raw)?),
-                None => None,
-            };
-            let (profile_command, shells) = match launch.profile {
-                Some(name) => {
+            let requested = launch.elevated;
+            // The badge follows the token, including a window Explorer
+            // started with "Run as administrator" and no `--elevated`.
+            // A failed token query counts as elevated, so the restrictions
+            // stay on. Only the flag relaunches, and only when the query
+            // succeeds and says this process is not elevated.
+            let elevated = requested || elevate::process_is_elevated();
+            // `--elevated` relaunches through UAC unless this process is
+            // already the elevated one. The child receives only the
+            // allowlisted argv, then resolves `-p` from its own detection.
+            let launch = if requested {
+                let forwarded = elevate::forward_args(&launch)?;
+                // A name that is not installed fails before the UAC prompt.
+                // The command that goes with it is not kept: the elevated
+                // process detects its shells again and matches the name.
+                if let Some(name) = launch.profile.as_deref() {
                     let found = shells::detect();
-                    let shell = shells::require_profile(&found, &name)?;
-                    (Some(shell.command.clone()), Some(found))
+                    shells::require_profile_by_name(&found, name)?;
                 }
-                None => (None, None),
+                if !elevate::process_is_elevated() {
+                    let exe = std::env::current_exe()
+                        .map_err(|error| format!("could not find bayan.exe: {error}"))?;
+                    elevate::relaunch(&exe, &forwarded)?;
+                    return Ok(());
+                }
+                match cli::parse(forwarded)? {
+                    cli::CliAction::Launch(clean) => clean,
+                    _ => {
+                        return Err("elevation relaunch was not a launch".into());
+                    }
+                }
+            } else {
+                launch
+            };
+            // Gate the folder before shell detection: a refused path should
+            // not wait on `wsl.exe`. An elevated launch has no folder.
+            let directory = match launch.directory {
+                Some(raw) if !elevated => Some(cli::gate_start_dir(&raw)?),
+                Some(_) | None => None,
+            };
+            let (profile_command, shells) = if elevated {
+                let found = shells::detect();
+                let command = match launch.profile.as_deref() {
+                    Some(name) => shells::require_profile_by_name(&found, name)?
+                        .command
+                        .clone(),
+                    None => shells::elevated_default_command(&found),
+                };
+                (Some(command), Some(found))
+            } else {
+                match launch.profile {
+                    Some(name) => {
+                        let found = shells::detect();
+                        let shell = shells::require_profile(&found, &name)?;
+                        (Some(shell.command.clone()), Some(found))
+                    }
+                    None => (None, None),
+                }
             };
             run(Startup {
                 directory,
                 profile_command,
-                command: launch.command,
+                command: if elevated { None } else { launch.command },
                 shells,
+                elevated,
             })
         }
     }
@@ -5605,6 +5830,14 @@ fn cli_start_dir(
 
 fn run(startup: Startup) -> Result<(), String> {
     harden_dll_search();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Ok(path) = cli::exe_display(&exe) {
+            let app_id = jumplist::app_user_model_id(&path);
+            if let Err(error) = jumplist::set_process_app_id(&app_id) {
+                eprintln!("bayan: AppUserModelID: {error}");
+            }
+        }
+    }
     prof::init();
     prof::mark("main start");
     use winit::platform::windows::EventLoopBuilderExtWindows;
@@ -5651,8 +5884,10 @@ fn run(startup: Startup) -> Result<(), String> {
         cfg.arabic_font = v.to_str().map(str::to_string);
     }
     // plugins load once, before the first renderer, so a plugin theme named in
-    // the config resolves on the very first frame
-    let plug = plugins::init(&cfg.disabled_plugins());
+    // the config resolves on the very first frame. An elevated token loads
+    // none: ~/.bayan/plugins is writable before UAC, and a send would reach
+    // the elevated shell after the confirm card.
+    let plug = plugins::init(startup.elevated, &cfg.disabled_plugins());
     if !plug.failed.is_empty() {
         eprintln!(
             "bayan: {} plugin(s) failed — see {}",
@@ -5668,7 +5903,17 @@ fn run(startup: Startup) -> Result<(), String> {
             eprintln!("bayan: Explorer menu: {error}");
         }
     }
+    if let Some(enabled) = cfg.terminal_handoff {
+        if let Err(error) = handoff::set_enabled(enabled) {
+            eprintln!("bayan: terminal handoff: {error}");
+        }
+    }
     lang::set(cfg.lang());
+    if let Some(shells) = &startup.shells {
+        if let Err(error) = jumplist::refresh(shells, elevate::may_write_bayan(startup.elevated)) {
+            eprintln!("bayan: jump list: {error}");
+        }
+    }
     // debug hook: BAYAN_LANG=en starts in English without touching
     // config.json, so the English layout can be screenshot-verified
     if let Some(v) = dev_hook("BAYAN_LANG") {
@@ -5742,6 +5987,7 @@ fn run(startup: Startup) -> Result<(), String> {
         start_dir: startup.directory,
         start_profile_command: startup.profile_command,
         start_command: startup.command,
+        elevated: startup.elevated,
     };
     let result = event_loop.run_app(&mut app);
     if let Some(error) = app.startup_error {
@@ -7112,5 +7358,123 @@ mod m38_tests {
         );
         let old = r#"{"tabs":[{"cwds":[null]}],"active":0}"#;
         assert_eq!(parse_state(old).unwrap().tabs[0].name, None);
+    }
+
+    #[test]
+    fn an_elevated_rename_or_group_change_does_not_write_session_json() {
+        let dir = std::env::temp_dir().join(format!("bayan-session-elev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.json");
+        std::fs::write(&path, b"ORIGINAL").unwrap();
+        super::SESSION_FILE.with(|slot| *slot.borrow_mut() = Some(path.clone()));
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event()
+            .with_any_thread(true)
+            .build()
+            .expect("event loop");
+        let mut app = super::session_app(event_loop.create_proxy(), true);
+        app.rename_tab(Some("مسؤول".into()));
+        app.rename_group(Some("مجموعة".into()));
+        app.move_tab_to_group(None);
+        app.blocked_link = Some(BlockedLink {
+            reason: "load".into(),
+            shown: "config.json is unreadable".into(),
+            confirm: None,
+            is_app_error: true,
+        });
+        app.apply_admin_notice();
+        let both = app
+            .blocked_link
+            .as_ref()
+            .expect("config error and admin notice");
+        assert!(both.shown.contains("config.json"));
+        assert!(both.shown.contains("الإضافات"));
+        app.open_posh();
+        SESSION_FILE.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(std::fs::read(&path).unwrap(), b"ORIGINAL");
+        assert!(app.posh.is_none());
+        let card = app.blocked_link.as_ref().expect("the picker refusal");
+        assert!(card.shown.contains("منتقي"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+fn session_app(proxy: EventLoopProxy<UserEvent>, elevated: bool) -> App {
+    App {
+        posh: None,
+        last_toast: None,
+        mru: mru::Mru::new(),
+        groups: groups::Groups::new(),
+        spawn_group: None,
+        palette: None,
+        shell_profiles: Vec::new(),
+        shell_profiles_ready: true,
+        startup_pending: false,
+        last_strip_click: None,
+        proxy,
+        window: None,
+        gpu: None,
+        renderer: None,
+        tabs: vec![Tab {
+            panes: Vec::new(),
+            layout: layout::Node::single(),
+            focused: 0,
+            title: "بيان".into(),
+            name: None,
+            attention: false,
+            broadcast: false,
+            zoomed: false,
+            group: 0,
+        }],
+        active: 0,
+        next_id: 1,
+        size: TermSize { cols: 80, rows: 24 },
+        modifiers: ModifiersState::default(),
+        first_frame: false,
+        first_output: false,
+        last_frame: Vec::new(),
+        last_frame_size: None,
+        cursor_pos: PhysicalPosition::new(0.0, 0.0),
+        ime_spot: None,
+        ime_area_reset: false,
+        mouse: mouse::Route::default(),
+        sel_pane: 0,
+        drag_divider: None,
+        cockpit: false,
+        cockpit_sel: 0,
+        pending_paste: None,
+        pending_close: None,
+        swallow_guard_release: false,
+        link_hover: None,
+        blocked_link: None,
+        link_cache: link::SpanCache::default(),
+        last_input: Instant::now(),
+        blink_drawn_on: true,
+        settings: None,
+        focused: false,
+        clicks: ClickTracker::new(),
+        wheel_accum: 0.0,
+        search: None,
+        clipboard: None,
+        auto_follow: true,
+        claude_manual: false,
+        config: config::UserConfig::default(),
+        config_load_error: None,
+        startup_error: None,
+        keymap: Vec::new(),
+        shortcuts: None,
+        atlas_generation: 0,
+        font_delta: 0.0,
+        renderer_building: false,
+        inflight_delta: 0.0,
+        normal_geom: None,
+        keys_held_away: Vec::new(),
+        debug_paste: None,
+        start_dir: None,
+        start_profile_command: None,
+        start_command: None,
+        elevated,
     }
 }

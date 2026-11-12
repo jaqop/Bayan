@@ -2041,6 +2041,39 @@ fn expand_env(path: &str) -> String {
     out
 }
 
+/// The `-Command` script for a PowerShell Bayan starts itself.
+///
+/// UTF-8 and the prompt marks stay. The oh-my-posh line is omitted when
+/// `elevated` is set, even if `theme` is `Some`: that path comes from
+/// `$PROFILE` or `POSH_THEME`, and `oh-my-posh` would be resolved from the
+/// user's `PATH`. A theme `command` segment or a planted binary would then
+/// run as administrator, with no confirm card.
+pub(crate) fn powershell_setup(elevated: bool, theme: Option<&str>, capture_nonce: bool) -> String {
+    let mut setup = String::new();
+    if capture_nonce {
+        setup.push_str(&nonce_capture_ps());
+    }
+    setup.push_str(
+        "$OutputEncoding=[Console]::InputEncoding=[Console]::OutputEncoding=\
+         [Text.UTF8Encoding]::new();",
+    );
+    if !elevated {
+        if let Some(theme) = theme.filter(|theme| !theme.is_empty()) {
+            setup.push_str(&format!(
+                " $ErrorActionPreference='SilentlyContinue'; \
+                 & {{oh-my-posh init powershell --config '{}' | Invoke-Expression}} 2>$null; \
+                 $ErrorActionPreference='Continue';",
+                powershell_escape_single(theme)
+            ));
+        }
+    }
+    if capture_nonce {
+        setup.push(' ');
+        setup.push_str(&shell_integration_ps(NONCE_PS_EXPR));
+    }
+    setup
+}
+
 fn detect_posh_theme() -> Option<String> {
     if let Ok(t) = std::env::var("POSH_THEME") {
         if !t.is_empty() && std::path::Path::new(&t).exists() {
@@ -2495,6 +2528,9 @@ impl Session {
         // process, and Bayan does not append its PowerShell or cmd wrapper.
         // `None` is every other launch, including a `-p` profile.
         raw_argv: Option<&[String]>,
+        // This process token is elevated. PowerShell is not given an
+        // oh-my-posh line.
+        elevated: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let prompt_nonce = fresh_prompt_nonce();
         let pty = native_pty_system();
@@ -2521,6 +2557,15 @@ impl Session {
             return Err(
                 "refusing to spawn wsl.exe by a bare name; System32\\wsl.exe is not there".into(),
             );
+        };
+        let prog = if elevated {
+            crate::shells::resolve_elevated_pwsh(
+                prog.as_str(),
+                crate::link::known_program_files().as_deref(),
+                |path| path.is_file(),
+            )?
+        } else {
+            prog
         };
         let mut cmd = CommandBuilder::new(prog);
         for a in &args {
@@ -2552,33 +2597,15 @@ impl Session {
             // us: UTF-8 (Arabic!) and the user's prompt theme, auto-detected.
             cmd.args(["-NoProfile", "-NoExit", "-Command"]);
             // R-08: the nonce rides in the environment, is taken before
-            // anything else runs (oh-my-posh init spawns a process), and is
-            // then removed, so it is in neither the command line nor any
-            // child's environment
-            let mut setup = String::new();
+            // anything else runs, and is then removed, so it is in neither
+            // the command line nor any child's environment.
             if prompt_nonce != NONCE_OFF {
                 cmd.env(NONCE_ENV, &prompt_nonce);
-                setup.push_str(&nonce_capture_ps());
             }
-            setup.push_str(
-                "$OutputEncoding=[Console]::InputEncoding=[Console]::OutputEncoding=\
-                 [Text.UTF8Encoding]::new();",
-            );
-            if let Some(theme) = detect_posh_theme() {
-                setup.push_str(&format!(
-                    " $ErrorActionPreference='SilentlyContinue'; \
-                     & {{oh-my-posh init powershell --config '{}' | Invoke-Expression}} 2>$null; \
-                     $ErrorActionPreference='Continue';",
-                    powershell_escape_single(&theme)
-                ));
-            }
-            // NEW-05: with no random nonce the wrapper is left out, so the
-            // pane runs without prompt marks (like cmd) instead of trusting
-            // marks anyone could forge
-            if prompt_nonce != NONCE_OFF {
-                setup.push(' ');
-                setup.push_str(&shell_integration_ps(NONCE_PS_EXPR));
-            }
+            // Elevated: do not read POSH_THEME or $PROFILE, and do not name
+            // oh-my-posh. The setup string is `powershell_setup`.
+            let theme = if elevated { None } else { detect_posh_theme() };
+            let setup = powershell_setup(elevated, theme.as_deref(), prompt_nonce != NONCE_OFF);
             cmd.arg(setup);
         } else if raw_argv.is_none() && shell_family(shell) == ShellFamily::Cmd {
             // UTF-8 code page so Arabic paths survive; no OSC 133 marks
@@ -3174,6 +3201,25 @@ pub fn regex_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_elevated_powershell_setup_does_not_inject_oh_my_posh() {
+        let theme = r"C:\Users\me\.poshthemes\evil.omp.json";
+        let elevated = powershell_setup(true, Some(theme), true);
+        assert!(
+            !elevated.to_ascii_lowercase().contains("oh-my-posh"),
+            "{elevated}"
+        );
+        assert!(!elevated.contains("Invoke-Expression"), "{elevated}");
+        assert!(
+            elevated.contains("UTF8Encoding"),
+            "UTF-8 still has to be set"
+        );
+        let ordinary = powershell_setup(false, Some(theme), true);
+        assert!(ordinary.contains("oh-my-posh"));
+        assert!(ordinary.contains("Invoke-Expression"));
+        assert!(ordinary.contains("evil.omp.json"));
+    }
 
     #[test]
     fn a_panic_holding_the_term_lock_does_not_poison_it() {

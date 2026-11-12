@@ -517,12 +517,19 @@ impl App {
         let may_open = self
             .blocked_link
             .as_ref()
-            .is_some_and(|c| c.confirm_uri.is_some());
+            .is_some_and(|c| c.confirm.is_some());
         match link::card_decision(enter, escape, may_open) {
             link::CardDecision::Open => {
                 if let Some(card) = self.blocked_link.take() {
-                    if let Some(uri) = card.confirm_uri {
-                        self.spawn_link_open(link::Action::Browse(uri));
+                    if let Some(open) = card.confirm {
+                        let action = link::confirm_enter(&open);
+                        if link::confirm_enter_settles(&open) {
+                            self.spawn_link_open(action);
+                        } else if let link::Action::Reveal(path) = action {
+                            // Direct explorer /select. settle would classify
+                            // config.json as an association open.
+                            self.spawn_reveal_only(&path);
+                        }
                     }
                 }
                 self.request_redraw();
