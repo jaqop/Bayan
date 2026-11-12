@@ -86,6 +86,13 @@ pub struct UserConfig {
     /// "pwsh.exe", "cmd.exe". Live sessions keep their shell.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
+    /// When set, startup registers (`true`) or removes (`false`) the
+    /// per-user Explorer «افتح بيان هنا» entries, and skips the write when
+    /// they already match. Absent: leave the menu as it is. The same work as
+    /// `bayan --register-context-menu`. HKCU only; there is no settings-panel
+    /// row, the same way `osc52` is config-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explorer_context_menu: Option<bool>,
     /// Hide the tab bar while only one tab is open (default off).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hide_single_tab: Option<bool>,
@@ -614,5 +621,14 @@ mod tests {
                 serde_json::from_str(&format!(r#"{{"osc52":"{text}"}}"#)).unwrap();
             assert!(!cfg.osc52_read_enabled(), "{text} must not enable a read");
         }
+    }
+
+    #[test]
+    fn explorer_context_menu_is_opt_in_and_omitted_when_unset() {
+        assert!(UserConfig::default().explorer_context_menu.is_none());
+        let on: UserConfig = serde_json::from_str(r#"{"explorer_context_menu":true}"#).unwrap();
+        assert_eq!(on.explorer_context_menu, Some(true));
+        let off: UserConfig = serde_json::from_str(r#"{"explorer_context_menu":false}"#).unwrap();
+        assert_eq!(off.explorer_context_menu, Some(false));
     }
 }

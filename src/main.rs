@@ -10,7 +10,9 @@
 mod bidi;
 mod bidi_ctl;
 mod chrome;
+mod cli;
 mod config;
+mod context_menu;
 mod copymode;
 mod gpu;
 mod groups;
@@ -1547,7 +1549,14 @@ struct App {
     /// needs cell metrics to land on a pane.
     debug_paste: Option<String>,
     /// `--cwd`'s folder, already gated, until the first tab opens in it.
+    /// `#45`: with saved tabs restored, they come back first and this folder
+    /// opens as the active extra tab.
     start_dir: Option<String>,
+    /// Resolved `-p` command line for that same tab. `None` keeps the
+    /// configured shell. Ignored when `start_command` is set.
+    start_profile_command: Option<String>,
+    /// argv after `--`. When set, that program is the tab's process.
+    start_command: Option<Vec<String>>,
 }
 
 impl App {
@@ -2137,7 +2146,7 @@ impl App {
                     .session()
                     .and_then(|s| s.meta.lock_or_recover().spawn_cwd());
                 let before = self.tabs.len();
-                self.spawn_tab_command(cwd, &command);
+                self.spawn_tab_command(cwd, &command, None);
                 if self.tabs.len() == before && self.blocked_link.is_none() {
                     self.blocked_link = Some(BlockedLink {
                         reason: tr("تعذر تشغيل الطرفية", "Could not start the shell").into(),
@@ -2731,10 +2740,15 @@ impl App {
     }
 
     fn spawn_pane(&mut self, cwd: Option<&str>) -> Option<Pane> {
-        self.spawn_pane_command(cwd, &self.config.shell_program())
+        self.spawn_pane_command(cwd, &self.config.shell_program(), None)
     }
 
-    fn spawn_pane_command(&mut self, cwd: Option<&str>, command: &str) -> Option<Pane> {
+    fn spawn_pane_command(
+        &mut self,
+        cwd: Option<&str>,
+        command: &str,
+        raw: Option<&[String]>,
+    ) -> Option<Pane> {
         let id = self.next_id;
         self.next_id += 1;
         match Session::spawn(
@@ -2745,6 +2759,7 @@ impl App {
             self.config.scrollback_lines(),
             command,
             self.config.kitty_protocol_on(),
+            raw,
         ) {
             Ok(session) => Some(Pane {
                 id,
@@ -2761,10 +2776,10 @@ impl App {
     }
 
     fn spawn_tab(&mut self, cwd: Option<String>) {
-        self.spawn_tab_command(cwd, &self.config.shell_program());
+        self.spawn_tab_command(cwd, &self.config.shell_program(), None);
     }
 
-    fn spawn_tab_command(&mut self, cwd: Option<String>, command: &str) {
+    fn spawn_tab_command(&mut self, cwd: Option<String>, command: &str, raw: Option<&[String]>) {
         // Same gate as spawn: a restored UNC path must not become the tab
         // title either. accept_local_cwd does not touch the filesystem.
         let cwd = cwd.and_then(|c| term::accept_local_cwd(&c));
@@ -2777,7 +2792,7 @@ impl App {
             .spawn_group
             .take()
             .unwrap_or_else(|| self.active_group());
-        if let Some(pane) = self.spawn_pane_command(cwd.as_deref(), command) {
+        if let Some(pane) = self.spawn_pane_command(cwd.as_deref(), command, raw) {
             // this becomes the active tab without switch_tab, so a button
             // held on the previous tab has to go up first
             self.abandon_mouse();
@@ -3265,18 +3280,31 @@ impl App {
         // start it immediately with a default grid; the exact grid follows
         // once cell metrics exist (EasyTer starts 110x32 the same way).
         // Start one fresh tab unless saved-tab restoration is explicitly enabled.
-        match self.start_dir.take() {
-            // `--cwd` adds the active tab; saved tabs still come back first,
-            // so the next save does not drop them
-            Some(dir) => {
-                if self.config.restore_tabs.unwrap_or(false)
-                    && load_saved_state().is_some_and(|s| !s.tabs.is_empty())
-                {
-                    self.restore_state();
-                }
-                self.spawn_tab(Some(dir));
+        // `#45` opens `--cwd` as the active tab after any restored tabs. A
+        // profile or a `--` command rides on that same tab; with neither, and
+        // no folder, startup is unchanged.
+        let explicit = self.start_dir.is_some()
+            || self.start_profile_command.is_some()
+            || self.start_command.is_some();
+        if explicit {
+            if self.config.restore_tabs.unwrap_or(false)
+                && load_saved_state().is_some_and(|s| !s.tabs.is_empty())
+            {
+                self.restore_state();
             }
-            None => self.restore_state(),
+            let default = self.config.shell_program();
+            let process = cli::launch_process(
+                self.start_profile_command.as_deref(),
+                self.start_command.as_deref(),
+                &default,
+            );
+            self.spawn_tab_command(
+                self.start_dir.clone(),
+                &process.command_line,
+                process.raw_argv.as_deref(),
+            );
+        } else {
+            self.restore_state();
         }
         // debug hook: BAYAN_SPLIT=1 opens the first tab pre-split, so the
         // pane machinery can be verified without injecting any input
@@ -3411,7 +3439,7 @@ impl App {
                     self.spawn_group = Some(group as u32);
                     let cwd = cwds.next().flatten();
                     let first = shell();
-                    self.spawn_tab_command(cwd.clone(), &first);
+                    self.spawn_tab_command(cwd.clone(), &first, None);
                     if self.tabs.len() == before && first != default {
                         // the saved shell is gone (PowerShell 7 uninstalled,
                         // a WSL distro removed): the tab still comes back
@@ -3432,7 +3460,7 @@ impl App {
                         // re-split with the saved axis; weights come after
                         let cmd = shell();
                         let pane = self
-                            .spawn_pane_command(cwd.as_deref(), &cmd)
+                            .spawn_pane_command(cwd.as_deref(), &cmd, None)
                             .or_else(|| self.spawn_pane(cwd.as_deref()));
                         if let Some(pane) = pane {
                             if let Some(t) = self.tabs.last_mut() {
@@ -5476,8 +5504,42 @@ fn show_error_dialog(
     }
 }
 
+fn show_info_dialog(text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+
+    let title: Vec<u16> = "Bayan".encode_utf16().chain(Some(0)).collect();
+    let text: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    // SAFETY: both buffers are NUL-terminated and live for the call.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
+/// Help, version, and menu registration have no terminal yet. A console
+/// parent (cmd) sees the text; Explorer gets a dialog instead of silence.
+fn present(text: &str) {
+    if !cli::write_console(text) {
+        show_info_dialog(text);
+    }
+}
+
+/// What a normal launch carries into the window. The folder is already gated.
+struct Startup {
+    directory: Option<String>,
+    profile_command: Option<String>,
+    command: Option<Vec<String>>,
+    /// `Some` when `-p` already ran shell detection, so the window does not
+    /// detect a second time.
+    shells: Option<Vec<shells::Shell>>,
+}
+
 fn main() -> std::process::ExitCode {
-    match run() {
+    match dispatch() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("bayan: {error}");
@@ -5487,48 +5549,62 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// `-d <folder>`, `--cwd <folder>` or `--cwd=<folder>`: where the first tab
-/// opens. A relative folder is taken from the current one. The folder goes
-/// through the start-directory gate, and a refused one is an error rather
-/// than a quiet fall back to home: the user named it.
+fn dispatch() -> Result<(), String> {
+    match cli::parse(std::env::args_os().skip(1))? {
+        cli::CliAction::Help => {
+            present(cli::HELP);
+            Ok(())
+        }
+        cli::CliAction::Version => {
+            present(&format!("bayan {}", env!("CARGO_PKG_VERSION")));
+            Ok(())
+        }
+        cli::CliAction::RegisterContextMenu => {
+            context_menu::set_enabled(true)?;
+            present(context_menu::REGISTERED_NOTE);
+            Ok(())
+        }
+        cli::CliAction::UnregisterContextMenu => {
+            context_menu::set_enabled(false)?;
+            present(context_menu::REMOVED_NOTE);
+            Ok(())
+        }
+        cli::CliAction::Launch(launch) => {
+            // Gate the folder before shell detection: a refused path should
+            // not wait on `wsl.exe`.
+            let directory = match launch.directory {
+                Some(raw) => Some(cli::gate_start_dir(&raw)?),
+                None => None,
+            };
+            let (profile_command, shells) = match launch.profile {
+                Some(name) => {
+                    let found = shells::detect();
+                    let shell = shells::require_profile(&found, &name)?;
+                    (Some(shell.command.clone()), Some(found))
+                }
+                None => (None, None),
+            };
+            run(Startup {
+                directory,
+                profile_command,
+                command: launch.command,
+                shells,
+            })
+        }
+    }
+}
+
+/// The directory half of [`cli::parse`], gated the way `#45` gated it.
+/// The test below calls this so those cases stay on the same function.
+#[cfg(test)]
 fn cli_start_dir(
     args: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> Result<Option<String>, String> {
-    const USAGE: &str = "usage: bayan [-d | --cwd <folder>]";
-    let text = |a: std::ffi::OsString| {
-        a.into_string()
-            .map_err(|_| format!("an argument is not valid Unicode\n{USAGE}"))
-    };
-    let mut args = args.into_iter();
-    let mut raw = None;
-    while let Some(a) = args.next() {
-        let a = text(a)?;
-        raw = Some(match a.as_str() {
-            "-d" | "--cwd" => text(
-                args.next()
-                    .ok_or_else(|| format!("{a} needs a folder\n{USAGE}"))?,
-            )?,
-            _ => match a.strip_prefix("--cwd=") {
-                Some(v) => v.to_string(),
-                None => return Err(format!("unknown argument {a:?}\n{USAGE}")),
-            },
-        });
-    }
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    // GetFullPathNameW: string work only, so a UNC name is not opened here
-    std::path::absolute(&raw)
-        .ok()
-        .and_then(|p| p.to_str().and_then(term::accept_local_cwd))
-        .filter(|d| term::usable_spawn_dir(d))
-        .map(Some)
-        .ok_or_else(|| format!("--cwd {raw:?} is not a local folder Bayan can open"))
+    cli::start_directory(args)
 }
 
-fn run() -> Result<(), String> {
+fn run(startup: Startup) -> Result<(), String> {
     harden_dll_search();
-    let start_dir = cli_start_dir(std::env::args_os().skip(1))?;
     prof::init();
     prof::mark("main start");
     use winit::platform::windows::EventLoopBuilderExtWindows;
@@ -5557,10 +5633,13 @@ fn run() -> Result<(), String> {
     event_loop.set_control_flow(ControlFlow::Wait);
     prof::mark("event loop built");
     let proxy = event_loop.create_proxy();
-    let profiles_proxy = proxy.clone();
-    std::thread::spawn(move || {
-        let _ = profiles_proxy.send_event(UserEvent::ShellProfiles(shells::detect()));
-    });
+    let shells_ready = startup.shells.is_some();
+    if !shells_ready {
+        let profiles_proxy = proxy.clone();
+        std::thread::spawn(move || {
+            let _ = profiles_proxy.send_event(UserEvent::ShellProfiles(shells::detect()));
+        });
+    }
     let (mut cfg, config_load_error) = match config::load() {
         Ok(cfg) => (cfg, None),
         Err(error) => (config::UserConfig::default(), Some(error.to_string())),
@@ -5581,6 +5660,14 @@ fn run() -> Result<(), String> {
             config::bayan_dir().join("plugins.log").display()
         );
     }
+    // Optional installer / settings hook: the key is absent unless someone
+    // set it. Failure here must not stop the terminal from opening.
+    if let Some(enabled) = cfg.explorer_context_menu {
+        // Skip the write when the verbs already match this exe, or are already gone.
+        if let Err(error) = context_menu::sync_enabled(enabled) {
+            eprintln!("bayan: Explorer menu: {error}");
+        }
+    }
     lang::set(cfg.lang());
     // debug hook: BAYAN_LANG=en starts in English without touching
     // config.json, so the English layout can be screenshot-verified
@@ -5596,8 +5683,8 @@ fn run() -> Result<(), String> {
         groups: groups::Groups::new(),
         spawn_group: None,
         palette: None,
-        shell_profiles: Vec::new(),
-        shell_profiles_ready: false,
+        shell_profiles: startup.shells.unwrap_or_default(),
+        shell_profiles_ready: shells_ready,
         startup_pending: true,
         last_strip_click: None,
         proxy,
@@ -5652,7 +5739,9 @@ fn run() -> Result<(), String> {
         normal_geom: None,
         keys_held_away: Vec::new(),
         debug_paste: None,
-        start_dir,
+        start_dir: startup.directory,
+        start_profile_command: startup.profile_command,
+        start_command: startup.command,
     };
     let result = event_loop.run_app(&mut app);
     if let Some(error) = app.startup_error {

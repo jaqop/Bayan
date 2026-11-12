@@ -296,6 +296,40 @@ pub fn is_restorable(command: &str, installed: &[Shell]) -> bool {
     }
 }
 
+/// The shell a `-p` / `--profile` name refers to.
+///
+/// Matches the stored command, then the name, then the English label of the
+/// fast PowerShell entry (`PowerShell (fast)`), whose stored name is Arabic.
+/// ASCII case does not matter. An empty or unknown name is `None`.
+pub fn find_profile<'a>(installed: &'a [Shell], query: &str) -> Option<&'a Shell> {
+    let query = query.trim();
+    if query.is_empty() {
+        return None;
+    }
+    let same = |candidate: &str| candidate == query || candidate.eq_ignore_ascii_case(query);
+    installed
+        .iter()
+        .find(|shell| same(&shell.command))
+        .or_else(|| installed.iter().find(|shell| same(&shell.name)))
+        .or_else(|| {
+            installed
+                .iter()
+                .find(|shell| shell.command == FAST_POWERSHELL && same("PowerShell (fast)"))
+        })
+}
+
+/// [`find_profile`], or an error that names what is installed.
+pub fn require_profile<'a>(installed: &'a [Shell], query: &str) -> Result<&'a Shell, String> {
+    find_profile(installed, query).ok_or_else(|| {
+        let names = installed
+            .iter()
+            .map(|shell| shell.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("unknown profile {query:?}; installed: {names}")
+    })
+}
+
 /// Friendly label for a stored command line, for the settings panel. Falls
 /// back to a trimmed command so a hand-edited config.json still reads sanely.
 /// `found` is the app's one background `detect()`: this runs inside the frame
@@ -589,5 +623,43 @@ mod tests {
             "wsl discovery must take the System32 path"
         );
         assert!(!prod.contains("Command::new(\"wsl\")"));
+    }
+
+    #[test]
+    fn a_profile_name_or_command_selects_one_shell() {
+        let installed = vec![
+            Shell::new("PowerShell", "powershell.exe"),
+            Shell::new("PowerShell سريع", FAST_POWERSHELL),
+            Shell::new("Command Prompt", "cmd.exe"),
+            Shell::new("WSL · Ubuntu", r"C:\Windows\System32\wsl.exe -d Ubuntu"),
+        ];
+        assert_eq!(
+            find_profile(&installed, "PowerShell").map(|s| s.command.as_str()),
+            Some("powershell.exe")
+        );
+        assert_eq!(
+            find_profile(&installed, "powershell.exe").map(|s| s.command.as_str()),
+            Some("powershell.exe")
+        );
+        assert_eq!(
+            find_profile(&installed, "PowerShell سريع").map(|s| s.command.as_str()),
+            Some(FAST_POWERSHELL)
+        );
+        assert_eq!(
+            find_profile(&installed, "PowerShell (fast)").map(|s| s.command.as_str()),
+            Some(FAST_POWERSHELL)
+        );
+        assert_eq!(
+            find_profile(&installed, "command prompt").map(|s| s.name.as_str()),
+            Some("Command Prompt")
+        );
+        assert_eq!(
+            find_profile(&installed, r"C:\Windows\System32\wsl.exe -d Ubuntu")
+                .map(|s| s.name.as_str()),
+            Some("WSL · Ubuntu")
+        );
+        assert!(find_profile(&installed, "no such shell").is_none());
+        assert!(find_profile(&installed, "   ").is_none());
+        assert!(require_profile(&installed, "nope").is_err());
     }
 }
