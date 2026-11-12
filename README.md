@@ -1191,15 +1191,57 @@ that turns them on. Direct transmission (`t=d`) accepts raw RGB (`f=24`),
 RGBA (`f=32`) and PNG (`f=100`), including chunked `m=1` / `m=0`. iTerm2
 payloads are PNG.
 
-ConPTY is created **without** `PSEUDOCONSOLE_PASSTHROUGH_MODE` (`0x8`).
-The flags are inherit-cursor, the resize quirk, and Win32 input mode
-(`vendor/portable-pty/src/win/psuedocon.rs`). In that mode conhost parses
-DCS and APC and does not forward them, so a real Windows console host will
-not deliver Sixel or Kitty graphics. OSC is forwarded, which is why OSC 7,
-9, 52 and 133 already work, so an iTerm2 `OSC 1337` is not stripped the way
-DCS and APC are. A 96×48 PNG (224 base64 bytes) printed with `cmd /c type`
-arrived intact through conhost on Windows 11 26200; larger payloads against
-conhost's OSC limits have not been checked (see wezterm#3624 and Rio#1764).
+Inbox ConPTY (kernel32 `CreatePseudoConsole`, System32 `conhost.exe`)
+parses DCS and APC and does not forward them, so Sixel and Kitty graphics
+do not arrive on Windows 11 24H2/25H2 (builds 26100 and 26200). OSC is
+forwarded, which is why OSC 7, 9, 52 and 133 already work, and why an
+iTerm2 `OSC 1337` is not stripped the way DCS and APC are. A 96×48 PNG
+(224 base64 bytes) printed with `cmd /c type` arrived intact through
+conhost on Windows 11 26200; larger payloads against conhost's OSC limits
+have not been checked (see wezterm#3624 and Rio#1764).
+
+Bit `0x8` is not how that changes. It was `PSEUDOCONSOLE_PASSTHROUGH_MODE`
+(`--passthrough`) on older OpenConsole, and on build 26100 passing it is a
+measured no-op (microsoft/terminal#7019). The ConPTY rewrite
+(microsoft/terminal#17510, Windows Terminal 1.22, August 2024) passes VT
+through by default, and the same bit is now
+`PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES`. Bayan therefore does not set it.
+Passthrough is "a `conpty.dll` whose file version is 1.22 or newer, loaded
+by absolute path from the directory that contains `bayan.exe`, and only
+when `OpenConsole.exe` is in that same directory." The current directory
+and `PATH` are not searched. A `conpty.dll` with no `OpenConsole.exe`
+beside it is ignored, which is the planted-DLL case the loader test still
+rejects. If `CreatePseudoConsole` on that DLL fails, the pane is opened
+with kernel32 and Sixel is not advertised. Primary DA stays alacritty's
+VT102 reply (`CSI ? 6 c`) until that host is actually up; then it is
+`CSI ? 64 ; 4 c` (parameter 4 is Sixel, the `64` is the level). A DLL
+older than 1.22, or one with no version resource, is not passthrough
+and is not an error: the pane still opens on kernel32. `OpenConsole.exe`
+is that directory's file only. Bayan does not search PATH or the current
+directory for it. The file has to carry a trusted Authenticode signature
+(the optional SHA-256 pin in the loader is empty, so a signature is
+required). An elevated window also leaves the pair unused when the file
+or the directory is writable by a standard user. A missing file, a failed
+check, or a host that does not start is kernel32, with no error shown. Sixel and Kitty
+use the same caps as iTerm2 (`max_bytes`, `max_width`, `max_height`, and
+the pane and session budgets). A mux reattach feeds the saved tail
+through the replay filter first, so a Kitty graphics query is dropped
+and a command that would answer is quieted (`q=2`) instead of being
+written into the live session.
+
+The pair is the MIT-licensed `Microsoft.Windows.Console.ConPTY` redistributable
+from microsoft/terminal (not committed here). WezTerm's known-good match
+is 1.24.2604.02001: 1.22 passes DCS, and 1.22 also had alt-screen and
+`pwsh` exit bugs that 1.24 fixed (wezterm#7774). Copy
+`runtimes/win-x64/native/conpty.dll` and
+`build/native/runtimes/x64/OpenConsole.exe` from the `.nupkg` next to
+`bayan.exe` (the arm64 pair on arm64). Both files, same version. Shipping
+them is a packaging decision: about 1.2 MB per architecture, and the
+install directory has to be one only the user can write, the same rule as
+the rest of the exe directory. Inbox conhost on current Windows 11 does
+not include the rewrite (the Windows 11 24H2 cutoff was before #17510;
+the in-box sync was expected at a later major release, and as of August
+2026 the built-in console's Sixel was still Insider-only).
 
 **The image never moves the cursor.** The first build reserved the image's
 rows the way the protocols ask (`ESC D` per row). Under ConPTY that was
@@ -1211,8 +1253,11 @@ disappeared. Now the image stays on the rows it arrived on and the text
 conhost prints next draws over it (images are drawn first, and a cell with
 the default background draws nothing). The cost: conhost's repaint clears
 lines with EL, and EL clears an iTerm or Sixel image it touches, so a resize
-repaint or `cls` (also all EL) removes the image. Reserving rows is worth
-revisiting only with `PSEUDOCONSOLE_PASSTHROUGH_MODE`.
+repaint or `cls` (also all EL) removes the image. Reserving rows is still
+not done when the bundled OpenConsole is the host: that host does not
+repaint the way inbox conhost does, so the reservation is the right
+follow-up once a live `img2sixel` shows the prompt painting over the
+image. It is not bit `0x8`.
 
 PNG payloads (iTerm2 and Kitty `f=100`, chunked uploads included) and Sixel
 are decoded on the reader thread before the terminal lock is taken. For a

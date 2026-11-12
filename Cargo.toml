@@ -51,7 +51,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Shell", # Shell_NotifyIcon balloons = native toasts, no WinRT
     "Win32_Storage_FileSystem", # GetShortPathNameW: ConPTY chokes on spaces in paths
     "Win32_System_Com", # CoInitializeEx on the link-open thread, before ShellExecuteW
-    "Win32_System_LibraryLoader", # SetDllDirectoryW; ConPTY comes from kernel32, not conpty.dll
+    "Win32_System_LibraryLoader", # SetDllDirectoryW; ConPTY is kernel32, or an absolute-path conpty.dll the owner placed next to the exe
     "Win32_System_ProcessStatus", # EnumProcessModules in the planted-conpty.dll test
     "Win32_System_Threading", # GetCurrentProcess for that module walk
     "Win32_Security", # TokenElevation: an elevated token does not run Lua
@@ -127,7 +127,9 @@ alacritty_terminal = { git = "https://github.com/alacritty/alacritty", rev = "54
 cosmic-text = { git = "https://github.com/pop-os/cosmic-text", rev = "4fe1195e6451d6aaa3dc383895d6fd366ea9fc7b" }
 # portable-pty 0.9 loads conpty.dll by bare name. The vendored copy resolves
 # CreatePseudoConsole / ResizePseudoConsole / ClosePseudoConsole from
-# kernel32 via LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32).
+# kernel32 via LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32), and from
+# <exe>\conpty.dll only when <exe>\OpenConsole.exe is there and the DLL
+# version is 1.22 or newer. A bare name is still never passed to the loader.
 portable-pty = { path = "vendor/portable-pty" }
 
 [lints.clippy]

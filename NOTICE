@@ -22,6 +22,20 @@ user has a monospaced Arabic font to pick in Settings → Arabic font, even
 on a PC that has none installed. It is redistributed unmodified.
 
 --------------------------------------------------------------------------
+Optional ConPTY pair — MIT, not included
+--------------------------------------------------------------------------
+
+Bayan does not redistribute `conpty.dll` or `OpenConsole.exe`. If you
+place a matched pair from the `Microsoft.Windows.Console.ConPTY` package
+next to `bayan.exe`, Bayan loads that DLL by its absolute path so Sixel
+and Kitty graphics can pass through ConPTY. Those binaries are built from
+the Windows Terminal project (https://github.com/microsoft/terminal),
+which is MIT licensed, Copyright (c) Microsoft Corporation. Shipping them
+with Bayan is a packaging choice: keep the MIT notice and the copyright
+line with the files, ship `conpty.dll` and `OpenConsole.exe` together,
+and do not substitute a DLL from any other directory.
+
+--------------------------------------------------------------------------
 Lua 5.4 — MIT
 --------------------------------------------------------------------------
 

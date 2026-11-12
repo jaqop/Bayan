@@ -3179,6 +3179,7 @@ impl App {
         self.config = runtime;
         // published once at startup; a reload has to publish it again
         term::set_osc52_read(self.config.osc52_read_enabled());
+        self.reapply_image_limits();
         if language {
             lang::set(self.config.lang());
         }
@@ -3196,6 +3197,23 @@ impl App {
         }
         self.config_notice = reload_notice(decision.replaced, &decision.deferred);
         self.request_redraw();
+    }
+
+    /// Image caps are live. The shared budget and every open pane pick up
+    /// the file's `images` block; placements already drawn stay, and the
+    /// next Sixel or Kitty image is charged against the new caps.
+    fn reapply_image_limits(&mut self) {
+        let limits = self.config.images.limits();
+        self.image_budget.set_limits(limits);
+        let limits = self.image_budget.limits();
+        for tab in &self.tabs {
+            for pane in &tab.panes {
+                pane.session
+                    .meta
+                    .lock_or_recover()
+                    .apply_image_limits(limits);
+            }
+        }
     }
 
     fn report_config_load_error(&mut self) {
@@ -7563,7 +7581,9 @@ fn blur_forgets_held_keys(focused: bool, held: &mut Vec<winit::keyboard::Physica
 /// ConPTY does not depend on this call. `CreatePseudoConsole`,
 /// `ResizePseudoConsole`, and `ClosePseudoConsole` come from `kernel32.dll`
 /// opened with `LoadLibraryExW(L"kernel32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32)`.
-/// `conpty.dll` is never passed to the loader.
+/// A bundled `conpty.dll` is loaded only by the absolute path beside this
+/// executable, and only after `OpenConsole.exe` in that same directory
+/// verifies. The bare name is never passed to the loader.
 ///
 /// NEW-04 (partly): the application directory still precedes System32 for a
 /// bare name, so a `d3d12.dll` planted beside `bayan.exe` (a Downloads
