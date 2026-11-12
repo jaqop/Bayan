@@ -7,7 +7,7 @@
 // release builds are pure GUI apps: no companion console window
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod a11y;
+mod screen_reader;
 mod bidi;
 mod bidi_ctl;
 mod chrome;
@@ -1552,33 +1552,33 @@ struct App {
     start_dir: Option<String>,
     /// UI Automation adapter. `None` until the window exists. The first
     /// client turns it on for the rest of the session on Windows.
-    a11y: Option<accesskit_winit::Adapter>,
+    reader: Option<accesskit_winit::Adapter>,
     /// Set when a client has asked for the tree. Before that, redraws do
-    /// not stamp or build. After that, [`a11y::TreePace`] decides.
-    a11y_seen_client: bool,
+    /// not stamp or build. After that, [`screen_reader::TreePace`] decides.
+    reader_seen_client: bool,
     /// Bumped when pane text changes without the cursor or the selection
     /// necessarily moving (a PTY chunk, a relayout).
-    a11y_gen: u64,
-    a11y_pace: a11y::TreePace,
+    reader_gen: u64,
+    reader_pace: screen_reader::TreePace,
     /// Trailing tree build, when a stamp changed inside the 10 Hz window.
-    a11y_tree_at: Option<Instant>,
+    reader_tree_at: Option<Instant>,
     /// Epoch for the announcer's millisecond clock.
-    a11y_origin: Instant,
+    reader_origin: Instant,
     /// When the held output burst may be spoken. `about_to_wait` wakes then.
-    a11y_deadline: Option<Instant>,
-    a11y_gate: a11y::OutputGate,
+    reader_deadline: Option<Instant>,
+    reader_gate: screen_reader::OutputGate,
     /// Document text last given to the tree. Held still across a flood.
-    a11y_bodies: Vec<a11y::PaneItem>,
+    reader_bodies: Vec<screen_reader::PaneItem>,
     /// Focused pane the gate is diffing. A change resets the gate.
-    a11y_pane: Option<u64>,
+    reader_pane: Option<u64>,
     /// Last command line seen while it was running, for the finish sentence.
-    a11y_cmd: String,
+    reader_cmd: String,
     /// OSC 133 mark already observed. A new absolute row is a new finish.
-    a11y_mark: Option<u64>,
+    reader_mark: Option<u64>,
     /// The mark present when a reader first looked is not announced.
-    a11y_mark_ready: bool,
+    reader_mark_ready: bool,
     /// Last live-region name. Unchanged text does not raise another event.
-    a11y_live: Option<String>,
+    reader_live: Option<String>,
 }
 
 impl App {
@@ -2895,7 +2895,7 @@ impl App {
         // Pane rows moved. Cached link spans would underline the wrong cells.
         self.link_cache.clear();
         // A wrap changes what the reader sees even when the cursor does not.
-        self.bump_a11y();
+        self.bump_reader();
         // resolve "hide the bar with one tab" BEFORE measuring the content
         let hide = self.config.hide_single_tab_on() && self.tabs.len() <= 1;
         if let Some(r) = self.renderer.as_mut() {
@@ -3600,7 +3600,7 @@ impl App {
         match target {
             CloseTarget::Pane(ti, pi) => {
                 let cmd = chrome_text(&self.running_command(ti, pi).unwrap_or_default());
-                a11y::close_pane_message(&cmd)
+                screen_reader::close_pane_message(&cmd)
             }
             CloseTarget::Tab(ti) => {
                 let n = self
@@ -3613,116 +3613,116 @@ impl App {
                             .count()
                     })
                     .unwrap_or(0);
-                a11y::close_count_message(n, true)
+                screen_reader::close_count_message(n, true)
             }
-            CloseTarget::Window => a11y::close_count_message(self.running_count(), false),
+            CloseTarget::Window => screen_reader::close_count_message(self.running_count(), false),
         }
     }
 
     /// Push a full tree when a client is connected and the stamp changed.
     /// Before the first client this returns without taking the terminal
     /// lock. Afterwards an unchanged frame does not build, and a burst is
-    /// at most one build per [`a11y::TREE_MIN_MS`], with the last stamp
-    /// delivered on [`Self::a11y_tree_at`].
-    fn publish_a11y(&mut self) {
-        if !self.a11y_seen_client || self.a11y.is_none() {
+    /// at most one build per [`screen_reader::TREE_MIN_MS`], with the last stamp
+    /// delivered on [`Self::reader_tree_at`].
+    fn publish_reader(&mut self) {
+        if !self.reader_seen_client || self.reader.is_none() {
             return;
         }
-        let now_ms = self.a11y_origin.elapsed().as_millis() as u64;
-        let announce_due = self.a11y_deadline.is_some_and(|t| Instant::now() >= t);
-        let fp = self.a11y_fp();
-        let pace = self.a11y_pace.consider(fp, now_ms);
+        let now_ms = self.reader_origin.elapsed().as_millis() as u64;
+        let announce_due = self.reader_deadline.is_some_and(|t| Instant::now() >= t);
+        let fp = self.reader_fp();
+        let pace = self.reader_pace.consider(fp, now_ms);
         let build = pace.publish || announce_due;
         if build && !pace.publish {
-            self.a11y_pace.note_published(fp, now_ms);
+            self.reader_pace.note_published(fp, now_ms);
         }
         if build {
-            let Some(mut adapter) = self.a11y.take() else {
+            let Some(mut adapter) = self.reader.take() else {
                 return;
             };
-            adapter.update_if_active(|| self.a11y_update(now_ms));
-            self.a11y = Some(adapter);
-            self.a11y_tree_at = None;
+            adapter.update_if_active(|| self.reader_update(now_ms));
+            self.reader = Some(adapter);
+            self.reader_tree_at = None;
         } else {
-            self.a11y_tree_at = pace
+            self.reader_tree_at = pace
                 .wake_ms
-                .map(|ms| self.a11y_origin + std::time::Duration::from_millis(ms));
+                .map(|ms| self.reader_origin + std::time::Duration::from_millis(ms));
         }
     }
 
     /// Cursor, selection, focus, tabs, palette, and card. Not the cells.
-    fn a11y_fp(&self) -> u64 {
-        let mut h = a11y::stamp_mix(self.a11y_gen, self.active as u64);
-        h = a11y::stamp_mix(h, u64::from(lang::rtl()));
+    fn reader_fp(&self) -> u64 {
+        let mut h = screen_reader::stamp_mix(self.reader_gen, self.active as u64);
+        h = screen_reader::stamp_mix(h, u64::from(lang::rtl()));
         let (vis, _) = self.visible_tabs();
         for i in vis {
-            h = a11y::stamp_str(h, &self.tabs[i].label());
-            h = a11y::stamp_mix(h, u64::from(i == self.active));
+            h = screen_reader::stamp_str(h, &self.tabs[i].label());
+            h = screen_reader::stamp_mix(h, u64::from(i == self.active));
         }
         if let Some(tab) = self.tabs.get(self.active) {
-            h = a11y::stamp_mix(h, tab.focused as u64);
+            h = screen_reader::stamp_mix(h, tab.focused as u64);
             for pane in &tab.panes {
                 let term = pane.session.term.lock();
-                h = a11y::stamp_mix(h, a11y::pane_stamp(&term));
+                h = screen_reader::stamp_mix(h, screen_reader::pane_stamp(&term));
             }
         }
         h = match &self.palette {
-            None => a11y::stamp_mix(h, 0),
+            None => screen_reader::stamp_mix(h, 0),
             Some(p) => {
-                let mut h = a11y::stamp_mix(h, 1);
-                h = a11y::stamp_mix(h, p.sel as u64);
-                h = a11y::stamp_mix(h, u64::from(p.menu.is_some()));
-                h = a11y::stamp_mix(h, u64::from(p.shells_menu));
-                h = a11y::stamp_str(h, &p.query);
-                a11y::stamp_mix(h, p.extras.len() as u64)
+                let mut h = screen_reader::stamp_mix(h, 1);
+                h = screen_reader::stamp_mix(h, p.sel as u64);
+                h = screen_reader::stamp_mix(h, u64::from(p.menu.is_some()));
+                h = screen_reader::stamp_mix(h, u64::from(p.shells_menu));
+                h = screen_reader::stamp_str(h, &p.query);
+                screen_reader::stamp_mix(h, p.extras.len() as u64)
             }
         };
         h = match self.pending_close {
-            None => a11y::stamp_mix(h, 0),
+            None => screen_reader::stamp_mix(h, 0),
             Some(CloseTarget::Pane(ti, pi)) => {
-                let h = a11y::stamp_mix(h, 1);
-                let h = a11y::stamp_mix(h, ti as u64);
-                a11y::stamp_mix(h, pi as u64)
+                let h = screen_reader::stamp_mix(h, 1);
+                let h = screen_reader::stamp_mix(h, ti as u64);
+                screen_reader::stamp_mix(h, pi as u64)
             }
             Some(CloseTarget::Tab(ti)) => {
-                let h = a11y::stamp_mix(h, 2);
-                a11y::stamp_mix(h, ti as u64)
+                let h = screen_reader::stamp_mix(h, 2);
+                screen_reader::stamp_mix(h, ti as u64)
             }
-            Some(CloseTarget::Window) => a11y::stamp_mix(h, 3),
+            Some(CloseTarget::Window) => screen_reader::stamp_mix(h, 3),
         };
         if let Some(block) = &self.blocked_link {
-            h = a11y::stamp_str(h, &block.reason);
-            h = a11y::stamp_str(h, &block.shown);
-            h = a11y::stamp_mix(h, u64::from(block.confirm_uri.is_some()));
+            h = screen_reader::stamp_str(h, &block.reason);
+            h = screen_reader::stamp_str(h, &block.shown);
+            h = screen_reader::stamp_mix(h, u64::from(block.confirm_uri.is_some()));
         } else {
-            h = a11y::stamp_mix(h, 0);
+            h = screen_reader::stamp_mix(h, 0);
         }
         if let Some(paste) = &self.pending_paste {
-            h = a11y::stamp_mix(h, paste.lines as u64);
-            h = a11y::stamp_mix(h, paste.chars as u64);
-            h = a11y::stamp_str(h, &paste.reason);
+            h = screen_reader::stamp_mix(h, paste.lines as u64);
+            h = screen_reader::stamp_mix(h, paste.chars as u64);
+            h = screen_reader::stamp_str(h, &paste.reason);
         }
         h
     }
 
-    fn bump_a11y(&mut self) {
-        self.a11y_gen = self.a11y_gen.wrapping_add(1);
+    fn bump_reader(&mut self) {
+        self.reader_gen = self.reader_gen.wrapping_add(1);
     }
 
-    fn a11y_update(&mut self, now_ms: u64) -> accesskit::TreeUpdate {
-        let view = self.a11y_view(now_ms);
-        self.a11y_deadline = self
-            .a11y_gate
+    fn reader_update(&mut self, now_ms: u64) -> accesskit::TreeUpdate {
+        let view = self.reader_view(now_ms);
+        self.reader_deadline = self
+            .reader_gate
             .flush_at_ms()
-            .map(|ms| self.a11y_origin + std::time::Duration::from_millis(ms));
-        a11y::build_tree(&view)
+            .map(|ms| self.reader_origin + std::time::Duration::from_millis(ms));
+        screen_reader::build_tree(&view)
     }
 
-    fn a11y_view(&mut self, now_ms: u64) -> a11y::View {
+    fn reader_view(&mut self, now_ms: u64) -> screen_reader::View {
         let (vis, _) = self.visible_tabs();
-        let tabs: Vec<a11y::TabItem> = vis
+        let tabs: Vec<screen_reader::TabItem> = vis
             .iter()
-            .map(|&i| a11y::TabItem {
+            .map(|&i| screen_reader::TabItem {
                 index: i,
                 name: self.tabs[i].label(),
                 selected: i == self.active,
@@ -3743,9 +3743,9 @@ impl App {
                 // after it is released. A reader must not stall the PTY.
                 let raw = {
                     let term = pane.session.term.lock();
-                    a11y::copy_pane(&term)
+                    screen_reader::copy_pane(&term)
                 };
-                let text = a11y::pane_text(raw, claude);
+                let text = screen_reader::pane_text(raw, claude);
                 if pi == focused {
                     focused_id = Some(pane.id);
                     focused_lines = text.lines.iter().map(|line| line.text.clone()).collect();
@@ -3758,56 +3758,56 @@ impl App {
                         .find(|mark| mark.exit.is_some())
                         .map(|mark| (mark.abs, mark.exit));
                 }
-                bodies.push(a11y::PaneItem {
+                bodies.push(screen_reader::PaneItem {
                     index: pi,
-                    name: a11y::pane_name(pi, count),
+                    name: screen_reader::pane_name(pi, count),
                     text,
                 });
             }
         }
-        if focused_id != self.a11y_pane {
-            self.a11y_gate.reset();
-            self.a11y_pane = focused_id;
-            self.a11y_mark = None;
-            self.a11y_mark_ready = false;
-            self.a11y_cmd.clear();
-            self.a11y_bodies.clear();
+        if focused_id != self.reader_pane {
+            self.reader_gate.reset();
+            self.reader_pane = focused_id;
+            self.reader_mark = None;
+            self.reader_mark_ready = false;
+            self.reader_cmd.clear();
+            self.reader_bodies.clear();
         }
         if !running.is_empty() {
-            self.a11y_cmd = running;
+            self.reader_cmd = running;
         }
         if let Some((abs, exit)) = finished {
-            if self.a11y_mark != Some(abs) {
-                let announce = self.a11y_mark_ready;
-                self.a11y_mark = Some(abs);
+            if self.reader_mark != Some(abs) {
+                let announce = self.reader_mark_ready;
+                self.reader_mark = Some(abs);
                 if announce {
-                    self.a11y_gate
-                        .command_finished(exit, &self.a11y_cmd, now_ms);
+                    self.reader_gate
+                        .command_finished(exit, &self.reader_cmd, now_ms);
                 }
             }
         }
-        self.a11y_mark_ready = true;
-        let update = self.a11y_gate.push(&focused_lines, now_ms);
+        self.reader_mark_ready = true;
+        let update = self.reader_gate.push(&focused_lines, now_ms);
         // A selection is the user's, not the flood's: show it immediately.
         let selecting = bodies.iter().any(|pane| pane.text.selection.is_some());
         let panes =
-            if selecting || update.refresh_document || self.a11y_bodies.len() != bodies.len() {
-                self.a11y_bodies = bodies;
-                self.a11y_bodies.clone()
+            if selecting || update.refresh_document || self.reader_bodies.len() != bodies.len() {
+                self.reader_bodies = bodies;
+                self.reader_bodies.clone()
             } else {
-                self.a11y_bodies.clone()
+                self.reader_bodies.clone()
             };
         if let Some(live) = update.live.clone() {
-            let on_screen = self.a11y_live.as_deref().unwrap_or(a11y::live_name());
-            self.a11y_live = Some(a11y::live_label(on_screen, live));
+            let on_screen = self.reader_live.as_deref().unwrap_or(screen_reader::live_name());
+            self.reader_live = Some(screen_reader::live_label(on_screen, live));
         }
         let palette = self.palette.as_ref().map(|p| {
             let menu = p.menu.is_some();
-            a11y::PaletteItem {
+            screen_reader::PaletteItem {
                 name: if menu {
-                    a11y::menu_name()
+                    screen_reader::menu_name()
                 } else {
-                    a11y::palette_name()
+                    screen_reader::palette_name()
                 }
                 .to_string(),
                 query: p.query.clone(),
@@ -3820,32 +3820,32 @@ impl App {
                 menu,
             }
         });
-        let dialog = self.a11y_dialog();
-        a11y::View {
+        let dialog = self.reader_dialog();
+        screen_reader::View {
             tabs,
             active_tab: active,
             panes,
             focused_pane: focused,
             live: self
-                .a11y_live
+                .reader_live
                 .clone()
-                .unwrap_or_else(|| a11y::live_name().to_string()),
+                .unwrap_or_else(|| screen_reader::live_name().to_string()),
             palette,
             dialog,
         }
     }
 
-    fn a11y_dialog(&self) -> Option<a11y::DialogItem> {
+    fn reader_dialog(&self) -> Option<screen_reader::DialogItem> {
         if let Some(target) = self.pending_close {
             let name = self.close_message(target);
-            return Some(a11y::DialogItem {
+            return Some(screen_reader::DialogItem {
                 body: name.clone(),
                 name,
             });
         }
         if let Some(block) = &self.blocked_link {
             if block.is_app_error {
-                return Some(a11y::DialogItem {
+                return Some(screen_reader::DialogItem {
                     name: block.reason.clone(),
                     body: block.shown.clone(),
                 });
@@ -3856,7 +3856,7 @@ impl App {
                 block.reason
             );
             let (ar, en) = link::card_key_lines(block.confirm_uri.is_some());
-            return Some(a11y::DialogItem {
+            return Some(screen_reader::DialogItem {
                 name,
                 body: format!("{}\n{ar}\n{en}", block.shown),
             });
@@ -3864,8 +3864,8 @@ impl App {
         let paste = self.pending_paste.as_ref()?;
         let preview = card_preview(paste.kind, &paste.text);
         let shown = preview.first().map(String::as_str).unwrap_or("");
-        Some(a11y::DialogItem {
-            name: a11y::paste_dialog_name().to_string(),
+        Some(screen_reader::DialogItem {
+            name: screen_reader::paste_dialog_name().to_string(),
             body: format!("{}\n{shown}", paste.reason),
         })
     }
@@ -4813,7 +4813,7 @@ impl App {
     fn redraw(&mut self) {
         // Before a client, this is a flag check. After one, an unchanged
         // stamp does not walk the grid; a flood builds at about 10 Hz.
-        self.publish_a11y();
+        self.publish_reader();
         // A scroll under a still pointer moves the link. Refresh only while
         // a hover is showing, and never during a drag: that path must not
         // redraw on every pixel.
@@ -5286,7 +5286,7 @@ impl ApplicationHandler<UserEvent> for App {
         crate::prof::mark("window created");
         // Before the first show: a reader that connects later is answered
         // from the UI thread, and nothing is built until then.
-        self.a11y = Some(accesskit_winit::Adapter::with_event_loop_proxy(
+        self.reader = Some(accesskit_winit::Adapter::with_event_loop_proxy(
             el,
             &window,
             self.proxy.clone(),
@@ -5361,12 +5361,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.shell_profiles = profiles;
                 self.shell_profiles_ready = true;
-                self.bump_a11y();
+                self.bump_reader();
                 self.start_sessions();
                 self.request_redraw();
             }
             UserEvent::Wakeup(id) => {
-                self.bump_a11y();
+                self.bump_reader();
                 self.link_cache.invalidate_pane(id);
                 // The row that was hovered may have moved. Drop the tooltip
                 // and the click target together, or they can disagree.
@@ -5579,24 +5579,24 @@ impl ApplicationHandler<UserEvent> for App {
                 accesskit_winit::WindowEvent::InitialTreeRequested => {
                     // The next consider must build even if the stamp matches
                     // a tree we never managed to send.
-                    self.a11y_seen_client = true;
-                    self.a11y_pace = a11y::TreePace::default();
-                    self.publish_a11y();
+                    self.reader_seen_client = true;
+                    self.reader_pace = screen_reader::TreePace::default();
+                    self.publish_reader();
                 }
                 accesskit_winit::WindowEvent::AccessibilityDeactivated => {
                     // Windows does not deliver this. Other backends do,
                     // and then the redraw path goes quiet again.
-                    self.a11y_seen_client = false;
-                    self.a11y_pace = a11y::TreePace::default();
-                    self.a11y_tree_at = None;
-                    self.a11y_gate.reset();
-                    self.a11y_bodies.clear();
-                    self.a11y_pane = None;
-                    self.a11y_mark = None;
-                    self.a11y_mark_ready = false;
-                    self.a11y_deadline = None;
-                    self.a11y_live = None;
-                    self.a11y_cmd.clear();
+                    self.reader_seen_client = false;
+                    self.reader_pace = screen_reader::TreePace::default();
+                    self.reader_tree_at = None;
+                    self.reader_gate.reset();
+                    self.reader_bodies.clear();
+                    self.reader_pane = None;
+                    self.reader_mark = None;
+                    self.reader_mark_ready = false;
+                    self.reader_deadline = None;
+                    self.reader_live = None;
+                    self.reader_cmd.clear();
                 }
                 accesskit_winit::WindowEvent::ActionRequested(_) => {}
             },
@@ -5650,12 +5650,12 @@ impl ApplicationHandler<UserEvent> for App {
         // The burst is spoken once the hold elapses, and a stamp that
         // arrived inside the 10 Hz window is published when that window ends.
         let now = Instant::now();
-        if self.a11y_deadline.is_some_and(|t| now >= t)
-            || self.a11y_tree_at.is_some_and(|t| now >= t)
+        if self.reader_deadline.is_some_and(|t| now >= t)
+            || self.reader_tree_at.is_some_and(|t| now >= t)
         {
-            self.publish_a11y();
+            self.publish_reader();
         }
-        let soon = match (self.a11y_deadline, self.a11y_tree_at) {
+        let soon = match (self.reader_deadline, self.reader_tree_at) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
@@ -5669,7 +5669,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        if let (Some(adapter), Some(window)) = (self.a11y.as_mut(), self.window.as_ref()) {
+        if let (Some(adapter), Some(window)) = (self.reader.as_mut(), self.window.as_ref()) {
             adapter.process_event(window, &event);
         }
         if self.modal_pointer(&event, el) {
@@ -5984,20 +5984,20 @@ fn run() -> Result<(), String> {
         keys_held_away: Vec::new(),
         debug_paste: None,
         start_dir,
-        a11y: None,
-        a11y_seen_client: false,
-        a11y_gen: 0,
-        a11y_pace: a11y::TreePace::default(),
-        a11y_tree_at: None,
-        a11y_origin: Instant::now(),
-        a11y_deadline: None,
-        a11y_gate: a11y::OutputGate::default(),
-        a11y_bodies: Vec::new(),
-        a11y_pane: None,
-        a11y_cmd: String::new(),
-        a11y_mark: None,
-        a11y_mark_ready: false,
-        a11y_live: None,
+        reader: None,
+        reader_seen_client: false,
+        reader_gen: 0,
+        reader_pace: screen_reader::TreePace::default(),
+        reader_tree_at: None,
+        reader_origin: Instant::now(),
+        reader_deadline: None,
+        reader_gate: screen_reader::OutputGate::default(),
+        reader_bodies: Vec::new(),
+        reader_pane: None,
+        reader_cmd: String::new(),
+        reader_mark: None,
+        reader_mark_ready: false,
+        reader_live: None,
     };
     let result = event_loop.run_app(&mut app);
     if let Some(error) = app.startup_error {

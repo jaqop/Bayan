@@ -36,12 +36,12 @@ selection and BiDi paths must do.
 | `plugins.rs` | declarative JSON plugin host (`~/.bayan/plugins/`) |
 | `config.rs` | `~/.bayan/config.json`, optional and BOM-tolerant |
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
-| `a11y.rs` | screen-reader tree: each pane is a document in logical order, with the caret, the selection, and a coalesced live region (AccessKit, which speaks UIA on Windows) |
+| `screen_reader.rs` | screen-reader tree: each pane is a document in logical order, with the caret, the selection, and a coalesced live region (AccessKit, which speaks UIA on Windows) |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
 511 tests across the tree. `term.rs` (82), `link.rs` (61) and `render.rs` (65)
-carry the most; `localpath.rs` has 21; `a11y.rs` has 11. Three more in `term.rs` are `#[ignore]`d
+carry the most; `localpath.rs` has 21; `screen_reader.rs` has 11. Three more in `term.rs` are `#[ignore]`d
 probes, run by hand (see Measuring).
 
 ## Measuring
@@ -177,7 +177,7 @@ UIA client, `update_if_active` does not run the builder and a redraw does
 not even stamp. On Windows that client leaves the adapter active for the
 session (deactivate is ignored), so later frames use a stamp — output
 generation, cursor, selection, focus, tabs, palette, card — and
-[`a11y::TreePace`]: unchanged means no rebuild, and a moving stamp is
+[`screen_reader::TreePace`]: unchanged means no rebuild, and a moving stamp is
 built at about 10 Hz with a trailing update so the last state is sent.
 The full cell copy happens only on those builds. The terminal lock for a
 build is held only long enough to copy the visible cells; Claude
