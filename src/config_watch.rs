@@ -285,6 +285,18 @@ pub fn merge_reload(base: &UserConfig, live: &UserConfig, file: &UserConfig) -> 
             &file.system_apps_light,
             &mut overrode,
         ),
+        follow_system_text_size: merge_field(
+            &base.follow_system_text_size,
+            &live.follow_system_text_size,
+            &file.follow_system_text_size,
+            &mut overrode,
+        ),
+        terminal_follow_high_contrast: merge_field(
+            &base.terminal_follow_high_contrast,
+            &live.terminal_follow_high_contrast,
+            &file.terminal_follow_high_contrast,
+            &mut overrode,
+        ),
         keyboard: merge_field(
             &base.keyboard,
             &live.keyboard,
@@ -385,8 +397,10 @@ pub fn diff(prev: &UserConfig, next: &UserConfig) -> (ApplyPlan, Vec<DeferredSet
         colors: prev.theme != next.theme
             || prev.bg != next.bg
             || prev.fg != next.fg
-            || prev.palette != next.palette,
+            || prev.palette != next.palette
+            || prev.terminal_follows_high_contrast() != next.terminal_follows_high_contrast(),
         font: prev.font_family != next.font_family
+            || prev.follow_system_text_size() != next.follow_system_text_size()
             || prev.arabic_font != next.arabic_font
             || prev.font_size != next.font_size
             || prev.ligatures != next.ligatures,

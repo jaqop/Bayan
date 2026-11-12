@@ -44,6 +44,7 @@ selection and BiDi paths must do.
 | `config.rs` | `~/.bayan/config.json`, optional and BOM-tolerant. `scrollbar.position` (`right`/`left`/`hidden`), `scrollbar.width`, `scrollbar.autohide` |
 | `config_watch.rs` | reload that file on change: debounce, rename-replace saves, keep the last good config on a parse error |
 | `theme.rs` | Windows light/dark: `system`/`dark`/`light`, the palette pair, and the theme-change event |
+| `a11y.rs` | High Contrast color mapping and the system text-size multiplier, pure and tested; the Win32 read sits behind `read_snapshot` |
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
@@ -208,6 +209,18 @@ because Explorer and the Start menu often hand a process `System32`, and
 except when it is Bayan's own folder (Explorer's default cwd — a pane opened
 in Downloads would let cmd run a planted `git.bat`). It passes the same
 `accept_local_cwd` + `usable_spawn_dir` gate as every other start directory.
+
+**High Contrast and text size are not the palette's `text_scale`.**
+`PaletteLayout.text_scale` compresses the command palette when the window
+is short. Windows Accessibility text size is `a11y::text_scale_factor`
+(100–225%, clamped), stored on the renderer as `system_text_scale`, and
+multiplied separately from DPI: pixels = points × text scale × dpi. An
+explicit `font_size` is the size at 100% and is still multiplied while
+`follow_system_text_size` is on. High Contrast maps chrome through
+`a11y::map_chrome` and, unless `terminal_follow_high_contrast` is false,
+the grid's fg/bg/selection/cursor through `a11y::map_terminal`. The 16
+ANSI colors stay on the theme. Both are re-read on `WM_SETTINGCHANGE` and
+`WM_SYSCOLORCHANGE`.
 
 **Two performance properties are load-bearing.** The shaped-run cache reshapes
 only changed lines (~1.5ms → ~4µs on a cached frame). Differential redraw skips

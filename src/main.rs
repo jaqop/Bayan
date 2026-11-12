@@ -7,6 +7,7 @@
 // release builds are pure GUI apps: no companion console window
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod a11y;
 mod bidi;
 mod bidi_ctl;
 mod chrome;
@@ -137,6 +138,9 @@ fn beep() {
 static QUAKE_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// A toast/tray click wants the window raised (summon, never hide).
 static SUMMON_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `WM_SETTINGCHANGE` / `WM_SYSCOLORCHANGE` arrived. `about_to_wait` re-reads
+/// High Contrast and the text-size slider; the hook only sets the bit.
+static A11Y_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const QUAKE_ID: usize = 0xB1AA;
 
 /// The letter a Ctrl+<letter> event represents, resolved the way real
@@ -1585,6 +1589,10 @@ struct App {
     /// Ctrl+wheel zoom, in points on top of the configured size.
     font_delta: f32,
     renderer_building: bool,
+    /// Last High Contrast / text-size read. The renderer in flight was
+    /// built from `inflight_a11y`; a change during the build is chased.
+    a11y: a11y::A11ySnapshot,
+    inflight_a11y: a11y::A11ySnapshot,
     /// the last rectangle the window had while NOT maximized — what a
     /// maximized window restores down to, and what the session saves
     normal_geom: Option<WindowGeom>,
@@ -1816,6 +1824,8 @@ impl App {
             config_watch,
             config_build,
             config_notice: None,
+            a11y: a11y::A11ySnapshot::neutral(),
+            inflight_a11y: a11y::A11ySnapshot::neutral(),
         }
     }
 
@@ -1823,6 +1833,20 @@ impl App {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
+    }
+
+    /// Re-read High Contrast and the text-size slider. A real change
+    /// rebuilds the renderer so chrome colors and font metrics update
+    /// without a restart. An unrelated `WM_SETTINGCHANGE` (a wallpaper,
+    /// a policy) that leaves both values alone does not rebuild.
+    fn reload_a11y(&mut self) {
+        let next = a11y::read_snapshot();
+        if next == self.a11y {
+            return;
+        }
+        self.a11y = next;
+        self.rebuild_renderer();
+        self.request_redraw();
     }
 
     /// (Re)build the renderer off-thread for the current scale, config and
@@ -1843,8 +1867,10 @@ impl App {
         let scale = w.scale_factor() as f32;
         let cfg = self.config_build.snapshot().clone();
         let delta = self.font_delta;
+        let snap = self.a11y;
+        self.inflight_a11y = snap;
         std::thread::spawn(move || {
-            let r = render::Renderer::new(scale, &cfg, delta);
+            let r = render::Renderer::with_a11y(scale, &cfg, delta, snap);
             let _ = proxy.send_event(UserEvent::RendererReady(Box::new(r)));
         });
     }
@@ -6136,10 +6162,11 @@ impl ApplicationHandler<UserEvent> for App {
                 self.apply_window_frame();
                 // now that cell metrics exist, snap every pane to its rect
                 self.relayout_active();
-                // A reload or a zoom that arrived while this build ran is
-                // not in the renderer we just installed. Start the next one
-                // from the config the session wants now.
-                if self.config_build.finish(self.font_delta) {
+                // A reload, a zoom, or an accessibility change that arrived
+                // while this build ran is not in the renderer we just
+                // installed. Start the next one from what the session wants
+                // now.
+                if self.config_build.finish(self.font_delta) || self.a11y != self.inflight_a11y {
                     self.rebuild_renderer();
                 }
                 if let Some(text) = self.debug_paste.take() {
@@ -6226,6 +6253,11 @@ impl ApplicationHandler<UserEvent> for App {
                 w.focus_window();
                 self.apply_opacity(); // set_visible wipes the layered bit
             }
+        }
+        // High Contrast or the text-size slider changed. Re-read now; a
+        // rebuild applies it on the next frame, without restarting.
+        if A11Y_DIRTY.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            self.reload_a11y();
         }
         // busy dots decay after ~2s of quiet: keep repainting on a slow
         // heartbeat only while any background tab is (or just was) active
@@ -6604,6 +6636,9 @@ fn run(startup: Startup) -> Result<(), String> {
             // SAFETY: winit's msg hook is handed a pointer to the MSG being
             // dispatched, valid for the duration of the callback. It is only read.
             let m = unsafe { &*(msg as *const MSG) };
+            if a11y::message_triggers_reread(m.message) {
+                A11Y_DIRTY.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             if m.message == WM_HOTKEY && m.wParam == QUAKE_ID {
                 QUAKE_HIT.store(true, std::sync::atomic::Ordering::Relaxed);
                 return true; // consumed
@@ -6697,6 +6732,10 @@ fn run(startup: Startup) -> Result<(), String> {
     app.start_profile_command = startup.profile_command;
     app.start_command = startup.command;
     app.elevated = startup.elevated;
+    // App::new starts neutral so a test never reads the machine's High
+    // Contrast theme; the running window reads it here.
+    app.a11y = a11y::read_snapshot();
+    app.inflight_a11y = app.a11y;
     let result = event_loop.run_app(&mut app);
     if let Some(error) = app.startup_error {
         return Err(error);

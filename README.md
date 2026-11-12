@@ -908,6 +908,7 @@ key falls back to a sane default:
   "copy_on_select": true, "ligatures": true, "bell": "attention",
   "shell": "pwsh.exe", "padding": 8, "opacity": 0.9,
   "hide_single_tab": true, "confirm_close": true, "osc52": "off",
+  "follow_system_text_size": true, "terminal_follow_high_contrast": true,
   "editor": "code -g {file}:{line}:{col}", "tab_switch": "recent",
   "keybinds": { "new-tab": "ctrl+shift+n" },
   "keyboard": { "kitty_protocol": false, "kitty_base_layout_fallback": true },
@@ -921,6 +922,26 @@ key falls back to a sane default:
 theme. `"dark"` and `"light"` stay on that pair. A named scheme, or a
 hand-set `bg`/`fg`/`palette`, wins over a later system change. The settings
 row «سمة النظام» is the same choice; picking a gallery tile names that scheme.
+
+High Contrast and the Windows text-size slider are honored live, without a
+restart. While High Contrast is on, the tab bar, title bar, command palette,
+cards, scrollbar, focus rings, selection and cursor take the system colors
+(`COLOR_WINDOW`, `COLOR_WINDOWTEXT`, `COLOR_HIGHLIGHT`, `COLOR_HIGHLIGHTTEXT`,
+`COLOR_HOTLIGHT`, `COLOR_GRAYTEXT`, `COLOR_BTNFACE`). The terminal grid's
+background, foreground, selection and cursor follow those colors too, unless
+`"terminal_follow_high_contrast"` is false — then the theme stays inside the
+grid and the chrome still follows. The 16 ANSI colors stay on the theme either
+way, so a program's red is still red.
+
+`"follow_system_text_size"` (default true) multiplies UI chrome and the
+terminal font by Accessibility text size, a percent from 100 to 225 read from
+`HKCU\Software\Microsoft\Accessibility\TextScaleFactor` (the value
+`UISettings.TextScaleFactor` persists; Bayan does not link WinRT). An explicit
+`font_size` is the size at 100% and is still multiplied. DPI is a separate
+multiplier applied after that: pixels = points × text scale × dpi. Set the
+option to false to keep the point size absolute; DPI still applies. Ctrl+wheel
+changes the 100% point size, and the text scale multiplies that too. A change
+to either setting is re-read on `WM_SETTINGCHANGE` / `WM_SYSCOLORCHANGE`.
 
 `"osc_notify": true` lets programs raise desktop toasts through OSC 9,
 OSC 777 and OSC 99. It is off by default because any output can carry
