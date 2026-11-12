@@ -40,8 +40,8 @@ selection and BiDi paths must do.
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-509 tests across the tree. `term.rs` (82), `link.rs` (61) and `render.rs` (65)
-carry the most; `localpath.rs` has 21; `a11y.rs` has 9. Three more in `term.rs` are `#[ignore]`d
+511 tests across the tree. `term.rs` (82), `link.rs` (61) and `render.rs` (65)
+carry the most; `localpath.rs` has 21; `a11y.rs` has 11. Three more in `term.rs` are `#[ignore]`d
 probes, run by hand (see Measuring).
 
 ## Measuring
@@ -172,16 +172,22 @@ except when it is Bayan's own folder (Explorer's default cwd — a pane opened
 in Downloads would let cmd run a planted `git.bat`). It passes the same
 `accept_local_cwd` + `usable_spawn_dir` gate as every other start directory.
 
-**The accessibility tree stays off the paint hot path.** AccessKit does not
-call the builder until a screen reader connects (`update_if_active` is a
-no-op otherwise). The terminal lock is held only long enough to copy the
-visible cells; Claude restoration and the node tree happen after it is
-dropped. Pane text is logical grid order, so Arabic is read as the program
-emitted it — not the visually reordered line the shaper draws. Claude rows
-use the same visual→logical map as copy. A burst of output is one
-announcement per 500ms (the tail, not every line), and an OSC 133 finish
-replaces that tail with the exit code. Do not build this tree from a
-redraw that has no reader, and do not hand it shaped glyphs.
+**The accessibility tree stays off the paint hot path.** Until the first
+UIA client, `update_if_active` does not run the builder and a redraw does
+not even stamp. On Windows that client leaves the adapter active for the
+session (deactivate is ignored), so later frames use a stamp — output
+generation, cursor, selection, focus, tabs, palette, card — and
+[`a11y::TreePace`]: unchanged means no rebuild, and a moving stamp is
+built at about 10 Hz with a trailing update so the last state is sent.
+The full cell copy happens only on those builds. The terminal lock for a
+build is held only long enough to copy the visible cells; Claude
+restoration and the node tree happen after it is dropped. Pane text is
+logical grid order, so Arabic is read as the program emitted it — not the
+visually reordered line the shaper draws. Claude rows use the same
+visual→logical map as copy. A burst of output is one announcement per
+500ms (the tail, not every line), and an OSC 133 finish replaces that
+tail with the exit code. Do not build this tree on an unchanged stamp,
+and do not hand it shaped glyphs.
 
 **Two performance properties are load-bearing.** The shaped-run cache reshapes
 only changed lines (~1.5ms → ~4µs on a cached frame). Differential redraw skips

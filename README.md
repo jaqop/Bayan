@@ -882,7 +882,10 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       unsafe COM surface that three readers each interpret slightly
       differently. AccessKit already maps a document of text runs, a caret
       and a live region onto those UIA events, and it builds nothing until
-      a client connects. That laziness is the reason to take the dependency
+      a client connects. On Windows that first client leaves the adapter
+      active for the session, so afterwards the tree is rebuilt only when
+      the stamp changes, at about 10 Hz, and the last state of a burst is
+      always sent. That laziness is the reason to take the dependency
       instead of calling UIA directly. Each visible pane is a document whose
       lines are the grid's logical order (Arabic is not read in the shaped
       visual order; Claude rows go through the same restoration as copy).
@@ -897,12 +900,14 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       confirm cards have names and roles in the UI language (Arabic by
       default). Focus follows the active pane, and a card or the palette
       takes it while it is open. The shaping path is unchanged. Proven by
-      9 tests (a mixed Arabic+Latin line stays in storage order, including
+      11 tests (a mixed Arabic+Latin line stays in storage order, including
       off a real `Term`; the caret column, including a wide glyph; the
       selection range; flood coalescing; the exit-code sentence; a repeated
       sentence re-firing; Arabic
       names and roles for tabs, panes, the palette and a confirm card;
-      focus following the active pane). Not verified on a machine: NVDA,
+      focus following the active pane; an unchanged stamp does not rebuild;
+      a 60 Hz burst stays near 10 builds a second and still publishes the
+      last stamp). Not verified on a machine: NVDA,
       JAWS or Narrator actually speaking a running Bayan. Character boxes
       for a magnifier's caret highlight are not provided, and a reader
       cannot move the selection: the document does not advertise

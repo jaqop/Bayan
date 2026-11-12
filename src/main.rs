@@ -1550,9 +1550,18 @@ struct App {
     debug_paste: Option<String>,
     /// `--cwd`'s folder, already gated, until the first tab opens in it.
     start_dir: Option<String>,
-    /// UI Automation adapter. `None` until the window exists. Tree builds
-    /// run only inside `update_if_active`, which is a no-op with no reader.
+    /// UI Automation adapter. `None` until the window exists. The first
+    /// client turns it on for the rest of the session on Windows.
     a11y: Option<accesskit_winit::Adapter>,
+    /// Set when a client has asked for the tree. Before that, redraws do
+    /// not stamp or build. After that, [`a11y::TreePace`] decides.
+    a11y_seen_client: bool,
+    /// Bumped when pane text changes without the cursor or the selection
+    /// necessarily moving (a PTY chunk, a relayout).
+    a11y_gen: u64,
+    a11y_pace: a11y::TreePace,
+    /// Trailing tree build, when a stamp changed inside the 10 Hz window.
+    a11y_tree_at: Option<Instant>,
     /// Epoch for the announcer's millisecond clock.
     a11y_origin: Instant,
     /// When the held output burst may be spoken. `about_to_wait` wakes then.
@@ -2885,6 +2894,8 @@ impl App {
     fn relayout_active(&mut self) {
         // Pane rows moved. Cached link spans would underline the wrong cells.
         self.link_cache.clear();
+        // A wrap changes what the reader sees even when the cursor does not.
+        self.bump_a11y();
         // resolve "hide the bar with one tab" BEFORE measuring the content
         let hide = self.config.hide_single_tab_on() && self.tabs.len() <= 1;
         if let Some(r) = self.renderer.as_mut() {
@@ -3608,15 +3619,94 @@ impl App {
         }
     }
 
-    /// Push a full tree if a screen reader is listening. The closure is not
-    /// called otherwise, so the grid is not walked and the lock is not taken.
+    /// Push a full tree when a client is connected and the stamp changed.
+    /// Before the first client this returns without taking the terminal
+    /// lock. Afterwards an unchanged frame does not build, and a burst is
+    /// at most one build per [`a11y::TREE_MIN_MS`], with the last stamp
+    /// delivered on [`Self::a11y_tree_at`].
     fn publish_a11y(&mut self) {
-        let Some(mut adapter) = self.a11y.take() else {
+        if !self.a11y_seen_client || self.a11y.is_none() {
             return;
+        }
+        let now_ms = self.a11y_origin.elapsed().as_millis() as u64;
+        let announce_due = self.a11y_deadline.is_some_and(|t| Instant::now() >= t);
+        let fp = self.a11y_fp();
+        let pace = self.a11y_pace.consider(fp, now_ms);
+        let build = pace.publish || announce_due;
+        if build && !pace.publish {
+            self.a11y_pace.note_published(fp, now_ms);
+        }
+        if build {
+            let Some(mut adapter) = self.a11y.take() else {
+                return;
+            };
+            adapter.update_if_active(|| self.a11y_update(now_ms));
+            self.a11y = Some(adapter);
+            self.a11y_tree_at = None;
+        } else {
+            self.a11y_tree_at = pace
+                .wake_ms
+                .map(|ms| self.a11y_origin + std::time::Duration::from_millis(ms));
+        }
+    }
+
+    /// Cursor, selection, focus, tabs, palette, and card. Not the cells.
+    fn a11y_fp(&self) -> u64 {
+        let mut h = a11y::stamp_mix(self.a11y_gen, self.active as u64);
+        h = a11y::stamp_mix(h, u64::from(lang::rtl()));
+        let (vis, _) = self.visible_tabs();
+        for i in vis {
+            h = a11y::stamp_str(h, &self.tabs[i].label());
+            h = a11y::stamp_mix(h, u64::from(i == self.active));
+        }
+        if let Some(tab) = self.tabs.get(self.active) {
+            h = a11y::stamp_mix(h, tab.focused as u64);
+            for pane in &tab.panes {
+                let term = pane.session.term.lock();
+                h = a11y::stamp_mix(h, a11y::pane_stamp(&term));
+            }
+        }
+        h = match &self.palette {
+            None => a11y::stamp_mix(h, 0),
+            Some(p) => {
+                let mut h = a11y::stamp_mix(h, 1);
+                h = a11y::stamp_mix(h, p.sel as u64);
+                h = a11y::stamp_mix(h, u64::from(p.menu.is_some()));
+                h = a11y::stamp_mix(h, u64::from(p.shells_menu));
+                h = a11y::stamp_str(h, &p.query);
+                a11y::stamp_mix(h, p.extras.len() as u64)
+            }
         };
-        let now = self.a11y_origin.elapsed().as_millis() as u64;
-        adapter.update_if_active(|| self.a11y_update(now));
-        self.a11y = Some(adapter);
+        h = match self.pending_close {
+            None => a11y::stamp_mix(h, 0),
+            Some(CloseTarget::Pane(ti, pi)) => {
+                let h = a11y::stamp_mix(h, 1);
+                let h = a11y::stamp_mix(h, ti as u64);
+                a11y::stamp_mix(h, pi as u64)
+            }
+            Some(CloseTarget::Tab(ti)) => {
+                let h = a11y::stamp_mix(h, 2);
+                a11y::stamp_mix(h, ti as u64)
+            }
+            Some(CloseTarget::Window) => a11y::stamp_mix(h, 3),
+        };
+        if let Some(block) = &self.blocked_link {
+            h = a11y::stamp_str(h, &block.reason);
+            h = a11y::stamp_str(h, &block.shown);
+            h = a11y::stamp_mix(h, u64::from(block.confirm_uri.is_some()));
+        } else {
+            h = a11y::stamp_mix(h, 0);
+        }
+        if let Some(paste) = &self.pending_paste {
+            h = a11y::stamp_mix(h, paste.lines as u64);
+            h = a11y::stamp_mix(h, paste.chars as u64);
+            h = a11y::stamp_str(h, &paste.reason);
+        }
+        h
+    }
+
+    fn bump_a11y(&mut self) {
+        self.a11y_gen = self.a11y_gen.wrapping_add(1);
     }
 
     fn a11y_update(&mut self, now_ms: u64) -> accesskit::TreeUpdate {
@@ -4721,8 +4811,8 @@ impl App {
     }
 
     fn redraw(&mut self) {
-        // A reader hears new output from this frame. With none connected the
-        // adapter returns before the closure, so the grid is not walked.
+        // Before a client, this is a flag check. After one, an unchanged
+        // stamp does not walk the grid; a flood builds at about 10 Hz.
         self.publish_a11y();
         // A scroll under a still pointer moves the link. Refresh only while
         // a hover is showing, and never during a drag: that path must not
@@ -5271,10 +5361,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.shell_profiles = profiles;
                 self.shell_profiles_ready = true;
+                self.bump_a11y();
                 self.start_sessions();
                 self.request_redraw();
             }
             UserEvent::Wakeup(id) => {
+                self.bump_a11y();
                 self.link_cache.invalidate_pane(id);
                 // The row that was hovered may have moved. Drop the tooltip
                 // and the click target together, or they can disagree.
@@ -5484,8 +5576,19 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_redraw();
             }
             UserEvent::AccessKit(event) => match event.window_event {
-                accesskit_winit::WindowEvent::InitialTreeRequested => self.publish_a11y(),
+                accesskit_winit::WindowEvent::InitialTreeRequested => {
+                    // The next consider must build even if the stamp matches
+                    // a tree we never managed to send.
+                    self.a11y_seen_client = true;
+                    self.a11y_pace = a11y::TreePace::default();
+                    self.publish_a11y();
+                }
                 accesskit_winit::WindowEvent::AccessibilityDeactivated => {
+                    // Windows does not deliver this. Other backends do,
+                    // and then the redraw path goes quiet again.
+                    self.a11y_seen_client = false;
+                    self.a11y_pace = a11y::TreePace::default();
+                    self.a11y_tree_at = None;
                     self.a11y_gate.reset();
                     self.a11y_bodies.clear();
                     self.a11y_pane = None;
@@ -5544,12 +5647,19 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(b) = blink_wake {
             wake = Some(wake.map_or(b, |w| w.min(b)));
         }
-        // The burst is spoken once the hold elapses, even if the pane has
-        // gone quiet and nothing else would redraw.
-        if self.a11y_deadline.is_some_and(|t| Instant::now() >= t) {
+        // The burst is spoken once the hold elapses, and a stamp that
+        // arrived inside the 10 Hz window is published when that window ends.
+        let now = Instant::now();
+        if self.a11y_deadline.is_some_and(|t| now >= t)
+            || self.a11y_tree_at.is_some_and(|t| now >= t)
+        {
             self.publish_a11y();
         }
-        if let Some(at) = self.a11y_deadline {
+        let soon = match (self.a11y_deadline, self.a11y_tree_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if let Some(at) = soon {
             wake = Some(wake.map_or(at, |w| w.min(at)));
         }
         match wake {
@@ -5875,6 +5985,10 @@ fn run() -> Result<(), String> {
         debug_paste: None,
         start_dir,
         a11y: None,
+        a11y_seen_client: false,
+        a11y_gen: 0,
+        a11y_pace: a11y::TreePace::default(),
+        a11y_tree_at: None,
         a11y_origin: Instant::now(),
         a11y_deadline: None,
         a11y_gate: a11y::OutputGate::default(),

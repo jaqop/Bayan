@@ -1,9 +1,12 @@
 //! Screen-reader tree for NVDA, JAWS and Narrator.
 //!
-//! AccessKit turns this tree into UI Automation on Windows. The adapter
-//! does nothing until a client connects, and [`crate::App`] only calls
-//! [`OutputGate`] / [`build_tree`] from inside `update_if_active`, so an
-//! idle terminal with no reader never walks the grid.
+//! AccessKit turns this tree into UI Automation on Windows. Until the
+//! first client asks for the tree, `update_if_active` does not run the
+//! builder. On Windows that client leaves the adapter active for the
+//! rest of the session (the deactivate message is ignored), so later
+//! frames are gated by [`TreePace`]: an unchanged stamp does not rebuild,
+//! and a moving one is published at about 10 Hz with a trailing update
+//! so the last state is not dropped.
 //!
 //! Pane text is the grid's storage order. That is the logical order the
 //! program emitted. The renderer reorders Arabic for the screen; a reader
@@ -32,6 +35,10 @@ use crate::lang::{self, tr};
 
 /// How long a burst of output is held before one announcement.
 pub const GAP_MS: u64 = 500;
+
+/// Minimum gap between tree builds once a client is connected. 100ms is
+/// about 10 Hz: a `cargo build` redraws far faster than a reader can use.
+pub const TREE_MIN_MS: u64 = 100;
 
 /// Lines kept in one announcement. Older lines are counted, not read.
 const TAIL_LINES: usize = 8;
@@ -475,6 +482,92 @@ pub struct GateUpdate {
     pub refresh_document: bool,
     /// A new live-region name, when one announcement is due.
     pub live: Option<String>,
+}
+
+/// Whether to build the tree now, and when a held change should be sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pace {
+    pub publish: bool,
+    /// Absolute time on the caller's clock. `None` when nothing is held.
+    pub wake_ms: Option<u64>,
+}
+
+/// At most one publish per [`TREE_MIN_MS`]. A fingerprint that arrives
+/// inside the window replaces the held one and is sent when the window
+/// ends, so the last state of a burst is always published.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TreePace {
+    last_fp: Option<u64>,
+    last_ms: Option<u64>,
+    held: Option<u64>,
+}
+
+impl TreePace {
+    pub fn consider(&mut self, fp: u64, now_ms: u64) -> Pace {
+        if self.last_fp == Some(fp) {
+            self.held = None;
+            return Pace {
+                publish: false,
+                wake_ms: None,
+            };
+        }
+        self.held = Some(fp);
+        let ready = self
+            .last_ms
+            .is_none_or(|t| now_ms.saturating_sub(t) >= TREE_MIN_MS);
+        if ready {
+            self.last_fp = self.held.take();
+            self.last_ms = Some(now_ms);
+            return Pace {
+                publish: true,
+                wake_ms: None,
+            };
+        }
+        Pace {
+            publish: false,
+            wake_ms: self.last_ms.map(|t| t.saturating_add(TREE_MIN_MS)),
+        }
+    }
+
+    /// A build that happened for the announcement timer, not because the
+    /// pace opened a slot. The fingerprint is consumed either way.
+    pub fn note_published(&mut self, fp: u64, now_ms: u64) {
+        self.last_fp = Some(fp);
+        self.last_ms = Some(now_ms);
+        self.held = None;
+    }
+}
+
+/// Cursor, scroll, and selection of one pane. Not the cells: those are
+/// what a full rebuild copies, and a stamp must stay cheap.
+pub fn pane_stamp<T: EventListener>(term: &Term<T>) -> u64 {
+    let point = term.grid().cursor.point;
+    let mut h = stamp_mix(0, point.line.0 as u64);
+    h = stamp_mix(h, point.column.0 as u64);
+    h = stamp_mix(h, term.grid().display_offset() as u64);
+    match term.selection.as_ref().and_then(|sel| sel.to_range(term)) {
+        Some(sel) => {
+            h = stamp_mix(h, 1);
+            h = stamp_mix(h, sel.start.line.0 as u64);
+            h = stamp_mix(h, sel.start.column.0 as u64);
+            h = stamp_mix(h, sel.end.line.0 as u64);
+            h = stamp_mix(h, sel.end.column.0 as u64);
+            stamp_mix(h, u64::from(sel.is_block))
+        }
+        None => stamp_mix(h, 0),
+    }
+}
+
+pub fn stamp_mix(h: u64, v: u64) -> u64 {
+    h.wrapping_mul(0x100000001b3) ^ v
+}
+
+pub fn stamp_str(mut h: u64, text: &str) -> u64 {
+    h = stamp_mix(h, text.len() as u64);
+    for b in text.bytes() {
+        h = stamp_mix(h, u64::from(b));
+    }
+    h
 }
 
 /// Diff, hold, and flush. The document text moves only when
@@ -1302,5 +1395,58 @@ mod tests {
         let tree = build_tree(&view);
         assert_eq!(find(&tree, ID_DIALOG).role(), Role::Dialog);
         assert_eq!(find(&tree, ID_DIALOG).label(), Some(close.as_str()));
+    }
+
+    #[test]
+    fn an_unchanged_stamp_does_not_rebuild() {
+        let mut pace = TreePace::default();
+        assert!(pace.consider(7, 0).publish, "the first stamp is a tree");
+        for t in [1, 16, 50, 99, 500, 10_000] {
+            let d = pace.consider(7, t);
+            assert!(!d.publish, "t={t} changed nothing");
+            assert!(d.wake_ms.is_none(), "t={t} must not schedule a rebuild");
+        }
+    }
+
+    #[test]
+    fn a_burst_stays_near_ten_hertz_and_publishes_the_last_state() {
+        let mut pace = TreePace::default();
+        let frames = 60u64;
+        let mut publishes = Vec::new();
+        let mut wake = None;
+        for i in 0..frames {
+            let now = i * 16;
+            let d = pace.consider(i + 1, now);
+            if d.publish {
+                publishes.push((now, i + 1));
+            }
+            wake = d.wake_ms;
+        }
+        let elapsed = (frames - 1) * 16;
+        let limit = 1 + elapsed / TREE_MIN_MS;
+        assert!(
+            publishes.len() as u64 <= limit,
+            "{:?} is more than {limit} builds in {elapsed}ms",
+            publishes
+        );
+        for pair in publishes.windows(2) {
+            assert!(
+                pair[1].0 - pair[0].0 >= TREE_MIN_MS,
+                "builds at {} and {} are closer than {TREE_MIN_MS}ms",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+        let last_fp = frames;
+        if publishes.last().map(|(_, fp)| *fp) != Some(last_fp) {
+            let now = wake.expect("the last frame is held for a trailing build");
+            assert!(now >= elapsed);
+            let d = pace.consider(last_fp, now);
+            assert!(d.publish, "the trailing slot must publish the last stamp");
+            let prev = publishes.last().unwrap().0;
+            assert!(now - prev >= TREE_MIN_MS);
+            publishes.push((now, last_fp));
+        }
+        assert_eq!(publishes.last().map(|(_, fp)| *fp), Some(last_fp));
     }
 }
