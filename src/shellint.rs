@@ -424,75 +424,33 @@ const BASH_ELEVATED_ENV: &str = r#"
 # and ~/bash_completion.d/*.bash. Moving HOME for that read did not stop
 # the real profile from executing those files. PATH and MSYSTEM come from
 # this bash's own install.
-# A launcher that already chose MSYSTEM is kept.
-__bayan_bash=${BASH:-$(command -v bash 2>/dev/null)}
-case "$__bayan_bash" in
-  [A-Za-z]:*)
-    if command -v cygpath >/dev/null 2>&1; then
-      __bayan_bash=$(cygpath -u -- "$__bayan_bash" 2>/dev/null) || true
-    fi
-    ;;
-esac
-# No cd. cygpath may return //c/... and MSYS treats a leading // as a
-# network path, so a later [ -d ] waits on a host that does not exist.
-__bayan_bash="${__bayan_bash//\\//}"
-case "$__bayan_bash" in
-  //*) __bayan_bash="${__bayan_bash#/}" ;;
-esac
-__bayan_bin="${__bayan_bash%/*}"
-__bayan_root=
-case "$__bayan_bin" in
-  */usr/bin) __bayan_root="${__bayan_bin%/usr/bin}" ;;
-  ?*) __bayan_root="${__bayan_bin%/*}" ;;
-esac
-case "$__bayan_root" in
-  "") __bayan_root=/ ;;
-  //*) __bayan_root="${__bayan_root#/}" ;;
-esac
+# A launcher that already chose MSYSTEM is kept. Paths are the MSYS
+# root (/), not a cygpath result: //c/... is a network path and [ -d ]
+# waits on it. Git for Windows 2.56 has /ucrt64 and no /mingw64.
 if [ -z "${MSYSTEM:-}" ]; then
-  # Git for Windows 2.56 ships ucrt64 and no mingw64. usr/bin/bash does
-  # not set MSYSTEM itself, so the first layout that exists wins.
-  if [ -n "$__bayan_root" ] && [ -d "$__bayan_root/ucrt64/bin" ]; then
+  if [ -d /ucrt64/bin ]; then
     MSYSTEM=UCRT64
-  elif [ -n "$__bayan_root" ] && [ -d "$__bayan_root/mingw64/bin" ]; then
+  elif [ -d /mingw64/bin ]; then
     MSYSTEM=MINGW64
-  elif [ -n "$__bayan_root" ] && [ -d "$__bayan_root/clangarm64/bin" ]; then
+  elif [ -d /clangarm64/bin ]; then
     MSYSTEM=CLANGARM64
-  elif [ -n "$__bayan_root" ] && [ -d "$__bayan_root/mingw32/bin" ]; then
+  elif [ -d /mingw32/bin ]; then
     MSYSTEM=MINGW32
-  elif [ -n "$__bayan_root" ] && [ -d "$__bayan_root/clang64/bin" ]; then
+  elif [ -d /clang64/bin ]; then
     MSYSTEM=CLANG64
   else
     MSYSTEM=MSYS
   fi
 fi
-# `$root/usr/bin` is `//usr/bin` when the install root is `/`, and MSYS
-# treats a leading `//` as a network path. Drop that extra slash.
-__bayan_slash() {
-  case "$1" in
-    //*) printf '%s\n' "${1#/}" ;;
-    *) printf '%s\n' "$1" ;;
-  esac
-}
-__bayan_prefix=
 case "$MSYSTEM" in
-  MINGW32) __bayan_prefix=$(__bayan_slash "$__bayan_root/mingw32") ;;
-  MINGW64) __bayan_prefix=$(__bayan_slash "$__bayan_root/mingw64") ;;
-  CLANGARM64) __bayan_prefix=$(__bayan_slash "$__bayan_root/clangarm64") ;;
-  CLANG64) __bayan_prefix=$(__bayan_slash "$__bayan_root/clang64") ;;
-  UCRT64) __bayan_prefix=$(__bayan_slash "$__bayan_root/ucrt64") ;;
+  MINGW32) PATH="/mingw32/bin:/usr/bin${PATH:+:$PATH}" ;;
+  MINGW64) PATH="/mingw64/bin:/usr/bin${PATH:+:$PATH}" ;;
+  CLANGARM64) PATH="/clangarm64/bin:/usr/bin${PATH:+:$PATH}" ;;
+  CLANG64) PATH="/clang64/bin:/usr/bin${PATH:+:$PATH}" ;;
+  UCRT64) PATH="/ucrt64/bin:/usr/bin${PATH:+:$PATH}" ;;
+  *) PATH="/usr/bin${PATH:+:$PATH}" ;;
 esac
-__bayan_usr=$(__bayan_slash "$__bayan_root/usr/bin")
-if [ -n "$__bayan_prefix" ] && [ -d "$__bayan_prefix/bin" ]; then
-  PATH="$__bayan_prefix/bin:$__bayan_usr${PATH:+:$PATH}"
-elif [ -n "$__bayan_root" ] && [ -d "$__bayan_usr" ]; then
-  PATH="$__bayan_usr${PATH:+:$PATH}"
-elif [ -n "$__bayan_bin" ]; then
-  PATH="$__bayan_bin${PATH:+:$PATH}"
-fi
 export MSYSTEM PATH
-unset __bayan_bash __bayan_bin __bayan_root __bayan_prefix __bayan_usr
-unset -f __bayan_slash
 # Do not cd to the rcfile path: a Windows path can look like a network
 # share to MSYS and the cd then waits until the test kills it.
 __bayan_here="${BASH_SOURCE[0]}"
