@@ -951,7 +951,9 @@ without an `OP_TBC` instruction, so banning that opcode would ban every
 generic loop. `setmetatable` instead refuses a metatable that already has
 `__close`, installs a private copy, and makes `getmetatable` return a
 read-only view. A later `__close` on the caller's table, or on that view,
-is not the metamethod that runs. The string metatable is sealed the same
+is not the metamethod that runs. This is not stock Lua: `getmetatable(o) == Class`
+is false, calling `setmetatable` again on that object throws, and a metamethod
+added to the class after `setmetatable` does not apply. The string metatable is sealed the same
 way. `rawset` and `rawget` cannot put `__close` back onto those tables.
 Every chunk, including one passed to `load`, is still refused if its
 bytecode contains `OP_TBC`. The hook also

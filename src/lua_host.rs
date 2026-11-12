@@ -1226,6 +1226,13 @@ fn harden(lua: &Lua, fuel: &Arc<Fuel>) -> Result<(), String> {
     // iterator value to-be-closed (OP_TFORPREP) and looks the metamethod up
     // then. The caller's table is therefore never the metatable that runs.
     let protected = lua.create_table().map_err(|e| e.to_string())?;
+    // Weak keys. real, view, and guard are stored here, and a strong key
+    // would keep every sealed metatable alive after its object is gone.
+    let mode = lua.create_table().map_err(|e| e.to_string())?;
+    mode.raw_set("__mode", "k").map_err(|e| e.to_string())?;
+    protected
+        .set_metatable(Some(mode))
+        .map_err(|e| e.to_string())?;
     shield_shared_metatables(lua, &protected)?;
     let orig_setmt: mlua::Function = g.get("setmetatable").map_err(|e| e.to_string())?;
     let set_protected = protected.clone();
@@ -3380,6 +3387,66 @@ mod tests {
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(out.config.font_size, Some(38.0));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sealed_metatables_do_not_accumulate_across_keypresses() {
+        let dir = scratch("meta-mem");
+        let plugins = dir.join("plugins");
+        fs::create_dir_all(&plugins).unwrap();
+        let src = r#"
+            local Class = {}
+            Class.__index = Class
+            function Class:ping() return 1 end
+            bayan.bind("f12", function()
+              for _ = 1, 10 do
+                local o = setmetatable({}, Class)
+                o:ping()
+              end
+            end)
+            bayan.bind("f11", function()
+              collectgarbage("collect")
+              collectgarbage("collect")
+              bayan.send(tostring(collectgarbage("count")))
+            end)
+        "#;
+        fs::write(plugins.join("hello.lua"), src).unwrap();
+        let mut cfg = plugin_cfg(&plugins, "hello", false);
+        approve(&mut cfg, src.as_bytes());
+        let mut out = load_with(&cfg, &dir, false);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        for _ in 0..5000 {
+            assert!(out.plugins.fire("f12").is_empty());
+        }
+        let sent = out.plugins.fire("f11");
+        assert_eq!(sent.len(), 1, "the measurement callback must still run");
+        let kb: f64 = sent[0].text.parse().expect(&sent[0].text);
+        assert!(
+            kb < 256.0,
+            "sealed metatables leaked: collectgarbage count is {kb} KB"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rawset_of_close_is_refused_and_ordinary_rawset_works() {
+        let got = probe(
+            r#"
+            local sm = getmetatable("")
+            local ok = pcall(rawset, sm, "__close", function() end)
+            if ok then error("rawset allowed __close on the string metatable") end
+            local o = setmetatable({}, {__index = {}})
+            local g = getmetatable(o)
+            ok = pcall(rawset, g, "__close", function() end)
+            if ok then error("rawset allowed __close on the view") end
+            local t = {}
+            rawset(t, "k", "v")
+            if rawget(t, "k") ~= "v" then error("ordinary rawset failed") end
+            return "ok"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(got, "ok");
     }
 
     fn feed_terminal(bytes: &[u8]) {
