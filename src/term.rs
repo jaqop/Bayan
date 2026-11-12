@@ -6518,8 +6518,14 @@ mod tests {
         let spawn = src.split("pub fn spawn(").nth(1).expect("spawn");
         let body = spawn.split("pub fn shell(").next().unwrap_or(spawn);
         let gate = body.find("injection_allowed").expect("gate");
-        let wrapper = body.find("shell_integration_ps").expect("wrapper");
+        // The wrapper is written by `powershell_setup`, and only when the
+        // gate's answer is passed in.
+        let wrapper = body
+            .find("powershell_setup(elevated, theme.as_deref(), integrate)")
+            .expect("wrapper");
         assert!(gate < wrapper);
+        assert!(!powershell_setup(false, None, false).contains("133;"));
+        assert!(powershell_setup(false, None, true).contains("133;"));
     }
 
     fn osc7_of(url: &str) -> Vec<u8> {
