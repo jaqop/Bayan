@@ -11,7 +11,7 @@
 use crate::term::LockExt;
 use std::time::Instant;
 
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
@@ -396,7 +396,7 @@ impl App {
         if let Some(s) = self.session() {
             let mut t = s.term.lock();
             let off = t.grid().display_offset() as i32;
-            let point = Point::new(Line(row as i32 - off), Column(col));
+            let point = Point::new(Line(crate::scroll::grid_line(row, off)), Column(col));
             if let Some(sel) = t.selection.as_mut() {
                 sel.update(point, side);
             }
@@ -444,20 +444,24 @@ impl App {
         // 1003: motion with no button. Shift and overlays already dropped
         // out inside the report.
         if let Some((id, row, col)) = cell {
-            self.report_motion_at(id, row, col);
+            if let Some(row) = crate::scroll::screen_row(row) {
+                self.report_motion_at(id, row, col);
+            }
         }
     }
 
     /// `WindowEvent::MouseWheel`, after the modals.
     pub(crate) fn mouse_wheel(&mut self, delta: MouseScrollDelta) {
         let cell_h = self.renderer.as_ref().map_or(20.0, |r| r.cell_h);
-        let (n, rest) = take_whole_lines(self.wheel_accum, wheel_lines(delta, cell_h));
-        self.wheel_accum = rest;
-        if n == 0 {
-            return;
-        }
-        // Ctrl+wheel = live font zoom (EasyTer's favorite)
+        let lines = wheel_lines(delta, cell_h);
+        // Ctrl+wheel = live font zoom (EasyTer's favorite). Whole lines,
+        // whether or not scrollback itself eases.
         if self.modifiers.control_key() {
+            let (n, rest) = take_whole_lines(self.wheel_accum, lines);
+            self.wheel_accum = rest;
+            if n == 0 {
+                return;
+            }
             self.font_delta = zoomed(self.font_delta, n as f32);
             self.rebuild_renderer();
             return;
@@ -466,18 +470,58 @@ impl App {
         // the tab bar or the padding is not a cell: tracking programs do
         // not hear 1;1. Shift scrolls locally, including on the alt screen.
         let (at, view_id) = match self.locate(self.cursor_pos) {
-            Some((_, id, row, col)) => (Some(mouse::Cell { pane: id, row, col }), Some(id)),
+            Some((_, id, row, col)) => (
+                crate::scroll::screen_row(row).map(|row| mouse::Cell { pane: id, row, col }),
+                Some(id),
+            ),
             None => (None, self.focused_pane_id()),
         };
         let Some(id) = view_id else {
             return;
         };
+        let view = self.wheel_view(id);
+        let reports = view.proto.wants(mouse::What::Wheel, false);
+        let pixel = matches!(delta, MouseScrollDelta::PixelDelta(_));
+        match crate::scroll::wheel_plan(
+            self.config.smooth_scroll_on(),
+            view.alt_screen,
+            reports,
+            self.modifiers.shift_key(),
+            self.wheel_accum,
+            lines,
+            pixel,
+        ) {
+            crate::scroll::WheelPlan::Classic { lines: n, accum } => {
+                self.wheel_accum = accum;
+                if n == 0 {
+                    return;
+                }
+                self.apply_classic_wheel(at, id, n);
+            }
+            crate::scroll::WheelPlan::Smooth { pixel } => {
+                if lines == 0.0 {
+                    return;
+                }
+                self.smooth_scroll_pane(id, lines, pixel);
+            }
+        }
+    }
+
+    /// Whole-line wheel: mouse report, alt-screen arrows, or an immediate
+    /// `scroll_display`. Unchanged from the path that ignored sub-line motion.
+    fn apply_classic_wheel(&mut self, at: Option<mouse::Cell>, id: u64, n: i32) {
+        // A report or an alt-screen wheel draws the integer viewport, so a
+        // leftover fraction cannot disagree with the cell those paths use.
+        self.drop_smooth(id);
         match mouse::Route::wheel(at, self.wheel_view(id), n, self.mods_now()) {
             Some(mouse::Wheel::Report { pane, bytes })
             | Some(mouse::Wheel::Arrows { pane, bytes }) => {
                 self.write_pane(pane, &bytes);
             }
             Some(mouse::Wheel::Scroll { pane, lines }) => {
+                if pane != id {
+                    self.drop_smooth(pane);
+                }
                 if let Some((ti, pi)) = self.find_pane(pane) {
                     self.tabs[ti].panes[pi]
                         .session
@@ -489,6 +533,153 @@ impl App {
                 self.request_redraw();
             }
             None => {}
+        }
+    }
+
+    /// Sub-line scrollback for one pane. Pixel deltas move now; a wheel
+    /// notch waits in `pending` for [`Self::tick_smooth_scroll`].
+    pub(crate) fn smooth_scroll_pane(&mut self, id: u64, lines: f32, pixel: bool) {
+        let Some((ti, pi)) = self.find_pane(id) else {
+            return;
+        };
+        let mut st = self.smooth.remove(&id).unwrap_or_default();
+        let delta = {
+            let mut term = self.tabs[ti].panes[pi].session.term.lock();
+            let offset = term.grid().display_offset() as i32;
+            let history = term.grid().history_size() as i32;
+            st.note_motion(Instant::now());
+            let next = if pixel {
+                st.apply_pixels(offset, history, lines)
+            } else {
+                st.queue_lines(lines);
+                offset
+            };
+            let delta = next - offset;
+            if delta != 0 {
+                // Term::scroll_display, not the grid's: in copy mode this
+                // keeps the vi cursor inside the viewport.
+                term.scroll_display(crate::scroll::display_delta(offset, next));
+            }
+            delta
+        };
+        if st.idle() {
+            self.smooth.remove(&id);
+        } else {
+            self.smooth.insert(id, st);
+        }
+        if delta != 0 {
+            self.link_cache.invalidate_pane(id);
+        }
+        self.request_redraw();
+    }
+
+    /// Drop a pane's pixel offset. A keyboard page, a search jump, or typing
+    /// has just put the viewport on a whole line.
+    pub(crate) fn drop_smooth(&mut self, id: u64) {
+        self.smooth.remove(&id);
+    }
+
+    /// Spend a pending notch and round onto a line before a copy-mode key,
+    /// so the vi cursor is not left between two rows.
+    pub(crate) fn snap_smooth(&mut self, id: u64) {
+        let Some(st) = self.smooth.remove(&id) else {
+            return;
+        };
+        if st.idle() {
+            return;
+        }
+        let Some((ti, pi)) = self.find_pane(id) else {
+            return;
+        };
+        let delta = {
+            let mut term = self.tabs[ti].panes[pi].session.term.lock();
+            let offset = term.grid().display_offset() as i32;
+            let history = term.grid().history_size() as i32;
+            let (next, _) = st.commit_for_navigation(offset, history);
+            let delta = next - offset;
+            if delta != 0 {
+                term.scroll_display(crate::scroll::display_delta(offset, next));
+            }
+            delta
+        };
+        if delta != 0 {
+            self.link_cache.invalidate_pane(id);
+            self.request_redraw();
+        }
+    }
+
+    /// Ease wheel notches. Returns when the next sample should run.
+    pub(crate) fn tick_smooth_scroll(&mut self) -> Option<Instant> {
+        if !self.config.smooth_scroll_on() {
+            if !self.smooth.is_empty() {
+                self.smooth.clear();
+                self.request_redraw();
+            }
+            self.smooth_at = None;
+            return None;
+        }
+        let now = Instant::now();
+        let dt = self
+            .smooth_at
+            .map(|t| now.saturating_duration_since(t).as_secs_f32() * 1000.0)
+            .unwrap_or(0.0);
+        let ids: Vec<u64> = self.smooth.keys().copied().collect();
+        let mut any_pending = false;
+        let mut moved = false;
+        for id in ids {
+            let Some(mut st) = self.smooth.get(&id).copied() else {
+                continue;
+            };
+            if st.pending == 0.0 {
+                continue;
+            }
+            if dt > 0.0 {
+                let Some((ti, pi)) = self.find_pane(id) else {
+                    self.smooth.remove(&id);
+                    continue;
+                };
+                let old_sub = st.subline;
+                let delta = {
+                    let mut term = self.tabs[ti].panes[pi].session.term.lock();
+                    if term.mode().contains(TermMode::ALT_SCREEN) {
+                        drop(term);
+                        self.smooth.remove(&id);
+                        continue;
+                    }
+                    let offset = term.grid().display_offset() as i32;
+                    let history = term.grid().history_size() as i32;
+                    let next = st.tick(offset, history, dt);
+                    let delta = next - term.grid().display_offset() as i32;
+                    if delta != 0 {
+                        term.scroll_display(crate::scroll::display_delta(offset, next));
+                    }
+                    delta
+                };
+                if delta != 0 {
+                    self.link_cache.invalidate_pane(id);
+                }
+                if delta != 0 || (st.subline - old_sub).abs() > f32::EPSILON {
+                    moved = true;
+                }
+            }
+            if st.pending != 0.0 {
+                any_pending = true;
+            }
+            if st.idle() {
+                self.smooth.remove(&id);
+            } else {
+                self.smooth.insert(id, st);
+            }
+        }
+        if moved {
+            self.request_redraw();
+        }
+        if any_pending {
+            self.smooth_at = Some(now);
+            Some(now + std::time::Duration::from_millis(8))
+        } else {
+            self.smooth_at = None;
+            None
         }
     }
 
@@ -752,7 +943,7 @@ impl App {
 
     /// A local press in pane `pi`: focus it and anchor a selection whose
     /// kind follows the click count.
-    fn start_selection(&mut self, pi: usize, row: usize, col: usize, side: Side) {
+    fn start_selection(&mut self, pi: usize, row: i32, col: usize, side: Side) {
         if let Some(t) = self.tabs.get_mut(self.active) {
             t.focused = pi;
         }
@@ -763,7 +954,7 @@ impl App {
         if let Some(s) = self.session() {
             let mut t = s.term.lock();
             let off = t.grid().display_offset() as i32;
-            let point = Point::new(Line(row as i32 - off), Column(col));
+            let point = Point::new(Line(crate::scroll::grid_line(row, off)), Column(col));
             t.selection = Some(Selection::new(ty, point, side));
         }
         self.mouse.selecting = true;

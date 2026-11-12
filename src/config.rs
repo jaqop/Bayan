@@ -151,6 +151,10 @@ pub struct UserConfig {
     /// [`KeyboardConfig`].
     #[serde(default, skip_serializing_if = "KeyboardConfig::is_default")]
     pub keyboard: KeyboardConfig,
+    /// Pixel-smooth scrollback. `{"scroll":{"smooth":false}}` is the old
+    /// whole-line wheel. Default on, and omitted until someone sets it.
+    #[serde(default, skip_serializing_if = "ScrollConfig::is_default")]
+    pub scroll: ScrollConfig,
 }
 
 /// Selection copy. `clean` is `"off"`, `"on"`, or `"claude_mode"`.
@@ -283,6 +287,27 @@ impl Default for KeyboardConfig {
             kitty_protocol: false,
             kitty_base_layout_fallback: true,
         }
+    }
+}
+
+/// Scrollback wheel. `smooth` draws a sub-line pixel offset instead of
+/// waiting for a whole line. The default is on; false is the previous
+/// whole-line wheel, byte for byte.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ScrollConfig {
+    pub smooth: bool,
+}
+
+impl ScrollConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl Default for ScrollConfig {
+    fn default() -> Self {
+        Self { smooth: true }
     }
 }
 
@@ -482,6 +507,11 @@ impl UserConfig {
 
     pub fn kitty_base_layout_fallback_on(&self) -> bool {
         self.keyboard.kitty_base_layout_fallback
+    }
+
+    /// Sub-line scrollback. Absent, or `"scroll": {}`, stays on.
+    pub fn smooth_scroll_on(&self) -> bool {
+        self.scroll.smooth
     }
 }
 
@@ -698,6 +728,24 @@ mod tests {
         })
         .unwrap();
         assert!(kept.contains("\"mode\":\"off\""), "{kept}");
+    }
+
+    #[test]
+    fn smooth_scroll_defaults_on_and_false_is_explicit() {
+        assert!(UserConfig::default().smooth_scroll_on());
+        let absent: UserConfig = serde_json::from_str("{}").unwrap();
+        assert!(absent.smooth_scroll_on());
+        let empty: UserConfig = serde_json::from_str(r#"{"scroll":{}}"#).unwrap();
+        assert!(empty.smooth_scroll_on());
+        let off: UserConfig = serde_json::from_str(r#"{"scroll":{"smooth":false}}"#).unwrap();
+        assert!(!off.smooth_scroll_on());
+        let json = serde_json::to_string(&UserConfig::default()).unwrap();
+        assert!(
+            !json.contains("scroll"),
+            "the default must not appear in an untouched config: {json}"
+        );
+        let saved = serde_json::to_string(&off).unwrap();
+        assert!(saved.contains("\"smooth\":false"), "{saved}");
     }
 
     #[test]

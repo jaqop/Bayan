@@ -2452,6 +2452,79 @@ fn prepare_event(pane: u64, event: Event) -> Option<Event> {
     }
 }
 
+/// Bytes `Session::write` handed the PTY thread. `wait` blocks until some arrive.
+#[cfg(test)]
+pub(crate) struct HeadlessWrite(Arc<(Mutex<Vec<u8>>, std::sync::Condvar)>);
+
+#[cfg(test)]
+impl HeadlessWrite {
+    pub(crate) fn wait(&self) -> Vec<u8> {
+        let (lock, cv) = &*self.0;
+        let mut buf = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let start = Instant::now();
+        while buf.is_empty() {
+            let left = std::time::Duration::from_secs(2).saturating_sub(start.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            let (next, _) = cv
+                .wait_timeout(buf, left)
+                .unwrap_or_else(|e| e.into_inner());
+            buf = next;
+        }
+        std::mem::take(&mut *buf)
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct HeadlessOut(Arc<(Mutex<Vec<u8>>, std::sync::Condvar)>);
+
+#[cfg(test)]
+impl std::io::Write for HeadlessOut {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let mut buf = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        buf.extend_from_slice(data);
+        self.0 .1.notify_all();
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct IdleChild;
+
+#[cfg(test)]
+impl portable_pty::ChildKiller for IdleChild {
+    fn kill(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        Box::new(IdleChild)
+    }
+}
+
+#[cfg(test)]
+impl Child for IdleChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+        Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
+    }
+    fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+        Ok(portable_pty::ExitStatus::with_exit_code(0))
+    }
+    fn process_id(&self) -> Option<u32> {
+        None
+    }
+    #[cfg(windows)]
+    fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+        None
+    }
+}
+
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         // Answered here, on the reader thread, so a reply joins this
@@ -2790,6 +2863,51 @@ impl Session {
             shell: shell.to_string(),
             parser,
         })
+    }
+
+    /// A pane with no child process. Tests drive the grid and read what
+    /// `write` would have sent to the shell.
+    #[cfg(test)]
+    pub(crate) fn headless(
+        size: TermSize,
+        proxy: EventLoopProxy<UserEvent>,
+        id: u64,
+    ) -> (Self, HeadlessWrite) {
+        let written = Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new()));
+        let writer =
+            crate::pty_writer::PtyWriter::spawn(HeadlessOut(Arc::clone(&written)), |_| {}, |_| {})
+                .expect("pty writer thread");
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: size.rows as u16,
+                cols: size.cols as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("pty");
+        drop(pair.slave);
+        let batch = Arc::new(Mutex::new(EventBatch::default()));
+        let term = Arc::new(FairMutex::new(Term::new(
+            Config {
+                scrolling_history: 1_000,
+                ..Config::default()
+            },
+            &size,
+            EventProxy(proxy.clone(), id, batch),
+        )));
+        let session = Self {
+            term,
+            meta: Arc::new(Mutex::new(SessionMeta::default())),
+            writer,
+            write_error: Arc::new(AtomicBool::new(false)),
+            proxy,
+            id,
+            master: pair.master,
+            child: Box::new(IdleChild),
+            shell: String::new(),
+            parser: Arc::new(Mutex::new(Processor::new())),
+        };
+        (session, HeadlessWrite(written))
     }
 
     /// The command line passed to [`Session::spawn`], for shell-specific quoting.

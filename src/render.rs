@@ -1067,6 +1067,12 @@ pub struct PaneView<'a> {
     /// Status text for that link: scheme and host, then the path. The
     /// drawer forces an LTR paragraph and isolates the path.
     pub link_tip: Option<&'a crate::link::StatusParts>,
+    /// Pixels the grid is shifted down inside the pane. Zero draws every
+    /// row where it was drawn before this offset existed.
+    pub scroll_px: i32,
+    /// SCP direction of the history line drawn above the pane. Ignored
+    /// when `scroll_px` is zero, so a whole-line frame does not read it.
+    pub peek_dir: ParagraphDir,
 }
 
 // translucent overlays, EasyTer's colors: selection blue, search amber
@@ -1152,6 +1158,20 @@ fn auto_paragraph_dir(chars: impl IntoIterator<Item = char>) -> ParagraphDir {
         Some(false) => ParagraphDir::Ltr,
         None => ParagraphDir::Default,
     }
+}
+
+/// Direction of a mouse snapshot's first strong letter, as `draw_pane`
+/// reads it for the history row above the viewport: HIDDEN cells count as
+/// blanks.
+pub(crate) fn snap_paragraph_dir(cells: &[SnapCell]) -> ParagraphDir {
+    auto_paragraph_dir(cells.iter().flat_map(|c| {
+        let base = if c.flags.intersects(Flags::HIDDEN) {
+            ' '
+        } else {
+            c.c
+        };
+        std::iter::once(base).chain(c.zw.iter().copied())
+    }))
 }
 
 /// The per-row direction decision, walked top to bottom over the viewport.
@@ -1667,6 +1687,51 @@ pub fn snapshot_row<T: alacritty_terminal::event::EventListener>(
             bg: cell.bg,
             flags: cell.flags,
         });
+    }
+    cells
+}
+
+/// Cells of one grid line, including a history line above the viewport.
+/// `line` is the grid's own index (`0` is the top of the screen when the
+/// view is at the bottom; negative lines are scrollback).
+pub fn snapshot_grid_line<T: alacritty_terminal::event::EventListener>(
+    term: &Term<T>,
+    line: i32,
+) -> Vec<SnapCell> {
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::{Column, Line};
+    let at = Line(line);
+    if at < term.topmost_line() || at > term.bottommost_line() {
+        return Vec::new();
+    }
+    let grid_row = &term.grid()[at];
+    let mut cells = Vec::new();
+    let mut col = 0;
+    while col < term.columns() {
+        let cell = &grid_row[Column(col)];
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            col += 1;
+            continue;
+        }
+        let w = if cell.flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else {
+            1
+        };
+        cells.push(SnapCell {
+            col,
+            w,
+            c: if cell.flags.intersects(Flags::HIDDEN) {
+                ' '
+            } else {
+                cell.c
+            },
+            zw: cell.zerowidth().map(|z| z.to_vec()).unwrap_or_default(),
+            fg: cell.fg,
+            bg: cell.bg,
+            flags: cell.flags,
+        });
+        col += 1;
     }
     cells
 }
@@ -2334,6 +2399,16 @@ impl Renderer {
                 spans.dedup();
             }
         }
+    }
+
+    /// One shaped span, so a test can click a column `hit_cell` returns
+    /// without drawing a frame.
+    #[cfg(test)]
+    pub(crate) fn plant_hit(&mut self, pane: Rect, row: usize, x: i32, width: i32, col: usize) {
+        self.row_hits
+            .entry((pane, row))
+            .or_default()
+            .push((x, width, col, false));
     }
 
     pub fn hit_cell(
@@ -3595,6 +3670,110 @@ impl Renderer {
         cursor
     }
 
+    /// One grid line, in the same cell order `display_iter` feeds a row.
+    fn cells_of_line<T: alacritty_terminal::event::EventListener>(
+        &self,
+        term: &Term<T>,
+        line: alacritty_terminal::index::Line,
+    ) -> Vec<CellInfo> {
+        use alacritty_terminal::index::Column;
+        let row = &term.grid()[line];
+        let mut cells = Vec::new();
+        for col in 0..term.columns() {
+            let cell = &row[Column(col)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            let w = if cell.flags.contains(Flags::WIDE_CHAR) {
+                2
+            } else {
+                1
+            };
+            let (fg, bg, style) = self.cell_paint(cell.fg, cell.bg, cell.flags);
+            let ch = if cell.flags.intersects(Flags::HIDDEN) {
+                ' '
+            } else {
+                cell.c
+            };
+            cells.push(CellInfo {
+                col,
+                w,
+                c: ch,
+                zw: cell.zerowidth().map(|z| z.to_vec()),
+                fg,
+                bg,
+                style,
+                ul: cell.underline_color().map_or(fg, |c| self.ansi_rgb(c)),
+            });
+        }
+        cells
+    }
+
+    /// Paint one viewport row. `vis` is the row's place in the pane (`-1`
+    /// is the history line above it); the geometry key is that row, or
+    /// [`crate::scroll::PEEK_ROW`] for the line above. Shaping is the same
+    /// path a fully visible row takes.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_row(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        clip: Rect,
+        px: i32,
+        pw: i32,
+        y: i32,
+        vis: i32,
+        cells: &[CellInfo],
+        view: &PaneView,
+        alt: bool,
+        cursor_vrow: i32,
+        ccol: usize,
+        dir: ParagraphDir,
+        follow_rtl: bool,
+    ) -> Option<(i32, i32)> {
+        if cells.is_empty() {
+            return None;
+        }
+        let key = if vis < 0 {
+            crate::scroll::PEEK_ROW
+        } else {
+            vis as usize
+        };
+        self.mapping_context = Some((view.rect, key));
+        let hover_key = if vis < 0 {
+            crate::scroll::PEEK_ROW
+        } else {
+            vis as usize
+        };
+        let hover = view
+            .link_hover
+            .and_then(|(row, a, b)| (row == hover_key).then_some((a, b)));
+        // Explicit BDSM: the application sent visual order (and, per the
+        // recommendation, presentation forms). The grid path does not
+        // run UAX#9 and does not reshape. Implicit mode keeps the
+        // whole-line shaper, with SCP's base direction if one was set.
+        let arabic = cells.iter().any(|ci| is_rtl(ci.c));
+        let row_claude = view.claude && view.claude_from.is_none_or(|start| vis as i64 >= start);
+        // A wrapped tail of an RTL paragraph (`follow_rtl`) stays on the
+        // bidi path even when this row itself has no Arabic letter.
+        if (arabic || follow_rtl) && view.reorder {
+            let on_row = cursor_vrow == vis;
+            let col = if on_row { Some(ccol) } else { None };
+            // Alternate-screen rows stay in their grid columns: a TUI
+            // positioned the cells. The primary screen's prose aligns
+            // an RTL paragraph to the pane's right edge.
+            if (row_claude || alt) && is_tui_row(cells) {
+                self.draw_line_tui(out, clip, px, y, cells, row_claude, col, dir, hover)
+            } else {
+                self.draw_line_bidi(
+                    out, clip, px, y, pw, cells, row_claude, col, dir, hover, !alt,
+                )
+            }
+        } else {
+            self.draw_line_grid(out, clip, px, y, cells, hover);
+            None
+        }
+    }
+
     /// Draw one pane's terminal into its rect.
     pub fn draw_pane<T: alacritty_terminal::event::EventListener>(
         &mut self,
@@ -3611,8 +3790,16 @@ impl Renderer {
         let content = term.renderable_content();
         let cursor = content.cursor;
         let selection = content.selection;
-        // scrolled into history: viewport row = grid line + display offset
+        // scrolled into history: viewport row = grid line + display offset.
+        // `shift` is the sub-line remainder, in pixels downward. Zero keeps
+        // every y on the row it had before smooth scroll.
         let off = content.display_offset as i32;
+        let shift = view.scroll_px.max(0);
+        let cell_h = self.cell_h;
+        let y_at = |row: i32| crate::scroll::content_y(py, row, cell_h, shift);
+        let alt = term
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
 
         // collect the visible grid; paint non-default cell backgrounds as
         // pixel-snapped rects (EasyTer lesson: snap both edges so adjacent
@@ -3674,18 +3861,8 @@ impl Renderer {
         let mut cursor_rect: Option<(i32, i32)> = None; // (x, w) via shaped layout
         let mut walk = ParagraphWalk::default();
         for (li, cells) in lines.iter().enumerate() {
-            self.mapping_context = Some((view.rect, li));
-            if cells.is_empty() {
-                continue;
-            }
-            let y = py + (li as f32 * self.cell_h).round() as i32;
-            let hover = view
-                .link_hover
-                .and_then(|(row, a, b)| (row == li).then_some((a, b)));
-            // Explicit BDSM: the application sent visual order (and, per the
-            // recommendation, presentation forms). The grid path does not
-            // run UAX#9 and does not reshape. Implicit mode keeps the
-            // whole-line shaper, with SCP's base direction if one was set.
+            // The row's direction: SCP stamp, then the wrapped paragraph's
+            // direction, then its own first strong letter.
             let explicit = view.line_dir.get(li).copied().unwrap_or_default();
             let continued = line_wrapped_into(term, li, off);
             let auto = auto_paragraph_dir(
@@ -3693,42 +3870,73 @@ impl Renderer {
                     .iter()
                     .flat_map(|ci| std::iter::once(ci.c).chain(ci.zw.iter().flatten().copied())),
             );
-            // A wrapped tail of an RTL paragraph stays on the bidi path even
-            // when this row itself has no Arabic letter.
             let (dir, follow_rtl) = walk.row(explicit, continued, auto);
-            let arabic = cells.iter().any(|ci| is_rtl(ci.c));
-            let row_claude = view.claude && view.claude_from.is_none_or(|start| li as i64 >= start);
-            if (arabic || follow_rtl) && view.reorder {
-                let on_row = cursor_vrow >= 0 && cursor_vrow as usize == li;
-                let col = if on_row { Some(ccol) } else { None };
-                // Alternate-screen rows stay in their grid columns: a TUI
-                // positioned the cells. The primary screen's prose aligns
-                // an RTL paragraph to the pane's right edge.
-                let alt_screen = term
-                    .mode()
-                    .contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
-                let r = if (row_claude || alt_screen) && is_tui_row(cells) {
-                    self.draw_line_tui(out, clip, px, y, cells, row_claude, col, dir, hover)
-                } else {
-                    self.draw_line_bidi(
-                        out,
-                        clip,
-                        px,
-                        y,
-                        pw,
-                        cells,
-                        row_claude,
-                        col,
-                        dir,
-                        hover,
-                        !alt_screen,
-                    )
-                };
-                if r.is_some() {
-                    cursor_rect = r;
+            if let Some(r) = self.paint_row(
+                out,
+                clip,
+                px,
+                pw,
+                y_at(li as i32),
+                li as i32,
+                cells,
+                view,
+                alt,
+                cursor_vrow,
+                ccol,
+                dir,
+                follow_rtl,
+            ) {
+                cursor_rect = Some(r);
+            }
+        }
+        // One extra history row, shifted into the pane by `shift` and
+        // clipped to the pane rect by every quad. A zero shift draws nothing
+        // here, so the frame matches the unshifted viewport.
+        if shift > 0 && off >= 0 && (off as usize) < history {
+            let line = alacritty_terminal::index::Line(-(off + 1));
+            let extra = self.cells_of_line(term, line);
+            for c in &extra {
+                let point = alacritty_terminal::index::Point::new(
+                    line,
+                    alacritty_terminal::index::Column(c.col),
+                );
+                if selection.is_some_and(|sel| sel.contains(point)) {
+                    sel_cells.push((crate::scroll::PEEK_ROW, c.col, c.w));
                 }
-            } else {
-                self.draw_line_grid(out, clip, px, y, cells, hover);
+                if view
+                    .search_match
+                    .is_some_and(|m| *m.start() <= point && point <= *m.end())
+                {
+                    hit_cells.push((crate::scroll::PEEK_ROW, c.col, c.w));
+                }
+            }
+            // The peek row starts its own walk: an SCP stamp, else its
+            // first strong letter. Row 0 does the same when the line above
+            // it is off screen.
+            let peek_dir =
+                if view.peek_dir != ParagraphDir::Default {
+                    view.peek_dir
+                } else {
+                    auto_paragraph_dir(extra.iter().flat_map(|ci| {
+                        std::iter::once(ci.c).chain(ci.zw.iter().flatten().copied())
+                    }))
+                };
+            if let Some(r) = self.paint_row(
+                out,
+                clip,
+                px,
+                pw,
+                y_at(-1),
+                -1,
+                &extra,
+                view,
+                alt,
+                cursor_vrow,
+                ccol,
+                peek_dir,
+                false,
+            ) {
+                cursor_rect = Some(r);
             }
         }
         self.mapping_context = None;
@@ -3738,8 +3946,13 @@ impl Renderer {
         // blue, current search hit amber
         for (cells, ((r, g, b), a)) in [(&sel_cells, SELECTION_RGBA), (&hit_cells, SEARCH_RGBA)] {
             for &(li, col, w) in cells.iter() {
+                let vis = if li == crate::scroll::PEEK_ROW {
+                    -1
+                } else {
+                    li as i32
+                };
+                let y0 = y_at(vis);
                 if let Some(spans) = self.cell_geometry.get(&(view.rect, li, col)) {
-                    let y0 = py + (li as f32 * self.cell_h).round() as i32;
                     for &(x0, width, _) in spans {
                         push_rect(
                             out,
@@ -3755,8 +3968,7 @@ impl Renderer {
                 }
                 let x0 = px + (col as f32 * self.cell_w).round() as i32;
                 let x1 = px + ((col + w) as f32 * self.cell_w).round() as i32;
-                let y0 = py + (li as f32 * self.cell_h).round() as i32;
-                let y1 = py + ((li + 1) as f32 * self.cell_h).round() as i32;
+                let y1 = y_at(vis + 1);
                 push_rect(out, clip, x0, y0, x1 - x0, y1 - y0, c4((r, g, b), a as u8));
             }
         }
@@ -3769,7 +3981,7 @@ impl Renderer {
                 px + (ccol as f32 * self.cell_w).round() as i32,
                 self.cell_w.round() as i32,
             ));
-            let y0 = py + (cursor_vrow as f32 * self.cell_h).round() as i32;
+            let y0 = y_at(cursor_vrow);
             let hpx = self.cell_h.round() as i32;
             self.ime_spot = Some((x0, y0, wpx, hpx));
             if let Some(text) = self.preedit.clone().filter(|t| !t.is_empty()) {
@@ -3797,7 +4009,7 @@ impl Renderer {
                 px + (ccol as f32 * self.cell_w).round() as i32,
                 self.cell_w.round() as i32,
             ));
-            let y0 = py + (cursor_vrow as f32 * self.cell_h).round() as i32;
+            let y0 = y_at(cursor_vrow);
             let hpx = self.cell_h.round() as i32;
             use crate::config::CursorStyle::*;
             match view.cursor {
@@ -3817,7 +4029,8 @@ impl Renderer {
         // command-block lights in the pane's left gutter (EasyTer's bars)
         for &(abs, exit) in view.marks {
             let vrow = abs as i64 - history as i64 + off as i64;
-            if vrow < 0 || vrow >= rows as i64 {
+            let min_row = if shift > 0 { -1 } else { 0 };
+            if vrow < min_row || vrow >= rows as i64 {
                 continue;
             }
             let color = match exit {
@@ -3825,7 +4038,7 @@ impl Renderer {
                 Some(_) => (0xcf, 0x22, 0x2e),
                 None => (0x6e, 0x76, 0x81),
             };
-            let y0 = py + (vrow as f32 * self.cell_h).round() as i32;
+            let y0 = y_at(vrow as i32);
             push_rect(
                 out,
                 clip,
@@ -3837,10 +4050,17 @@ impl Renderer {
             );
         }
 
-        // scroll position indicator while in history (EasyTer's slim bar)
-        if off > 0 && history > 0 {
+        // scroll position indicator while in history (EasyTer's slim bar).
+        // A zero shift uses `off` alone, the same fraction as before.
+        if (off > 0 || shift > 0) && history > 0 {
+            let frac = if shift > 0 && cell_h > 0.0 {
+                (shift as f32 / cell_h).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let pos = off as f32 + frac;
             let th = ((ph as f32 * rows as f32 / (history + rows) as f32) as i32).max(24);
-            let ty = py + ((ph - th) as f32 * (1.0 - off as f32 / history as f32)) as i32;
+            let ty = py + ((ph - th) as f32 * (1.0 - pos / history as f32)) as i32;
             push_rect(out, clip, px + pw - 7, ty, 4, th, c4(self.fg, 70));
         }
 
@@ -7087,6 +7307,8 @@ mod tests {
             marks: &[],
             link_hover: None,
             link_tip: None,
+            scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
         };
         let block = c4(r.fg, 170);
         let opaque_bg = c4(r.bg, 255);
@@ -7172,6 +7394,8 @@ mod tests {
             link_hover: None,
             bidi_mode: crate::bidi_ctl::BidiReorder::Full,
             link_tip: None,
+            scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
         };
         let mut out = Vec::new();
         r.begin_frame();
@@ -7222,6 +7446,8 @@ mod tests {
             marks: &[],
             link_hover: None,
             link_tip: None,
+            scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
         };
         r.draw_pane(&mut Vec::new(), &view, &t);
         let inverse = r
@@ -7265,6 +7491,8 @@ mod tests {
             marks: &[],
             link_hover: None,
             link_tip: None,
+            scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
         };
         r.draw_pane(&mut Vec::new(), &view, &t);
         let x = |col: usize| {
@@ -7362,6 +7590,8 @@ mod tests {
             reorder: true,
             line_dir: &[],
             bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+            scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
         };
         let mut out = Vec::new();
         r.draw_pane(&mut out, &view, &t);
@@ -7524,6 +7754,8 @@ mod tests {
                 reorder: true,
                 line_dir: &[],
                 bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+                scroll_px: 0,
+                peek_dir: ParagraphDir::Default,
             };
             let mut out = Vec::new();
             r.draw_pane(&mut out, &view, &t);
@@ -8460,6 +8692,8 @@ mod tests {
                 link_hover: None,
                 link_tip: None,
                 bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+                scroll_px: 0,
+                peek_dir: ParagraphDir::Default,
             };
             let mut out = Vec::new();
             r.begin_frame();
@@ -9276,6 +9510,8 @@ mod cache_tests {
                 reorder: true,
                 line_dir: &[],
                 bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+                scroll_px: 0,
+                peek_dir: ParagraphDir::Default,
             };
             // an underline is a solid quad (page 0, white texel) th px tall
             let th = (r.cell_h / 14.0).max(1.0) as i32;
@@ -9296,6 +9532,231 @@ mod cache_tests {
         assert!(
             underlined > plain,
             "no underline quads on the Arabic row ({underlined} vs {plain})"
+        );
+    }
+
+    /// A smooth scroll that has landed on a whole line draws an Arabic and
+    /// Hebrew row the same way a `Scroll::Delta` of those lines does. While
+    /// the fraction is still on screen the shaped boxes (x, width, RTL) do
+    /// not move; only the pixels do.
+    #[test]
+    fn settled_smooth_scroll_matches_the_whole_line_bidi_frame() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::grid::{Dimensions, Scroll};
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let mut renderer = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 40, rows: 4 };
+        let bytes: String = [
+            "latin-aaa\r\n",
+            "مرحبا واحد\r\n",
+            "latin-bbb\r\n",
+            "שלום שתיים\r\n",
+            "latin-ccc\r\n",
+            "مرحبا ثلاثة\r\n",
+            "latin-ddd\r\n",
+            "שלום ארבע\r\n",
+        ]
+        .concat();
+        let term = || {
+            let mut t = Term::new(Config::default(), &size, VoidListener);
+            let mut parser: Processor = Processor::new();
+            parser.advance(&mut t, bytes.as_bytes());
+            t
+        };
+        let pane = (0, 0, 800, 200);
+        type SpanBox = (i32, i32, bool);
+        type RowGeom = ((usize, usize), Vec<SpanBox>);
+        let frame = |renderer: &mut Renderer, term: &Term<VoidListener>, scroll_px: i32| {
+            let mut out = Vec::new();
+            let view = PaneView {
+                rect: pane,
+                focused: false,
+                cursor: crate::config::CursorStyle::Block,
+                cursor_on: false,
+                bordered: false,
+                claude: false,
+                claude_from: None,
+                reorder: true,
+                line_dir: &[],
+                search_match: None,
+                marks: &[],
+                link_hover: None,
+                link_tip: None,
+                scroll_px,
+                peek_dir: ParagraphDir::Default,
+                bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+            };
+            renderer.draw_pane(&mut out, &view, term);
+            let mut geom: Vec<RowGeom> = renderer
+                .cell_geometry
+                .iter()
+                .filter(|((_, row, _), _)| *row != crate::scroll::PEEK_ROW)
+                .map(|((_, row, col), spans)| ((*row, *col), spans.clone()))
+                .collect();
+            geom.sort_by_key(|entry| entry.0);
+            (out, geom)
+        };
+        let same_quads = |a: &[crate::gpu::Vertex], b: &[crate::gpu::Vertex]| {
+            a.len() == b.len()
+                && a.iter().zip(b).all(|(p, q)| {
+                    p.pos == q.pos && p.uv == q.uv && p.layer == q.layer && p.color == q.color
+                })
+        };
+
+        let mut held = term();
+        let (whole_now, geom_now) = frame(&mut renderer, &held, 0);
+        let shift = crate::scroll::offset_px(0.5, renderer.cell_h);
+        assert!(shift > 0, "half a line must be a visible pixel offset");
+        let (_shifted, geom_shifted) = frame(&mut renderer, &held, shift);
+        assert_eq!(
+            geom_shifted, geom_now,
+            "a fractional offset moved the Arabic/Hebrew shaping"
+        );
+        assert!(
+            geom_now.iter().any(|(_, spans)| spans.iter().any(|s| s.2)),
+            "the row was not shaped as RTL"
+        );
+        // settling the same half plus another half is one whole line
+        let history = held.grid().history_size() as i32;
+        assert!(history >= 1);
+        let mut smooth = crate::scroll::PaneScroll::default();
+        let mut offset = smooth.apply_pixels(0, history, 0.5);
+        assert!(smooth.subline > 0.0);
+        offset = smooth.apply_pixels(offset, history, 0.5);
+        assert_eq!(smooth.subline, 0.0);
+        assert_eq!(offset, 1);
+        assert_eq!(crate::scroll::offset_px(smooth.subline, renderer.cell_h), 0);
+        held.scroll_display(Scroll::Delta(offset));
+        let (settled, geom_settled) = frame(&mut renderer, &held, 0);
+
+        let mut jumped = term();
+        jumped.scroll_display(Scroll::Delta(1));
+        let (whole_line, geom_line) = frame(&mut renderer, &jumped, 0);
+        assert!(
+            same_quads(&settled, &whole_line),
+            "settled smooth scroll diverged from a one-line wheel"
+        );
+        assert_eq!(geom_settled, geom_line);
+        assert!(
+            !same_quads(&settled, &whole_now),
+            "scrolling one line should reveal a different row"
+        );
+    }
+
+    /// The history line peeking in keeps its SCP direction, and a search hit
+    /// on that line is drawn in the sliver.
+    #[test]
+    fn the_peek_row_keeps_its_paragraph_direction_and_search_hit() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::index::{Column, Line, Point};
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let mut renderer = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 40, rows: 4 };
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(
+            &mut term,
+            "aaa\r\nbbb\r\nA\u{645}\u{631}\u{62d}\u{628}\u{627}\r\nccc\r\nddd\r\neee\r\n"
+                .as_bytes(),
+        );
+        let above = &term.grid()[Line(-1)];
+        assert_eq!(above[Column(0)].c, 'A', "the peek line is the mixed row");
+        let shift = 12;
+        let pane = (0, 40, 800, 160);
+        let draw = |renderer: &mut Renderer, dir: ParagraphDir, search: bool| {
+            let start = Point::new(Line(-1), Column(0));
+            let end = Point::new(Line(-1), Column(2));
+            let range = start..=end;
+            let mut out = Vec::new();
+            let view = PaneView {
+                rect: pane,
+                focused: false,
+                cursor: crate::config::CursorStyle::Block,
+                cursor_on: false,
+                bordered: false,
+                claude: false,
+                claude_from: None,
+                reorder: true,
+                line_dir: &[],
+                search_match: search.then_some(&range),
+                marks: &[],
+                link_hover: None,
+                link_tip: None,
+                scroll_px: shift,
+                peek_dir: dir,
+                bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+            };
+            renderer.draw_pane(&mut out, &view, &term);
+            let geom: Vec<(i32, i32, bool)> = renderer
+                .cell_geometry
+                .iter()
+                .filter(|((_, row, _), _)| *row == crate::scroll::PEEK_ROW)
+                .flat_map(|(_, spans)| spans.iter().copied())
+                .collect();
+            let top = out
+                .chunks(6)
+                .filter(|q| q[0].pos[1] < pane.1 as f32 + shift as f32)
+                .count();
+            (geom, top, out.len())
+        };
+        let (ltr, _, _) = draw(&mut renderer, ParagraphDir::Default, false);
+        let (rtl, _, _) = draw(&mut renderer, ParagraphDir::Rtl, false);
+        assert!(!ltr.is_empty(), "the peek row was not shaped");
+        assert_ne!(ltr, rtl, "an SCP RTL stamp must move the mixed peek row");
+        let (_, plain, _) = draw(&mut renderer, ParagraphDir::Default, false);
+        let (_, hit, _) = draw(&mut renderer, ParagraphDir::Default, true);
+        assert!(
+            hit > plain,
+            "the search hit on the peek row added no quads ({hit} vs {plain})"
+        );
+    }
+
+    /// The history line peeking in keeps its SGR 58 underline colour, as the
+    /// same line does once it scrolls fully into the viewport.
+    #[test]
+    fn the_peek_row_keeps_its_underline_colour() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let mut renderer = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 30, rows: 3 };
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(
+            &mut term,
+            "\x1b[4;58;2;255;0;0mabcdef\x1b[0m\r\nb\r\nc\r\nd".as_bytes(),
+        );
+        let shift = renderer.cell_h as i32 - 1;
+        let mut out = Vec::new();
+        let view = PaneView {
+            rect: (0, 0, 600, 90),
+            focused: false,
+            cursor: crate::config::CursorStyle::Block,
+            cursor_on: false,
+            bordered: false,
+            claude: false,
+            claude_from: None,
+            reorder: true,
+            line_dir: &[],
+            search_match: None,
+            marks: &[],
+            link_hover: None,
+            link_tip: None,
+            scroll_px: shift,
+            peek_dir: ParagraphDir::Default,
+            bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+        };
+        renderer.draw_pane(&mut out, &view, &term);
+        let red = [1.0, 0.0, 0.0, 1.0];
+        assert!(
+            out.chunks(6)
+                .any(|q| q[0].uv == [WHITE_UV, WHITE_UV] && q[0].color == red),
+            "the peek row drew its underline without the SGR 58 colour"
         );
     }
 
@@ -9329,6 +9790,8 @@ mod cache_tests {
                 reorder: true,
                 line_dir: &[],
                 bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+                scroll_px: 0,
+                peek_dir: ParagraphDir::Default,
             };
             let th = (r.cell_h / 14.0).max(1.0) as i32;
             r.draw_pane(&mut out, &view, &t);
@@ -9845,6 +10308,8 @@ mod paragraph_align {
             marks: &[],
             link_hover: None,
             link_tip: None,
+            scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
         };
         let glyph_xs = |out: &[Vertex]| -> Vec<f32> {
             out.iter()
@@ -9924,6 +10389,8 @@ mod paragraph_align {
                 marks: &[],
                 link_hover: None,
                 link_tip: None,
+                scroll_px: 0,
+                peek_dir: ParagraphDir::Default,
             };
             let mut out = Vec::new();
             r.begin_frame();
@@ -9956,6 +10423,8 @@ mod paragraph_align {
             marks: &[],
             link_hover: None,
             link_tip: None,
+            scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
         }
     }
 

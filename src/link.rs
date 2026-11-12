@@ -2336,6 +2336,53 @@ pub fn links_on_row<T: EventListener>(term: &Term<T>, viewport_row: usize) -> Ve
     links_in_row(&cells)
 }
 
+/// Links on viewport row `vrow`, which may be `-1` when a smooth scroll
+/// has drawn the history line above the screen. Row 0 and below are the
+/// same scan as [`links_on_row`].
+pub fn links_on_viewport<T: EventListener>(term: &Term<T>, vrow: i32) -> Vec<LinkSpan> {
+    if vrow >= 0 {
+        return links_on_row(term, vrow as usize);
+    }
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::{Column, Line};
+    let off = term.grid().display_offset() as i32;
+    let line = Line(vrow - off);
+    if line < term.topmost_line() || line > term.bottommost_line() {
+        return Vec::new();
+    }
+    let grid_row = &term.grid()[line];
+    let mut cells = Vec::new();
+    let mut col = 0;
+    while col < term.columns() {
+        let cell = &grid_row[Column(col)];
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            col += 1;
+            continue;
+        }
+        let width = if cell.flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else {
+            1
+        };
+        let hidden = cell.flags.intersects(Flags::HIDDEN);
+        let href = if hidden { None } else { cell.hyperlink() };
+        let ch = if hidden { ' ' } else { cell.c };
+        cells.push(RowCell {
+            col,
+            width,
+            ch,
+            osc_id: href.as_ref().map(|h| h.id().to_string()),
+            osc_uri: href
+                .as_ref()
+                .map(|h| h.uri().to_string())
+                .filter(|u| !u.is_empty()),
+            hidden,
+        });
+        col += 1;
+    }
+    links_in_row(&cells)
+}
+
 fn links_in_row(cells: &[RowCell]) -> Vec<LinkSpan> {
     let mut spans = osc_spans(cells);
     let (text, map) = line_text(cells);
@@ -2843,6 +2890,68 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A partial pixel offset: the sliver at the top is the history line,
+    /// not viewport row 0. The link path asks [`links_on_viewport`] for
+    /// that row.
+    #[test]
+    fn a_partial_offset_reads_the_link_on_the_shifted_row() {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::Column;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let size = crate::term::TermSize { cols: 48, rows: 4 };
+        let mut t = Term::new(
+            Config::default(),
+            &size,
+            alacritty_terminal::event::VoidListener,
+        );
+        let mut parser: Processor = Processor::new();
+        let text = concat!(
+            "http://peek.example/old\r\n",
+            "http://top.example/row0\r\n",
+            "http://mid.example/row1\r\n",
+            "http://low.example/row2\r\n",
+        );
+        parser.advance(&mut t, text.as_bytes());
+        assert!(t.grid().history_size() >= 1, "the first url scrolled away");
+        let peek = &t.grid()[alacritty_terminal::index::Line(-1)];
+        assert_eq!(peek[Column(0)].c, 'h', "line above the viewport");
+
+        let cell_h = 20.0;
+        let shift = 8.0;
+        let sliver = crate::scroll::selection_row(3.0, cell_h, shift, 4);
+        let below = crate::scroll::selection_row(10.0, cell_h, shift, 4);
+        assert_eq!(sliver, -1);
+        assert_eq!(below, 0);
+        // cell_at would have called the sliver row 0
+        assert_eq!((3.0f64 / cell_h).floor() as i32, 0);
+
+        let peek_urls: Vec<_> = links_on_viewport(&t, sliver)
+            .into_iter()
+            .filter_map(|sp| match sp.kind {
+                LinkKind::Url { uri } => Some(uri),
+                _ => None,
+            })
+            .collect();
+        let top_urls: Vec<_> = links_on_viewport(&t, below)
+            .into_iter()
+            .filter_map(|sp| match sp.kind {
+                LinkKind::Url { uri } => Some(uri),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            peek_urls.iter().any(|u| u.contains("peek.example")),
+            "peek row links: {peek_urls:?}"
+        );
+        assert!(
+            top_urls.iter().any(|u| u.contains("top.example")),
+            "top row links: {top_urls:?}"
+        );
+        assert!(peek_urls.iter().all(|u| !u.contains("top.example")));
     }
 
     fn files_in(s: &str) -> Vec<(String, u32, Option<u32>, String)> {

@@ -374,6 +374,11 @@ impl AltScreenTrack {
     }
 }
 
+/// Absolute line of the history row drawn above viewport row 0.
+pub fn peek_line_abs(evicted: u64, history: u64, display_offset: u64) -> u64 {
+    viewport_line_abs(evicted, history, display_offset, 0).saturating_sub(1)
+}
+
 /// UAX#9 base-direction mark. cosmic-text chooses the paragraph level from
 /// the first strong character and has no knob for it; LRM/RLM are that
 /// character and occupy no columns. `None` leaves auto-detection alone,
@@ -789,6 +794,24 @@ mod tests {
             SessionMeta::default(),
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn the_peek_line_is_the_one_above_the_viewport() {
+        let top = viewport_line_abs(4, 10, 2, 0);
+        assert_eq!(peek_line_abs(4, 10, 2), top - 1);
+        let mut state = BidiState {
+            mode: BidiMode::Implicit,
+            direction: ParagraphDir::Default,
+            stamps: Vec::new(),
+        };
+        state.note_scp(ParagraphDir::Rtl, peek_line_abs(4, 10, 2), 0);
+        state.note_scp(ParagraphDir::Ltr, top, 0);
+        assert_eq!(
+            state.direction_at(peek_line_abs(4, 10, 2)),
+            ParagraphDir::Rtl
+        );
+        assert_eq!(state.direction_at(top), ParagraphDir::Ltr);
     }
 
     fn feed(
