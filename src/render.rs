@@ -10618,6 +10618,15 @@ mod cache_tests {
     /// Glyph quads against the opaque fill behind them. A 4.5:1 miss is the
     /// light-page foreground sitting on a dark card.
     fn card_text_failures(verts: &[crate::gpu::Vertex]) -> (usize, Vec<String>) {
+        card_text_on(verts, None)
+    }
+
+    /// `only` limits the check to one fill, so a frame that also draws the
+    /// tab bar does not score bar glyphs as card text.
+    fn card_text_on(
+        verts: &[crate::gpu::Vertex],
+        only: Option<(u8, u8, u8)>,
+    ) -> (usize, Vec<String>) {
         let mut solids = Vec::new();
         let mut glyphs = Vec::new();
         for quad in verts.as_chunks::<6>().0 {
@@ -10648,6 +10657,9 @@ mod cache_tests {
                     && y < s.3
             });
             let Some(fill) = ground else { continue };
+            if only.is_some_and(|want| fill.4 != want) {
+                continue;
+            }
             checked += 1;
             let ratio = crate::theme::contrast_ratio(ink, fill.4);
             if ratio < 4.5 {
@@ -10786,9 +10798,14 @@ mod cache_tests {
             r.hover_tab = None;
             frames
         };
+        let tip_fill = (0x1c, 0x21, 0x28);
         for light in [true, false] {
             for (name, verts) in paint(light) {
-                let (checked, bad) = card_text_failures(&verts);
+                let (checked, bad) = if name == "tab tip" {
+                    card_text_on(&verts, Some(tip_fill))
+                } else {
+                    card_text_failures(&verts)
+                };
                 assert!(checked > 0, "{name} (light={light}) drew no text on a card");
                 assert!(
                     bad.is_empty(),
