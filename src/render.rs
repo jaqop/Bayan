@@ -6376,6 +6376,63 @@ mod tests {
         assert!(blink.iter().any(|v| v.color == opaque_bg));
     }
 
+    /// DECTCEM (`CSI ? 25 l`) hides the cursor. Claude Code does this.
+    /// The candidate window still has to sit on the cell the program is
+    /// writing into, not on the origin and not on nothing.
+    #[test]
+    fn ime_spot_stays_on_the_real_cell_when_the_cursor_is_hidden() {
+        use alacritty_terminal::{
+            event::VoidListener,
+            term::{Config, Term},
+            vte::ansi::Processor,
+        };
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 40, rows: 3 };
+        let mut t = Term::new(Config::default(), &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        p.advance(&mut t, b"ab\x1b[?25l");
+        assert!(
+            !t.mode()
+                .contains(alacritty_terminal::term::TermMode::SHOW_CURSOR),
+            "DECTCEM cleared"
+        );
+        let pane = (0, 0, 600, 120);
+        let view = PaneView {
+            rect: pane,
+            focused: true,
+            cursor: crate::config::CursorStyle::Block,
+            cursor_on: true,
+            bordered: false,
+            claude: false,
+            claude_from: None,
+            reorder: true,
+            line_dir: &[],
+            search_match: None,
+            marks: &[],
+            link_hover: None,
+            link_tip: None,
+        };
+        let mut out = Vec::new();
+        r.begin_frame();
+        r.draw_pane(&mut out, &view, &t);
+        let spot = (
+            (2.0 * r.cell_w).round() as i32,
+            0,
+            r.cell_w.round() as i32,
+            r.cell_h.round() as i32,
+        );
+        assert_eq!(
+            r.ime_spot,
+            Some(spot),
+            "a hidden cursor still anchors the candidates on column 2"
+        );
+        let block = c4(r.fg, 170);
+        assert!(
+            !out.iter().any(|v| v.color == block),
+            "DECTCEM hides the block; the spot above is the cell, not the glyph"
+        );
+    }
+
     #[test]
     fn claude_inverse_space_cursor_stays_attached_to_arabic_input() {
         use alacritty_terminal::{

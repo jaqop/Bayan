@@ -100,6 +100,68 @@ pub(crate) fn commit_target(owner: Option<KeyOwner>) -> CommitTo {
     }
 }
 
+/// The cursor box last handed to `set_ime_cursor_area`, in physical pixels.
+pub(crate) type ImeSpot = (i32, i32, i32, i32);
+
+/// Windows reports a key the IME has already consumed as
+/// `NamedKey::Process` (`VK_PROCESSKEY`). winit 0.30.13 still delivers
+/// that `KeyboardInput` (winit#4508), often before `Ime::Preedit` stores
+/// a composition string. The text arrives separately as preedit or
+/// commit, so the key must not be encoded for the PTY.
+pub(crate) fn is_ime_process_key(key: &Key) -> bool {
+    matches!(key, Key::Named(NamedKey::Process))
+}
+
+/// Swallow a key the IME owns. A visible preedit owns every key (the
+/// IME is composing). `NamedKey::Process` is swallowed even before that
+/// string exists, which is when Windows emits it.
+pub(crate) fn ime_swallows_key(composing: bool, key: &Key) -> bool {
+    composing || is_ime_process_key(key)
+}
+
+/// A window event that may rebuild the IME context.
+///
+/// `ImeEnabled` is `WindowEvent::Ime(Ime::Enabled)`. `FocusGained` is
+/// `WindowEvent::Focused(true)`, handled in `input::focus_changed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CursorAreaEvent {
+    ImeEnabled,
+    ImePreedit,
+    ImeCommit,
+    ImeDisabled,
+    FocusGained,
+    FocusLost,
+}
+
+/// Windows drops the composition window on these two events, so the
+/// cursor box has to be sent again even when it has not moved
+/// (winit#2569). Every other IME phase and a focus loss leave it.
+pub(crate) fn cursor_area_reset(event: CursorAreaEvent) -> bool {
+    matches!(
+        event,
+        CursorAreaEvent::ImeEnabled | CursorAreaEvent::FocusGained
+    )
+}
+
+/// The rectangle to pass to `set_ime_cursor_area`, if a call is due.
+///
+/// An unchanged box is not sent again. `reset` comes from
+/// [`cursor_area_reset`]: `Ime::Enabled` and a focus return both set it.
+/// `None` current means there is no cell to anchor yet; the caller keeps
+/// `reset` set.
+pub(crate) fn ime_area_due(
+    last_sent: Option<ImeSpot>,
+    current: Option<ImeSpot>,
+    reset: bool,
+) -> Option<ImeSpot> {
+    let current = current?;
+    if reset || last_sent != Some(current) {
+        Some(current)
+    } else {
+        None
+    }
+}
+
 /// Enter is `Some(true)`, Esc `Some(false)`, anything else `None`.
 pub(crate) fn enter_or_escape(key: &Key) -> Option<bool> {
     match key {
@@ -202,6 +264,15 @@ impl App {
 
     /// IME composition and commits: CJK input, the emoji panel, dictation.
     pub(crate) fn ime_input(&mut self, ime: Ime) {
+        let area = match &ime {
+            Ime::Enabled => CursorAreaEvent::ImeEnabled,
+            Ime::Preedit(_, _) => CursorAreaEvent::ImePreedit,
+            Ime::Commit(_) => CursorAreaEvent::ImeCommit,
+            Ime::Disabled => CursorAreaEvent::ImeDisabled,
+        };
+        // Only Enabled rebuilds the IME context. The other phases leave
+        // the candidate window where it is (winit#2569).
+        self.note_cursor_area(area);
         match ime {
             Ime::Preedit(text, _) => self.set_preedit(Some(text)),
             Ime::Disabled => self.set_preedit(None),
@@ -216,6 +287,13 @@ impl App {
             }
         }
         self.request_redraw();
+    }
+
+    /// Ask for `set_ime_cursor_area` again when `event` rebuilt the context.
+    pub(crate) fn note_cursor_area(&mut self, event: CursorAreaEvent) {
+        if cursor_area_reset(event) {
+            self.ime_area_reset = true;
+        }
     }
 
     fn set_preedit(&mut self, text: Option<String>) {
@@ -259,8 +337,9 @@ impl App {
         // early return above the write leaves the key here, so its release
         // stays out of the PTY too.
         self.note_held_away(event);
-        // the IME owns every key while it composes
-        if self.composing() {
+        // Preedit owns every key. `NamedKey::Process` is the IME's too,
+        // and it arrives before the preedit string does (winit#4508).
+        if ime_swallows_key(self.composing(), &event.logical_key) {
             return;
         }
         let m = self.modifiers;
@@ -586,6 +665,13 @@ impl App {
     /// still own every shortcut; a release only reports, and only when the
     /// press itself reached the PTY.
     fn key_released(&mut self, event: &KeyEvent) {
+        // A Process release must not be reported either: the press was
+        // the IME's, and a TUI that asked for key-up would see a release
+        // whose press it never got.
+        if is_ime_process_key(&event.logical_key) {
+            let _ = self.take_held_away(event);
+            return;
+        }
         let held_away = self.take_held_away(event);
         if held_away {
             return;
@@ -638,6 +724,75 @@ mod tests {
             ..Open::default()
         };
         assert_eq!(commit_target(key_owner(&both)), CommitTo::Drop);
+    }
+
+    #[test]
+    fn ime_process_keys_are_swallowed_and_ordinary_letters_are_not() {
+        let process = Key::Named(NamedKey::Process);
+        let arabic = Key::Character(SmolStr::new("ب"));
+        let ctrl_letter = Key::Character(SmolStr::new("ؤ"));
+        // Process is the IME's even before a preedit string exists, so it
+        // is not encoded beside the later Commit.
+        assert!(is_ime_process_key(&process));
+        assert!(ime_swallows_key(false, &process));
+        assert!(ime_swallows_key(true, &process));
+        // a visible composition still owns every other key
+        assert!(ime_swallows_key(true, &arabic));
+        // Arabic letters and the logical char of an Arabic-layout Ctrl
+        // chord are not Process, so they keep the normal key path
+        assert!(!is_ime_process_key(&arabic));
+        assert!(!ime_swallows_key(false, &arabic));
+        assert!(!is_ime_process_key(&ctrl_letter));
+        assert!(!ime_swallows_key(false, &ctrl_letter));
+        assert!(!ime_swallows_key(false, &Key::Named(NamedKey::Enter)));
+    }
+
+    #[test]
+    fn ime_cursor_area_is_sent_again_after_the_context_is_rebuilt() {
+        let spot = (40, 80, 10, 20);
+        let moved = (50, 80, 10, 20);
+        // unchanged and no reset: winit already has this rectangle
+        assert_eq!(ime_area_due(Some(spot), Some(spot), false), None);
+        // Ime::Enabled or a focus return: Windows dropped it, send again
+        assert_eq!(ime_area_due(Some(spot), Some(spot), true), Some(spot));
+        // a real move is sent whether or not the context was rebuilt
+        assert_eq!(ime_area_due(Some(spot), Some(moved), false), Some(moved));
+        assert_eq!(ime_area_due(None, Some(spot), false), Some(spot));
+        // nothing to anchor yet: the caller keeps the reset flag
+        assert_eq!(ime_area_due(Some(spot), None, true), None);
+    }
+
+    /// Both context rebuilds ask for the candidate window again, and the
+    /// other IME phases and a blur do not. The handlers call
+    /// `cursor_area_reset` with these same variants: `Ime::Enabled` in
+    /// `ime_input`, and `Focused(true)` in `input::focus_changed`.
+    #[test]
+    fn ime_enabled_and_focus_regained_both_resend_the_cursor_area() {
+        let spot = (12, 48, 9, 18);
+        // already on screen, and the cell has not moved
+        assert_eq!(ime_area_due(Some(spot), Some(spot), false), None);
+        for event in [CursorAreaEvent::ImeEnabled, CursorAreaEvent::FocusGained] {
+            assert!(
+                cursor_area_reset(event),
+                "{event:?} rebuilds the IME context"
+            );
+            assert_eq!(
+                ime_area_due(Some(spot), Some(spot), cursor_area_reset(event)),
+                Some(spot),
+                "{event:?} re-sends the same cursor box"
+            );
+        }
+        for event in [
+            CursorAreaEvent::ImePreedit,
+            CursorAreaEvent::ImeCommit,
+            CursorAreaEvent::ImeDisabled,
+            CursorAreaEvent::FocusLost,
+        ] {
+            assert!(
+                !cursor_area_reset(event),
+                "{event:?} must leave the candidate window where it is"
+            );
+        }
     }
 
     #[test]
