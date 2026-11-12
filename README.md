@@ -878,6 +878,21 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       selection, the RTL arrow and a clean prompt after Esc. There is no
       vim count prefix, `gg` is a single g, and the column is not
       remembered across short lines.
+- [x] **Follow the Windows app theme** — `"theme": "system"` (the absent
+      key means the same) tracks light and dark. `"dark"` and `"light"`
+      lock the pair in `theme.rs`; a named scheme, or any hand-set
+      `bg`/`fg`/`palette`, is not replaced when Windows changes. The
+      signal is winit's `ThemeChanged` and `WM_SETTINGCHANGE` whose
+      lParam is `ImmersiveColorSet`; both read
+      `HKCU\...\Personalize\AppsUseLightTheme` (DWORD 1 is light, anything
+      else including a missing value is dark). The terminal palette, the
+      tab bar (it already derives from the page colour), and
+      `DWMWA_USE_IMMERSIVE_DARK_MODE` update together. The settings row
+      «سمة النظام» offers النظام / داكن / فاتح. OSC 11 is not answered
+      here. Proven by the resolution tests (system/dark/light against the
+      registry DWORD, a named scheme and a hand-set background stay put)
+      and the event-path test (a theme-changed signal replaces the
+      palette and the caption flag, and does not touch a locked scheme).
 
 ## Settings
 
@@ -888,7 +903,7 @@ key falls back to a sane default:
 
 ```json
 {
-  "theme": "Bayan", "font_family": "Cascadia Code NF", "font_size": 15.0,
+  "theme": "system", "font_family": "Cascadia Code NF", "font_size": 15.0,
   "cursor_style": "bar", "cursor_blink": true, "scrollback": 20000,
   "copy_on_select": true, "ligatures": true, "bell": "attention",
   "shell": "pwsh.exe", "padding": 8, "opacity": 0.9,
@@ -900,6 +915,12 @@ key falls back to a sane default:
   "scrollbar": { "position": "right", "width": 8, "autohide": true }
 }
 ```
+
+`"theme"` is `"system"`, `"dark"`, `"light"`, or a named scheme such as
+`"Dracula"`. `"system"` (and leaving the key out) follows the Windows app
+theme. `"dark"` and `"light"` stay on that pair. A named scheme, or a
+hand-set `bg`/`fg`/`palette`, wins over a later system change. The settings
+row «سمة النظام» is the same choice; picking a gallery tile names that scheme.
 
 `"osc_notify": true` lets programs raise desktop toasts through OSC 9,
 OSC 777 and OSC 99. It is off by default because any output can carry

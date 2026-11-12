@@ -15,10 +15,17 @@ pub struct UserConfig {
     /// Restore saved tabs and panes on launch. Default off: start one fresh tab.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restore_tabs: Option<bool>,
-    /// Named built-in theme (set by the in-app settings). Explicit
-    /// bg/fg/palette below still override it.
+    /// Named built-in theme, or a mode word: `"system"` follows the Windows
+    /// app theme, `"dark"` and `"light"` lock that pair. Absent means
+    /// `"system"`. A named scheme is never replaced when Windows changes.
+    /// Explicit bg/fg/palette below still override the colours and, like a
+    /// named scheme, stop the live follow.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    /// Last `AppsUseLightTheme` sample (`Some(true)` is light). Not saved.
+    /// `None` means the value could not be read, which resolves like dark.
+    #[serde(skip)]
+    pub system_apps_light: Option<bool>,
     /// Primary font family; must be installed. Falls back to the built-in
     /// Nerd-Font-first candidate list when absent or not found.
     #[serde(skip_serializing_if = "Option::is_none")]

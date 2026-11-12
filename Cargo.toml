@@ -45,7 +45,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading", # GetCurrentProcess for that module walk
     "Win32_System_SystemInformation", # GetSystemDirectoryW: loaded kernel32 must sit under System32
     "Win32_System_IO", # DeviceIoControl: read a link's target without following it (localpath.rs)
-    "Win32_System_Registry", # HKCU Explorer "Open Bayan here" (no HKLM)
+    "Win32_System_Registry", # HKCU Explorer "Open Bayan here" (no HKLM); AppsUseLightTheme
     "Win32_System_Console", # --help / --version attach to the parent console
     "Win32_Security", # TokenElevation: is this process already elevated?
 ] }

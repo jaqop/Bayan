@@ -43,6 +43,7 @@ selection and BiDi paths must do.
 | `scrollbar.rs` | per-pane scrollbar in the padding or the split seam: thumb from viewport/total and `display_offset`, hit-tested only outside the grid |
 | `config.rs` | `~/.bayan/config.json`, optional and BOM-tolerant. `scrollbar.position` (`right`/`left`/`hidden`), `scrollbar.width`, `scrollbar.autohide` |
 | `config_watch.rs` | reload that file on change: debounce, rename-replace saves, keep the last good config on a parse error |
+| `theme.rs` | Windows light/dark: `system`/`dark`/`light`, the palette pair, and the theme-change event |
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |

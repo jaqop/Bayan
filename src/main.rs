@@ -44,6 +44,7 @@ mod scroll;
 mod scrollbar;
 mod shells;
 mod term;
+mod theme;
 mod toast;
 
 #[cfg(test)]
@@ -1850,22 +1851,19 @@ impl App {
 
     // ---- settings panel ----
 
-    /// Index of the active theme in the gallery order (built-ins, then
-    /// plugin themes) — the index the panel highlights and apply_theme takes.
-    fn active_theme(&self) -> usize {
-        let name = self
-            .config
-            .theme
-            .as_deref()
-            .unwrap_or(render::DEFAULT_THEME);
+    /// Index of the active named theme in the gallery order (built-ins, then
+    /// plugin themes). `None` while the user is on system/dark/light, so a
+    /// mode word does not light a tile it does not name.
+    fn active_theme(&self) -> Option<usize> {
+        let name = self.config.theme.as_deref()?;
         if let Some(i) = render::THEMES.iter().position(|t| t.name == name) {
-            return i;
+            return Some(i);
         }
         plugins::registry()
             .themes
             .iter()
             .position(|t| t.name == name)
-            .map_or(0, |i| render::THEMES.len() + i)
+            .map(|i| render::THEMES.len() + i)
     }
 
     /// Apply theme `idx` (copy its colors into the config), live.
@@ -1884,9 +1882,55 @@ impl App {
             self.config.bg = Some(hex(t.bg));
             self.config.fg = Some(hex(t.fg));
             self.config.palette = Some(t.palette.iter().map(|&c| hex(c)).collect());
-            self.rebuild_renderer();
-            self.request_redraw();
+            self.push_colors();
         }
+    }
+
+    /// النظام / داكن / فاتح. Clears a named scheme and hand-set colours so
+    /// the pair can show; that clear is the user's new choice.
+    fn set_appearance(&mut self, choice: theme::ThemeChoice) {
+        self.config.bg = None;
+        self.config.fg = None;
+        self.config.palette = None;
+        self.config.theme = match choice {
+            theme::ThemeChoice::System => None,
+            theme::ThemeChoice::Dark => Some("dark".into()),
+            theme::ThemeChoice::Light => Some("light".into()),
+        };
+        self.push_colors();
+    }
+
+    /// Paint the colours `resolved_colors` names, and match the caption to them.
+    fn push_colors(&mut self) {
+        let colors = render::resolved_colors(&self.config);
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_colors(colors.bg, colors.fg, colors.palette);
+            // OSC 10/11 answer with what is on screen now
+            term::set_query_colors(r.query_colors());
+        }
+        self.set_title_bar_dark(colors.title_bar_dark);
+        self.request_redraw();
+    }
+
+    fn theme_surface(&self) -> theme::ThemeSurface {
+        theme::ThemeSurface {
+            colors: render::resolved_colors(&self.config),
+            follows_system: render::follows_system_theme(&self.config),
+        }
+    }
+
+    /// A Windows theme signal. The tested `apply_event` decides the palette
+    /// and the caption flag; an explicit scheme comes back unchanged.
+    fn on_system_theme(&mut self, event: theme::SystemThemeEvent) {
+        let after = self.theme_surface().apply_event(event);
+        self.config.system_apps_light = Some(event.is_light());
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_colors(after.colors.bg, after.colors.fg, after.colors.palette);
+            // a program that asks OSC 11 after the switch sees the new side
+            term::set_query_colors(r.query_colors());
+        }
+        self.set_title_bar_dark(after.colors.title_bar_dark);
+        self.request_redraw();
     }
 
     fn change_font_size(&mut self, delta: i32) {
@@ -2076,12 +2120,16 @@ impl App {
     }
 
     fn apply_window_frame(&self) {
+        self.set_title_bar_dark(render::resolved_colors(&self.config).title_bar_dark);
+    }
+
+    fn set_title_bar_dark(&self, title_bar_dark: bool) {
         let Some(hwnd) = self.hwnd() else { return };
         use windows_sys::Win32::Graphics::Dwm::{
             DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
             DWMWCP_ROUND,
         };
-        let dark = 1i32;
+        let dark = i32::from(title_bar_dark);
         let corner = DWMWCP_ROUND;
         // Windows 10 ignores unsupported corner preferences; the native
         // resize frame and shadow remain available there.
@@ -2971,6 +3019,12 @@ impl App {
             self.toggle_hide_bar();
         } else if render::rect_hit(lay.close_toggle, px, py) {
             self.toggle_confirm_close();
+        } else if let Some(i) = lay
+            .appearance_btns
+            .iter()
+            .position(|&b| render::rect_hit(b, px, py))
+        {
+            self.set_appearance(theme::APPEARANCE_SEGMENTS[i]);
         }
     }
 
@@ -5551,6 +5605,7 @@ impl App {
                         px.height as usize,
                         &render::SettingsView {
                             theme: settings_theme,
+                            appearance: theme::appearance_highlight(&self.config),
                             font_family: &settings_family,
                             font_size: settings_size,
                             arabic_font: &settings_arabic,
@@ -6070,9 +6125,15 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::RendererReady(r) => {
                 crate::prof::mark("renderer ready");
+                // The build cloned the config when it started. A theme
+                // signal during that build has a newer sample; paint it.
+                let mut r = *r;
+                let colors = render::resolved_colors(&self.config);
+                r.set_colors(colors.bg, colors.fg, colors.palette);
                 term::set_query_colors(r.query_colors());
-                self.renderer = Some(*r);
+                self.renderer = Some(r);
                 self.renderer_building = false;
+                self.apply_window_frame();
                 // now that cell metrics exist, snap every pane to its rect
                 self.relayout_active();
                 // A reload or a zoom that arrived while this build ran is
@@ -6247,6 +6308,19 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::KeyboardInput { event, .. } => self.key_input(&event, el),
             WindowEvent::Ime(ime) => self.ime_input(ime),
             WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::ThemeChanged(theme) => {
+                // The registry DWORD is the app theme. winit's value covers a
+                // read that fails (the key is missing, or this is not Windows).
+                let event = match theme::read_apps_use_light_theme() {
+                    Some(value) => theme::SystemThemeEvent::ImmersiveColorSet {
+                        apps_use_light_theme: Some(value),
+                    },
+                    None => theme::SystemThemeEvent::Winit {
+                        light: matches!(theme, winit::window::Theme::Light),
+                    },
+                };
+                self.on_system_theme(event);
+            }
             _ => {}
         }
     }
@@ -6560,6 +6634,8 @@ fn run(startup: Startup) -> Result<(), String> {
         Ok(cfg) => (cfg, None),
         Err(error) => (config::UserConfig::default(), Some(error.to_string())),
     };
+    cfg.system_apps_light =
+        theme::read_apps_use_light_theme().map(|v| theme::apps_use_light_theme(Some(v)));
     // debug hook: BAYAN_ARABIC_FONT=<family> draws terminal Arabic in that
     // font for this run only (config.json is not written unless a setting
     // is changed in the panel), so the setting is screenshot-verifiable
@@ -6898,6 +6974,56 @@ mod tests {
         assert_eq!(restored, current);
         assert!(path.is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Enough of an `App` to run `on_system_theme`. No window, so the caption
+    /// flag is computed and then has nowhere to go; the renderer and the
+    /// config sample are what the test can see.
+    fn app_for_theme(cfg: config::UserConfig) -> App {
+        let renderer = render::Renderer::new(1.0, &cfg, 0.0);
+        let mut app = App::new(test_proxy(), cfg, None, None);
+        app.startup_pending = false;
+        app.renderer = Some(renderer);
+        app.size = TermSize { cols: 80, rows: 24 };
+        app
+    }
+
+    /// The window loop's theme handler. Removing `on_system_theme` fails
+    /// this test: the renderer must take the new palette, and the config
+    /// must record the sample. A named scheme stays put.
+    #[test]
+    fn on_system_theme_paints_the_renderer_and_records_the_sample() {
+        let cfg = config::UserConfig {
+            system_apps_light: Some(false),
+            ..Default::default()
+        };
+        let mut app = app_for_theme(cfg);
+        assert_eq!(app.renderer.as_ref().map(|r| r.bg), Some(theme::DARK.bg));
+        app.on_system_theme(theme::SystemThemeEvent::Winit { light: true });
+        assert_eq!(app.config.system_apps_light, Some(true));
+        assert_eq!(
+            app.renderer.as_ref().map(|r| r.bg),
+            Some(theme::LIGHT.bg),
+            "a light ThemeChanged must reach the renderer"
+        );
+        app.on_system_theme(theme::SystemThemeEvent::Winit { light: false });
+        assert_eq!(app.config.system_apps_light, Some(false));
+        assert_eq!(app.renderer.as_ref().map(|r| r.bg), Some(theme::DARK.bg));
+
+        let locked = config::UserConfig {
+            theme: Some("Dracula".into()),
+            system_apps_light: Some(false),
+            ..Default::default()
+        };
+        let dracula = render::theme_by_name("Dracula").unwrap().bg;
+        let mut app = app_for_theme(locked);
+        app.on_system_theme(theme::SystemThemeEvent::Winit { light: true });
+        assert_eq!(app.config.system_apps_light, Some(true));
+        assert_eq!(
+            app.renderer.as_ref().map(|r| r.bg),
+            Some(dracula),
+            "a named scheme is not replaced"
+        );
     }
 
     #[test]

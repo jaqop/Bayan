@@ -279,6 +279,12 @@ pub fn merge_reload(base: &UserConfig, live: &UserConfig, file: &UserConfig) -> 
             &file.scrollbar,
             &mut overrode,
         ),
+        system_apps_light: merge_field(
+            &base.system_apps_light,
+            &live.system_apps_light,
+            &file.system_apps_light,
+            &mut overrode,
+        ),
         keyboard: merge_field(
             &base.keyboard,
             &live.keyboard,
