@@ -8427,12 +8427,7 @@ mod m38_tests {
         let path = dir.join("session.json");
         std::fs::write(&path, b"ORIGINAL").unwrap();
         super::SESSION_FILE.with(|slot| *slot.borrow_mut() = Some(path.clone()));
-        use winit::platform::windows::EventLoopBuilderExtWindows;
-        let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event()
-            .with_any_thread(true)
-            .build()
-            .expect("event loop");
-        let mut app = super::session_app(event_loop.create_proxy(), true);
+        let mut app = super::session_app(super::test_proxy(), true);
         app.rename_tab(Some("مسؤول".into()));
         app.rename_group(Some("مجموعة".into()));
         app.move_tab_to_group(None);
