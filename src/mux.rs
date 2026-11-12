@@ -7,6 +7,14 @@
 //! process exits when nothing is left alive. `mux.enabled` defaults to
 //! false, and while it is false the window does not start or dial a server.
 //!
+//! Both ends of the pipe are opened for overlapped I/O. Each end has one
+//! thread parked in a read while another writes, and on a synchronous
+//! handle Windows serializes the two: the write would wait for the read.
+//! The server also queues frames per window and writes them on that
+//! window's own thread, so one window that stops reading cannot hold up
+//! the others. Past [`CLIENT_QUEUE`] frames the window is cut off and its
+//! sessions are left detached.
+//!
 //! What this is not: a ConPTY created inside the window cannot be handed
 //! across with `DuplicateHandle` yet. Sessions that can be detached are
 //! the ones the server spawned (SSH, when the mux is on). File-and-scrollback
@@ -22,11 +30,17 @@ use std::sync::{mpsc, Arc};
 pub const TAIL_MAX: usize = 256 * 1024;
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_SESSIONS: usize = 32;
+/// Frames the server holds for one window before it gives up on it. PTY
+/// output arrives in chunks of at most 8 KiB, so this is about 8 MiB.
+pub const CLIENT_QUEUE: usize = 1024;
 const PROTO_VERSION: u8 = 1;
 
 /// `dwPipeMode` bit: refuse clients that are not on this machine.
 /// Win32 `PIPE_REJECT_REMOTE_CLIENTS`.
 pub const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008;
+/// Win32 `FILE_FLAG_OVERLAPPED`. Without it a pending read on one thread
+/// blocks a write on another, and both ends of this pipe do exactly that.
+pub const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
 
 pub fn label_detach() -> &'static str {
     crate::lang::tr("فصل الجلسة", "Detach session")
@@ -221,6 +235,15 @@ impl MuxHub {
         };
         slot.attached_to = None;
         true
+    }
+
+    /// Leave every session `client` has on screen running, with no window.
+    fn detach_client(&mut self, client: u64) {
+        for slot in self.slots.values_mut() {
+            if slot.attached_to == Some(client) {
+                slot.attached_to = None;
+            }
+        }
     }
 
     fn list_detached(&self) -> Vec<SessionSnap> {
@@ -585,14 +608,14 @@ pub fn sddl_for_sid(sid: &str) -> Result<String, String> {
 
 /// Later instances of the same pipe omit `FILE_FLAG_FIRST_PIPE_INSTANCE`
 /// so a second window can connect while the first is still attached.
-/// Every instance rejects remote clients.
+/// Every instance is overlapped and rejects remote clients.
 pub fn server_instance_flags(first: bool) -> (u32, u32) {
     const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
     const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
     const PIPE_TYPE_BYTE: u32 = 0;
     const PIPE_READMODE_BYTE: u32 = 0;
     const PIPE_WAIT: u32 = 0;
-    let mut open = PIPE_ACCESS_DUPLEX;
+    let mut open = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
     if first {
         open |= FILE_FLAG_FIRST_PIPE_INSTANCE;
     }
@@ -611,11 +634,11 @@ pub const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
 /// Impersonation level Identification, shifted into `dwFlagsAndAttributes`.
 pub const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
 
-/// Flags for `CreateFileW` on the client end: a normal file plus
-/// identification-only QoS.
+/// Flags for `CreateFileW` on the client end: a normal file, overlapped,
+/// with identification-only QoS.
 pub fn client_file_flags() -> u32 {
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-    FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION
+    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION
 }
 
 pub fn encode_frame(msg: &Message, out: &mut Vec<u8>) {
@@ -1232,9 +1255,9 @@ pub fn connect_or_spawn(enabled: bool) -> Result<MuxClient, String> {
 mod os {
     use super::*;
     use std::collections::HashMap;
-    use std::fs::File;
-    use std::os::windows::io::{FromRawHandle, RawHandle};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use std::sync::Mutex;
+    use windows_sys::Win32::Foundation::HANDLE;
 
     const REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -1243,7 +1266,7 @@ mod os {
         let mut hub = MuxHub::new();
         let mut gate = Gate { ever_had: false };
         let mut lives: HashMap<u64, Live> = HashMap::new();
-        let mut clients: HashMap<u64, File> = HashMap::new();
+        let mut clients: HashMap<u64, Link> = HashMap::new();
         let mut next_client = 1u64;
         let mut first_instance = true;
         let mut accepting = false;
@@ -1251,18 +1274,14 @@ mod os {
         begin_accept(&tx, first_instance, &mut accepting);
         while let Ok(ev) = rx.recv() {
             match ev {
-                Ev::Connected(file) => {
+                Ev::Connected(pipe) => {
                     accepting = false;
                     accept_fails = 0;
-                    match file.try_clone() {
-                        Ok(read) => {
-                            let client = next_client;
-                            next_client += 1;
-                            clients.insert(client, file);
-                            let tx2 = tx.clone();
-                            let _ = std::thread::Builder::new()
-                                .name("bayan-mux-read".into())
-                                .spawn(move || reader_loop(client, read, tx2));
+                    let client = next_client;
+                    next_client += 1;
+                    match Link::open(client, pipe, &tx) {
+                        Ok(link) => {
+                            clients.insert(client, link);
                             // The name is claimed. Later instances must not use
                             // FILE_FLAG_FIRST_PIPE_INSTANCE.
                             first_instance = false;
@@ -1270,8 +1289,8 @@ mod os {
                             // instead of waiting for this one to leave.
                             begin_accept(&tx, first_instance, &mut accepting);
                         }
-                        Err(e) => {
-                            let _ = tx.send(Ev::AcceptErr(e.to_string()));
+                        Err(error) => {
+                            let _ = tx.send(Ev::AcceptErr(error));
                         }
                     }
                 }
@@ -1292,24 +1311,21 @@ mod os {
                             outcome.exit_now = false;
                         }
                     }
-                    if let Some(w) = clients.get_mut(&client) {
-                        for reply in &outcome.replies {
-                            if write_frame(&mut *w, reply).is_err() {
-                                clients.remove(&client);
-                                break;
-                            }
-                        }
+                    for reply in outcome.replies {
+                        send(&mut clients, &mut hub, client, reply);
                     }
                     if outcome.exit_now || (gate.ever_had && hub.alive() == 0) {
                         break;
                     }
                 }
                 Ev::Output(id, bytes) => {
-                    let dest = hub.note_output(id, &bytes);
-                    if let Some(client) = dest {
-                        if let Some(w) = clients.get_mut(&client) {
-                            let _ = write_frame(&mut *w, &Message::Output { id, bytes });
-                        }
+                    if let Some(client) = hub.note_output(id, &bytes) {
+                        send(
+                            &mut clients,
+                            &mut hub,
+                            client,
+                            Message::Output { id, bytes },
+                        );
                     }
                 }
                 Ev::ChildGone(id) => {
@@ -1318,9 +1334,7 @@ mod os {
                     if hub.child_gone(id) {
                         lives.remove(&id);
                         if let Some(client) = dest {
-                            if let Some(w) = clients.get_mut(&client) {
-                                let _ = write_frame(&mut *w, &Message::Exit { id, code });
-                            }
+                            send(&mut clients, &mut hub, client, Message::Exit { id, code });
                         }
                     }
                     if gate.ever_had && hub.alive() == 0 {
@@ -1368,8 +1382,64 @@ mod os {
             .unwrap_or(1)
     }
 
+    /// One connected window: the queue its writer thread drains, and the
+    /// pipe, kept so a window that stops reading can be disconnected.
+    struct Link {
+        queue: mpsc::SyncSender<Message>,
+        pipe: PipeEnd,
+    }
+
+    impl Link {
+        /// Start the reader and the writer for `pipe`.
+        fn open(client: u64, pipe: PipeEnd, tx: &mpsc::Sender<Ev>) -> Result<Self, String> {
+            let read = pipe.try_clone()?;
+            let mut write = pipe.try_clone()?;
+            let (queue, frames) = mpsc::sync_channel::<Message>(CLIENT_QUEUE);
+            let tx = tx.clone();
+            spawn_named("bayan-mux-read", move || reader_loop(client, read, tx))?;
+            spawn_named("bayan-mux-write", move || {
+                for frame in frames {
+                    if write_frame(&mut write, &frame).is_err() {
+                        break;
+                    }
+                }
+            })?;
+            Ok(Self { queue, pipe })
+        }
+    }
+
+    fn spawn_named(name: &str, f: impl FnOnce() + Send + 'static) -> Result<(), String> {
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(f)
+            .map(drop)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Queue `msg` for `client` without waiting on its pipe. A window whose
+    /// queue is full has stopped reading: it is disconnected, and what it
+    /// had on screen stays in the server, detached. A window whose writer
+    /// has ended is on its way out, and its reader reports that.
+    fn send(clients: &mut HashMap<u64, Link>, hub: &mut MuxHub, client: u64, msg: Message) {
+        let Some(link) = clients.get(&client) else {
+            return;
+        };
+        match link.queue.try_send(msg) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                clients.remove(&client);
+            }
+            Err(mpsc::TrySendError::Full(_)) => {
+                hub.detach_client(client);
+                if let Some(link) = clients.remove(&client) {
+                    link.pipe.disconnect();
+                }
+            }
+        }
+    }
+
     enum Ev {
-        Connected(File),
+        Connected(PipeEnd),
         Frame { client: u64, msg: Message },
         Eof { client: u64 },
         Output(u64, Vec<u8>),
@@ -1383,7 +1453,7 @@ mod os {
         child: Box<dyn portable_pty::Child + Send + Sync>,
     }
 
-    fn reader_loop(client: u64, mut read: File, tx: mpsc::Sender<Ev>) {
+    fn reader_loop(client: u64, mut read: PipeEnd, tx: mpsc::Sender<Ev>) {
         loop {
             match read_frame(&mut read) {
                 Ok(msg) => {
@@ -1494,8 +1564,8 @@ mod os {
         let _ = std::thread::Builder::new()
             .name("bayan-mux-accept".into())
             .spawn(move || match create_connected_pipe(first) {
-                Ok(file) => {
-                    let _ = tx.send(Ev::Connected(file));
+                Ok(pipe) => {
+                    let _ = tx.send(Ev::Connected(pipe));
                 }
                 Err(e) => {
                     let _ = tx.send(Ev::AcceptErr(e));
@@ -1541,7 +1611,7 @@ mod os {
     impl MuxClient {
         fn dial() -> Result<Self, String> {
             let write = connect_pipe()?;
-            let mut read = write.try_clone().map_err(|e| e.to_string())?;
+            let mut read = write.try_clone()?;
             let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
             let (control_tx, control_rx) = mpsc::channel::<Message>();
             let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
@@ -1619,7 +1689,7 @@ mod os {
     }
 
     fn command_loop(
-        mut write: File,
+        mut write: PipeEnd,
         cmd_rx: mpsc::Receiver<Cmd>,
         control_rx: mpsc::Receiver<Message>,
         routes: Routes,
@@ -1750,82 +1820,186 @@ mod os {
         }
     }
 
-    fn connect_pipe() -> Result<File, String> {
+    /// One end of the mux pipe. The handle is overlapped, so a read parked
+    /// on one clone does not hold up a write on another. Each clone has its
+    /// own event, and each call waits for its own operation to finish.
+    pub(super) struct PipeEnd {
+        handle: Arc<OwnedHandle>,
+        event: OwnedHandle,
+    }
+
+    impl PipeEnd {
+        /// Take ownership of a pipe handle opened with `FILE_FLAG_OVERLAPPED`.
+        fn from_overlapped(handle: HANDLE) -> Result<Self, String> {
+            // SAFETY: the caller hands over an open handle nothing else owns.
+            let handle = unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) };
+            Ok(Self {
+                handle: Arc::new(handle),
+                event: new_event()?,
+            })
+        }
+
+        pub(super) fn try_clone(&self) -> Result<Self, String> {
+            Ok(Self {
+                handle: Arc::clone(&self.handle),
+                event: new_event()?,
+            })
+        }
+
+        /// Start one overlapped operation and wait for it. Returns the
+        /// bytes it moved.
+        fn transfer(
+            &self,
+            start: impl FnOnce(HANDLE, *mut windows_sys::Win32::System::IO::OVERLAPPED) -> i32,
+        ) -> std::io::Result<usize> {
+            use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+            const ERROR_IO_PENDING: u32 = 997;
+            let handle = self.as_raw_handle() as HANDLE;
+            let mut overlapped = OVERLAPPED {
+                hEvent: self.event.as_raw_handle() as HANDLE,
+                ..Default::default()
+            };
+            if start(handle, &mut overlapped) == 0 {
+                let err = last_error();
+                if err != ERROR_IO_PENDING {
+                    return Err(std::io::Error::from_raw_os_error(err as i32));
+                }
+            }
+            let mut moved = 0u32;
+            // SAFETY: `overlapped` and the caller's buffer outlive the
+            // operation, because this call blocks until it has finished.
+            // The event belongs to this clone, so no other operation
+            // signals it.
+            let done = unsafe { GetOverlappedResult(handle, &overlapped, &mut moved, 1) };
+            if done == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(moved as usize)
+        }
+
+        /// Wait for a client on a listening instance. `ERROR_PIPE_CONNECTED`
+        /// means the client won the race, which is success.
+        pub(super) fn accept(&self) -> Result<(), String> {
+            use windows_sys::Win32::System::Pipes::ConnectNamedPipe;
+            const ERROR_PIPE_CONNECTED: i32 = 535;
+            let connected = self.transfer(|handle, overlapped| {
+                // SAFETY: the handle is a pipe instance from CreateNamedPipeW,
+                // and `transfer` keeps the OVERLAPPED alive until the connect ends.
+                unsafe { ConnectNamedPipe(handle, overlapped) }
+            });
+            match connected {
+                Ok(_) => Ok(()),
+                Err(e) if e.raw_os_error() == Some(ERROR_PIPE_CONNECTED) => Ok(()),
+                Err(e) => Err(format!("ConnectNamedPipe failed ({e})")),
+            }
+        }
+
+        /// Drop the client from the server end. Its pending reads and
+        /// writes fail, and the window sees the pipe close.
+        fn disconnect(&self) {
+            // SAFETY: the handle is a live server end of the pipe.
+            unsafe {
+                windows_sys::Win32::System::Pipes::DisconnectNamedPipe(
+                    self.as_raw_handle() as HANDLE
+                );
+            }
+        }
+    }
+
+    impl AsRawHandle for PipeEnd {
+        fn as_raw_handle(&self) -> RawHandle {
+            self.handle.as_raw_handle()
+        }
+    }
+
+    impl Read for PipeEnd {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            use windows_sys::Win32::Storage::FileSystem::ReadFile;
+            const ERROR_BROKEN_PIPE: i32 = 109;
+            let len = buf.len().min(u32::MAX as usize) as u32;
+            // SAFETY: `buf` is writable for `len` bytes and outlives the
+            // operation, which `transfer` waits for.
+            let read = self.transfer(|handle, overlapped| unsafe {
+                ReadFile(
+                    handle,
+                    buf.as_mut_ptr(),
+                    len,
+                    std::ptr::null_mut(),
+                    overlapped,
+                )
+            });
+            match read {
+                // The other end closed: that is end of file, as on any pipe.
+                Err(e) if e.raw_os_error() == Some(ERROR_BROKEN_PIPE) => Ok(0),
+                other => other,
+            }
+        }
+    }
+
+    impl Write for PipeEnd {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            use windows_sys::Win32::Storage::FileSystem::WriteFile;
+            let len = buf.len().min(u32::MAX as usize) as u32;
+            // SAFETY: `buf` is readable for `len` bytes and outlives the
+            // operation, which `transfer` waits for.
+            self.transfer(|handle, overlapped| unsafe {
+                WriteFile(handle, buf.as_ptr(), len, std::ptr::null_mut(), overlapped)
+            })
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A manual-reset event, unsignalled, for one end's overlapped calls.
+    fn new_event() -> Result<OwnedHandle, String> {
+        use windows_sys::Win32::System::Threading::CreateEventW;
+        // SAFETY: no name and no security attributes; the handle is ours.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return Err(format!("CreateEventW failed ({})", last_error()));
+        }
+        // SAFETY: `event` is a fresh handle nothing else owns.
+        Ok(unsafe { OwnedHandle::from_raw_handle(event as RawHandle) })
+    }
+
+    fn connect_pipe() -> Result<PipeEnd, String> {
         open_and_verify(&production_pipe_name()?)
     }
 
     /// Open `name` and refuse it unless the owner and the server process
     /// are the current user. This is the check `dial` runs.
-    fn open_and_verify(name: &str) -> Result<File, String> {
+    fn open_and_verify(name: &str) -> Result<PipeEnd, String> {
         let wide = wstr(name);
         // SAFETY: `wide` is NUL-terminated and lives for the call. WaitNamedPipeW
         // only reads the name. A miss is fine: CreateFileW reports it.
         unsafe {
             windows_sys::Win32::System::Pipes::WaitNamedPipeW(wide.as_ptr(), 200);
         }
-        let handle = create_file_pipe(&wide)?;
-        // SAFETY: `handle` is an open pipe we own. File closes it. The
-        // owner check runs before this function returns the handle to a
+        // The owner check runs before this function returns the pipe to a
         // caller that would type into it.
-        let file = unsafe { File::from_raw_handle(handle as RawHandle) };
-        let sid = current_user_sid()?;
-        verify_server(&file, &sid)?;
-        Ok(file)
-    }
-
-    /// Test hook: connect the listening instance. `ERROR_PIPE_CONNECTED`
-    /// means the client already attached, which is success.
-    #[cfg(test)]
-    pub(super) fn accept_one(file: &File) -> Result<(), String> {
-        use std::os::windows::io::AsRawHandle;
-        // SAFETY: `file` is the server end from CreateNamedPipeW. A null
-        // overlapped pointer is the synchronous connect.
-        let ok = unsafe {
-            windows_sys::Win32::System::Pipes::ConnectNamedPipe(
-                file.as_raw_handle() as _,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            let err = last_error();
-            if err != 535 {
-                return Err(format!("ConnectNamedPipe failed ({err})"));
-            }
-        }
-        Ok(())
+        let pipe = PipeEnd::from_overlapped(create_file_pipe(&wide)?)?;
+        verify_server(&pipe, &current_user_sid()?)?;
+        Ok(pipe)
     }
 
     /// Test hook: the same open the window uses, against a chosen name.
     #[cfg(test)]
-    pub(super) fn dial_name(name: &str) -> Result<File, String> {
+    pub(super) fn dial_name(name: &str) -> Result<PipeEnd, String> {
         open_and_verify(name)
     }
 
-    fn create_connected_pipe(first: bool) -> Result<File, String> {
+    fn create_connected_pipe(first: bool) -> Result<PipeEnd, String> {
         let name = production_pipe_name()?;
-        let handle = create_named_pipe(&name, first)?;
-        // SAFETY: `handle` came from CreateNamedPipeW and is not yet connected.
-        // A null overlapped pointer is the synchronous form.
-        let ok = unsafe {
-            windows_sys::Win32::System::Pipes::ConnectNamedPipe(handle, std::ptr::null_mut())
-        };
-        if ok == 0 {
-            let err = last_error();
-            // 535 ERROR_PIPE_CONNECTED: the client won the race, which is success.
-            if err != 535 {
-                // SAFETY: the handle is not wrapped yet, so this is the only close.
-                unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
-                return Err(format!("ConnectNamedPipe failed ({err})"));
-            }
-        }
-        // SAFETY: `handle` is an open connected pipe this function owns.
-        // `File` closes it.
-        Ok(unsafe { File::from_raw_handle(handle as RawHandle) })
+        let pipe = PipeEnd::from_overlapped(create_named_pipe(&name, first)?)?;
+        pipe.accept()?;
+        Ok(pipe)
     }
 
     #[cfg(test)]
     pub(super) struct SecuredPipe {
-        pub file: File,
+        pub pipe: PipeEnd,
         pub mode: u32,
         pub sid: Vec<u8>,
     }
@@ -1836,8 +2010,7 @@ mod os {
         let (_open, mode) = server_instance_flags(true);
         let handle = create_named_pipe(name, true)?;
         Ok(SecuredPipe {
-            // SAFETY: we own `handle` and have not connected it. Drop closes it.
-            file: unsafe { File::from_raw_handle(handle as RawHandle) },
+            pipe: PipeEnd::from_overlapped(handle)?,
             mode,
             sid,
         })
@@ -1890,21 +2063,20 @@ mod os {
 
     /// True when the pipe's DACL is exactly one allow ACE and that ACE is `sid`.
     #[cfg(test)]
-    pub(super) fn dacl_is_only(file: &File, sid: &[u8]) -> Result<bool, String> {
-        use std::os::windows::io::AsRawHandle;
+    pub(super) fn dacl_is_only(pipe: &PipeEnd, sid: &[u8]) -> Result<bool, String> {
         use windows_sys::Win32::Foundation::LocalFree;
         use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
         use windows_sys::Win32::Security::{GetAce, ACL};
         const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
         const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
-        // SAFETY: `file` is a live pipe handle. GetSecurityInfo allocates
+        // SAFETY: `pipe` is a live pipe handle. GetSecurityInfo allocates
         // `sd`; the DACL pointer addresses memory inside that block, and
         // LocalFree releases the block after the ACE bytes are compared.
         unsafe {
             let mut dacl: *mut ACL = std::ptr::null_mut();
             let mut sd = std::ptr::null_mut();
             let err = GetSecurityInfo(
-                file.as_raw_handle() as _,
+                pipe.as_raw_handle() as _,
                 SE_KERNEL_OBJECT,
                 DACL_SECURITY_INFORMATION,
                 std::ptr::null_mut(),
@@ -2088,30 +2260,29 @@ mod os {
     /// The pipe's owner and the server process token must both be `client_sid`.
     /// Anything else — another account's pipe, or a process we cannot query —
     /// is refused, so keystrokes are not sent to an impersonator.
-    pub(super) fn verify_server(file: &File, client_sid: &[u8]) -> Result<(), String> {
-        let owner = pipe_owner_sid(file)?;
+    pub(super) fn verify_server(pipe: &PipeEnd, client_sid: &[u8]) -> Result<(), String> {
+        let owner = pipe_owner_sid(pipe)?;
         if !owner_is_client(&owner, client_sid) {
             return Err("pipe owner is not this user".into());
         }
-        let server = server_process_user(file)?;
+        let server = server_process_user(pipe)?;
         if !owner_is_client(&server, client_sid) {
             return Err("pipe server process is not this user".into());
         }
         Ok(())
     }
 
-    fn pipe_owner_sid(file: &File) -> Result<Vec<u8>, String> {
-        use std::os::windows::io::AsRawHandle;
+    fn pipe_owner_sid(pipe: &PipeEnd) -> Result<Vec<u8>, String> {
         use windows_sys::Win32::Foundation::LocalFree;
         use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
         const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
-        // SAFETY: `file` is a live pipe. GetSecurityInfo allocates `sd`; the
+        // SAFETY: `pipe` is a live pipe. GetSecurityInfo allocates `sd`; the
         // owner pointer addresses memory inside that block, copied before free.
         unsafe {
             let mut owner = std::ptr::null_mut();
             let mut sd = std::ptr::null_mut();
             let err = GetSecurityInfo(
-                file.as_raw_handle() as _,
+                pipe.as_raw_handle() as _,
                 SE_KERNEL_OBJECT,
                 OWNER_SECURITY_INFORMATION,
                 &mut owner,
@@ -2135,8 +2306,7 @@ mod os {
         }
     }
 
-    fn server_process_user(file: &File) -> Result<Vec<u8>, String> {
-        use std::os::windows::io::AsRawHandle;
+    fn server_process_user(pipe: &PipeEnd) -> Result<Vec<u8>, String> {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY};
         use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
@@ -2146,7 +2316,7 @@ mod os {
         // closed before return. The SID is copied out of the token buffer.
         unsafe {
             let mut pid = 0u32;
-            if GetNamedPipeServerProcessId(file.as_raw_handle() as _, &mut pid) == 0 || pid == 0 {
+            if GetNamedPipeServerProcessId(pipe.as_raw_handle() as _, &mut pid) == 0 || pid == 0 {
                 return Err(format!(
                     "GetNamedPipeServerProcessId failed ({})",
                     last_error()
@@ -2470,10 +2640,10 @@ mod tests {
         assert!(srv.effects.is_empty());
     }
 
+    /// A secured listening instance on a fresh name, and the window's end
+    /// of it, opened and checked the way `dial` does.
     #[cfg(windows)]
-    #[test]
-    fn pipe_security_descriptor_allows_only_the_current_user_and_rejects_remote_clients() {
-        let sid = os::current_user_sid().expect("token user sid");
+    fn connected_pipe() -> (os::SecuredPipe, os::PipeEnd) {
         let name = format!(
             r"\\.\pipe\bayan-mux-test-{}-{}",
             std::process::id(),
@@ -2482,19 +2652,9 @@ mod tests {
                 .unwrap_or_default()
                 .as_nanos()
         );
-        let pipe = os::listen_secured(&name).expect("create the pipe");
-        assert_eq!(
-            pipe.mode & PIPE_REJECT_REMOTE_CLIENTS,
-            PIPE_REJECT_REMOTE_CLIENTS,
-            "CreateNamedPipeW is given PIPE_REJECT_REMOTE_CLIENTS"
-        );
-        assert_eq!(pipe.sid, sid);
-        assert!(
-            os::dacl_is_only(&pipe.file, &sid).expect("read the DACL"),
-            "DACL must be one allow ACE for the token user and nobody else"
-        );
-        let server = pipe.file.try_clone().expect("clone the server end");
-        let accept = std::thread::spawn(move || os::accept_one(&server));
+        let listening = os::listen_secured(&name).expect("create the pipe");
+        let server = listening.pipe.try_clone().expect("clone the server end");
+        let accept = std::thread::spawn(move || server.accept());
         let client = os::dial_name(&name).unwrap_or_else(|error| {
             panic!("a pipe we created must pass the server check: {error}")
         });
@@ -2502,6 +2662,24 @@ mod tests {
             .join()
             .expect("accept thread")
             .expect("ConnectNamedPipe");
+        (listening, client)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_security_descriptor_allows_only_the_current_user_and_rejects_remote_clients() {
+        let sid = os::current_user_sid().expect("token user sid");
+        let (listening, client) = connected_pipe();
+        assert_eq!(
+            listening.mode & PIPE_REJECT_REMOTE_CLIENTS,
+            PIPE_REJECT_REMOTE_CLIENTS,
+            "CreateNamedPipeW is given PIPE_REJECT_REMOTE_CLIENTS"
+        );
+        assert_eq!(listening.sid, sid);
+        assert!(
+            os::dacl_is_only(&listening.pipe, &sid).expect("read the DACL"),
+            "DACL must be one allow ACE for the token user and nobody else"
+        );
         let mut foreign = sid.clone();
         let last = foreign.last_mut().unwrap();
         *last ^= 0xff;
@@ -2512,6 +2690,60 @@ mod tests {
             os::verify_server(&client, &foreign).is_err(),
             "dial must refuse a pipe whose expected owner is not the client"
         );
+    }
+
+    /// The window and the server each keep one thread parked in a read and
+    /// write from another. On a synchronous handle the write waits for that
+    /// read, so the first frame in either direction would never leave.
+    #[cfg(windows)]
+    #[test]
+    fn a_read_parked_on_a_pipe_end_does_not_hold_up_a_write_on_it() {
+        let (listening, client) = connected_pipe();
+        let ask = Message::List;
+        let answer = Message::Sessions {
+            sessions: Vec::new(),
+        };
+
+        let (got, arrivals) = mpsc::channel();
+        for (end, read) in [("server", &listening.pipe), ("window", &client)] {
+            let mut read = read.try_clone().expect("clone for the reader");
+            let got = got.clone();
+            std::thread::spawn(move || {
+                let _ = got.send((end, read_frame(&mut read).map_err(|e| e.to_string())));
+            });
+        }
+        // Both reads are pending before anything is written.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        for (mut write, frame) in [(client, ask.clone()), (listening.pipe, answer.clone())] {
+            std::thread::spawn(move || write_frame(&mut write, &frame));
+        }
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let arrival = arrivals
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("a write waited for the read parked on the same end");
+            seen.push(arrival);
+        }
+        seen.sort_by_key(|(end, _)| *end);
+        assert_eq!(seen, vec![("server", Ok(ask)), ("window", Ok(answer))]);
+    }
+
+    #[test]
+    fn a_window_that_is_cut_off_leaves_its_sessions_detached() {
+        let mut hub = MuxHub::new();
+        let mine = hub.spawn(&sample_spec("ssh.exe"), 1).unwrap();
+        let theirs = hub.spawn(&sample_spec("ssh.exe"), 2).unwrap();
+        hub.detach_client(1);
+        assert_eq!(hub.attached_client(mine), None);
+        assert_eq!(hub.attached_client(theirs), Some(2));
+        assert!(
+            hub.drop_client(1).is_empty(),
+            "the pipe closing afterwards must not kill what was detached"
+        );
+        assert_eq!(hub.alive(), 2);
+        let listed: Vec<u64> = hub.list_detached().iter().map(|snap| snap.id).collect();
+        assert_eq!(listed, vec![mine]);
     }
 
     fn spawned(srv: &mut FakeMuxServer, client: u64, token: u64) -> u64 {
@@ -2573,6 +2805,13 @@ mod tests {
         let flags = client_file_flags();
         assert_eq!(flags & SECURITY_SQOS_PRESENT, SECURITY_SQOS_PRESENT);
         assert_eq!(flags & SECURITY_IDENTIFICATION, SECURITY_IDENTIFICATION);
+        for (end, flags) in [("first", first), ("next", next), ("window", flags)] {
+            assert_ne!(
+                flags & FILE_FLAG_OVERLAPPED,
+                0,
+                "the {end} handle must be overlapped: it is read and written at once"
+            );
+        }
     }
 
     #[test]
