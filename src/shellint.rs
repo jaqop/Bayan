@@ -367,13 +367,19 @@ fn cmd_setup() -> String {
 /// so a second source ran ssh-agent and PATH setup twice. Non-login sources
 /// `~/.bashrc` only, and only when `user` is set. `windows_elevated` is Git
 /// Bash running as administrator: that profile is not read at all, because
-/// its `git-prompt.sh` runs files under the user's home. WSL elevated
-/// (`windows_elevated` false, `user` false) still reads the distro profile,
-/// with `HOME` pointed at the rcfile directory for that read.
+/// its `git-prompt.sh` runs files under the user's home. Login or not, the
+/// rcfile puts the real `HOME` back and points completion at the integration
+/// directory. WSL elevated (`windows_elevated` false, `user` false) still
+/// reads the distro profile, with `HOME` pointed at the rcfile directory
+/// for that read.
 fn bash_rc(login: bool, user: bool, windows_elevated: bool) -> String {
     let mut s = String::from(BASH_PRELUDE);
-    if login && !user && windows_elevated {
+    if windows_elevated && !user {
+        // PATH and MSYSTEM too, not only for a login shell. A bare
+        // `bash.exe -i` otherwise keeps an empty MSYSTEM and never sees
+        // /ucrt64/bin.
         s.push_str(BASH_ELEVATED_ENV);
+        s.push_str(BASH_ELEVATED_HOME);
     } else if login {
         if user {
             s.push_str(BASH_SYSTEM_PROFILE);
@@ -438,6 +444,40 @@ unset __bayan_real_home __bayan_safe
 BASH_COMPLETION_USER_DIR=$__bayan_completion_dir
 readonly BASH_COMPLETION_USER_DIR
 unset __bayan_completion_dir
+# bash-completion >= 2.12 also loads share/bash-completion/completions
+# beside every PATH entry that ends in /bin. WSL appends /mnt/c/...
+# directories the user can write. Run the loaders with those removed.
+__bayan_safe_path() {
+  local _p _out= _uid _mode
+  local IFS=:
+  for _p in $PATH; do
+    case "$_p" in
+      ''|/mnt|/*/mnt/*) continue ;;
+    esac
+    if [ -e "$_p" ]; then
+      _uid=$(stat -c %u "$_p" 2>/dev/null) || _uid=
+      _mode=$(stat -c %a "$_p" 2>/dev/null) || _mode=
+      if [ -n "$_uid" ] && [ "$_uid" != 0 ]; then
+        continue
+      fi
+      case "$_mode" in
+        *[2367]) continue ;;
+      esac
+    fi
+    _out="${_out:+$_out:}$_p"
+  done
+  printf '%s\n' "$_out"
+}
+__bayan_wrap_loader() {
+  local _name=$1 _orig _def
+  declare -F "$_name" >/dev/null 2>&1 || return 0
+  _orig=__bayan_orig_${_name}
+  _def=$(declare -f "$_name") || return 0
+  eval "${_def/$_name/$_orig}"
+  eval "$_name() { local PATH; PATH=\$(__bayan_safe_path); $_orig \"\$@\"; }"
+}
+__bayan_wrap_loader _comp_load
+__bayan_wrap_loader __load_completion
 "#;
 
 const BASH_ELEVATED_ENV: &str = r#"
@@ -445,8 +485,9 @@ const BASH_ELEVATED_ENV: &str = r#"
 # runs /etc/profile.d/git-prompt.sh, which sources ~/.config/git/git-prompt.sh
 # and ~/bash_completion.d/*.bash. Bash's system-wide startup file sources
 # the same script for a non-login shell, and bash reads it before this
-# file, so HOME was an empty directory beside this file until now (it is
-# restored below). PATH and MSYSTEM come from this bash's own install.
+# file, so HOME was an empty directory beside this file until now.
+# BASH_ELEVATED_HOME puts it back for login and non-login alike.
+# PATH and MSYSTEM come from this bash's own install.
 # A launcher that already chose MSYSTEM is kept. Paths are the MSYS
 # root (/), not a converted Windows path: //c/... is a network path and
 # [ -d ] waits on it. Git for Windows 2.56 has /ucrt64 and no /mingw64.
@@ -474,15 +515,19 @@ case "$MSYSTEM" in
   *) PATH="/usr/bin${PATH:+:$PATH}" ;;
 esac
 export MSYSTEM PATH
-# The user's home again: the HOME the launcher saved, else the profile
-# folder. A Windows path is converted now that cygpath is on PATH. If
-# neither is usable HOME stays on the empty directory.
+"#;
+
+/// Restores the real `HOME` for every elevated Git Bash, login or not.
+/// Non-login shells often do not have `/usr/bin` on `PATH` yet, so
+/// `cygpath` is the absolute program. `BAYAN_SI_HOME` is removed so
+/// children do not inherit it.
+const BASH_ELEVATED_HOME: &str = r#"
 __bayan_home=${BAYAN_SI_HOME:-${USERPROFILE:-}}
 unset BAYAN_SI_HOME
 case "$__bayan_home" in
   [A-Za-z]:*)
-    if command -v cygpath >/dev/null 2>&1; then
-      __bayan_home=$(cygpath -u -- "$__bayan_home" 2>/dev/null) || __bayan_home=
+    if [ -x /usr/bin/cygpath ]; then
+      __bayan_home=$(/usr/bin/cygpath -u -- "$__bayan_home" 2>/dev/null) || __bayan_home=
     else
       __bayan_home=
     fi
@@ -493,9 +538,6 @@ if [ -n "$__bayan_home" ] && [ -d "$__bayan_home" ]; then
   export HOME
 fi
 unset __bayan_home
-# Tab completion must not follow HOME back to the user's files. The
-# directory is this rcfile's folder; do not cd there (a Windows path can
-# look like a network share).
 __bayan_here="${BASH_SOURCE[0]}"
 __bayan_here="${__bayan_here//\\//}"
 __bayan_completion_dir="${__bayan_here%/*}/bash-completion"
@@ -971,18 +1013,19 @@ pub(crate) fn materialize(plan: &Plan) -> Result<Materialized, String> {
     for (key, rel) in &plan.path_env {
         let path = resolve_rel(&dir, rel).ok_or_else(|| format!("refusing path {rel}"))?;
         if key == "HOME" {
-            // The value being replaced, so the rcfile can restore it.
-            if let Some(real) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-                env.push((
-                    REAL_HOME_ENV.to_string(),
-                    real.to_string_lossy().into_owned(),
-                ));
-            }
+            // Always an explicit value, including empty. An inherited
+            // BAYAN_SI_HOME from a parent must not survive when this
+            // process has no HOME of its own.
+            env.push((REAL_HOME_ENV.to_string(), saved_home()));
         }
         env.push((key.clone(), path.display().to_string()));
     }
     let dir = cleanup.disarm();
     Ok(Materialized { args, env, dir })
+}
+
+fn saved_home() -> String {
+    std::env::var("HOME").unwrap_or_default()
 }
 
 fn resolve_rel(dir: &Path, rel: &str) -> Option<PathBuf> {
@@ -2327,6 +2370,27 @@ mod tests {
             !BASH_ELEVATED_ENV.contains("PS1="),
             "elevated Git Bash must keep the prompt Git already set:\n{BASH_ELEVATED_ENV}"
         );
+        assert!(!BASH_ELEVATED_HOME.contains("PS1="), "{BASH_ELEVATED_HOME}");
+    }
+
+    #[test]
+    fn elevated_non_login_bash_restores_home() {
+        for cmd in [
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe -i",
+            r"C:\Program Files\Git\usr\bin\bash.exe --noprofile --login -i",
+            r"C:\msys64\usr\bin\bash.exe -i",
+        ] {
+            let plan = plan(cmd, true, true, NONCE).unwrap();
+            let rc = file(&plan, "bash.sh");
+            assert!(rc.contains("HOME=$__bayan_home"), "{cmd}\n{rc}");
+            assert!(rc.contains("/usr/bin/cygpath"), "{cmd}");
+            assert!(rc.contains("readonly BASH_COMPLETION_USER_DIR"), "{cmd}");
+            assert!(rc.contains("unset XDG_DATA_HOME"), "{cmd}");
+            let used = rc.find("${BAYAN_SI_HOME:").expect(cmd);
+            let cleared = rc.find("unset BAYAN_SI_HOME").expect(cmd);
+            assert!(used < cleared, "{cmd} leaves BAYAN_SI_HOME exported");
+        }
     }
 
     #[test]
@@ -2354,10 +2418,12 @@ mod tests {
         let wsl = file(&plan, "bash.sh");
         let sourced = wsl.find(". /etc/profile").expect("profile");
         for var in [
+            "unset XDG_DATA_HOME",
             "unset XDG_DATA_DIRS",
             "unset XDG_CONFIG_HOME",
             "unset BASH_COMPLETION_USER_FILE",
             "unset BASH_COMPLETION_COMPAT_DIR",
+            "unset BASH_COMPLETION_USER_DIR",
         ] {
             let at = wsl.find(var).unwrap_or_else(|| panic!("missing {var}"));
             assert!(
@@ -2418,8 +2484,7 @@ mod tests {
     /// Elevated Git Bash must not run the user's git-prompt or completion
     /// scripts. PATH and MSYSTEM are set without `/etc/profile`. Skip when
     /// bash is absent; CI has it.
-    #[test]
-    fn real_git_bash_elevated_profile_does_not_run_user_git_prompt() {
+    fn real_git_bash_elevated_session(launch: &str) {
         let Some(bash) = find_real_bash() else {
             if std::env::var_os("GITHUB_ACTIONS").is_some() {
                 panic!("Git Bash is required on the Windows CI runner");
@@ -2449,7 +2514,7 @@ mod tests {
             format!("echo completion > '{marker_bash}'\n"),
         )
         .unwrap();
-        let planned = plan(bash_git(), true, true, NONCE).unwrap();
+        let planned = plan(launch, true, true, NONCE).unwrap();
         for (rel, body) in &planned.files {
             let path = safe.join(rel);
             if let Some(parent) = path.parent() {
@@ -2497,6 +2562,8 @@ mod tests {
         use std::io::Write;
         let _ = writeln!(stdin, "printf 'MSYSTEM=%s\\n' \"$MSYSTEM\"");
         let _ = writeln!(stdin, "printf 'AFTER=%s\\n' \"$HOME\"");
+        let _ = writeln!(stdin, "printf 'BCUD=%s\\n' \"$BASH_COMPLETION_USER_DIR\"");
+        let _ = writeln!(stdin, "printf 'SAVED=%s\\n' \"${BAYAN_SI_HOME-}\"");
         let _ = writeln!(
             stdin,
             "command -v ls >/dev/null && printf 'LS=ok\\n' || printf 'LS=missing\\n'"
@@ -2530,6 +2597,26 @@ mod tests {
             pwned.is_empty(),
             "user git-prompt ran as the elevated shell: {pwned}\n{text}"
         );
+        assert!(
+            text.contains("BCUD=") && text.contains("bayan-elev-rc-"),
+            "completion dir was not the integration directory:\n{text}"
+        );
+        assert!(
+            text.contains("SAVED=\n") || text.contains("SAVED=\r"),
+            "BAYAN_SI_HOME leaked to the shell:\n{text}"
+        );
+        let after = text
+            .lines()
+            .find(|line| line.contains("AFTER="))
+            .unwrap_or("");
+        assert!(
+            after.contains("bayan-elev-home-"),
+            "HOME was not put back on the user's home:\n{text}"
+        );
+        assert!(
+            !after.contains("bayan-elev-rc-"),
+            "HOME was left on the rcfile directory:\n{text}"
+        );
         let bash_path = bash.to_string_lossy().to_ascii_lowercase();
         if bash_path.contains("\\git\\") || bash_path.contains("/git/") {
             assert!(
@@ -2538,24 +2625,119 @@ mod tests {
                     || text.contains("MSYSTEM=CLANG"),
                 "Git install left MSYSTEM unset or MSYS:\n{text}"
             );
-        } else {
-            assert!(
-                text.contains("MSYSTEM=UCRT")
-                    || text.contains("MSYSTEM=MINGW")
-                    || text.contains("MSYSTEM=CLANG")
-                    || text.contains("MSYSTEM=MSYS"),
-                "MSYSTEM was not set:\n{text}"
-            );
         }
         assert!(text.contains("LS=ok"), "PATH has no ls:\n{text}");
-        assert!(text.contains("AFTER="), "{text}");
+    }
+
+    #[test]
+    fn real_git_bash_elevated_profile_does_not_run_user_git_prompt() {
+        real_git_bash_elevated_session(bash_git());
+    }
+
+    #[test]
+    fn real_git_bash_elevated_interactive_restores_home() {
+        real_git_bash_elevated_session(r"C:\Program Files\Git\usr\bin\bash.exe -i");
+    }
+
+    #[test]
+    fn materialize_saves_the_real_home_for_elevated_bash() {
+        let plan = plan(bash_git(), true, true, NONCE).unwrap();
+        let done = materialize(&plan).expect("elevated materialize");
+        let dir = done.dir.clone().expect("dir");
+        let saved = done
+            .env
+            .iter()
+            .find(|(k, _)| k == REAL_HOME_ENV)
+            .map(|(_, v)| v.clone());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(saved.as_deref(), Some(saved_home().as_str()));
+    }
+
+    #[test]
+    fn planted_completion_beside_an_mnt_path_is_not_loaded() {
+        let Some(bash) = find_real_bash() else {
+            if std::env::var_os("GITHUB_ACTIONS").is_some() {
+                panic!("Git Bash is required on the Windows CI runner");
+            }
+            return;
+        };
+        let hex = random_hex().expect("random");
+        let root = std::env::temp_dir().join(format!("bayan-mnt-{hex}"));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("mnt/c/cargo/bin");
+        let comp = root.join("mnt/c/cargo/share/bash-completion/completions");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&comp).unwrap();
+        let marker = root.join("PWNED");
+        let marker_bash = marker.display().to_string().replace('\\', "/");
+        std::fs::write(
+            comp.join("zzcmd"),
+            format!("printf 'PWN\\n' > '{marker_bash}'\n"),
+        )
+        .unwrap();
+        let wsl = plan(r"C:\Windows\System32\wsl.exe -d Ubuntu", true, true, NONCE).unwrap();
+        let guard = file(&wsl, "bash.sh");
+        let start = guard.find("__bayan_safe_path()").expect("filter");
+        let script = format!(
+            r#"
+_comp_load() {{
+  local dir
+  local IFS=:
+  for dir in $PATH; do
+    case "$dir" in
+      */bin|*/sbin)
+        dir="${{dir%/*}}/share/bash-completion/completions"
+        if [ -f "$dir/$1" ]; then . "$dir/$1"; fi
+        ;;
+    esac
+  done
+}}
+{guard}
+_comp_load zzcmd
+printf 'DONE\n'
+"#,
+            guard = &guard[start..]
+        );
+        // Git Bash sees the temp dir as /tmp/.../mnt/c/..., which the filter
+        // treats like a WSL /mnt path.
+        let bin_bash = format!(
+            "/tmp/{}/mnt/c/cargo/bin",
+            root.file_name().unwrap().to_string_lossy()
+        );
+        // The Windows temp path is not always /tmp. Pass the path Git Bash
+        // will actually see by asking it.
+        let listed = std::process::Command::new(&bash)
+            .arg("-c")
+            .arg("cygpath -u \"$1\"")
+            .arg("cygpath")
+            .arg(&bin)
+            .output()
+            .expect("cygpath");
+        let bin_posix = String::from_utf8_lossy(&listed.stdout).trim().to_string();
+        let bin_posix = if bin_posix.is_empty() {
+            bin_bash
+        } else {
+            bin_posix
+        };
+        let output = std::process::Command::new(&bash)
+            .arg("--noprofile")
+            .arg("--norc")
+            .arg("-c")
+            .arg(&script)
+            .env("PATH", format!("{bin_posix}:/usr/bin"))
+            .output()
+            .expect("bash");
+        let text = String::from_utf8_lossy(&output.stdout);
+        let pwned = std::fs::read_to_string(&marker).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&root);
         assert!(
-            !text.contains("bayan-elev-rc-"),
-            "HOME was left on the rcfile directory:\n{text}"
+            text.contains("DONE"),
+            "loader did not finish: {text}\n{}",
+            String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            text.contains("AFTER=") && text.contains("bayan-elev-home-"),
-            "HOME was not put back on the user's home:\n{text}"
+            pwned.is_empty(),
+            "planted completion under {bin_posix} ran: {pwned}"
         );
     }
 }

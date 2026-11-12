@@ -54,8 +54,8 @@ selection and BiDi paths must do.
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-835 tests across the tree. `render.rs` (100), `term.rs` (99) and `link.rs`
-(66) carry the most; `lua_host.rs` has 46, `shellint.rs` 28, `images.rs` and
+839 tests across the tree. `render.rs` (100), `term.rs` (99) and `link.rs`
+(66) carry the most; `lua_host.rs` has 46, `shellint.rs` 32, `images.rs` and
 `localpath.rs` 21 each, `mux.rs` 15, `config_watch.rs` 14, `screen_reader.rs`
 11 and `ssh.rs` 7. Three more in `term.rs` are `#[ignore]`d probes, run by
 hand (see Measuring).
@@ -221,14 +221,18 @@ the user's rc files. An elevated token must not source `~/.bashrc`,
 `~/.bash_profile`, `~/.inputrc`, or the zsh home files: set `INPUTRC` and
 `HISTFILE` to `/dev/null`. Elevated Git Bash passes `--noprofile` before
 `-i` and must not source `/etc/profile` (its `git-prompt.sh` runs user
-files). `PATH` and `MSYSTEM` come from `/ucrt64` before `/mingw64`. Do not
+files). Login or not, the rcfile restores `HOME` from `BAYAN_SI_HOME`
+with `/usr/bin/cygpath` and then unsets that variable. `PATH` and
+`MSYSTEM` come from `/ucrt64` before `/mingw64`. Do not
 replace `PS1`: the system prompt (cwd, branch, window title) stays, and
 the OSC mark is appended. Elevated WSL bash still reads the distro
 profile with `HOME` pointed at the rcfile directory, after clearing
 inherited `XDG_DATA_DIRS`, `XDG_CONFIG_HOME`, `BASH_COMPLETION_USER_FILE`
 and `BASH_COMPLETION_COMPAT_DIR`. Once `HOME` is real again,
 `BASH_COMPLETION_USER_DIR` is the integration directory for both Git Bash
-and WSL. A failed
+and WSL. The WSL loaders `_comp_load` and `__load_completion` then run
+with `/mnt` and user-owned or world-writable `PATH` entries removed, so a
+completion planted beside a Windows `bin` directory is not sourced. A failed
 elevation query is treated as elevated. `shellint` takes the `elevated` flag `Session::spawn` is given, which is
 `elevate::process_is_elevated`, the one token query in the tree.
 The script directory comes from `SHGetKnownFolderPath(FOLDERID_ProgramData)`

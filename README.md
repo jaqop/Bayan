@@ -1102,7 +1102,8 @@ macro. Elevated Git Bash is started with `--noprofile` before `-i` and
 does not read `/etc/profile`: that file runs `git-prompt.sh`, which
 executes `~/.config/git/git-prompt.sh` and `~/bash_completion.d/*.bash` as
 administrator. `HOME` is an empty directory in the integration folder
-until the rcfile restores it. `PATH` and `MSYSTEM` come from the Git
+until the rcfile restores it, including a non-login `bash.exe -i`.
+`PATH` and `MSYSTEM` come from the Git
 install, preferring `/ucrt64` (Git for Windows 2.56) over `/mingw64`.
 Git's own prompt is kept. Elevated WSL bash still reads the distro's
 `/etc/profile`, with `HOME` pointed at the rcfile directory for that
