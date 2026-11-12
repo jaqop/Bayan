@@ -121,17 +121,37 @@ fn bash_plan(args: &[String], elevated: bool, mut env: Vec<(String, String)>) ->
         // before the rcfile.
         bash_argv.push("--noprofile".to_string());
     }
+    let mut files = vec![("bash.sh".into(), bash_rc(login, user, elevated))];
+    let mut path_env = Vec::new();
+    if elevated {
+        // bash reads /etc/bash.bashrc before the rcfile, and no flag skips
+        // it while keeping `--rcfile`. Git for Windows' copy sources
+        // git-prompt.sh for a non-login shell, which runs
+        // ~/.config/git/git-prompt.sh and ~/bash_completion.d/*.bash. HOME
+        // is an empty directory beside the rcfile for that read; the
+        // rcfile puts the user's home back.
+        files.push((format!("{ELEVATED_HOME_DIR}/.keep"), String::new()));
+        path_env.push(("HOME".to_string(), ELEVATED_HOME_DIR.to_string()));
+    }
     Some(Plan {
         kind: ShellKind::Bash,
         args: bash_argv,
-        files: vec![("bash.sh".into(), bash_rc(login, user, elevated))],
-        path_env: Vec::new(),
+        files,
+        path_env,
         env,
         wslenv_path: Vec::new(),
         wslenv_plain: Vec::new(),
         elevated,
     })
 }
+
+/// The empty directory an elevated Git Bash has as `HOME` until its rcfile
+/// runs. It sits in the protected integration directory.
+const ELEVATED_HOME_DIR: &str = "home";
+
+/// The user's own `HOME`, when the environment set one, for the rcfile to
+/// restore. Without it the rcfile falls back to `USERPROFILE`.
+const REAL_HOME_ENV: &str = "BAYAN_SI_HOME";
 
 /// readline and the history file are not affected by `--rcfile`. An elevated
 /// shell must not open the user's `~/.inputrc` (a macro there runs as admin)
@@ -407,9 +427,10 @@ unset __bayan_real_home
 const BASH_ELEVATED_ENV: &str = r#"
 # Elevated Git Bash does not source /etc/profile. Git for Windows' copy
 # runs /etc/profile.d/git-prompt.sh, which sources ~/.config/git/git-prompt.sh
-# and ~/bash_completion.d/*.bash. Moving HOME for that read did not stop
-# the real profile from executing those files. PATH and MSYSTEM come from
-# this bash's own install.
+# and ~/bash_completion.d/*.bash. Bash's system-wide startup file sources
+# the same script for a non-login shell, and bash reads it before this
+# file, so HOME was an empty directory beside this file until now (it is
+# restored below). PATH and MSYSTEM come from this bash's own install.
 # A launcher that already chose MSYSTEM is kept.
 __bayan_bash=${BASH:-$(command -v bash 2>/dev/null)}
 case "$__bayan_bash" in
@@ -463,6 +484,25 @@ fi
 export MSYSTEM PATH
 unset __bayan_bash __bayan_bin __bayan_root __bayan_prefix __bayan_usr
 unset -f __bayan_slash
+# The user's home again: the HOME the launcher saved, else the profile
+# folder. A Windows path is converted now that cygpath is on PATH. If
+# neither is usable HOME stays on the empty directory.
+__bayan_home=${BAYAN_SI_HOME:-${USERPROFILE:-}}
+unset BAYAN_SI_HOME
+case "$__bayan_home" in
+  [A-Za-z]:*)
+    if command -v cygpath >/dev/null 2>&1; then
+      __bayan_home=$(cygpath -u -- "$__bayan_home" 2>/dev/null) || __bayan_home=
+    else
+      __bayan_home=
+    fi
+    ;;
+esac
+if [ -n "$__bayan_home" ] && [ -d "$__bayan_home" ]; then
+  HOME=$__bayan_home
+  export HOME
+fi
+unset __bayan_home
 "#;
 
 const BASH_USER_PROFILE: &str = r#"
@@ -928,6 +968,15 @@ pub(crate) fn materialize(plan: &Plan) -> Result<Materialized, String> {
     }
     for (key, rel) in &plan.path_env {
         let path = resolve_rel(&dir, rel).ok_or_else(|| format!("refusing path {rel}"))?;
+        if key == "HOME" {
+            // The value being replaced, so the rcfile can restore it.
+            if let Some(real) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+                env.push((
+                    REAL_HOME_ENV.to_string(),
+                    real.to_string_lossy().into_owned(),
+                ));
+            }
+        }
         env.push((key.clone(), path.display().to_string()));
     }
     let dir = cleanup.disarm();
@@ -1744,6 +1793,19 @@ mod tests {
             "elevated bash must not be a profile login"
         );
         assert!(!rc.contains(".bashrc"), "{rc}");
+        // The system-wide startup file runs before the rcfile, with HOME on
+        // an empty directory in the protected folder.
+        assert_eq!(
+            plan.path_env,
+            vec![("HOME".to_string(), ELEVATED_HOME_DIR.to_string())]
+        );
+        assert!(plan
+            .files
+            .iter()
+            .any(|(rel, _)| rel.starts_with(ELEVATED_HOME_DIR)));
+        assert!(rc.contains("BAYAN_SI_HOME"), "{rc}");
+        let unelevated = super::plan(bash_git(), true, false, NONCE).unwrap();
+        assert!(unelevated.path_env.is_empty());
         assert!(rc.contains(r"printf '\033]133;D;%s;%s\007'"));
         assert_eq!(
             plan.env
@@ -2298,7 +2360,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&safe);
         std::fs::create_dir_all(home.join(".config/git")).unwrap();
         std::fs::create_dir_all(home.join("bash_completion.d")).unwrap();
-        std::fs::create_dir_all(&safe).unwrap();
+        // what `materialize` does for an elevated plan: an empty HOME
+        // beside the rcfile, and the real one in BAYAN_SI_HOME
+        let empty_home = safe.join(ELEVATED_HOME_DIR);
+        std::fs::create_dir_all(&empty_home).unwrap();
         let marker = home.join("PWNED");
         let marker_bash = marker.display().to_string().replace('\\', "/");
         std::fs::write(
@@ -2318,7 +2383,8 @@ mod tests {
             .arg("--rcfile")
             .arg(&rc_path)
             .arg("-i")
-            .env("HOME", &home)
+            .env("HOME", &empty_home)
+            .env(REAL_HOME_ENV, &home)
             .env("USERPROFILE", &home)
             .env("BAYAN_PROMPT_NONCE", "n0nce")
             .env("INPUTRC", "/dev/null")
@@ -2376,6 +2442,10 @@ mod tests {
         assert!(
             !text.contains("bayan-elev-rc-"),
             "HOME was left on the rcfile directory:\n{text}"
+        );
+        assert!(
+            text.contains("AFTER=") && text.contains("bayan-elev-home-"),
+            "HOME was not put back on the user's home:\n{text}"
         );
     }
 }
