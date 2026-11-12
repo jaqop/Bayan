@@ -1561,26 +1561,45 @@ struct App {
     config_notice: Option<ConfigNotice>,
 }
 
-/// What a reload does to the session's config and its load error.
-/// A rejected file leaves the config alone and blocks the next save.
-/// A missing file keeps the config; after an error it arrives as the same
-/// config applied, which clears the error. The watcher's plan is not kept:
-/// the window recomputes it from the live config.
-struct AbsorbedReload {
+/// What a reload does to the session. The watcher's plan is not kept:
+/// `plan` is `diff(live, merged)`.
+struct ReloadDecision {
     config: config::UserConfig,
     load_error: Option<String>,
+    plan: config_watch::ApplyPlan,
+    deferred: Vec<config_watch::DeferredSetting>,
+    /// Notice when the file overrode a value the open panel had edited.
+    replaced: Option<String>,
 }
 
-fn absorb_reload(current: config::UserConfig, msg: config_watch::ReloadMsg) -> AbsorbedReload {
+fn decide_reload(
+    live: &config::UserConfig,
+    panel_open: bool,
+    msg: config_watch::ReloadMsg,
+) -> ReloadDecision {
     match msg {
-        config_watch::ReloadMsg::Rejected { error } => AbsorbedReload {
-            config: current,
+        config_watch::ReloadMsg::Rejected { error } => ReloadDecision {
+            config: live.clone(),
             load_error: Some(error),
+            plan: config_watch::ApplyPlan::default(),
+            deferred: Vec::new(),
+            replaced: None,
         },
-        config_watch::ReloadMsg::Applied { config, .. } => AbsorbedReload {
-            config: *config,
-            load_error: None,
-        },
+        config_watch::ReloadMsg::Applied { config, base, .. } => {
+            // File fields that moved since `base` win. Everything else stays
+            // as the panel left it. The plan is then live versus that merge,
+            // not live versus the raw file and not the watcher's disk diff.
+            let (merged, overrode) = config_watch::merge_reload(&base, live, &config);
+            let (plan, deferred) = plan_against_live(live, &merged);
+            let replaced = open_panel_file_notice(panel_open && overrode, live, &merged);
+            ReloadDecision {
+                config: merged,
+                load_error: None,
+                plan,
+                deferred,
+                replaced,
+            }
+        }
     }
 }
 
@@ -1595,13 +1614,10 @@ fn save_bytes(load_error: &Option<String>, config: &config::UserConfig) -> Resul
 
 /// How an external reload meets an open settings panel.
 ///
-/// The file wins, including over edits the panel has applied on screen but
-/// not saved yet. The plan is `diff(live, file)`, not the plan the watcher
-/// computed against the previous file: a font the panel raised to 20 is
-/// rebuilt when the file still says 14, so the screen and the config cannot
-/// drift apart. Closing the panel then saves the file's values. When the
-/// panel is open and those values differ from what it was showing, the
-/// notice tells the user the file took over — the replacement is not silent.
+/// `plan_against_live` is `diff(live, merged)`. It must stay that
+/// comparison: diffing the raw file against itself, or the live config
+/// against the raw file, either rebuilds a font the merge kept or skips
+/// a font the file actually changed.
 fn plan_against_live(
     live: &config::UserConfig,
     incoming: &config::UserConfig,
@@ -1609,7 +1625,8 @@ fn plan_against_live(
     config_watch::diff(live, incoming)
 }
 
-/// Set when the panel is open and the file is not what the panel is showing.
+/// Set when the open panel had edited a field and the file changed that
+/// same field to something else. The file's value is the one kept.
 fn open_panel_file_notice(
     panel_open: bool,
     live: &config::UserConfig,
@@ -1618,8 +1635,8 @@ fn open_panel_file_notice(
     if panel_open && live != incoming {
         Some(
             tr(
-                "تغيّر ملف الإعدادات واللوحة مفتوحة، فصارت قيم الملف هي المعتمدة.",
-                "The settings file changed while the panel was open, so the file's values are now in effect.",
+                "تغيّر ملف الإعدادات قيمة عدّلتها اللوحة، فصارت قيمة الملف هي المعتمدة.",
+                "The settings file changed a value the panel had edited, so the file's value is now in effect.",
             )
             .to_string(),
         )
@@ -2587,16 +2604,15 @@ impl App {
 
     /// Apply a config.json change that did not come from the settings panel.
     ///
-    /// The file replaces the live config, unsaved panel edits included.
-    /// The plan is the difference from what is on screen, so a font the
-    /// panel already drew is rebuilt when the file still has the old size.
-    /// A bad file leaves `self.config` as it was. Font and color changes
-    /// rebuild the renderer; when that renderer arrives, `relayout_active`
-    /// resizes every PTY to the new cell size. Padding alone resizes with
-    /// the metrics already on screen.
+    /// Fields the file changed since the last load take the file's value.
+    /// Every other field keeps the live panel value. The plan is
+    /// `diff(live, merged)` via [`decide_reload`]. A bad file leaves
+    /// `self.config` as it was. Font and color changes rebuild the renderer;
+    /// when that renderer arrives, `relayout_active` resizes every PTY.
+    /// Padding alone resizes with the metrics already on screen.
     fn apply_config_reload(&mut self, msg: config_watch::ReloadMsg) {
-        let absorbed = absorb_reload(self.config.clone(), msg);
-        if let Some(error) = absorbed.load_error {
+        let decision = decide_reload(&self.config, self.settings.is_some(), msg);
+        if let Some(error) = decision.load_error {
             self.config_load_error = Some(error.clone());
             self.config_notice = Some(ConfigNotice {
                 text: config_watch::parse_error_notice(&error),
@@ -2605,28 +2621,25 @@ impl App {
             self.request_redraw();
             return;
         }
-        let (plan, deferred) = plan_against_live(&self.config, &absorbed.config);
-        let replaced =
-            open_panel_file_notice(self.settings.is_some(), &self.config, &absorbed.config);
         self.config_load_error = None;
-        let language = plan.language && absorbed.config.lang() != self.config.lang();
-        self.config = absorbed.config;
+        let language = decision.plan.language && decision.config.lang() != self.config.lang();
+        self.config = decision.config;
         if language {
             lang::set(self.config.lang());
         }
-        if plan.keybinds {
+        if decision.plan.keybinds {
             self.keymap = keybinds::effective_map(&self.config);
         }
-        if plan.opacity {
+        if decision.plan.opacity {
             self.apply_opacity();
         }
-        let rebuild = plan.font || plan.colors;
+        let rebuild = decision.plan.font || decision.plan.colors;
         if rebuild {
             self.rebuild_renderer();
-        } else if plan.padding || plan.hide_bar {
+        } else if decision.plan.padding || decision.plan.hide_bar {
             self.relayout_active();
         }
-        self.config_notice = reload_notice(replaced, &deferred);
+        self.config_notice = reload_notice(decision.replaced, &decision.deferred);
         self.request_redraw();
     }
 
@@ -5869,28 +5882,117 @@ mod tests {
     }
 
     #[test]
-    fn unsaved_panel_font_is_rebuilt_when_the_file_keeps_the_old_size() {
-        // The file on disk is 14pt. The open panel has already drawn 20pt
-        // and has not saved. An external edit keeps 14pt and sets padding.
-        // Diffing the new file against the old file does not mention the
-        // font, so using that plan would leave the screen at 20 while the
-        // config (and the next panel save) becomes 14.
-        let on_disk = config::UserConfig {
+    fn panel_cursor_survives_an_external_padding_edit() {
+        // The last loaded file has the default cursor. The open panel set
+        // the cursor to bar and has not saved. An external edit changes
+        // only padding. The cursor stays bar; padding comes from the file.
+        let base = config::UserConfig::default();
+        let disk = config::encode(&base).unwrap();
+        let from_editor = config::UserConfig {
+            padding: Some(16),
+            ..config::UserConfig::default()
+        };
+        let msg = config_watch::reload_from_bytes(
+            base.clone(),
+            &disk,
+            &config::encode(&from_editor).unwrap(),
+        )
+        .expect("padding edit reloads");
+        let config_watch::ReloadMsg::Applied {
+            base: loaded_base, ..
+        } = &msg
+        else {
+            panic!("padding edit parsed");
+        };
+        assert_eq!(
+            loaded_base.padding, None,
+            "the merge base is the previous file"
+        );
+        let live = config::UserConfig {
+            cursor_style: Some("bar".into()),
+            copy_on_select: Some(false),
+            ..config::UserConfig::default()
+        };
+        let decision = decide_reload(&live, true, msg);
+        assert_eq!(decision.config.cursor(), config::CursorStyle::Bar);
+        assert!(!decision.config.copy_on_select_on());
+        assert_eq!(decision.config.padding_px(), 16);
+        assert!(decision.plan.padding);
+        assert!(!decision.plan.cursor);
+        assert!(
+            decision.replaced.is_none(),
+            "the file did not touch the cursor, so it does not announce an override"
+        );
+        // The next reload's base is the file we just loaded, not the merge.
+        // A later file that still leaves the cursor unset keeps bar.
+        let again = config::UserConfig {
+            padding: Some(8),
+            ..from_editor.clone()
+        };
+        let second = config_watch::ReloadMsg::Applied {
+            config: Box::new(again),
+            base: Box::new(from_editor),
+            plan: config_watch::ApplyPlan::default(),
+            deferred: Vec::new(),
+        };
+        let decision = decide_reload(&decision.config, true, second);
+        assert_eq!(decision.config.cursor(), config::CursorStyle::Bar);
+        assert_eq!(decision.config.padding_px(), 8);
+    }
+
+    /// The panel and the file both changed the font. The file wins that
+    /// field. The panel's other unsaved edits stay.
+    #[test]
+    fn file_wins_when_the_panel_and_the_file_change_the_same_field() {
+        let base = config::UserConfig {
             font_size: Some(14.0),
             ..config::UserConfig::default()
         };
-        let disk_bytes = config::encode(&on_disk).unwrap();
+        let live = config::UserConfig {
+            font_size: Some(20.0),
+            cursor_style: Some("bar".into()),
+            ..base.clone()
+        };
+        let file = config::UserConfig {
+            font_size: Some(18.0),
+            ..base.clone()
+        };
+        let msg = config_watch::ReloadMsg::Applied {
+            config: Box::new(file),
+            base: Box::new(base),
+            plan: config_watch::ApplyPlan::default(),
+            deferred: Vec::new(),
+        };
+        let decision = decide_reload(&live, true, msg);
+        assert_eq!(
+            decision.config.font_size,
+            Some(18.0),
+            "the file's font wins the field both sides changed"
+        );
+        assert_eq!(decision.config.cursor(), config::CursorStyle::Bar);
+        assert!(decision.plan.font, "20 on screen versus 18 from the file");
+        assert!(decision.replaced.is_some());
+    }
+
+    /// `apply_config_reload` takes its plan from [`decide_reload`], which
+    /// diffs the live config against the merge. Comparing the raw file to
+    /// itself would drop the padding rebuild; comparing the live config to
+    /// the raw file would rebuild a font the merge kept.
+    #[test]
+    fn reload_plan_compares_the_live_config_with_the_merge() {
+        let base = config::UserConfig {
+            font_size: Some(14.0),
+            ..config::UserConfig::default()
+        };
+        let disk = config::encode(&base).unwrap();
         let from_editor = config::UserConfig {
             font_size: Some(14.0),
             padding: Some(12),
             ..config::UserConfig::default()
         };
-        let msg = config_watch::reload_from_bytes(
-            on_disk,
-            &disk_bytes,
-            &config::encode(&from_editor).unwrap(),
-        )
-        .expect("the external edit is a reload");
+        let msg =
+            config_watch::reload_from_bytes(base, &disk, &config::encode(&from_editor).unwrap())
+                .expect("padding edit reloads");
         let config_watch::ReloadMsg::Applied {
             plan: disk_plan,
             config: file,
@@ -5899,47 +6001,26 @@ mod tests {
         else {
             panic!("the external edit parsed");
         };
-        assert!(
-            !disk_plan.font,
-            "the file's font did not change, so the watcher's plan ignores it"
-        );
+        assert!(!disk_plan.font);
+        assert!(disk_plan.padding);
         let live = config::UserConfig {
             font_size: Some(20.0),
             ..config::UserConfig::default()
         };
-        let (plan, deferred) = plan_against_live(&live, file);
+        // The comparison this test guards. Dropping `live` (diffing the
+        // file with itself) makes padding false. Diffing `live` with the
+        // raw file makes font true.
+        let against_raw = plan_against_live(&live, file);
+        assert!(against_raw.0.font);
+        let decision = decide_reload(&live, false, msg);
+        assert_eq!(decision.config.font_size, Some(20.0));
+        assert_eq!(decision.config.padding_px(), 12);
         assert!(
-            plan.font,
-            "the screen is at 20 and the file says 14, so the font must be rebuilt"
+            !decision.plan.font,
+            "the merge kept 20, which is already on screen"
         );
-        assert!(plan.padding);
-        assert!(!plan.colors);
-        assert!(deferred.is_empty());
-        let absorbed = absorb_reload(live.clone(), msg);
-        assert_eq!(absorbed.config.font_size, Some(14.0));
-        assert_eq!(absorbed.config.padding_px(), 12);
-        // Closing the panel saves the file, not the unsaved 20.
-        let saved = save_bytes(&absorbed.load_error, &absorbed.config).unwrap();
-        let round = config::parse_bytes(&saved).unwrap();
-        assert_eq!(round.font_size, Some(14.0));
-        assert_eq!(round.padding_px(), 12);
-        // The panel is open, so the takeover is announced. Closed, it is not.
-        lang::set(lang::Lang::En);
-        let notice = open_panel_file_notice(true, &live, &absorbed.config).unwrap();
-        assert!(notice.contains("file's values are now in effect"));
-        assert!(open_panel_file_notice(false, &live, &absorbed.config).is_none());
-        lang::set(lang::Lang::Ar);
-
-        // The file caught up to the panel's 20 and only padding changed:
-        // the font is already on screen, so it is not rebuilt again.
-        let caught_up = config::UserConfig {
-            font_size: Some(20.0),
-            padding: Some(12),
-            ..config::UserConfig::default()
-        };
-        let (plan, _) = plan_against_live(&live, &caught_up);
-        assert!(!plan.font);
-        assert!(plan.padding);
+        assert!(decision.plan.padding);
+        assert!(decision.replaced.is_none());
     }
 
     #[test]
@@ -5957,15 +6038,15 @@ mod tests {
             br#"{"font_size":99.0,"cursor_style":"underline""#,
         )
         .expect("a truncated file is a reload message");
-        let absorbed = absorb_reload(current, msg);
+        let decision = decide_reload(&current, false, msg);
         assert!(
-            absorbed.load_error.is_some(),
+            decision.load_error.is_some(),
             "truncated json is a load error"
         );
-        assert_eq!(absorbed.config.font_size, Some(22.0));
-        assert_eq!(absorbed.config.cursor(), config::CursorStyle::Bar);
-        assert!(absorbed.config.osc52_copy_enabled());
-        assert!(save_bytes(&absorbed.load_error, &absorbed.config).is_err());
+        assert_eq!(decision.config.font_size, Some(22.0));
+        assert_eq!(decision.config.cursor(), config::CursorStyle::Bar);
+        assert!(decision.config.osc52_copy_enabled());
+        assert!(save_bytes(&decision.load_error, &decision.config).is_err());
         let dir = temp_dir("truncated");
         let path = dir.join("config.json");
         assert!(!path.exists(), "a blocked save must not create config.json");
@@ -5982,11 +6063,11 @@ mod tests {
         let bytes = config::encode(&current).unwrap();
         let msg = config_watch::reload_from_bytes(current.clone(), &bytes, b"{oops")
             .expect("invalid json is a reload message");
-        let absorbed = absorb_reload(current, msg);
-        assert!(absorbed.load_error.is_some());
-        assert_eq!(absorbed.config.arabic_font.as_deref(), Some("Amiri"));
-        assert_eq!(absorbed.config.font_size, Some(22.0));
-        assert!(save_bytes(&absorbed.load_error, &absorbed.config).is_err());
+        let decision = decide_reload(&current, false, msg);
+        assert!(decision.load_error.is_some());
+        assert_eq!(decision.config.arabic_font.as_deref(), Some("Amiri"));
+        assert_eq!(decision.config.font_size, Some(22.0));
+        assert!(save_bytes(&decision.load_error, &decision.config).is_err());
     }
 
     #[test]
@@ -6000,9 +6081,9 @@ mod tests {
         // another bad file: the running config stays, and a save writes it
         // back, never defaults over the user's settings.
         let [bad, deleted] = config_watch::reload_bad_then_missing(current.clone(), b"{oops");
-        let mut blocked = absorb_reload(current.clone(), bad.unwrap());
+        let mut blocked = decide_reload(&current, false, bad.unwrap());
         assert!(blocked.load_error.is_some());
-        blocked = absorb_reload(blocked.config, deleted.expect("delete is noticed"));
+        blocked = decide_reload(&blocked.config, false, deleted.expect("delete is noticed"));
         assert!(
             blocked.load_error.is_none(),
             "a missing file must not block save_config"

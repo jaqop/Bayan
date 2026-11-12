@@ -111,13 +111,167 @@ impl DeferredSetting {
 #[derive(Clone, Debug)]
 pub enum ReloadMsg {
     Applied {
+        /// The file that was just read.
         config: Box<UserConfig>,
+        /// The previous file this session had loaded, before `config`
+        /// replaced it. The window merges unsaved panel edits against this.
+        base: Box<UserConfig>,
         plan: ApplyPlan,
         deferred: Vec<DeferredSetting>,
     },
     /// The file is unreadable (after retries) or not JSON. `config` in the watcher
     /// is still the previous good one.
     Rejected { error: String },
+}
+
+/// Three-way merge of an external reload.
+///
+/// `base` is the last file this session loaded. A field the new file
+/// changed (`file` differs from `base`) takes the file's value. That
+/// includes a field the panel also changed: the file wins the conflict.
+/// Every other field keeps `live`, so an unsaved panel edit the file did
+/// not touch survives. The bool is true when the file overrode such an edit.
+pub fn merge_reload(base: &UserConfig, live: &UserConfig, file: &UserConfig) -> (UserConfig, bool) {
+    let mut overrode = false;
+    let merged = UserConfig {
+        language: merge_field(
+            &base.language,
+            &live.language,
+            &file.language,
+            &mut overrode,
+        ),
+        restore_tabs: merge_field(
+            &base.restore_tabs,
+            &live.restore_tabs,
+            &file.restore_tabs,
+            &mut overrode,
+        ),
+        theme: merge_field(&base.theme, &live.theme, &file.theme, &mut overrode),
+        font_family: merge_field(
+            &base.font_family,
+            &live.font_family,
+            &file.font_family,
+            &mut overrode,
+        ),
+        arabic_font: merge_field(
+            &base.arabic_font,
+            &live.arabic_font,
+            &file.arabic_font,
+            &mut overrode,
+        ),
+        font_size: merge_field(
+            &base.font_size,
+            &live.font_size,
+            &file.font_size,
+            &mut overrode,
+        ),
+        bg: merge_field(&base.bg, &live.bg, &file.bg, &mut overrode),
+        fg: merge_field(&base.fg, &live.fg, &file.fg, &mut overrode),
+        palette: merge_field(&base.palette, &live.palette, &file.palette, &mut overrode),
+        ligatures: merge_field(
+            &base.ligatures,
+            &live.ligatures,
+            &file.ligatures,
+            &mut overrode,
+        ),
+        cursor_style: merge_field(
+            &base.cursor_style,
+            &live.cursor_style,
+            &file.cursor_style,
+            &mut overrode,
+        ),
+        cursor_blink: merge_field(
+            &base.cursor_blink,
+            &live.cursor_blink,
+            &file.cursor_blink,
+            &mut overrode,
+        ),
+        scrollback: merge_field(
+            &base.scrollback,
+            &live.scrollback,
+            &file.scrollback,
+            &mut overrode,
+        ),
+        copy_on_select: merge_field(
+            &base.copy_on_select,
+            &live.copy_on_select,
+            &file.copy_on_select,
+            &mut overrode,
+        ),
+        right_click: merge_field(
+            &base.right_click,
+            &live.right_click,
+            &file.right_click,
+            &mut overrode,
+        ),
+        osc52: merge_field(&base.osc52, &live.osc52, &file.osc52, &mut overrode),
+        bell: merge_field(&base.bell, &live.bell, &file.bell, &mut overrode),
+        opacity: merge_field(&base.opacity, &live.opacity, &file.opacity, &mut overrode),
+        shell: merge_field(&base.shell, &live.shell, &file.shell, &mut overrode),
+        hide_single_tab: merge_field(
+            &base.hide_single_tab,
+            &live.hide_single_tab,
+            &file.hide_single_tab,
+            &mut overrode,
+        ),
+        confirm_close: merge_field(
+            &base.confirm_close,
+            &live.confirm_close,
+            &file.confirm_close,
+            &mut overrode,
+        ),
+        padding: merge_field(&base.padding, &live.padding, &file.padding, &mut overrode),
+        disabled_plugins: merge_field(
+            &base.disabled_plugins,
+            &live.disabled_plugins,
+            &file.disabled_plugins,
+            &mut overrode,
+        ),
+        notifications: merge_field(
+            &base.notifications,
+            &live.notifications,
+            &file.notifications,
+            &mut overrode,
+        ),
+        osc_notify: merge_field(
+            &base.osc_notify,
+            &live.osc_notify,
+            &file.osc_notify,
+            &mut overrode,
+        ),
+        editor: merge_field(&base.editor, &live.editor, &file.editor, &mut overrode),
+        keybinds: merge_field(
+            &base.keybinds,
+            &live.keybinds,
+            &file.keybinds,
+            &mut overrode,
+        ),
+        tab_switch: merge_field(
+            &base.tab_switch,
+            &live.tab_switch,
+            &file.tab_switch,
+            &mut overrode,
+        ),
+        bidi: merge_field(&base.bidi, &live.bidi, &file.bidi, &mut overrode),
+        keyboard: merge_field(
+            &base.keyboard,
+            &live.keyboard,
+            &file.keyboard,
+            &mut overrode,
+        ),
+    };
+    (merged, overrode)
+}
+
+fn merge_field<T: Clone + PartialEq>(base: &T, live: &T, file: &T, overrode: &mut bool) -> T {
+    if file != base {
+        if live != base && live != file {
+            *overrode = true;
+        }
+        file.clone()
+    } else {
+        live.clone()
+    }
 }
 
 /// Notice for settings that wait for a new pane, a new tab, or a restart.
@@ -318,8 +472,10 @@ impl WatchState {
         if !std::mem::take(&mut self.had_error) {
             return None;
         }
+        let kept = self.last_good.clone();
         Some(ReloadMsg::Applied {
-            config: Box::new(self.last_good.clone()),
+            config: Box::new(kept.clone()),
+            base: Box::new(kept),
             plan: ApplyPlan::default(),
             deferred: Vec::new(),
         })
@@ -374,9 +530,13 @@ impl WatchState {
                 if !was_error && cfg == self.last_good {
                     return None;
                 }
+                // `base` is the file before this read. `last_good` then
+                // becomes the new file, so the next reload diffs against it.
+                let base = self.last_good.clone();
                 self.last_good = cfg.clone();
                 Some(ReloadMsg::Applied {
                     config: Box::new(cfg),
+                    base: Box::new(base),
                     plan,
                     deferred,
                 })
@@ -710,6 +870,7 @@ mod tests {
                 config,
                 plan,
                 deferred,
+                ..
             } => (*config, plan, deferred),
             ReloadMsg::Rejected { error } => panic!("expected an applied config, got {error}"),
         }

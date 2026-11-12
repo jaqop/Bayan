@@ -7390,6 +7390,7 @@ mod cache_tests {
             config,
             plan,
             deferred,
+            ..
         } = msg
         else {
             panic!("font-size reload was rejected");
