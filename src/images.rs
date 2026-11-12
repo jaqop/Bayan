@@ -394,7 +394,7 @@ impl ImageStore {
         let pane = self.limits.max_pane_bytes.saturating_sub(self.pane_bytes);
         let session = self
             .budget
-            .limits
+            .limits()
             .max_session_bytes
             .saturating_sub(self.budget.charged_bytes());
         pane.min(session)
