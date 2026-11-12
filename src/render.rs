@@ -408,9 +408,7 @@ fn dim((r, g, b): (u8, u8, u8)) -> (u8, u8, u8) {
     (f(r), f(g), f(b))
 }
 
-/// A preferred width between `min_w` and `max_w`. `i32::clamp` panics when
-/// the floor is above the ceiling, which a 150% text size does to a 700px
-/// window (`430 * 1.5` against `fw - 60`). The ceiling wins.
+/// Keep a control inside the window after the ledger is scaled down.
 fn clamp_rect_bottom(r: Rect, limit: i32) -> Rect {
     if r.1 + r.3 > limit {
         (r.0, r.1, r.2, (limit - r.1).max(1))
@@ -418,6 +416,10 @@ fn clamp_rect_bottom(r: Rect, limit: i32) -> Rect {
         r
     }
 }
+
+/// A preferred width between `min_w` and `max_w`. `i32::clamp` panics when
+/// the floor is above the ceiling, which a 150% text size does to a 700px
+/// window (`430 * 1.5` against `fw - 60`). The ceiling wins.
 
 fn span_in(preferred: i32, min_w: i32, max_w: i32) -> i32 {
     let max_w = max_w.max(0);
@@ -2464,6 +2466,9 @@ pub struct Renderer {
     /// High Contrast is on and the grid follows it (fg/bg/selection/cursor).
     grid_follows_hc: bool,
     chrome: crate::a11y::ChromeColors,
+    /// `(fg, bg) -> adjusted fg` for High Contrast cell text. Cleared with
+    /// the renderer, so a theme change cannot serve a stale pair.
+    contrast_cache: std::collections::HashMap<((u8, u8, u8), (u8, u8, u8)), (u8, u8, u8)>,
     cache_hot: std::collections::HashMap<RunKey, ShapedRun>,
     cache_cold: std::collections::HashMap<RunKey, ShapedRun>,
     pub atlas: Atlas,
@@ -2683,6 +2688,7 @@ impl Renderer {
             high_contrast: a11y.high_contrast,
             grid_follows_hc,
             chrome,
+            contrast_cache: std::collections::HashMap::new(),
             cache_hot: std::collections::HashMap::new(),
             cache_cold: std::collections::HashMap::new(),
             atlas: Atlas::new(),
@@ -2916,6 +2922,17 @@ impl Renderer {
         self.metrics = saved.0;
         self.cell_w = saved.1;
         self.cell_h = saved.2;
+    }
+
+    /// High Contrast cell ink. The first pair pays for `ensure_contrast`;
+    /// every later cell with the same pair reads the map.
+    fn cached_cell_contrast(&mut self, fg: (u8, u8, u8), bg: (u8, u8, u8)) -> (u8, u8, u8) {
+        if let Some(hit) = self.contrast_cache.get(&(fg, bg)).copied() {
+            return hit;
+        }
+        let adjusted = crate::a11y::ensure_contrast(fg, bg, crate::a11y::MIN_CELL_CONTRAST);
+        self.contrast_cache.insert((fg, bg), adjusted);
+        adjusted
     }
 
     pub fn use_ui_metrics(&mut self, active: bool) {
@@ -4395,7 +4412,7 @@ impl Renderer {
                 }
             }
             if self.grid_follows_hc {
-                fg = crate::a11y::ensure_contrast(fg, bg, crate::a11y::MIN_CELL_CONTRAST);
+                fg = self.cached_cell_contrast(fg, bg);
             }
             if view
                 .search_match
@@ -7359,7 +7376,14 @@ impl Renderer {
             // its fill at the reported percent (full-width dim = indeterminate)
             if let Some(p) = tab.progress.filter(|_| tw >= 28) {
                 let (bx, bw, by, bh) = (tx + 6, tabw - 12, oy - 3, 3);
-                let c = progress_color(p);
+                let c = if p.state == crate::term::ProgressState::Paused {
+                    self.accent_color(crate::theme::bar_accent(
+                        crate::theme::BarAccent::Amber,
+                        page_dark,
+                    ))
+                } else {
+                    progress_color(p)
+                };
                 push_rect(out, whole, bx, by, bw, bh, c4(c, 70));
                 let fill = match p.state {
                     crate::term::ProgressState::Indeterminate => bw,
@@ -7378,9 +7402,13 @@ impl Renderer {
             self.draw_title_tip(out, whole, width, tx, &full);
         }
 
+        let elevated_color = self.accent_color(crate::theme::bar_accent(
+            crate::theme::BarAccent::Amber,
+            page_dark,
+        ));
         let elevated_w = elevated_label
             .map(|text| {
-                let segs = [Seg::plain(text, (0xf2, 0xcc, 0x60))];
+                let segs = [Seg::plain(text, elevated_color)];
                 self.measure(&segs, false).ceil() as i32 + 16
             })
             .unwrap_or(0);
@@ -7411,7 +7439,7 @@ impl Renderer {
             }
         }
         if let Some(text) = elevated_label {
-            let label = [Seg::plain(text, (0xf2, 0xcc, 0x60))];
+            let label = [Seg::plain(text, elevated_color)];
             let tw = self.measure(&label, false);
             let x = self.tab_controls(width)[0].0 - tw.ceil() as i32 - 12;
             if x >= end + 12 {
@@ -10434,6 +10462,166 @@ mod cache_tests {
                 && crate::a11y::contrast_ratio(c, sys.window) >= crate::a11y::MIN_CELL_CONTRAST
         });
         assert!(painted, "white-on-white cell text was left unreadable");
+    }
+
+    fn cached_text_colors(r: &Renderer, needle: &str) -> Vec<(u8, u8, u8)> {
+        let mut colors = Vec::new();
+        for (segs, _, _, _, _) in r.cache_hot.keys() {
+            for seg in segs {
+                if seg.text.contains(needle) {
+                    colors.push(seg.fg);
+                }
+            }
+        }
+        colors
+    }
+
+    #[test]
+    fn elevated_badge_keeps_contrast_on_light_dark_and_high_contrast() {
+        let label = "مسؤول";
+        let cases = [
+            (None, false, (255, 255, 255)),
+            (None, true, (0x0d, 0x11, 0x17)),
+            (Some((0, 0, 128)), false, (255, 255, 255)),
+        ];
+        for (hotlight, _dark_page, bg) in cases {
+            let mut cfg = crate::config::UserConfig::default();
+            cfg.bg = Some(format!("#{:02x}{:02x}{:02x}", bg.0, bg.1, bg.2));
+            let high_contrast = hotlight.is_some();
+            let mut colors = crate::a11y::A11ySnapshot::neutral().colors;
+            colors.window = (255, 255, 255);
+            colors.window_text = (0, 0, 0);
+            if let Some(hot) = hotlight {
+                colors.hotlight = hot;
+            }
+            let mut r = Renderer::with_a11y(
+                1.0,
+                &cfg,
+                0.0,
+                crate::a11y::A11ySnapshot {
+                    high_contrast,
+                    colors,
+                    text_scale: 1.0,
+                },
+            );
+            let page_dark = crate::theme::title_bar_dark_for(r.bg);
+            let expected = r.accent_color(crate::theme::bar_accent(
+                crate::theme::BarAccent::Amber,
+                page_dark,
+            ));
+            let mut out = Vec::new();
+            r.use_ui_metrics(true);
+            r.draw_chrome(
+                &mut out,
+                1600,
+                800,
+                &[TabInfo {
+                    title: "بيان".into(),
+                    busy: false,
+                    attention: false,
+                    active: true,
+                    progress: None,
+                }],
+                None,
+                false,
+                Some(label),
+            );
+            let found = cached_text_colors(&r, label);
+            assert!(
+                !found.is_empty(),
+                "the badge was neither measured nor drawn"
+            );
+            assert!(
+                found.iter().all(|c| *c == expected),
+                "measure and draw diverged: {found:?} expected {expected:?}"
+            );
+            if !page_dark || high_contrast {
+                assert_ne!(
+                    expected,
+                    (0xf2, 0xcc, 0x60),
+                    "light or HC kept the hard-coded amber"
+                );
+            }
+            let surface = if high_contrast {
+                colors.window
+            } else if page_dark {
+                chrome_bar_bg(r.bg)
+            } else {
+                (255, 255, 255)
+            };
+            assert!(
+                crate::a11y::contrast_ratio(expected, surface) >= 4.5,
+                "{expected:?} on {surface:?} is {}",
+                crate::a11y::contrast_ratio(expected, surface)
+            );
+            let _ = out;
+        }
+        // The dark page still uses the bright amber, which clears 4.5 on the dark bar.
+        let dark = crate::theme::bar_accent(crate::theme::BarAccent::Amber, true);
+        assert_eq!(dark, (0xf2, 0xcc, 0x60));
+    }
+
+    #[test]
+    fn contrast_cache_returns_the_same_adjusted_color() {
+        let mut r = Renderer::with_a11y(
+            1.0,
+            &crate::config::UserConfig::default(),
+            0.0,
+            crate::a11y::A11ySnapshot {
+                high_contrast: true,
+                colors: crate::a11y::A11ySnapshot::neutral().colors,
+                text_scale: 1.0,
+            },
+        );
+        let white = (255, 255, 255);
+        let first = r.cached_cell_contrast(white, white);
+        let second = r.cached_cell_contrast(white, white);
+        assert_eq!(first, second);
+        assert_eq!(r.contrast_cache.len(), 1);
+        let other = r.cached_cell_contrast((255, 0, 0), white);
+        assert_eq!(r.contrast_cache.len(), 2);
+        assert_eq!(r.cached_cell_contrast((255, 0, 0), white), other);
+        assert!(crate::a11y::contrast_ratio(first, white) >= crate::a11y::MIN_CELL_CONTRAST);
+    }
+
+    #[test]
+    fn paused_progress_bar_clears_three_to_one_on_white() {
+        let mut cfg = crate::config::UserConfig::default();
+        cfg.bg = Some("#ffffff".into());
+        let mut r = Renderer::with_a11y(1.0, &cfg, 0.0, crate::a11y::A11ySnapshot::neutral());
+        let expected = r.accent_color(crate::theme::bar_accent(
+            crate::theme::BarAccent::Amber,
+            false,
+        ));
+        assert!(
+            crate::a11y::contrast_ratio(expected, (255, 255, 255)) >= 3.0,
+            "paused progress {expected:?} is under 3:1 on white"
+        );
+        assert_ne!(expected, (0xf2, 0xcc, 0x60));
+        let mut out = Vec::new();
+        r.use_ui_metrics(true);
+        r.draw_chrome(
+            &mut out,
+            1200,
+            600,
+            &[TabInfo {
+                title: "عمل".into(),
+                busy: false,
+                attention: false,
+                active: true,
+                progress: Some(crate::term::Progress {
+                    state: crate::term::ProgressState::Paused,
+                    percent: 40,
+                }),
+            }],
+            None,
+            false,
+            None,
+        );
+        assert!(
+            quad_has(&out, expected),
+            "the paused progress bar was not drawn in the readable amber"
+        );
     }
 
     /// M20: cosmic-text 0.19 shapes through harfrust with default OpenType

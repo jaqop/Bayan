@@ -2523,8 +2523,8 @@ mod tests {
     #[test]
     fn elevated_startup_runs_no_lua_and_loads_no_plugins() {
         // Files are present and already approved. The injected flag is what
-        // `is_elevated` returns for a UAC token or Explorer's Run as
-        // administrator. `load_at` and `reload` pass that function through.
+        // `elevate::process_is_elevated` is true for a UAC token or
+        // Explorer's Run as administrator. `load_at` passes that through.
         let dir = scratch("elevated");
         let plugins = dir.join("plugins");
         fs::create_dir_all(&plugins).unwrap();

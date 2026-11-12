@@ -149,9 +149,10 @@ static SUMMON_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// them. The subclass (or the thread's call-wnd hook) sets this bit, and
 /// `about_to_wait` re-reads.
 static A11Y_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// One subclass id, and whether the call-wnd hook is already installed.
+/// One subclass id, and the call-wnd hook if the subclass export is missing.
 const A11Y_SUBCLASS_ID: usize = 0xB1A5;
-static A11Y_HOOKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static A11Y_HOOK: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 const QUAKE_ID: usize = 0xB1AA;
 
 /// The letter a Ctrl+<letter> event represents, resolved the way real
@@ -7823,15 +7824,28 @@ unsafe extern "system" fn a11y_subclass_proc(
     _id: usize,
     _data: usize,
 ) -> windows_sys::Win32::Foundation::LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_NCDESTROY;
     note_a11y_message(msg);
+    if msg == WM_NCDESTROY && !hwnd.is_null() {
+        if let Some(api) = comctl_fns() {
+            // SAFETY: this hwnd was subclassed with this procedure and id.
+            // Removing it on WM_NCDESTROY is the documented order, before
+            // the default subclass procedure runs.
+            unsafe { (api.remove)(hwnd, Some(a11y_subclass_proc), A11Y_SUBCLASS_ID) };
+        }
+        unhook_a11y();
+    }
     if hwnd.is_null() {
         return 0;
     }
-    // SAFETY: this window was subclassed with this procedure, so
-    // DefSubclassProc is the documented way to pass the message on. The
-    // pointers belong to this call. The body of this unsafe fn is the
-    // unsafe context.
-    windows_sys::Win32::UI::Shell::DefSubclassProc(hwnd, msg, wparam, lparam)
+    if let Some(api) = comctl_fns() {
+        // SAFETY: DefSubclassProc was loaded from the same System32
+        // comctl32 that installed this subclass. The pointers belong to
+        // this call.
+        unsafe { (api.def)(hwnd, msg, wparam, lparam) }
+    } else {
+        0
+    }
 }
 
 unsafe extern "system" fn a11y_call_hook(
@@ -7844,6 +7858,9 @@ unsafe extern "system" fn a11y_call_hook(
         // that lives for this call.
         let cwp = &*(lparam as *const windows_sys::Win32::UI::WindowsAndMessaging::CWPSTRUCT);
         note_a11y_message(cwp.message);
+        if cwp.message == windows_sys::Win32::UI::WindowsAndMessaging::WM_NCDESTROY {
+            unhook_a11y();
+        }
     }
     // SAFETY: a null hook handle asks CallNextHookEx to walk the chain
     // without naming ours. Documented.
@@ -7863,7 +7880,10 @@ fn install_a11y_watch(hwnd: windows_sys::Win32::Foundation::HWND) {
     if try_set_window_subclass(hwnd) {
         return;
     }
-    if A11Y_HOOKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    if !A11Y_HOOK
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .is_null()
+    {
         return;
     }
     // SAFETY: the hook procedure is 'static. A null module with the
@@ -7878,45 +7898,105 @@ fn install_a11y_watch(hwnd: windows_sys::Win32::Foundation::HWND) {
         )
     };
     if installed.is_null() {
-        A11Y_HOOKED.store(false, std::sync::atomic::Ordering::Relaxed);
         eprintln!("bayan: could not watch High Contrast changes");
+    } else {
+        A11Y_HOOK.store(installed, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-fn try_set_window_subclass(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
-    use windows_sys::Win32::Foundation::FARPROC;
-    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-    use windows_sys::Win32::UI::Shell::SUBCLASSPROC;
-    type SetSubclass = unsafe extern "system" fn(
-        windows_sys::Win32::Foundation::HWND,
-        SUBCLASSPROC,
-        usize,
-        usize,
-    ) -> i32;
+fn unhook_a11y() {
+    let hook = A11Y_HOOK.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
+    if hook.is_null() {
+        return;
+    }
+    // SAFETY: `hook` is the HHOOK returned by SetWindowsHookExW for this
+    // thread, or it was already taken. UnhookWindowsHookEx releases it.
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx(hook);
+    }
+}
+
+type SetSubclassFn = unsafe extern "system" fn(
+    windows_sys::Win32::Foundation::HWND,
+    windows_sys::Win32::UI::Shell::SUBCLASSPROC,
+    usize,
+    usize,
+) -> i32;
+type DefSubclassFn = unsafe extern "system" fn(
+    windows_sys::Win32::Foundation::HWND,
+    u32,
+    windows_sys::Win32::Foundation::WPARAM,
+    windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::LRESULT;
+type RemoveSubclassFn = unsafe extern "system" fn(
+    windows_sys::Win32::Foundation::HWND,
+    windows_sys::Win32::UI::Shell::SUBCLASSPROC,
+    usize,
+) -> i32;
+
+struct ComctlFns {
+    set: SetSubclassFn,
+    def: DefSubclassFn,
+    remove: RemoveSubclassFn,
+}
+
+fn comctl_fns() -> Option<&'static ComctlFns> {
+    use std::sync::OnceLock;
+    static FNS: OnceLock<Option<ComctlFns>> = OnceLock::new();
+    FNS.get_or_init(load_comctl).as_ref()
+}
+
+fn load_comctl() -> Option<ComctlFns> {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
     let wide: Vec<u16> = "comctl32.dll"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    // SAFETY: the path is a null-terminated UTF-16 string. LoadLibraryW
-    // returns a module handle we do not free: comctl32 stays loaded for
-    // the process, which is what the subclass pointer needs.
-    let lib = unsafe { LoadLibraryW(wide.as_ptr()) };
+    // SAFETY: the path is a null-terminated UTF-16 string. SEARCH_SYSTEM32
+    // refuses a comctl32 planted next to the executable. The module stays
+    // loaded: the subclass pointers need it for the process lifetime.
+    let lib = unsafe {
+        LoadLibraryExW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    };
     if lib.is_null() {
-        return false;
+        return None;
     }
-    let name = b"SetWindowSubclass\0";
-    // SAFETY: `name` is a null-terminated ANSI string. The returned
-    // pointer is either null or SetWindowSubclass in that module.
-    let sym: FARPROC = unsafe { GetProcAddress(lib, name.as_ptr()) };
-    let Some(sym) = sym else {
+    let proc_of = |name: &[u8]| {
+        // SAFETY: `name` is a null-terminated ANSI export. The pointer is
+        // null or that export in the System32 module.
+        unsafe { GetProcAddress(lib, name.as_ptr()) }
+    };
+    let set = proc_of(b"SetWindowSubclass\0")?;
+    let def = proc_of(b"DefSubclassProc\0")?;
+    let remove = proc_of(b"RemoveWindowSubclass\0")?;
+    // SAFETY: each name is the export of that exact ABI. A function
+    // pointer is the same size as every other function pointer.
+    Some(ComctlFns {
+        set: unsafe {
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, SetSubclassFn>(set)
+        },
+        def: unsafe {
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, DefSubclassFn>(def)
+        },
+        remove: unsafe {
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, RemoveSubclassFn>(remove)
+        },
+    })
+}
+
+fn try_set_window_subclass(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
+    let Some(api) = comctl_fns() else {
         return false;
     };
-    // SAFETY: the export name is SetWindowSubclass, whose ABI is SetSubclass.
-    let set =
-        unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, SetSubclass>(sym) };
-    // SAFETY: hwnd is this window's live handle, and the procedure is the
-    // subclass installed for it.
-    unsafe { set(hwnd, Some(a11y_subclass_proc), A11Y_SUBCLASS_ID, 0) != 0 }
+    // SAFETY: hwnd is this window's live handle. The procedure and id are
+    // the pair RemoveWindowSubclass uses on WM_NCDESTROY.
+    unsafe { (api.set)(hwnd, Some(a11y_subclass_proc), A11Y_SUBCLASS_ID, 0) != 0 }
 }
 
 fn run(startup: Startup) -> Result<(), String> {
@@ -8133,6 +8213,15 @@ mod tests {
             a11y_subclass_proc(std::ptr::null_mut(), 0x000F, 0, 0, 0, 0);
         }
         assert!(!A11Y_DIRTY.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn the_window_installs_the_accessibility_watch() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("install_a11y_watch(h)"),
+            "removing install_a11y_watch(h) leaves High Contrast stuck until restart"
+        );
     }
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
