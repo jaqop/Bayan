@@ -1564,12 +1564,11 @@ struct App {
 /// What a reload does to the session's config and its load error.
 /// A rejected file leaves the config alone and blocks the next save.
 /// A missing file keeps the config; after an error it arrives as the same
-/// config applied, which clears the error.
+/// config applied, which clears the error. The watcher's plan is not kept:
+/// the window recomputes it from the live config.
 struct AbsorbedReload {
     config: config::UserConfig,
     load_error: Option<String>,
-    plan: config_watch::ApplyPlan,
-    deferred: Vec<config_watch::DeferredSetting>,
 }
 
 fn absorb_reload(current: config::UserConfig, msg: config_watch::ReloadMsg) -> AbsorbedReload {
@@ -1577,18 +1576,10 @@ fn absorb_reload(current: config::UserConfig, msg: config_watch::ReloadMsg) -> A
         config_watch::ReloadMsg::Rejected { error } => AbsorbedReload {
             config: current,
             load_error: Some(error),
-            plan: config_watch::ApplyPlan::default(),
-            deferred: Vec::new(),
         },
-        config_watch::ReloadMsg::Applied {
-            config,
-            plan,
-            deferred,
-        } => AbsorbedReload {
+        config_watch::ReloadMsg::Applied { config, .. } => AbsorbedReload {
             config: *config,
             load_error: None,
-            plan,
-            deferred,
         },
     }
 }
@@ -1600,6 +1591,57 @@ fn save_bytes(load_error: &Option<String>, config: &config::UserConfig) -> Resul
         return Err(error.clone());
     }
     config::encode(config).map_err(|error| error.to_string())
+}
+
+/// How an external reload meets an open settings panel.
+///
+/// The file wins, including over edits the panel has applied on screen but
+/// not saved yet. The plan is `diff(live, file)`, not the plan the watcher
+/// computed against the previous file: a font the panel raised to 20 is
+/// rebuilt when the file still says 14, so the screen and the config cannot
+/// drift apart. Closing the panel then saves the file's values. When the
+/// panel is open and those values differ from what it was showing, the
+/// notice tells the user the file took over — the replacement is not silent.
+fn plan_against_live(
+    live: &config::UserConfig,
+    incoming: &config::UserConfig,
+) -> (config_watch::ApplyPlan, Vec<config_watch::DeferredSetting>) {
+    config_watch::diff(live, incoming)
+}
+
+/// Set when the panel is open and the file is not what the panel is showing.
+fn open_panel_file_notice(
+    panel_open: bool,
+    live: &config::UserConfig,
+    incoming: &config::UserConfig,
+) -> Option<String> {
+    if panel_open && live != incoming {
+        Some(
+            tr(
+                "تغيّر ملف الإعدادات واللوحة مفتوحة، فصارت قيم الملف هي المعتمدة.",
+                "The settings file changed while the panel was open, so the file's values are now in effect.",
+            )
+            .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+fn reload_notice(
+    replaced: Option<String>,
+    deferred: &[config_watch::DeferredSetting],
+) -> Option<ConfigNotice> {
+    let later = config_watch::deferred_notice(deferred);
+    let text = match (replaced, later) {
+        (Some(replaced), Some(later)) => format!("{replaced} {later}"),
+        (Some(text), None) | (None, Some(text)) => text,
+        (None, None) => return None,
+    };
+    Some(ConfigNotice {
+        text,
+        until: Some(Instant::now() + std::time::Duration::from_secs(8)),
+    })
 }
 
 impl App {
@@ -2544,6 +2586,10 @@ impl App {
     }
 
     /// Apply a config.json change that did not come from the settings panel.
+    ///
+    /// The file replaces the live config, unsaved panel edits included.
+    /// The plan is the difference from what is on screen, so a font the
+    /// panel already drew is rebuilt when the file still has the old size.
     /// A bad file leaves `self.config` as it was. Font and color changes
     /// rebuild the renderer; when that renderer arrives, `relayout_active`
     /// resizes every PTY to the new cell size. Padding alone resizes with
@@ -2559,29 +2605,28 @@ impl App {
             self.request_redraw();
             return;
         }
+        let (plan, deferred) = plan_against_live(&self.config, &absorbed.config);
+        let replaced =
+            open_panel_file_notice(self.settings.is_some(), &self.config, &absorbed.config);
         self.config_load_error = None;
-        let language = absorbed.plan.language && absorbed.config.lang() != self.config.lang();
+        let language = plan.language && absorbed.config.lang() != self.config.lang();
         self.config = absorbed.config;
         if language {
             lang::set(self.config.lang());
         }
-        if absorbed.plan.keybinds {
+        if plan.keybinds {
             self.keymap = keybinds::effective_map(&self.config);
         }
-        if absorbed.plan.opacity {
+        if plan.opacity {
             self.apply_opacity();
         }
-        let rebuild = absorbed.plan.font || absorbed.plan.colors;
+        let rebuild = plan.font || plan.colors;
         if rebuild {
             self.rebuild_renderer();
-        } else if absorbed.plan.padding || absorbed.plan.hide_bar {
+        } else if plan.padding || plan.hide_bar {
             self.relayout_active();
         }
-        self.config_notice =
-            config_watch::deferred_notice(&absorbed.deferred).map(|text| ConfigNotice {
-                text,
-                until: Some(Instant::now() + std::time::Duration::from_secs(8)),
-            });
+        self.config_notice = reload_notice(replaced, &deferred);
         self.request_redraw();
     }
 
@@ -5821,6 +5866,80 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn unsaved_panel_font_is_rebuilt_when_the_file_keeps_the_old_size() {
+        // The file on disk is 14pt. The open panel has already drawn 20pt
+        // and has not saved. An external edit keeps 14pt and sets padding.
+        // Diffing the new file against the old file does not mention the
+        // font, so using that plan would leave the screen at 20 while the
+        // config (and the next panel save) becomes 14.
+        let on_disk = config::UserConfig {
+            font_size: Some(14.0),
+            ..config::UserConfig::default()
+        };
+        let disk_bytes = config::encode(&on_disk).unwrap();
+        let from_editor = config::UserConfig {
+            font_size: Some(14.0),
+            padding: Some(12),
+            ..config::UserConfig::default()
+        };
+        let msg = config_watch::reload_from_bytes(
+            on_disk,
+            &disk_bytes,
+            &config::encode(&from_editor).unwrap(),
+        )
+        .expect("the external edit is a reload");
+        let config_watch::ReloadMsg::Applied {
+            plan: disk_plan,
+            config: file,
+            ..
+        } = &msg
+        else {
+            panic!("the external edit parsed");
+        };
+        assert!(
+            !disk_plan.font,
+            "the file's font did not change, so the watcher's plan ignores it"
+        );
+        let live = config::UserConfig {
+            font_size: Some(20.0),
+            ..config::UserConfig::default()
+        };
+        let (plan, deferred) = plan_against_live(&live, file);
+        assert!(
+            plan.font,
+            "the screen is at 20 and the file says 14, so the font must be rebuilt"
+        );
+        assert!(plan.padding);
+        assert!(!plan.colors);
+        assert!(deferred.is_empty());
+        let absorbed = absorb_reload(live.clone(), msg);
+        assert_eq!(absorbed.config.font_size, Some(14.0));
+        assert_eq!(absorbed.config.padding_px(), 12);
+        // Closing the panel saves the file, not the unsaved 20.
+        let saved = save_bytes(&absorbed.load_error, &absorbed.config).unwrap();
+        let round = config::parse_bytes(&saved).unwrap();
+        assert_eq!(round.font_size, Some(14.0));
+        assert_eq!(round.padding_px(), 12);
+        // The panel is open, so the takeover is announced. Closed, it is not.
+        lang::set(lang::Lang::En);
+        let notice = open_panel_file_notice(true, &live, &absorbed.config).unwrap();
+        assert!(notice.contains("file's values are now in effect"));
+        assert!(open_panel_file_notice(false, &live, &absorbed.config).is_none());
+        lang::set(lang::Lang::Ar);
+
+        // The file caught up to the panel's 20 and only padding changed:
+        // the font is already on screen, so it is not rebuilt again.
+        let caught_up = config::UserConfig {
+            font_size: Some(20.0),
+            padding: Some(12),
+            ..config::UserConfig::default()
+        };
+        let (plan, _) = plan_against_live(&live, &caught_up);
+        assert!(!plan.font);
+        assert!(plan.padding);
     }
 
     #[test]

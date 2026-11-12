@@ -187,7 +187,11 @@ pub fn directory_watch_lost(event: &notify::Event, dir: &Path) -> bool {
     event.kind.is_remove() && event.paths.iter().any(|path| path == dir)
 }
 
-fn diff(prev: &UserConfig, next: &UserConfig) -> (ApplyPlan, Vec<DeferredSetting>) {
+/// Difference between what is on screen (`prev`) and the config to apply
+/// (`next`). The watcher also uses this against the last file it handed
+/// the session; the window calls it again with the live config, because
+/// an open settings panel can have changed that without saving.
+pub fn diff(prev: &UserConfig, next: &UserConfig) -> (ApplyPlan, Vec<DeferredSetting>) {
     // Behavioral fields with no flag (copy on select, bell, osc52, the editor,
     // kitty's base-layout fallback, …) are live because the caller swaps the
     // whole config in and the next use reads them.
@@ -361,6 +365,9 @@ impl WatchState {
                 })
             }
             Ok(cfg) => {
+                // This plan is against the last file handed to the session.
+                // The window recomputes it against the live config, which
+                // may include unsaved panel edits.
                 let (plan, deferred) = diff(&self.last_good, &cfg);
                 let was_error = self.had_error;
                 self.had_error = false;
