@@ -388,6 +388,13 @@ pub struct SessionMeta {
     /// A that carries this nonce. Clink's OSC 7 has no 133 and is still
     /// accepted when the pane is already idle.
     pub prompt_nonce: String,
+    /// Bytes vte is holding for the open synchronized update, SCP already
+    /// removed. A forced flush replays this so paragraph marks see the
+    /// cursor those bytes produce, not the cursor from before BSU.
+    pub(crate) sync_mirror: Vec<u8>,
+    /// SCP that arrived while the update was open: offset into
+    /// [`Self::sync_mirror`], then the direction.
+    pub(crate) sync_bidi: Vec<(usize, crate::bidi_ctl::ParagraphDir)>,
 }
 
 impl SessionMeta {
@@ -1387,6 +1394,122 @@ fn note_screen_swap<T: EventListener>(before_alt: bool, t: &Term<T>, meta: &mut 
     }
 }
 
+/// `CSI ? 2026 l`, the exact sequence vte treats as the end of a sync.
+const ESU_SEQ: &[u8] = b"\x1b[?2026l";
+
+/// Swallow a synchronized update's buffered bytes. The grid is updated by
+/// [`replay_deferred_bidi`] instead, so `stop_sync` must not apply them twice.
+struct DiscardSync;
+
+impl alacritty_terminal::vte::ansi::Handler for DiscardSync {}
+
+fn slice_has_esu(mirror: &[u8], bytes: &[u8]) -> bool {
+    if bytes.windows(ESU_SEQ.len()).any(|w| w == ESU_SEQ) {
+        return true;
+    }
+    let keep = (ESU_SEQ.len() - 1).min(mirror.len());
+    if keep == 0 {
+        return false;
+    }
+    let mut edge = mirror[mirror.len() - keep..].to_vec();
+    let take = (ESU_SEQ.len() - 1).min(bytes.len());
+    edge.extend_from_slice(&bytes[..take]);
+    edge.windows(ESU_SEQ.len()).any(|w| w == ESU_SEQ)
+}
+
+/// Apply the held update in stream order, then drop vte's copy of it.
+///
+/// SCP was removed before those bytes reached vte, so a plain `stop_sync`
+/// paints the text and leaves the paragraph mark on the pre-BSU row.
+fn release_sync_for_bidi<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    meta: &mut SessionMeta,
+) {
+    replay_deferred_bidi(t, meta);
+    parser.stop_sync(&mut DiscardSync);
+}
+
+fn replay_deferred_bidi<T: EventListener>(t: &mut Term<T>, meta: &mut SessionMeta) {
+    let bytes = std::mem::take(&mut meta.sync_mirror);
+    let marks = std::mem::take(&mut meta.sync_bidi);
+    let mut scratch = Processor::new();
+    let mut at = 0;
+    for (offset, dir) in marks {
+        let offset = offset.min(bytes.len());
+        if offset > at {
+            apply_visible(&mut scratch, t, &bytes[at..offset]);
+            at = offset;
+        }
+        if bidi_controls_live(t, meta) {
+            let (abs, col) = crate::bidi_ctl::cursor_abs(t, meta.evicted);
+            meta.bidi_mut().note_scp(dir, abs, col);
+        }
+    }
+    if at < bytes.len() {
+        apply_visible(&mut scratch, t, &bytes[at..]);
+    }
+}
+
+/// Parse `bytes` onto the grid. An inner BSU must not swallow the tail:
+/// this is the flush, and the tail is part of the frame being released.
+fn apply_visible<T: EventListener>(parser: &mut Processor, t: &mut Term<T>, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    parser.advance(t, bytes);
+    if parser.sync_bytes_count() > 0 || parser.sync_timeout().sync_timeout().is_some() {
+        parser.stop_sync(t);
+    }
+}
+
+fn advance_for_sync<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    meta: &mut SessionMeta,
+    bytes: &[u8],
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    // ESU is about to close the update. Replay first so an SCP that sits
+    // in the held bytes stamps the row the cursor is on at that point,
+    // then let this slice — including the ESU — draw normally.
+    if parser.sync_timeout().sync_timeout().is_some()
+        && !meta.sync_bidi.is_empty()
+        && slice_has_esu(&meta.sync_mirror, bytes)
+    {
+        release_sync_for_bidi(parser, t, meta);
+    }
+    let was_open = parser.sync_timeout().sync_timeout().is_some();
+    // Captured before `advance` replaces the mirror. An ESU split across
+    // the boundary is still this update's end.
+    let ends_update = was_open && slice_has_esu(&meta.sync_mirror, bytes);
+    let before = parser.sync_bytes_count();
+    parser.advance(t, bytes);
+    if parser.sync_timeout().sync_timeout().is_none() {
+        meta.sync_mirror.clear();
+        meta.sync_bidi.clear();
+        return;
+    }
+    let after = parser.sync_bytes_count();
+    if ends_update {
+        // ESU and a new BSU in this chunk. vte applied the old frame and
+        // kept only the new buffer, which is the last `after` bytes of
+        // this chunk — the bytes after the final BSU. `after == before`
+        // used to leave the old frame in the mirror, so the next SCP
+        // replayed it and dropped the start of the new frame.
+        let start = bytes.len().saturating_sub(after);
+        meta.sync_mirror.clear();
+        meta.sync_mirror.extend_from_slice(&bytes[start..]);
+        meta.sync_bidi.clear();
+    } else if after > before {
+        let added = after - before;
+        let start = bytes.len().saturating_sub(added);
+        meta.sync_mirror.extend_from_slice(&bytes[start..]);
+    }
+}
+
 fn feed_plain<T: EventListener>(
     parser: &mut Processor,
     t: &mut Term<T>,
@@ -1397,7 +1520,7 @@ fn feed_plain<T: EventListener>(
         return;
     }
     let before_alt = t.mode().contains(TermMode::ALT_SCREEN);
-    parser.advance(t, bytes);
+    advance_for_sync(parser, t, meta, bytes);
     note_screen_swap(before_alt, t, meta);
     // Same `ESC c` that [`process_chunk`] records in `saw_ris`. The parser
     // has just cleared both keyboard stacks. The counter has to follow, or
@@ -1450,16 +1573,16 @@ fn contains_ris(bytes: &[u8]) -> bool {
 fn repair_keyboard_stack<T: EventListener>(
     parser: &mut Processor,
     t: &mut Term<T>,
-    depth: &mut u16,
+    meta: &mut SessionMeta,
 ) {
     let flags = crate::keys::protocol_bits(*t.mode());
-    parser.advance(t, b"\x1b[<u");
-    *depth = depth.saturating_sub(1);
+    advance_for_sync(parser, t, meta, b"\x1b[<u");
+    meta.kitty_depth = meta.kitty_depth.saturating_sub(1);
     let revealed = crate::keys::protocol_bits(*t.mode());
-    if (flags != 0 || revealed != 0) && *depth < KITTY_STACK_CAP {
+    if (flags != 0 || revealed != 0) && meta.kitty_depth < KITTY_STACK_CAP {
         let repair = format!("\x1b[>{flags}u");
-        parser.advance(t, repair.as_bytes());
-        *depth = depth.saturating_add(1);
+        advance_for_sync(parser, t, meta, repair.as_bytes());
+        meta.kitty_depth = meta.kitty_depth.saturating_add(1);
     }
 }
 
@@ -1484,7 +1607,7 @@ pub(crate) fn reset_keyboard_modes<T: EventListener>(
         return;
     }
     let pop = format!("\x1b[<{}u", meta.kitty_depth);
-    parser.advance(t, pop.as_bytes());
+    advance_for_sync(parser, t, meta, pop.as_bytes());
     meta.kitty_depth = 0;
 }
 
@@ -1509,20 +1632,20 @@ fn apply_kitty_seq<T: EventListener>(
             if meta.kitty_depth >= KITTY_STACK_CAP {
                 return;
             }
-            parser.advance(t, seq);
+            advance_for_sync(parser, t, meta, seq);
             meta.kitty_depth = meta.kitty_depth.saturating_add(1);
         }
         KittySeqKind::Pop(n) => {
-            parser.advance(t, seq);
+            advance_for_sync(parser, t, meta, seq);
             meta.kitty_depth = meta.kitty_depth.saturating_sub(n);
         }
         KittySeqKind::Set => {
-            parser.advance(t, seq);
-            repair_keyboard_stack(parser, t, &mut meta.kitty_depth);
+            advance_for_sync(parser, t, meta, seq);
+            repair_keyboard_stack(parser, t, meta);
         }
         KittySeqKind::Query => {
-            repair_keyboard_stack(parser, t, &mut meta.kitty_depth);
-            parser.advance(t, seq);
+            repair_keyboard_stack(parser, t, meta);
+            advance_for_sync(parser, t, meta, seq);
         }
     }
 }
@@ -1710,8 +1833,15 @@ pub(crate) fn process_chunk<T: EventListener>(
             }
             crate::bidi_ctl::StreamItem::Scp(dir) => {
                 if bidi_controls_live(t, meta) {
-                    let (abs, col) = crate::bidi_ctl::cursor_abs(t, meta.evicted);
-                    meta.bidi_mut().note_scp(dir, abs, col);
+                    // The cursor motion in front of this SCP is still in
+                    // vte's sync buffer. Stamp it when that buffer is
+                    // applied, at the offset it occupies in the mirror.
+                    if parser.sync_timeout().sync_timeout().is_some() {
+                        meta.sync_bidi.push((meta.sync_mirror.len(), dir));
+                    } else {
+                        let (abs, col) = crate::bidi_ctl::cursor_abs(t, meta.evicted);
+                        meta.bidi_mut().note_scp(dir, abs, col);
+                    }
                 }
             }
             crate::bidi_ctl::StreamItem::Ris => {
@@ -2040,13 +2170,21 @@ pub(crate) fn first_report(pending: &AtomicBool) -> bool {
 fn expire_sync_update<T: EventListener>(
     parser: &mut Processor,
     t: &mut Term<T>,
+    meta: &mut SessionMeta,
     now: Instant,
 ) -> Option<Instant> {
     let deadline = parser.sync_timeout().sync_timeout()?;
     if deadline > now {
         return Some(deadline);
     }
-    parser.stop_sync(t);
+    if meta.sync_bidi.is_empty() {
+        parser.stop_sync(t);
+        meta.sync_mirror.clear();
+    } else {
+        // stop_sync would paint the text and leave SCP on the pre-BSU
+        // row. Replay so the mark and any saved cursor land together.
+        release_sync_for_bidi(parser, t, meta);
+    }
     None
 }
 
@@ -2057,6 +2195,7 @@ fn expire_sync_update<T: EventListener>(
 /// reader drops its sender.
 fn spawn_sync_watchdog<T: EventListener + Send + 'static>(
     term: Arc<FairMutex<Term<T>>>,
+    meta: Arc<Mutex<SessionMeta>>,
     parser: Arc<Mutex<Processor>>,
     batch: Arc<Mutex<EventBatch>>,
     on_flush: impl Fn(ChunkOutput) + Send + 'static,
@@ -2073,12 +2212,13 @@ fn spawn_sync_watchdog<T: EventListener + Send + 'static>(
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
-                // term, then parser: the reader's order, without meta
+                // term, then meta, then parser: the reader's order.
                 let (pending, out) = {
                     let mut t = term.lock();
+                    let mut m = meta.lock_or_recover();
                     let mut p = parser.lock_or_recover();
                     batch.lock_or_recover().begin();
-                    let pending = expire_sync_update(&mut p, &mut t, Instant::now());
+                    let pending = expire_sync_update(&mut p, &mut t, &mut m, Instant::now());
                     (pending, batch.lock_or_recover().finish(false, Vec::new()))
                 };
                 match pending {
@@ -2307,6 +2447,7 @@ impl Session {
         let sync_proxy = proxy.clone();
         let (sync_tx, _) = spawn_sync_watchdog(
             Arc::clone(&term),
+            Arc::clone(&meta),
             Arc::clone(&parser),
             Arc::clone(&batch),
             move |out| {
@@ -3492,22 +3633,28 @@ mod tests {
 
     #[test]
     fn a_sync_update_without_its_end_is_held_until_the_deadline() {
-        let (mut t, mut p, ..) = test_term();
+        let (mut t, mut p, mut meta, _) = test_term();
         p.advance(&mut t, BSU);
         p.advance(&mut t, b"held");
         let deadline = p.sync_timeout().sync_timeout().expect("BSU set a deadline");
         let early = deadline - std::time::Duration::from_millis(1);
-        assert_eq!(expire_sync_update(&mut p, &mut t, early), Some(deadline));
+        assert_eq!(
+            expire_sync_update(&mut p, &mut t, &mut meta, early),
+            Some(deadline)
+        );
         assert_eq!(first_row(&t), "", "nothing is drawn before the deadline");
     }
 
     #[test]
     fn a_sync_update_without_its_end_is_flushed_after_the_deadline() {
-        let (mut t, mut p, ..) = test_term();
+        let (mut t, mut p, mut meta, _) = test_term();
         p.advance(&mut t, BSU);
         p.advance(&mut t, b"frozen");
         let deadline = p.sync_timeout().sync_timeout().unwrap();
-        assert_eq!(expire_sync_update(&mut p, &mut t, deadline), None);
+        assert_eq!(
+            expire_sync_update(&mut p, &mut t, &mut meta, deadline),
+            None
+        );
         assert_eq!(first_row(&t), "frozen");
         // the parser is out of the update: later bytes draw at once
         p.advance(&mut t, b"!");
@@ -3524,13 +3671,19 @@ mod tests {
     }
 
     fn watched() -> Watched {
-        let (t, p, ..) = test_term();
+        let (t, p, meta, _) = test_term();
         let (t, p) = (Arc::new(FairMutex::new(t)), Arc::new(Mutex::new(p)));
+        let meta = Arc::new(Mutex::new(meta));
         let (flushed_tx, flushed) = mpsc::channel();
-        let (tx, handle) =
-            spawn_sync_watchdog(Arc::clone(&t), Arc::clone(&p), Arc::default(), move |out| {
+        let (tx, handle) = spawn_sync_watchdog(
+            Arc::clone(&t),
+            Arc::clone(&meta),
+            Arc::clone(&p),
+            Arc::default(),
+            move |out| {
                 let _ = flushed_tx.send(out);
-            });
+            },
+        );
         Watched {
             t,
             p,
@@ -3602,6 +3755,319 @@ mod tests {
         let Watched { tx, handle, .. } = watched();
         drop(tx);
         handle.join().expect("the watchdog exits cleanly");
+    }
+
+    fn screen_has(t: &Term<VoidListener>, needle: &str) -> bool {
+        let mut text = String::new();
+        for line in 0..t.screen_lines() {
+            let row = &t.grid()[alacritty_terminal::index::Line(line as i32)];
+            for col in 0..t.columns() {
+                text.push(row[Column(col)].c);
+            }
+        }
+        text.contains(needle)
+    }
+
+    fn grid_chars(t: &Term<VoidListener>) -> String {
+        let mut text = String::new();
+        for line in 0..t.screen_lines() {
+            let row = &t.grid()[alacritty_terminal::index::Line(line as i32)];
+            for col in 0..t.columns() {
+                let cell = &row[Column(col)];
+                let fg = &cell.fg;
+                let ch = cell.c;
+                text.push_str(&format!("{fg:?}:{ch}"));
+            }
+            text.push('\n');
+        }
+        let cur = t.grid().cursor.point;
+        let line = cur.line.0;
+        let col = cur.column.0;
+        text.push_str(&format!("@{line}:{col}"));
+        text
+    }
+
+    /// Ctrl+F: literal search from the bottom of the grid upward.
+    fn search_has(t: &mut Term<VoidListener>, query: &str) -> bool {
+        use alacritty_terminal::index::{Direction, Line, Point, Side};
+        use alacritty_terminal::term::search::RegexSearch;
+        let Ok(mut rs) = RegexSearch::new(&regex_escape(query)) else {
+            return false;
+        };
+        let origin = Point::new(
+            Line(t.screen_lines() as i32 - 1),
+            Column(t.columns().saturating_sub(1)),
+        );
+        t.search_next(&mut rs, origin, Direction::Left, Side::Right, None)
+            .is_some()
+    }
+
+    #[test]
+    fn echoed_output_stays_held_until_esu_or_the_sync_timeout() {
+        // The reader path, not a bare `advance`: keystroke echo that
+        // arrives inside an open update stays off the grid until ESU.
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?2026h");
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"typed");
+        assert!(!screen_has(&t, "typed"));
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?2026l");
+        assert!(screen_has(&t, "typed"));
+        assert!(p.sync_timeout().sync_timeout().is_none());
+
+        // Same echo, ESU never arrives: the deadline flush shows it,
+        // and no further byte is fed before that flush.
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?2026hecho");
+        assert!(!screen_has(&t, "echo"));
+        let deadline = p.sync_timeout().sync_timeout().expect("open update");
+        assert_eq!(
+            expire_sync_update(
+                &mut p,
+                &mut t,
+                &mut meta,
+                deadline - std::time::Duration::from_millis(1),
+            ),
+            Some(deadline)
+        );
+        assert!(!screen_has(&t, "echo"));
+        assert_eq!(
+            expire_sync_update(&mut p, &mut t, &mut meta, deadline),
+            None
+        );
+        assert!(screen_has(&t, "echo"));
+    }
+
+    #[test]
+    fn forced_flush_recomputes_scp_and_saved_cursor_on_the_right_row() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.running_cmd = "app".into();
+        // A save outside the update. Applying DECSC too early would leave
+        // this point in place; applying SCP against this cursor (row 4,
+        // column 4) would stamp row 5 instead of the held motion's row.
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[5;5H\x1b7");
+        assert_eq!(t.grid().saved_cursor.point.line.0, 4);
+        assert_eq!(t.grid().saved_cursor.point.column.0, 4);
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[?2026h\x1b[1;1H\x1b7\r\n\x1b[2 kMARK\x1b8",
+        );
+        assert_eq!(t.grid().saved_cursor.point.line.0, 4);
+        assert_eq!(
+            meta.bidi.direction_at(1),
+            crate::bidi_ctl::ParagraphDir::Default
+        );
+        assert!(!screen_has(&t, "MARK"));
+        let deadline = p.sync_timeout().sync_timeout().expect("open update");
+        assert_eq!(
+            expire_sync_update(&mut p, &mut t, &mut meta, deadline),
+            None
+        );
+        assert_eq!(
+            meta.bidi.direction_at(0),
+            crate::bidi_ctl::ParagraphDir::Default
+        );
+        assert_eq!(
+            meta.bidi.direction_at(1),
+            crate::bidi_ctl::ParagraphDir::Rtl
+        );
+        let mark = &t.grid()[alacritty_terminal::index::Line(1)];
+        assert_eq!(mark[Column(0)].c, 'M');
+        assert_eq!(t.grid().cursor.point.line.0, 0);
+        assert_eq!(t.grid().cursor.point.column.0, 0);
+        assert_eq!(t.grid().saved_cursor.point.line.0, 0);
+        assert_eq!(t.grid().saved_cursor.point.column.0, 0);
+    }
+
+    #[test]
+    fn a_finished_sync_pair_matches_the_bytes_without_the_bracket() {
+        let paired = b"A\x1b[31m\x1b[?2026h\x1b[32mB\x1b[0mC\x1b[?2026lD";
+        let plain = b"A\x1b[31m\x1b[32mB\x1b[0mCD";
+        let (mut with, mut pw, mut mw, mut cw) = test_term();
+        let (mut without, mut po, mut mo, mut co) = test_term();
+        process_chunk(&mut pw, &mut with, &mut mw, &mut cw, paired);
+        process_chunk(&mut po, &mut without, &mut mo, &mut co, plain);
+        assert!(pw.sync_timeout().sync_timeout().is_none());
+        assert!(mw.sync_bidi.is_empty());
+        assert_eq!(grid_chars(&with), grid_chars(&without));
+    }
+
+    #[test]
+    fn scrollback_and_search_work_while_a_sync_is_open() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        for i in 0..12 {
+            let line = format!("row{i} needle\r\n");
+            process_chunk(&mut p, &mut t, &mut meta, &mut carry, line.as_bytes());
+        }
+        assert!(t.grid().history_size() > 0);
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?2026hHIDDEN");
+        assert!(p.sync_timeout().sync_timeout().is_some());
+        assert!(!screen_has(&t, "HIDDEN"));
+        assert!(search_has(&mut t, "needle"), "Ctrl+F still sees the grid");
+        assert!(!search_has(&mut t, "HIDDEN"));
+        let before = t.grid().display_offset();
+        t.scroll_display(Scroll::Delta(2));
+        assert!(t.grid().display_offset() > before);
+        assert!(search_has(&mut t, "needle"));
+        t.scroll_display(Scroll::Bottom);
+        assert_eq!(t.grid().display_offset(), 0);
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?2026l");
+        assert!(screen_has(&t, "HIDDEN"));
+        assert!(search_has(&mut t, "HIDDEN"));
+    }
+
+    fn screen_flat(t: &Term<VoidListener>) -> String {
+        let mut text = String::new();
+        for line in 0..t.screen_lines() {
+            let row = &t.grid()[alacritty_terminal::index::Line(line as i32)];
+            for col in 0..t.columns() {
+                text.push(row[Column(col)].c);
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn esu_then_bsu_in_one_chunk_does_not_replay_the_old_frame() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.running_cmd = "app".into();
+        // Ten bytes, so a new ten-byte buffer does not change the count.
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[?2026hAAAAAAAAAA",
+        );
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[?2026l\x1b[?2026hBBBBBBBBBB",
+        );
+        assert!(
+            screen_flat(&t).contains("AAAAAAAAAA"),
+            "closing the first frame paints it"
+        );
+        assert!(
+            !screen_flat(&t).contains("BBBBBBBBBB"),
+            "the new frame stays held"
+        );
+        assert!(
+            !meta.sync_mirror.windows(10).any(|w| w == b"AAAAAAAAAA"),
+            "the mirror dropped the old frame"
+        );
+        assert!(
+            meta.sync_mirror.windows(10).any(|w| w == b"BBBBBBBBBB"),
+            "the mirror kept the new frame"
+        );
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[2 k");
+        let deadline = p.sync_timeout().sync_timeout().expect("second frame");
+        assert_eq!(
+            expire_sync_update(&mut p, &mut t, &mut meta, deadline),
+            None
+        );
+        let flat = screen_flat(&t);
+        assert_eq!(
+            flat.matches("AAAAAAAAAA").count(),
+            1,
+            "the old frame was not replayed"
+        );
+        assert_eq!(
+            flat.matches("BBBBBBBBBB").count(),
+            1,
+            "the new frame is intact"
+        );
+        assert!(flat.contains("AAAAAAAAAABBBBBBBBBB"));
+        assert_eq!(
+            meta.bidi.direction_at(1),
+            crate::bidi_ctl::ParagraphDir::Rtl
+        );
+    }
+
+    #[test]
+    fn esu_while_scp_is_deferred_does_not_draw_the_frame_twice() {
+        // No CUP: a second draw continues after the first and the row
+        // becomes ABAB. Home would paint the copy on top of the original.
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.running_cmd = "app".into();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?2026hAB");
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[2 k");
+        assert_eq!(meta.sync_bidi.len(), 1, "the mark waits for the flush");
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?2026l");
+        let row = &t.grid()[alacritty_terminal::index::Line(0)];
+        let text: String = (0..8).map(|c| row[Column(c)].c).collect();
+        assert_eq!(text, "AB      ");
+        assert_eq!(
+            meta.bidi.direction_at(0),
+            crate::bidi_ctl::ParagraphDir::Default
+        );
+        assert_eq!(
+            meta.bidi.direction_at(1),
+            crate::bidi_ctl::ParagraphDir::Rtl
+        );
+    }
+
+    #[test]
+    fn forced_flush_keeps_an_arabic_line_with_its_scp_mark() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.running_cmd = "app".into();
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            "\x1b[?2026h\r\n\x1b[2 kمرحبا".as_bytes(),
+        );
+        let deadline = p.sync_timeout().sync_timeout().expect("open update");
+        assert_eq!(
+            expire_sync_update(&mut p, &mut t, &mut meta, deadline),
+            None
+        );
+        let row = &t.grid()[alacritty_terminal::index::Line(1)];
+        let text: String = (0..5).map(|c| row[Column(c)].c).collect();
+        assert_eq!(text, "مرحبا");
+        assert_eq!(
+            meta.bidi.direction_at(1),
+            crate::bidi_ctl::ParagraphDir::Rtl
+        );
+        assert_eq!(
+            meta.bidi.direction_at(0),
+            crate::bidi_ctl::ParagraphDir::Default
+        );
+    }
+
+    #[test]
+    fn forced_flush_after_resize_stamps_scp_on_the_new_grid() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.running_cmd = "app".into();
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[?2026hHELLO\r\n",
+        );
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[2 k");
+        // Same order as Session::resize: reflow, then drop stamps that
+        // named the old rows. The flush recomputes the mark.
+        t.resize(TermSize { cols: 20, rows: 10 });
+        meta.bidi_mut().on_resize();
+        let deadline = p.sync_timeout().sync_timeout().expect("open update");
+        assert_eq!(
+            expire_sync_update(&mut p, &mut t, &mut meta, deadline),
+            None
+        );
+        let flat = screen_flat(&t);
+        assert_eq!(flat.matches("HELLO").count(), 1);
+        assert_eq!(
+            meta.bidi.direction_at(1),
+            crate::bidi_ctl::ParagraphDir::Rtl
+        );
     }
 
     #[test]
