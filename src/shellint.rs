@@ -556,8 +556,8 @@ __bayan_prompt_command() {
   # starship / oh-my-posh would paint a green mark on a failed command.
   local __bayan_ec=${?} __bayan_pipe=("${PIPESTATUS[@]}")
   # Elevated Git Bash is started with HOME on the integration directory,
-  # so /etc/profile and git-prompt.sh cannot see the user's files. The
-  # real values come back here, after every startup file has run.
+  # so a system profile cannot see the user's files. The real values
+  # come back here, after every startup file has run.
   if [ -n "${BAYAN_REAL_HOME+x}" ]; then
     case "$BAYAN_REAL_HOME" in
       [A-Za-z]:*)
