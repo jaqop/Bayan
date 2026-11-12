@@ -2533,32 +2533,12 @@ mod tests {
         )
         .unwrap();
         let planned = plan(bash_git(), true, true, NONCE).unwrap();
-        let stage = safe.join("stage");
         for (rel, body) in &planned.files {
             let path = safe.join(rel);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).unwrap();
             }
-            // Bookends so a hang says whether the rcfile started.
-            let mut marked = String::from(
-                "printf 'start si=%s\\n' \"${__BAYAN_SI-}\" >> \"$BAYAN_STAGE\"\nunset __BAYAN_SI\nprintf 'nonce2\\n' >> \"$BAYAN_STAGE\"\n",
-            );
-            let body = body
-                .replace(
-                    "unset BAYAN_PROMPT_NONCE\n",
-                    "unset BAYAN_PROMPT_NONCE\nprintf 'nonce\\n' >> \"$BAYAN_STAGE\"\n",
-                )
-                .replace(
-                    "export MSYSTEM PATH\n",
-                    "export MSYSTEM PATH\nprintf 'path\\n' >> \"$BAYAN_STAGE\"\n",
-                )
-                .replace(
-                    "__bayan_bin=\"${__bayan_bash%/*}\"",
-                    "printf 'bin\\n' >> \"$BAYAN_STAGE\"\n__bayan_bin=\"${__bayan_bash%/*}\"",
-                );
-            marked.push_str(&body);
-            marked.push_str("\nprintf 'end\\n' >> \"$BAYAN_STAGE\"\n");
-            std::fs::write(path, marked).unwrap();
+            std::fs::write(path, body).unwrap();
         }
         let home_str = home.display().to_string();
         let mut env = planned.env.clone();
@@ -2576,10 +2556,6 @@ mod tests {
         }
         child
             .env("BAYAN_PROMPT_NONCE", "n0nce")
-            .env(
-                "BAYAN_STAGE",
-                stage.display().to_string().replace('\\', "/"),
-            )
             .env_remove("BASH_ENV")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -2611,8 +2587,7 @@ mod tests {
                 let _ = child.wait();
                 let output = reader.join().unwrap_or_default();
                 let text = String::from_utf8_lossy(&output);
-                let stage_text = std::fs::read_to_string(&stage).unwrap_or_default();
-                panic!("bash did not exit\nstage={stage_text}\n{text}");
+                panic!("bash did not exit\n{text}");
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
