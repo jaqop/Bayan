@@ -38,6 +38,7 @@ selection and BiDi paths must do.
 | `elevate.rs` | `--elevated` → `ShellExecuteW` verb `runas` only; argv is `--elevated` and optional `-p <name>` |
 | `jumplist.rs` | taskbar Jump List (`ICustomDestinationList`) and the explicit AppUserModelID |
 | `handoff.rs` | per-user `ITerminalHandoff` COM class, default off; not the Windows default terminal |
+| `shellint.rs` | OSC 133 injection for Git Bash, WSL bash/zsh, and cmd (PowerShell's wrapper stays in `term.rs`) |
 | `posh.rs` | oh-my-posh theme picker with a live ANSI preview |
 | `plugins.rs` | declarative JSON plugin host (`~/.bayan/plugins/`) |
 | `lua_host.rs` | sandboxed `config.lua` and allowlisted executable plugins |
@@ -200,6 +201,31 @@ RevealOnly, so `HTTPS://` still opens in the browser. `pwsh.exe` is only
 elevated. No environment block, registry value,
 pipe, or file carries the request. The jump list's admin task is
 `--elevated` with no profile.
+
+**Shell integration is opt-out and shell-specific.** PowerShell's prompt
+wrapper stays in `term.rs`. Git Bash, MSYS bash, WSL bash and WSL zsh
+are built in `shellint.rs` and produce the same nonce-checked OSC 133 A/B/D
+bytes. cmd wraps the user's `PROMPT` in A and B with **no nonce**: every
+child of cmd inherits `PROMPT`, so a nonce there could be read and used to
+forge trusted marks. Its marks are untrusted, like any forged mark. Never
+give cmd the nonce in any form. `git-bash.exe`, `bash -c`, and
+`bash script.sh` are not injected. An unknown program is never injected.
+`$?` is restored before the user's `PROMPT_COMMAND`. A login shell sources
+`/etc/profile` and one user profile, not `~/.bashrc` as well. `"shell_integration": false` skips all of them. The nonce is
+`BAYAN_PROMPT_NONCE` and is unset before a child inherits it. Do not write
+the user's rc files. An elevated token must not source `~/.bashrc`,
+`~/.bash_profile`, `~/.inputrc`, or the zsh home files: set `INPUTRC` and
+`HISTFILE` to `/dev/null`. Elevated Git Bash is `--noprofile` and must
+not source `/etc/profile` (its `git-prompt.sh` runs user files); set
+`PATH` and `MSYSTEM` from the bash install. Elevated WSL bash still reads the
+distro profile with `HOME` pointed at the rcfile directory. A failed
+elevation query is treated as elevated. `shellint` takes the `elevated` flag `Session::spawn` is given, which is
+`elevate::process_is_elevated`, the one token query in the tree.
+The script directory comes from `SHGetKnownFolderPath(FOLDERID_ProgramData)`
+when elevated, never from the `PROGRAMDATA` environment variable. It is a
+random name with a DACL that is not world-writable, and zsh's `ZDOTDIR` is
+restored to the user's value before the first prompt. Only a directory
+whose name we minted is deleted.
 
 **Start-directory precedence, in order:** a restored session's saved cwd, then
 the launcher's directory (a shortcut's "Start in"), then `USERPROFILE`. The

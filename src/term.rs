@@ -101,9 +101,11 @@ fn is_under(path: &str, root: &str) -> bool {
     p == r || p.starts_with(&format!("{r}\\"))
 }
 
-/// The PowerShell family gets the full treatment (UTF-8, prompt theme,
-/// OSC 133 marks); other shells launch bare and the mark-driven features
-/// (command lights, prompt jumps, Claude auto-detect) degrade gracefully.
+/// The PowerShell family gets UTF-8, the prompt theme and OSC 133 marks.
+/// Git Bash and WSL bash/zsh get the same marks from `shellint`; cmd gets
+/// A and B with no exit code and no nonce, so they are untrusted. Anything
+/// else launches bare, and the
+/// mark-driven features degrade gracefully.
 fn is_powershell(shell: &str) -> bool {
     // `shell` is a COMMAND LINE now, not a program name: detection emits
     // "powershell.exe -NoProfile", "wsl.exe -d Ubuntu", "…bash.exe --login -i".
@@ -195,8 +197,9 @@ const PS_END: &str = "$([char]7)\"}}}; __by_wrap";
 /// A report from a running command is stored only after an A that carries
 /// the same nonce, so a spoofed `133;D` cannot authorize the OSC 7 that
 /// follows it. Hex is safe inside the double-quoted prompt string. An empty
-/// nonce keeps the old "any A/D" rule for tests. cmd/clink has no 133 marks;
-/// its OSC 7 is still accepted while the pane is already idle.
+/// nonce keeps the old "any A/D" rule for tests. cmd's `PROMPT` emits A and
+/// B only, without the nonce, so a clink OSC 7 is still accepted while the
+/// pane is already idle and never on the strength of those marks.
 pub(crate) fn shell_integration_ps(nonce: &str) -> String {
     // `nonce` is spliced in as text: the live session passes NONCE_PS_EXPR,
     // tests pass a literal
@@ -252,9 +255,16 @@ pub(crate) const NONCE_OFF: &str = ";integration-off";
 /// output mint "trusted" prompt marks, which is worse than having none.
 fn fresh_prompt_nonce() -> String {
     let mut bytes = [0u8; 16];
-    // SAFETY: the length passed is `bytes`'s own, so the write stays in bounds.
-    let ok = unsafe { SystemFunction036(bytes.as_mut_ptr().cast(), bytes.len() as u32) != 0 };
-    nonce_hex(ok.then_some(bytes))
+    nonce_hex(fill_random(&mut bytes).then_some(bytes))
+}
+
+/// Fill `buf` from `RtlGenRandom`. False when the OS RNG refuses.
+pub(crate) fn fill_random(buf: &mut [u8]) -> bool {
+    if buf.is_empty() {
+        return false;
+    }
+    // SAFETY: the length passed is `buf`'s own, so the write stays in bounds.
+    unsafe { SystemFunction036(buf.as_mut_ptr().cast(), buf.len() as u32) != 0 }
 }
 
 fn nonce_hex(bytes: Option<[u8; 16]>) -> String {
@@ -2836,6 +2846,8 @@ pub struct Session {
     /// Command line this pane was spawned with. Drag-drop quoting follows it,
     /// not whatever the settings say now — the live shell is the one reading.
     shell: String,
+    /// Bash/WSL integration scripts, removed when the pane closes.
+    integration_dir: Option<std::path::PathBuf>,
     /// The reader thread's VTE parser. Shell exit resets keyboard modes
     /// through this one, so a sequence the child already started is the
     /// machine that sees the pop. A fresh `Processor` would leave this one
@@ -2865,13 +2877,17 @@ impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.child.kill();
         clear_text_area_grid(self.id);
+        if let Some(dir) = self.integration_dir.take() {
+            crate::shellint::remove_integration_dir(&dir);
+        }
     }
 }
 
 impl Session {
     // `raw_argv` is the one extra fact a `-- command` needs, and the shared
-    // image budget is the last argument: folding it into a config struct
-    // would hide that every pane charges the same counter.
+    // image budget is its own argument: folding it into a config struct
+    // would hide that every pane charges the same counter. Each of the
+    // others is a property of this pane.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         size: TermSize,
@@ -2890,8 +2906,11 @@ impl Session {
         elevated: bool,
         // Every pane charges this one counter.
         images: Arc<crate::images::ImageBudget>,
+        // `"shell_integration": false` launches the shell without prompt marks.
+        shell_integration: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let prompt_nonce = fresh_prompt_nonce();
+        crate::shellint::sweep_stale_integration_dirs();
         let pty = native_pty_system();
         let pair = pty.openpty(PtySize {
             rows: size.rows as u16,
@@ -2948,9 +2967,14 @@ impl Session {
         if let Some(d) = dir {
             cmd.cwd(d);
         }
-        // A raw command is the program the user named. The PowerShell and
-        // cmd wrappers belong to a shell Bayan itself launched.
-        if raw_argv.is_none() && is_powershell(shell) {
+        // A raw command is the program the user named. The PowerShell,
+        // bash, zsh and cmd wrappers belong to a shell Bayan itself launched.
+        // Opt-out and a failed nonce both leave that shell unmarked.
+        let wrap = raw_argv.is_none();
+        let integrate = crate::shellint::injection_allowed(shell_integration, &prompt_nonce);
+        let mut applied = false;
+        let mut integration_scripts = crate::shellint::IntegrationDir(None);
+        if wrap && is_powershell(shell) {
             // -NoProfile: the profile is seconds of avoidable startup (it
             // re-runs oh-my-posh, chcp, modules). Self-provide what it gave
             // us: UTF-8 (Arabic!) and the user's prompt theme, auto-detected.
@@ -2958,16 +2982,47 @@ impl Session {
             // R-08: the nonce rides in the environment, is taken before
             // anything else runs, and is then removed, so it is in neither
             // the command line nor any child's environment.
-            if prompt_nonce != NONCE_OFF {
+            if integrate {
                 cmd.env(NONCE_ENV, &prompt_nonce);
             }
             // Elevated: do not read POSH_THEME or $PROFILE, and do not name
-            // oh-my-posh. The setup string is `powershell_setup`.
+            // oh-my-posh. The setup string is `powershell_setup`. NEW-05:
+            // with no random nonce, or `"shell_integration": false`, the
+            // wrapper is left out, so the pane runs without prompt marks
+            // instead of trusting marks anyone could forge.
             let theme = if elevated { None } else { detect_posh_theme() };
-            let setup = powershell_setup(elevated, theme.as_deref(), prompt_nonce != NONCE_OFF);
+            let setup = powershell_setup(elevated, theme.as_deref(), integrate);
             cmd.arg(setup);
-        } else if raw_argv.is_none() && shell_family(shell) == ShellFamily::Cmd {
-            // UTF-8 code page so Arabic paths survive; no OSC 133 marks
+        } else if wrap {
+            if let Some(plan) =
+                crate::shellint::plan(shell, shell_integration, elevated, &prompt_nonce)
+            {
+                match crate::shellint::materialize(&plan) {
+                    Ok(done) => {
+                        let argv = cmd.get_argv_mut();
+                        let prog = argv.first().cloned();
+                        argv.clear();
+                        if let Some(prog) = prog {
+                            argv.push(prog);
+                        }
+                        for arg in done.args {
+                            argv.push(arg.into());
+                        }
+                        for (key, value) in done.env {
+                            cmd.env(key, value);
+                        }
+                        integration_scripts = crate::shellint::IntegrationDir(done.dir);
+                        applied = true;
+                    }
+                    Err(err) => {
+                        eprintln!("bayan: shell integration skipped: {err}");
+                    }
+                }
+            }
+        }
+        if wrap && !applied && shell_family(shell) == ShellFamily::Cmd {
+            // UTF-8 code page so Arabic paths survive. Marks, when they
+            // were applied above, already include this chcp.
             cmd.args(["/K", "chcp 65001>nul"]);
         }
         let mut reader = pair.master.try_clone_reader()?;
@@ -3160,6 +3215,7 @@ impl Session {
             master: pair.master,
             child,
             shell: shell.to_string(),
+            integration_dir: integration_scripts.disarm(),
             parser,
         })
     }
@@ -3205,6 +3261,7 @@ impl Session {
             child: Box::new(IdleChild),
             shell: String::new(),
             parser: Arc::new(Mutex::new(Processor::new())),
+            integration_dir: None,
         };
         (session, HeadlessWrite(written))
     }
@@ -6269,6 +6326,99 @@ mod tests {
         let ps = shell_integration_ps("n0nce");
         assert!(ps.contains("]133;B;n0nce$([char]7)"), "{ps}");
         assert_eq!(ps.matches("n0nce").count(), 3, "D, A and B each carry it");
+    }
+
+    struct MarkState {
+        exits: Vec<Option<i32>>,
+        at_prompt: bool,
+        screen: String,
+    }
+
+    fn mark_state(bytes: &[u8]) -> MarkState {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.prompt_nonce = "n0nce".into();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, bytes);
+        let mut screen = String::new();
+        for line in 0..t.screen_lines() {
+            let row = &t.grid()[alacritty_terminal::index::Line(line as i32)];
+            for col in 0..t.columns() {
+                screen.push(row[Column(col)].c);
+            }
+            screen.push('\n');
+        }
+        MarkState {
+            exits: meta.marks.iter().map(|m| m.exit).collect(),
+            at_prompt: meta.at_prompt,
+            screen,
+        }
+    }
+
+    /// Bash and zsh print the same D/A/B frame as PowerShell, plus a C when
+    /// the command starts. C is not a prompt boundary, so the blocks and
+    /// the exit code match. The OSC bytes are not cells, including when the
+    /// prompt is Arabic.
+    #[test]
+    fn bash_and_zsh_marks_match_powershell_and_stay_off_the_screen() {
+        let nonce = "n0nce";
+        let prompt = "بيان $ ";
+        let ps = format!(
+            "\x1b]133;D;0;{nonce}\x07\x1b]133;A;{nonce}\x07{prompt}\x1b]133;B;{nonce}\x07out\r\n\x1b]133;D;4;{nonce}\x07\x1b]133;A;{nonce}\x07{prompt}\x1b]133;B;{nonce}\x07"
+        );
+        let mut bash = crate::shellint::trusted_prompt_frame(0, nonce, prompt);
+        bash.extend(crate::shellint::command_started_mark(nonce));
+        bash.extend(b"out\r\n");
+        bash.extend(crate::shellint::trusted_prompt_frame(4, nonce, prompt));
+        let ps_state = mark_state(ps.as_bytes());
+        let bash_state = mark_state(&bash);
+        assert_eq!(bash_state.exits, ps_state.exits);
+        assert_eq!(bash_state.at_prompt, ps_state.at_prompt);
+        assert_eq!(ps_state.exits, vec![Some(4), None]);
+        assert!(ps_state.at_prompt);
+        for screen in [&ps_state.screen, &bash_state.screen] {
+            assert!(screen.contains("بيان"), "{screen:?}");
+            assert!(!screen.contains("133"), "{screen:?}");
+            assert!(!screen.contains('\u{1b}'), "{screen:?}");
+        }
+    }
+
+    /// cmd emits A and B with ST, no D and no nonce, so they are exactly as
+    /// untrusted as bytes any program in the pane could print: A resets the
+    /// BiDi mode the last command left on, and nothing else. No block, no
+    /// "at a prompt", the running command stays, and an OSC 7 after them
+    /// is not accepted.
+    #[test]
+    fn cmd_marks_are_untrusted() {
+        let mut bytes = crate::shellint::cmd_prompt_frame("> ");
+        bytes.extend(b"dir\r\n");
+        bytes.extend(crate::shellint::cmd_prompt_frame("> "));
+        let state = mark_state(&bytes);
+        assert!(!state.at_prompt);
+        assert!(state.exits.is_empty(), "{:?}", state.exits);
+        assert!(state.screen.contains('>'));
+        assert!(!state.screen.contains("133"), "{:?}", state.screen);
+        assert!(!state.screen.contains('\u{1b}'));
+
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.prompt_nonce = "n0nce".into();
+        meta.running_cmd = "evil".into();
+        meta.bidi_mut().mode = crate::bidi_ctl::BidiMode::Explicit;
+        let mut forged = crate::shellint::cmd_prompt_frame("> ");
+        forged.extend(osc7_of("file:///C:/evil"));
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &forged);
+        assert!(ev.cwd.is_none());
+        assert_eq!(meta.running_cmd, "evil");
+        assert!(!meta.at_prompt);
+        assert_eq!(meta.bidi.mode, crate::bidi_ctl::BidiMode::Implicit);
+    }
+
+    #[test]
+    fn spawn_checks_shell_integration_before_injecting_the_powershell_wrapper() {
+        let src = include_str!("term.rs");
+        let spawn = src.split("pub fn spawn(").nth(1).expect("spawn");
+        let body = spawn.split("pub fn shell(").next().unwrap_or(spawn);
+        let gate = body.find("injection_allowed").expect("gate");
+        let wrapper = body.find("shell_integration_ps").expect("wrapper");
+        assert!(gate < wrapper);
     }
 
     fn osc7_of(url: &str) -> Vec<u8> {

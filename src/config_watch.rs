@@ -316,6 +316,12 @@ pub fn merge_reload(base: &UserConfig, live: &UserConfig, file: &UserConfig) -> 
             &file.lua_plugins_dir,
             &mut overrode,
         ),
+        shell_integration: merge_field(
+            &base.shell_integration,
+            &live.shell_integration,
+            &file.shell_integration,
+            &mut overrode,
+        ),
         keyboard: merge_field(
             &base.keyboard,
             &live.keyboard,

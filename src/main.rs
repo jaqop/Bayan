@@ -46,6 +46,7 @@ mod render;
 mod screen_reader;
 mod scroll;
 mod scrollbar;
+mod shellint;
 mod shells;
 mod term;
 mod theme;
@@ -3437,6 +3438,7 @@ impl App {
             raw,
             self.elevated,
             Arc::clone(&self.image_budget),
+            self.config.shell_integration_on(),
         ) {
             Ok(session) => Some(Pane {
                 id,

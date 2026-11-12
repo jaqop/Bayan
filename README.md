@@ -931,6 +931,33 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       for a magnifier's caret highlight are not provided, and a reader
       cannot move the selection: the document does not advertise
       SetTextSelection because nothing handles it.
+- [x] **Shell integration for bash, WSL and cmd** — the PowerShell OSC 133
+      wrapper is no longer the only one. Git Bash and MSYS bash get a temp
+      `--rcfile`, WSL bash the same file after the distro's login shell is
+      read from passwd, WSL zsh a `ZDOTDIR`, and cmd its own `PROMPT`
+      wrapped in `$E` marks. The bash and zsh sequences are the ones
+      PowerShell already emits (`D` with the exit code, `A`, `B`, all
+      carrying the session nonce), so prompt jump, command blocks, "at
+      prompt" drops and the exit-code gutter see the same marks. Bash and
+      zsh also emit `C` at command start; the parser ignores it as a
+      boundary. cmd cannot: `A` and `B` only, and no nonce, because every
+      program cmd starts inherits `PROMPT` and could read it back. Its marks
+      are untrusted: they reset a leftover BiDi mode and do nothing else, so
+      cmd keeps the features it had without them. Unknown shells are not
+      injected. `"shell_integration": false` turns it off, including for
+      PowerShell. User rc files are never rewritten. An elevated token does
+      not source them (and does not init oh-my-posh from the profile); the
+      scripts sit in `%ProgramData%` with a random name, a protected
+      administrator DACL and a high integrity label, and are deleted with
+      the pane. A normal pane's files are in the user temp directory, current
+      user only, not world-writable. Proven by the `shellint` plan tests
+      (bash rcfile, login vs not, elevated, WSL bash/zsh/other, cmd, opt-out,
+      unknown shell, WSLENV, the SDDL, the delete guard) and by feeding the
+      emitted bytes through the same OSC 133 parser as PowerShell, including
+      an Arabic prompt that must not show the sequence. Not run here: a live
+      Git Bash, a WSL distro, or an elevated token — this tree was checked
+      with `cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings`
+      and `cargo fmt --check`.
 
 ## Settings
 
@@ -944,7 +971,7 @@ key falls back to a sane default:
   "theme": "system", "font_family": "Cascadia Code NF", "font_size": 15.0,
   "cursor_style": "bar", "cursor_blink": true, "scrollback": 20000,
   "copy_on_select": true, "ligatures": true, "bell": "attention",
-  "shell": "pwsh.exe", "padding": 8, "opacity": 0.9,
+  "shell": "pwsh.exe", "shell_integration": true, "padding": 8, "opacity": 0.9,
   "hide_single_tab": true, "confirm_close": true, "osc52": "off",
   "follow_system_text_size": true, "terminal_follow_high_contrast": true,
   "editor": "code -g {file}:{line}:{col}", "tab_switch": "recent",
@@ -987,6 +1014,55 @@ those sequences (an ssh host, a `cat`'d file, an install script). When on,
 the toast's title is always «بيان · tab» and the program's text is cleaned
 and capped. Bayan's own toasts (a long command finished, the bell) follow
 `notifications` and need no opt-in.
+
+`"shell_integration"` defaults to **on** (leave the key out and it stays
+on). `false` starts new panes with no OSC 133 injection. It applies to
+PowerShell, Git Bash and MSYS `bash.exe` (not `git-bash.exe`, which is a
+GUI launcher), WSL bash and zsh, and cmd. `bash -c` and `bash script.sh`
+are not injected. An unknown program — fish, nushell, dash, `sh`, a
+Windows `zsh.exe` — is never injected, even when the key is on. Bash is
+started with a temporary `--rcfile` (`--login` is dropped, because bash
+would ignore the rcfile). A login shell then reads `/etc/profile` and the
+first of `~/.bash_profile`, `~/.bash_login`, `~/.profile`, and does not
+also read `~/.bashrc` — that is bash's own rule, and Ubuntu's profile
+already sources it. A non-login shell reads `~/.bashrc` only. The user's
+`PROMPT_COMMAND` is kept; `$?` is restored immediately before it runs, so
+starship and oh-my-posh still see a failed command. `PS0` emits `C` as a
+raw OSC (not `\[ \]`, which bash would print as SOH/STX). Nothing is
+written into the user's home. WSL reads the distro's login shell from
+passwd (`getent`, or `/etc/passwd` when getent is absent). Bash gets that
+rcfile. zsh gets a `ZDOTDIR` only while its startup files load, then the
+user's `ZDOTDIR` is restored (or unset, if it was unset) so history and
+tmux keep the user's directory. fish, dash, or any other default shell is
+exec'd with no rcfile. Windows paths become Linux paths through `WSLENV`
+(`/up`) and, if the value still looks like `C:\…`, `wslpath -u`. OSC 7
+percent-encodes the path as UTF-8 bytes, including spaces and Arabic, and
+`cygpath`/`wslpath` run once per directory, a directory that does not
+convert included. cmd's `PROMPT` keeps the user's own text and adds `$E`
+marks for `A` and `B` only. cmd has no hook that runs when a command
+starts, and no way to report `ERRORLEVEL` as that command's exit, so the
+gutter stays unknown and a `D` mark is not invented. The nonce travels in
+`BAYAN_PROMPT_NONCE` and is removed before a child inherits it. cmd never
+receives it: it would have to live in `PROMPT`, which every child
+inherits, so cmd's marks carry no nonce and are not trusted. An
+elevated token (Run as administrator) does not source user rc files, sets
+`INPUTRC` and `HISTFILE` to `/dev/null` so `~/.inputrc` cannot run a
+macro. Elevated Git Bash is started with `--noprofile` and does not read
+`/etc/profile`: that file runs `git-prompt.sh`, which executes
+`~/.config/git/git-prompt.sh` and `~/bash_completion.d/*.bash` as
+administrator. `PATH` and `MSYSTEM` are set from the Git install instead. Elevated WSL bash still reads the
+distro's `/etc/profile`, with `HOME` pointed at the rcfile directory for
+that read and restored afterwards. Elevated zsh ends `.zlogin` with
+`unsetopt rcs`, so exit does not read `~/.zlogout`. oh-my-posh is not inited from the user
+profile. A failed elevation query is treated as elevated. Elevated scripts
+are created under the real ProgramData folder
+(`SHGetKnownFolderPath(FOLDERID_ProgramData)`, not the `PROGRAMDATA`
+environment variable) with a random name, a protected DACL for SYSTEM and
+Administrators, and a high integrity label. A normal pane uses the user
+temp directory with a DACL for the current user only. The directory is
+removed when the pane closes, and a later launch deletes `bayan-si-*`
+directories older than 12 hours that this user owns. A name that is not
+one of those random directories is not deleted.
 
 `scrollbar.position` is `right` (the default, in Arabic and in English),
 `left`, or `hidden`. `scrollbar.width` is the thickness in logical pixels,
@@ -1256,8 +1332,12 @@ pending, and the pane is not on the alt screen. Enter at the prompt sets
 only a nonce-verified OSC 133 A or D clears it. While it is set, OSC 7
 needs the nonce the same way it does while a command is running.
 PowerShell's wrapper sends OSC 133 D and A with a per-session nonce, and
-only that A arms the report, so a spoofed `133;D` from `cat` cannot. An
-idle OSC 7 (cmd/clink, which has no 133) is still stored. A new tab calls
+only that A arms the report, so a spoofed `133;D` from `cat` cannot. Bash
+and zsh emit the same D/A/B bytes (and a C from `PS0` / `preexec`, which
+the parser does not treat as a prompt boundary), plus OSC 9;9 and OSC 7
+when the directory converts to a Windows path. cmd emits A and B with ST
+(`ESC \`), no exit code and no nonce, so they arm nothing. An idle OSC 7
+with no trusted 133 (clink in cmd) is still stored. A new tab calls
 `GetDriveTypeW` on the drive root and rejects a remote drive, and it
 rejects a reparse point without following it, before `is_dir`.
 
