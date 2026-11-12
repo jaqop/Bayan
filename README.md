@@ -961,8 +961,12 @@ receives it: it would have to live in `PROMPT`, which every child
 inherits, so cmd's marks carry no nonce and are not trusted. An
 elevated token (Run as administrator) does not source user rc files, sets
 `INPUTRC` and `HISTFILE` to `/dev/null` so `~/.inputrc` cannot run a
-macro, still reads `/etc/profile` (Git's copy is not user-writable; without
-it `/usr/bin` is missing), and does not init oh-my-posh from the user
+macro. It still reads `/etc/profile` so `PATH` and `MSYSTEM` exist, but
+`HOME` for that read is the rcfile's directory: Git's `git-prompt.sh`
+would otherwise run `~/.config/git/git-prompt.sh` and
+`~/bash_completion.d/*.bash` as administrator. `HOME` is restored
+afterwards. Elevated zsh ends `.zlogin` with `unsetopt rcs`, so exit does
+not read `~/.zlogout`. oh-my-posh is not inited from the user
 profile. A failed elevation query is treated as elevated. Elevated scripts
 are created under the real ProgramData folder
 (`SHGetKnownFolderPath(FOLDERID_ProgramData)`, not the `PROGRAMDATA`

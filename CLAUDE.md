@@ -40,9 +40,9 @@ selection and BiDi paths must do.
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-524 tests in `src` (`cargo test --all-targets` does not run the vendored
-`portable-pty` crate). `term.rs` (85), `link.rs` (61) and `render.rs` (65)
-carry the most; `shellint.rs` has 21 and `localpath.rs` has 21. Three more in
+531 tests in `src` (`cargo test --all-targets` does not run the vendored
+`portable-pty` crate). `term.rs` (88), `link.rs` (61) and `render.rs` (65)
+carry the most; `shellint.rs` has 25 and `localpath.rs` has 21. Three more in
 `term.rs` are `#[ignore]`d probes, run by hand (see Measuring).
 
 ## Measuring

@@ -105,9 +105,10 @@ fn bash_plan(args: &[String], elevated: bool, mut env: Vec<(String, String)>) ->
         return None;
     }
     // A real login shell reads /etc/profile and one user profile, and does
-    // not itself read ~/.bashrc. An elevated login still reads /etc/profile:
-    // that file ships with Git and is not user-writable, and without it
-    // `/usr/bin` is missing. It does not read the user's profile or bashrc.
+    // not itself read ~/.bashrc. An elevated login still reads /etc/profile
+    // so PATH and MSYSTEM exist, but with HOME pointed at this rcfile's
+    // directory: Git's git-prompt.sh would otherwise run
+    // ~/.config/git/git-prompt.sh and ~/bash_completion.d/*.bash as admin.
     let login = is_login(args) && !has_flag(args, "--noprofile");
     let user = !elevated && !has_flag(args, "--norc");
     if elevated {
@@ -145,7 +146,8 @@ fn wsl_plan(args: &[String], elevated: bool, mut env: Vec<(String, String)>) -> 
     launch.push(wsl_launcher());
     // WSL's own interactive start is a login shell. The rcfile imitates
     // that, because `-e` would otherwise skip `/etc/profile`. Elevated
-    // still reads `/etc/profile` (not user-writable) and not `~/.bashrc`.
+    // reads `/etc/profile` with HOME pointed at the rcfile directory, so a
+    // profile snippet cannot run a file from the user's home.
     let source_user = !elevated;
     if elevated {
         push_safe_readline(&mut env);
@@ -333,13 +335,16 @@ fn cmd_setup() -> String {
 /// `~/.bash_profile`, `~/.bash_login`, `~/.profile`. It does not also source
 /// `~/.bashrc`: a login shell never does, and Ubuntu's profile already does,
 /// so a second source ran ssh-agent and PATH setup twice. Non-login sources
-/// `~/.bashrc` only, and only when `user` is set.
+/// `~/.bashrc` only, and only when `user` is set. When `user` is false the
+/// profile still runs, but `HOME` is the rcfile directory for that read.
 fn bash_rc(login: bool, user: bool) -> String {
     let mut s = String::from(BASH_PRELUDE);
     if login {
-        s.push_str(BASH_SYSTEM_PROFILE);
         if user {
+            s.push_str(BASH_SYSTEM_PROFILE);
             s.push_str(BASH_USER_PROFILE);
+        } else {
+            s.push_str(BASH_SYSTEM_PROFILE_SAFE_HOME);
         }
     } else if user {
         s.push_str(BASH_BASHRC);
@@ -365,12 +370,29 @@ fi
 
 const BASH_SYSTEM_PROFILE: &str = r#"
 # --login cannot be combined with --rcfile (bash ignores the rcfile).
-# /etc/profile is the system file a login shell reads. It is not
-# user-writable, including the copy Git for Windows ships, so an elevated
-# pane still reads it — without it, /usr/bin is not on PATH.
+# /etc/profile is what a login shell reads first. The user's own profile
+# comes next and may source ~/.bashrc; this file does not.
 if [ -r /etc/profile ]; then
   . /etc/profile
 fi
+"#;
+
+const BASH_SYSTEM_PROFILE_SAFE_HOME: &str = r#"
+# --login cannot be combined with --rcfile (bash ignores the rcfile).
+# /etc/profile itself is not user-writable, but Git for Windows' copy runs
+# /etc/profile.d/git-prompt.sh, which sources ~/.config/git/git-prompt.sh
+# and ~/bash_completion.d/*.bash. Those are. HOME is this rcfile's directory
+# for that read (the protected integration directory when elevated), then
+# restored. PATH and MSYSTEM from the profile stay.
+__bayan_real_home=$HOME
+HOME=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+export HOME
+if [ -r /etc/profile ]; then
+  . /etc/profile
+fi
+HOME=$__bayan_real_home
+export HOME
+unset __bayan_real_home
 "#;
 
 const BASH_USER_PROFILE: &str = r#"
@@ -530,6 +552,12 @@ fn zsh_login(source_user: bool) -> String {
     // A user .zlogin may have replaced precmd_functions. Put the marks back,
     // then leave ZDOTDIR as the user left it so history and tmux are theirs.
     s.push_str("__bayan_ensure_hooks\n__bayan_finish_zdotdir\n");
+    if !source_user {
+        // After ZDOTDIR is restored, a login zsh reads ~/.zlogout on exit.
+        // That file is user-writable. unsetopt rcs stops the exit read.
+        // The marks are already installed.
+        s.push_str("unsetopt rcs\n");
+    }
     s
 }
 
@@ -550,6 +578,11 @@ __bayan_source_user() {
   if [[ -f "$_dir/$_file" ]]; then
     ZDOTDIR=$_dir
     source "$ZDOTDIR/$_file"
+    # An XDG .zshenv sets ZDOTDIR to ~/.config/zsh. That value is the one
+    # to keep. Leaving BAYAN_ZDOTDIR_UNSET set would drop it on the floor.
+    if [[ $ZDOTDIR != $_dir ]]; then
+      unset BAYAN_ZDOTDIR_UNSET
+    fi
     BAYAN_USER_ZDOTDIR=$ZDOTDIR
     export BAYAN_USER_ZDOTDIR
   fi
@@ -1673,11 +1706,18 @@ mod tests {
     fn an_elevated_bash_does_not_source_user_rc_files() {
         let plan = plan(bash_git(), true, true, NONCE).unwrap();
         let rc = file(&plan, "bash.sh");
-        assert!(!rc.contains("$HOME"), "{rc}");
         assert!(
-            rc.contains("/etc/profile"),
-            "elevated Git Bash still needs the system profile"
+            !rc.contains("$HOME/"),
+            "elevated rc must not name a file under the user's home: {rc}"
         );
+        assert!(
+            rc.contains("__bayan_real_home=$HOME"),
+            "profile runs with HOME pointed at the rcfile directory"
+        );
+        let moved = rc.find("__bayan_real_home=$HOME").unwrap();
+        let sourced = rc.find(". /etc/profile").unwrap();
+        let restored = rc.find("HOME=$__bayan_real_home").unwrap();
+        assert!(moved < sourced && sourced < restored, "{rc}");
         assert!(!rc.contains(".bashrc"), "{rc}");
         assert!(rc.contains(r"printf '\033]133;D;%s;%s\007'"));
         assert_eq!(
@@ -2176,5 +2216,137 @@ mod tests {
             "Arabic directory must be percent-encoded in OSC 7:\n{text}"
         );
         assert!(!text.contains('\u{1}'), "PS0 leaked SOH:\n{text}");
+    }
+
+    #[test]
+    fn elevated_profile_points_home_at_the_rcfile_before_reading_it() {
+        let rc = bash_rc(true, false);
+        let moved = rc
+            .find("__bayan_real_home=$HOME")
+            .expect("save HOME before the profile");
+        let sourced = rc.find(". /etc/profile").expect("profile still runs");
+        let restored = rc.find("HOME=$__bayan_real_home").expect("HOME comes back");
+        assert!(moved < sourced && sourced < restored, "{rc}");
+        assert!(!rc.contains("$HOME/.config"), "{rc}");
+        assert!(!rc.contains("bash_completion.d"), "{rc}");
+    }
+
+    #[test]
+    fn elevated_zsh_login_stops_reading_rc_files_before_exit() {
+        let elevated = plan(r"C:\Windows\System32\wsl.exe -d Ubuntu", true, true, NONCE).unwrap();
+        let zlogin = file(&elevated, "zsh/.zlogin");
+        assert!(
+            zlogin.trim_end().ends_with("unsetopt rcs"),
+            "exit would read ~/.zlogout: {zlogin}"
+        );
+        let ordinary = plan(r"C:\Windows\System32\wsl.exe -d Ubuntu", true, false, NONCE).unwrap();
+        assert!(
+            !file(&ordinary, "zsh/.zlogin").contains("unsetopt rcs"),
+            "a normal login zsh still runs the user's .zlogout"
+        );
+    }
+
+    #[test]
+    fn a_user_zdotdir_change_clears_the_unset_flag() {
+        let plan = plan(r"C:\Windows\System32\wsl.exe -d Ubuntu", true, false, NONCE).unwrap();
+        let env = file(&plan, "zsh/.zshenv");
+        let start = env.find("__bayan_source_user()").unwrap();
+        let end = env.find("__bayan_finish_zdotdir()").unwrap();
+        let body = &env[start..end];
+        let sourced = body.find("source \"$ZDOTDIR/$_file\"").unwrap();
+        let cleared = body.find("unset BAYAN_ZDOTDIR_UNSET").unwrap();
+        assert!(sourced < cleared, "{body}");
+    }
+
+    /// Elevated Git Bash still runs /etc/profile (PATH, MSYSTEM) but HOME
+    /// during that read is the rcfile directory, so git-prompt.sh cannot
+    /// execute ~/.config/git/git-prompt.sh. Skip when bash is absent; CI has it.
+    #[test]
+    fn real_git_bash_elevated_profile_does_not_run_user_git_prompt() {
+        let Some(bash) = find_real_bash() else {
+            if std::env::var_os("GITHUB_ACTIONS").is_some() {
+                panic!("Git Bash is required on the Windows CI runner");
+            }
+            return;
+        };
+        let hex = random_hex().expect("random");
+        let home = std::env::temp_dir().join(format!("bayan-elev-home-{hex}"));
+        let safe = std::env::temp_dir().join(format!("bayan-elev-rc-{hex}"));
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&safe);
+        std::fs::create_dir_all(home.join(".config/git")).unwrap();
+        std::fs::create_dir_all(home.join("bash_completion.d")).unwrap();
+        std::fs::create_dir_all(&safe).unwrap();
+        let marker = home.join("PWNED");
+        let marker_bash = marker.display().to_string().replace('\\', "/");
+        std::fs::write(
+            home.join(".config/git/git-prompt.sh"),
+            format!("echo gitprompt > '{marker_bash}'\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("bash_completion.d/pwn.bash"),
+            format!("echo completion > '{marker_bash}'\n"),
+        )
+        .unwrap();
+        let rc_path = safe.join("bash.sh");
+        std::fs::write(&rc_path, bash_rc(true, false)).unwrap();
+        let mut child = std::process::Command::new(&bash)
+            .arg("--rcfile")
+            .arg(&rc_path)
+            .arg("-i")
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("BAYAN_PROMPT_NONCE", "n0nce")
+            .env("INPUTRC", "/dev/null")
+            .env("HISTFILE", "/dev/null")
+            .env_remove("BASH_ENV")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn bash");
+        let mut stdout = child.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
+            buf
+        });
+        let mut stdin = child.stdin.take().unwrap();
+        use std::io::Write;
+        writeln!(stdin, "printf 'MSYSTEM=%s\\n' \"$MSYSTEM\"").unwrap();
+        writeln!(stdin, "printf 'AFTER=%s\\n' \"$HOME\"").unwrap();
+        writeln!(stdin, "exit").unwrap();
+        drop(stdin);
+        let start = std::time::Instant::now();
+        loop {
+            if child.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(20) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("bash did not exit");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let output = reader.join().expect("stdout");
+        let text = String::from_utf8_lossy(&output);
+        let pwned = std::fs::read_to_string(&marker).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&safe);
+        assert!(
+            pwned.is_empty(),
+            "user git-prompt ran as the elevated shell: {pwned}\n{text}"
+        );
+        assert!(
+            text.contains("MSYSTEM=MINGW") || text.contains("MSYSTEM=MSYS"),
+            "profile did not set MSYSTEM:\n{text}"
+        );
+        assert!(text.contains("AFTER="), "{text}");
+        assert!(
+            !text.contains("bayan-elev-rc-"),
+            "HOME was left on the rcfile directory:\n{text}"
+        );
     }
 }
