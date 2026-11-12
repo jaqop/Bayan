@@ -160,19 +160,30 @@ pub(crate) struct BundleProbe {
     pub version: Option<(u16, u16, u16, u16)>,
 }
 
-/// Inbox unless both files are present and the DLL version is 1.22 or
-/// newer. An unversioned image, a DLL alone, and a pre-rewrite pair are
-/// not loaded: passthrough would be a guess, and DA1 would advertise
-/// Sixel that conhost then strips.
+/// Inbox unless both files are present and [`negotiate`] says the DLL
+/// version supports passthrough. An unversioned image, a DLL alone, and a
+/// pre-rewrite pair are not loaded: passthrough would be a guess, and DA1
+/// would advertise Sixel that conhost then strips.
 pub(crate) fn capability_from_probe(probe: BundleProbe) -> ConptyCapability {
     if !probe.dll_is_file || !probe.open_console_is_file {
         return ConptyCapability::Inbox;
     }
-    match probe.version {
+    if negotiate(probe.version).passthrough {
+        ConptyCapability::BundledRewrite
+    } else {
+        ConptyCapability::Inbox
+    }
+}
+
+/// Version gate for passthrough. Always a plan: a supported 1.22+ pair
+/// passes VT through, and an older or missing version keeps the inbox
+/// flags. Neither case is an error, so spawn does not fail closed.
+pub(crate) fn negotiate(version: Option<(u16, u16, u16, u16)>) -> ConptyCreate {
+    match version {
         Some((1, minor, _, _)) if minor >= BUNDLED_REWRITE_MINOR => {
-            ConptyCapability::BundledRewrite
+            create_flags(ConptyCapability::BundledRewrite)
         }
-        _ => ConptyCapability::Inbox,
+        _ => create_flags(ConptyCapability::Inbox),
     }
 }
 

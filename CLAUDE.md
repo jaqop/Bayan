@@ -54,9 +54,9 @@ selection and BiDi paths must do.
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, the passthrough flag choice, and vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-836 tests across the tree. `render.rs` and `term.rs` (100 each) and
+839 tests across the tree. `render.rs` and `term.rs` (100 each) and
 `link.rs` (66) carry the most; `lua_host.rs` has 46, `shellint.rs` 24,
-`images.rs` 22, `localpath.rs` 21, `mux.rs` 15, `config_watch.rs` 14,
+`images.rs` 23, `localpath.rs` 21, `mux.rs` 16, `config_watch.rs` 14,
 `screen_reader.rs` 11 and `ssh.rs` 7. Three more in `term.rs` are
 `#[ignore]`d probes, run by hand (see Measuring).
 
@@ -198,9 +198,14 @@ or newer, loaded by that absolute path (`LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
 LOAD_LIBRARY_SEARCH_SYSTEM32`). A DLL alone, a bare name, the current
 directory, and `PATH` are not a host. If that `CreatePseudoConsole` fails,
 the pane opens on kernel32. DA advertises Sixel (`CSI ? 64 ; 4 c`) only
-after a bundled pseudoconsole has been created. The binaries are not in
-the repo. Image caps still come from `images` in config.json and are
-reapplied to open panes on reload. Do not move the cursor for an image:
+after a bundled pseudoconsole has been created. A missing or older
+version keeps the inbox flags and does not fail the spawn. The binaries
+are not in the repo. Image caps (`max_bytes`, `max_width`, `max_height`,
+the pane and session budgets) apply to Sixel and Kitty and are reapplied
+to open panes on reload. A mux reattach runs the tail through
+`mux::replay_bytes` first: queries, including Kitty `a=q`, are removed,
+and a Kitty command that would answer is forced to `q=2`, so replay does
+not write into the live session. Do not move the cursor for an image:
 conhost, and a host that is not actually passing DCS through, would
 desync the rows.
 

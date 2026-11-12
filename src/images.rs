@@ -2739,6 +2739,74 @@ mod tests {
         assert_eq!(meta.images.pane_bytes(), before);
     }
 
+    /// A Sixel wider than `max_width` and a Kitty image whose decoded RGBA
+    /// exceeds `max_bytes` are dropped. The parser keeps going, and a later
+    /// image inside both caps is stored.
+    #[test]
+    fn sixel_and_kitty_over_dimension_or_byte_cap_are_dropped() {
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        meta.apply_image_limits(ImageLimits {
+            max_width: 1,
+            max_height: 32,
+            max_bytes: 64,
+            ..ImageLimits::default()
+        });
+        feed(&mut t, &mut p, &mut meta, &mut carry, red_green_sixel());
+        assert_eq!(
+            meta.images.placement_count(),
+            0,
+            "a 2px-wide sixel is over max_width"
+        );
+        let wide = b64(&[1, 2, 3, 4, 5, 6]);
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            &kitty(&format!("a=T,f=24,s=2,v=1,C=1,q=2;{wide}")),
+        );
+        assert_eq!(
+            meta.images.placement_count(),
+            0,
+            "a 2px-wide kitty is over max_width"
+        );
+
+        meta.apply_image_limits(ImageLimits {
+            max_width: 32,
+            max_height: 32,
+            max_bytes: 4,
+            ..ImageLimits::default()
+        });
+        // 2×1 RGB is 8 decoded bytes, over the 4-byte cap. 1×1 RGBA is 4.
+        let over = b64(&[9, 9, 9, 8, 8, 8]);
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            &kitty(&format!("a=T,f=24,s=2,v=1,C=1,q=2;{over}")),
+        );
+        assert_eq!(
+            meta.images.placement_count(),
+            0,
+            "decoded size over max_bytes"
+        );
+        let fits = b64(&[1, 2, 3]);
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            &kitty(&format!("a=T,f=24,s=1,v=1,C=1,q=2;{fits}")),
+        );
+        assert_eq!(
+            meta.images.placement_count(),
+            1,
+            "an image inside the caps lands"
+        );
+        assert!(meta.images.pane_bytes() <= 4);
+    }
+
     #[test]
     fn sixel_is_stored_and_does_not_print() {
         let (mut t, mut p, mut meta, mut carry) = fresh();

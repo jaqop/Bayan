@@ -203,6 +203,29 @@ fn bundled_pair_is_passthrough_only_at_1_22_with_both_files() {
     assert!(file_version_from_fixed(&fixed).is_none());
 }
 
+/// Supported (1.22+), unsupported (older or a non-1.x file version), and
+/// unknown (no version resource) all return a plan. Only supported turns
+/// passthrough on. The other two keep the inbox flags Bayan already uses.
+#[test]
+fn passthrough_follows_conpty_version_and_unknown_stays_inbox() {
+    use crate::conpty_resolve::{negotiate, CONPTY_BASE_FLAGS};
+
+    let supported = negotiate(Some((1, 22, 0, 1)));
+    assert!(supported.passthrough);
+    assert_eq!(supported.flags, CONPTY_BASE_FLAGS);
+    assert_eq!(negotiate(Some((1, 24, 2604, 2001))), supported);
+
+    let unsupported = negotiate(Some((1, 21, 0, 0)));
+    assert!(!unsupported.passthrough);
+    assert_eq!(unsupported.flags, CONPTY_BASE_FLAGS);
+    let numbered_like_inbox = negotiate(Some((10, 0, 26100, 1)));
+    assert_eq!(numbered_like_inbox, unsupported);
+
+    let unknown = negotiate(None);
+    assert!(!unknown.passthrough);
+    assert_eq!(unknown, unsupported);
+}
+
 #[test]
 fn kernel32_file_version_is_readable() {
     let path = system32_dir().join("kernel32.dll");

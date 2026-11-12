@@ -1214,7 +1214,14 @@ beside it is ignored, which is the planted-DLL case the loader test still
 rejects. If `CreatePseudoConsole` on that DLL fails, the pane is opened
 with kernel32 and Sixel is not advertised. Primary DA stays alacritty's
 VT102 reply (`CSI ? 6 c`) until that host is actually up; then it is
-`CSI ? 64 ; 4 c` (parameter 4 is Sixel, the `64` is the level).
+`CSI ? 64 ; 4 c` (parameter 4 is Sixel, the `64` is the level). A DLL
+older than 1.22, or one with no version resource, is not passthrough
+and is not an error: the pane still opens on kernel32. Sixel and Kitty
+use the same caps as iTerm2 (`max_bytes`, `max_width`, `max_height`, and
+the pane and session budgets). A mux reattach feeds the saved tail
+through the replay filter first, so a Kitty graphics query is dropped
+and a command that would answer is quieted (`q=2`) instead of being
+written into the live session.
 
 The pair is the MIT-licensed `Microsoft.Windows.Console.ConPTY` redistributable
 from microsoft/terminal (not committed here). WezTerm's known-good match

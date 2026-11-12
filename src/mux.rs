@@ -411,6 +411,9 @@ pub fn push_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
 /// Bytes a reattach may feed to a fresh terminal. The cut is on a UTF-8
 /// boundary and not inside an escape sequence, and device queries are
 /// removed so a stale `CSI 6n` is not answered into the live session.
+/// Kitty graphics that would answer (`a=q`, or any command carrying `i`
+/// with quiet other than 2) are held to that same rule: the image stays,
+/// the reply does not get written into the session.
 pub fn replay_bytes(input: &[u8]) -> Vec<u8> {
     let mut i = safe_boundary(input, 0);
     let mut out = Vec::with_capacity(input.len().saturating_sub(i));
@@ -419,7 +422,7 @@ pub fn replay_bytes(input: &[u8]) -> Vec<u8> {
             match escape_end(input, i) {
                 Some(end) => {
                     if !is_query(&input[i..end]) {
-                        out.extend_from_slice(&input[i..end]);
+                        out.extend_from_slice(&silence_kitty_reply(&input[i..end]));
                     }
                     i = end;
                     continue;
@@ -546,8 +549,93 @@ fn is_query(seq: &[u8]) -> bool {
             final_b == b'n' || final_b == b'c' || (final_b == b'u' && seq.contains(&b'?'))
         }
         b']' => seq.contains(&b'?'),
+        // Kitty protocol query (`a=q`). A transmit that only carries an id
+        // is not a query; [`silence_kitty_reply`] stops that one answering.
+        b'_' => kitty_action_is(seq, b'q'),
         _ => false,
     }
+}
+
+/// Kitty answers when the client sent `i` and quiet is not 2. Replay must
+/// not write that answer into the live session, and it must still show the
+/// image, so the command is kept with `q=2`.
+fn silence_kitty_reply(seq: &[u8]) -> Vec<u8> {
+    let Some(ctl) = kitty_control(seq) else {
+        return seq.to_vec();
+    };
+    if control_value(ctl, b'i').is_none() || control_is(ctl, b'q', b"2") {
+        return seq.to_vec();
+    }
+    let ctl_off = 3;
+    let ctl_end = ctl_off + ctl.len();
+    if let Some(rel) = key_value_index(ctl, b'q') {
+        let at = ctl_off + rel;
+        let val_end = seq[at..]
+            .iter()
+            .position(|&b| b == b',' || b == b';' || b == 0x07 || b == 0x1b)
+            .map_or(seq.len(), |n| at + n);
+        let mut out = Vec::with_capacity(seq.len());
+        out.extend_from_slice(&seq[..at]);
+        out.push(b'2');
+        out.extend_from_slice(&seq[val_end..]);
+        return out;
+    }
+    let mut out = Vec::with_capacity(seq.len() + 4);
+    out.extend_from_slice(&seq[..ctl_end]);
+    out.extend_from_slice(b",q=2");
+    out.extend_from_slice(&seq[ctl_end..]);
+    out
+}
+
+fn control_is(ctl: &[u8], key: u8, value: &[u8]) -> bool {
+    let Some(rel) = key_value_index(ctl, key) else {
+        return false;
+    };
+    let rest = &ctl[rel..];
+    let end = rest.iter().position(|&b| b == b',').unwrap_or(rest.len());
+    &rest[..end] == value
+}
+
+/// Control bytes of `APC G`, after `ESC _ G` and before `;` or the
+/// terminator. `None` when this is not a Kitty graphics command.
+fn kitty_control(seq: &[u8]) -> Option<&[u8]> {
+    if seq.len() < 3 || seq[0] != 0x1b || seq[1] != b'_' || seq[2] != b'G' {
+        return None;
+    }
+    let rest = &seq[3..];
+    let end = rest
+        .iter()
+        .position(|&b| b == b';' || b == 0x07 || b == 0x1b)
+        .unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+fn kitty_action_is(seq: &[u8], action: u8) -> bool {
+    kitty_control(seq)
+        .and_then(|ctl| control_value(ctl, b'a'))
+        .is_some_and(|value| value == action)
+}
+
+fn control_value(ctl: &[u8], key: u8) -> Option<u8> {
+    key_value_index(ctl, key).and_then(|rel| ctl.get(rel).copied())
+}
+
+/// Index of the first value byte of `key=` in a comma-separated control.
+fn key_value_index(ctl: &[u8], key: u8) -> Option<usize> {
+    let mut i = 0;
+    while i < ctl.len() {
+        let start = i;
+        let end = ctl[i..]
+            .iter()
+            .position(|&b| b == b',')
+            .map_or(ctl.len(), |rel| i + rel);
+        let part = &ctl[start..end];
+        if part.len() >= 2 && part[0] == key && part[1] == b'=' {
+            return Some(start + 2);
+        }
+        i = end + 1;
+    }
+    None
 }
 
 /// An elevated window must not own the mux. The pipe name is only the user
@@ -2677,5 +2765,78 @@ mod tests {
         assert!(text.contains("world"));
         assert!(text.contains("red"));
         assert!(replay.windows(5).any(|w| w == b"\x1b[31m"));
+    }
+
+    /// A reattach feeds the tail through this filter before the new terminal
+    /// parses it. Sixel and a Kitty transmit stay, so the picture can come
+    /// back. A Kitty protocol query is dropped like `CSI c`, and a transmit
+    /// that would answer (`i` set, quiet not 2) is forced to `q=2`.
+    #[test]
+    fn replay_keeps_images_and_does_not_answer_them() {
+        let sixel = b"\x1bPq#1~-\x1b\\";
+        let transmit = b"\x1b_Ga=T,f=24,s=1,v=1,i=7;AQID\x1b\\";
+        let query = b"\x1b_Ga=q,i=31\x1b\\";
+        let already = b"\x1b_Ga=T,i=1,q=2;AQID\x1b\\";
+        let mut raw = b"hi ".to_vec();
+        raw.extend_from_slice(sixel);
+        raw.extend_from_slice(transmit);
+        raw.extend_from_slice(query);
+        raw.extend_from_slice(already);
+        raw.extend_from_slice(b"\x1b[c");
+        let replay = replay_bytes(&raw);
+        let text = String::from_utf8_lossy(&replay);
+        assert!(text.contains("hi "), "{text}");
+        assert!(
+            replay.windows(sixel.len()).any(|w| w == sixel),
+            "sixel dropped: {text}"
+        );
+        assert!(
+            !text.contains("a=q"),
+            "kitty query would be answered: {text}"
+        );
+        assert!(
+            !replay.windows(3).any(|w| w == b"\x1b[c"),
+            "DA left in the replay: {text}"
+        );
+        assert!(text.contains("i=7"), "{text}");
+        assert!(text.contains("q=2"), "{text}");
+        assert!(
+            !text.contains("q=0") && !text.contains(",q=1"),
+            "a reply-requesting quiet survived: {text}"
+        );
+        let (mut t, mut p, mut meta, mut carry) = fresh_term();
+        let ev = crate::term::process_chunk(&mut p, &mut t, &mut meta, &mut carry, &replay);
+        assert!(
+            ev.pty_replies.is_empty(),
+            "replay wrote into the session: {:?}",
+            ev.pty_replies
+        );
+        assert!(
+            meta.images.placement_count() >= 1,
+            "the image itself was suppressed"
+        );
+    }
+
+    fn fresh_term() -> (
+        alacritty_terminal::term::Term<alacritty_terminal::event::VoidListener>,
+        alacritty_terminal::vte::ansi::Processor,
+        crate::term::SessionMeta,
+        Vec<u8>,
+    ) {
+        let size = crate::term::TermSize { cols: 40, rows: 8 };
+        let config = alacritty_terminal::term::Config {
+            scrolling_history: 10,
+            ..alacritty_terminal::term::Config::default()
+        };
+        (
+            alacritty_terminal::term::Term::new(
+                config,
+                &size,
+                alacritty_terminal::event::VoidListener,
+            ),
+            alacritty_terminal::vte::ansi::Processor::new(),
+            crate::term::SessionMeta::default(),
+            Vec::new(),
+        )
     }
 }
