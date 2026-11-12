@@ -330,14 +330,19 @@ fn rejected_or_unstarted_open_console_falls_back_to_inbox() {
     assert!(!host_file_ok(unsigned_str, false));
     let _ = std::fs::remove_dir_all(&dir);
 
-    let conhost = system32_dir().join("conhost.exe");
-    let conhost_str = conhost.to_str().expect("system32 path");
-    let status = crate::conpty_resolve::signature_status(conhost_str);
+    // conhost.exe is catalog-signed; WinVerifyTrust reports
+    // TRUST_E_NOSIGNATURE (0x800B0100) for it. The OpenConsole.exe from the
+    // ConPTY package is embedded-signed, the same way powershell.exe is.
+    let signed = system32_dir()
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let signed_str = signed.to_str().expect("powershell path");
+    let status = crate::conpty_resolve::signature_status(signed_str);
     assert_eq!(
-        status,
-        0,
-        "System32 conhost.exe should carry a trusted signature: {} status {status:#x}",
-        conhost.display()
+        status, 0,
+        "powershell.exe should carry an embedded trusted signature: {} status {status:#x} (unsigned was {unsigned_status:#x})",
+        signed.display()
     );
 }
 
