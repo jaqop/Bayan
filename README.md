@@ -945,7 +945,11 @@ The sandbox is Lua 5.4 via mlua, with `string`, `table`, `math`, and
 `utf8` only. `io`, `os`, `debug`, and `package` are absent. `require`,
 `loadfile`, `dofile`, and `string.dump` are removed, and `load` accepts
 text chunks only. A metatable with `__gc` is rejected, because Lua 5.4
-runs finalizers with the instruction hook switched off. The hook also
+runs finalizers with the instruction hook switched off. `<close>` is
+rejected too: after the budget aborts a call, the `__close` handler
+runs with that hook off, and setting `__close` after `setmetatable`
+still arms it. Every chunk, including one passed to `load`, is refused
+if its bytecode contains `OP_TBC`. The hook also
 cannot interrupt one C call, so `string.find`, `match`, `gmatch`, and
 `gsub` first bound the matcher's worst case for that subject and pattern
 (start positions times the ways the subject splits among the `*` `+` `-`

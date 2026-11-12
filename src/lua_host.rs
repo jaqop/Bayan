@@ -50,7 +50,9 @@
 //! Each call into a plugin — loading it, a key binding, one event dispatch —
 //! gets its own instruction budget and its own deadline. Handlers of one
 //! dispatch share that deadline, and one event holds at most 32 of them.
-//! A loop is cut off. The next call starts clean. `__gc` is rejected.
+//! A loop is cut off. The next call starts clean. `__gc` is rejected, and
+//! so is `<close>`: its `OP_TBC` instruction is refused in every loaded
+//! chunk, including one hidden inside `load`.
 //!
 //! Strings crossing the boundary are UTF-8. Arabic round-trips unchanged.
 //!
@@ -712,11 +714,8 @@ fn apply_config_lua(cfg: &UserConfig, bytes: &[u8]) -> Result<UserConfig, String
         .map_err(|e| e.to_string())?;
     // No bayan table. spawn, bind, on, and send are not installed.
     fuel.reset();
-    let returned: Value = lua
-        .load(source)
-        .set_mode(ChunkMode::Text)
-        .set_name("config.lua")
-        .eval()
+    let returned: Value = compile_text(&lua, source, "config.lua")?
+        .call(())
         .map_err(|e| e.to_string())?;
     let mut merged = {
         let current: Value = lua.globals().get("config").map_err(|e| e.to_string())?;
@@ -847,10 +846,8 @@ fn exec_plugin(allow: &LuaPluginAllow, source: &str) -> Result<LoadedPlugin, Str
     };
     install_plugin_api(&lua, allow.spawn, &regs)?;
     fuel.reset();
-    lua.load(source)
-        .set_mode(ChunkMode::Text)
-        .set_name(&allow.name)
-        .exec()
+    compile_text(&lua, source, &allow.name)?
+        .call::<()>(())
         .map_err(|e| e.to_string())?;
     Ok(LoadedPlugin {
         name: allow.name.clone(),
@@ -1530,7 +1527,227 @@ fn text_only_load(lua: &Lua, args: MultiValue) -> mlua::Result<mlua::Function> {
     if let Some(Value::Table(env)) = args.get(3) {
         loader = loader.set_environment(env.clone());
     }
-    loader.into_function()
+    let func = loader.into_function()?;
+    // `<close>` is compiled into this function, including its nested
+    // prototypes. Reject it before the caller can run it.
+    if let Err(msg) = reject_to_be_closed(&func) {
+        return Err(mlua::Error::runtime(msg));
+    }
+    Ok(func)
+}
+
+fn compile_text(lua: &Lua, source: &str, name: &str) -> Result<mlua::Function, String> {
+    let func = lua
+        .load(source)
+        .set_mode(ChunkMode::Text)
+        .set_name(name)
+        .into_function()
+        .map_err(|e| e.to_string())?;
+    reject_to_be_closed(&func)?;
+    Ok(func)
+}
+
+fn reject_to_be_closed(func: &mlua::Function) -> Result<(), String> {
+    let bytes = func.dump(true);
+    if bytes.is_empty() {
+        return Err("lua chunk could not be checked".into());
+    }
+    match bytecode_arms_close(&bytes) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err("<close> is disabled".into()),
+        Err(()) => Err("lua chunk could not be checked".into()),
+    }
+}
+
+/// `OP_TBC` in Lua 5.4. It is the only instruction that marks a local
+/// to-be-closed. `__close` then runs while unwinding, with hooks off, so
+/// the instruction budget cannot stop a loop inside that handler. The
+/// field may be written after `setmetatable`; the opcode is what arms it.
+const OP_TBC: u32 = 55;
+const LUA_VNIL: u8 = 0;
+const LUA_VFALSE: u8 = 1;
+const LUA_VTRUE: u8 = 17;
+const LUA_VNUMINT: u8 = 3;
+const LUA_VNUMFLT: u8 = 19;
+const LUA_VSHRSTR: u8 = 4;
+const LUA_VLNGSTR: u8 = 20;
+
+/// Whether this official Lua 5.4 dump contains `OP_TBC` in any prototype.
+/// `Err` means the bytes are not a dump we can read. Callers reject both.
+fn bytecode_arms_close(bytes: &[u8]) -> Result<bool, ()> {
+    let mut r = Dump::new(bytes);
+    r.header()?;
+    let _upvalues = r.byte()?;
+    let found = r.function()?;
+    if r.i != r.b.len() {
+        return Err(());
+    }
+    Ok(found)
+}
+
+struct Dump<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl<'a> Dump<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        Self { b, i: 0 }
+    }
+
+    fn byte(&mut self) -> Result<u8, ()> {
+        let b = *self.b.get(self.i).ok_or(())?;
+        self.i += 1;
+        Ok(b)
+    }
+
+    fn bytes(&mut self, n: usize) -> Result<&'a [u8], ()> {
+        let end = self.i.checked_add(n).ok_or(())?;
+        let s = self.b.get(self.i..end).ok_or(())?;
+        self.i = end;
+        Ok(s)
+    }
+
+    fn skip(&mut self, n: usize) -> Result<(), ()> {
+        let _ = self.bytes(n)?;
+        Ok(())
+    }
+
+    /// Lua's `dumpSize`: 7-bit groups, most significant first, high bit set
+    /// on the last byte.
+    fn size(&mut self) -> Result<usize, ()> {
+        let mut x: u64 = 0;
+        for _ in 0..10 {
+            let b = self.byte()?;
+            if x > (u64::MAX >> 7) {
+                return Err(());
+            }
+            x = (x << 7) | u64::from(b & 0x7f);
+            if b & 0x80 != 0 {
+                return usize::try_from(x).map_err(|_| ());
+            }
+        }
+        Err(())
+    }
+
+    fn header(&mut self) -> Result<(), ()> {
+        if self.bytes(4)? != b"\x1bLua" {
+            return Err(());
+        }
+        if self.byte()? != 0x54 || self.byte()? != 0 {
+            return Err(());
+        }
+        if self.bytes(6)? != b"\x19\x93\r\n\x1a\n" {
+            return Err(());
+        }
+        // Instruction, lua_Integer, lua_Number. Then the endianness checks.
+        if self.byte()? != 4 || self.byte()? != 8 || self.byte()? != 8 {
+            return Err(());
+        }
+        if self.bytes(8)? != 0x5678u64.to_le_bytes() {
+            return Err(());
+        }
+        let num = f64::from_le_bytes(self.bytes(8)?.try_into().map_err(|_| ())?);
+        if num.to_bits() != 370.5f64.to_bits() {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn lua_string(&mut self) -> Result<(), ()> {
+        let n = self.size()?;
+        if n == 0 {
+            return Ok(());
+        }
+        self.skip(n - 1)
+    }
+
+    fn function(&mut self) -> Result<bool, ()> {
+        self.lua_string()?;
+        let _ = self.size()?;
+        let _ = self.size()?;
+        let _ = self.byte()?;
+        let _ = self.byte()?;
+        let _ = self.byte()?;
+        let mut found = self.code()?;
+        self.constants()?;
+        self.upvalues()?;
+        if self.protos()? {
+            found = true;
+        }
+        self.debug()?;
+        Ok(found)
+    }
+
+    fn code(&mut self) -> Result<bool, ()> {
+        let n = self.bounded()?;
+        let mut found = false;
+        for _ in 0..n {
+            let word = u32::from_le_bytes(self.bytes(4)?.try_into().map_err(|_| ())?);
+            if (word & 0x7f) == OP_TBC {
+                found = true;
+            }
+        }
+        Ok(found)
+    }
+
+    fn constants(&mut self) -> Result<(), ()> {
+        let n = self.bounded()?;
+        for _ in 0..n {
+            match self.byte()? {
+                LUA_VNIL | LUA_VFALSE | LUA_VTRUE => {}
+                LUA_VNUMINT | LUA_VNUMFLT => self.skip(8)?,
+                LUA_VSHRSTR | LUA_VLNGSTR => self.lua_string()?,
+                _ => return Err(()),
+            }
+        }
+        Ok(())
+    }
+
+    fn upvalues(&mut self) -> Result<(), ()> {
+        let n = self.bounded()?;
+        self.skip(n.checked_mul(3).ok_or(())?)
+    }
+
+    fn protos(&mut self) -> Result<bool, ()> {
+        let n = self.bounded()?;
+        let mut found = false;
+        for _ in 0..n {
+            if self.function()? {
+                found = true;
+            }
+        }
+        Ok(found)
+    }
+
+    fn debug(&mut self) -> Result<(), ()> {
+        let lines = self.bounded()?;
+        self.skip(lines)?;
+        let abs = self.bounded()?;
+        for _ in 0..abs {
+            let _ = self.size()?;
+            let _ = self.size()?;
+        }
+        let locals = self.bounded()?;
+        for _ in 0..locals {
+            self.lua_string()?;
+            let _ = self.size()?;
+            let _ = self.size()?;
+        }
+        let names = self.bounded()?;
+        for _ in 0..names {
+            self.lua_string()?;
+        }
+        Ok(())
+    }
+
+    fn bounded(&mut self) -> Result<usize, ()> {
+        let n = self.size()?;
+        if n > 1_000_000 {
+            return Err(());
+        }
+        Ok(n)
+    }
 }
 
 fn read_source(path: &Path) -> Result<Vec<u8>, String> {
@@ -1743,11 +1960,8 @@ fn probe(src: &str) -> Result<String, String> {
 fn probe_with(src: &str, limits: Limits) -> Result<String, String> {
     let (lua, fuel) = open_sandbox(limits)?;
     fuel.reset();
-    let value: Value = lua
-        .load(src)
-        .set_mode(ChunkMode::Text)
-        .set_name("probe")
-        .eval()
+    let value: Value = compile_text(&lua, src, "probe")?
+        .call(())
         .map_err(|e| e.to_string())?;
     match value {
         Value::Nil => Ok(String::new()),
@@ -1763,6 +1977,26 @@ fn probe_with(src: &str, limits: Limits) -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::config::UserConfig;
+
+    /// Run `f` on another thread. A `__gc` or `__close` loop never returns,
+    /// so the assertion has to fail on a timeout instead of wedging CI.
+    fn finish_within<T: Send>(limit: Duration, f: impl FnOnce() -> T + Send) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let _ = tx.send(outcome);
+        });
+        match rx.recv_timeout(limit) {
+            Ok(Ok(value)) => value,
+            Ok(Err(payload)) => std::panic::resume_unwind(payload),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("lua did not return within {limit:?}")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("lua worker stopped without a result")
+            }
+        }
+    }
 
     fn scratch(label: &str) -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
@@ -1958,31 +2192,35 @@ mod tests {
 
     #[test]
     fn an_infinite_loop_is_cut_off() {
-        let start = Instant::now();
-        let err = probe("while true do end").unwrap_err();
-        assert!(
-            start.elapsed() < Duration::from_secs(3),
-            "loop ran for {:?}",
-            start.elapsed()
-        );
-        assert!(
-            err.contains("limit"),
-            "expected the execution limit, got {err}"
-        );
+        finish_within(Duration::from_secs(5), || {
+            let start = Instant::now();
+            let err = probe("while true do end").unwrap_err();
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "loop ran for {:?}",
+                start.elapsed()
+            );
+            assert!(
+                err.contains("limit"),
+                "expected the execution limit, got {err}"
+            );
+        });
     }
 
     #[test]
     fn pcall_cannot_swallow_the_execution_limit() {
-        let start = Instant::now();
-        let err = probe(
-            r#"
+        finish_within(Duration::from_secs(5), || {
+            let start = Instant::now();
+            let err = probe(
+                r#"
             pcall(function() while true do end end)
             return "continued"
             "#,
-        )
-        .unwrap_err();
-        assert!(start.elapsed() < Duration::from_secs(3));
-        assert!(err.contains("limit"), "{err}");
+            )
+            .unwrap_err();
+            assert!(start.elapsed() < Duration::from_secs(3));
+            assert!(err.contains("limit"), "{err}");
+        });
     }
 
     #[test]
@@ -2367,26 +2605,28 @@ mod tests {
 
     #[test]
     fn a_runaway_callback_is_cut_off_and_the_next_call_works() {
-        let dir = scratch("runaway");
-        let plugins = dir.join("plugins");
-        fs::create_dir_all(&plugins).unwrap();
-        let src = r#"
+        finish_within(Duration::from_secs(5), || {
+            let dir = scratch("runaway");
+            let plugins = dir.join("plugins");
+            fs::create_dir_all(&plugins).unwrap();
+            let src = r#"
             bayan.bind("f12", function() while true do end end)
             bayan.bind("f11", function() local s=0; for i=1,5000 do s=s+i end; bayan.send("ok") end)
         "#;
-        fs::write(plugins.join("hello.lua"), src).unwrap();
-        let mut cfg = plugin_cfg(&plugins, "hello", false);
-        approve(&mut cfg, src.as_bytes());
-        let mut out = load_with(&cfg, &dir, false);
-        assert!(out.errors.is_empty(), "{:?}", out.errors);
-        let start = Instant::now();
-        assert!(out.plugins.fire("f12").is_empty());
-        assert!(
-            start.elapsed() < Duration::from_secs(3),
-            "a loop must still be killed"
-        );
-        assert_eq!(out.plugins.fire("f11")[0].text, "ok");
-        let _ = fs::remove_dir_all(&dir);
+            fs::write(plugins.join("hello.lua"), src).unwrap();
+            let mut cfg = plugin_cfg(&plugins, "hello", false);
+            approve(&mut cfg, src.as_bytes());
+            let mut out = load_with(&cfg, &dir, false);
+            assert!(out.errors.is_empty(), "{:?}", out.errors);
+            let start = Instant::now();
+            assert!(out.plugins.fire("f12").is_empty());
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "a loop must still be killed"
+            );
+            assert_eq!(out.plugins.fire("f11")[0].text, "ok");
+            let _ = fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
@@ -2500,59 +2740,62 @@ mod tests {
 
     #[test]
     fn a_finalizer_loop_fails_fast_instead_of_hanging() {
-        let dir = scratch("gc");
-        let src =
-            "setmetatable({}, {__gc=function() while true do end end})\nconfig.font_size = 3\n";
-        fs::write(dir.join("config.lua"), src).unwrap();
-        let mut cfg = json_cfg(r#"{"font_size":12.0}"#);
-        approve(&mut cfg, src.as_bytes());
-        let start = Instant::now();
-        {
-            let out = load_with(&cfg, &dir, false);
-            assert!(!out.errors.is_empty(), "a __gc metatable must be rejected");
-            assert_ne!(out.config.font_size, Some(3.0));
-        }
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "dropping the state hung in a finalizer"
-        );
+        finish_within(Duration::from_secs(5), || {
+            let dir = scratch("gc");
+            let src =
+                "setmetatable({}, {__gc=function() while true do end end})\nconfig.font_size = 3\n";
+            fs::write(dir.join("config.lua"), src).unwrap();
+            let mut cfg = json_cfg(r#"{"font_size":12.0}"#);
+            approve(&mut cfg, src.as_bytes());
+            let start = Instant::now();
+            {
+                let out = load_with(&cfg, &dir, false);
+                assert!(!out.errors.is_empty(), "a __gc metatable must be rejected");
+                assert_ne!(out.config.font_size, Some(3.0));
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "dropping the state hung in a finalizer"
+            );
 
-        let plugins = dir.join("plugins");
-        fs::create_dir_all(&plugins).unwrap();
-        let plug = "setmetatable({}, {__gc=function() while true do end end})\n";
-        fs::write(plugins.join("hello.lua"), plug).unwrap();
-        let mut pcfg = plugin_cfg(&plugins, "hello", false);
-        approve(&mut pcfg, plug.as_bytes());
-        let start = Instant::now();
-        {
-            let out = load_with(&pcfg, &dir, false);
-            assert!(!out.errors.is_empty(), "{:?}", out.errors);
-            assert_eq!(out.plugins.callback_runs(), 0);
-        }
-        assert!(start.elapsed() < Duration::from_secs(2));
+            let plugins = dir.join("plugins");
+            fs::create_dir_all(&plugins).unwrap();
+            let plug = "setmetatable({}, {__gc=function() while true do end end})\n";
+            fs::write(plugins.join("hello.lua"), plug).unwrap();
+            let mut pcfg = plugin_cfg(&plugins, "hello", false);
+            approve(&mut pcfg, plug.as_bytes());
+            let start = Instant::now();
+            {
+                let out = load_with(&pcfg, &dir, false);
+                assert!(!out.errors.is_empty(), "{:?}", out.errors);
+                assert_eq!(out.plugins.callback_runs(), 0);
+            }
+            assert!(start.elapsed() < Duration::from_secs(2));
 
-        let raw = r#"
+            let raw = r#"
             local t, mt = {}, {}
             setmetatable(t, mt)
             local ok = pcall(function() rawset(mt, "__gc", function() while true do end end) end)
             if ok then error("rawset allowed __gc") end
             config.font_size = 7
         "#;
-        fs::write(dir.join("config.lua"), raw).unwrap();
-        let mut rcfg = json_cfg(r#"{"font_size":12.0}"#);
-        approve(&mut rcfg, raw.as_bytes());
-        let out = load_with(&rcfg, &dir, false);
-        assert!(out.errors.is_empty(), "{:?}", out.errors);
-        assert_eq!(out.config.font_size, Some(7.0));
-        let _ = fs::remove_dir_all(&dir);
+            fs::write(dir.join("config.lua"), raw).unwrap();
+            let mut rcfg = json_cfg(r#"{"font_size":12.0}"#);
+            approve(&mut rcfg, raw.as_bytes());
+            let out = load_with(&rcfg, &dir, false);
+            assert!(out.errors.is_empty(), "{:?}", out.errors);
+            assert_eq!(out.config.font_size, Some(7.0));
+            let _ = fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
     fn an_event_keeps_thirty_two_handlers_and_one_deadline() {
-        let dir = scratch("handlers");
-        let plugins = dir.join("plugins");
-        fs::create_dir_all(&plugins).unwrap();
-        let src = r#"
+        finish_within(Duration::from_secs(5), || {
+            let dir = scratch("handlers");
+            let plugins = dir.join("plugins");
+            fs::create_dir_all(&plugins).unwrap();
+            let src = r#"
             local n = 0
             for i = 1, 1000 do
               local ok = pcall(function()
@@ -2562,24 +2805,25 @@ mod tests {
             end
             bayan.bind("f12", function() bayan.send(tostring(n)) end)
         "#;
-        fs::write(plugins.join("hello.lua"), src).unwrap();
-        let mut cfg = plugin_cfg(&plugins, "hello", false);
-        approve(&mut cfg, src.as_bytes());
-        let mut out = load_with(&cfg, &dir, false);
-        assert!(out.errors.is_empty(), "{:?}", out.errors);
-        assert_eq!(out.plugins.fire("f12")[0].text, "32");
-        let before = out.plugins.callback_runs();
-        let start = Instant::now();
-        let _ = out.plugins.emit("bell", &[]);
-        assert!(
-            start.elapsed() < Duration::from_millis(500),
-            "handlers must share one deadline, took {:?}",
-            start.elapsed()
-        );
-        // The first spinning handler spends the shared budget. The rest
-        // must not be entered, so the run count moves by one, not by 32.
-        assert_eq!(out.plugins.callback_runs() - before, 1);
-        let _ = fs::remove_dir_all(&dir);
+            fs::write(plugins.join("hello.lua"), src).unwrap();
+            let mut cfg = plugin_cfg(&plugins, "hello", false);
+            approve(&mut cfg, src.as_bytes());
+            let mut out = load_with(&cfg, &dir, false);
+            assert!(out.errors.is_empty(), "{:?}", out.errors);
+            assert_eq!(out.plugins.fire("f12")[0].text, "32");
+            let before = out.plugins.callback_runs();
+            let start = Instant::now();
+            let _ = out.plugins.emit("bell", &[]);
+            assert!(
+                start.elapsed() < Duration::from_millis(500),
+                "handlers must share one deadline, took {:?}",
+                start.elapsed()
+            );
+            // The first spinning handler spends the shared budget. The rest
+            // must not be entered, so the run count moves by one, not by 32.
+            assert_eq!(out.plugins.callback_runs() - before, 1);
+            let _ = fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
@@ -2644,33 +2888,37 @@ mod tests {
 
     #[test]
     fn a_pattern_too_costly_for_its_subject_is_refused_before_it_runs() {
-        // Short pattern, no dots, subject under 1 KiB: n^4 steps in one C call.
-        for src in [
-            r#"return select(2, pcall(function() return ("a"):rep(1000):find("a*a*a*b") end))"#,
-            r#"return select(2, pcall(string.match, ("a"):rep(1000), "%a-%a-%a-b"))"#,
-            r#"return select(2, pcall(function() return ("a"):rep(1e5):find(".-.-.-.-.-b") end))"#,
-            r#"return select(2, pcall(function() for _ in ("a"):rep(600):gmatch("(a*)(a*)b") do end end))"#,
-            r#"return select(2, pcall(string.gsub, ("a"):rep(600), "a+a+b", ""))"#,
-            r#"return select(2, pcall(string.find, ("a"):rep(1e6), ("a"):rep(1e5) .. "b", 1, true))"#,
-        ] {
-            let err = probe(src).unwrap();
-            assert!(err.contains("too costly"), "{src}: {err}");
-        }
+        finish_within(Duration::from_secs(5), || {
+            // Short pattern, no dots, subject under 1 KiB: n^4 steps in one C call.
+            for src in [
+                r#"return select(2, pcall(function() return ("a"):rep(1000):find("a*a*a*b") end))"#,
+                r#"return select(2, pcall(string.match, ("a"):rep(1000), "%a-%a-%a-b"))"#,
+                r#"return select(2, pcall(function() return ("a"):rep(1e5):find(".-.-.-.-.-b") end))"#,
+                r#"return select(2, pcall(function() for _ in ("a"):rep(600):gmatch("(a*)(a*)b") do end end))"#,
+                r#"return select(2, pcall(string.gsub, ("a"):rep(600), "a+a+b", ""))"#,
+                r#"return select(2, pcall(string.find, ("a"):rep(1e6), ("a"):rep(1e5) .. "b", 1, true))"#,
+            ] {
+                let err = probe(src).unwrap();
+                assert!(err.contains("too costly"), "{src}: {err}");
+            }
+        });
     }
 
     #[test]
     fn a_loop_of_admitted_patterns_stops_at_the_deadline() {
-        // Each call is under the budget (a few ms), and ~200 of them fit
-        // between two hook runs. The call itself must check the deadline.
-        let src = r#"
+        finish_within(Duration::from_secs(5), || {
+            // Each call is under the budget (a few ms), and ~200 of them fit
+            // between two hook runs. The call itself must check the deadline.
+            let src = r#"
             local s = ("a"):rep(1200)
             for i = 1, 1e9 do s:find("a*b") end
         "#;
-        let start = Instant::now();
-        let err = probe(src).unwrap_err();
-        let took = start.elapsed();
-        assert!(err.contains("limit exceeded"), "{err}");
-        assert!(took < Duration::from_millis(400), "took {took:?}");
+            let start = Instant::now();
+            let err = probe(src).unwrap_err();
+            let took = start.elapsed();
+            assert!(err.contains("limit exceeded"), "{err}");
+            assert!(took < Duration::from_millis(400), "took {took:?}");
+        });
     }
 
     #[test]
@@ -2733,6 +2981,127 @@ mod tests {
         while slot.load(Ordering::Relaxed) > 0 {
             end_spawn(&slot);
         }
+    }
+
+    #[test]
+    fn bytecode_scanner_sees_close_in_nested_functions_not_in_strings() {
+        let (lua, _) = open_sandbox(Limits::production()).unwrap();
+        let nested = compile_text(
+            &lua,
+            "local function f()\n  local x <close> = nil\nend\nreturn 1\n",
+            "nested",
+        );
+        assert!(
+            nested.is_err(),
+            "a nested <close> must be refused before it runs"
+        );
+        let plain = lua
+            .load("return 'local x <close> = 1\\55'")
+            .set_mode(ChunkMode::Text)
+            .into_function()
+            .unwrap();
+        assert_eq!(bytecode_arms_close(&plain.dump(true)), Ok(false));
+        let with_upvalue = lua
+            .load("local a = 'hello'\nlocal function f()\n  return a .. 'local x <close>'\nend\nreturn 1\n")
+            .set_mode(ChunkMode::Text)
+            .into_function()
+            .unwrap();
+        assert_eq!(bytecode_arms_close(&with_upvalue.dump(true)), Ok(false));
+        let inner = lua
+            .load("local function f()\n  local x <close> = nil\nend\n")
+            .set_mode(ChunkMode::Text)
+            .into_function()
+            .unwrap();
+        assert_eq!(bytecode_arms_close(&inner.dump(true)), Ok(true));
+    }
+
+    #[test]
+    fn a_close_variable_cannot_run_a_loop_after_the_budget() {
+        finish_within(Duration::from_secs(5), || {
+            let dir = scratch("close");
+            let src = "local x <close> = setmetatable({}, {__close=function() while true do end end})\nwhile true do end\nconfig.font_size = 4\n";
+            fs::write(dir.join("config.lua"), src).unwrap();
+            let mut cfg = json_cfg(r#"{"font_size":12.0}"#);
+            approve(&mut cfg, src.as_bytes());
+            let out = load_with(&cfg, &dir, false);
+            assert!(
+                out.errors.iter().any(|e| e.contains("<close>")),
+                "{:?}",
+                out.errors
+            );
+            assert_ne!(out.config.font_size, Some(4.0));
+
+            let plugins = dir.join("plugins");
+            fs::create_dir_all(&plugins).unwrap();
+            let plug = r#"
+                bayan.bind("f12", function()
+                  local x <close> = setmetatable({}, {__close=function() while true do end end})
+                  while true do end
+                  bayan.send("ran")
+                end)
+            "#;
+            fs::write(plugins.join("hello.lua"), plug).unwrap();
+            let mut pcfg = plugin_cfg(&plugins, "hello", false);
+            approve(&mut pcfg, plug.as_bytes());
+            let mut out = load_with(&pcfg, &dir, false);
+            assert!(
+                out.errors.iter().any(|e| e.contains("<close>")),
+                "{:?}",
+                out.errors
+            );
+            assert!(out.plugins.fire("f12").is_empty());
+            let _ = fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn a_close_handler_assigned_after_setmetatable_is_rejected() {
+        finish_within(Duration::from_secs(5), || {
+            let dir = scratch("late-close");
+            let src = r#"
+                local mt = {}
+                local o = setmetatable({}, mt)
+                mt.__close = function() while true do end end
+                local x <close> = o
+                while true do end
+                config.font_size = 4
+            "#;
+            fs::write(dir.join("config.lua"), src).unwrap();
+            let mut cfg = json_cfg(r#"{"font_size":12.0}"#);
+            approve(&mut cfg, src.as_bytes());
+            let out = load_with(&cfg, &dir, false);
+            assert!(
+                out.errors.iter().any(|e| e.contains("<close>")),
+                "{:?}",
+                out.errors
+            );
+            assert_ne!(out.config.font_size, Some(4.0));
+
+            let plugins = dir.join("plugins");
+            fs::create_dir_all(&plugins).unwrap();
+            let plug = r#"
+                local function arm()
+                  local mt = {}
+                  local o = setmetatable({}, mt)
+                  mt.__close = function() while true do end end
+                  local ok, f = pcall(load, "local x <close> = ...\nwhile true do end\n")
+                  if ok and f then f(o) end
+                end
+                bayan.bind("f12", function()
+                  arm()
+                  bayan.send("ran")
+                end)
+            "#;
+            fs::write(plugins.join("hello.lua"), plug).unwrap();
+            let mut pcfg = plugin_cfg(&plugins, "hello", false);
+            approve(&mut pcfg, plug.as_bytes());
+            let mut out = load_with(&pcfg, &dir, false);
+            assert!(out.errors.is_empty(), "{:?}", out.errors);
+            let sent = out.plugins.fire("f12");
+            assert_eq!(sent.len(), 1, "load of <close> must fail before the loop");
+            assert_eq!(sent[0].text, "ran");
+            let _ = fs::remove_dir_all(&dir);
+        });
     }
 
     fn feed_terminal(bytes: &[u8]) {
