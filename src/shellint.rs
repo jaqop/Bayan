@@ -421,7 +421,12 @@ const BASH_ELEVATED_ENV: &str = r#"
 # this bash's own install.
 # A launcher that already chose MSYSTEM is kept.
 # Tab completion must not follow HOME back to the user's files.
-__bayan_completion_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/bash-completion
+# Do not cd to this path: a Windows rcfile path can look like a network
+# share to MSYS and the cd then waits until the test kills it.
+__bayan_here=${BASH_SOURCE[0]}
+__bayan_here=${__bayan_here//\\//}
+__bayan_completion_dir="${__bayan_here%/*}/bash-completion"
+unset __bayan_here
 __bayan_bash=${BASH:-$(command -v bash 2>/dev/null)}
 case "$__bayan_bash" in
   [A-Za-z]:*)
@@ -2446,8 +2451,9 @@ mod tests {
         for (name, rc) in [("git", git), ("wsl", wsl)] {
             assert!(
                 rc.contains("__bayan_completion_dir=")
-                    && (rc.contains("__bayan_completion_dir=$(CDPATH=")
-                        || rc.contains("__bayan_completion_dir=$__bayan_safe/bash-completion")),
+                    && (rc.contains(
+                        r#"__bayan_completion_dir="${__bayan_here%/*}/bash-completion""#,
+                    ) || rc.contains("__bayan_completion_dir=$__bayan_safe/bash-completion")),
                 "{name} completion dir must be the rcfile directory:\n{rc}"
             );
             assert!(
