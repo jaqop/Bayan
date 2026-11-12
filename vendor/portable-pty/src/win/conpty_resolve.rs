@@ -474,7 +474,7 @@ pub(crate) fn signature_status(path: &str) -> i32 {
     let status = unsafe { WinVerifyTrust(std::ptr::null_mut(), &mut action, &mut data) };
     data.state_action = 2; // WTD_STATEACTION_CLOSE
     unsafe { WinVerifyTrust(std::ptr::null_mut(), &mut action, &mut data) };
-    status == 0
+    status
 }
 
 /// `true` when a standard user's medium token could write `path`. `None`
