@@ -164,6 +164,8 @@ pub(crate) struct Hits {
     pub shortcuts_open: bool,
     pub settings_open: bool,
     pub tab_control: Option<usize>,
+    /// The shell-menu arrow beside the tabs.
+    pub shell_arrow: bool,
     pub gear: bool,
     pub cockpit_open: bool,
     pub cockpit_row: Option<usize>,
@@ -193,6 +195,8 @@ pub(crate) enum LeftPress {
     Settings,
     /// A tab-bar arrow or plus. Consumed even when it does nothing.
     TabControl(usize),
+    /// The dropdown beside the tabs: a menu of shells for a new tab.
+    ShellArrow,
     /// The gear opens settings: a click is layout-proof, unlike Ctrl+,.
     OpenSettings,
     /// The cockpit swallows the click: pick a row or dismiss.
@@ -243,6 +247,7 @@ pub(crate) fn left_press(h: &Hits) -> LeftPress {
     }
     if h.card_open
         && (h.tab_control.is_some()
+            || h.shell_arrow
             || h.gear
             || h.divider.is_some()
             || h.tab.is_some()
@@ -253,6 +258,9 @@ pub(crate) fn left_press(h: &Hits) -> LeftPress {
     }
     if let Some(control) = h.tab_control {
         return LeftPress::TabControl(control);
+    }
+    if h.shell_arrow {
+        return LeftPress::ShellArrow;
     }
     if h.gear {
         return LeftPress::OpenSettings;
@@ -319,6 +327,7 @@ pub(crate) fn right_press(h: &Hits, overlay: bool) -> RightPress {
         || h.tab_close.is_some()
         || h.group_chip
         || h.tab_control.is_some()
+        || h.shell_arrow
         || h.drag_strip;
     let other_chrome = h.edge.is_some() || h.caption.is_some() || h.gear;
     if other_chrome || (on_bar && (overlay || h.card_open)) {
@@ -448,6 +457,20 @@ impl App {
         crate::layout::divider_at(&self.dividers(), pos.x, pos.y, DIVIDER_GRAB)
     }
 
+    /// The shell-menu arrow beside the tabs.
+    pub(crate) fn shell_arrow_at(&self, pos: PhysicalPosition<f64>) -> bool {
+        let (Some(r), Some(w)) = (self.renderer.as_ref(), self.window.as_ref()) else {
+            return false;
+        };
+        if r.tab_bar_h() == 0.0 || pos.y >= r.tab_bar_h() as f64 {
+            return false;
+        }
+        let pw = w.inner_size().width as usize;
+        let (labels, active) = self.visible_labels();
+        let titles: Vec<&str> = labels.iter().map(String::as_str).collect();
+        r.shell_arrow_hit(pw, &titles, active, pos.x, pos.y)
+    }
+
     /// The tab-bar arrow or plus under the pointer, and whether the gear is.
     fn tab_bar_controls_at(&self, pos: PhysicalPosition<f64>) -> (Option<usize>, bool) {
         let (Some(r), Some(w)) = (self.renderer.as_ref(), self.window.as_ref()) else {
@@ -469,6 +492,7 @@ impl App {
             shortcuts_open: self.shortcuts.is_some(),
             settings_open: self.settings.is_some(),
             tab_control,
+            shell_arrow: self.shell_arrow_at(pos),
             gear,
             cockpit_open: self.cockpit,
             cockpit_row: self.cockpit_row_hit(pos),

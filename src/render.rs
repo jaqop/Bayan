@@ -2319,6 +2319,8 @@ pub struct Renderer {
     pub hover_caption: Option<usize>,
     /// pointer over the settings gear
     pub hover_gear: bool,
+    /// pointer over the shell-menu arrow beside the tabs
+    pub hover_shell_arrow: bool,
     /// IME composition text, drawn at the focused cursor. winit keeps the
     /// IME's own composition window hidden, so this is the only place
     /// the text being composed shows.
@@ -2547,6 +2549,7 @@ impl Renderer {
             mapping_context: None,
             hover_caption: None,
             hover_gear: false,
+            hover_shell_arrow: false,
             preedit: None,
             ime_spot: None,
             font_system,
@@ -7198,6 +7201,38 @@ impl Renderer {
             self.draw_title_tip(out, whole, width, tx, &full);
         }
 
+        if let Some((bx, by, bw, bh)) = self.shell_arrow_rect(width, &titles, active) {
+            if self.hover_shell_arrow {
+                push_rect(
+                    out,
+                    whole,
+                    bx,
+                    by,
+                    bw,
+                    bh,
+                    c4(
+                        if self.high_contrast {
+                            self.chrome.card
+                        } else {
+                            caption_hover(self.bg, false)
+                        },
+                        255,
+                    ),
+                );
+            }
+            let seg = [Seg::plain("\u{25be}", self.chrome_fg())];
+            let gw = self.measure(&seg, false);
+            self.draw_run(
+                &seg,
+                false,
+                out,
+                whole,
+                bx as f32 + (bw as f32 - gw) / 2.0,
+                by + bh / 2 - self.cell_h as i32 / 2,
+                1.0,
+            );
+        }
+
         let elevated_w = elevated_label
             .map(|text| {
                 let segs = [Seg::plain(text, (0xf2, 0xcc, 0x60))];
@@ -7362,6 +7397,44 @@ impl Renderer {
             return None;
         }
         crate::chrome::rect_at(&self.tab_controls(width), px, py)
+    }
+
+    /// The shell-menu arrow beside the tabs, or nothing when it would
+    /// cover a tab or the ‹ › + cluster.
+    pub fn shell_arrow_rect(&self, width: usize, titles: &[&str], active: usize) -> Option<Rect> {
+        if self.bar_hidden {
+            return None;
+        }
+        let rects = self.tab_rects(width, titles, active);
+        let min_x = self.tabs_x0();
+        let first = rects.first().map(|r| r.1).unwrap_or(min_x);
+        let last_end = rects.last().map(|r| r.1 + r.2).unwrap_or(min_x);
+        let controls_x = self.tab_controls(width)[0].0;
+        let size = (self.ui_cell_w() * 1.7).round().max(22.0 * self.dpi_scale) as i32;
+        let bar_h = self.tab_bar_h().round() as i32;
+        crate::shellmenu::arrow_box(
+            first,
+            last_end,
+            controls_x,
+            min_x,
+            size,
+            4,
+            bar_h,
+            crate::lang::rtl(),
+        )
+        .map(|b| (b.x, b.y, b.w, b.h))
+    }
+
+    pub fn shell_arrow_hit(
+        &self,
+        width: usize,
+        titles: &[&str],
+        active: usize,
+        px: f64,
+        py: f64,
+    ) -> bool {
+        self.shell_arrow_rect(width, titles, active)
+            .is_some_and(|r| rect_hit(r, px, py))
     }
 
     /// The longest prefix of `title` (with "…" when cut) whose shaped width

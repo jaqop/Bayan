@@ -20,8 +20,8 @@
 //! 133 finish replaces that tail with a single exit-code sentence.
 
 use accesskit::{
-    Live, Node, NodeId, Role, TextDirection, TextPosition, TextSelection, TreeId, TreeInfo,
-    TreeUpdate,
+    HasPopup, Live, Node, NodeId, Role, TextDirection, TextPosition, TextSelection, TreeId,
+    TreeInfo, TreeUpdate,
 };
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
@@ -57,6 +57,7 @@ const ID_DIALOG: NodeId = NodeId(5);
 const ID_PALETTE_LIST: NodeId = NodeId(6);
 const ID_PALETTE_QUERY: NodeId = NodeId(7);
 const ID_DIALOG_BODY: NodeId = NodeId(8);
+const ID_SHELL_BUTTON: NodeId = NodeId(9);
 
 pub fn tab_node(index: usize) -> NodeId {
     NodeId(0x0001_0000 + index as u64)
@@ -636,8 +637,21 @@ pub struct PaletteItem {
     pub name: String,
     pub query: String,
     pub rows: Vec<String>,
+    /// What each row announces. Empty means the drawn `rows` label.
+    /// The shell menu puts the shell name here, without the default mark.
+    pub row_names: Vec<String>,
     pub selected: usize,
     pub menu: bool,
+    /// The tab-bar shell menu. Its rows are menu items of the arrow button.
+    pub shell_menu: bool,
+}
+
+/// The tab-bar button that opens the shell menu.
+#[derive(Clone, Debug)]
+pub struct ShellButton {
+    pub label: String,
+    /// The menu is closed and the button has focus (Esc returned here).
+    pub focused: bool,
 }
 
 /// A confirm card or an error card.
@@ -657,6 +671,8 @@ pub struct View {
     pub live: String,
     pub palette: Option<PaletteItem>,
     pub dialog: Option<DialogItem>,
+    /// The shell-menu arrow. Absent only in a test that does not draw chrome.
+    pub shell_button: Option<ShellButton>,
 }
 
 /// Full tree. AccessKit's proxy activation returns no initial tree, so
@@ -684,6 +700,17 @@ pub fn build_tree(view: &View) -> TreeUpdate {
     tabs.set_children(tab_ids);
     nodes.push((ID_TABS, tabs));
     root_children.push(ID_TABS);
+
+    if let Some(button) = &view.shell_button {
+        let mut node = Node::new(Role::Button);
+        node.set_label(button.label.clone());
+        node.set_has_popup(HasPopup::Menu);
+        if lang::rtl() {
+            node.set_text_direction(TextDirection::RightToLeft);
+        }
+        nodes.push((ID_SHELL_BUTTON, node));
+        root_children.push(ID_SHELL_BUTTON);
+    }
 
     let nested = view.tabs.iter().any(|tab| tab.selected);
     for pane in &view.panes {
@@ -732,6 +759,13 @@ fn focus_of(view: &View) -> NodeId {
         }
         let sel = palette.selected.min(palette.rows.len() - 1);
         return option_node(sel);
+    }
+    if view
+        .shell_button
+        .as_ref()
+        .is_some_and(|button| button.focused)
+    {
+        return ID_SHELL_BUTTON;
     }
     if view.panes.is_empty() {
         return ID_ROOT;
@@ -926,7 +960,16 @@ fn palette_nodes(palette: &PaletteItem) -> Vec<(NodeId, Node)> {
         } else {
             Role::ListBoxOption
         });
-        node.set_label(row.clone());
+        let spoken = palette
+            .row_names
+            .get(i)
+            .filter(|name| !name.is_empty())
+            .map(|name| name.as_str())
+            .unwrap_or(row);
+        node.set_label(spoken.to_string());
+        if lang::rtl() {
+            node.set_text_direction(TextDirection::RightToLeft);
+        }
         if i == sel && !palette.rows.is_empty() {
             node.set_selected(true);
         }
@@ -937,6 +980,12 @@ fn palette_nodes(palette: &PaletteItem) -> Vec<(NodeId, Node)> {
         let mut menu = Node::new(Role::Menu);
         menu.set_label(palette.name.clone());
         menu.set_children(row_ids);
+        if palette.shell_menu {
+            menu.set_popup_for(ID_SHELL_BUTTON);
+        }
+        if lang::rtl() {
+            menu.set_text_direction(TextDirection::RightToLeft);
+        }
         nodes.push((ID_PALETTE, menu));
         return nodes;
     }
@@ -1034,6 +1083,7 @@ mod tests {
             live: live_name().into(),
             palette: None,
             dialog: None,
+            shell_button: None,
         }
     }
 
@@ -1251,6 +1301,7 @@ mod tests {
             live: live_name().into(),
             palette: None,
             dialog: None,
+            shell_button: None,
         };
         let tree = build_tree(&view);
         let tabs = find(&tree, ID_TABS);
@@ -1329,6 +1380,7 @@ mod tests {
             live: live_name().into(),
             palette: None,
             dialog: None,
+            shell_button: None,
         };
         let tree = build_tree(&view);
         assert_eq!(tree.focus, pane_node(3, 1));
@@ -1351,8 +1403,10 @@ mod tests {
             name: palette_name().into(),
             query: "تبويب".into(),
             rows: vec!["تبويب جديد".into(), "نسخ".into()],
+            row_names: Vec::new(),
             selected: 1,
             menu: false,
+            shell_menu: false,
         });
         let tree = build_tree(&view);
         let palette = find(&tree, ID_PALETTE);
@@ -1395,6 +1449,45 @@ mod tests {
         let tree = build_tree(&view);
         assert_eq!(find(&tree, ID_DIALOG).role(), Role::Dialog);
         assert_eq!(find(&tree, ID_DIALOG).label(), Some(close.as_str()));
+    }
+
+    #[test]
+    fn the_shell_button_is_a_popup_and_each_row_announces_the_shell() {
+        let _lang = with_lang(Lang::Ar);
+        let mut view = one_pane("ready", (0, 0), None);
+        view.shell_button = Some(ShellButton {
+            label: "الطرفيات".into(),
+            focused: true,
+        });
+        let tree = build_tree(&view);
+        let button = find(&tree, ID_SHELL_BUTTON);
+        assert_eq!(button.role(), Role::Button);
+        assert_eq!(button.has_popup(), Some(HasPopup::Menu));
+        assert_eq!(button.label(), Some("الطرفيات"));
+        assert_eq!(button.text_direction(), Some(TextDirection::RightToLeft));
+        assert_eq!(tree.focus, ID_SHELL_BUTTON);
+
+        view.shell_button.as_mut().unwrap().focused = false;
+        view.palette = Some(PaletteItem {
+            name: "اختر الطرفية".into(),
+            query: String::new(),
+            rows: vec!["PowerShell · الافتراضية".into(), "Git Bash".into()],
+            row_names: vec!["PowerShell".into(), "Git Bash".into()],
+            selected: 1,
+            menu: true,
+            shell_menu: true,
+        });
+        let tree = build_tree(&view);
+        let menu = find(&tree, ID_PALETTE);
+        assert_eq!(menu.role(), Role::Menu);
+        assert_eq!(menu.label(), Some("اختر الطرفية"));
+        assert_eq!(menu.popup_for(), Some(ID_SHELL_BUTTON));
+        assert_eq!(find(&tree, option_node(0)).role(), Role::MenuItem);
+        assert_eq!(find(&tree, option_node(0)).label(), Some("PowerShell"));
+        let row = find(&tree, option_node(1));
+        assert_eq!(row.role(), Role::MenuItem);
+        assert_eq!(row.label(), Some("Git Bash"));
+        assert_eq!(tree.focus, option_node(1));
     }
 
     #[test]

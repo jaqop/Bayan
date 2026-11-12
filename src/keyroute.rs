@@ -367,6 +367,27 @@ impl App {
             }
             None => {}
         }
+        // Alt+Down opens the shell menu. The physical Down key, so an
+        // Arabic layout still reaches it. It is not a pane-focus step.
+        let down = event.physical_key == PhysicalKey::Code(KeyCode::ArrowDown);
+        if crate::shellmenu::alt_down_opens(alt, ctrl, shift, down) {
+            self.open_shell_from_arrow();
+            return;
+        }
+        if self.shell_arrow_focused && self.palette.is_none() {
+            match &event.logical_key {
+                Key::Named(NamedKey::Enter) => {
+                    self.open_shell_from_arrow();
+                    return;
+                }
+                Key::Named(NamedKey::Escape) => {
+                    self.shell_arrow_focused = false;
+                    self.request_redraw();
+                    return;
+                }
+                _ => self.shell_arrow_focused = false,
+            }
+        }
         if self.keymap_key(event, ctrl, shift, alt, el) {
             return;
         }
