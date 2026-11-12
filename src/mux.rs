@@ -562,7 +562,11 @@ pub fn owner_is_client(owner: &[u8], client: &[u8]) -> bool {
     !client.is_empty() && owner == client
 }
 
-/// SDDL for a pipe DACL: protected, one allow-all ACE, that SID only.
+/// SDDL for the pipe: owned by that SID, with a protected DACL of one
+/// allow-all ACE for that SID only. The owner is written out because the
+/// default is the token's, and for a token in the Administrators group
+/// that can be the group: the client's owner check would then refuse a
+/// pipe this same user created.
 /// `WD` (everyone), `BA` (admins) and a second ACE are not produced.
 /// The SID must already be an `S-1-…` string; anything else is rejected so
 /// a caller cannot smuggle extra ACEs through the SID text.
@@ -576,7 +580,7 @@ pub fn sddl_for_sid(sid: &str) -> Result<String, String> {
     {
         return Err("security identifier is not a single S-1 sid".into());
     }
-    Ok(format!("D:P(A;;GA;;;{sid})"))
+    Ok(format!("O:{sid}D:P(A;;GA;;;{sid})"))
 }
 
 /// Later instances of the same pipe omit `FILE_FLAG_FIRST_PIPE_INSTANCE`
@@ -2428,7 +2432,10 @@ mod tests {
     #[test]
     fn sddl_allows_only_the_given_sid_and_the_pipe_rejects_remote_clients() {
         let sddl = sddl_for_sid("S-1-5-21-1-2-3-1001").unwrap();
-        assert_eq!(sddl, "D:P(A;;GA;;;S-1-5-21-1-2-3-1001)");
+        assert_eq!(
+            sddl,
+            "O:S-1-5-21-1-2-3-1001D:P(A;;GA;;;S-1-5-21-1-2-3-1001)"
+        );
         assert_eq!(sddl.matches("(A;").count(), 1);
         assert!(!sddl.contains("WD"), "everyone");
         assert!(!sddl.contains("BA"), "builtin admins");
