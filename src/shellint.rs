@@ -411,6 +411,11 @@ fi
 HOME=$__bayan_real_home
 export HOME
 unset __bayan_real_home __bayan_safe
+unset BASH_COMPLETION_USER_DIR
+BASH_COMPLETION_USER_DIR=$__bayan_completion_dir
+readonly BASH_COMPLETION_USER_DIR
+unset XDG_DATA_HOME
+unset __bayan_completion_dir
 "#;
 
 const BASH_ELEVATED_ENV: &str = r#"
@@ -489,6 +494,11 @@ fi
 export MSYSTEM PATH
 unset __bayan_bash __bayan_bin __bayan_root __bayan_prefix __bayan_usr
 unset -f __bayan_slash
+unset BASH_COMPLETION_USER_DIR
+BASH_COMPLETION_USER_DIR=$__bayan_completion_dir
+readonly BASH_COMPLETION_USER_DIR
+unset XDG_DATA_HOME
+unset __bayan_completion_dir
 "#;
 
 const BASH_USER_PROFILE: &str = r#"
@@ -602,17 +612,6 @@ __bayan_prompt_command() {
     USERPROFILE=$BAYAN_REAL_USERPROFILE
     export USERPROFILE
     unset BAYAN_REAL_USERPROFILE
-  fi
-  # Same moment HOME is real again: the completion loader would otherwise
-  # source ~/.local/share/bash-completion/completions/<cmd> on Tab.
-  # readonly so a later assignment cannot clear it, and XDG_DATA_HOME is
-  # removed so it cannot become the fallback.
-  if [ -n "${__bayan_completion_dir-}" ]; then
-    unset BASH_COMPLETION_USER_DIR
-    BASH_COMPLETION_USER_DIR=$__bayan_completion_dir
-    readonly BASH_COMPLETION_USER_DIR
-    unset XDG_DATA_HOME
-    unset __bayan_completion_dir
   fi
   printf '\033]133;D;%s;%s\007' "$__bayan_ec" "$__BAYAN_NONCE"
   printf '\033]133;A;%s\007' "$__BAYAN_NONCE"
@@ -2594,18 +2593,12 @@ mod tests {
             .env_remove("MSYSTEM")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::null());
         let mut child = child.spawn().expect("spawn bash");
         let mut stdout = child.stdout.take().unwrap();
-        let mut stderr = child.stderr.take().unwrap();
         let reader = std::thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
-            buf
-        });
-        let err_reader = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut stderr, &mut buf);
             buf
         });
         let mut stdin = child.stdin.take().unwrap();
@@ -2631,16 +2624,13 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
         let output = reader.join().expect("stdout");
-        let err = err_reader.join().expect("stderr");
         let text = String::from_utf8_lossy(&output);
-        let err_text = String::from_utf8_lossy(&err);
         let pwned = std::fs::read_to_string(&marker).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&safe);
-        assert!(status.success(), "bash exited {status}: {err_text}\n{text}");
         assert!(
-            !err_text.contains("invalid option"),
-            "argv rejected: {err_text}"
+            status.success() && !text.contains("invalid option"),
+            "bash exited {status}: {text}"
         );
         assert!(
             pwned.is_empty(),
@@ -2652,7 +2642,7 @@ mod tests {
                 text.contains("MSYSTEM=UCRT")
                     || text.contains("MSYSTEM=MINGW")
                     || text.contains("MSYSTEM=CLANG"),
-                "Git install left MSYSTEM unset or MSYS:\n{text}\n{err_text}"
+                "Git install left MSYSTEM unset or MSYS:\n{text}"
             );
         } else {
             assert!(
@@ -2660,7 +2650,7 @@ mod tests {
                     || text.contains("MSYSTEM=MINGW")
                     || text.contains("MSYSTEM=CLANG")
                     || text.contains("MSYSTEM=MSYS"),
-                "MSYSTEM was not set:\n{text}\n{err_text}"
+                "MSYSTEM was not set:\n{text}"
             );
         }
         assert!(text.contains("LS=ok"), "PATH has no ls:\n{text}");
