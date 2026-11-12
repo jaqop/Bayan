@@ -63,10 +63,17 @@ pub struct UserConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub right_click: Option<String>,
     /// OSC 52 clipboard writes from the child. Off unless this is exactly
-    /// `"copy"`. There is no read setting: a query never returns clipboard
-    /// bytes, whatever this says. Writes also require the window to be focused.
+    /// `"copy"`. This string never enables a read — `"read"`, `"paste"`,
+    /// and `"on"` stay write-off and read-off. Writes also require the
+    /// window to be focused.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub osc52: Option<String>,
+    /// OSC 52 clipboard reads (`OSC 52 ; c ; ?`). Off unless this is exactly
+    /// `true`. Even then Bayan does not read the clipboard or write a reply
+    /// (not an empty one either); a later change does the read. A missing
+    /// key and `false` stay off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub osc52_read: Option<bool>,
     /// BEL behavior: "attention" (amber tab dot, default), "sound"
     /// (dot + system beep), "silent" (nothing).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -287,8 +294,15 @@ impl UserConfig {
 
     /// True only for an explicit `"copy"`. `"paste"`, `"read"`, `"on"`, and
     /// a missing key all stay off — a typo must not open the clipboard.
+    /// The read flag is separate and defaults off.
     pub fn osc52_copy_enabled(&self) -> bool {
         matches!(self.osc52.as_deref(), Some("copy"))
+    }
+
+    /// OSC 52 read. Exactly `true` in config; anything else, including a
+    /// missing key, is off. Turning it on does not by itself write a reply.
+    pub fn osc52_read_enabled(&self) -> bool {
+        self.osc52_read.unwrap_or(false)
     }
 
     pub fn cursor_blink_on(&self) -> bool {
@@ -573,8 +587,32 @@ mod tests {
                 !cfg.osc52_copy_enabled(),
                 "{off} must not enable a write or a read"
             );
+            assert!(!cfg.osc52_read_enabled(), "{off} must not enable a read");
         }
         let on: UserConfig = serde_json::from_str(r#"{"osc52":"copy"}"#).unwrap();
         assert!(on.osc52_copy_enabled());
+        assert!(!on.osc52_read_enabled(), "copy does not enable a read");
+    }
+
+    /// The read flag is its own key and defaults off. The `osc52` string
+    /// cannot turn it on.
+    #[test]
+    fn osc52_read_is_off_unless_explicitly_enabled() {
+        assert!(!UserConfig::default().osc52_read_enabled());
+        let missing: UserConfig = serde_json::from_str("{}").unwrap();
+        assert!(!missing.osc52_read_enabled());
+        let off: UserConfig = serde_json::from_str(r#"{"osc52_read":false}"#).unwrap();
+        assert!(!off.osc52_read_enabled());
+        let on: UserConfig = serde_json::from_str(r#"{"osc52_read":true}"#).unwrap();
+        assert!(on.osc52_read_enabled());
+        assert!(
+            !on.osc52_copy_enabled(),
+            "the read flag does not enable a write"
+        );
+        for text in ["read", "paste", "copy", "on"] {
+            let cfg: UserConfig =
+                serde_json::from_str(&format!(r#"{{"osc52":"{text}"}}"#)).unwrap();
+            assert!(!cfg.osc52_read_enabled(), "{text} must not enable a read");
+        }
     }
 }

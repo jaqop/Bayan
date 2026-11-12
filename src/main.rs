@@ -420,6 +420,10 @@ pub enum UserEvent {
     /// `allow_osc52_write` says so — the default is to drop it, and a write
     /// from any pane but the focused one of the active tab is dropped too.
     ClipboardSet(u64, String),
+    /// Pane `id` asked to read the clipboard (OSC 52). Forwarded so a later
+    /// change can answer it. This build writes no reply. The read flag
+    /// defaults off; see [`config::UserConfig::osc52_read_enabled`].
+    ClipboardLoad(u64, alacritty_terminal::term::ClipboardType),
     /// Pane `id`'s shell reported its working directory (OSC 7 or OSC 9;9).
     Cwd(u64, String),
     /// Pane `id` rang the bell (Claude waiting for an approval).
@@ -2869,6 +2873,9 @@ impl App {
             return;
         };
         let (cw, ch) = (r.cell_w, r.cell_h);
+        // Same cell the grid was measured with. `CSI 14 t` multiplies it
+        // by each pane's columns and rows.
+        term::set_text_area_cell(cw, ch);
         if let Some(t) = self.tabs.get_mut(self.active) {
             for (pane, rect) in t.panes.iter_mut().zip(&rects) {
                 if !rect_visible(rect) {
@@ -5103,6 +5110,11 @@ impl ApplicationHandler<UserEvent> for App {
                     self.report_error(tr("تعذر إرسال الإدخال", "Could not send input"), &error);
                 }
             }
+            UserEvent::ClipboardLoad(_id, _kind) => {
+                // No PTY reply. The read flag defaults off, and even when
+                // it is on this build does not read the clipboard or write
+                // an empty OSC 52. Item 31 is the read.
+            }
             UserEvent::ClipboardSet(id, text) => {
                 // has_focus, not the startup value of self.focused: that flag
                 // begins false and only tracks Focused events, which can lag
@@ -5220,6 +5232,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::RendererReady(r) => {
                 crate::prof::mark("renderer ready");
+                term::set_query_colors(r.query_colors());
                 self.renderer = Some(*r);
                 self.renderer_building = false;
                 // now that cell metrics exist, snap every pane to its rect
@@ -5574,6 +5587,7 @@ fn run() -> Result<(), String> {
     if let Some(v) = dev_hook("BAYAN_LANG") {
         lang::set(lang::Lang::from_config(v.to_str()));
     }
+    term::set_osc52_read(cfg.osc52_read_enabled());
     let keymap = keybinds::effective_map(&cfg);
     let mut app = App {
         posh: None,

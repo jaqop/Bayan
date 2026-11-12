@@ -2039,6 +2039,17 @@ impl Renderer {
         }
     }
 
+    /// What an OSC 4/10/11/12 query should hear: the colours this renderer
+    /// paints with. The cursor is drawn in the foreground colour.
+    pub fn query_colors(&self) -> crate::term::QueryColors {
+        let mut c = [self.fg; 259];
+        for (i, slot) in c.iter_mut().take(256).enumerate() {
+            *slot = self.ansi_rgb(AnsiColor::Indexed(i as u8));
+        }
+        c[257] = self.bg;
+        c
+    }
+
     fn ansi_rgb(&self, color: AnsiColor) -> (u8, u8, u8) {
         match color {
             AnsiColor::Named(n) => self.named_rgb(n),
@@ -7653,6 +7664,24 @@ mod cache_tests {
     /// colors) must actually change the renderer's bg/fg/palette. This is the
     /// heart of "settings change the appearance" — the complaint that started
     /// M15. Verified without any GUI.
+    #[test]
+    fn the_query_table_holds_the_colours_this_renderer_paints() {
+        let dracula = theme_by_name("Dracula").unwrap();
+        let cfg = crate::config::UserConfig {
+            theme: Some("Dracula".into()),
+            ..Default::default()
+        };
+        let r = Renderer::new(1.0, &cfg, 0.0);
+        let q = r.query_colors();
+        assert_eq!(q[257], dracula.bg, "OSC 11 hears the painted background");
+        assert_eq!(q[256], dracula.fg, "OSC 10");
+        assert_eq!(q[258], dracula.fg, "OSC 12: the cursor is drawn in fg");
+        assert_eq!(&q[..16], &dracula.palette[..]);
+        for i in [16u8, 100, 231, 232, 255] {
+            assert_eq!(q[i as usize], r.ansi_rgb(AnsiColor::Indexed(i)), "{i}");
+        }
+    }
+
     #[test]
     fn a_theme_changes_the_renderer_colors() {
         // default theme = بيان (dark GitHub-ish)
