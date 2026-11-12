@@ -966,9 +966,14 @@ macro. Elevated Git Bash is started with `--noprofile` and does not read
 `~/.config/git/git-prompt.sh` and `~/bash_completion.d/*.bash` as
 administrator. `PATH` and `MSYSTEM` are set from the Git install
 instead, and `HOME` and `USERPROFILE` are the integration directory
-until the first prompt, which puts the real home back. Elevated WSL bash still reads the
-distro's `/etc/profile`, with `HOME` pointed at the rcfile directory for
-that read and restored afterwards. Elevated zsh ends `.zlogin` with
+until the first prompt, which puts the real home back. `--noprofile`
+comes before `-i`; bash rejects a long option after a short one.
+Elevated WSL bash still reads the distro's `/etc/profile`, with `HOME`
+pointed at the rcfile directory for that read and restored afterwards.
+Once `HOME` is real again, `BASH_COMPLETION_USER_DIR` stays on the
+integration directory (Git Bash and WSL) so Tab does not source
+`~/.local/share/bash-completion/completions/<cmd>`, and
+`XDG_DATA_HOME` is cleared so it cannot redirect that path. Elevated zsh ends `.zlogin` with
 `unsetopt rcs`, so exit does not read `~/.zlogout`. oh-my-posh is not inited from the user
 profile. A failed elevation query is treated as elevated. Elevated scripts
 are created under the real ProgramData folder

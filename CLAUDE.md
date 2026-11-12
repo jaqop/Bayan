@@ -40,9 +40,9 @@ selection and BiDi paths must do.
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-532 tests in `src` (`cargo test --all-targets` does not run the vendored
+535 tests in `src` (`cargo test --all-targets` does not run the vendored
 `portable-pty` crate). `term.rs` (88), `link.rs` (61) and `render.rs` (65)
-carry the most; `shellint.rs` has 26 and `localpath.rs` has 21. Three more in
+carry the most; `shellint.rs` has 29 and `localpath.rs` has 21. Three more in
 `term.rs` are `#[ignore]`d probes, run by hand (see Measuring).
 
 ## Measuring
@@ -177,12 +177,17 @@ the user's rc files. An elevated token must not source `~/.bashrc`,
 `~/.bash_profile`, `~/.inputrc`, or the zsh home files: set `INPUTRC` and
 `HISTFILE` to `/dev/null`. Elevated Git Bash is `--noprofile` and must
 not source `/etc/profile` (its `git-prompt.sh` runs user files); set
-`PATH` and `MSYSTEM` from the bash install, and start with `HOME` and
-`USERPROFILE` on the integration directory. The first prompt restores
-them. Elevated WSL bash still reads the
-distro profile with `HOME` pointed at the rcfile directory. A failed
-elevation query is treated as elevated. `shellint::is_elevated` is a copy
-of the check in PR #59; delete one of them when both are on `bayan-plus`.
+`PATH` and `MSYSTEM` from the bash install (`ucrt64` before `mingw64`),
+and start with `HOME` and `USERPROFILE` on the integration directory.
+The first prompt restores them. `--noprofile` is the first argument:
+bash rejects a long option after `-i`. Elevated WSL bash still reads the
+distro profile with `HOME` pointed at the rcfile directory. After that
+restore, `BASH_COMPLETION_USER_DIR` is the integration directory for
+both Git Bash and WSL, and `XDG_DATA_HOME` is unset, so Tab completion
+does not source the user's files. A failed
+elevation query is treated as elevated. `is_elevated` exists in four
+copies (#59 `elevate.rs` and `lua_host.rs`, this file, #67 `mux.rs`).
+Keep the `elevate.rs` copy at merge time and call it from the others.
 The script directory comes from `SHGetKnownFolderPath(FOLDERID_ProgramData)`
 when elevated, never from the `PROGRAMDATA` environment variable. It is a
 random name with a DACL that is not world-writable, and zsh's `ZDOTDIR` is

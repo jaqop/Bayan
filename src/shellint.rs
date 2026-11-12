@@ -116,10 +116,10 @@ fn bash_plan(args: &[String], elevated: bool, mut env: Vec<(String, String)>) ->
     }
     let mut bash_argv = bash_args(args, "@file:bash.sh");
     if elevated && !bash_argv.iter().any(|a| a == "--noprofile") {
-        // `--login` is already gone. `--noprofile` also stops a bash that
-        // still treats itself as a login shell from reading /etc/profile
-        // before the rcfile.
-        bash_argv.push("--noprofile".to_string());
+        // Long options have to precede the first short option. bash
+        // rejects `--noprofile` after `-i` (`--: invalid option`, exit 2)
+        // and the pane never reaches a prompt.
+        bash_argv.insert(0, "--noprofile".into());
     }
     Some(Plan {
         kind: ShellKind::Bash,
@@ -153,8 +153,11 @@ fn wsl_plan(args: &[String], elevated: bool, mut env: Vec<(String, String)>) -> 
     launch.push(wsl_launcher());
     // WSL's own interactive start is a login shell. The rcfile imitates
     // that, because `-e` would otherwise skip `/etc/profile`. Elevated
-    // reads `/etc/profile` with HOME pointed at the rcfile directory, so a
-    // profile snippet cannot run a file from the user's home.
+    // reads that profile with HOME pointed at the rcfile directory.
+    // After HOME is restored, bash-completion loads the user's
+    // `completions/<cmd>` on Tab, so `BASH_COMPLETION_USER_DIR` stays
+    // on the integration directory and `XDG_DATA_HOME` cannot send it
+    // back to the user's files.
     let source_user = !elevated;
     if elevated {
         push_safe_readline(&mut env);
@@ -393,15 +396,21 @@ const BASH_SYSTEM_PROFILE_SAFE_HOME: &str = r#"
 # WSL elevated login. The distro's /etc/profile is not user-writable, but a
 # snippet in it can name a file under $HOME. HOME is this rcfile's directory
 # for that read (the protected integration directory), then restored.
+# bash-completion's lazy loader then reads
+# ${BASH_COMPLETION_USER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion}
+# on Tab. The directory stays the integration directory, and clearing
+# XDG_DATA_HOME means it cannot point back at the user's files.
 __bayan_real_home=$HOME
-HOME=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+__bayan_safe=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+__bayan_completion_dir=$__bayan_safe/bash-completion
+HOME=$__bayan_safe
 export HOME
 if [ -r /etc/profile ]; then
   . /etc/profile
 fi
 HOME=$__bayan_real_home
 export HOME
-unset __bayan_real_home
+unset __bayan_real_home __bayan_safe
 "#;
 
 const BASH_ELEVATED_ENV: &str = r#"
@@ -411,6 +420,8 @@ const BASH_ELEVATED_ENV: &str = r#"
 # the real profile from executing those files. PATH and MSYSTEM come from
 # this bash's own install.
 # A launcher that already chose MSYSTEM is kept.
+# Tab completion must not follow HOME back to the user's files.
+__bayan_completion_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/bash-completion
 __bayan_bash=${BASH:-$(command -v bash 2>/dev/null)}
 case "$__bayan_bash" in
   [A-Za-z]:*)
@@ -430,8 +441,18 @@ case "$__bayan_bin" in
     ;;
 esac
 if [ -z "${MSYSTEM:-}" ]; then
-  if [ -n "$__bayan_root" ] && [ -d "$__bayan_root/mingw64/bin" ]; then
+  # Git for Windows 2.56 ships ucrt64 and no mingw64. usr/bin/bash does
+  # not set MSYSTEM itself, so the first layout that exists wins.
+  if [ -n "$__bayan_root" ] && [ -d "$__bayan_root/ucrt64/bin" ]; then
+    MSYSTEM=UCRT64
+  elif [ -n "$__bayan_root" ] && [ -d "$__bayan_root/mingw64/bin" ]; then
     MSYSTEM=MINGW64
+  elif [ -n "$__bayan_root" ] && [ -d "$__bayan_root/clangarm64/bin" ]; then
+    MSYSTEM=CLANGARM64
+  elif [ -n "$__bayan_root" ] && [ -d "$__bayan_root/mingw32/bin" ]; then
+    MSYSTEM=MINGW32
+  elif [ -n "$__bayan_root" ] && [ -d "$__bayan_root/clang64/bin" ]; then
+    MSYSTEM=CLANG64
   else
     MSYSTEM=MSYS
   fi
@@ -576,6 +597,17 @@ __bayan_prompt_command() {
     USERPROFILE=$BAYAN_REAL_USERPROFILE
     export USERPROFILE
     unset BAYAN_REAL_USERPROFILE
+  fi
+  # Same moment HOME is real again: the completion loader would otherwise
+  # source ~/.local/share/bash-completion/completions/<cmd> on Tab.
+  # readonly so a later assignment cannot clear it, and XDG_DATA_HOME is
+  # removed so it cannot become the fallback.
+  if [ -n "${__bayan_completion_dir-}" ]; then
+    unset BASH_COMPLETION_USER_DIR
+    BASH_COMPLETION_USER_DIR=$__bayan_completion_dir
+    readonly BASH_COMPLETION_USER_DIR
+    unset XDG_DATA_HOME
+    unset __bayan_completion_dir
   fi
   printf '\033]133;D;%s;%s\007' "$__bayan_ec" "$__BAYAN_NONCE"
   printf '\033]133;A;%s\007' "$__BAYAN_NONCE"
@@ -953,23 +985,39 @@ pub(crate) fn materialize(plan: &Plan) -> Result<Materialized, String> {
         env.push((key.clone(), path.display().to_string()));
     }
     if elevated && plan.kind == ShellKind::Bash {
-        pin_elevated_bash_home(&mut env, &dir);
+        let real_home = std::env::var("HOME").ok();
+        let real_profile = std::env::var("USERPROFILE").ok();
+        pin_elevated_bash_home(
+            &mut env,
+            &dir,
+            real_home.as_deref(),
+            real_profile.as_deref(),
+        );
     }
     let dir = cleanup.disarm();
     Ok(Materialized { args, env, dir })
 }
 
-/// Git for Windows reads `git-prompt.sh` from the home it sees at process
-/// start, before `--rcfile` and despite `--noprofile`. Point `HOME` and
-/// `USERPROFILE` at the integration directory for that read. The rcfile
-/// puts the real values back on the first prompt.
-fn pin_elevated_bash_home(env: &mut Vec<(String, String)>, safe_dir: &Path) {
+/// Git for Windows compiles `SYS_BASHRC` to `/etc/bash.bashrc`, and that
+/// file sources `git-prompt.sh` for every interactive shell that is not a
+/// login shell. It runs before `--rcfile`. `--noprofile` does not stop it.
+/// Point `HOME` and `USERPROFILE` at the integration directory so that
+/// read cannot see the user's files. The first prompt puts the real
+/// values back.
+fn pin_elevated_bash_home(
+    env: &mut Vec<(String, String)>,
+    safe_dir: &Path,
+    real_home: Option<&str>,
+    real_userprofile: Option<&str>,
+) {
     let safe = safe_dir.display().to_string();
-    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-        env.push(("BAYAN_REAL_HOME".into(), home));
+    if let Some(home) = real_home.filter(|s| !s.is_empty()) {
+        env.push(("BAYAN_REAL_HOME".into(), home.to_string()));
+    } else if let Some(profile) = real_userprofile.filter(|s| !s.is_empty()) {
+        env.push(("BAYAN_REAL_HOME".into(), profile.to_string()));
     }
-    if let Ok(profile) = std::env::var("USERPROFILE") {
-        env.push(("BAYAN_REAL_USERPROFILE".into(), profile));
+    if let Some(profile) = real_userprofile.filter(|s| !s.is_empty()) {
+        env.push(("BAYAN_REAL_USERPROFILE".into(), profile.to_string()));
     }
     env.push(("HOME".into(), safe.clone()));
     env.push(("USERPROFILE".into(), safe));
@@ -1825,11 +1873,21 @@ mod tests {
             !rc.contains(". /etc/profile"),
             "elevated Git Bash must not source /etc/profile: {rc}"
         );
+        assert!(rc.contains("MSYSTEM=UCRT64"), "{rc}");
         assert!(rc.contains("MSYSTEM=MINGW64"), "{rc}");
-        assert!(rc.contains("/mingw64"), "{rc}");
+        let ucrt = rc.find("MSYSTEM=UCRT64").unwrap();
+        let mingw = rc.find("MSYSTEM=MINGW64").unwrap();
+        assert!(ucrt < mingw, "ucrt64 is preferred over mingw64: {rc}");
+        let noprofile = plan
+            .args
+            .iter()
+            .position(|a| a == "--noprofile")
+            .expect("--noprofile");
+        let interactive = plan.args.iter().position(|a| a == "-i").expect("-i");
         assert!(
-            plan.args.iter().any(|a| a == "--noprofile"),
-            "elevated bash must not be a profile login"
+            noprofile < interactive,
+            "long options must precede -i, got {:?}",
+            plan.args
         );
         assert!(!rc.contains(".bashrc"), "{rc}");
         assert!(rc.contains(r"printf '\033]133;D;%s;%s\007'"));
@@ -2335,7 +2393,12 @@ mod tests {
     fn elevated_bash_pins_home_to_the_script_directory() {
         let dir = Path::new(r"C:\ProgramData\bayan-si-abc");
         let mut env = Vec::new();
-        pin_elevated_bash_home(&mut env, dir);
+        pin_elevated_bash_home(
+            &mut env,
+            dir,
+            Some(r"C:\Users\someone"),
+            Some(r"C:\Users\someone"),
+        );
         assert_eq!(
             env.iter()
                 .find(|(k, _)| k == "HOME")
@@ -2348,11 +2411,57 @@ mod tests {
                 .map(|(_, v)| v.as_str()),
             Some(dir.to_str().unwrap())
         );
-        assert!(
+        assert_eq!(
             env.iter()
-                .any(|(k, v)| k == "BAYAN_REAL_HOME" && v != &dir.display().to_string()),
-            "the user's home must be kept aside"
+                .find(|(k, _)| k == "BAYAN_REAL_HOME")
+                .map(|(_, v)| v.as_str()),
+            Some(r"C:\Users\someone")
         );
+    }
+
+    #[test]
+    fn materialize_pins_the_elevated_bash_home() {
+        let plan = plan(bash_git(), true, true, NONCE).unwrap();
+        let done = materialize(&plan).expect("elevated materialize");
+        let dir = done.dir.clone().expect("integration dir");
+        let home = done
+            .env
+            .iter()
+            .find(|(k, _)| k == "HOME")
+            .map(|(_, v)| v.clone());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            home.as_deref(),
+            Some(dir.to_str().unwrap()),
+            "removing pin_elevated_bash_home from materialize leaves HOME unset"
+        );
+    }
+
+    #[test]
+    fn elevated_completion_user_dir_is_the_integration_directory() {
+        let git_plan = plan(bash_git(), true, true, NONCE).unwrap();
+        let wsl_plan = plan(r"C:\Windows\System32\wsl.exe -d Ubuntu", true, true, NONCE).unwrap();
+        let git = file(&git_plan, "bash.sh");
+        let wsl = file(&wsl_plan, "bash.sh");
+        for (name, rc) in [("git", git), ("wsl", wsl)] {
+            assert!(
+                rc.contains("__bayan_completion_dir=")
+                    && (rc.contains("__bayan_completion_dir=$(CDPATH=")
+                        || rc.contains("__bayan_completion_dir=$__bayan_safe/bash-completion")),
+                "{name} completion dir must be the rcfile directory:\n{rc}"
+            );
+            assert!(
+                rc.contains("BASH_COMPLETION_USER_DIR=$__bayan_completion_dir"),
+                "{name}"
+            );
+            assert!(rc.contains("unset XDG_DATA_HOME"), "{name}");
+            assert!(rc.contains("readonly BASH_COMPLETION_USER_DIR"), "{name}");
+            assert!(!rc.contains("BASH_COMPLETION_USER_DIR=$HOME"), "{name}");
+            assert!(
+                !rc.contains("BASH_COMPLETION_USER_DIR=${XDG_DATA_HOME"),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -2372,12 +2481,25 @@ mod tests {
             saved < user_pc,
             "HOME must be back before the user's prompt command"
         );
-        // WSL elevated still reads the distro profile, with HOME moved first.
-        let wsl = bash_rc(true, false, false);
-        let moved = wsl.find("__bayan_real_home=$HOME").unwrap();
-        let sourced = wsl.find(". /etc/profile").unwrap();
-        let restored = wsl.find("HOME=$__bayan_real_home").unwrap();
-        assert!(moved < sourced && sourced < restored, "{wsl}");
+    }
+
+    #[test]
+    fn elevated_wsl_moves_home_before_reading_the_profile() {
+        let plan = plan(r"C:\Windows\System32\wsl.exe -d Ubuntu", true, true, NONCE).unwrap();
+        let wsl = file(&plan, "bash.sh");
+        let saved = wsl.find("__bayan_real_home=$HOME").expect("save HOME");
+        let safe = wsl
+            .find("__bayan_safe=$(CDPATH=")
+            .expect("rcfile directory");
+        let moved = wsl.find("HOME=$__bayan_safe").expect("HOME moves");
+        let sourced = wsl.find(". /etc/profile").expect("profile");
+        let restored = wsl
+            .find("HOME=$__bayan_real_home")
+            .expect("HOME comes back");
+        assert!(
+            saved < safe && safe < moved && moved < sourced && sourced < restored,
+            "{wsl}"
+        );
     }
 
     #[test]
@@ -2438,47 +2560,62 @@ mod tests {
             format!("echo completion > '{marker_bash}'\n"),
         )
         .unwrap();
-        let rc_path = safe.join("bash.sh");
-        std::fs::write(&rc_path, bash_rc(true, false, true)).unwrap();
-        let mut child = std::process::Command::new(&bash)
-            .arg("--noprofile")
-            .arg("--rcfile")
-            .arg(&rc_path)
-            .arg("-i")
-            .env("HOME", &safe)
-            .env("USERPROFILE", &safe)
-            .env("BAYAN_REAL_HOME", &home)
-            .env("BAYAN_REAL_USERPROFILE", &home)
+        let planned = plan(bash_git(), true, true, NONCE).unwrap();
+        for (rel, body) in &planned.files {
+            let path = safe.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, body).unwrap();
+        }
+        let home_str = home.display().to_string();
+        let mut env = planned.env.clone();
+        pin_elevated_bash_home(&mut env, &safe, Some(&home_str), Some(&home_str));
+        let mut child = std::process::Command::new(&bash);
+        for arg in &planned.args {
+            if let Some(rel) = arg.strip_prefix("@file:") {
+                child.arg(safe.join(rel));
+            } else {
+                child.arg(arg);
+            }
+        }
+        for (key, value) in &env {
+            child.env(key, value);
+        }
+        child
             .env("BAYAN_PROMPT_NONCE", "n0nce")
-            .env("INPUTRC", "/dev/null")
-            .env("HISTFILE", "/dev/null")
             .env_remove("BASH_ENV")
+            .env_remove("MSYSTEM")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn bash");
+            .stderr(std::process::Stdio::piped());
+        let mut child = child.spawn().expect("spawn bash");
         let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
         let reader = std::thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
             buf
         });
+        let err_reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stderr, &mut buf);
+            buf
+        });
         let mut stdin = child.stdin.take().unwrap();
         use std::io::Write;
-        writeln!(stdin, "printf 'MSYSTEM=%s\\n' \"$MSYSTEM\"").unwrap();
-        writeln!(stdin, "printf 'AFTER=%s\\n' \"$HOME\"").unwrap();
-        writeln!(
+        let _ = writeln!(stdin, "printf 'MSYSTEM=%s\\n' \"$MSYSTEM\"");
+        let _ = writeln!(stdin, "printf 'AFTER=%s\\n' \"$HOME\"");
+        let _ = writeln!(
             stdin,
             "command -v ls >/dev/null && printf 'LS=ok\\n' || printf 'LS=missing\\n'"
-        )
-        .unwrap();
-        writeln!(stdin, "exit").unwrap();
+        );
+        let _ = writeln!(stdin, "exit");
         drop(stdin);
         let start = std::time::Instant::now();
-        loop {
-            if child.try_wait().ok().flatten().is_some() {
-                break;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait") {
+                break status;
             }
             if start.elapsed() > std::time::Duration::from_secs(20) {
                 let _ = child.kill();
@@ -2486,20 +2623,40 @@ mod tests {
                 panic!("bash did not exit");
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        };
         let output = reader.join().expect("stdout");
+        let err = err_reader.join().expect("stderr");
         let text = String::from_utf8_lossy(&output);
+        let err_text = String::from_utf8_lossy(&err);
         let pwned = std::fs::read_to_string(&marker).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&safe);
+        assert!(status.success(), "bash exited {status}: {err_text}\n{text}");
+        assert!(
+            !err_text.contains("invalid option"),
+            "argv rejected: {err_text}"
+        );
         assert!(
             pwned.is_empty(),
             "user git-prompt ran as the elevated shell: {pwned}\n{text}"
         );
-        assert!(
-            text.contains("MSYSTEM=MINGW") || text.contains("MSYSTEM=MSYS"),
-            "MSYSTEM was not set:\n{text}"
-        );
+        let bash_path = bash.to_string_lossy().to_ascii_lowercase();
+        if bash_path.contains("\\git\\") || bash_path.contains("/git/") {
+            assert!(
+                text.contains("MSYSTEM=UCRT")
+                    || text.contains("MSYSTEM=MINGW")
+                    || text.contains("MSYSTEM=CLANG"),
+                "Git install left MSYSTEM unset or MSYS:\n{text}\n{err_text}"
+            );
+        } else {
+            assert!(
+                text.contains("MSYSTEM=UCRT")
+                    || text.contains("MSYSTEM=MINGW")
+                    || text.contains("MSYSTEM=CLANG")
+                    || text.contains("MSYSTEM=MSYS"),
+                "MSYSTEM was not set:\n{text}\n{err_text}"
+            );
+        }
         assert!(text.contains("LS=ok"), "PATH has no ls:\n{text}");
         assert!(
             text.contains("bayan-elev-home-"),
