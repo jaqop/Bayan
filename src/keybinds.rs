@@ -34,10 +34,11 @@ pub enum Action {
     NextGroup,
     PrevGroup,
     CopyMode,
+    CopyClean,
 }
 
 impl Action {
-    pub const ALL: [Action; 21] = [
+    pub const ALL: [Action; 22] = [
         Action::NewTab,
         Action::ClosePane,
         Action::Search,
@@ -59,6 +60,7 @@ impl Action {
         Action::NextGroup,
         Action::PrevGroup,
         Action::CopyMode,
+        Action::CopyClean,
     ];
 
     /// The config.json key.
@@ -85,6 +87,7 @@ impl Action {
             Action::NextGroup => "next-group",
             Action::PrevGroup => "prev-group",
             Action::CopyMode => "copy-mode",
+            Action::CopyClean => "copy-clean",
         }
     }
 
@@ -125,6 +128,7 @@ impl Action {
             Action::NextGroup => crate::lang::pick(lang, "المجموعة التالية", "Next group"),
             Action::PrevGroup => crate::lang::pick(lang, "المجموعة السابقة", "Previous group"),
             Action::CopyMode => crate::lang::pick(lang, "وضع النسخ", "Copy mode"),
+            Action::CopyClean => crate::lang::pick(lang, "نسخ نظيف", "Copy clean"),
         }
     }
 
@@ -167,6 +171,8 @@ impl Action {
             Action::PrevGroup => c(true, true, PageUp),
             // X: WezTerm's ActivateCopyMode chord
             Action::CopyMode => c(true, true, Letter('x')),
+            // Y for yank, cleaned. X is copy mode.
+            Action::CopyClean => c(true, true, Letter('y')),
         }
     }
 }
@@ -564,6 +570,28 @@ mod tests {
         assert_eq!(
             lookup(&defaults, Action::ResetKeyboard.default_chord()),
             Some(Action::ResetKeyboard)
+        );
+    }
+
+    #[test]
+    fn copy_clean_reaches_a_full_screen_tui_and_does_not_take_copy_mode() {
+        let map = effective_map(&crate::config::UserConfig::default());
+        let clean = Action::CopyClean.default_chord();
+        assert_eq!(clean, Chord::parse("ctrl+shift+y").unwrap());
+        for alt_screen in [false, true] {
+            assert_eq!(
+                resolve(&map, clean, alt_screen, true),
+                Some(Action::CopyClean),
+                "alt_screen={alt_screen}"
+            );
+            assert_eq!(
+                resolve(&map, clean, alt_screen, false),
+                Some(Action::CopyClean)
+            );
+        }
+        assert_eq!(
+            resolve(&map, Chord::parse("ctrl+shift+x").unwrap(), true, false),
+            Some(Action::CopyMode)
         );
     }
 

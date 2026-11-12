@@ -464,6 +464,18 @@ impl App {
     fn copy_mode_key(&mut self, event: &KeyEvent, shift: bool) {
         use copymode::Cmd;
         let ctrl = self.modifiers.control_key();
+        let alt = self.modifiers.alt_key();
+        // The copy-clean chord yanks and leaves even when `copy.clean` is
+        // off, and even though copy mode would otherwise swallow it. `y`,
+        // Enter and Ctrl+C stay on copy_selection, so the setting (including
+        // claude_mode) covers an ordinary copy-mode yank.
+        if let Some(chord) = keybinds::chord_from(event.physical_key, ctrl, shift, alt) {
+            if keybinds::lookup(&self.keymap, chord) == Some(keybinds::Action::CopyClean) {
+                self.copy_selection_clean();
+                self.exit_copy_mode();
+                return;
+            }
+        }
         let rtl = self.copy_cursor_rtl();
         let Some(cmd) = copymode::command(event.physical_key, &event.logical_key, ctrl, shift, rtl)
         else {

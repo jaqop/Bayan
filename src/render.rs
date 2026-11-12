@@ -4131,10 +4131,19 @@ impl Renderer {
         let rowh = (room / (n as i32).max(1)).clamp(tight, roomy);
         let h = head_h + 6 + rowh * n as i32 + foot_h;
         let x = (fw as i32 - w) / 2;
-        // a third of the spare height above, but never past the bottom
-        let y = (bar + (fh as i32 - h) / 3)
-            .min(fh as i32 - h - 12)
-            .max(bar + 12);
+        // a third of the spare height above, but never past the bottom.
+        // A registry that fills the window sits against the tab bar instead
+        // of running off the bottom edge.
+        let y = {
+            let placed = (bar + (fh as i32 - h) / 3)
+                .min(fh as i32 - h - 12)
+                .max(bar + 12);
+            if placed + h > fh as i32 {
+                bar.max(fh as i32 - h)
+            } else {
+                placed
+            }
+        };
         let rows_top = y + head_h + 6;
         let rows = (0..n as i32)
             .map(|i| (x + 8, rows_top + rowh * i, w - 16, rowh))
