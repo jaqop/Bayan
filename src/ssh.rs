@@ -19,6 +19,12 @@ pub fn label_open() -> &'static str {
     crate::lang::tr("فتح SSH", "Open SSH")
 }
 
+/// An elevated window does not offer SSH. `~/.ssh/config` can name a
+/// `ProxyCommand`, and that would otherwise run as admin.
+pub fn offered(elevated: bool) -> bool {
+    !elevated
+}
+
 /// Why a destination was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SshError {
@@ -485,5 +491,14 @@ host Second
         assert_eq!(label_open(), "فتح SSH");
         crate::lang::set(crate::lang::Lang::En);
         assert_eq!(label_open(), "Open SSH");
+    }
+
+    #[test]
+    fn elevated_window_does_not_offer_ssh() {
+        assert!(offered(false));
+        assert!(
+            !offered(true),
+            "an elevated window must not run ~/.ssh/config as admin"
+        );
     }
 }

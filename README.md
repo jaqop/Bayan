@@ -908,14 +908,16 @@ DACL allows only the current user's SID, the first instance is created with
 `PIPE_REJECT_REMOTE_CLIENTS`. The client opens the pipe with identification
 QoS and accepts it only when the owner and the server process are that same
 SID, so another account cannot sit on the name and read keystrokes. An
-elevated window does not start the server and does not connect: the pipe
-name is only the user SID, and a normal process of that user must not be
-able to ask an admin server to spawn a program. Several windows can connect
+elevated window does not start the server, does not connect, and does not
+offer «فتح SSH», so a `ProxyCommand` in `~/.ssh/config` does not run as
+admin. The pipe name is only the user SID, and a normal process of that
+user must not be able to ask an admin server to spawn a program. Several windows can connect
 at once; each gets its own pipe instance. «فصل الجلسة» drops the tab and
 leaves the session running in the server. «إعادة الاتصال» lists those
-sessions and opens one again. The replay is capped at 256 KiB, starts on a
-UTF-8 and escape-sequence boundary, and device queries (`CSI 6n`, `CSI c`,
-OSC `?`) are removed so they are not answered into the live session.
+sessions and opens one again. The replay is capped at 256 KiB and starts on a UTF-8 and escape-sequence
+boundary. While those bytes are painted, every reply the parser would
+write — DA, DSR, colour queries, DECRQSS, XTVERSION, and anything else —
+is dropped, so nothing is typed into the live session.
 «إنهاء الجلسة» kills one. Closing the window kills sessions that are still
 attached and leaves the server running while any detached session remains.
 The server process exits when the last session ends, and a child exit keeps

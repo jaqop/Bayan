@@ -2014,8 +2014,11 @@ impl App {
             })
             .unwrap_or_default();
         let mut extras = palette_extras(&self.shell_profiles, &links);
-        extras.push((PaletteRow::OpenSsh, ssh::label_open().to_string()));
-        if self.config.mux_enabled() {
+        let elevated = mux::is_elevated();
+        if ssh::offered(elevated) {
+            extras.push((PaletteRow::OpenSsh, ssh::label_open().to_string()));
+        }
+        if mux::mux_may_run(self.config.mux_enabled(), elevated) {
             extras.push((PaletteRow::DetachSession, mux::label_detach().to_string()));
             extras.push((PaletteRow::OpenDetached, mux::label_reattach().to_string()));
         }
@@ -2878,6 +2881,9 @@ impl App {
     }
 
     fn open_ssh_menu(&mut self) {
+        if !ssh::offered(mux::is_elevated()) {
+            return;
+        }
         let hosts = ssh::host_list(&self.config.ssh_hosts, &ssh::read_user_config());
         if hosts.is_empty() {
             self.blocked_link = Some(BlockedLink {
@@ -2908,6 +2914,9 @@ impl App {
     }
 
     fn open_ssh_host(&mut self, token: &str) {
+        if !ssh::offered(mux::is_elevated()) {
+            return;
+        }
         let dir = ssh::system32_dir();
         let launch = match ssh::prepare_launch(dir.as_deref(), |p| p.is_file(), token) {
             Ok(launch) => launch,
@@ -3010,6 +3019,7 @@ impl App {
                 on_resize: Some(attached.on_resize),
                 on_kill: Some(attached.on_kill),
             },
+            replay: attached.replay,
         })
         .map_err(|error| {
             eprintln!("bayan: mux pane failed: {error}");
@@ -4545,8 +4555,11 @@ impl App {
                 (t.panes.len(), t.zoomed, t.broadcast)
             });
         let mut rows = context_menu_rows(self.has_selection(), panes, zoomed, broadcast);
-        rows.push((PaletteRow::OpenSsh, ssh::label_open().to_string()));
-        if self.config.mux_enabled() {
+        let elevated = mux::is_elevated();
+        if ssh::offered(elevated) {
+            rows.push((PaletteRow::OpenSsh, ssh::label_open().to_string()));
+        }
+        if mux::mux_may_run(self.config.mux_enabled(), elevated) {
             rows.push((PaletteRow::OpenDetached, mux::label_reattach().to_string()));
             if self.focused_is_mux() {
                 rows.push((PaletteRow::DetachSession, mux::label_detach().to_string()));

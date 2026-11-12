@@ -2020,6 +2020,46 @@ impl EventBatch {
     }
 }
 
+/// A reattach feeds saved output through the same parser as a live read.
+/// Every answer that parser would write — DA, DSR, colour queries, DECRQSS,
+/// XTVERSION, anything else — is dropped, so it cannot land in the live
+/// session's input.
+pub(crate) fn commit_replies(mut out: ChunkOutput, suppress: bool) -> ChunkOutput {
+    if suppress {
+        out.replies.clear();
+    }
+    out
+}
+
+/// Paint `data` and throw away every reply it provoked, including one that
+/// a still-open synchronized update would emit when it is closed.
+fn feed_replay(
+    term: &FairMutex<Term<EventProxy>>,
+    meta: &Mutex<SessionMeta>,
+    parser: &Mutex<Processor>,
+    batch: &Mutex<EventBatch>,
+    data: &[u8],
+) {
+    if data.is_empty() {
+        return;
+    }
+    let mut carry = Vec::new();
+    let mut t = term.lock();
+    let mut m = meta.lock_or_recover();
+    let mut p = parser.lock_or_recover();
+    batch.lock_or_recover().begin();
+    let ev = process_chunk(&mut p, &mut t, &mut m, &mut carry, data);
+    let _ = commit_replies(
+        batch
+            .lock_or_recover()
+            .finish(ev.clean_claude, ev.pty_replies),
+        true,
+    );
+    batch.lock_or_recover().begin();
+    p.stop_sync(&mut *t);
+    let _ = commit_replies(batch.lock_or_recover().finish(false, Vec::new()), true);
+}
+
 /// Whole replies only: a reply cut in half would be a broken sequence.
 fn push_reply(out: &mut String, reply: &str) {
     if out.len() + reply.len() <= MAX_CHUNK_REPLY_BYTES {
@@ -2182,6 +2222,9 @@ pub struct SessionArgs {
     pub kitty_protocol: bool,
     pub prompt_nonce: String,
     pub io: SessionIo,
+    /// Output already on screen when this pane attaches to a mux session.
+    /// Fed before the live reader, and its replies are not written back.
+    pub replay: Vec<u8>,
 }
 
 impl Session {
@@ -2291,6 +2334,7 @@ impl Session {
                 on_resize: None,
                 on_kill: None,
             },
+            replay: Vec::new(),
         })
     }
 
@@ -2307,6 +2351,7 @@ impl Session {
             kitty_protocol,
             prompt_nonce,
             io,
+            replay,
         } = args;
         let SessionIo {
             mut reader,
@@ -2339,6 +2384,7 @@ impl Session {
             ..SessionMeta::default()
         }));
         let parser = Arc::new(Mutex::new(Processor::new()));
+        feed_replay(&term, &meta, &parser, &batch, &replay);
         let capture_term = Arc::clone(&term);
         let capture_meta = Arc::clone(&meta);
         let error_proxy = proxy.clone();
@@ -2411,7 +2457,10 @@ impl Session {
                             let mut ev =
                                 process_chunk(&mut p, &mut t, &mut m, &mut carry, &buf[..n]);
                             let replies = std::mem::take(&mut ev.pty_replies);
-                            let out = batch.lock_or_recover().finish(ev.clean_claude, replies);
+                            let out = commit_replies(
+                                batch.lock_or_recover().finish(ev.clean_claude, replies),
+                                false,
+                            );
                             (ev, out, p.sync_timeout().sync_timeout())
                         };
                         if let Some(deadline) = sync_deadline {
@@ -4366,6 +4415,38 @@ mod tests {
         batch
             .lock_or_recover()
             .finish(ev.clean_claude, ev.pty_replies)
+    }
+
+    /// A reattach paints saved output through the same parser. Every reply
+    /// that parser would write has to be dropped, or it is typed into the
+    /// live session.
+    #[test]
+    fn replay_writes_no_reply_for_da_dsr_colour_decrqss_or_xtversion() {
+        let mut queries = Vec::new();
+        for seq in [
+            &b"\x1b[c"[..],
+            &b"\x1b[0c"[..],
+            &b"\x1b[6n"[..],
+            &b"\x1b]10;?\x07"[..],
+            &b"\x1b]11;?\x07"[..],
+            &b"\x1b]4;1;?\x07"[..],
+            &b"\x1bP$q\"p\x1b\\"[..],
+            &b"\x1b[>0q"[..],
+        ] {
+            queries.extend_from_slice(seq);
+        }
+        let (mut live_term, live_batch, _) = batch_term();
+        let live = run_batched(&mut live_term, &live_batch, &queries);
+        assert!(
+            !live.replies.is_empty(),
+            "at least DA must be answered when the bytes are live"
+        );
+        let dropped = commit_replies(live, true);
+        assert!(
+            dropped.replies.is_empty(),
+            "a replay must not write any query reply: {}",
+            dropped.replies
+        );
     }
 
     /// RESEXHAUST-001: one read of BEL bytes and terminal queries used to

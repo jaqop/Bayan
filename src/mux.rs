@@ -43,9 +43,12 @@ pub fn label_kill() -> &'static str {
 /// Palette rows for the mux. Detach and reattach are absent unless the
 /// user opted in, so a default config cannot ask the window to start a server.
 #[cfg(test)]
-pub fn palette_labels(enabled: bool) -> Vec<&'static str> {
-    let mut labels = vec![crate::ssh::label_open()];
-    if enabled {
+pub fn palette_labels(enabled: bool, elevated: bool) -> Vec<&'static str> {
+    let mut labels = Vec::new();
+    if crate::ssh::offered(elevated) {
+        labels.push(crate::ssh::label_open());
+    }
+    if mux_may_run(enabled, elevated) {
         labels.push(label_detach());
         labels.push(label_reattach());
     }
@@ -1014,6 +1017,9 @@ pub struct Attached {
     pub on_kill: Box<dyn FnOnce() + Send>,
     /// Cleared to detach: the kill hook then leaves the server process alone.
     pub armed: Arc<AtomicBool>,
+    /// Screen to paint before live output. Replies from this buffer are not
+    /// written to the session.
+    pub replay: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -1153,6 +1159,7 @@ fn finish_attached(
     command: String,
     output: mpsc::Receiver<Vec<u8>>,
     tx: mpsc::Sender<Cmd>,
+    replay: Vec<u8>,
 ) -> Attached {
     let armed = Arc::new(AtomicBool::new(true));
     let armed_kill = Arc::clone(&armed);
@@ -1177,6 +1184,7 @@ fn finish_attached(
             }
         }),
         armed,
+        replay,
     }
 }
 
@@ -1599,8 +1607,10 @@ mod os {
             }
             Message::Reattached { snap } => {
                 let id = snap.id;
+                // The screen is carried on the control message and painted
+                // with replies suppressed. It is not mixed into the live
+                // byte stream, which would answer those queries.
                 if let Some(tx) = lock_map(pending).remove(&id) {
-                    let _ = tx.send(snap.screen.clone());
                     lock_map(routes).insert(id, tx);
                 }
                 let _ = control.send(Message::Reattached { snap });
@@ -1642,9 +1652,14 @@ mod os {
                                     if *t == token
                             )
                         })? {
-                            Message::Spawned { id, .. } => {
-                                Ok(finish_attached(id, title, command, out_rx, cmd_tx.clone()))
-                            }
+                            Message::Spawned { id, .. } => Ok(finish_attached(
+                                id,
+                                title,
+                                command,
+                                out_rx,
+                                cmd_tx.clone(),
+                                Vec::new(),
+                            )),
                             Message::Fail { message, .. } => Err(message),
                             _ => Err("unexpected spawn reply".into()),
                         }
@@ -1670,6 +1685,7 @@ mod os {
                                 snap.command,
                                 out_rx,
                                 cmd_tx.clone(),
+                                snap.screen,
                             )),
                             Message::Missing { .. } => Err("session is not detached".into()),
                             _ => Err("unexpected reattach reply".into()),
@@ -2448,10 +2464,14 @@ mod tests {
         let up = connect_if_enabled(true, || false, || spawned = true);
         assert!(!up, "spawn still needs the second connect to succeed");
         assert!(spawned);
-        let labels = palette_labels(false);
+        let labels = palette_labels(false, false);
         assert_eq!(labels, vec![crate::ssh::label_open()]);
-        assert!(palette_labels(true).contains(&label_detach()));
-        assert!(palette_labels(true).contains(&label_reattach()));
+        assert!(palette_labels(true, false).contains(&label_detach()));
+        assert!(palette_labels(true, false).contains(&label_reattach()));
+        assert!(
+            palette_labels(true, true).is_empty(),
+            "an elevated window offers neither SSH nor the mux"
+        );
         crate::lang::set(crate::lang::Lang::Ar);
         assert_eq!(label_detach(), "فصل الجلسة");
         assert_eq!(label_reattach(), "إعادة الاتصال");
