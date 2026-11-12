@@ -185,6 +185,9 @@ pub struct UserConfig {
         skip_serializing_if = "crate::scrollbar::ScrollbarConfig::is_default"
     )]
     pub scrollbar: crate::scrollbar::ScrollbarConfig,
+    /// Inline images. Absent means on, with the caps in [`ImageConfig`].
+    #[serde(default, skip_serializing_if = "ImageConfig::is_default")]
+    pub images: ImageConfig,
 }
 
 /// Selection copy. `clean` is `"off"`, `"on"`, or `"claude_mode"`.
@@ -338,6 +341,50 @@ impl ScrollConfig {
 impl Default for ScrollConfig {
     fn default() -> Self {
         Self { smooth: true }
+    }
+}
+
+/// Inline-image switch and caps. Missing keys use these defaults; values
+/// above the hard ceilings in `images.rs` are clamped when a pane is spawned.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ImageConfig {
+    /// `false` drops every image sequence without drawing it. The bytes are
+    /// still consumed, so a sixel dump does not spill onto the grid.
+    pub enabled: bool,
+    /// Decoded bytes of one image. Default 20 MiB.
+    pub max_bytes: u64,
+    /// Maximum width in pixels.
+    pub max_width: u32,
+    /// Maximum height in pixels.
+    pub max_height: u32,
+    /// Decoded bytes one pane may hold.
+    pub max_pane_bytes: u64,
+    /// Decoded bytes every pane of this process may hold together.
+    pub max_session_bytes: u64,
+}
+
+impl ImageConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn limits(&self) -> crate::images::ImageLimits {
+        crate::images::ImageLimits::from_user(self)
+    }
+}
+
+impl Default for ImageConfig {
+    fn default() -> Self {
+        let limits = crate::images::ImageLimits::default();
+        Self {
+            enabled: limits.enabled,
+            max_bytes: limits.max_bytes as u64,
+            max_width: limits.max_width,
+            max_height: limits.max_height,
+            max_pane_bytes: limits.max_pane_bytes as u64,
+            max_session_bytes: limits.max_session_bytes as u64,
+        }
     }
 }
 
@@ -838,6 +885,36 @@ mod tests {
         );
         let saved = serde_json::to_string(&off).unwrap();
         assert!(saved.contains("\"smooth\":false"), "{saved}");
+    }
+
+    #[test]
+    fn image_caps_default_on_and_round_trip() {
+        let d = UserConfig::default();
+        assert!(d.images.enabled);
+        assert_eq!(d.images.max_bytes, 20 * 1024 * 1024);
+        let limits = d.images.limits();
+        assert!(limits.enabled);
+        assert_eq!(limits.max_width, 4096);
+        assert_eq!(limits.max_pane_bytes, 64 * 1024 * 1024);
+        assert_eq!(limits.max_session_bytes, 128 * 1024 * 1024);
+        // A missing key keeps the defaults, and the default object is omitted
+        // from a saved config (see saving_omits_unset_fields).
+        let absent: UserConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.images, ImageConfig::default());
+        let off: UserConfig =
+            serde_json::from_str(r#"{"images":{"enabled":false,"max_bytes":10}}"#).unwrap();
+        assert!(!off.images.enabled);
+        let clamped = off.images.limits();
+        assert_eq!(clamped.max_bytes, 10);
+        // Above the hard ceiling is clamped, not treated as unlimited.
+        let wild: UserConfig = serde_json::from_str(
+            r#"{"images":{"max_bytes":999999999999,"max_width":100000,"max_pane_bytes":1,"max_session_bytes":1}}"#,
+        )
+        .unwrap();
+        let limits = wild.images.limits();
+        assert!(limits.max_bytes <= crate::images::CEIL_IMAGE_BYTES);
+        assert!(limits.max_width <= crate::images::CEIL_DIM);
+        assert!(limits.max_pane_bytes <= limits.max_session_bytes);
     }
 
     #[test]

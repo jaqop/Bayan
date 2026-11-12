@@ -21,6 +21,7 @@ mod elevate;
 mod gpu;
 mod groups;
 mod handoff;
+mod images;
 mod input;
 mod jumplist;
 mod keybinds;
@@ -1588,6 +1589,9 @@ struct App {
     auto_follow: bool,
     claude_manual: bool,
     config: config::UserConfig,
+    /// Pixel budget shared by every pane. Caps are the ones from config at
+    /// startup; a later edit applies to the next launch, like scrollback.
+    image_budget: Arc<images::ImageBudget>,
     config_load_error: Option<String>,
     startup_error: Option<String>,
     /// every rebindable action's effective chord (defaults + config)
@@ -1843,6 +1847,7 @@ impl App {
             clipboard: None,
             auto_follow: true,
             claude_manual: false,
+            image_budget: Arc::new(images::ImageBudget::new(config.images.limits())),
             config,
             config_load_error,
             startup_error: None,
@@ -3293,6 +3298,7 @@ impl App {
             self.config.kitty_protocol_on(),
             raw,
             self.elevated,
+            Arc::clone(&self.image_budget),
         ) {
             Ok(session) => Some(Pane {
                 id,
@@ -5752,6 +5758,7 @@ impl App {
             return;
         }
         let mut verts: Vec<gpu::Vertex> = Vec::new();
+        let mut sprites: Vec<render::ImageSprite> = Vec::new();
         match (self.renderer.as_mut(), self.tabs.get(self.active)) {
             (Some(renderer), Some(tab)) if !rects.is_empty() => {
                 renderer.begin_frame();
@@ -5791,6 +5798,16 @@ impl App {
                             m.bidi_reorder,
                             m.alt_track.on(),
                         )
+                    };
+                    // Cell size is published before the term lock. Taking meta
+                    // again while `term` is held deadlocks the reader, which
+                    // locks term and then meta.
+                    let cw = renderer.cell_w.round().max(1.0) as u32;
+                    let ch = renderer.cell_h.round().max(1.0) as u32;
+                    let image_snaps = {
+                        let mut m = pane.session.meta.lock_or_recover();
+                        m.images.set_cell_px(cw, ch);
+                        m.images.snapshot()
                     };
                     let t = pane.session.term.lock();
                     // Explicit BDSM suppresses reordering for the whole pane,
@@ -5886,6 +5903,17 @@ impl App {
                             scroll::offset_px(sub, renderer.cell_h)
                         },
                     };
+                    // after the view: an image rides the same sub-line
+                    // shift as the row it is anchored to
+                    sprites.extend(render::image_sprites(
+                        *rect,
+                        renderer.cell_w,
+                        renderer.cell_h,
+                        evicted.saturating_add(history),
+                        off,
+                        view.scroll_px,
+                        &image_snaps,
+                    ));
                     let rows = t.screen_lines();
                     renderer.draw_pane(&mut verts, &view, &t);
                     // Smooth scroll's sub-line remainder is the fraction's
@@ -6117,13 +6145,34 @@ impl App {
         // the frame is pixel-for-pixel the last one — skip the submit. (An
         // atlas upload this frame always redraws; so does a heal.)
         let frame_bytes = bytemuck::cast_slice::<gpu::Vertex, u8>(&verts);
+        let mut extended = Vec::new();
+        let frame_key: &[u8] = if sprites.is_empty() {
+            frame_bytes
+        } else {
+            extended.extend_from_slice(frame_bytes);
+            for sprite in &sprites {
+                extended.extend_from_slice(&sprite.cookie.to_le_bytes());
+                extended.extend_from_slice(bytemuck::cast_slice(&sprite.verts));
+            }
+            &extended
+        };
         let unchanged =
-            self.last_frame_size == Some(px) && !heal && frame_bytes == self.last_frame.as_slice();
+            self.last_frame_size == Some(px) && !heal && frame_key == self.last_frame.as_slice();
         if unchanged {
             return;
         }
         let bg = self.renderer.as_ref().map_or(render::BG, |r| r.bg);
-        if !gpu.render(&verts, bg) {
+        let quads: Vec<gpu::ImageQuad<'_>> = sprites
+            .iter()
+            .map(|sprite| gpu::ImageQuad {
+                cookie: sprite.cookie,
+                width: sprite.width,
+                height: sprite.height,
+                rgba: &sprite.rgba,
+                verts: &sprite.verts,
+            })
+            .collect();
+        if !gpu.render(&verts, &quads, bg) {
             // Retry once after reconfiguring, without spinning on occlusion.
             self.last_frame_size = None;
             if surface_resized || heal {
@@ -6133,7 +6182,7 @@ impl App {
         }
         crate::prof::frame_presented();
         self.last_frame.clear();
-        self.last_frame.extend_from_slice(frame_bytes);
+        self.last_frame.extend_from_slice(frame_key);
         self.last_frame_size = Some(px);
         if heal {
             window.request_redraw();

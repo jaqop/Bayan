@@ -472,6 +472,74 @@ fn push_quad(
     ]);
 }
 
+/// One inline image, clipped to its pane. `verts` is empty when the image
+/// sits fully outside the clip. The GPU samples `rgba` with these uvs.
+pub struct ImageSprite {
+    pub cookie: u64,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: std::sync::Arc<[u8]>,
+    pub verts: Vec<Vertex>,
+}
+
+/// Quads for `snaps`, in pane pixels. `screen_top` is the absolute line of
+/// viewport row 0 when the view is not scrolled; `display_offset` moves
+/// history down into the pane, and `scroll_px` is smooth scroll's sub-line
+/// shift on top of it. The quad is clipped to `clip`.
+///
+/// The image stays on its logical cell. Texture coordinates run left to
+/// right, so an RTL paragraph does not reverse the pixels. Anchoring the
+/// quad to the right edge of an RTL paragraph is a later decision.
+pub fn image_sprites(
+    clip: Rect,
+    cell_w: f32,
+    cell_h: f32,
+    screen_top: u64,
+    display_offset: u64,
+    scroll_px: i32,
+    snaps: &[crate::images::ImageSnap],
+) -> Vec<ImageSprite> {
+    if !(cell_w > 0.0 && cell_h > 0.0) {
+        return Vec::new();
+    }
+    let mut sprites = Vec::new();
+    for snap in snaps {
+        if snap.cols == 0 || snap.rows == 0 || snap.width == 0 || snap.height == 0 {
+            continue;
+        }
+        let vrow = snap.line as i64 - screen_top as i64 + display_offset as i64;
+        let x = clip.0 as f32 + snap.col as f32 * cell_w;
+        let y = clip.1 as f32 + vrow as f32 * cell_h + scroll_px.max(0) as f32;
+        let w = snap.cols as f32 * cell_w;
+        let h = snap.rows as f32 * cell_h;
+        let mut verts = Vec::new();
+        push_quad(
+            &mut verts,
+            clip,
+            x,
+            y,
+            w,
+            h,
+            0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            [1.0, 1.0, 1.0, 1.0],
+        );
+        // An off-screen image is still sent, with no verts: the GPU keeps
+        // its texture while the store holds it, so scrolling back is free.
+        sprites.push(ImageSprite {
+            cookie: snap.cookie,
+            width: snap.width,
+            height: snap.height,
+            rgba: std::sync::Arc::clone(&snap.rgba),
+            verts,
+        });
+    }
+    sprites
+}
+
 /// Solid rect (samples the white texel on page 0).
 fn push_rect(out: &mut Vec<Vertex>, clip: Rect, x: i32, y: i32, w: i32, h: i32, color: [f32; 4]) {
     push_quad(
@@ -8637,6 +8705,72 @@ mod tests {
         // a hidden bar has no chip to hit
         r.set_bar_hidden(true);
         assert!(!r.group_chip_hit((cx + cw / 2) as f64, 20.0));
+    }
+
+    /// An image in some cells of a row must not change how the Arabic in
+    /// the other cells is shaped. The grid still holds logical text, and
+    /// the bidi path produces the same boxes it would without the image.
+    #[test]
+    fn arabic_beside_an_image_keeps_the_same_shaping() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+        use base64::Engine;
+
+        let size = crate::term::TermSize { cols: 40, rows: 4 };
+        let mut with_img = Term::new(Config::default(), &size, VoidListener);
+        let mut plain = Term::new(Config::default(), &size, VoidListener);
+        let mut p1 = Processor::new();
+        let mut p2 = Processor::new();
+        let mut m1 = crate::term::SessionMeta::default();
+        let mut m2 = crate::term::SessionMeta::default();
+        let mut c1 = Vec::new();
+        let mut c2 = Vec::new();
+        let px = base64::engine::general_purpose::STANDARD.encode([255u8, 0, 0]);
+        let img = format!("\x1b_Ga=T,f=24,s=1,v=1,c=2,r=1,C=1,q=2;{px}\x1b\\");
+        let arabic = "\x1b[1;12Hمرحبا";
+        crate::term::process_chunk(&mut p1, &mut with_img, &mut m1, &mut c1, img.as_bytes());
+        crate::term::process_chunk(&mut p1, &mut with_img, &mut m1, &mut c1, arabic.as_bytes());
+        crate::term::process_chunk(&mut p2, &mut plain, &mut m2, &mut c2, arabic.as_bytes());
+        assert_eq!(m1.images.placement_count(), 1);
+
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let pane = (0, 0, 800, 200);
+        let view = PaneView {
+            rect: pane,
+            focused: true,
+            cursor: crate::config::CursorStyle::Block,
+            cursor_on: false,
+            bordered: false,
+            claude: false,
+            claude_from: None,
+            reorder: true,
+            line_dir: &[],
+            search_match: None,
+            marks: &[],
+            link_hover: None,
+            link_tip: None,
+            bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+            scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
+        };
+        let boxes = |r: &mut Renderer, term: &Term<VoidListener>| {
+            r.begin_frame();
+            r.draw_pane(&mut Vec::new(), &view, term);
+            (11..16)
+                .map(|col| r.cell_geometry.get(&(pane, 0, col)).cloned())
+                .collect::<Vec<_>>()
+        };
+        let shaped = boxes(&mut r, &with_img);
+        let alone = boxes(&mut r, &plain);
+        assert!(
+            shaped.iter().any(|b| b.is_some()),
+            "the row took the bidi path"
+        );
+        assert_eq!(
+            shaped, alone,
+            "Arabic boxes changed because an image shared the row"
+        );
     }
 
     /// Arabic must shape to real glyphs (no .notdef) through the fallback

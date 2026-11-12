@@ -364,6 +364,11 @@ pub struct SessionMeta {
     pub alt_track: crate::bidi_ctl::AltScreenTrack,
     /// Half-parsed BDSM/SCP/RIS held across PTY reads.
     pub(crate) esc_filter: crate::bidi_ctl::StreamFilter,
+    /// Sixel, Kitty graphics, and iTerm2 images anchored to grid cells.
+    pub images: crate::images::ImageStore,
+    /// A DCS / APC / OSC 1337 that has not finished arriving. Larger than
+    /// the 4 KiB OSC carry, and not fed to vte.
+    pub(crate) image_in: crate::images::ImageFilter,
     /// command blocks (OSC 133 A/D): gutter lights + prompt jumping
     pub marks: Vec<CmdMark>,
     /// history lines evicted past the scrollback cap (+ ED3-cleared lines):
@@ -429,6 +434,18 @@ impl SessionMeta {
         self.reported_cwd()
             .and_then(accept_local_cwd)
             .filter(|p| usable_spawn_dir(p))
+    }
+
+    /// Replace this pane's image budget. Used by tests that share one
+    /// session cap across two panes, and at spawn.
+    pub fn share_image_budget(&mut self, budget: Arc<crate::images::ImageBudget>) {
+        self.image_in.set_limits(budget.limits());
+        self.images.attach(budget);
+    }
+
+    #[cfg(test)]
+    pub fn set_image_limits(&mut self, limits: crate::images::ImageLimits) {
+        self.share_image_budget(Arc::new(crate::images::ImageBudget::new(limits)));
     }
 }
 
@@ -1753,7 +1770,7 @@ fn process_bytes<T: EventListener>(
     };
     let mut pos = 0;
     for (s, e, kind, exit, trusted) in marks {
-        feed_counted(parser, t, meta, &buf[pos..s], &mut ev.pty_replies);
+        feed_region(parser, t, meta, &buf[pos..s], &mut ev.pty_replies);
         handle_osc133(t, meta, kind, exit, trusted, &mut ev);
         // A new prompt means the previous program is gone. A crashed TUI
         // never pops its keyboard flags; clear the current screen before
@@ -1764,7 +1781,7 @@ fn process_bytes<T: EventListener>(
         }
         pos = e;
     }
-    feed_counted(parser, t, meta, &buf[pos..], &mut ev.pty_replies);
+    feed_region(parser, t, meta, &buf[pos..], &mut ev.pty_replies);
     if let Some(start_abs) = meta.clean_claude_after {
         let first = start_abs as i64 - meta.evicted as i64 - t.grid().history_size() as i64;
         if first < 0 {
@@ -1812,6 +1829,10 @@ fn process_bytes<T: EventListener>(
 ///
 /// `merge_chunk` joins those `Bytes` items and extends `pty_replies`, so a
 /// kitty `CSI ? u` answer is kept when the filter splits the read.
+///
+/// The PTY reader does not call this. It decodes images before taking the
+/// terminal lock, then applies the same pieces. Tests share this entry.
+#[cfg(test)]
 pub(crate) fn process_chunk<T: EventListener>(
     parser: &mut Processor,
     t: &mut Term<T>,
@@ -1819,52 +1840,301 @@ pub(crate) fn process_chunk<T: EventListener>(
     carry: &mut Vec<u8>,
     data: &[u8],
 ) -> ChunkEvents {
-    // `?47` / `?1047` / `?1049` for alt_off. Raw bytes, so a CSI split
-    // across reads stays open here. The parser still receives `data`
-    // unchanged (the filter below only strips BDSM and SCP).
-    meta.alt_track.observe(data);
-    let items = meta.esc_filter.pull(data);
+    // Image sequences are lifted out first. Their payloads can hold ESC
+    // bytes (the terminator) and are larger than the BiDi filter's hold,
+    // so the filter never sees them. What remains is the stream BDSM, SCP,
+    // and OSC 133 already understand.
+    let mut pieces = meta.image_in.pull(data);
+    // Sixel and PNG are decoded before the rest of the chunk mutates the
+    // grid. The reader calls the same warm step with the locks released.
+    let limits = meta.images.limits();
+    meta.image_in.warm(&mut pieces, &limits);
+    // The completed payload has left the carry. Charge only what is still open
+    // before the decoded image itself is charged. A carry the budget cannot
+    // hold is dropped rather than kept for free.
+    if !meta.images.sync_inflight(meta.image_in.carry_len()) {
+        meta.image_in.abandon();
+    }
+    let ev = apply_image_pieces(parser, t, meta, carry, pieces);
+    // A chunked upload now sits in `pending`. Charge it before the next read.
+    if !meta.images.sync_inflight(meta.image_in.carry_len()) {
+        meta.image_in.abandon();
+    }
+    ev
+}
+
+fn apply_image_pieces<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    meta: &mut SessionMeta,
+    carry: &mut Vec<u8>,
+    pieces: Vec<crate::images::Inbound>,
+) -> ChunkEvents {
     let mut ev = ChunkEvents::default();
-    for item in items {
-        match item {
-            crate::bidi_ctl::StreamItem::Bytes(bytes) => {
+    for piece in pieces {
+        match piece {
+            crate::images::Inbound::Bytes(bytes) => {
                 if bytes.is_empty() {
                     continue;
                 }
-                let was_alt = t.mode().contains(TermMode::ALT_SCREEN);
-                let part = process_bytes(parser, t, meta, carry, &bytes);
-                if was_alt != t.mode().contains(TermMode::ALT_SCREEN)
-                    || contains_alt_screen_csi(&bytes)
-                {
-                    meta.bidi_mut().reset();
-                }
-                merge_chunk(&mut ev, part);
-            }
-            crate::bidi_ctl::StreamItem::Bdsm(mode) => {
-                if bidi_controls_live(t, meta) {
-                    meta.bidi_mut().mode = mode;
-                }
-            }
-            crate::bidi_ctl::StreamItem::Scp(dir) => {
-                if bidi_controls_live(t, meta) {
-                    // The cursor motion in front of this SCP is still in
-                    // vte's sync buffer. Stamp it when that buffer is
-                    // applied, at the offset it occupies in the mirror.
-                    if parser.sync_timeout().sync_timeout().is_some() {
-                        meta.sync_bidi.push((meta.sync_mirror.len(), dir));
-                    } else {
-                        let (abs, col) = crate::bidi_ctl::cursor_abs(t, meta.evicted);
-                        meta.bidi_mut().note_scp(dir, abs, col);
+                // `?47` / `?1047` / `?1049` for alt_off. Raw bytes, so a
+                // CSI split across reads stays open here. An image payload
+                // was lifted out above and is not a mode switch.
+                meta.alt_track.observe(&bytes);
+                let items = meta.esc_filter.pull(&bytes);
+                for item in items {
+                    match item {
+                        crate::bidi_ctl::StreamItem::Bytes(bytes) => {
+                            if bytes.is_empty() {
+                                continue;
+                            }
+                            let was_alt = t.mode().contains(TermMode::ALT_SCREEN);
+                            let part = process_bytes(parser, t, meta, carry, &bytes);
+                            if was_alt != t.mode().contains(TermMode::ALT_SCREEN)
+                                || contains_alt_screen_csi(&bytes)
+                            {
+                                meta.bidi_mut().reset();
+                            }
+                            merge_chunk(&mut ev, part);
+                        }
+                        crate::bidi_ctl::StreamItem::Bdsm(mode) => {
+                            if bidi_controls_live(t, meta) {
+                                meta.bidi_mut().mode = mode;
+                            }
+                        }
+                        crate::bidi_ctl::StreamItem::Scp(dir) => {
+                            if bidi_controls_live(t, meta) {
+                                // The cursor motion in front of this SCP is
+                                // still in vte's sync buffer. Stamp it when
+                                // that buffer is applied, at the offset it
+                                // occupies in the mirror.
+                                if parser.sync_timeout().sync_timeout().is_some() {
+                                    meta.sync_bidi.push((meta.sync_mirror.len(), dir));
+                                } else {
+                                    let (abs, col) = crate::bidi_ctl::cursor_abs(t, meta.evicted);
+                                    meta.bidi_mut().note_scp(dir, abs, col);
+                                }
+                            }
+                        }
+                        crate::bidi_ctl::StreamItem::Ris => {
+                            meta.saw_ris = true;
+                            meta.bidi_mut().reset();
+                        }
                     }
                 }
             }
-            crate::bidi_ctl::StreamItem::Ris => {
-                meta.saw_ris = true;
-                meta.bidi_mut().reset();
+            other => {
+                let at = place_at(t, meta);
+                let effect = meta.images.ingest(other, &at);
+                ev.pty_replies.extend(effect.replies);
+                // The cursor is not moved past the image, whatever the
+                // protocol asks. Conhost owns the cursor and does not know
+                // the image: it keeps counting rows without it and repaints
+                // with absolute positions, so rows reserved here put its
+                // later output on the wrong lines (text after the image was
+                // lost). The image stays on the rows it arrived on and the
+                // text that follows draws over it. Revisit only if
+                // PSEUDOCONSOLE_PASSTHROUGH_MODE is turned on.
             }
         }
     }
     ev
+}
+
+fn place_at<T: EventListener>(t: &Term<T>, meta: &SessionMeta) -> crate::images::PlaceAt {
+    let (line, col) = crate::bidi_ctl::cursor_abs(t, meta.evicted);
+    let history = t.grid().history_size() as u64;
+    crate::images::PlaceAt {
+        line,
+        col,
+        columns: t.columns(),
+        screen_rows: t.screen_lines(),
+        screen_top: meta.evicted.saturating_add(history),
+    }
+}
+
+/// Feed `bytes`, and clear images on ED / EL / alt-screen / RIS at the
+/// cursor those bytes have reached. The control itself is still fed, so
+/// the grid and the image store move together.
+fn feed_region<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    meta: &mut SessionMeta,
+    bytes: &[u8],
+    replies: &mut Vec<String>,
+) {
+    let mut pos = 0;
+    while pos < bytes.len() {
+        match next_grid_op(&bytes[pos..]) {
+            Some((start, end, kind)) => {
+                let abs_s = pos + start;
+                let abs_e = pos + end;
+                feed_counted(parser, t, meta, &bytes[pos..abs_s], replies);
+                meta.images.evict(meta.evicted);
+                apply_grid_op(kind, t, meta);
+                feed_counted(parser, t, meta, &bytes[abs_s..abs_e], replies);
+                meta.images.evict(meta.evicted);
+                pos = abs_e;
+            }
+            None => {
+                feed_counted(parser, t, meta, &bytes[pos..], replies);
+                meta.images.evict(meta.evicted);
+                break;
+            }
+        }
+    }
+}
+
+enum GridOp {
+    Ed(u16),
+    El(u16),
+    Alt(bool),
+    Ris,
+}
+
+fn apply_grid_op<T: EventListener>(kind: GridOp, t: &Term<T>, meta: &mut SessionMeta) {
+    let at = place_at(t, meta);
+    match kind {
+        GridOp::Ed(3) => meta.images.clear_history(at.screen_top),
+        GridOp::Ed(mode) => meta.images.erase_display(mode, at),
+        GridOp::El(mode) => meta.images.erase_line(mode, at),
+        GridOp::Alt(enter) => meta.images.set_alt(enter),
+        GridOp::Ris => meta.images.reset(),
+    }
+}
+
+/// The next ED, EL, alt-screen CSI, or RIS in `data`, as
+/// `(start, end, op)` relative to `data`. Strings (OSC / DCS / APC) are
+/// skipped so a payload cannot look like a clear. `None` when the only
+/// control left is unfinished: the caller feeds it and the carry holds it.
+fn next_grid_op(data: &[u8]) -> Option<(usize, usize, GridOp)> {
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] != 0x1b {
+            i = data[i..]
+                .iter()
+                .position(|&b| b == 0x1b)
+                .map_or(data.len(), |k| i + k);
+            continue;
+        }
+        if let Some((start, end)) = ris_at(data, i) {
+            return Some((start, end, GridOp::Ris));
+        }
+        match data.get(i + 1) {
+            Some(b']') | Some(b'P') | Some(b'_') | Some(b'X') | Some(b'^') => {
+                i = skip_string(data, i + 2)?;
+            }
+            Some(b'[') => match classify_grid_csi(data, i) {
+                Some((end, Some(op))) => return Some((i, end, op)),
+                Some((end, None)) => i = end,
+                None => return None,
+            },
+            Some(_) => i += 1,
+            None => return None,
+        }
+    }
+    None
+}
+
+/// RIS starting at `i`, including the forms vte accepts (`ESC ESC c`,
+/// `ESC <C0> c`). `ESC [` is a CSI, not RIS.
+fn ris_at(data: &[u8], i: usize) -> Option<(usize, usize)> {
+    if data.get(i) != Some(&0x1b) {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < data.len() {
+        match data[j] {
+            0x1b => j += 1,
+            0x18 | 0x1a => return None,
+            0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f | 0x80..=0xff => j += 1,
+            b'c' => return Some((i, j + 1)),
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn skip_string(data: &[u8], mut j: usize) -> Option<usize> {
+    while j < data.len() {
+        match data[j] {
+            0x07 | 0x18 | 0x1a => return Some(j + 1),
+            0x1b => {
+                if data.get(j + 1) == Some(&b'\\') {
+                    return Some(j + 2);
+                }
+                // The ESC aborted the string and starts the next sequence.
+                return Some(j);
+            }
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+fn classify_grid_csi(data: &[u8], i: usize) -> Option<(usize, Option<GridOp>)> {
+    let mut j = i + 2;
+    let private = data.get(j) == Some(&b'?');
+    if private {
+        j += 1;
+    }
+    let param_at = j;
+    while j < data.len() && matches!(data[j], b'0'..=b'9' | b';' | b':') {
+        j += 1;
+    }
+    let inter_at = j;
+    while j < data.len() && (0x20..=0x2f).contains(&data[j]) {
+        j += 1;
+    }
+    if j >= data.len() {
+        return None;
+    }
+    let final_b = data[j];
+    if final_b == 0x1b {
+        return Some((j, None));
+    }
+    if !(0x40..=0x7e).contains(&final_b) {
+        return Some((j + 1, None));
+    }
+    let end = j + 1;
+    if inter_at != j {
+        return Some((end, None));
+    }
+    let params = &data[param_at..inter_at];
+    if private {
+        if matches!(final_b, b'h' | b'l') && grid_alt_param(params) {
+            return Some((end, Some(GridOp::Alt(final_b == b'h'))));
+        }
+        return Some((end, None));
+    }
+    if final_b == b'J' {
+        return Some((end, Some(GridOp::Ed(grid_first_param(params)))));
+    }
+    if final_b == b'K' {
+        return Some((end, Some(GridOp::El(grid_first_param(params)))));
+    }
+    Some((end, None))
+}
+
+fn grid_first_param(params: &[u8]) -> u16 {
+    let end = params
+        .iter()
+        .position(|&b| b == b';' || b == b':')
+        .unwrap_or(params.len());
+    if end == 0 {
+        return 0;
+    }
+    std::str::from_utf8(&params[..end])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+fn grid_alt_param(params: &[u8]) -> bool {
+    params.split(|b| *b == b';').any(|p| {
+        let head = p.split(|b| *b == b':').next().unwrap_or(p);
+        matches!(head, b"1049" | b"47" | b"1047")
+    })
 }
 
 fn bidi_controls_live<T: EventListener>(t: &Term<T>, meta: &SessionMeta) -> bool {
@@ -2597,8 +2867,9 @@ impl Drop for Session {
 }
 
 impl Session {
-    // `raw_argv` is the one extra fact a `-- command` needs. The other seven
-    // arguments are the spawn this already had.
+    // `raw_argv` is the one extra fact a `-- command` needs, and the shared
+    // image budget is the last argument: folding it into a config struct
+    // would hide that every pane charges the same counter.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         size: TermSize,
@@ -2615,6 +2886,8 @@ impl Session {
         // This process token is elevated. PowerShell is not given an
         // oh-my-posh line.
         elevated: bool,
+        // Every pane charges this one counter.
+        images: Arc<crate::images::ImageBudget>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let prompt_nonce = fresh_prompt_nonce();
         let pty = native_pty_system();
@@ -2721,11 +2994,13 @@ impl Session {
             EventProxy(proxy.clone(), id, Arc::clone(&batch)),
         )));
 
-        let meta = Arc::new(Mutex::new(SessionMeta {
+        let mut session_meta = SessionMeta {
             kitty_protocol,
             prompt_nonce,
             ..SessionMeta::default()
-        }));
+        };
+        session_meta.share_image_budget(images);
+        let meta = Arc::new(Mutex::new(session_meta));
         let parser = Arc::new(Mutex::new(Processor::new()));
         let capture_term = Arc::clone(&term);
         let capture_meta = Arc::clone(&meta);
@@ -2783,6 +3058,19 @@ impl Session {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         crate::prof::output_read();
+                        // Lift and decode images before taking the terminal
+                        // lock. A large sixel or PNG must not freeze the UI
+                        // thread, which draws under that lock.
+                        let (filter, pieces) = {
+                            let mut m = meta2.lock_or_recover();
+                            let limits = m.images.limits();
+                            let mut filter = std::mem::take(&mut m.image_in);
+                            let mut pieces = filter.pull(&buf[..n]);
+                            // Drop the meta guard before decoding.
+                            drop(m);
+                            filter.warm(&mut pieces, &limits);
+                            (filter, pieces)
+                        };
                         let (ev, out, sync_deadline) = {
                             // term, then meta, then parser. reset_keyboard
                             // on the UI thread takes the same order. The
@@ -2791,9 +3079,18 @@ impl Session {
                             let mut t = term2.lock();
                             let mut m = meta2.lock_or_recover();
                             let mut p = parser2.lock_or_recover();
+                            m.image_in = filter;
+                            let carry_len = m.image_in.carry_len();
+                            if !m.images.sync_inflight(carry_len) {
+                                m.image_in.abandon();
+                            }
                             batch.lock_or_recover().begin();
                             let mut ev =
-                                process_chunk(&mut p, &mut t, &mut m, &mut carry, &buf[..n]);
+                                apply_image_pieces(&mut p, &mut t, &mut m, &mut carry, pieces);
+                            let open = m.image_in.carry_len();
+                            if !m.images.sync_inflight(open) {
+                                m.image_in.abandon();
+                            }
                             let replies = std::mem::take(&mut ev.pty_replies);
                             let out = batch.lock_or_recover().finish(ev.clean_claude, replies);
                             (ev, out, p.sync_timeout().sync_timeout())
@@ -2947,20 +3244,46 @@ impl Session {
     }
 
     pub fn resize(&mut self, size: TermSize) {
+        let reflow = {
+            let t = self.term.lock();
+            match column_reflow(t.columns(), t.screen_lines(), size) {
+                None => return,
+                Some(reflow) => reflow,
+            }
+        };
         let _ = self.master.resize(PtySize {
             rows: size.rows as u16,
             cols: size.cols as u16,
             pixel_width: 0,
             pixel_height: 0,
         });
-        // Drop the term lock before meta. A resize reflows rows, so SCP
-        // stamps no longer name the text they were written on.
-        // The text-area map is taken after both: a query on the reader
-        // already holds the term lock and then that map.
+        // Drop the term lock before meta. A column change reflows rows, so
+        // SCP stamps and image anchors no longer name the text they were
+        // written on. The text-area map is taken after both: a query on the
+        // reader already holds the term lock and then that map.
         self.term.lock().resize(size);
-        self.meta.lock_or_recover().bidi_mut().on_resize();
+        if reflow {
+            after_resize(&mut self.meta.lock_or_recover());
+        }
         set_text_area_grid(self.id, size.cols, size.rows);
     }
+}
+
+/// `None` when the size is unchanged. `Some(true)` when the column count
+/// changes and rows will reflow. `Some(false)` when only the row count changes.
+pub(crate) fn column_reflow(old_cols: usize, old_rows: usize, size: TermSize) -> Option<bool> {
+    if old_cols == size.cols && old_rows == size.rows {
+        None
+    } else {
+        Some(old_cols != size.cols)
+    }
+}
+
+/// A column change reflows rows, so SCP stamps and image anchors no longer
+/// name the text they were written on.
+pub(crate) fn after_resize(meta: &mut SessionMeta) {
+    meta.bidi_mut().on_resize();
+    meta.images.on_resize();
 }
 
 /// Does this write submit the line at the prompt? A carriage return does —
@@ -6616,6 +6939,16 @@ mod measure_probes {
                     mb / secs
                 );
             };
+            let mut images = crate::images::ImageFilter::default();
+            time("image filter", &mut |c| {
+                std::hint::black_box(images.pull(c));
+            });
+            time("next_grid_op", &mut |c| {
+                let mut pos = 0;
+                while let Some((_, end, _)) = next_grid_op(&c[pos..]) {
+                    pos += end;
+                }
+            });
             let mut filter = SessionMeta::default().esc_filter;
             time("bidi_ctl filter", &mut |c| {
                 std::hint::black_box(filter.pull(c));

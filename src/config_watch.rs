@@ -297,6 +297,7 @@ pub fn merge_reload(base: &UserConfig, live: &UserConfig, file: &UserConfig) -> 
             &file.terminal_follow_high_contrast,
             &mut overrode,
         ),
+        images: merge_field(&base.images, &live.images, &file.images, &mut overrode),
         keyboard: merge_field(
             &base.keyboard,
             &live.keyboard,
