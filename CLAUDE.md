@@ -40,6 +40,7 @@ selection and BiDi paths must do.
 | `handoff.rs` | per-user `ITerminalHandoff` COM class, default off; not the Windows default terminal |
 | `posh.rs` | oh-my-posh theme picker with a live ANSI preview |
 | `plugins.rs` | declarative JSON plugin host (`~/.bayan/plugins/`) |
+| `lua_host.rs` | sandboxed `config.lua` and allowlisted executable plugins |
 | `scrollbar.rs` | per-pane scrollbar in the padding or the split seam: thumb from viewport/total and `display_offset`, hit-tested only outside the grid |
 | `config.rs` | `~/.bayan/config.json`, optional and BOM-tolerant. `scrollbar.position` (`right`/`left`/`hidden`), `scrollbar.width`, `scrollbar.autohide` |
 | `config_watch.rs` | reload that file on change: debounce, rename-replace saves, keep the last good config on a parse error |

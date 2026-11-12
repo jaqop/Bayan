@@ -33,6 +33,7 @@ mod latency;
 mod layout;
 mod link;
 mod localpath;
+mod lua_host;
 mod mouse;
 mod mru;
 mod osc7;
@@ -529,6 +530,9 @@ enum PendingKind {
     /// A plugin action's command (BAYAN-007): the focused pane only,
     /// unbracketed, so a trailing CR still runs it.
     Command,
+    /// config.lua or an executable plugin, approved by content hash.
+    /// Enter does not type the source into the shell.
+    ApproveLua,
 }
 
 /// Text held for the confirm card: the bytes to send, and why the card is up.
@@ -542,6 +546,12 @@ struct PendingPaste {
     lines: usize,
     chars: usize,
     reason: String,
+    /// Set when Enter approves a Lua file instead of typing `text`.
+    lua: Option<lua_host::PendingScript>,
+    /// Rows of a long approval card already scrolled off the top.
+    scroll: usize,
+    /// The last row of that card has been inside the window.
+    saw_end: bool,
 }
 
 /// One terminal pane (a tab holds one or more).
@@ -1286,13 +1296,74 @@ fn dismiss_paste_for(pending: &mut Option<PendingPaste>, removed: &[u64]) {
 
 /// Chars of preview per card row; the card is 62 cells wide.
 const CARD_ROW_CHARS: usize = 56;
+/// Visible rows of a Lua approval card. The rest scroll.
+const LUA_CARD_ROWS: usize = 12;
+/// After Enter reveals a script, the next Enter is ignored until this
+/// passes, so a held key cannot approve on autorepeat.
+const LUA_APPROVE_DELAY: std::time::Duration = std::time::Duration::from_millis(700);
+
+/// Change one action on the saved map and the same action on the runtime
+/// map. A chord that exists only on the runtime map — a `config.lua`
+/// binding — is left where it is.
+fn apply_shortcut(
+    saved: &mut Option<std::collections::HashMap<String, String>>,
+    runtime: &mut Option<std::collections::HashMap<String, String>>,
+    action_id: &str,
+    chord: Option<String>,
+) {
+    put_binding(saved, action_id, chord.clone());
+    put_binding(runtime, action_id, chord);
+}
+
+fn put_binding(
+    map: &mut Option<std::collections::HashMap<String, String>>,
+    action_id: &str,
+    chord: Option<String>,
+) {
+    match chord {
+        Some(c) => {
+            map.get_or_insert_with(Default::default)
+                .insert(action_id.to_string(), c);
+        }
+        None => {
+            let empty = map.as_mut().is_some_and(|m| {
+                m.remove(action_id);
+                m.is_empty()
+            });
+            if empty {
+                *map = None;
+            }
+        }
+    }
+}
+
+/// The rows the approval card paints, and whether the last row is in view.
+fn lua_card_window(rows: &[String], scroll: usize) -> (Vec<String>, usize, bool) {
+    if rows.len() <= LUA_CARD_ROWS {
+        return (rows.to_vec(), 0, true);
+    }
+    let max = rows.len() - LUA_CARD_ROWS;
+    let scroll = scroll.min(max);
+    let at_end = scroll >= max;
+    (
+        rows[scroll..scroll + LUA_CARD_ROWS].to_vec(),
+        scroll,
+        at_end,
+    )
+}
+
+fn lua_enter_ready(not_before: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    not_before.is_none_or(|t| now >= t)
+}
 
 /// The card's preview rows. A paste shows one elided row, as before. A
 /// plugin command shows ALL of what Enter will type (R-03), wrapped into
 /// rows, with CR as ␍. The 512-char cap stays within ten rows because
 /// plugin load rejects every character this preview would expand.
 fn card_preview(kind: PendingKind, text: &str) -> Vec<String> {
-    if kind != PendingKind::Command {
+    // A plugin command and a Lua file show every character the card is
+    // holding (R-03). A paste stays one elided row.
+    if !matches!(kind, PendingKind::Command | PendingKind::ApproveLua) {
         return vec![term::paste_preview(text, 48)];
     }
     let full = term::paste_preview(text, usize::MAX);
@@ -1344,6 +1415,9 @@ fn plugin_pending(label: &str, send: &str, pane: Option<u64>) -> PendingPaste {
             "{} — {label}",
             tr("إضافة تريد كتابة نص", "A plugin wants to type text")
         ),
+        lua: None,
+        scroll: 0,
+        saw_end: true,
     }
 }
 
@@ -1592,8 +1666,24 @@ struct App {
     /// Pixel budget shared by every pane. Caps are the ones from config at
     /// startup; a later edit applies to the next launch, like scrollback.
     image_budget: Arc<images::ImageBudget>,
+    /// The config.json document. Lua overrides live only in `config`.
+    json_config: config::UserConfig,
     config_load_error: Option<String>,
     startup_error: Option<String>,
+    /// Executable Lua plugins that passed the allowlist and the hash approval.
+    lua_plugins: lua_host::PluginSet,
+    /// config.lua and plugins the confirm card has not approved yet.
+    lua_pending: Vec<lua_host::PendingScript>,
+    /// Hashes dismissed this session, so a reload does not raise them again.
+    lua_skipped: Vec<String>,
+    /// Text a Lua callback wants typed. Shown on the plugin confirm card.
+    lua_send_queue: std::collections::VecDeque<lua_host::PluginSend>,
+    /// Lua failures to show once the window exists. Never fatal.
+    lua_errors: Vec<String>,
+    /// Set when the token is elevated and scripts were left unloaded.
+    lua_notice: Option<String>,
+    /// Enter on a revealed Lua card is ignored until this instant.
+    lua_approve_not_before: Option<std::time::Instant>,
     /// every rebindable action's effective chord (defaults + config)
     keymap: Vec<(keybinds::Action, keybinds::Chord)>,
     /// the shortcuts editor overlay, when open
@@ -1848,6 +1938,14 @@ impl App {
             auto_follow: true,
             claude_manual: false,
             image_budget: Arc::new(images::ImageBudget::new(config.images.limits())),
+            json_config: config.clone(),
+            lua_plugins: lua_host::PluginSet::default(),
+            lua_pending: Vec::new(),
+            lua_skipped: Vec::new(),
+            lua_send_queue: std::collections::VecDeque::new(),
+            lua_errors: Vec::new(),
+            lua_notice: None,
+            lua_approve_not_before: None,
             config,
             config_load_error,
             startup_error: None,
@@ -1962,10 +2060,13 @@ impl App {
             } else {
                 plugins::registry().themes[idx - builtin].name.clone()
             };
-            self.config.theme = Some(name);
-            self.config.bg = Some(hex(t.bg));
-            self.config.fg = Some(hex(t.fg));
-            self.config.palette = Some(t.palette.iter().map(|&c| hex(c)).collect());
+            self.remember(name, |c, v| c.theme = Some(v));
+            self.remember(hex(t.bg), |c, v| c.bg = Some(v));
+            self.remember(hex(t.fg), |c, v| c.fg = Some(v));
+            self.remember(
+                t.palette.iter().map(|&c| hex(c)).collect::<Vec<_>>(),
+                |c, v| c.palette = Some(v),
+            );
             self.push_colors();
         }
     }
@@ -1973,14 +2074,17 @@ impl App {
     /// النظام / داكن / فاتح. Clears a named scheme and hand-set colours so
     /// the pair can show; that clear is the user's new choice.
     fn set_appearance(&mut self, choice: theme::ThemeChoice) {
-        self.config.bg = None;
-        self.config.fg = None;
-        self.config.palette = None;
-        self.config.theme = match choice {
+        let theme = match choice {
             theme::ThemeChoice::System => None,
-            theme::ThemeChoice::Dark => Some("dark".into()),
-            theme::ThemeChoice::Light => Some("light".into()),
+            theme::ThemeChoice::Dark => Some("dark".to_string()),
+            theme::ThemeChoice::Light => Some("light".to_string()),
         };
+        self.remember(theme, |c, v| {
+            c.bg = None;
+            c.fg = None;
+            c.palette = None;
+            c.theme = v;
+        });
         self.push_colors();
     }
 
@@ -2007,7 +2111,8 @@ impl App {
     /// and the caption flag; an explicit scheme comes back unchanged.
     fn on_system_theme(&mut self, event: theme::SystemThemeEvent) {
         let after = self.theme_surface().apply_event(event);
-        self.config.system_apps_light = Some(event.is_light());
+        // a runtime sample: both documents carry it, neither writes it
+        self.remember(Some(event.is_light()), |c, v| c.system_apps_light = v);
         if let Some(r) = self.renderer.as_mut() {
             r.set_colors(after.colors.bg, after.colors.fg, after.colors.palette);
             // a program that asks OSC 11 after the switch sees the new side
@@ -2020,14 +2125,14 @@ impl App {
     fn change_font_size(&mut self, delta: i32) {
         let s = (self.config.font_size.unwrap_or(render::DEFAULT_FONT_SIZE) + delta as f32)
             .clamp(8.0, 40.0);
-        self.config.font_size = Some(s);
+        self.remember(s, |c, v| c.font_size = Some(v));
         self.rebuild_renderer();
         self.request_redraw();
     }
 
     fn toggle_ligatures(&mut self) {
         let v = !self.config.ligatures.unwrap_or(true);
-        self.config.ligatures = Some(v);
+        self.remember(v, |c, v| c.ligatures = Some(v));
         self.rebuild_renderer();
         self.request_redraw();
     }
@@ -2045,7 +2150,7 @@ impl App {
         let cur = r.family();
         let i = choices.iter().position(|c| c == cur).unwrap_or(0);
         let next = choices[keyroute::cycle(i, dir, choices.len())].clone();
-        self.config.font_family = Some(next);
+        self.remember(next, |c, v| c.font_family = Some(v));
         self.rebuild_renderer();
         self.request_redraw();
     }
@@ -2057,18 +2162,20 @@ impl App {
         };
         let choices = r.arabic_font_choices();
         let current = r.arabic_family().map(str::to_string);
-        self.config.arabic_font = step_arabic_font(&choices, current.as_deref(), dir);
+        let next = step_arabic_font(&choices, current.as_deref(), dir);
+        self.remember(next, |c, v| c.arabic_font = v);
         self.rebuild_renderer();
         self.request_redraw();
     }
 
     fn set_cursor_style(&mut self, s: config::CursorStyle) {
-        self.config.cursor_style = Some(s.as_str().to_string());
+        self.remember(s.as_str().to_string(), |c, v| c.cursor_style = Some(v));
         self.request_redraw(); // read per-frame; no rebuild needed
     }
 
     fn toggle_blink(&mut self) {
-        self.config.cursor_blink = Some(!self.config.cursor_blink_on());
+        let on = !self.config.cursor_blink_on();
+        self.remember(on, |c, v| c.cursor_blink = Some(v));
         self.last_input = Instant::now(); // preview the blink right away
         self.request_redraw();
     }
@@ -2077,17 +2184,19 @@ impl App {
     /// terminal convention — live sessions keep their buffer).
     fn change_scrollback(&mut self, dir: i32) {
         let cur = self.config.scrollback_lines();
-        self.config.scrollback = Some(step_preset(&config::SCROLLBACK_STEPS, cur, dir) as u32);
+        let n = step_preset(&config::SCROLLBACK_STEPS, cur, dir) as u32;
+        self.remember(n, |c, v| c.scrollback = Some(v));
         self.request_redraw();
     }
 
     fn toggle_copy_on_select(&mut self) {
-        self.config.copy_on_select = Some(!self.config.copy_on_select_on());
+        let on = !self.config.copy_on_select_on();
+        self.remember(on, |c, v| c.copy_on_select = Some(v));
         self.request_redraw();
     }
 
     fn set_bell(&mut self, mode: config::BellMode) {
-        self.config.bell = Some(mode.as_str().to_string());
+        self.remember(mode.as_str().to_string(), |c, v| c.bell = Some(v));
         if mode == config::BellMode::Sound {
             beep(); // preview the mode you just picked
         }
@@ -2102,24 +2211,25 @@ impl App {
         }
         let cur = self.config.shell_program();
         let i = shells::index_of(choices, &cur).unwrap_or(0);
-        self.config.shell = Some(
-            choices[keyroute::cycle(i, dir, choices.len())]
-                .command
-                .clone(),
-        );
+        let command = choices[keyroute::cycle(i, dir, choices.len())]
+            .command
+            .clone();
+        self.remember(command, |c, v| c.shell = Some(v));
         self.request_redraw();
     }
 
     fn change_padding(&mut self, dir: i32) {
         let cur = self.config.padding_px() as u32;
-        self.config.padding = Some(step_preset(&config::PADDING_STEPS, cur, dir));
+        let n = step_preset(&config::PADDING_STEPS, cur, dir);
+        self.remember(n, |c, v| c.padding = Some(v));
         self.relayout_active(); // pane rects (and PTY sizes) follow the inset
         self.request_redraw();
     }
 
     fn change_opacity(&mut self, dir: i32) {
         let cur = (self.config.opacity_level() * 100.0).round() as u32;
-        self.config.opacity = Some(step_preset(&config::OPACITY_STEPS, cur, dir) as f32 / 100.0);
+        let n = step_preset(&config::OPACITY_STEPS, cur, dir) as f32 / 100.0;
+        self.remember(n, |c, v| c.opacity = Some(v));
         self.apply_opacity();
         self.request_redraw();
     }
@@ -2237,19 +2347,21 @@ impl App {
     }
 
     fn toggle_hide_bar(&mut self) {
-        self.config.hide_single_tab = Some(!self.config.hide_single_tab_on());
+        let on = !self.config.hide_single_tab_on();
+        self.remember(on, |c, v| c.hide_single_tab = Some(v));
         self.relayout_active(); // the content area gains/loses the bar strip
         self.request_redraw();
     }
 
     fn toggle_confirm_close(&mut self) {
-        self.config.confirm_close = Some(!self.config.confirm_close_on());
+        let on = !self.config.confirm_close_on();
+        self.remember(on, |c, v| c.confirm_close = Some(v));
         self.request_redraw();
     }
 
     fn toggle_notifications(&mut self) {
         let on = !self.config.notifications_on();
-        self.config.notifications = Some(on);
+        self.remember(on, |c, v| c.notifications = Some(v));
         if on {
             // preview the toast you just turned on
             if let Some(h) = self.hwnd() {
@@ -2600,6 +2712,9 @@ impl App {
                         "Insert a command from the palette",
                     )
                     .into(),
+                    lua: None,
+                    scroll: 0,
+                    saw_end: true,
                 });
             }
             PaletteRow::Plugin(i) => {
@@ -2784,26 +2899,28 @@ impl App {
     /// Store a binding (pruned back out if it IS the default) and rebuild
     /// the live keymap.
     fn set_binding(&mut self, action: keybinds::Action, chord: keybinds::Chord) {
-        let kb = self.config.keybinds.get_or_insert_with(Default::default);
-        if chord == action.default_chord() {
-            kb.remove(action.id());
+        let stored = if chord == action.default_chord() {
+            None
         } else {
-            kb.insert(action.id().to_string(), chord.to_config());
-        }
-        if self.config.keybinds.as_ref().is_some_and(|m| m.is_empty()) {
-            self.config.keybinds = None;
-        }
+            Some(chord.to_config())
+        };
+        apply_shortcut(
+            &mut self.json_config.keybinds,
+            &mut self.config.keybinds,
+            action.id(),
+            stored,
+        );
         self.keymap = keybinds::effective_map(&self.config);
         self.request_redraw();
     }
 
     fn clear_binding(&mut self, action: keybinds::Action) {
-        if let Some(kb) = self.config.keybinds.as_mut() {
-            kb.remove(action.id());
-            if kb.is_empty() {
-                self.config.keybinds = None;
-            }
-        }
+        apply_shortcut(
+            &mut self.json_config.keybinds,
+            &mut self.config.keybinds,
+            action.id(),
+            None,
+        );
         self.keymap = keybinds::effective_map(&self.config);
         self.request_redraw();
     }
@@ -2882,7 +2999,7 @@ impl App {
     /// mirrored, with the button now naming the way back.
     fn switch_language(&mut self) {
         let next = self.config.lang().other();
-        self.config.language = Some(next.id().to_string());
+        self.remember(next.id().to_string(), |c, v| c.language = Some(v));
         lang::set(next);
         self.save_config();
         self.request_redraw();
@@ -2897,6 +3014,13 @@ impl App {
             is_app_error: true,
         });
         self.request_redraw();
+    }
+
+    /// A panel edit lands in the runtime config and in the JSON document.
+    /// Lua-only values stay on `config` and are not copied here.
+    fn remember<T: Clone>(&mut self, value: T, write: impl Fn(&mut config::UserConfig, T)) {
+        write(&mut self.config, value.clone());
+        write(&mut self.json_config, value);
     }
 
     /// The Arabic admin card. A config-load error already on the card stays;
@@ -2929,7 +3053,7 @@ impl App {
             );
             return;
         }
-        let bytes = match save_bytes(&self.config_load_error, &self.config) {
+        let bytes = match save_bytes(&self.config_load_error, &self.json_config) {
             Ok(bytes) => bytes,
             Err(error) => {
                 if self.config_load_error.is_some() {
@@ -2963,7 +3087,8 @@ impl App {
     /// when that renderer arrives, `relayout_active` resizes every PTY.
     /// Padding alone resizes with the metrics already on screen.
     fn apply_config_reload(&mut self, msg: config_watch::ReloadMsg) {
-        let decision = decide_reload(&self.config, self.settings.is_some(), msg);
+        // The merge runs on the JSON document, where panel edits also land.
+        let decision = decide_reload(&self.json_config, self.settings.is_some(), msg);
         if let Some(error) = decision.load_error {
             self.config_load_error = Some(error.clone());
             self.config_notice = Some(ConfigNotice {
@@ -2974,10 +3099,23 @@ impl App {
             return;
         }
         self.config_load_error = None;
-        let language = decision.plan.language && decision.config.lang() != self.config.lang();
+        // The running config also holds config.lua's overrides. A field the
+        // file changed takes the file's value there too; every other field
+        // keeps what is on screen. No script runs on a reload: a new hash in
+        // `lua_approvals` is honoured by the confirm card or the next launch.
+        let (runtime, _) =
+            config_watch::merge_reload(&self.json_config, &self.config, &decision.config);
+        let (plan, deferred) = plan_against_live(&self.config, &runtime);
+        let decision = ReloadDecision {
+            plan,
+            deferred,
+            ..decision
+        };
+        self.json_config = decision.config.clone();
+        let language = decision.plan.language && runtime.lang() != self.config.lang();
         // the bar's side and width decide the gutter, so the grid moves
-        let bar_moved = decision.config.scrollbar != self.config.scrollbar;
-        self.config = decision.config;
+        let bar_moved = runtime.scrollbar != self.config.scrollbar;
+        self.config = runtime;
         // published once at startup; a reload has to publish it again
         term::set_osc52_read(self.config.osc52_read_enabled());
         if language {
@@ -3352,6 +3490,9 @@ impl App {
             self.enter_tab();
             self.relayout_active();
             self.sync_focus(None);
+            let index = self.active.to_string();
+            // A tab the user opened, not bytes from the pane.
+            self.emit_lua_event("tab-opened", &[("index", &index)]);
         }
     }
 
@@ -5495,6 +5636,7 @@ impl App {
             match kind {
                 PendingKind::Paste => self.send_paste(&txt),
                 PendingKind::Drop | PendingKind::Command => self.send_focused(kind, &txt),
+                PendingKind::ApproveLua => {}
             }
             return;
         };
@@ -5511,6 +5653,9 @@ impl App {
             lines,
             chars,
             reason,
+            lua: None,
+            scroll: 0,
+            saw_end: true,
         });
         self.request_redraw();
     }
@@ -5521,6 +5666,12 @@ impl App {
         let Some(p) = self.pending_paste.take() else {
             return;
         };
+        if p.kind == PendingKind::ApproveLua {
+            self.approve_lua(p);
+            self.after_confirm_card();
+            self.request_redraw();
+            return;
+        }
         if !card_still_targets(p.pane, self.focused_pane_id()) {
             self.request_redraw();
             return;
@@ -5528,8 +5679,222 @@ impl App {
         match p.kind {
             PendingKind::Paste => self.send_paste(&p.text),
             PendingKind::Drop | PendingKind::Command => self.send_focused(p.kind, &p.text),
+            PendingKind::ApproveLua => {}
+        }
+        self.after_confirm_card();
+        self.request_redraw();
+    }
+
+    /// Esc on the confirm card. A Lua file that was refused stays unapproved
+    /// for this session; the next waiting file is raised.
+    pub(crate) fn dismiss_paste_card(&mut self) {
+        if let Some(hash) = self
+            .pending_paste
+            .as_ref()
+            .and_then(|p| p.lua.as_ref())
+            .map(|s| s.hash.clone())
+        {
+            self.lua_skipped.push(hash);
+        }
+        self.pending_paste = None;
+        self.lua_approve_not_before = None;
+        self.after_confirm_card();
+        self.request_redraw();
+    }
+
+    fn after_confirm_card(&mut self) {
+        if self.pending_paste.is_some() {
+            return;
+        }
+        self.show_next_lua_card();
+        if self.pending_paste.is_none() {
+            self.pump_lua_sends();
+        }
+    }
+
+    fn show_next_lua_card(&mut self) {
+        if self.pending_paste.is_some() {
+            return;
+        }
+        let skipped = self.lua_skipped.clone();
+        let Some(index) = self
+            .lua_pending
+            .iter()
+            .position(|p| !skipped.iter().any(|h| h == &p.hash))
+        else {
+            return;
+        };
+        let script = self.lua_pending.remove(index);
+        self.raise_lua_card(script);
+    }
+
+    fn raise_lua_card(&mut self, script: lua_host::PendingScript) {
+        let text = script.preview.clone();
+        let rows = card_preview(PendingKind::ApproveLua, &text);
+        let saw_end = rows.len() <= LUA_CARD_ROWS;
+        let mut reason = script.reason();
+        if !saw_end {
+            reason.push_str(tr(" — مرّر حتى آخر السكربت", " — scroll to the end"));
+        }
+        let lines = text.lines().count().max(1);
+        let chars = text.chars().count();
+        self.pending_paste = Some(PendingPaste {
+            kind: PendingKind::ApproveLua,
+            pane: None,
+            text,
+            lines,
+            chars,
+            reason,
+            lua: Some(script),
+            scroll: 0,
+            saw_end,
+        });
+    }
+
+    /// Wheel and arrows while the approval card is up. Returns whether the
+    /// card consumed the input.
+    fn scroll_lua_card(&mut self, delta: i32) -> bool {
+        let Some(p) = self.pending_paste.as_mut() else {
+            return false;
+        };
+        if p.kind != PendingKind::ApproveLua {
+            return false;
+        }
+        let rows = card_preview(p.kind, &p.text);
+        let (_, scroll, _) = lua_card_window(&rows, p.scroll);
+        if rows.len() <= LUA_CARD_ROWS {
+            p.saw_end = true;
+            p.scroll = scroll;
+            return true;
+        }
+        let max = rows.len() - LUA_CARD_ROWS;
+        let next = (scroll as i32 + delta).clamp(0, max as i32) as usize;
+        p.scroll = next;
+        if next >= max {
+            p.saw_end = true;
+        }
+        true
+    }
+
+    fn scroll_lua_card_key(&mut self, key: &winit::keyboard::Key) -> bool {
+        let lua = self
+            .pending_paste
+            .as_ref()
+            .is_some_and(|p| p.kind == PendingKind::ApproveLua);
+        if !lua {
+            return false;
+        }
+        let delta = match key {
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowDown) => 1,
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp) => -1,
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::PageDown) => {
+                LUA_CARD_ROWS as i32
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::PageUp) => {
+                -(LUA_CARD_ROWS as i32)
+            }
+            _ => return false,
+        };
+        self.scroll_lua_card(delta);
+        true
+    }
+
+    fn approve_lua(&mut self, card: PendingPaste) {
+        let Some(script) = card.lua.clone() else {
+            return;
+        };
+        if !script.shows_everything() {
+            self.lua_approve_not_before = Some(std::time::Instant::now() + LUA_APPROVE_DELAY);
+            self.raise_lua_card(script.reveal());
+            self.request_redraw();
+            return;
+        }
+        if !lua_enter_ready(self.lua_approve_not_before, std::time::Instant::now()) || !card.saw_end
+        {
+            self.pending_paste = Some(card);
+            self.request_redraw();
+            return;
+        }
+        self.lua_approve_not_before = None;
+        match lua_host::unchanged(&script) {
+            Ok(()) => {
+                lua_host::grant(&mut self.json_config, &script.hash);
+                self.save_config();
+                let outcome = lua_host::reload(&self.json_config, &config::bayan_dir());
+                self.apply_lua_outcome(outcome);
+            }
+            Err(err) => {
+                eprintln!("bayan: {err}");
+                self.report_error(
+                    tr("تعذر اعتماد السكربت", "Could not approve the script"),
+                    "تغيّر الملف ويحتاج اعتمادًا جديدًا.",
+                );
+                let outcome = lua_host::reload(&self.json_config, &config::bayan_dir());
+                self.apply_lua_outcome(outcome);
+            }
+        }
+    }
+
+    fn apply_lua_outcome(&mut self, outcome: lua_host::Outcome) {
+        self.json_config = outcome.persisted;
+        self.config = outcome.config;
+        self.keymap = keybinds::effective_map(&self.config);
+        lang::set(self.config.lang());
+        self.lua_plugins = outcome.plugins;
+        self.lua_pending = outcome.pending;
+        self.lua_errors = outcome.shown;
+        self.lua_notice = outcome.notice;
+        if self.renderer.is_some() && !self.renderer_building {
+            self.rebuild_renderer();
+        }
+        self.apply_opacity();
+        self.report_lua_errors();
+    }
+
+    fn report_lua_errors(&mut self) {
+        if let Some(notice) = self.lua_notice.take() {
+            self.report_error(tr("مسؤول", "Administrator"), &notice);
+        }
+        if self.lua_errors.is_empty() {
+            return;
+        }
+        let detail = self.lua_errors.join("\n");
+        self.lua_errors.clear();
+        self.report_error(tr("تعذر تشغيل لوا", "Lua did not run"), &detail);
+    }
+
+    fn fire_lua_chord(&mut self, chord: &str) -> bool {
+        if !self.lua_plugins.has_binding(chord) {
+            return false;
+        }
+        let sends = self.lua_plugins.fire(chord);
+        self.lua_send_queue.extend(sends);
+        if self.pending_paste.is_none() {
+            self.pump_lua_sends();
         }
         self.request_redraw();
+        true
+    }
+
+    fn pump_lua_sends(&mut self) {
+        if self.pending_paste.is_some() {
+            return;
+        }
+        if let Some(send) = self.lua_send_queue.pop_front() {
+            let pane = self.focused_pane_id();
+            self.pending_paste = Some(plugin_pending(&send.plugin, &send.text, pane));
+        }
+    }
+
+    fn emit_lua_event(&mut self, event: &str, fields: &[(&str, &str)]) {
+        let sends = self.lua_plugins.emit(event, fields);
+        if sends.is_empty() {
+            return;
+        }
+        self.lua_send_queue.extend(sends);
+        if self.pending_paste.is_none() {
+            self.pump_lua_sends();
+        }
     }
 
     /// A drop or a plugin command into the FOCUSED pane only. A drop keeps
@@ -5996,7 +6361,14 @@ impl App {
                     );
                 }
                 if let Some(p) = &self.pending_paste {
-                    let preview = card_preview(p.kind, &p.text);
+                    let all = card_preview(p.kind, &p.text);
+                    let preview = if p.kind == PendingKind::ApproveLua {
+                        lua_card_window(&all, p.scroll).0
+                    } else {
+                        all
+                    };
+                    let heading = (p.kind == PendingKind::ApproveLua)
+                        .then(|| tr("تشغيل سكربت لوا؟", "Run this Lua script?"));
                     renderer.draw_paste_guard(
                         &mut verts,
                         px.width as usize,
@@ -6006,6 +6378,7 @@ impl App {
                             chars: p.chars,
                             reason: &p.reason,
                             preview: &preview,
+                            heading,
                         },
                     );
                 }
@@ -6323,6 +6696,8 @@ impl ApplicationHandler<UserEvent> for App {
         self.window = Some(window.clone());
         self.report_config_load_error();
         self.apply_admin_notice();
+        self.report_lua_errors();
+        self.show_next_lua_card();
         self.apply_opacity(); // the configured window alpha, from frame one
         self.apply_window_frame();
         if let Some(h) = self.hwnd() {
@@ -6426,6 +6801,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Bell(id) => {
+                // Terminal output does not run Lua. The helper's result is empty.
+                let _ = lua_host::plugin_sends_from_pty(
+                    &self.lua_plugins,
+                    &lua_host::PtyFacts {
+                        bell: true,
+                        ..lua_host::PtyFacts::default()
+                    },
+                );
                 // the cockpit signal: a pane you're NOT looking at wants you
                 let mode = self.config.bell_mode();
                 if mode == config::BellMode::Silent {
@@ -6518,6 +6901,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Cwd(id, cwd) => {
+                let _ = lua_host::plugin_sends_from_pty(
+                    &self.lua_plugins,
+                    &lua_host::PtyFacts {
+                        cwd: Some(cwd.clone()),
+                        title: Some(cwd.clone()),
+                        ..lua_host::PtyFacts::default()
+                    },
+                );
                 let base = cwd.rsplit(['\\', '/']).next().unwrap_or(&cwd).to_string();
                 if let Some((ti, pi)) = self.find_pane(id) {
                     // the tab is named after its FOCUSED pane's directory
@@ -7092,6 +7483,22 @@ fn run(startup: Startup) -> Result<(), String> {
     };
     cfg.system_apps_light =
         theme::read_apps_use_light_theme().map(|v| theme::apps_use_light_theme(Some(v)));
+    // config.lua merges over JSON only when its bytes are already approved
+    // and the token is not elevated. An elevated token (UAC or Explorer's
+    // Run as administrator) keeps the JSON and runs no script and no plugin.
+    let lua = lua_host::load_with(&cfg, &config::bayan_dir(), startup.elevated);
+    for err in &lua.errors {
+        eprintln!("bayan: {err}");
+    }
+    if let Some(notice) = &lua.notice {
+        eprintln!("bayan: {notice}");
+    }
+    let lua_pending = lua.pending;
+    let lua_plugins = lua.plugins;
+    let lua_errors = lua.shown;
+    let lua_notice = lua.notice;
+    let json_config = lua.persisted;
+    cfg = lua.config;
     // debug hook: BAYAN_ARABIC_FONT=<family> draws terminal Arabic in that
     // font for this run only (config.json is not written unless a setting
     // is changed in the panel), so the setting is screenshot-verifiable
@@ -7140,7 +7547,8 @@ fn run(startup: Startup) -> Result<(), String> {
     let reload_proxy = proxy.clone();
     let config_watch = config_watch::spawn(
         config_path,
-        cfg.clone(),
+        // the file's own content: config.lua's overrides are not in it
+        json_config.clone(),
         baseline_bytes.as_deref(),
         move |msg| {
             let _ = reload_proxy.send_event(UserEvent::ConfigReloaded(msg));
@@ -7157,6 +7565,11 @@ fn run(startup: Startup) -> Result<(), String> {
     // Contrast theme; the running window reads it here.
     app.a11y = a11y::read_snapshot();
     app.inflight_a11y = app.a11y;
+    app.json_config = json_config;
+    app.lua_plugins = lua_plugins;
+    app.lua_pending = lua_pending;
+    app.lua_errors = lua_errors;
+    app.lua_notice = lua_notice;
     let result = event_loop.run_app(&mut app);
     if let Some(error) = app.startup_error {
         return Err(error);
@@ -7533,6 +7946,66 @@ mod tests {
     }
 
     #[test]
+    fn a_shortcut_edit_does_not_copy_lua_bindings_into_json() {
+        use std::collections::HashMap;
+        let mut saved = Some(HashMap::from([(
+            "copy".to_string(),
+            "ctrl+shift+c".to_string(),
+        )]));
+        let mut runtime = Some(HashMap::from([
+            ("copy".to_string(), "ctrl+shift+c".to_string()),
+            ("new-tab".to_string(), "ctrl+alt+t".to_string()),
+        ]));
+        apply_shortcut(
+            &mut saved,
+            &mut runtime,
+            "copy",
+            Some("ctrl+shift+x".into()),
+        );
+        assert_eq!(
+            saved.as_ref().unwrap().get("copy").map(String::as_str),
+            Some("ctrl+shift+x")
+        );
+        assert!(
+            saved.as_ref().unwrap().get("new-tab").is_none(),
+            "a lua binding must not be written into config.json: {saved:?}"
+        );
+        assert_eq!(
+            runtime.as_ref().unwrap().get("new-tab").map(String::as_str),
+            Some("ctrl+alt+t")
+        );
+        apply_shortcut(&mut saved, &mut runtime, "copy", None);
+        assert!(
+            !saved.as_ref().is_some_and(|m| m.contains_key("new-tab")),
+            "clearing a shortcut must not copy the lua map: {saved:?}"
+        );
+        assert!(runtime.as_ref().unwrap().contains_key("new-tab"));
+    }
+
+    #[test]
+    fn a_long_approval_card_scrolls_and_enter_waits() {
+        let rows: Vec<String> = (0..40).map(|i| format!("row {i}")).collect();
+        let (window, scroll, at_end) = lua_card_window(&rows, 0);
+        assert_eq!(window.len(), LUA_CARD_ROWS);
+        assert_eq!(scroll, 0);
+        assert!(!at_end);
+        assert_eq!(window[0], "row 0");
+        let (end, _, at_end) = lua_card_window(&rows, 1000);
+        assert!(at_end);
+        assert_eq!(end.last().map(String::as_str), Some("row 39"));
+        let short = vec!["only".to_string()];
+        assert!(lua_card_window(&short, 0).2);
+
+        let now = std::time::Instant::now();
+        assert!(lua_enter_ready(None, now));
+        assert!(!lua_enter_ready(Some(now + LUA_APPROVE_DELAY), now));
+        assert!(lua_enter_ready(
+            Some(now - std::time::Duration::from_millis(1)),
+            now
+        ));
+    }
+
+    #[test]
     fn a_confirm_card_goes_away_with_its_pane() {
         // The card is keyed by pane id (R-02 keeps the send safe). When that
         // pane is removed — shell exit, pane close, or the whole tab — the
@@ -7546,6 +8019,9 @@ mod tests {
                 lines: 1,
                 chars: 8,
                 reason: "test".into(),
+                lua: None,
+                scroll: 0,
+                saw_end: true,
             })
         };
         let mut pending = card(Some(7));

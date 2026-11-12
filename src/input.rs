@@ -476,6 +476,21 @@ impl App {
     pub(crate) fn mouse_wheel(&mut self, delta: MouseScrollDelta) {
         let cell_h = self.renderer.as_ref().map_or(20.0, |r| r.cell_h);
         let lines = wheel_lines(delta, cell_h);
+        // The approval card scrolls instead of the pane behind it. Whole
+        // lines, like the zoom below.
+        if self
+            .pending_paste
+            .as_ref()
+            .is_some_and(|p| p.kind == crate::PendingKind::ApproveLua)
+        {
+            let (n, rest) = take_whole_lines(self.wheel_accum, lines);
+            self.wheel_accum = rest;
+            if n != 0 {
+                self.scroll_lua_card(-n);
+                self.request_redraw();
+            }
+            return;
+        }
         // Ctrl+wheel = live font zoom (EasyTer's favorite). Whole lines,
         // whether or not scrollback itself eases.
         if self.modifiers.control_key() {

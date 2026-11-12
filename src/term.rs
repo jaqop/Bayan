@@ -1832,6 +1832,8 @@ fn process_bytes<T: EventListener>(
 ///
 /// The PTY reader does not call this. It decodes images before taking the
 /// terminal lock, then applies the same pieces. Tests share this entry.
+/// Neither path calls into Lua: escape sequences, OSC, hyperlinks, bells,
+/// and program text stay terminal data.
 #[cfg(test)]
 pub(crate) fn process_chunk<T: EventListener>(
     parser: &mut Processor,

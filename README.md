@@ -1095,6 +1095,88 @@ base64 is identical. The image filter copies text and CSI runs whole and
 steps byte by byte only through `ESC P`, `ESC _` and `ESC ]`: SGR-heavy
 output through `process_chunk` went from 76 to 82 MB/s (main: 88).
 
+
+## Lua config and executable plugins
+
+`~/.bayan/config.lua`, next to `config.json`, is optional. Bayan runs it
+only after the confirm card has approved that file's SHA-256. The script
+receives the JSON config as the global `config` and may change it or
+return a table; either way the result is merged over the JSON. On a
+syntax or runtime error Bayan logs `~/.bayan/lua.log`, shows the message,
+and keeps the JSON. The three keys `lua_approvals`, `lua_plugins`, and
+`lua_plugins_dir` stay as they are in config.json.
+
+Executable plugins are `<name>.lua` files in the directory
+`lua_plugins_dir` names (absolute, or relative to the config directory).
+Nothing in that directory runs until `lua_plugins` lists the stem, and
+each file still needs its own hash on the confirm card. A changed file
+is a new hash. There is no default directory and no default allowlist.
+
+```json
+{
+  "lua_plugins_dir": "plugins",
+  "lua_plugins": [ { "name": "hello", "spawn": false } ]
+}
+```
+
+The plugin API is `bayan.bind(chord, fn)`, `bayan.on(event, fn)`, and
+`bayan.send(text)`. `bayan.spawn(program, args)` exists only when that
+entry's `spawn` is true, and `config.lua` never has it. `send` waits on
+the same confirm card as a JSON plugin action. Events are `tab-opened`,
+`title-changed`, `bell`, and `osc7-cwd`. Opening a tab dispatches
+`tab-opened`. Bytes from the pane — escape sequences, OSC, hyperlinks,
+bells, program output — do not enter Lua. One event accepts 32 handlers.
+Every handler of one dispatch shares a single deadline.
+
+The sandbox is Lua 5.4 via mlua, with `string`, `table`, `math`, and
+`utf8` only. `io`, `os`, `debug`, and `package` are absent. `require`,
+`loadfile`, `dofile`, and `string.dump` are removed, and `load` accepts
+text chunks only. A metatable with `__gc` is rejected, because Lua 5.4
+runs finalizers with the instruction hook switched off. `<close>` is
+rejected too: after the budget aborts a call, the `__close` handler
+runs with that hook off, and setting `__close` after `setmetatable`
+still arms it. Every chunk, including one passed to `load`, is refused
+if its bytecode contains `OP_TBC`. The hook also
+cannot interrupt one C call, so `string.find`, `match`, `gmatch`, and
+`gsub` first bound the matcher's worst case for that subject and pattern
+(start positions times the ways the subject splits among the `*` `+` `-`
+`?` items, times the pattern length, with `%b` and back-references
+rescanning) and refuse a call over 10^7 steps. The first fix here capped
+subject and pattern length and counted `.-` chains; `("a"):rep(1000)
+:find("a*a*a*b")` passed all three and had not returned after 60 s. Measured in
+a debug build, the costliest admitted calls take about 5 ms. These calls,
+`string.rep`, and `table.move` also check the deadline themselves, since
+a loop body calling one is only a few instructions and the hook runs every
+thousand. `string.rep` refuses a result over 1 MiB and answers an empty
+one directly: `string.rep("", math.maxinteger)` copies zero bytes 2^63
+times, so the memory limit never stops it. `table.move` refuses more than
+2^20 elements, because moving nils allocates nothing either. config.lua's
+tables become JSON by Rust recursion outside the hook, so a table that
+contains itself, nesting past 32 levels, or more than 100,000 values in
+all is a config.lua error instead of a stack overflow on every launch.
+Each call into Lua gets its
+own instruction budget and its own short deadline, so one callback cannot
+spend the next one's time. A loop is still cut off. Strings are UTF-8;
+Arabic round-trips.
+
+`bayan.spawn` returns `""` immediately. Stdout is discarded, and the
+process is killed after two seconds, so it is not a way to open an
+editor. At most four of these processes run at once. On Windows the
+process is created suspended (`CREATE_SUSPENDED | CREATE_NO_WINDOW`),
+placed in a job, and only then resumed, so it cannot outlive the job.
+The values `config.lua` changes are not written back to `config.json`,
+and editing a shortcut writes only that one action. A script longer than
+the card shows its size and hash first. Enter reveals the rest, the card
+scrolls, and a second Enter can approve only after a short pause and
+only once the last row has been on screen.
+
+An elevated token does not run any of it. That is `--elevated` after the
+UAC prompt and Explorer's Run as administrator: the process token, not a
+flag Bayan has to be the one to set. `config.lua`, executable plugins, and
+the declarative JSON plugins are left unread. The window keeps the plain
+JSON settings. When a `config.lua` or a plugin is actually present, the
+window shows «سكربتات لوا والإضافات متوقفة لأن النافذة تعمل كمسؤول.»
+
 ## BiDi controls and the current directory
 
 Two escape sequences from ECMA-48 / the terminal-wg "BiDi in Terminal

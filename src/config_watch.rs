@@ -298,6 +298,24 @@ pub fn merge_reload(base: &UserConfig, live: &UserConfig, file: &UserConfig) -> 
             &mut overrode,
         ),
         images: merge_field(&base.images, &live.images, &file.images, &mut overrode),
+        lua_approvals: merge_field(
+            &base.lua_approvals,
+            &live.lua_approvals,
+            &file.lua_approvals,
+            &mut overrode,
+        ),
+        lua_plugins: merge_field(
+            &base.lua_plugins,
+            &live.lua_plugins,
+            &file.lua_plugins,
+            &mut overrode,
+        ),
+        lua_plugins_dir: merge_field(
+            &base.lua_plugins_dir,
+            &live.lua_plugins_dir,
+            &file.lua_plugins_dir,
+            &mut overrode,
+        ),
         keyboard: merge_field(
             &base.keyboard,
             &live.keyboard,

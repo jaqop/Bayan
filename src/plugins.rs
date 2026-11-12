@@ -1,11 +1,10 @@
 //! Plugin host — ported from EasyTer's `pluginhost.py`, principles first.
 //!
-//! EasyTer loads Python modules; Rust is compiled, so a faithful port of the
-//! MECHANISM would need an embedded script runtime or unsafe dynamic
-//! libraries. Both fight this project's rule that dependencies stay few and
-//! deliberate, and a `.dll` plugin can crash the host outright, which breaks
-//! the very first principle below. So the HOST is ported and the first
-//! backend is declarative: JSON files in `~/.bayan/plugins/`.
+//! The host below is the declarative backend: JSON files in
+//! `~/.bayan/plugins/`. A `.dll` plugin is not a backend — it can crash the
+//! process, which breaks the first principle. Executable plugins are Lua,
+//! sandboxed in `lua_host`, and they stay off until config allowlists the
+//! file and the confirm card has approved that exact content.
 //!
 //! The four principles that make EasyTer's host worth copying:
 //!

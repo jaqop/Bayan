@@ -2385,8 +2385,12 @@ pub struct PasteCard<'a> {
     pub chars: usize,
     pub reason: &'a str,
     /// One row per entry. A paste shows one elided row; a plugin command
-    /// shows its whole payload, wrapped (R-03).
+    /// shows its whole payload, wrapped (R-03). A Lua file uses the same
+    /// rows so the card shows the source being approved.
     pub preview: &'a [String],
+    /// Replaces the "Paste N lines?" title. Lua approval uses it; a paste
+    /// leaves it empty and keeps the original question.
+    pub heading: Option<&'a str>,
 }
 
 /// Hint under the command palette. The number is the filtered list the
@@ -6861,20 +6865,21 @@ impl Renderer {
             c4(self.accent_color((0xf2, 0xcc, 0x60)), 255),
         ); // warn accent
 
+        let paste_title = if crate::lang::rtl() {
+            format!(
+                "لصق {} ({})؟",
+                arabic_lines(card.lines),
+                arabic_chars(card.chars)
+            )
+        } else {
+            format!(
+                "Paste {} ({})?",
+                english_count(card.lines, "line"),
+                english_count(card.chars, "char")
+            )
+        };
         let title = [Seg {
-            text: if crate::lang::rtl() {
-                format!(
-                    "لصق {} ({})؟",
-                    arabic_lines(card.lines),
-                    arabic_chars(card.chars)
-                )
-            } else {
-                format!(
-                    "Paste {} ({})?",
-                    english_count(card.lines, "line"),
-                    english_count(card.chars, "char")
-                )
-            },
+            text: card.heading.unwrap_or(&paste_title).to_string(),
             fg: self.chrome_fg(),
             style: ST_BOLD,
         }];
