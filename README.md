@@ -991,7 +991,17 @@ DACL allows only the current user's SID, the first instance is created with
 `FILE_FLAG_FIRST_PIPE_INSTANCE`, and the mode includes
 `PIPE_REJECT_REMOTE_CLIENTS`. The client opens the pipe with identification
 QoS and accepts it only when the owner and the server process are that same
-SID, so another account cannot sit on the name and read keystrokes. An
+SID, so another account cannot sit on the name and read keystrokes. Both
+ends are opened with `FILE_FLAG_OVERLAPPED`. The first version used
+synchronous handles, with one thread reading each end while another wrote
+it; Windows serializes I/O on a synchronous handle, so a write waits for
+the read already pending and the first `Spawn` would never have left the
+window. It passed CI because no test sent a frame through a real pipe;
+one does now, in both directions, with both reads parked first. The
+server writes each window's frames on that window's own thread from a
+queue of 1024, so a window that stops reading cannot stall the others;
+when its queue fills it is disconnected and its sessions stay in the
+server, detached. An
 elevated window does not start the server and does not connect: the pipe
 name is only the user SID, and a normal process of that user must not be
 able to ask an admin server to spawn a program. Several windows can connect
@@ -1259,11 +1269,23 @@ The sandbox is Lua 5.4 via mlua, with `string`, `table`, `math`, and
 `utf8` only. `io`, `os`, `debug`, and `package` are absent. `require`,
 `loadfile`, `dofile`, and `string.dump` are removed, and `load` accepts
 text chunks only. A metatable with `__gc` is rejected, because Lua 5.4
-runs finalizers with the instruction hook switched off. `<close>` is
-rejected too: after the budget aborts a call, the `__close` handler
-runs with that hook off, and setting `__close` after `setmetatable`
-still arms it. Every chunk, including one passed to `load`, is refused
-if its bytecode contains `OP_TBC`. The hook also
+runs finalizers with the instruction hook switched off. `__close` is
+rejected for the same reason: when the budget aborts a call, mlua clears
+the Lua stack from inside the hook, and that runs the `__close` of every
+to-be-closed slot in the running function with the hook off. The first
+fix refused any chunk whose bytecode contained `OP_TBC`, the instruction
+behind `<close>`. It missed the fourth value of a generic `for`, which is
+to-be-closed with no `OP_TBC` at all: `for _ in f, nil, nil, obj do while
+true do end end` with a spinning `obj.__close` had not returned after 20 s
+against a 100 ms deadline. The scanner is gone. `setmetatable` now gives
+the object a private snapshot of the metatable, so a script never holds a
+live one and cannot add `__close` after the check, and `getmetatable("")`
+returns `false` so the shared string metatable is out of reach too. With
+no value able to carry `__close`, `<close>` and the `for` closing value
+have nothing to run; a script that tries gets Lua's own "non-closable
+value" error. The cost is that a metamethod assigned after `setmetatable`
+is not seen until `setmetatable` is called again. Methods reached through
+`__index` stay live. The hook also
 cannot interrupt one C call, so `string.find`, `match`, `gmatch`, and
 `gsub` first bound the matcher's worst case for that subject and pattern
 (start positions times the ways the subject splits among the `*` `+` `-`

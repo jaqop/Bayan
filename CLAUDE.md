@@ -54,9 +54,9 @@ selection and BiDi paths must do.
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-831 tests across the tree. `render.rs` (100), `term.rs` (99) and `link.rs`
-(66) carry the most; `lua_host.rs` has 46, `shellint.rs` 24, `images.rs` and
-`localpath.rs` 21 each, `mux.rs` 15, `config_watch.rs` 14, `screen_reader.rs`
+835 tests across the tree. `render.rs` (100), `term.rs` (99) and `link.rs`
+(66) carry the most; `lua_host.rs` has 48, `shellint.rs` 24, `images.rs` and
+`localpath.rs` 21 each, `mux.rs` 17, `config_watch.rs` 14, `screen_reader.rs`
 11 and `ssh.rs` 7. Three more in `term.rs` are `#[ignore]`d probes, run by
 hand (see Measuring).
 
@@ -230,6 +230,26 @@ when elevated, never from the `PROGRAMDATA` environment variable. It is a
 random name with a DACL that is not world-writable, and zsh's `ZDOTDIR` is
 restored to the user's value before the first prompt. Only a directory
 whose name we minted is deleted.
+
+**No Lua value may carry `__close` or `__gc`.** When the instruction hook
+ends a call, mlua clears the Lua stack from inside the hook, which closes
+every to-be-closed slot of the running function with hooks off. A
+`__close` handler that loops there never returns, and `__gc` always runs
+unhooked. So the sandbox's `setmetatable` installs a private snapshot of
+the table it is given and refuses those two fields, and `getmetatable("")`
+returns `false`. Do not hand a script a live metatable, a userdata, or the
+original `setmetatable`. Rejecting `<close>` in the bytecode was the first
+fix and missed the closing value of a generic `for`, which needs no
+`<close>`.
+
+**The mux pipe is overlapped at both ends.** The window and the server
+each park one thread in a read and write from another. On a synchronous
+handle Windows serializes the two, so the write waits for the read and
+nothing is ever sent. `mux::os::PipeEnd` does every read, write and
+connect with its own `OVERLAPPED` and event. Do not swap it for
+`std::fs::File`. The server never writes to a pipe from its event loop:
+frames go to a bounded queue per window, and a window that fills it is
+disconnected with its sessions left detached.
 
 **Start-directory precedence, in order:** a restored session's saved cwd, then
 the launcher's directory (a shortcut's "Start in"), then `USERPROFILE`. The
