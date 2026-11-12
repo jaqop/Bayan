@@ -1,11 +1,10 @@
 //! Plugin host — ported from EasyTer's `pluginhost.py`, principles first.
 //!
-//! EasyTer loads Python modules; Rust is compiled, so a faithful port of the
-//! MECHANISM would need an embedded script runtime or unsafe dynamic
-//! libraries. Both fight this project's rule that dependencies stay few and
-//! deliberate, and a `.dll` plugin can crash the host outright, which breaks
-//! the very first principle below. So the HOST is ported and the first
-//! backend is declarative: JSON files in `~/.bayan/plugins/`.
+//! The host below is the declarative backend: JSON files in
+//! `~/.bayan/plugins/`. A `.dll` plugin is not a backend — it can crash the
+//! process, which breaks the first principle. Executable plugins are Lua,
+//! sandboxed in `lua_host`, and they stay off until config allowlists the
+//! file and the confirm card has approved that exact content.
 //!
 //! The four principles that make EasyTer's host worth copying:
 //!
@@ -305,9 +304,28 @@ pub fn load_from(dir: &Path, disabled: &[String]) -> Registry {
 /// The live registry. Read at call time (principle 3) rather than captured.
 static REGISTRY: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
 
-/// Load plugins once, from `~/.bayan/plugins/`.
-pub fn init(disabled: &[String]) -> &'static Registry {
-    REGISTRY.get_or_init(|| load_from(&crate::config::bayan_dir().join("plugins"), disabled))
+/// What startup loads. An elevated token gets an empty registry and the
+/// directory is not read: a `send` in `~/.bayan/plugins` would otherwise
+/// reach the elevated shell after the confirm card. `dir` is that plugins
+/// directory.
+pub fn load_startup(elevated: bool, dir: &std::path::Path, disabled: &[String]) -> Registry {
+    if elevated {
+        Registry::default()
+    } else {
+        load_from(dir, disabled)
+    }
+}
+
+/// Load plugins once. Elevated startup records an empty registry so a later
+/// `registry()` call cannot fill it from disk.
+pub fn init(elevated: bool, disabled: &[String]) -> &'static Registry {
+    REGISTRY.get_or_init(|| {
+        load_startup(
+            elevated,
+            &crate::config::bayan_dir().join("plugins"),
+            disabled,
+        )
+    })
 }
 
 /// Plugins loaded so far, or an empty registry if `init` has not run.
@@ -323,6 +341,41 @@ pub fn theme_by_name(name: &str) -> Option<&'static PluginTheme> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elevated_startup_loads_nothing_from_a_plugins_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "bayan-plugins-elevated-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The same shape as ~/.bayan/plugins: a send the confirm card would
+        // type into an elevated shell. The test directory is not that home.
+        std::fs::write(
+            dir.join("planted.json"),
+            concat!(
+                "{\"actions\":[{\"label\":\"Run\",\"send\":\"calc.exe\\r\"}],",
+                "\"themes\":[{\"name\":\"Planted\",\"bg\":\"#101010\",",
+                "\"fg\":\"#ffffff\",\"ansi\":{}}]}"
+            ),
+        )
+        .unwrap();
+        let elevated = load_startup(true, &dir, &[]);
+        assert!(elevated.loaded.is_empty());
+        assert!(elevated.actions.is_empty());
+        assert!(elevated.themes.is_empty());
+        assert!(elevated.failed.is_empty());
+        let ordinary = load_startup(false, &dir, &[]);
+        assert_eq!(ordinary.loaded, vec!["planted".to_string()]);
+        assert_eq!(ordinary.actions.len(), 1);
+        assert_eq!(ordinary.actions[0].send, "calc.exe\r");
+        assert_eq!(ordinary.themes.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_runs_never_write_the_users_plugin_log() {

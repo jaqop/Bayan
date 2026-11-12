@@ -356,7 +356,11 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       mode on, and a RIS forgets the last CSI I so the next one is sent
       again. The wheel still scrolls the pane under the pointer and is
       not reported at all over the tab bar or the padding; Ctrl+wheel is
-      still font zoom. The suite size after this merged with main is
+      still font zoom. Scrollback itself moves by pixels when
+      `scroll.smooth` is on (the default): a touchpad keeps the fraction
+      of a line, a notch eases in, and `"scroll": {"smooth": false}` is
+      the old whole-line jump. The alt screen still turns the wheel into
+      arrows. The suite size after this merged with main is
       under M31. Not proven here: a live htop /
       vim `mouse=a` / lazygit / Claude Code session — this tree doesn't
       run a window on the machine that built it. Windows CI is the build
@@ -874,6 +878,137 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       selection, the RTL arrow and a clean prompt after Esc. There is no
       vim count prefix, `gg` is a single g, and the column is not
       remembered across short lines.
+- [x] **Follow the Windows app theme** — `"theme": "system"` (the absent
+      key means the same) tracks light and dark. `"dark"` and `"light"`
+      lock the pair in `theme.rs`; a named scheme, or any hand-set
+      `bg`/`fg`/`palette`, is not replaced when Windows changes. The
+      signal is winit's `ThemeChanged` and `WM_SETTINGCHANGE` whose
+      lParam is `ImmersiveColorSet`; both read
+      `HKCU\...\Personalize\AppsUseLightTheme` (DWORD 1 is light, anything
+      else including a missing value is dark). The terminal palette, the
+      tab bar (it already derives from the page colour), and
+      `DWMWA_USE_IMMERSIVE_DARK_MODE` update together. The settings row
+      «سمة النظام» offers النظام / داكن / فاتح. OSC 11 is not answered
+      here. Proven by the resolution tests (system/dark/light against the
+      registry DWORD, a named scheme and a hand-set background stay put)
+      and the event-path test (a theme-changed signal replaces the
+      palette and the caption flag, and does not touch a locked scheme).
+- [x] **Screen readers** — NVDA, JAWS and Narrator reach Bayan through
+      AccessKit (`accesskit` + `accesskit_winit`), whose Windows backend is
+      UI Automation. A raw `IRawElementProvider` / `ITextProvider`
+      implementation was the alternative: no extra crates, and the text
+      events would be exactly Windows Terminal's. It would also be a large
+      unsafe COM surface that three readers each interpret slightly
+      differently. AccessKit already maps a document of text runs, a caret
+      and a live region onto those UIA events, and it builds nothing until
+      a client connects. On Windows that first client leaves the adapter
+      active for the session, so afterwards the tree is rebuilt only when
+      the stamp changes, at about 10 Hz, and the last state of a burst is
+      always sent. That laziness is the reason to take the dependency
+      instead of calling UIA directly. Each visible pane is a document whose
+      lines are the grid's logical order (Arabic is not read in the shaped
+      visual order; Claude rows go through the same restoration as copy).
+      The cursor is the caret and the selection is a range on those runs.
+      New output is a polite live region, held for 500ms and then spoken as
+      one tail, so `cargo build` is not a line-by-line flood. An OSC 133
+      finish replaces that tail with one sentence that includes the exit
+      code. AccessKit raises LiveRegionChanged only when the name string
+      changes, so the same sentence twice in a row (two commands finishing
+      alike) toggles a trailing space to be spoken again. Tabs, panes, the
+      command palette, the right-click menu and the
+      confirm cards have names and roles in the UI language (Arabic by
+      default). Focus follows the active pane, and a card or the palette
+      takes it while it is open. The shaping path is unchanged. Proven by
+      11 tests (a mixed Arabic+Latin line stays in storage order, including
+      off a real `Term`; the caret column, including a wide glyph; the
+      selection range; flood coalescing; the exit-code sentence; a repeated
+      sentence re-firing; Arabic
+      names and roles for tabs, panes, the palette and a confirm card;
+      focus following the active pane; an unchanged stamp does not rebuild;
+      a 60 Hz burst stays near 10 builds a second and still publishes the
+      last stamp). Not verified on a machine: NVDA,
+      JAWS or Narrator actually speaking a running Bayan. Character boxes
+      for a magnifier's caret highlight are not provided, and a reader
+      cannot move the selection: the document does not advertise
+      SetTextSelection because nothing handles it.
+- [x] **Shell integration for bash, WSL and cmd** — the PowerShell OSC 133
+      wrapper is no longer the only one. Git Bash and MSYS bash get a temp
+      `--rcfile`, WSL bash the same file after the distro's login shell is
+      read from passwd, WSL zsh a `ZDOTDIR`, and cmd its own `PROMPT`
+      wrapped in `$E` marks. The bash and zsh sequences are the ones
+      PowerShell already emits (`D` with the exit code, `A`, `B`, all
+      carrying the session nonce), so prompt jump, command blocks, "at
+      prompt" drops and the exit-code gutter see the same marks. Bash and
+      zsh also emit `C` at command start; the parser ignores it as a
+      boundary. cmd cannot: `A` and `B` only, and no nonce, because every
+      program cmd starts inherits `PROMPT` and could read it back. Its marks
+      are untrusted: they reset a leftover BiDi mode and do nothing else, so
+      cmd keeps the features it had without them. Unknown shells are not
+      injected. `"shell_integration": false` turns it off, including for
+      PowerShell. User rc files are never rewritten. An elevated token does
+      not source them (and does not init oh-my-posh from the profile); the
+      scripts sit in `%ProgramData%` with a random name, a protected
+      administrator DACL and a high integrity label, and are deleted with
+      the pane. A normal pane's files are in the user temp directory, current
+      user only, not world-writable. Proven by the `shellint` plan tests
+      (bash rcfile, login vs not, elevated, WSL bash/zsh/other, cmd, opt-out,
+      unknown shell, WSLENV, the SDDL, the delete guard) and by feeding the
+      emitted bytes through the same OSC 133 parser as PowerShell, including
+      an Arabic prompt that must not show the sequence. Not run here: a live
+      Git Bash, a WSL distro, or an elevated token — this tree was checked
+      with `cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings`
+      and `cargo fmt --check`.
+
+## SSH tabs and the session multiplexer
+
+An SSH tab runs the Windows OpenSSH client, `GetSystemDirectoryW()\OpenSSH\ssh.exe`,
+in a new ConPTY tab. A copy on `PATH`, beside `bayan.exe`, or named by an
+environment variable is never used, including when Bayan is elevated. The
+command palette row «فتح SSH» lists hosts from `ssh_hosts` in
+`config.json` and from `Host` lines in `~/.ssh/config`. Wildcard patterns
+(`*`, `?`) and `Match` blocks are not destinations. The host is the tab
+title. A host that starts with `-` is rejected, and `--` is placed before
+the destination so the host cannot become an ssh option. Bayan does not
+store a password; authentication stays with the ssh agent and keys.
+
+```json
+{ "ssh_hosts": ["example.com", "me@bastion.example"] }
+```
+
+`Include` directives inside the ssh config are not followed. An IPv6
+literal is not a palette token; give it a `Host` alias and Bayan will pass
+that alias to `ssh.exe`.
+
+The multiplexer is off unless config says so:
+
+```json
+{ "mux": { "enabled": true } }
+```
+
+With it on, «فتح SSH» asks a per-user server (`bayan --mux-server`) to own
+the ConPTY. The window talks to that process over a named pipe. The pipe's
+DACL allows only the current user's SID, the first instance is created with
+`FILE_FLAG_FIRST_PIPE_INSTANCE`, and the mode includes
+`PIPE_REJECT_REMOTE_CLIENTS`. The client opens the pipe with identification
+QoS and accepts it only when the owner and the server process are that same
+SID, so another account cannot sit on the name and read keystrokes. An
+elevated window does not start the server and does not connect: the pipe
+name is only the user SID, and a normal process of that user must not be
+able to ask an admin server to spawn a program. Several windows can connect
+at once; each gets its own pipe instance. «فصل الجلسة» drops the tab and
+leaves the session running in the server. «إعادة الاتصال» lists those
+sessions and opens one again. The replay is capped at 256 KiB, starts on a
+UTF-8 and escape-sequence boundary, and device queries (`CSI 6n`, `CSI c`,
+OSC `?`) are removed so they are not answered into the live session.
+«إنهاء الجلسة» kills one. Closing the window kills sessions that are still
+attached and leaves the server running while any detached session remains.
+The server process exits when the last session ends, and a child exit keeps
+the process's status code.
+
+A shell Bayan started itself (PowerShell, cmd, WSL) stays in the window
+process, so the existing prompt injection is unchanged. Moving that ConPTY
+into the server with `DuplicateHandle` is not done. Scrollback saved to
+disk is a different item and is not part of this.
 
 ## Settings
 
@@ -884,16 +1019,45 @@ key falls back to a sane default:
 
 ```json
 {
-  "theme": "Bayan", "font_family": "Cascadia Code NF", "font_size": 15.0,
+  "theme": "system", "font_family": "Cascadia Code NF", "font_size": 15.0,
   "cursor_style": "bar", "cursor_blink": true, "scrollback": 20000,
   "copy_on_select": true, "ligatures": true, "bell": "attention",
-  "shell": "pwsh.exe", "padding": 8, "opacity": 0.9,
+  "shell": "pwsh.exe", "shell_integration": true, "padding": 8, "opacity": 0.9,
   "hide_single_tab": true, "confirm_close": true, "osc52": "off",
+  "follow_system_text_size": true, "terminal_follow_high_contrast": true,
   "editor": "code -g {file}:{line}:{col}", "tab_switch": "recent",
   "keybinds": { "new-tab": "ctrl+shift+n" },
-  "keyboard": { "kitty_protocol": false, "kitty_base_layout_fallback": true }
+  "keyboard": { "kitty_protocol": false, "kitty_base_layout_fallback": true },
+  "scroll": { "smooth": true },
+  "scrollbar": { "position": "right", "width": 8, "autohide": true }
 }
 ```
+
+`"theme"` is `"system"`, `"dark"`, `"light"`, or a named scheme such as
+`"Dracula"`. `"system"` (and leaving the key out) follows the Windows app
+theme. `"dark"` and `"light"` stay on that pair. A named scheme, or a
+hand-set `bg`/`fg`/`palette`, wins over a later system change. The settings
+row «سمة النظام» is the same choice; picking a gallery tile names that scheme.
+
+High Contrast and the Windows text-size slider are honored live, without a
+restart. While High Contrast is on, the tab bar, title bar, command palette,
+cards, scrollbar, focus rings, selection and cursor take the system colors
+(`COLOR_WINDOW`, `COLOR_WINDOWTEXT`, `COLOR_HIGHLIGHT`, `COLOR_HIGHLIGHTTEXT`,
+`COLOR_HOTLIGHT`, `COLOR_GRAYTEXT`, `COLOR_BTNFACE`). The terminal grid's
+background, foreground, selection and cursor follow those colors too, unless
+`"terminal_follow_high_contrast"` is false — then the theme stays inside the
+grid and the chrome still follows. The 16 ANSI colors stay on the theme either
+way, so a program's red is still red.
+
+`"follow_system_text_size"` (default true) multiplies UI chrome and the
+terminal font by Accessibility text size, a percent from 100 to 225 read from
+`HKCU\Software\Microsoft\Accessibility\TextScaleFactor` (the value
+`UISettings.TextScaleFactor` persists; Bayan does not link WinRT). An explicit
+`font_size` is the size at 100% and is still multiplied. DPI is a separate
+multiplier applied after that: pixels = points × text scale × dpi. Set the
+option to false to keep the point size absolute; DPI still applies. Ctrl+wheel
+changes the 100% point size, and the text scale multiplies that too. A change
+to either setting is re-read on `WM_SETTINGCHANGE` / `WM_SYSCOLORCHANGE`.
 
 `"osc_notify": true` lets programs raise desktop toasts through OSC 9,
 OSC 777 and OSC 99. It is off by default because any output can carry
@@ -902,12 +1066,243 @@ the toast's title is always «بيان · tab» and the program's text is cleane
 and capped. Bayan's own toasts (a long command finished, the bell) follow
 `notifications` and need no opt-in.
 
-Shell and scrollback apply to new tabs (no terminal restarts a live
-session); everything else applies immediately. `osc52` is config-file
+`"shell_integration"` defaults to **on** (leave the key out and it stays
+on). `false` starts new panes with no OSC 133 injection. It applies to
+PowerShell, Git Bash and MSYS `bash.exe` (not `git-bash.exe`, which is a
+GUI launcher), WSL bash and zsh, and cmd. `bash -c` and `bash script.sh`
+are not injected. An unknown program — fish, nushell, dash, `sh`, a
+Windows `zsh.exe` — is never injected, even when the key is on. Bash is
+started with a temporary `--rcfile` (`--login` is dropped, because bash
+would ignore the rcfile). A login shell then reads `/etc/profile` and the
+first of `~/.bash_profile`, `~/.bash_login`, `~/.profile`, and does not
+also read `~/.bashrc` — that is bash's own rule, and Ubuntu's profile
+already sources it. A non-login shell reads `~/.bashrc` only. The user's
+`PROMPT_COMMAND` is kept; `$?` is restored immediately before it runs, so
+starship and oh-my-posh still see a failed command. `PS0` emits `C` as a
+raw OSC (not `\[ \]`, which bash would print as SOH/STX). Nothing is
+written into the user's home. WSL reads the distro's login shell from
+passwd (`getent`, or `/etc/passwd` when getent is absent). Bash gets that
+rcfile. zsh gets a `ZDOTDIR` only while its startup files load, then the
+user's `ZDOTDIR` is restored (or unset, if it was unset) so history and
+tmux keep the user's directory. fish, dash, or any other default shell is
+exec'd with no rcfile. Windows paths become Linux paths through `WSLENV`
+(`/up`) and, if the value still looks like `C:\…`, `wslpath -u`. OSC 7
+percent-encodes the path as UTF-8 bytes, including spaces and Arabic, and
+`cygpath`/`wslpath` run once per directory, a directory that does not
+convert included. cmd's `PROMPT` keeps the user's own text and adds `$E`
+marks for `A` and `B` only. cmd has no hook that runs when a command
+starts, and no way to report `ERRORLEVEL` as that command's exit, so the
+gutter stays unknown and a `D` mark is not invented. The nonce travels in
+`BAYAN_PROMPT_NONCE` and is removed before a child inherits it. cmd never
+receives it: it would have to live in `PROMPT`, which every child
+inherits, so cmd's marks carry no nonce and are not trusted. An
+elevated token (Run as administrator) does not source user rc files, sets
+`INPUTRC` and `HISTFILE` to `/dev/null` so `~/.inputrc` cannot run a
+macro. Elevated Git Bash is started with `--noprofile` and does not read
+`/etc/profile`: that file runs `git-prompt.sh`, which executes
+`~/.config/git/git-prompt.sh` and `~/bash_completion.d/*.bash` as
+administrator. `PATH` and `MSYSTEM` are set from the Git install instead. Elevated WSL bash still reads the
+distro's `/etc/profile`, with `HOME` pointed at the rcfile directory for
+that read and restored afterwards. Elevated zsh ends `.zlogin` with
+`unsetopt rcs`, so exit does not read `~/.zlogout`. oh-my-posh is not inited from the user
+profile. A failed elevation query is treated as elevated. Elevated scripts
+are created under the real ProgramData folder
+(`SHGetKnownFolderPath(FOLDERID_ProgramData)`, not the `PROGRAMDATA`
+environment variable) with a random name, a protected DACL for SYSTEM and
+Administrators, and a high integrity label. A normal pane uses the user
+temp directory with a DACL for the current user only. The directory is
+removed when the pane closes, and a later launch deletes `bayan-si-*`
+directories older than 12 hours that this user owns. A name that is not
+one of those random directories is not deleted.
+
+`scrollbar.position` is `right` (the default, in Arabic and in English),
+`left`, or `hidden`. `scrollbar.width` is the thickness in logical pixels,
+clamped to 2–24, default 8, then multiplied by the display scale. `padding`
+scales the same way, so at 150% an 8px bar (12 physical pixels) still fits
+in the default padding (15) and is not clipped to an unscaled 10. The drawn
+width is still capped by that physical padding, and padding 0 hides the
+outer bar. `scrollbar.autohide` (default on) drops the bar one second after
+the last scroll or hover. The bar is drawn in the window padding, or in the
+side-by-side seam, never on a grid cell, so the last column stays visible
+and clickable. The resize grip on the bar's side is 2–6px and never wider
+than the old edge. Corners and that grip resize the window, including the
+top 6px of the caption buttons and the outer pixels of the close button;
+the pointer is the resize arrow there, because it is chosen from the same
+decision as the click. A scrollbar track beats a side grip, so the thumb
+drags instead. The ConPTY column count is the grid width divided by the
+cell width. Padding grows with the display scale, so at 150% and 200% the
+grid is narrower and a pane can lose a column even with the bar hidden. A
+side-by-side split widens the seam to the bar, which can cost one more
+column per pane: at 1280px with 11px cells the two panes are 56 and 56,
+where a 1px seam was 57 and 57. It is hidden with no scrollback
+and on the alternate screen. The thumb is at least 16px, or the bar's
+width when that is wider. The thumb follows smooth scroll's sub-line remainder.
+
+`config.json` is watched while Bayan is running. A change is re-read
+after about 200 ms of quiet, including when an editor saves by renaming
+a temp file over the real one. Theme, colors, font family and size (the
+grid is laid out again and the PTY is resized), key bindings, padding,
+cursor, opacity, and the other live settings apply without a restart.
+A save from the settings panel is recognized as Bayan's own write, so
+it is not loaded again. A file that does not parse is left alone: the
+last good settings stay in effect and a small notice shows the error.
+A read that fails because another program holds the file is retried
+for about 150 ms first. Deleting or renaming the file keeps the running
+settings (not defaults), so a later panel save writes them back.
+Scrollback applies to new panes, the shell to new tabs, restoring tabs
+on the next launch, the plugin list after a restart, and the kitty
+keyboard protocol in new panes. When one of those changes, the notice
+names it. `osc52` is config-file
 only (there is no settings-panel row). Leave it out or set `"off"`.
 `"copy"` lets a focused window accept OSC 52 clipboard writes from the
 focused pane; no value enables a clipboard read. The decode backstop is
 64 KiB, and one scan sees about 48–51 KiB.
+
+## Inline images
+
+Sixel (`DCS q`), Kitty graphics (`APC _G`) and iTerm2 (`OSC 1337 ; File=`
+with `inline=1`) are placed on the grid cell under the cursor. They scroll
+with that row, leave when the row leaves the scrollback, and clear with
+ED 2, ED 3, and RIS. EL and a partial ED leave Kitty graphics in place.
+A resize drops them only when the column count changes, which is when rows
+reflow; switching tabs does not. The alt screen has its own placements; leaving it
+drops those and shows the primary screen's images again. Rows that also
+contain Arabic still take the whole-line shaper. Image pixels are never
+reversed on an RTL line. Where to anchor the quad in an RTL paragraph is
+left for a later decision; this build keeps the image on the cursor cell.
+
+```json
+{
+  "images": {
+    "enabled": true,
+    "max_bytes": 20971520,
+    "max_width": 4096,
+    "max_height": 4096,
+    "max_pane_bytes": 67108864,
+    "max_session_bytes": 134217728
+  }
+}
+```
+
+`enabled` defaults to true. Over-cap or malformed input is dropped.
+Kitty `t=f`, `t=t` and `t=s` (file, temp file, shared memory) are always
+rejected: nothing in this path opens a local path, and there is no setting
+that turns them on. Direct transmission (`t=d`) accepts raw RGB (`f=24`),
+RGBA (`f=32`) and PNG (`f=100`), including chunked `m=1` / `m=0`. iTerm2
+payloads are PNG.
+
+ConPTY is created **without** `PSEUDOCONSOLE_PASSTHROUGH_MODE` (`0x8`).
+The flags are inherit-cursor, the resize quirk, and Win32 input mode
+(`vendor/portable-pty/src/win/psuedocon.rs`). In that mode conhost parses
+DCS and APC and does not forward them, so a real Windows console host will
+not deliver Sixel or Kitty graphics. OSC is forwarded, which is why OSC 7,
+9, 52 and 133 already work, so an iTerm2 `OSC 1337` is not stripped the way
+DCS and APC are. A 96×48 PNG (224 base64 bytes) printed with `cmd /c type`
+arrived intact through conhost on Windows 11 26200; larger payloads against
+conhost's OSC limits have not been checked (see wezterm#3624 and Rio#1764).
+
+**The image never moves the cursor.** The first build reserved the image's
+rows the way the protocols ask (`ESC D` per row). Under ConPTY that was
+wrong, and live: conhost does not know the image, keeps its own cursor, and
+repaints from its own buffer with absolute positions (captured after a
+resize: `ESC[H` and every row with `ESC[K`). Bayan's rows then disagreed
+with conhost's by the image's height, and the line printed after the image
+disappeared. Now the image stays on the rows it arrived on and the text
+conhost prints next draws over it (images are drawn first, and a cell with
+the default background draws nothing). The cost: conhost's repaint clears
+lines with EL, and EL clears an iTerm or Sixel image it touches, so a resize
+repaint or `cls` (also all EL) removes the image. Reserving rows is worth
+revisiting only with `PSEUDOCONSOLE_PASSTHROUGH_MODE`.
+
+PNG payloads (iTerm2 and Kitty `f=100`, chunked uploads included) and Sixel
+are decoded on the reader thread before the terminal lock is taken. For a
+chunked Kitty upload the reader keeps its own copy of the base64 until the
+last chunk; the store uses that early decode only if its own assembled
+base64 is identical. The image filter copies text and CSI runs whole and
+steps byte by byte only through `ESC P`, `ESC _` and `ESC ]`: SGR-heavy
+output through `process_chunk` went from 76 to 82 MB/s (main: 88).
+
+
+## Lua config and executable plugins
+
+`~/.bayan/config.lua`, next to `config.json`, is optional. Bayan runs it
+only after the confirm card has approved that file's SHA-256. The script
+receives the JSON config as the global `config` and may change it or
+return a table; either way the result is merged over the JSON. On a
+syntax or runtime error Bayan logs `~/.bayan/lua.log`, shows the message,
+and keeps the JSON. The three keys `lua_approvals`, `lua_plugins`, and
+`lua_plugins_dir` stay as they are in config.json.
+
+Executable plugins are `<name>.lua` files in the directory
+`lua_plugins_dir` names (absolute, or relative to the config directory).
+Nothing in that directory runs until `lua_plugins` lists the stem, and
+each file still needs its own hash on the confirm card. A changed file
+is a new hash. There is no default directory and no default allowlist.
+
+```json
+{
+  "lua_plugins_dir": "plugins",
+  "lua_plugins": [ { "name": "hello", "spawn": false } ]
+}
+```
+
+The plugin API is `bayan.bind(chord, fn)`, `bayan.on(event, fn)`, and
+`bayan.send(text)`. `bayan.spawn(program, args)` exists only when that
+entry's `spawn` is true, and `config.lua` never has it. `send` waits on
+the same confirm card as a JSON plugin action. Events are `tab-opened`,
+`title-changed`, `bell`, and `osc7-cwd`. Opening a tab dispatches
+`tab-opened`. Bytes from the pane — escape sequences, OSC, hyperlinks,
+bells, program output — do not enter Lua. One event accepts 32 handlers.
+Every handler of one dispatch shares a single deadline.
+
+The sandbox is Lua 5.4 via mlua, with `string`, `table`, `math`, and
+`utf8` only. `io`, `os`, `debug`, and `package` are absent. `require`,
+`loadfile`, `dofile`, and `string.dump` are removed, and `load` accepts
+text chunks only. A metatable with `__gc` is rejected, because Lua 5.4
+runs finalizers with the instruction hook switched off. `<close>` is
+rejected too: after the budget aborts a call, the `__close` handler
+runs with that hook off, and setting `__close` after `setmetatable`
+still arms it. Every chunk, including one passed to `load`, is refused
+if its bytecode contains `OP_TBC`. The hook also
+cannot interrupt one C call, so `string.find`, `match`, `gmatch`, and
+`gsub` first bound the matcher's worst case for that subject and pattern
+(start positions times the ways the subject splits among the `*` `+` `-`
+`?` items, times the pattern length, with `%b` and back-references
+rescanning) and refuse a call over 10^7 steps. The first fix here capped
+subject and pattern length and counted `.-` chains; `("a"):rep(1000)
+:find("a*a*a*b")` passed all three and had not returned after 60 s. Measured in
+a debug build, the costliest admitted calls take about 5 ms. These calls,
+`string.rep`, and `table.move` also check the deadline themselves, since
+a loop body calling one is only a few instructions and the hook runs every
+thousand. `string.rep` refuses a result over 1 MiB and answers an empty
+one directly: `string.rep("", math.maxinteger)` copies zero bytes 2^63
+times, so the memory limit never stops it. `table.move` refuses more than
+2^20 elements, because moving nils allocates nothing either. config.lua's
+tables become JSON by Rust recursion outside the hook, so a table that
+contains itself, nesting past 32 levels, or more than 100,000 values in
+all is a config.lua error instead of a stack overflow on every launch.
+Each call into Lua gets its
+own instruction budget and its own short deadline, so one callback cannot
+spend the next one's time. A loop is still cut off. Strings are UTF-8;
+Arabic round-trips.
+
+`bayan.spawn` returns `""` immediately. Stdout is discarded, and the
+process is killed after two seconds, so it is not a way to open an
+editor. At most four of these processes run at once. On Windows the
+process is created suspended (`CREATE_SUSPENDED | CREATE_NO_WINDOW`),
+placed in a job, and only then resumed, so it cannot outlive the job.
+The values `config.lua` changes are not written back to `config.json`,
+and editing a shortcut writes only that one action. A script longer than
+the card shows its size and hash first. Enter reveals the rest, the card
+scrolls, and a second Enter can approve only after a short pause and
+only once the last row has been on screen.
+
+An elevated token does not run any of it. That is `--elevated` after the
+UAC prompt and Explorer's Run as administrator: the process token, not a
+flag Bayan has to be the one to set. `config.lua`, executable plugins, and
+the declarative JSON plugins are left unread. The window keeps the plain
+JSON settings. When a `config.lua` or a plugin is actually present, the
+window shows «سكربتات لوا والإضافات متوقفة لأن النافذة تعمل كمسؤول.»
 
 ## BiDi controls and the current directory
 
@@ -930,7 +1325,9 @@ when a sequence is split across reads.
   including `ESC ESC c`, `ESC` plus a C0 byte then `c`, and `ESC` plus a
   byte >= 0x80 then `c`) and when a `?1049` / `?47` / `?1047` CSI is seen,
   including a colon subparameter such as `?1049:0`, even if a second one in
-  the same read toggles the mode back. A resize drops SCP stamps. A BDSM or
+  the same read toggles the mode back. A resize drops SCP stamps when the
+  column count changes (rows reflow); a row-only resize and a same-size
+  resize leave them. A BDSM or
   SCP that ends an open OSC is stripped only after that OSC is closed, so
   the text after it is not swallowed.
 
@@ -940,6 +1337,27 @@ sends `CSI 8 l`:
 
 ```json
 { "bidi": { "honor_bdsm": false } }
+```
+
+`bidi.mode` is mintty's `Bidi=2/1/0`. `"full"` (2, the default) is the
+behavior above. `"alt_off"` (1) does not reorder while the program has
+entered the alternate screen with `?1049`, `?1047`, or `?47`, including
+when that CSI is split across reads, and reorders again after the reset.
+Only `?1049` changes alacritty's screen buffer. `?47` and `?1047` are
+tracked beside it for this decision and are not rewritten into `?1049`.
+`"off"` (0) does not reorder anywhere, so an agent that already ordered
+Arabic is not reversed a second time; Arabic shaping is unchanged. An
+explicit BDSM still disables reordering on top of `full` and of `alt_off`
+on the primary screen when `honor_bdsm` is true. Ctrl+Shift+F3
+(rebindable, `bidi-toggle`; bare F3 stays with htop and mc) cycles the focused pane `full → alt_off → off`; other panes
+stay as they are, and the corner chip reads `BiDi 1` or `BiDi 0` until the
+pane is back on `full`. An RTL paragraph (SCP 2, or auto when the first
+strong character is Arabic) is drawn flush with the pane's right edge on
+the primary screen. LTR paragraphs, TUI fields, and the alternate screen
+stay on the left.
+
+```json
+{ "bidi": { "mode": "alt_off" } }
 ```
 
 **OSC 7** (`ESC ] 7 ; file://host/path ST`, BEL or `ESC \`) stores the pane's
@@ -965,8 +1383,12 @@ pending, and the pane is not on the alt screen. Enter at the prompt sets
 only a nonce-verified OSC 133 A or D clears it. While it is set, OSC 7
 needs the nonce the same way it does while a command is running.
 PowerShell's wrapper sends OSC 133 D and A with a per-session nonce, and
-only that A arms the report, so a spoofed `133;D` from `cat` cannot. An
-idle OSC 7 (cmd/clink, which has no 133) is still stored. A new tab calls
+only that A arms the report, so a spoofed `133;D` from `cat` cannot. Bash
+and zsh emit the same D/A/B bytes (and a C from `PS0` / `preexec`, which
+the parser does not treat as a prompt boundary), plus OSC 9;9 and OSC 7
+when the directory converts to a Windows path. cmd emits A and B with ST
+(`ESC \`), no exit code and no nonce, so they arm nothing. An idle OSC 7
+with no trusted 133 (clink in cmd) is still stored. A new tab calls
 `GetDriveTypeW` on the drive root and rejects a remote drive, and it
 rejects a reparse point without following it, before `is_dir`.
 
@@ -1009,7 +1431,73 @@ in that folder; a relative one is taken from the current folder. It goes through
 the same gate as every start folder, and a UNC path, a mapped network drive or a
 missing folder stops Bayan with an error instead of opening somewhere else. With
 `restore_tabs` on, the saved tabs come back and the folder opens as the active
-extra tab.
+extra tab. `-p <name>` (or `--profile`) starts that tab in a detected shell
+profile, by its name or its command (`PowerShell`, `PowerShell سريع`,
+`cmd.exe`). `-- <command>...` runs that program in the tab instead.
+`--help` and `--version` print and exit. An unknown argument is an error.
+
+`bayan --register-context-menu` adds **افتح بيان هنا** for the current user
+under `HKCU\Software\Classes\Directory\shell\Bayan` and
+`Directory\Background\shell\Bayan`, with the command `"<exe>" -d "%V\."`.
+The `\.` keeps a drive root from arriving as `C:"`.
+`--unregister-context-menu` removes both. This does not write HKLM and does
+not ask for an administrator. Windows 11's top-level menu needs package
+identity (MSIX, later); until then the entry is under **Show more options**.
+`"explorer_context_menu": true` in `config.json` is the installer hook for
+the same registration (absent leaves the menu alone; there is no settings row).
+
+The taskbar Jump List lists each detected shell as `"<exe>" -p <name>` (the
+profile's name, not its command line), then **نافذة جديدة** (`--new-window`)
+and **تشغيل كمسؤول** (`--elevated`). The process sets an explicit
+AppUserModelID (`Bayan.Terminal.` plus a hash of the exe path) before the
+window exists, and rewrites the list on startup when the detected profiles
+differ from the list it last committed. The remembered list is only that
+comparison. It is not what gets written back.
+
+`--elevated` is the only way Bayan asks for an administrator. It calls
+`ShellExecuteW` with the verb `runas` (the normal UAC prompt) and then exits.
+The elevated process is given `--elevated` and, when a profile was named,
+`-p <profile name>`. A folder and a command after `--` are refused, and a
+profile name that is a path is refused. The elevated process resolves the
+name against the shells it detects itself; a command string does not match.
+It does not restore `session.json` and it does not start `config.json`'s
+`shell` value, because both are files a standard user can write. The window
+title and the tab strip show **مسؤول** while the token is elevated. Cancelling
+UAC does not open a window. Bayan does not elevate on its own, and the
+executable manifest stays `asInvoker`. An elevated window, including one
+Explorer started with Run as administrator, does not load `~/.bayan/plugins`
+and does not inject oh-my-posh. The prompt picker does not open in that
+window, so it neither runs `oh-my-posh.exe` nor rewrites `$PROFILE`. It does
+not use `config.json`'s `editor` command. Ctrl+click looks for `Code.exe`
+only under Program Files and Program Files (x86), from the known-folder
+API, not from `PATH` or `%LOCALAPPDATA%`. If that copy is missing, a confirm
+card shows the full path. Enter on that card reveals the file in Explorer
+and does not open it by its file association. `explorer.exe` comes from
+`GetWindowsDirectoryW`, not from `WINDIR`. A host card remembers whether
+Enter browses or reveals, so `HTTPS://` still opens in the browser.
+`pwsh.exe` is started only from
+`Program Files\PowerShell\7`. `save_state` does not write `session.json`
+when the token is elevated, including a rename or a group change, and a
+settings change is not written either. The jump-list stamp is not written.
+The window says so in Arabic when it opens, and a config-load error keeps
+that notice on the same card.
+
+`"terminal_handoff": true` (absent means off; the same switches are
+`--register-terminal-handoff` and `--unregister-terminal-handoff`) registers
+one per-user COM class,
+`HKCU\Software\Classes\CLSID\{A7C3E1B2-4D58-4F0A-9E6C-1B8D5A2F7043}\LocalServer32`,
+command `"<exe>" --handoff`. That is the terminal half of Windows Terminal's
+handoff (`ITerminalHandoff`, `ITerminalHandoff2`, and `ITerminalHandoff3`).
+It does **not** make Bayan the Windows 11 default terminal. The Settings
+list is an AppExtension catalog
+(`com.microsoft.windows.console.host` and `com.microsoft.windows.terminal.host`
+in the same MSIX package). Inbox conhost activates `DelegationConsole` as
+`IConsoleHandoff`, which is OpenConsole, and only that process calls
+`ITerminalHandoff`, through `OpenConsoleProxy.dll`. Bayan ships neither, and
+it does not write `HKCU\Console\%%Startup`. `--handoff` registers the class
+and every `EstablishPtyHandoff` returns `E_NOTIMPL`: no shell is started and
+no handle is kept. A working default terminal still needs the MSIX package,
+OpenConsole, and the proxy DLL.
 
 The default terminal font is 18; settings and tab controls use independent UI
 metrics so a small terminal font does not shrink the controls. Ctrl+V pastes in

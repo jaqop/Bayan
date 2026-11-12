@@ -2,16 +2,17 @@
 //! alacritty_terminal. Mirrors EasyTer's proven architecture: a reader thread
 //! feeds the emulator behind a mutex and nudges the UI thread to repaint.
 
-use std::io::Read;
+use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::Instant;
 
-use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Column;
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{Config, Osc52, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use base64::Engine;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -100,9 +101,11 @@ fn is_under(path: &str, root: &str) -> bool {
     p == r || p.starts_with(&format!("{r}\\"))
 }
 
-/// The PowerShell family gets the full treatment (UTF-8, prompt theme,
-/// OSC 133 marks); other shells launch bare and the mark-driven features
-/// (command lights, prompt jumps, Claude auto-detect) degrade gracefully.
+/// The PowerShell family gets UTF-8, the prompt theme and OSC 133 marks.
+/// Git Bash and WSL bash/zsh get the same marks from `shellint`; cmd gets
+/// A and B with no exit code and no nonce, so they are untrusted. Anything
+/// else launches bare, and the
+/// mark-driven features degrade gracefully.
 fn is_powershell(shell: &str) -> bool {
     // `shell` is a COMMAND LINE now, not a program name: detection emits
     // "powershell.exe -NoProfile", "wsl.exe -d Ubuntu", "…bash.exe --login -i".
@@ -194,8 +197,9 @@ const PS_END: &str = "$([char]7)\"}}}; __by_wrap";
 /// A report from a running command is stored only after an A that carries
 /// the same nonce, so a spoofed `133;D` cannot authorize the OSC 7 that
 /// follows it. Hex is safe inside the double-quoted prompt string. An empty
-/// nonce keeps the old "any A/D" rule for tests. cmd/clink has no 133 marks;
-/// its OSC 7 is still accepted while the pane is already idle.
+/// nonce keeps the old "any A/D" rule for tests. cmd's `PROMPT` emits A and
+/// B only, without the nonce, so a clink OSC 7 is still accepted while the
+/// pane is already idle and never on the strength of those marks.
 pub(crate) fn shell_integration_ps(nonce: &str) -> String {
     // `nonce` is spliced in as text: the live session passes NONCE_PS_EXPR,
     // tests pass a literal
@@ -251,9 +255,16 @@ pub(crate) const NONCE_OFF: &str = ";integration-off";
 /// output mint "trusted" prompt marks, which is worse than having none.
 fn fresh_prompt_nonce() -> String {
     let mut bytes = [0u8; 16];
-    // SAFETY: the length passed is `bytes`'s own, so the write stays in bounds.
-    let ok = unsafe { SystemFunction036(bytes.as_mut_ptr().cast(), bytes.len() as u32) != 0 };
-    nonce_hex(ok.then_some(bytes))
+    nonce_hex(fill_random(&mut bytes).then_some(bytes))
+}
+
+/// Fill `buf` from `RtlGenRandom`. False when the OS RNG refuses.
+pub(crate) fn fill_random(buf: &mut [u8]) -> bool {
+    if buf.is_empty() {
+        return false;
+    }
+    // SAFETY: the length passed is `buf`'s own, so the write stays in bounds.
+    unsafe { SystemFunction036(buf.as_mut_ptr().cast(), buf.len() as u32) != 0 }
 }
 
 fn nonce_hex(bytes: Option<[u8; 16]>) -> String {
@@ -354,8 +365,20 @@ pub struct SessionMeta {
     /// The reader thread uses [`Self::bidi_mut`], which copies only when a
     /// frame still holds the previous snapshot.
     pub bidi: std::sync::Arc<crate::bidi_ctl::BidiState>,
+    /// This pane's reorder mode, when the user toggled it. `None` follows
+    /// `bidi.mode` in the config. Kept off `bidi` so an alt-screen reset,
+    /// which clears BDSM and SCP, does not forget the toggle.
+    pub bidi_reorder: Option<crate::bidi_ctl::BidiReorder>,
+    /// `?47` / `?1047` / `?1049` set and reset, for `bidi.mode = alt_off`
+    /// only. The parser's bytes are not rewritten from this.
+    pub alt_track: crate::bidi_ctl::AltScreenTrack,
     /// Half-parsed BDSM/SCP/RIS held across PTY reads.
     pub(crate) esc_filter: crate::bidi_ctl::StreamFilter,
+    /// Sixel, Kitty graphics, and iTerm2 images anchored to grid cells.
+    pub images: crate::images::ImageStore,
+    /// A DCS / APC / OSC 1337 that has not finished arriving. Larger than
+    /// the 4 KiB OSC carry, and not fed to vte.
+    pub(crate) image_in: crate::images::ImageFilter,
     /// command blocks (OSC 133 A/D): gutter lights + prompt jumping
     pub marks: Vec<CmdMark>,
     /// history lines evicted past the scrollback cap (+ ED3-cleared lines):
@@ -388,6 +411,13 @@ pub struct SessionMeta {
     /// A that carries this nonce. Clink's OSC 7 has no 133 and is still
     /// accepted when the pane is already idle.
     pub prompt_nonce: String,
+    /// Bytes vte is holding for the open synchronized update, SCP already
+    /// removed. A forced flush replays this so paragraph marks see the
+    /// cursor those bytes produce, not the cursor from before BSU.
+    pub(crate) sync_mirror: Vec<u8>,
+    /// SCP that arrived while the update was open: offset into
+    /// [`Self::sync_mirror`], then the direction.
+    pub(crate) sync_bidi: Vec<(usize, crate::bidi_ctl::ParagraphDir)>,
 }
 
 impl SessionMeta {
@@ -414,6 +444,18 @@ impl SessionMeta {
         self.reported_cwd()
             .and_then(accept_local_cwd)
             .filter(|p| usable_spawn_dir(p))
+    }
+
+    /// Replace this pane's image budget. Used by tests that share one
+    /// session cap across two panes, and at spawn.
+    pub fn share_image_budget(&mut self, budget: Arc<crate::images::ImageBudget>) {
+        self.image_in.set_limits(budget.limits());
+        self.images.attach(budget);
+    }
+
+    #[cfg(test)]
+    pub fn set_image_limits(&mut self, limits: crate::images::ImageLimits) {
+        self.share_image_budget(Arc::new(crate::images::ImageBudget::new(limits)));
     }
 }
 
@@ -776,9 +818,11 @@ fn last_osc_payload<'a>(data: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
 
 /// OSC 52: a program asked to set the clipboard.
 ///
-/// Write-only. A query (`?`) returns `None` and nothing in this process
-/// ever replies with clipboard bytes. The caller still has to pass
-/// [`allow_osc52_write`]: this function only parses.
+/// Write-only. A query (`?`) returns `None` here. The parser may still
+/// emit `ClipboardLoad`; [`EventProxy`] forwards that and
+/// [`clipboard_load_reply`] writes nothing unless the read flag is on —
+/// and even then this build does not read the clipboard. The caller still
+/// has to pass [`allow_osc52_write`] for a copy: this function only parses.
 fn scan_osc52(data: &[u8]) -> Option<String> {
     let payload = last_osc_payload(data, b"\x1b]52;")?;
     // skip the selection field ("c;", "p;", ...)
@@ -1387,6 +1431,122 @@ fn note_screen_swap<T: EventListener>(before_alt: bool, t: &Term<T>, meta: &mut 
     }
 }
 
+/// `CSI ? 2026 l`, the exact sequence vte treats as the end of a sync.
+const ESU_SEQ: &[u8] = b"\x1b[?2026l";
+
+/// Swallow a synchronized update's buffered bytes. The grid is updated by
+/// [`replay_deferred_bidi`] instead, so `stop_sync` must not apply them twice.
+struct DiscardSync;
+
+impl alacritty_terminal::vte::ansi::Handler for DiscardSync {}
+
+fn slice_has_esu(mirror: &[u8], bytes: &[u8]) -> bool {
+    if bytes.windows(ESU_SEQ.len()).any(|w| w == ESU_SEQ) {
+        return true;
+    }
+    let keep = (ESU_SEQ.len() - 1).min(mirror.len());
+    if keep == 0 {
+        return false;
+    }
+    let mut edge = mirror[mirror.len() - keep..].to_vec();
+    let take = (ESU_SEQ.len() - 1).min(bytes.len());
+    edge.extend_from_slice(&bytes[..take]);
+    edge.windows(ESU_SEQ.len()).any(|w| w == ESU_SEQ)
+}
+
+/// Apply the held update in stream order, then drop vte's copy of it.
+///
+/// SCP was removed before those bytes reached vte, so a plain `stop_sync`
+/// paints the text and leaves the paragraph mark on the pre-BSU row.
+fn release_sync_for_bidi<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    meta: &mut SessionMeta,
+) {
+    replay_deferred_bidi(t, meta);
+    parser.stop_sync(&mut DiscardSync);
+}
+
+fn replay_deferred_bidi<T: EventListener>(t: &mut Term<T>, meta: &mut SessionMeta) {
+    let bytes = std::mem::take(&mut meta.sync_mirror);
+    let marks = std::mem::take(&mut meta.sync_bidi);
+    let mut scratch = Processor::new();
+    let mut at = 0;
+    for (offset, dir) in marks {
+        let offset = offset.min(bytes.len());
+        if offset > at {
+            apply_visible(&mut scratch, t, &bytes[at..offset]);
+            at = offset;
+        }
+        if bidi_controls_live(t, meta) {
+            let (abs, col) = crate::bidi_ctl::cursor_abs(t, meta.evicted);
+            meta.bidi_mut().note_scp(dir, abs, col);
+        }
+    }
+    if at < bytes.len() {
+        apply_visible(&mut scratch, t, &bytes[at..]);
+    }
+}
+
+/// Parse `bytes` onto the grid. An inner BSU must not swallow the tail:
+/// this is the flush, and the tail is part of the frame being released.
+fn apply_visible<T: EventListener>(parser: &mut Processor, t: &mut Term<T>, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    parser.advance(t, bytes);
+    if parser.sync_bytes_count() > 0 || parser.sync_timeout().sync_timeout().is_some() {
+        parser.stop_sync(t);
+    }
+}
+
+fn advance_for_sync<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    meta: &mut SessionMeta,
+    bytes: &[u8],
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    // ESU is about to close the update. Replay first so an SCP that sits
+    // in the held bytes stamps the row the cursor is on at that point,
+    // then let this slice — including the ESU — draw normally.
+    if parser.sync_timeout().sync_timeout().is_some()
+        && !meta.sync_bidi.is_empty()
+        && slice_has_esu(&meta.sync_mirror, bytes)
+    {
+        release_sync_for_bidi(parser, t, meta);
+    }
+    let was_open = parser.sync_timeout().sync_timeout().is_some();
+    // Captured before `advance` replaces the mirror. An ESU split across
+    // the boundary is still this update's end.
+    let ends_update = was_open && slice_has_esu(&meta.sync_mirror, bytes);
+    let before = parser.sync_bytes_count();
+    parser.advance(t, bytes);
+    if parser.sync_timeout().sync_timeout().is_none() {
+        meta.sync_mirror.clear();
+        meta.sync_bidi.clear();
+        return;
+    }
+    let after = parser.sync_bytes_count();
+    if ends_update {
+        // ESU and a new BSU in this chunk. vte applied the old frame and
+        // kept only the new buffer, which is the last `after` bytes of
+        // this chunk — the bytes after the final BSU. `after == before`
+        // used to leave the old frame in the mirror, so the next SCP
+        // replayed it and dropped the start of the new frame.
+        let start = bytes.len().saturating_sub(after);
+        meta.sync_mirror.clear();
+        meta.sync_mirror.extend_from_slice(&bytes[start..]);
+        meta.sync_bidi.clear();
+    } else if after > before {
+        let added = after - before;
+        let start = bytes.len().saturating_sub(added);
+        meta.sync_mirror.extend_from_slice(&bytes[start..]);
+    }
+}
+
 fn feed_plain<T: EventListener>(
     parser: &mut Processor,
     t: &mut Term<T>,
@@ -1397,7 +1557,7 @@ fn feed_plain<T: EventListener>(
         return;
     }
     let before_alt = t.mode().contains(TermMode::ALT_SCREEN);
-    parser.advance(t, bytes);
+    advance_for_sync(parser, t, meta, bytes);
     note_screen_swap(before_alt, t, meta);
     // Same `ESC c` that [`process_chunk`] records in `saw_ris`. The parser
     // has just cleared both keyboard stacks. The counter has to follow, or
@@ -1450,16 +1610,16 @@ fn contains_ris(bytes: &[u8]) -> bool {
 fn repair_keyboard_stack<T: EventListener>(
     parser: &mut Processor,
     t: &mut Term<T>,
-    depth: &mut u16,
+    meta: &mut SessionMeta,
 ) {
     let flags = crate::keys::protocol_bits(*t.mode());
-    parser.advance(t, b"\x1b[<u");
-    *depth = depth.saturating_sub(1);
+    advance_for_sync(parser, t, meta, b"\x1b[<u");
+    meta.kitty_depth = meta.kitty_depth.saturating_sub(1);
     let revealed = crate::keys::protocol_bits(*t.mode());
-    if (flags != 0 || revealed != 0) && *depth < KITTY_STACK_CAP {
+    if (flags != 0 || revealed != 0) && meta.kitty_depth < KITTY_STACK_CAP {
         let repair = format!("\x1b[>{flags}u");
-        parser.advance(t, repair.as_bytes());
-        *depth = depth.saturating_add(1);
+        advance_for_sync(parser, t, meta, repair.as_bytes());
+        meta.kitty_depth = meta.kitty_depth.saturating_add(1);
     }
 }
 
@@ -1484,7 +1644,7 @@ pub(crate) fn reset_keyboard_modes<T: EventListener>(
         return;
     }
     let pop = format!("\x1b[<{}u", meta.kitty_depth);
-    parser.advance(t, pop.as_bytes());
+    advance_for_sync(parser, t, meta, pop.as_bytes());
     meta.kitty_depth = 0;
 }
 
@@ -1509,20 +1669,20 @@ fn apply_kitty_seq<T: EventListener>(
             if meta.kitty_depth >= KITTY_STACK_CAP {
                 return;
             }
-            parser.advance(t, seq);
+            advance_for_sync(parser, t, meta, seq);
             meta.kitty_depth = meta.kitty_depth.saturating_add(1);
         }
         KittySeqKind::Pop(n) => {
-            parser.advance(t, seq);
+            advance_for_sync(parser, t, meta, seq);
             meta.kitty_depth = meta.kitty_depth.saturating_sub(n);
         }
         KittySeqKind::Set => {
-            parser.advance(t, seq);
-            repair_keyboard_stack(parser, t, &mut meta.kitty_depth);
+            advance_for_sync(parser, t, meta, seq);
+            repair_keyboard_stack(parser, t, meta);
         }
         KittySeqKind::Query => {
-            repair_keyboard_stack(parser, t, &mut meta.kitty_depth);
-            parser.advance(t, seq);
+            repair_keyboard_stack(parser, t, meta);
+            advance_for_sync(parser, t, meta, seq);
         }
     }
 }
@@ -1620,7 +1780,7 @@ fn process_bytes<T: EventListener>(
     };
     let mut pos = 0;
     for (s, e, kind, exit, trusted) in marks {
-        feed_counted(parser, t, meta, &buf[pos..s], &mut ev.pty_replies);
+        feed_region(parser, t, meta, &buf[pos..s], &mut ev.pty_replies);
         handle_osc133(t, meta, kind, exit, trusted, &mut ev);
         // A new prompt means the previous program is gone. A crashed TUI
         // never pops its keyboard flags; clear the current screen before
@@ -1631,7 +1791,7 @@ fn process_bytes<T: EventListener>(
         }
         pos = e;
     }
-    feed_counted(parser, t, meta, &buf[pos..], &mut ev.pty_replies);
+    feed_region(parser, t, meta, &buf[pos..], &mut ev.pty_replies);
     if let Some(start_abs) = meta.clean_claude_after {
         let first = start_abs as i64 - meta.evicted as i64 - t.grid().history_size() as i64;
         if first < 0 {
@@ -1679,6 +1839,12 @@ fn process_bytes<T: EventListener>(
 ///
 /// `merge_chunk` joins those `Bytes` items and extends `pty_replies`, so a
 /// kitty `CSI ? u` answer is kept when the filter splits the read.
+///
+/// The PTY reader does not call this. It decodes images before taking the
+/// terminal lock, then applies the same pieces. Tests share this entry.
+/// Neither path calls into Lua: escape sequences, OSC, hyperlinks, bells,
+/// and program text stay terminal data.
+#[cfg(test)]
 pub(crate) fn process_chunk<T: EventListener>(
     parser: &mut Processor,
     t: &mut Term<T>,
@@ -1686,41 +1852,301 @@ pub(crate) fn process_chunk<T: EventListener>(
     carry: &mut Vec<u8>,
     data: &[u8],
 ) -> ChunkEvents {
-    let items = meta.esc_filter.pull(data);
+    // Image sequences are lifted out first. Their payloads can hold ESC
+    // bytes (the terminator) and are larger than the BiDi filter's hold,
+    // so the filter never sees them. What remains is the stream BDSM, SCP,
+    // and OSC 133 already understand.
+    let mut pieces = meta.image_in.pull(data);
+    // Sixel and PNG are decoded before the rest of the chunk mutates the
+    // grid. The reader calls the same warm step with the locks released.
+    let limits = meta.images.limits();
+    meta.image_in.warm(&mut pieces, &limits);
+    // The completed payload has left the carry. Charge only what is still open
+    // before the decoded image itself is charged. A carry the budget cannot
+    // hold is dropped rather than kept for free.
+    if !meta.images.sync_inflight(meta.image_in.carry_len()) {
+        meta.image_in.abandon();
+    }
+    let ev = apply_image_pieces(parser, t, meta, carry, pieces);
+    // A chunked upload now sits in `pending`. Charge it before the next read.
+    if !meta.images.sync_inflight(meta.image_in.carry_len()) {
+        meta.image_in.abandon();
+    }
+    ev
+}
+
+fn apply_image_pieces<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    meta: &mut SessionMeta,
+    carry: &mut Vec<u8>,
+    pieces: Vec<crate::images::Inbound>,
+) -> ChunkEvents {
     let mut ev = ChunkEvents::default();
-    for item in items {
-        match item {
-            crate::bidi_ctl::StreamItem::Bytes(bytes) => {
+    for piece in pieces {
+        match piece {
+            crate::images::Inbound::Bytes(bytes) => {
                 if bytes.is_empty() {
                     continue;
                 }
-                let was_alt = t.mode().contains(TermMode::ALT_SCREEN);
-                let part = process_bytes(parser, t, meta, carry, &bytes);
-                if was_alt != t.mode().contains(TermMode::ALT_SCREEN)
-                    || contains_alt_screen_csi(&bytes)
-                {
-                    meta.bidi_mut().reset();
+                // `?47` / `?1047` / `?1049` for alt_off. Raw bytes, so a
+                // CSI split across reads stays open here. An image payload
+                // was lifted out above and is not a mode switch.
+                meta.alt_track.observe(&bytes);
+                let items = meta.esc_filter.pull(&bytes);
+                for item in items {
+                    match item {
+                        crate::bidi_ctl::StreamItem::Bytes(bytes) => {
+                            if bytes.is_empty() {
+                                continue;
+                            }
+                            let was_alt = t.mode().contains(TermMode::ALT_SCREEN);
+                            let part = process_bytes(parser, t, meta, carry, &bytes);
+                            if was_alt != t.mode().contains(TermMode::ALT_SCREEN)
+                                || contains_alt_screen_csi(&bytes)
+                            {
+                                meta.bidi_mut().reset();
+                            }
+                            merge_chunk(&mut ev, part);
+                        }
+                        crate::bidi_ctl::StreamItem::Bdsm(mode) => {
+                            if bidi_controls_live(t, meta) {
+                                meta.bidi_mut().mode = mode;
+                            }
+                        }
+                        crate::bidi_ctl::StreamItem::Scp(dir) => {
+                            if bidi_controls_live(t, meta) {
+                                // The cursor motion in front of this SCP is
+                                // still in vte's sync buffer. Stamp it when
+                                // that buffer is applied, at the offset it
+                                // occupies in the mirror.
+                                if parser.sync_timeout().sync_timeout().is_some() {
+                                    meta.sync_bidi.push((meta.sync_mirror.len(), dir));
+                                } else {
+                                    let (abs, col) = crate::bidi_ctl::cursor_abs(t, meta.evicted);
+                                    meta.bidi_mut().note_scp(dir, abs, col);
+                                }
+                            }
+                        }
+                        crate::bidi_ctl::StreamItem::Ris => {
+                            meta.saw_ris = true;
+                            meta.bidi_mut().reset();
+                        }
+                    }
                 }
-                merge_chunk(&mut ev, part);
             }
-            crate::bidi_ctl::StreamItem::Bdsm(mode) => {
-                if bidi_controls_live(t, meta) {
-                    meta.bidi_mut().mode = mode;
-                }
-            }
-            crate::bidi_ctl::StreamItem::Scp(dir) => {
-                if bidi_controls_live(t, meta) {
-                    let (abs, col) = crate::bidi_ctl::cursor_abs(t, meta.evicted);
-                    meta.bidi_mut().note_scp(dir, abs, col);
-                }
-            }
-            crate::bidi_ctl::StreamItem::Ris => {
-                meta.saw_ris = true;
-                meta.bidi_mut().reset();
+            other => {
+                let at = place_at(t, meta);
+                let effect = meta.images.ingest(other, &at);
+                ev.pty_replies.extend(effect.replies);
+                // The cursor is not moved past the image, whatever the
+                // protocol asks. Conhost owns the cursor and does not know
+                // the image: it keeps counting rows without it and repaints
+                // with absolute positions, so rows reserved here put its
+                // later output on the wrong lines (text after the image was
+                // lost). The image stays on the rows it arrived on and the
+                // text that follows draws over it. Revisit only if
+                // PSEUDOCONSOLE_PASSTHROUGH_MODE is turned on.
             }
         }
     }
     ev
+}
+
+fn place_at<T: EventListener>(t: &Term<T>, meta: &SessionMeta) -> crate::images::PlaceAt {
+    let (line, col) = crate::bidi_ctl::cursor_abs(t, meta.evicted);
+    let history = t.grid().history_size() as u64;
+    crate::images::PlaceAt {
+        line,
+        col,
+        columns: t.columns(),
+        screen_rows: t.screen_lines(),
+        screen_top: meta.evicted.saturating_add(history),
+    }
+}
+
+/// Feed `bytes`, and clear images on ED / EL / alt-screen / RIS at the
+/// cursor those bytes have reached. The control itself is still fed, so
+/// the grid and the image store move together.
+fn feed_region<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    meta: &mut SessionMeta,
+    bytes: &[u8],
+    replies: &mut Vec<String>,
+) {
+    let mut pos = 0;
+    while pos < bytes.len() {
+        match next_grid_op(&bytes[pos..]) {
+            Some((start, end, kind)) => {
+                let abs_s = pos + start;
+                let abs_e = pos + end;
+                feed_counted(parser, t, meta, &bytes[pos..abs_s], replies);
+                meta.images.evict(meta.evicted);
+                apply_grid_op(kind, t, meta);
+                feed_counted(parser, t, meta, &bytes[abs_s..abs_e], replies);
+                meta.images.evict(meta.evicted);
+                pos = abs_e;
+            }
+            None => {
+                feed_counted(parser, t, meta, &bytes[pos..], replies);
+                meta.images.evict(meta.evicted);
+                break;
+            }
+        }
+    }
+}
+
+enum GridOp {
+    Ed(u16),
+    El(u16),
+    Alt(bool),
+    Ris,
+}
+
+fn apply_grid_op<T: EventListener>(kind: GridOp, t: &Term<T>, meta: &mut SessionMeta) {
+    let at = place_at(t, meta);
+    match kind {
+        GridOp::Ed(3) => meta.images.clear_history(at.screen_top),
+        GridOp::Ed(mode) => meta.images.erase_display(mode, at),
+        GridOp::El(mode) => meta.images.erase_line(mode, at),
+        GridOp::Alt(enter) => meta.images.set_alt(enter),
+        GridOp::Ris => meta.images.reset(),
+    }
+}
+
+/// The next ED, EL, alt-screen CSI, or RIS in `data`, as
+/// `(start, end, op)` relative to `data`. Strings (OSC / DCS / APC) are
+/// skipped so a payload cannot look like a clear. `None` when the only
+/// control left is unfinished: the caller feeds it and the carry holds it.
+fn next_grid_op(data: &[u8]) -> Option<(usize, usize, GridOp)> {
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] != 0x1b {
+            i = data[i..]
+                .iter()
+                .position(|&b| b == 0x1b)
+                .map_or(data.len(), |k| i + k);
+            continue;
+        }
+        if let Some((start, end)) = ris_at(data, i) {
+            return Some((start, end, GridOp::Ris));
+        }
+        match data.get(i + 1) {
+            Some(b']') | Some(b'P') | Some(b'_') | Some(b'X') | Some(b'^') => {
+                i = skip_string(data, i + 2)?;
+            }
+            Some(b'[') => match classify_grid_csi(data, i) {
+                Some((end, Some(op))) => return Some((i, end, op)),
+                Some((end, None)) => i = end,
+                None => return None,
+            },
+            Some(_) => i += 1,
+            None => return None,
+        }
+    }
+    None
+}
+
+/// RIS starting at `i`, including the forms vte accepts (`ESC ESC c`,
+/// `ESC <C0> c`). `ESC [` is a CSI, not RIS.
+fn ris_at(data: &[u8], i: usize) -> Option<(usize, usize)> {
+    if data.get(i) != Some(&0x1b) {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < data.len() {
+        match data[j] {
+            0x1b => j += 1,
+            0x18 | 0x1a => return None,
+            0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f | 0x80..=0xff => j += 1,
+            b'c' => return Some((i, j + 1)),
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn skip_string(data: &[u8], mut j: usize) -> Option<usize> {
+    while j < data.len() {
+        match data[j] {
+            0x07 | 0x18 | 0x1a => return Some(j + 1),
+            0x1b => {
+                if data.get(j + 1) == Some(&b'\\') {
+                    return Some(j + 2);
+                }
+                // The ESC aborted the string and starts the next sequence.
+                return Some(j);
+            }
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+fn classify_grid_csi(data: &[u8], i: usize) -> Option<(usize, Option<GridOp>)> {
+    let mut j = i + 2;
+    let private = data.get(j) == Some(&b'?');
+    if private {
+        j += 1;
+    }
+    let param_at = j;
+    while j < data.len() && matches!(data[j], b'0'..=b'9' | b';' | b':') {
+        j += 1;
+    }
+    let inter_at = j;
+    while j < data.len() && (0x20..=0x2f).contains(&data[j]) {
+        j += 1;
+    }
+    if j >= data.len() {
+        return None;
+    }
+    let final_b = data[j];
+    if final_b == 0x1b {
+        return Some((j, None));
+    }
+    if !(0x40..=0x7e).contains(&final_b) {
+        return Some((j + 1, None));
+    }
+    let end = j + 1;
+    if inter_at != j {
+        return Some((end, None));
+    }
+    let params = &data[param_at..inter_at];
+    if private {
+        if matches!(final_b, b'h' | b'l') && grid_alt_param(params) {
+            return Some((end, Some(GridOp::Alt(final_b == b'h'))));
+        }
+        return Some((end, None));
+    }
+    if final_b == b'J' {
+        return Some((end, Some(GridOp::Ed(grid_first_param(params)))));
+    }
+    if final_b == b'K' {
+        return Some((end, Some(GridOp::El(grid_first_param(params)))));
+    }
+    Some((end, None))
+}
+
+fn grid_first_param(params: &[u8]) -> u16 {
+    let end = params
+        .iter()
+        .position(|&b| b == b';' || b == b':')
+        .unwrap_or(params.len());
+    if end == 0 {
+        return 0;
+    }
+    std::str::from_utf8(&params[..end])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+fn grid_alt_param(params: &[u8]) -> bool {
+    params.split(|b| *b == b';').any(|p| {
+        let head = p.split(|b| *b == b':').next().unwrap_or(p);
+        matches!(head, b"1049" | b"47" | b"1047")
+    })
 }
 
 fn bidi_controls_live<T: EventListener>(t: &Term<T>, meta: &SessionMeta) -> bool {
@@ -1908,6 +2334,39 @@ fn expand_env(path: &str) -> String {
     out
 }
 
+/// The `-Command` script for a PowerShell Bayan starts itself.
+///
+/// UTF-8 and the prompt marks stay. The oh-my-posh line is omitted when
+/// `elevated` is set, even if `theme` is `Some`: that path comes from
+/// `$PROFILE` or `POSH_THEME`, and `oh-my-posh` would be resolved from the
+/// user's `PATH`. A theme `command` segment or a planted binary would then
+/// run as administrator, with no confirm card.
+pub(crate) fn powershell_setup(elevated: bool, theme: Option<&str>, capture_nonce: bool) -> String {
+    let mut setup = String::new();
+    if capture_nonce {
+        setup.push_str(&nonce_capture_ps());
+    }
+    setup.push_str(
+        "$OutputEncoding=[Console]::InputEncoding=[Console]::OutputEncoding=\
+         [Text.UTF8Encoding]::new();",
+    );
+    if !elevated {
+        if let Some(theme) = theme.filter(|theme| !theme.is_empty()) {
+            setup.push_str(&format!(
+                " $ErrorActionPreference='SilentlyContinue'; \
+                 & {{oh-my-posh init powershell --config '{}' | Invoke-Expression}} 2>$null; \
+                 $ErrorActionPreference='Continue';",
+                powershell_escape_single(theme)
+            ));
+        }
+    }
+    if capture_nonce {
+        setup.push(' ');
+        setup.push_str(&shell_integration_ps(NONCE_PS_EXPR));
+    }
+    setup
+}
+
 fn detect_posh_theme() -> Option<String> {
     if let Ok(t) = std::env::var("POSH_THEME") {
         if !t.is_empty() && std::path::Path::new(&t).exists() {
@@ -2040,13 +2499,21 @@ pub(crate) fn first_report(pending: &AtomicBool) -> bool {
 fn expire_sync_update<T: EventListener>(
     parser: &mut Processor,
     t: &mut Term<T>,
+    meta: &mut SessionMeta,
     now: Instant,
 ) -> Option<Instant> {
     let deadline = parser.sync_timeout().sync_timeout()?;
     if deadline > now {
         return Some(deadline);
     }
-    parser.stop_sync(t);
+    if meta.sync_bidi.is_empty() {
+        parser.stop_sync(t);
+        meta.sync_mirror.clear();
+    } else {
+        // stop_sync would paint the text and leave SCP on the pre-BSU
+        // row. Replay so the mark and any saved cursor land together.
+        release_sync_for_bidi(parser, t, meta);
+    }
     None
 }
 
@@ -2057,6 +2524,7 @@ fn expire_sync_update<T: EventListener>(
 /// reader drops its sender.
 fn spawn_sync_watchdog<T: EventListener + Send + 'static>(
     term: Arc<FairMutex<Term<T>>>,
+    meta: Arc<Mutex<SessionMeta>>,
     parser: Arc<Mutex<Processor>>,
     batch: Arc<Mutex<EventBatch>>,
     on_flush: impl Fn(ChunkOutput) + Send + 'static,
@@ -2073,12 +2541,13 @@ fn spawn_sync_watchdog<T: EventListener + Send + 'static>(
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
-                // term, then parser: the reader's order, without meta
+                // term, then meta, then parser: the reader's order.
                 let (pending, out) = {
                     let mut t = term.lock();
+                    let mut m = meta.lock_or_recover();
                     let mut p = parser.lock_or_recover();
                     batch.lock_or_recover().begin();
-                    let pending = expire_sync_update(&mut p, &mut t, Instant::now());
+                    let pending = expire_sync_update(&mut p, &mut t, &mut m, Instant::now());
                     (pending, batch.lock_or_recover().finish(false, Vec::new()))
                 };
                 match pending {
@@ -2095,8 +2564,257 @@ fn spawn_sync_watchdog<T: EventListener + Send + 'static>(
     (tx, handle)
 }
 
+/// The colours the window paints with, for OSC 4/10/11/12 queries: the 256
+/// indexed colours, then foreground, background and cursor (alacritty's
+/// indices 256, 257, 258). One table: every pane shares the theme.
+pub type QueryColors = [(u8, u8, u8); 259];
+
+static QUERY_COLORS: std::sync::RwLock<Option<QueryColors>> = std::sync::RwLock::new(None);
+
+/// The renderer that is about to paint publishes its colours here.
+pub fn set_query_colors(colors: QueryColors) {
+    *QUERY_COLORS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(colors);
+}
+
+/// An OSC 4/10/11/12 query answered from `colors`, or `None` for an index
+/// the table has no colour for (or no table yet). Claude Code, Codex and
+/// Neovim pick a light or dark theme from the OSC 11 answer.
+fn color_reply(
+    colors: Option<&QueryColors>,
+    index: usize,
+    format: &(dyn Fn(alacritty_terminal::vte::ansi::Rgb) -> String + Sync + Send),
+) -> Option<String> {
+    let &(r, g, b) = colors?.get(index)?;
+    Some(format(alacritty_terminal::vte::ansi::Rgb { r, g, b }))
+}
+
+/// A colour query becomes its reply; an unanswerable one is dropped
+/// (`None`); every other event passes through.
+fn answer_color_query(event: Event, colors: Option<&QueryColors>) -> Option<Event> {
+    match event {
+        Event::ColorRequest(index, format) => {
+            color_reply(colors, index, &*format).map(Event::PtyWrite)
+        }
+        other => Some(other),
+    }
+}
+
+/// Cell size shared by every pane, and each pane's grid. `CSI 14 t` is
+/// rows × cell height by cols × cell width. Zero means the renderer has
+/// not measured a cell yet, and the query is then refused.
+struct TextArea {
+    cell_w: u16,
+    cell_h: u16,
+    grids: HashMap<u64, (u16, u16)>,
+}
+
+static TEXT_AREA: std::sync::LazyLock<RwLock<TextArea>> = std::sync::LazyLock::new(|| {
+    RwLock::new(TextArea {
+        cell_w: 0,
+        cell_h: 0,
+        grids: HashMap::new(),
+    })
+});
+
+/// OSC 52 read. Off unless the user set `osc52_read`. A reply is still
+/// refused while the read itself is unimplemented.
+static OSC52_READ: AtomicBool = AtomicBool::new(false);
+
+/// Publish the read flag. Default off. Called once at startup.
+pub fn set_osc52_read(enabled: bool) {
+    OSC52_READ.store(enabled, Ordering::Release);
+}
+
+/// The renderer's cell, in pixels. A non-finite or sub-pixel value counts
+/// as unknown.
+pub fn set_text_area_cell(cell_w: f32, cell_h: f32) {
+    let mut area = TEXT_AREA
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    area.cell_w = px_u16(cell_w);
+    area.cell_h = px_u16(cell_h);
+}
+
+/// This pane's grid, in cells. Paired with [`set_text_area_cell`].
+pub fn set_text_area_grid(id: u64, cols: usize, rows: usize) {
+    let mut area = TEXT_AREA
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    area.grids.insert(id, (u16_len(cols), u16_len(rows)));
+}
+
+pub(crate) fn clear_text_area_grid(id: u64) {
+    TEXT_AREA
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .grids
+        .remove(&id);
+}
+
+fn u16_len(n: usize) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
+}
+
+fn px_u16(v: f32) -> u16 {
+    if !v.is_finite() || v < 0.5 {
+        return 0;
+    }
+    let rounded = v.round();
+    if rounded > f32::from(u16::MAX) {
+        return u16::MAX;
+    }
+    // `rounded` is an integer in 1..=65535.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        rounded as u16
+    }
+}
+
+fn text_area_for(id: u64) -> Option<WindowSize> {
+    let area = TEXT_AREA
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let &(cols, rows) = area.grids.get(&id)?;
+    if area.cell_w == 0 || area.cell_h == 0 || cols == 0 || rows == 0 {
+        return None;
+    }
+    Some(WindowSize {
+        num_cols: cols,
+        num_lines: rows,
+        cell_width: area.cell_w,
+        cell_height: area.cell_h,
+    })
+}
+
+/// `CSI 14 t` answered from `area`, via alacritty's formatter
+/// (`CSI 4 ; height ; width t`). `None` when the window has no metrics yet.
+fn text_area_reply(
+    area: Option<WindowSize>,
+    format: &(dyn Fn(WindowSize) -> String + Sync + Send),
+) -> Option<String> {
+    area.map(format)
+}
+
+/// Bytes to write for an OSC 52 read, or nothing.
+///
+/// Off is the default. This function never returns text: not the clipboard,
+/// and not an empty OSC 52. Reading the clipboard is a later change; until
+/// then an enabled flag still writes nothing.
+pub(crate) fn clipboard_load_reply(read_enabled: bool) -> Option<String> {
+    if !read_enabled {
+        return None;
+    }
+    None
+}
+
+/// Colour, text-area, and clipboard queries, before the batch. A `PtyWrite`
+/// joins the read's 16 KiB cap. `ClipboardLoad` stays a notice: the
+/// formatter is not called, so no clipboard bytes (and no empty OSC 52)
+/// are written. `None` drops the event.
+fn prepare_event(pane: u64, event: Event) -> Option<Event> {
+    match event {
+        Event::TextAreaSizeRequest(format) => {
+            text_area_reply(text_area_for(pane), &*format).map(Event::PtyWrite)
+        }
+        Event::ClipboardLoad(kind, format) => {
+            // `format(text)` is the OSC 52 reply. It is not called.
+            match clipboard_load_reply(OSC52_READ.load(Ordering::Acquire)) {
+                Some(text) => Some(Event::PtyWrite(text)),
+                None => Some(Event::ClipboardLoad(kind, format)),
+            }
+        }
+        other => {
+            let colors = QUERY_COLORS
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            answer_color_query(other, colors.as_ref())
+        }
+    }
+}
+
+/// Bytes `Session::write` handed the PTY thread. `wait` blocks until some arrive.
+#[cfg(test)]
+pub(crate) struct HeadlessWrite(Arc<(Mutex<Vec<u8>>, std::sync::Condvar)>);
+
+#[cfg(test)]
+impl HeadlessWrite {
+    pub(crate) fn wait(&self) -> Vec<u8> {
+        let (lock, cv) = &*self.0;
+        let mut buf = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let start = Instant::now();
+        while buf.is_empty() {
+            let left = std::time::Duration::from_secs(2).saturating_sub(start.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            let (next, _) = cv
+                .wait_timeout(buf, left)
+                .unwrap_or_else(|e| e.into_inner());
+            buf = next;
+        }
+        std::mem::take(&mut *buf)
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct HeadlessOut(Arc<(Mutex<Vec<u8>>, std::sync::Condvar)>);
+
+#[cfg(test)]
+impl std::io::Write for HeadlessOut {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let mut buf = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        buf.extend_from_slice(data);
+        self.0 .1.notify_all();
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct IdleChild;
+
+#[cfg(test)]
+impl portable_pty::ChildKiller for IdleChild {
+    fn kill(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        Box::new(IdleChild)
+    }
+}
+
+#[cfg(test)]
+impl Child for IdleChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+        Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
+    }
+    fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+        Ok(portable_pty::ExitStatus::with_exit_code(0))
+    }
+    fn process_id(&self) -> Option<u32> {
+        None
+    }
+    #[cfg(windows)]
+    fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+        None
+    }
+}
+
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
+        // Answered here, on the reader thread, so a reply joins this
+        // read's batch and its 16 KiB cap: a flood of queries must not
+        // become one window event per query.
+        let Some(event) = prepare_event(self.1, event) else {
+            return;
+        };
         let Some(event) = self.2.lock_or_recover().absorb(event) else {
             return;
         };
@@ -2107,6 +2825,8 @@ impl EventListener for EventProxy {
             // the cockpit's attention signal
             Event::Bell => UserEvent::Bell(self.1),
             Event::Exit => UserEvent::Exit(self.1),
+            // Forwarded, not answered. The formatter was dropped above.
+            Event::ClipboardLoad(kind, _) => UserEvent::ClipboardLoad(self.1, kind),
             _ => return,
         };
         let _ = self.0.send_event(mapped);
@@ -2121,11 +2841,17 @@ pub struct Session {
     write_error: Arc<AtomicBool>,
     proxy: EventLoopProxy<UserEvent>,
     id: u64,
-    master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
+    master: Option<Box<dyn MasterPty + Send>>,
+    child: Option<Box<dyn Child + Send + Sync>>,
+    /// Once, on kill. A mux pane tells the server; detach clears the armed
+    /// flag inside the hook so the remote process keeps running.
+    on_kill: Option<Box<dyn FnOnce() + Send>>,
+    on_resize: Option<Box<dyn Fn(u16, u16) + Send + Sync>>,
     /// Command line this pane was spawned with. Drag-drop quoting follows it,
     /// not whatever the settings say now — the live shell is the one reading.
     shell: String,
+    /// Bash/WSL integration scripts, removed when the pane closes.
+    integration_dir: Option<std::path::PathBuf>,
     /// The reader thread's VTE parser. Shell exit resets keyboard modes
     /// through this one, so a sequence the child already started is the
     /// machine that sees the pop. A fresh `Processor` would leave this one
@@ -2153,11 +2879,48 @@ impl<T> LockExt<T> for Mutex<T> {
 /// it. Killing a child that already exited is a harmless error.
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        self.kill();
+        clear_text_area_grid(self.id);
+        if let Some(dir) = self.integration_dir.take() {
+            crate::shellint::remove_integration_dir(&dir);
+        }
     }
 }
 
+/// The pipes and the optional process behind a [`Session`]. A local ConPTY
+/// fills `master` and `child`. A mux view leaves them empty and sets the hooks.
+pub struct SessionIo {
+    pub reader: Box<dyn Read + Send>,
+    pub writer: Box<dyn Write + Send>,
+    pub master: Option<Box<dyn MasterPty + Send>>,
+    pub child: Option<Box<dyn Child + Send + Sync>>,
+    pub on_resize: Option<Box<dyn Fn(u16, u16) + Send + Sync>>,
+    pub on_kill: Option<Box<dyn FnOnce() + Send>>,
+}
+
+/// Everything [`Session::from_parts`] needs besides the byte streams.
+pub struct SessionArgs {
+    pub size: TermSize,
+    pub proxy: EventLoopProxy<UserEvent>,
+    pub id: u64,
+    pub scrollback: usize,
+    pub shell: String,
+    pub kitty_protocol: bool,
+    pub prompt_nonce: String,
+    /// The pixel budget every pane of this process charges.
+    pub images: Arc<crate::images::ImageBudget>,
+    /// Shell-integration scripts written for this pane. Dropped (and the
+    /// directory deleted) if the session cannot be built. A mux view has none.
+    pub(crate) integration: crate::shellint::IntegrationDir,
+    pub io: SessionIo,
+}
+
 impl Session {
+    // `raw_argv` is the one extra fact a `-- command` needs, and the shared
+    // image budget is its own argument: folding it into a config struct
+    // would hide that every pane charges the same counter. Each of the
+    // others is a property of this pane.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         size: TermSize,
         proxy: EventLoopProxy<UserEvent>,
@@ -2166,8 +2929,20 @@ impl Session {
         scrollback: usize,
         shell: &str,
         kitty_protocol: bool,
+        // `Some` when the user passed `-- command`: those arguments are the
+        // process, and Bayan does not append its PowerShell or cmd wrapper.
+        // `None` is every other launch, including a `-p` profile.
+        raw_argv: Option<&[String]>,
+        // This process token is elevated. PowerShell is not given an
+        // oh-my-posh line.
+        elevated: bool,
+        // Every pane charges this one counter.
+        images: Arc<crate::images::ImageBudget>,
+        // `"shell_integration": false` launches the shell without prompt marks.
+        shell_integration: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let prompt_nonce = fresh_prompt_nonce();
+        crate::shellint::sweep_stale_integration_dirs();
         let pty = native_pty_system();
         let pair = pty.openpty(PtySize {
             rows: size.rows as u16,
@@ -2176,13 +2951,31 @@ impl Session {
             pixel_height: 0,
         })?;
         // program + args, or a shell with switches would be spawned as one
-        // absurd filename ("powershell.exe -NoProfile" is not a program)
-        let (prog, args) = split_command(shell);
+        // absurd filename ("powershell.exe -NoProfile" is not a program).
+        // A `-- command` is already split, so a path with spaces stays one
+        // argument instead of going through that splitter again.
+        let (prog, args) = if let Some(argv) = raw_argv {
+            let Some(prog) = argv.first().filter(|prog| !prog.is_empty()) else {
+                return Err("missing command".into());
+            };
+            (prog.clone(), argv[1..].to_vec())
+        } else {
+            split_command(shell)
+        };
         // N-03: a saved `wsl.exe -d Ubuntu` must not search Bayan's folder.
         let Some(prog) = crate::shells::resolve_spawn_program(prog) else {
             return Err(
                 "refusing to spawn wsl.exe by a bare name; System32\\wsl.exe is not there".into(),
             );
+        };
+        let prog = if elevated {
+            crate::shells::resolve_elevated_pwsh(
+                prog.as_str(),
+                crate::link::known_program_files().as_deref(),
+                |path| path.is_file(),
+            )?
+        } else {
+            prog
         };
         let mut cmd = CommandBuilder::new(prog);
         for a in &args {
@@ -2206,49 +2999,113 @@ impl Session {
         if let Some(d) = dir {
             cmd.cwd(d);
         }
-        if is_powershell(shell) {
+        // A raw command is the program the user named. The PowerShell,
+        // bash, zsh and cmd wrappers belong to a shell Bayan itself launched.
+        // Opt-out and a failed nonce both leave that shell unmarked.
+        let wrap = raw_argv.is_none();
+        let integrate = crate::shellint::injection_allowed(shell_integration, &prompt_nonce);
+        let mut applied = false;
+        let mut integration_scripts = crate::shellint::IntegrationDir(None);
+        if wrap && is_powershell(shell) {
             // -NoProfile: the profile is seconds of avoidable startup (it
             // re-runs oh-my-posh, chcp, modules). Self-provide what it gave
             // us: UTF-8 (Arabic!) and the user's prompt theme, auto-detected.
             cmd.args(["-NoProfile", "-NoExit", "-Command"]);
             // R-08: the nonce rides in the environment, is taken before
-            // anything else runs (oh-my-posh init spawns a process), and is
-            // then removed, so it is in neither the command line nor any
-            // child's environment
-            let mut setup = String::new();
-            if prompt_nonce != NONCE_OFF {
+            // anything else runs, and is then removed, so it is in neither
+            // the command line nor any child's environment.
+            if integrate {
                 cmd.env(NONCE_ENV, &prompt_nonce);
-                setup.push_str(&nonce_capture_ps());
             }
-            setup.push_str(
-                "$OutputEncoding=[Console]::InputEncoding=[Console]::OutputEncoding=\
-                 [Text.UTF8Encoding]::new();",
-            );
-            if let Some(theme) = detect_posh_theme() {
-                setup.push_str(&format!(
-                    " $ErrorActionPreference='SilentlyContinue'; \
-                     & {{oh-my-posh init powershell --config '{}' | Invoke-Expression}} 2>$null; \
-                     $ErrorActionPreference='Continue';",
-                    powershell_escape_single(&theme)
-                ));
-            }
-            // NEW-05: with no random nonce the wrapper is left out, so the
-            // pane runs without prompt marks (like cmd) instead of trusting
-            // marks anyone could forge
-            if prompt_nonce != NONCE_OFF {
-                setup.push(' ');
-                setup.push_str(&shell_integration_ps(NONCE_PS_EXPR));
-            }
+            // Elevated: do not read POSH_THEME or $PROFILE, and do not name
+            // oh-my-posh. The setup string is `powershell_setup`. NEW-05:
+            // with no random nonce, or `"shell_integration": false`, the
+            // wrapper is left out, so the pane runs without prompt marks
+            // instead of trusting marks anyone could forge.
+            let theme = if elevated { None } else { detect_posh_theme() };
+            let setup = powershell_setup(elevated, theme.as_deref(), integrate);
             cmd.arg(setup);
-        } else if shell_family(shell) == ShellFamily::Cmd {
-            // UTF-8 code page so Arabic paths survive; no OSC 133 marks
+        } else if wrap {
+            if let Some(plan) =
+                crate::shellint::plan(shell, shell_integration, elevated, &prompt_nonce)
+            {
+                match crate::shellint::materialize(&plan) {
+                    Ok(done) => {
+                        let argv = cmd.get_argv_mut();
+                        let prog = argv.first().cloned();
+                        argv.clear();
+                        if let Some(prog) = prog {
+                            argv.push(prog);
+                        }
+                        for arg in done.args {
+                            argv.push(arg.into());
+                        }
+                        for (key, value) in done.env {
+                            cmd.env(key, value);
+                        }
+                        integration_scripts = crate::shellint::IntegrationDir(done.dir);
+                        applied = true;
+                    }
+                    Err(err) => {
+                        eprintln!("bayan: shell integration skipped: {err}");
+                    }
+                }
+            }
+        }
+        if wrap && !applied && shell_family(shell) == ShellFamily::Cmd {
+            // UTF-8 code page so Arabic paths survive. Marks, when they
+            // were applied above, already include this chcp.
             cmd.args(["/K", "chcp 65001>nul"]);
         }
-        let mut reader = pair.master.try_clone_reader()?;
+        let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
-        let mut child = pair.slave.spawn_command(cmd)?;
+        let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
+        Self::from_parts(SessionArgs {
+            size,
+            proxy,
+            id,
+            scrollback,
+            shell: shell.to_string(),
+            kitty_protocol,
+            prompt_nonce,
+            images,
+            integration: integration_scripts,
+            io: SessionIo {
+                reader,
+                writer,
+                master: Some(pair.master),
+                child: Some(child),
+                on_resize: None,
+                on_kill: None,
+            },
+        })
+    }
 
+    /// A pane fed by `io` instead of a ConPTY this process opened. Local
+    /// spawn and a mux reattach share the reader thread, so VT handling
+    /// does not fork.
+    pub fn from_parts(args: SessionArgs) -> Result<Self, Box<dyn std::error::Error>> {
+        let SessionArgs {
+            size,
+            proxy,
+            id,
+            scrollback,
+            shell,
+            kitty_protocol,
+            prompt_nonce,
+            images,
+            integration,
+            io,
+        } = args;
+        let SessionIo {
+            mut reader,
+            writer,
+            master,
+            mut child,
+            on_resize,
+            mut on_kill,
+        } = io;
         let config = Config {
             scrolling_history: scrollback,
             // Off unless the user opted in. The flag gates every stack
@@ -2257,6 +3114,10 @@ impl Session {
             // a `:` sub-parameter). Queries while off are answered by
             // `process_chunk`, not by the parser.
             kitty_keyboard: kitty_protocol,
+            // A copy stays on Bayan's scanner (alacritty will not emit
+            // ClipboardStore). A query is delivered as ClipboardLoad so
+            // the proxy can forward it. The proxy writes no reply.
+            osc52: Osc52::OnlyPaste,
             ..Config::default()
         };
         let batch = Arc::new(Mutex::new(EventBatch::default()));
@@ -2266,11 +3127,13 @@ impl Session {
             EventProxy(proxy.clone(), id, Arc::clone(&batch)),
         )));
 
-        let meta = Arc::new(Mutex::new(SessionMeta {
+        let mut session_meta = SessionMeta {
             kitty_protocol,
             prompt_nonce,
             ..SessionMeta::default()
-        }));
+        };
+        session_meta.share_image_budget(images);
+        let meta = Arc::new(Mutex::new(session_meta));
         let parser = Arc::new(Mutex::new(Processor::new()));
         let capture_term = Arc::clone(&term);
         let capture_meta = Arc::clone(&meta);
@@ -2296,7 +3159,12 @@ impl Session {
         ) {
             Ok(writer) => writer,
             Err(error) => {
-                let _ = child.kill();
+                if let Some(child) = child.as_mut() {
+                    let _ = child.kill();
+                }
+                if let Some(hook) = on_kill.take() {
+                    hook();
+                }
                 return Err(error.into());
             }
         };
@@ -2307,6 +3175,7 @@ impl Session {
         let sync_proxy = proxy.clone();
         let (sync_tx, _) = spawn_sync_watchdog(
             Arc::clone(&term),
+            Arc::clone(&meta),
             Arc::clone(&parser),
             Arc::clone(&batch),
             move |out| {
@@ -2327,6 +3196,19 @@ impl Session {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         crate::prof::output_read();
+                        // Lift and decode images before taking the terminal
+                        // lock. A large sixel or PNG must not freeze the UI
+                        // thread, which draws under that lock.
+                        let (filter, pieces) = {
+                            let mut m = meta2.lock_or_recover();
+                            let limits = m.images.limits();
+                            let mut filter = std::mem::take(&mut m.image_in);
+                            let mut pieces = filter.pull(&buf[..n]);
+                            // Drop the meta guard before decoding.
+                            drop(m);
+                            filter.warm(&mut pieces, &limits);
+                            (filter, pieces)
+                        };
                         let (ev, out, sync_deadline) = {
                             // term, then meta, then parser. reset_keyboard
                             // on the UI thread takes the same order. The
@@ -2335,9 +3217,18 @@ impl Session {
                             let mut t = term2.lock();
                             let mut m = meta2.lock_or_recover();
                             let mut p = parser2.lock_or_recover();
+                            m.image_in = filter;
+                            let carry_len = m.image_in.carry_len();
+                            if !m.images.sync_inflight(carry_len) {
+                                m.image_in.abandon();
+                            }
                             batch.lock_or_recover().begin();
                             let mut ev =
-                                process_chunk(&mut p, &mut t, &mut m, &mut carry, &buf[..n]);
+                                apply_image_pieces(&mut p, &mut t, &mut m, &mut carry, pieces);
+                            let open = m.image_in.carry_len();
+                            if !m.images.sync_inflight(open) {
+                                m.image_in.abandon();
+                            }
                             let replies = std::mem::take(&mut ev.pty_replies);
                             let out = batch.lock_or_recover().finish(ev.clean_claude, replies);
                             (ev, out, p.sync_timeout().sync_timeout())
@@ -2395,6 +3286,10 @@ impl Session {
             let _ = proxy.send_event(UserEvent::Exit(id));
         });
 
+        // `CSI 14 t` is answered from this map. `resize` returns early when
+        // the size did not change, so a pane that keeps the size it was
+        // spawned with would otherwise never be in it.
+        set_text_area_grid(id, size.cols, size.rows);
         Ok(Self {
             term,
             meta,
@@ -2402,11 +3297,62 @@ impl Session {
             write_error,
             proxy: input_proxy,
             id,
-            master: pair.master,
+            master,
             child,
-            shell: shell.to_string(),
+            on_kill,
+            on_resize,
+            shell,
+            integration_dir: integration.disarm(),
             parser,
         })
+    }
+
+    /// A pane with no child process. Tests drive the grid and read what
+    /// `write` would have sent to the shell.
+    #[cfg(test)]
+    pub(crate) fn headless(
+        size: TermSize,
+        proxy: EventLoopProxy<UserEvent>,
+        id: u64,
+    ) -> (Self, HeadlessWrite) {
+        let written = Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new()));
+        let writer =
+            crate::pty_writer::PtyWriter::spawn(HeadlessOut(Arc::clone(&written)), |_| {}, |_| {})
+                .expect("pty writer thread");
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: size.rows as u16,
+                cols: size.cols as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("pty");
+        drop(pair.slave);
+        let batch = Arc::new(Mutex::new(EventBatch::default()));
+        let term = Arc::new(FairMutex::new(Term::new(
+            Config {
+                scrolling_history: 1_000,
+                ..Config::default()
+            },
+            &size,
+            EventProxy(proxy.clone(), id, batch),
+        )));
+        let session = Self {
+            term,
+            meta: Arc::new(Mutex::new(SessionMeta::default())),
+            writer,
+            write_error: Arc::new(AtomicBool::new(false)),
+            proxy,
+            id,
+            master: Some(pair.master),
+            child: Some(Box::new(IdleChild)),
+            on_kill: None,
+            on_resize: None,
+            shell: String::new(),
+            parser: Arc::new(Mutex::new(Processor::new())),
+            integration_dir: None,
+        };
+        (session, HeadlessWrite(written))
     }
 
     /// The command line passed to [`Session::spawn`], for shell-specific quoting.
@@ -2415,8 +3361,15 @@ impl Session {
     }
 
     /// Terminate the shell (closing a tab must not leave orphans).
+    /// A mux pane's hook runs once; detach disarms it first so this does
+    /// not kill the server-side process.
     pub fn kill(&mut self) {
-        let _ = self.child.kill();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+        }
+        if let Some(hook) = self.on_kill.take() {
+            hook();
+        }
     }
 
     /// Clear the current screen's keyboard-mode stack (Ctrl+Shift+K, a
@@ -2446,17 +3399,51 @@ impl Session {
     }
 
     pub fn resize(&mut self, size: TermSize) {
-        let _ = self.master.resize(PtySize {
-            rows: size.rows as u16,
-            cols: size.cols as u16,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
-        // Drop the term lock before meta. A resize reflows rows, so SCP
-        // stamps no longer name the text they were written on.
+        let reflow = {
+            let t = self.term.lock();
+            match column_reflow(t.columns(), t.screen_lines(), size) {
+                None => return,
+                Some(reflow) => reflow,
+            }
+        };
+        if let Some(master) = &self.master {
+            let _ = master.resize(PtySize {
+                rows: size.rows as u16,
+                cols: size.cols as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        }
+        if let Some(hook) = &self.on_resize {
+            hook(size.cols as u16, size.rows as u16);
+        }
+        // Drop the term lock before meta. A column change reflows rows, so
+        // SCP stamps and image anchors no longer name the text they were
+        // written on. The text-area map is taken after both: a query on the
+        // reader already holds the term lock and then that map.
         self.term.lock().resize(size);
-        self.meta.lock_or_recover().bidi_mut().on_resize();
+        if reflow {
+            after_resize(&mut self.meta.lock_or_recover());
+        }
+        set_text_area_grid(self.id, size.cols, size.rows);
     }
+}
+
+/// `None` when the size is unchanged. `Some(true)` when the column count
+/// changes and rows will reflow. `Some(false)` when only the row count changes.
+pub(crate) fn column_reflow(old_cols: usize, old_rows: usize, size: TermSize) -> Option<bool> {
+    if old_cols == size.cols && old_rows == size.rows {
+        None
+    } else {
+        Some(old_cols != size.cols)
+    }
+}
+
+/// A column change reflows rows, so SCP stamps and image anchors no longer
+/// name the text they were written on.
+pub(crate) fn after_resize(meta: &mut SessionMeta) {
+    meta.bidi_mut().on_resize();
+    meta.images.on_resize();
 }
 
 /// Does this write submit the line at the prompt? A carriage return does —
@@ -2826,6 +3813,25 @@ pub fn regex_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_elevated_powershell_setup_does_not_inject_oh_my_posh() {
+        let theme = r"C:\Users\me\.poshthemes\evil.omp.json";
+        let elevated = powershell_setup(true, Some(theme), true);
+        assert!(
+            !elevated.to_ascii_lowercase().contains("oh-my-posh"),
+            "{elevated}"
+        );
+        assert!(!elevated.contains("Invoke-Expression"), "{elevated}");
+        assert!(
+            elevated.contains("UTF8Encoding"),
+            "UTF-8 still has to be set"
+        );
+        let ordinary = powershell_setup(false, Some(theme), true);
+        assert!(ordinary.contains("oh-my-posh"));
+        assert!(ordinary.contains("Invoke-Expression"));
+        assert!(ordinary.contains("evil.omp.json"));
+    }
 
     #[test]
     fn a_panic_holding_the_term_lock_does_not_poison_it() {
@@ -3492,22 +4498,28 @@ mod tests {
 
     #[test]
     fn a_sync_update_without_its_end_is_held_until_the_deadline() {
-        let (mut t, mut p, ..) = test_term();
+        let (mut t, mut p, mut meta, _) = test_term();
         p.advance(&mut t, BSU);
         p.advance(&mut t, b"held");
         let deadline = p.sync_timeout().sync_timeout().expect("BSU set a deadline");
         let early = deadline - std::time::Duration::from_millis(1);
-        assert_eq!(expire_sync_update(&mut p, &mut t, early), Some(deadline));
+        assert_eq!(
+            expire_sync_update(&mut p, &mut t, &mut meta, early),
+            Some(deadline)
+        );
         assert_eq!(first_row(&t), "", "nothing is drawn before the deadline");
     }
 
     #[test]
     fn a_sync_update_without_its_end_is_flushed_after_the_deadline() {
-        let (mut t, mut p, ..) = test_term();
+        let (mut t, mut p, mut meta, _) = test_term();
         p.advance(&mut t, BSU);
         p.advance(&mut t, b"frozen");
         let deadline = p.sync_timeout().sync_timeout().unwrap();
-        assert_eq!(expire_sync_update(&mut p, &mut t, deadline), None);
+        assert_eq!(
+            expire_sync_update(&mut p, &mut t, &mut meta, deadline),
+            None
+        );
         assert_eq!(first_row(&t), "frozen");
         // the parser is out of the update: later bytes draw at once
         p.advance(&mut t, b"!");
@@ -3524,13 +4536,19 @@ mod tests {
     }
 
     fn watched() -> Watched {
-        let (t, p, ..) = test_term();
+        let (t, p, meta, _) = test_term();
         let (t, p) = (Arc::new(FairMutex::new(t)), Arc::new(Mutex::new(p)));
+        let meta = Arc::new(Mutex::new(meta));
         let (flushed_tx, flushed) = mpsc::channel();
-        let (tx, handle) =
-            spawn_sync_watchdog(Arc::clone(&t), Arc::clone(&p), Arc::default(), move |out| {
+        let (tx, handle) = spawn_sync_watchdog(
+            Arc::clone(&t),
+            Arc::clone(&meta),
+            Arc::clone(&p),
+            Arc::default(),
+            move |out| {
                 let _ = flushed_tx.send(out);
-            });
+            },
+        );
         Watched {
             t,
             p,
@@ -3602,6 +4620,319 @@ mod tests {
         let Watched { tx, handle, .. } = watched();
         drop(tx);
         handle.join().expect("the watchdog exits cleanly");
+    }
+
+    fn screen_has(t: &Term<VoidListener>, needle: &str) -> bool {
+        let mut text = String::new();
+        for line in 0..t.screen_lines() {
+            let row = &t.grid()[alacritty_terminal::index::Line(line as i32)];
+            for col in 0..t.columns() {
+                text.push(row[Column(col)].c);
+            }
+        }
+        text.contains(needle)
+    }
+
+    fn grid_chars(t: &Term<VoidListener>) -> String {
+        let mut text = String::new();
+        for line in 0..t.screen_lines() {
+            let row = &t.grid()[alacritty_terminal::index::Line(line as i32)];
+            for col in 0..t.columns() {
+                let cell = &row[Column(col)];
+                let fg = &cell.fg;
+                let ch = cell.c;
+                text.push_str(&format!("{fg:?}:{ch}"));
+            }
+            text.push('\n');
+        }
+        let cur = t.grid().cursor.point;
+        let line = cur.line.0;
+        let col = cur.column.0;
+        text.push_str(&format!("@{line}:{col}"));
+        text
+    }
+
+    /// Ctrl+F: literal search from the bottom of the grid upward.
+    fn search_has(t: &mut Term<VoidListener>, query: &str) -> bool {
+        use alacritty_terminal::index::{Direction, Line, Point, Side};
+        use alacritty_terminal::term::search::RegexSearch;
+        let Ok(mut rs) = RegexSearch::new(&regex_escape(query)) else {
+            return false;
+        };
+        let origin = Point::new(
+            Line(t.screen_lines() as i32 - 1),
+            Column(t.columns().saturating_sub(1)),
+        );
+        t.search_next(&mut rs, origin, Direction::Left, Side::Right, None)
+            .is_some()
+    }
+
+    #[test]
+    fn echoed_output_stays_held_until_esu_or_the_sync_timeout() {
+        // The reader path, not a bare `advance`: keystroke echo that
+        // arrives inside an open update stays off the grid until ESU.
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?2026h");
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"typed");
+        assert!(!screen_has(&t, "typed"));
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?2026l");
+        assert!(screen_has(&t, "typed"));
+        assert!(p.sync_timeout().sync_timeout().is_none());
+
+        // Same echo, ESU never arrives: the deadline flush shows it,
+        // and no further byte is fed before that flush.
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?2026hecho");
+        assert!(!screen_has(&t, "echo"));
+        let deadline = p.sync_timeout().sync_timeout().expect("open update");
+        assert_eq!(
+            expire_sync_update(
+                &mut p,
+                &mut t,
+                &mut meta,
+                deadline - std::time::Duration::from_millis(1),
+            ),
+            Some(deadline)
+        );
+        assert!(!screen_has(&t, "echo"));
+        assert_eq!(
+            expire_sync_update(&mut p, &mut t, &mut meta, deadline),
+            None
+        );
+        assert!(screen_has(&t, "echo"));
+    }
+
+    #[test]
+    fn forced_flush_recomputes_scp_and_saved_cursor_on_the_right_row() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.running_cmd = "app".into();
+        // A save outside the update. Applying DECSC too early would leave
+        // this point in place; applying SCP against this cursor (row 4,
+        // column 4) would stamp row 5 instead of the held motion's row.
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[5;5H\x1b7");
+        assert_eq!(t.grid().saved_cursor.point.line.0, 4);
+        assert_eq!(t.grid().saved_cursor.point.column.0, 4);
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[?2026h\x1b[1;1H\x1b7\r\n\x1b[2 kMARK\x1b8",
+        );
+        assert_eq!(t.grid().saved_cursor.point.line.0, 4);
+        assert_eq!(
+            meta.bidi.direction_at(1),
+            crate::bidi_ctl::ParagraphDir::Default
+        );
+        assert!(!screen_has(&t, "MARK"));
+        let deadline = p.sync_timeout().sync_timeout().expect("open update");
+        assert_eq!(
+            expire_sync_update(&mut p, &mut t, &mut meta, deadline),
+            None
+        );
+        assert_eq!(
+            meta.bidi.direction_at(0),
+            crate::bidi_ctl::ParagraphDir::Default
+        );
+        assert_eq!(
+            meta.bidi.direction_at(1),
+            crate::bidi_ctl::ParagraphDir::Rtl
+        );
+        let mark = &t.grid()[alacritty_terminal::index::Line(1)];
+        assert_eq!(mark[Column(0)].c, 'M');
+        assert_eq!(t.grid().cursor.point.line.0, 0);
+        assert_eq!(t.grid().cursor.point.column.0, 0);
+        assert_eq!(t.grid().saved_cursor.point.line.0, 0);
+        assert_eq!(t.grid().saved_cursor.point.column.0, 0);
+    }
+
+    #[test]
+    fn a_finished_sync_pair_matches_the_bytes_without_the_bracket() {
+        let paired = b"A\x1b[31m\x1b[?2026h\x1b[32mB\x1b[0mC\x1b[?2026lD";
+        let plain = b"A\x1b[31m\x1b[32mB\x1b[0mCD";
+        let (mut with, mut pw, mut mw, mut cw) = test_term();
+        let (mut without, mut po, mut mo, mut co) = test_term();
+        process_chunk(&mut pw, &mut with, &mut mw, &mut cw, paired);
+        process_chunk(&mut po, &mut without, &mut mo, &mut co, plain);
+        assert!(pw.sync_timeout().sync_timeout().is_none());
+        assert!(mw.sync_bidi.is_empty());
+        assert_eq!(grid_chars(&with), grid_chars(&without));
+    }
+
+    #[test]
+    fn scrollback_and_search_work_while_a_sync_is_open() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        for i in 0..12 {
+            let line = format!("row{i} needle\r\n");
+            process_chunk(&mut p, &mut t, &mut meta, &mut carry, line.as_bytes());
+        }
+        assert!(t.grid().history_size() > 0);
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?2026hHIDDEN");
+        assert!(p.sync_timeout().sync_timeout().is_some());
+        assert!(!screen_has(&t, "HIDDEN"));
+        assert!(search_has(&mut t, "needle"), "Ctrl+F still sees the grid");
+        assert!(!search_has(&mut t, "HIDDEN"));
+        let before = t.grid().display_offset();
+        t.scroll_display(Scroll::Delta(2));
+        assert!(t.grid().display_offset() > before);
+        assert!(search_has(&mut t, "needle"));
+        t.scroll_display(Scroll::Bottom);
+        assert_eq!(t.grid().display_offset(), 0);
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?2026l");
+        assert!(screen_has(&t, "HIDDEN"));
+        assert!(search_has(&mut t, "HIDDEN"));
+    }
+
+    fn screen_flat(t: &Term<VoidListener>) -> String {
+        let mut text = String::new();
+        for line in 0..t.screen_lines() {
+            let row = &t.grid()[alacritty_terminal::index::Line(line as i32)];
+            for col in 0..t.columns() {
+                text.push(row[Column(col)].c);
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn esu_then_bsu_in_one_chunk_does_not_replay_the_old_frame() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.running_cmd = "app".into();
+        // Ten bytes, so a new ten-byte buffer does not change the count.
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[?2026hAAAAAAAAAA",
+        );
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[?2026l\x1b[?2026hBBBBBBBBBB",
+        );
+        assert!(
+            screen_flat(&t).contains("AAAAAAAAAA"),
+            "closing the first frame paints it"
+        );
+        assert!(
+            !screen_flat(&t).contains("BBBBBBBBBB"),
+            "the new frame stays held"
+        );
+        assert!(
+            !meta.sync_mirror.windows(10).any(|w| w == b"AAAAAAAAAA"),
+            "the mirror dropped the old frame"
+        );
+        assert!(
+            meta.sync_mirror.windows(10).any(|w| w == b"BBBBBBBBBB"),
+            "the mirror kept the new frame"
+        );
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[2 k");
+        let deadline = p.sync_timeout().sync_timeout().expect("second frame");
+        assert_eq!(
+            expire_sync_update(&mut p, &mut t, &mut meta, deadline),
+            None
+        );
+        let flat = screen_flat(&t);
+        assert_eq!(
+            flat.matches("AAAAAAAAAA").count(),
+            1,
+            "the old frame was not replayed"
+        );
+        assert_eq!(
+            flat.matches("BBBBBBBBBB").count(),
+            1,
+            "the new frame is intact"
+        );
+        assert!(flat.contains("AAAAAAAAAABBBBBBBBBB"));
+        assert_eq!(
+            meta.bidi.direction_at(1),
+            crate::bidi_ctl::ParagraphDir::Rtl
+        );
+    }
+
+    #[test]
+    fn esu_while_scp_is_deferred_does_not_draw_the_frame_twice() {
+        // No CUP: a second draw continues after the first and the row
+        // becomes ABAB. Home would paint the copy on top of the original.
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.running_cmd = "app".into();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?2026hAB");
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[2 k");
+        assert_eq!(meta.sync_bidi.len(), 1, "the mark waits for the flush");
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[?2026l");
+        let row = &t.grid()[alacritty_terminal::index::Line(0)];
+        let text: String = (0..8).map(|c| row[Column(c)].c).collect();
+        assert_eq!(text, "AB      ");
+        assert_eq!(
+            meta.bidi.direction_at(0),
+            crate::bidi_ctl::ParagraphDir::Default
+        );
+        assert_eq!(
+            meta.bidi.direction_at(1),
+            crate::bidi_ctl::ParagraphDir::Rtl
+        );
+    }
+
+    #[test]
+    fn forced_flush_keeps_an_arabic_line_with_its_scp_mark() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.running_cmd = "app".into();
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            "\x1b[?2026h\r\n\x1b[2 kمرحبا".as_bytes(),
+        );
+        let deadline = p.sync_timeout().sync_timeout().expect("open update");
+        assert_eq!(
+            expire_sync_update(&mut p, &mut t, &mut meta, deadline),
+            None
+        );
+        let row = &t.grid()[alacritty_terminal::index::Line(1)];
+        let text: String = (0..5).map(|c| row[Column(c)].c).collect();
+        assert_eq!(text, "مرحبا");
+        assert_eq!(
+            meta.bidi.direction_at(1),
+            crate::bidi_ctl::ParagraphDir::Rtl
+        );
+        assert_eq!(
+            meta.bidi.direction_at(0),
+            crate::bidi_ctl::ParagraphDir::Default
+        );
+    }
+
+    #[test]
+    fn forced_flush_after_resize_stamps_scp_on_the_new_grid() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.running_cmd = "app".into();
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[?2026hHELLO\r\n",
+        );
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"\x1b[2 k");
+        // Same order as Session::resize: reflow, then drop stamps that
+        // named the old rows. The flush recomputes the mark.
+        t.resize(TermSize { cols: 20, rows: 10 });
+        meta.bidi_mut().on_resize();
+        let deadline = p.sync_timeout().sync_timeout().expect("open update");
+        assert_eq!(
+            expire_sync_update(&mut p, &mut t, &mut meta, deadline),
+            None
+        );
+        let flat = screen_flat(&t);
+        assert_eq!(flat.matches("HELLO").count(), 1);
+        assert_eq!(
+            meta.bidi.direction_at(1),
+            crate::bidi_ctl::ParagraphDir::Rtl
+        );
     }
 
     #[test]
@@ -4641,6 +5972,194 @@ mod tests {
         }
     }
 
+    /// EventProxy's colour path with a fixed table instead of the global.
+    struct ColorLog(Option<QueryColors>, Arc<Mutex<Vec<String>>>);
+
+    impl EventListener for ColorLog {
+        fn send_event(&self, event: Event) {
+            if let Some(Event::PtyWrite(text)) = answer_color_query(event, self.0.as_ref()) {
+                self.1.lock_or_recover().push(text);
+            }
+        }
+    }
+
+    fn color_replies(table: Option<QueryColors>, input: &[u8]) -> Vec<String> {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let size = TermSize { cols: 40, rows: 6 };
+        let mut t = Term::new(Config::default(), &size, ColorLog(table, Arc::clone(&log)));
+        let mut p: Processor = Processor::new();
+        p.advance(&mut t, input);
+        let out = log.lock_or_recover().clone();
+        out
+    }
+
+    fn sample_colors() -> QueryColors {
+        let mut c = [(0xaa, 0xbb, 0xcc); 259];
+        c[1] = (0xcf, 0x22, 0x2e);
+        c[256] = (0xe6, 0xed, 0xf3);
+        c[257] = (0x0d, 0x11, 0x17);
+        c
+    }
+
+    #[test]
+    fn color_queries_are_answered_with_the_painted_colours() {
+        let got = color_replies(
+            Some(sample_colors()),
+            b"\x1b]11;?\x07\x1b]10;?\x1b\\\x1b]4;1;?\x07\x1b]12;?\x07",
+        );
+        assert_eq!(
+            got,
+            [
+                "\x1b]11;rgb:0d0d/1111/1717\x07",
+                "\x1b]10;rgb:e6e6/eded/f3f3\x1b\\",
+                "\x1b]4;1;rgb:cfcf/2222/2e2e\x07",
+                "\x1b]12;rgb:aaaa/bbbb/cccc\x07",
+            ]
+        );
+    }
+
+    #[test]
+    fn without_a_colour_table_a_query_gets_no_reply() {
+        // before the first renderer: silence (programs time out), never a
+        // made-up colour
+        assert!(color_replies(None, b"\x1b]11;?\x07").is_empty());
+        // a set is not a query
+        assert!(color_replies(Some(sample_colors()), b"\x1b]11;#ffffff\x07").is_empty());
+    }
+
+    /// The reply is read when the query arrives, not when the listener was
+    /// built. That is the theme switch: `set_query_colors` replaces the
+    /// table, and the next OSC 11 hears the new background.
+    #[test]
+    fn a_theme_change_is_the_next_colour_reply() {
+        let table = Arc::new(Mutex::new(sample_colors()));
+        struct Live(Arc<Mutex<QueryColors>>, Arc<Mutex<Vec<String>>>);
+        impl EventListener for Live {
+            fn send_event(&self, event: Event) {
+                let colors = *self.0.lock_or_recover();
+                if let Some(Event::PtyWrite(text)) = answer_color_query(event, Some(&colors)) {
+                    self.1.lock_or_recover().push(text);
+                }
+            }
+        }
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let size = TermSize { cols: 40, rows: 6 };
+        let mut t = Term::new(
+            Config::default(),
+            &size,
+            Live(Arc::clone(&table), Arc::clone(&log)),
+        );
+        let mut p: Processor = Processor::new();
+        p.advance(&mut t, b"\x1b]11;?\x07");
+        assert_eq!(
+            log.lock_or_recover().as_slice(),
+            ["\x1b]11;rgb:0d0d/1111/1717\x07"]
+        );
+        let dracula = crate::render::theme_by_name("Dracula").unwrap();
+        assert_ne!(dracula.bg, (0x0d, 0x11, 0x17));
+        table.lock_or_recover()[257] = dracula.bg;
+        p.advance(&mut t, b"\x1b]11;?\x07");
+        let (r, g, b) = dracula.bg;
+        assert_eq!(
+            log.lock_or_recover().as_slice(),
+            [
+                "\x1b]11;rgb:0d0d/1111/1717\x07",
+                format!("\x1b]11;rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}\x07").as_str(),
+            ]
+        );
+    }
+
+    /// What EventProxy posts for one event, without the winit proxy.
+    struct HostProbe {
+        pane: u64,
+        writes: Arc<Mutex<Vec<String>>>,
+        loads: Arc<Mutex<Vec<alacritty_terminal::term::ClipboardType>>>,
+    }
+
+    impl EventListener for HostProbe {
+        fn send_event(&self, event: Event) {
+            let Some(event) = prepare_event(self.pane, event) else {
+                return;
+            };
+            match event {
+                Event::PtyWrite(text) => self.writes.lock_or_recover().push(text),
+                Event::ClipboardLoad(kind, _) => self.loads.lock_or_recover().push(kind),
+                _ => {}
+            }
+        }
+    }
+
+    fn host_feed(
+        pane: u64,
+        config: Config,
+        input: &[u8],
+    ) -> (Vec<String>, Vec<alacritty_terminal::term::ClipboardType>) {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let loads = Arc::new(Mutex::new(Vec::new()));
+        let size = TermSize { cols: 80, rows: 24 };
+        let mut t = Term::new(
+            config,
+            &size,
+            HostProbe {
+                pane,
+                writes: Arc::clone(&writes),
+                loads: Arc::clone(&loads),
+            },
+        );
+        let mut p: Processor = Processor::new();
+        p.advance(&mut t, input);
+        let writes = writes.lock_or_recover().clone();
+        let loads = loads.lock_or_recover().clone();
+        (writes, loads)
+    }
+
+    /// `CSI 14 t` is the text area in pixels, from the cell size and the
+    /// pane's grid. No metrics yet means no reply.
+    #[test]
+    fn text_area_size_comes_from_the_cell_grid() {
+        let pane = u64::MAX;
+        clear_text_area_grid(pane);
+        let (writes, _) = host_feed(pane, Config::default(), b"\x1b[14t");
+        assert!(writes.is_empty(), "no cell size yet: {writes:?}");
+
+        // 9.2px → 9, 18.6px → 19. 24×19 by 80×9.
+        set_text_area_cell(9.2, 18.6);
+        set_text_area_grid(pane, 80, 24);
+        let (writes, _) = host_feed(pane, Config::default(), b"\x1b[14t");
+        assert_eq!(writes, ["\x1b[4;456;720t"]);
+        clear_text_area_grid(pane);
+    }
+
+    /// Default config writes nothing for an OSC 52 read. When the emulator
+    /// does deliver `ClipboardLoad`, it is forwarded and still not answered
+    /// — not even with an empty OSC 52. The read flag does not change that
+    /// until the clipboard is actually read.
+    #[test]
+    fn osc52_query_writes_nothing_and_the_load_is_forwarded() {
+        use alacritty_terminal::term::ClipboardType;
+        assert!(!crate::config::UserConfig::default().osc52_read_enabled());
+        assert!(!OSC52_READ.load(Ordering::Acquire));
+        assert!(clipboard_load_reply(false).is_none());
+        assert!(clipboard_load_reply(true).is_none());
+
+        let (writes, loads) = host_feed(1, Config::default(), b"\x1b]52;c;?\x07");
+        assert!(
+            writes.is_empty(),
+            "default config must not PtyWrite an OSC 52 reply: {writes:?}"
+        );
+        assert!(loads.is_empty(), "OnlyCopy never emits the load");
+
+        // The live pane asks alacritty to deliver the load (OnlyPaste) and
+        // then refuses the reply.
+        let cfg = Config {
+            osc52: Osc52::OnlyPaste,
+            ..Config::default()
+        };
+        let (writes, loads) = host_feed(1, cfg, b"\x1b]52;c;?\x07");
+        assert!(writes.is_empty(), "{writes:?}");
+        assert_eq!(loads, vec![ClipboardType::Clipboard]);
+    }
+
     struct KittyFixture {
         term: Term<PtyLog>,
         parser: Processor,
@@ -4908,6 +6427,105 @@ mod tests {
         let ps = shell_integration_ps("n0nce");
         assert!(ps.contains("]133;B;n0nce$([char]7)"), "{ps}");
         assert_eq!(ps.matches("n0nce").count(), 3, "D, A and B each carry it");
+    }
+
+    struct MarkState {
+        exits: Vec<Option<i32>>,
+        at_prompt: bool,
+        screen: String,
+    }
+
+    fn mark_state(bytes: &[u8]) -> MarkState {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.prompt_nonce = "n0nce".into();
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, bytes);
+        let mut screen = String::new();
+        for line in 0..t.screen_lines() {
+            let row = &t.grid()[alacritty_terminal::index::Line(line as i32)];
+            for col in 0..t.columns() {
+                screen.push(row[Column(col)].c);
+            }
+            screen.push('\n');
+        }
+        MarkState {
+            exits: meta.marks.iter().map(|m| m.exit).collect(),
+            at_prompt: meta.at_prompt,
+            screen,
+        }
+    }
+
+    /// Bash and zsh print the same D/A/B frame as PowerShell, plus a C when
+    /// the command starts. C is not a prompt boundary, so the blocks and
+    /// the exit code match. The OSC bytes are not cells, including when the
+    /// prompt is Arabic.
+    #[test]
+    fn bash_and_zsh_marks_match_powershell_and_stay_off_the_screen() {
+        let nonce = "n0nce";
+        let prompt = "بيان $ ";
+        let ps = format!(
+            "\x1b]133;D;0;{nonce}\x07\x1b]133;A;{nonce}\x07{prompt}\x1b]133;B;{nonce}\x07out\r\n\x1b]133;D;4;{nonce}\x07\x1b]133;A;{nonce}\x07{prompt}\x1b]133;B;{nonce}\x07"
+        );
+        let mut bash = crate::shellint::trusted_prompt_frame(0, nonce, prompt);
+        bash.extend(crate::shellint::command_started_mark(nonce));
+        bash.extend(b"out\r\n");
+        bash.extend(crate::shellint::trusted_prompt_frame(4, nonce, prompt));
+        let ps_state = mark_state(ps.as_bytes());
+        let bash_state = mark_state(&bash);
+        assert_eq!(bash_state.exits, ps_state.exits);
+        assert_eq!(bash_state.at_prompt, ps_state.at_prompt);
+        assert_eq!(ps_state.exits, vec![Some(4), None]);
+        assert!(ps_state.at_prompt);
+        for screen in [&ps_state.screen, &bash_state.screen] {
+            assert!(screen.contains("بيان"), "{screen:?}");
+            assert!(!screen.contains("133"), "{screen:?}");
+            assert!(!screen.contains('\u{1b}'), "{screen:?}");
+        }
+    }
+
+    /// cmd emits A and B with ST, no D and no nonce, so they are exactly as
+    /// untrusted as bytes any program in the pane could print: A resets the
+    /// BiDi mode the last command left on, and nothing else. No block, no
+    /// "at a prompt", the running command stays, and an OSC 7 after them
+    /// is not accepted.
+    #[test]
+    fn cmd_marks_are_untrusted() {
+        let mut bytes = crate::shellint::cmd_prompt_frame("> ");
+        bytes.extend(b"dir\r\n");
+        bytes.extend(crate::shellint::cmd_prompt_frame("> "));
+        let state = mark_state(&bytes);
+        assert!(!state.at_prompt);
+        assert!(state.exits.is_empty(), "{:?}", state.exits);
+        assert!(state.screen.contains('>'));
+        assert!(!state.screen.contains("133"), "{:?}", state.screen);
+        assert!(!state.screen.contains('\u{1b}'));
+
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        meta.prompt_nonce = "n0nce".into();
+        meta.running_cmd = "evil".into();
+        meta.bidi_mut().mode = crate::bidi_ctl::BidiMode::Explicit;
+        let mut forged = crate::shellint::cmd_prompt_frame("> ");
+        forged.extend(osc7_of("file:///C:/evil"));
+        let ev = process_chunk(&mut p, &mut t, &mut meta, &mut carry, &forged);
+        assert!(ev.cwd.is_none());
+        assert_eq!(meta.running_cmd, "evil");
+        assert!(!meta.at_prompt);
+        assert_eq!(meta.bidi.mode, crate::bidi_ctl::BidiMode::Implicit);
+    }
+
+    #[test]
+    fn spawn_checks_shell_integration_before_injecting_the_powershell_wrapper() {
+        let src = include_str!("term.rs");
+        let spawn = src.split("pub fn spawn(").nth(1).expect("spawn");
+        let body = spawn.split("pub fn shell(").next().unwrap_or(spawn);
+        let gate = body.find("injection_allowed").expect("gate");
+        // The wrapper is written by `powershell_setup`, and only when the
+        // gate's answer is passed in.
+        let wrapper = body
+            .find("powershell_setup(elevated, theme.as_deref(), integrate)")
+            .expect("wrapper");
+        assert!(gate < wrapper);
+        assert!(!powershell_setup(false, None, false).contains("133;"));
+        assert!(powershell_setup(false, None, true).contains("133;"));
     }
 
     fn osc7_of(url: &str) -> Vec<u8> {
@@ -5580,6 +7198,16 @@ mod measure_probes {
                     mb / secs
                 );
             };
+            let mut images = crate::images::ImageFilter::default();
+            time("image filter", &mut |c| {
+                std::hint::black_box(images.pull(c));
+            });
+            time("next_grid_op", &mut |c| {
+                let mut pos = 0;
+                while let Some((_, end, _)) = next_grid_op(&c[pos..]) {
+                    pos += end;
+                }
+            });
             let mut filter = SessionMeta::default().esc_filter;
             time("bidi_ctl filter", &mut |c| {
                 std::hint::black_box(filter.pull(c));

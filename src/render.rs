@@ -8,7 +8,10 @@
 //!   backgrounds and glyphs can never drift apart.
 //! - rows WITH Arabic shape as whole lines so cosmic-text applies UAX#9
 //!   BiDi (mixed directions, LTR islands): correct text outranks column
-//!   fidelity for prose.
+//!   fidelity for prose. An RTL paragraph (SCP 2, or auto when the first
+//!   strong character is Arabic or another RTL letter) sits on the right
+//!   edge of the pane. LTR paragraphs, TUI fields, and the alternate
+//!   screen stay on the left.
 //!
 //! Since M7 the unit of drawing is a PANE (a rect + its own Term): tabs can
 //! split into side-by-side or stacked panes, each clipped to its rect.
@@ -36,6 +39,8 @@ use crate::gpu::Vertex;
 // #eefbfa marks keywords. Everything else is a muted derivation, because the
 // original uses almost no other hue and loud fillers would break it.
 pub const BG: (u8, u8, u8) = (0x06, 0x26, 0x26);
+/// Measured foreground tan. The renderer reads a theme; tests pin this.
+#[cfg(test)]
 pub const FG: (u8, u8, u8) = (0xc2, 0xb7, 0x96);
 pub const DEFAULT_THEME: &str = "بيان (الأزرق)";
 
@@ -94,6 +99,76 @@ fn plugin_theme(p: &crate::plugins::PluginTheme) -> Theme {
         fg: p.fg,
         palette: p.palette,
     }
+}
+
+fn color_overrides(cfg: &crate::config::UserConfig) -> bool {
+    cfg.bg.is_some() || cfg.fg.is_some() || cfg.palette.is_some()
+}
+
+fn apply_color_overrides(
+    mut colors: crate::theme::Colors,
+    cfg: &crate::config::UserConfig,
+) -> crate::theme::Colors {
+    if let Some(c) = cfg.bg.as_deref().and_then(crate::config::parse_hex) {
+        colors.bg = c;
+    }
+    if let Some(c) = cfg.fg.as_deref().and_then(crate::config::parse_hex) {
+        colors.fg = c;
+    }
+    if let Some(p) = &cfg.palette {
+        for (slot, hex) in colors.palette.iter_mut().zip(p.iter()) {
+            if let Some(c) = crate::config::parse_hex(hex) {
+                *slot = c;
+            }
+        }
+    }
+    colors.title_bar_dark = crate::theme::title_bar_dark_for(colors.bg);
+    colors
+}
+
+/// Colours the user pinned: a named scheme, an unknown scheme name (kept on
+/// the default scheme, as before), or any hand-set bg/fg/palette. `None`
+/// means the system/dark/light pair is in charge.
+fn pinned_colors(cfg: &crate::config::UserConfig) -> Option<crate::theme::Colors> {
+    let word = crate::theme::is_mode_word(cfg.theme.as_deref());
+    let named = if word {
+        None
+    } else {
+        cfg.theme.as_deref().and_then(theme_by_name)
+    };
+    let unknown = cfg.theme.is_some() && !word && named.is_none();
+    if named.is_none() && !unknown && !color_overrides(cfg) {
+        return None;
+    }
+    let base = if let Some(t) = named {
+        crate::theme::Colors::from_parts(t.bg, t.fg, t.palette)
+    } else if unknown {
+        let t = theme_by_name(DEFAULT_THEME).expect("built-in default theme");
+        crate::theme::Colors::from_parts(t.bg, t.fg, t.palette)
+    } else {
+        crate::theme::pair(
+            crate::theme::choice_of(cfg.theme.as_deref()),
+            cfg.system_apps_light,
+        )
+    };
+    Some(apply_color_overrides(base, cfg))
+}
+
+/// True when a Windows theme change may replace the colours and the caption.
+pub fn follows_system_theme(cfg: &crate::config::UserConfig) -> bool {
+    crate::theme::choice_of(cfg.theme.as_deref()) == crate::theme::ThemeChoice::System
+        && pinned_colors(cfg).is_none()
+}
+
+/// bg/fg/palette the renderer should show for this config, including the
+/// Windows sample in `system_apps_light` when the user is following it.
+pub fn resolved_colors(cfg: &crate::config::UserConfig) -> crate::theme::Colors {
+    pinned_colors(cfg).unwrap_or_else(|| {
+        crate::theme::pair(
+            crate::theme::choice_of(cfg.theme.as_deref()),
+            cfg.system_apps_light,
+        )
+    })
 }
 
 /// A theme by name (used to resolve the config's `theme` field). Built-ins
@@ -395,6 +470,74 @@ fn push_quad(
         v(nx1, ny1, mu1, mv1),
         v(nx0, ny1, mu0, mv1),
     ]);
+}
+
+/// One inline image, clipped to its pane. `verts` is empty when the image
+/// sits fully outside the clip. The GPU samples `rgba` with these uvs.
+pub struct ImageSprite {
+    pub cookie: u64,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: std::sync::Arc<[u8]>,
+    pub verts: Vec<Vertex>,
+}
+
+/// Quads for `snaps`, in pane pixels. `screen_top` is the absolute line of
+/// viewport row 0 when the view is not scrolled; `display_offset` moves
+/// history down into the pane, and `scroll_px` is smooth scroll's sub-line
+/// shift on top of it. The quad is clipped to `clip`.
+///
+/// The image stays on its logical cell. Texture coordinates run left to
+/// right, so an RTL paragraph does not reverse the pixels. Anchoring the
+/// quad to the right edge of an RTL paragraph is a later decision.
+pub fn image_sprites(
+    clip: Rect,
+    cell_w: f32,
+    cell_h: f32,
+    screen_top: u64,
+    display_offset: u64,
+    scroll_px: i32,
+    snaps: &[crate::images::ImageSnap],
+) -> Vec<ImageSprite> {
+    if !(cell_w > 0.0 && cell_h > 0.0) {
+        return Vec::new();
+    }
+    let mut sprites = Vec::new();
+    for snap in snaps {
+        if snap.cols == 0 || snap.rows == 0 || snap.width == 0 || snap.height == 0 {
+            continue;
+        }
+        let vrow = snap.line as i64 - screen_top as i64 + display_offset as i64;
+        let x = clip.0 as f32 + snap.col as f32 * cell_w;
+        let y = clip.1 as f32 + vrow as f32 * cell_h + scroll_px.max(0) as f32;
+        let w = snap.cols as f32 * cell_w;
+        let h = snap.rows as f32 * cell_h;
+        let mut verts = Vec::new();
+        push_quad(
+            &mut verts,
+            clip,
+            x,
+            y,
+            w,
+            h,
+            0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            [1.0, 1.0, 1.0, 1.0],
+        );
+        // An off-screen image is still sent, with no verts: the GPU keeps
+        // its texture while the store holds it, so scrolling back is free.
+        sprites.push(ImageSprite {
+            cookie: snap.cookie,
+            width: snap.width,
+            height: snap.height,
+            rgba: std::sync::Arc::clone(&snap.rgba),
+            verts,
+        });
+    }
+    sprites
 }
 
 /// Solid rect (samples the white texel on page 0).
@@ -774,6 +917,9 @@ pub struct PaletteLayout {
     pub query: Rect,
     pub rows: Vec<(usize, Rect)>,
     pub footer: Rect,
+    /// Short-window compression of this card (1.0 when it fits). Not the
+    /// Windows text-size setting — that is `Renderer::system_text_scale`,
+    /// and the two multiply rather than share this field.
     pub text_scale: f32,
 }
 
@@ -935,6 +1081,9 @@ pub struct SettingsLayout {
     pub bar_toggle: Rect,
     pub close_label_y: i32,
     pub close_toggle: Rect,
+    pub appearance_label_y: i32,
+    /// segmented control, left→right: النظام، داكن، فاتح
+    pub appearance_btns: [Rect; 3],
 }
 
 /// Move a group of rects to the mirror-image position across the card
@@ -973,6 +1122,7 @@ impl SettingsLayout {
         }
         mirror_group(&mut self.cursor_btns, x, w);
         mirror_group(&mut self.bell_btns, x, w);
+        mirror_group(&mut self.appearance_btns, x, w);
         for t in [
             &mut self.blink_toggle,
             &mut self.copy_toggle,
@@ -996,7 +1146,10 @@ pub const BELL_SEGMENTS: [crate::config::BellMode; 3] = [
 
 /// Everything the settings panel displays (current values of each control).
 pub struct SettingsView<'a> {
-    pub theme: usize,
+    /// Gallery tile to ring, when a named scheme is selected.
+    pub theme: Option<usize>,
+    /// النظام / داكن / فاتح, when no named scheme is selected.
+    pub appearance: Option<crate::theme::ThemeChoice>,
     pub font_family: &'a str,
     pub font_size: i32,
     /// the Arabic font's name, or the "Auto" label
@@ -1045,9 +1198,12 @@ pub struct PaneView<'a> {
     pub claude: bool,
     /// First visible Claude row; older shell scrollback stays logical.
     pub claude_from: Option<i64>,
-    /// False when explicit BDSM is honored: cells are already in visual
-    /// order, so Arabic rows take the grid path and are not reordered.
+    /// False when explicit BDSM is honored, or the pane's BiDi mode is
+    /// off: cells are already in visual order, so Arabic rows take the
+    /// grid path and are not reordered.
     pub reorder: bool,
+    /// This pane's reorder mode. `Full` draws no chip; the other two do.
+    pub bidi_mode: crate::bidi_ctl::BidiReorder,
     /// SCP paragraph direction for each viewport row (index = row).
     pub line_dir: &'a [ParagraphDir],
     /// The current search hit (focused pane only).
@@ -1061,14 +1217,75 @@ pub struct PaneView<'a> {
     /// Status text for that link: scheme and host, then the path. The
     /// drawer forces an LTR paragraph and isolates the path.
     pub link_tip: Option<&'a crate::link::StatusParts>,
+    /// Pixels the grid is shifted down inside the pane. Zero draws every
+    /// row where it was drawn before this offset existed.
+    pub scroll_px: i32,
+    /// SCP direction of the history line drawn above the pane. Ignored
+    /// when `scroll_px` is zero, so a whole-line frame does not read it.
+    pub peek_dir: ParagraphDir,
 }
 
 // translucent overlays, EasyTer's colors: selection blue, search amber
 const SELECTION_RGBA: ((u8, u8, u8), u32) = ((80, 140, 255), 90);
 const SEARCH_RGBA: ((u8, u8, u8), u32) = ((240, 180, 40), 120);
-/// Hover underline for a hyperlink. Mint, so it sits in the palette
-/// instead of introducing a new blue the rest of the chrome doesn't use.
+/// Hover underline for a hyperlink. Mint on a dark page. On a light page
+/// the mint is 1.75:1, so the underline switches to the light palette's blue.
 const LINK_UNDER: (u8, u8, u8) = (0x58, 0xd1, 0xc0);
+
+fn link_underline(page: (u8, u8, u8)) -> (u8, u8, u8) {
+    if crate::theme::title_bar_dark_for(page) {
+        LINK_UNDER
+    } else {
+        (0x09, 0x69, 0xda)
+    }
+}
+
+/// The tab bar is the page at 80%. Caption glyphs and accents are measured
+/// against this, not against the page itself.
+fn chrome_bar_bg(bg: (u8, u8, u8)) -> (u8, u8, u8) {
+    (
+        (bg.0 as f32 * 0.80) as u8,
+        (bg.1 as f32 * 0.80) as u8,
+        (bg.2 as f32 * 0.80) as u8,
+    )
+}
+
+/// Caption buttons and the gear. The same ink as ‹ › +, except the close
+/// button under the pointer, which is white on the red hover.
+fn caption_glyph(fg: (u8, u8, u8), close_hovered: bool) -> (u8, u8, u8) {
+    if close_hovered {
+        (0xff, 0xff, 0xff)
+    } else {
+        fg
+    }
+}
+
+/// Hover fill. Close stays red. The others are the dark slate on a dark
+/// page, and the page stepped down on a light one — a dark slate on the
+/// light bar is a blob.
+fn caption_hover(bg: (u8, u8, u8), close: bool) -> (u8, u8, u8) {
+    if close {
+        (0xc4, 0x2b, 0x1c)
+    } else if crate::theme::title_bar_dark_for(bg) {
+        (0x33, 0x3c, 0x48)
+    } else {
+        (
+            bg.0.saturating_sub(0x20),
+            bg.1.saturating_sub(0x20),
+            bg.2.saturating_sub(0x20),
+        )
+    }
+}
+
+/// The search bar's underline. The dark page keeps the Blow amber; the
+/// light page uses the bar's amber accent, which clears 3:1 on the paper.
+fn search_line(page: (u8, u8, u8)) -> (u8, u8, u8) {
+    if crate::theme::title_bar_dark_for(page) {
+        PALETTE[11]
+    } else {
+        crate::theme::bar_accent(crate::theme::BarAccent::Amber, false)
+    }
+}
 
 /// The string the status bar shapes. The host is cut from the left only
 /// when it alone is wider than `columns`. The path is cut from the right,
@@ -1119,21 +1336,209 @@ struct CellInfo {
     ul: (u8, u8, u8),
 }
 
-fn is_tui_row(cells: &[CellInfo]) -> bool {
-    let end = cells.iter().rposition(|c| c.c != ' ').map_or(0, |i| i + 1);
-    let cells = &cells[..end];
-    if cells
-        .iter()
-        .find(|c| c.c != ' ')
-        .is_some_and(|c| matches!(c.c, '>' | '❯' | '›'))
-    {
-        return true;
+/// First strong character of a row: `Some(true)` for RTL (AL/R), `Some(false)`
+/// for LTR. Digits, ZWJ/ZWNJ, and tashkeel are not strong.
+fn strong_paragraph_char(c: char) -> Option<bool> {
+    if crate::bidi::is_combining(c) || c.is_numeric() {
+        return None;
     }
-    cells
-        .iter()
-        .any(|c| matches!(c.c, '\u{2500}'..='\u{259f}' | '\u{e000}'..='\u{f8ff}'))
-        || cells.windows(3).any(|s| s.iter().all(|c| c.c == ' '))
-        || cells.windows(2).any(|s| s[1].col > s[0].col + s[0].w + 1)
+    match c {
+        '\u{200C}' | '\u{200D}' | '\u{200E}' | '\u{200F}' | '\u{FEFF}' => return None,
+        _ => {}
+    }
+    if is_rtl(c) {
+        Some(true)
+    } else if c.is_alphabetic() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Direction of a row's first strong letter. `chars` is each cell's base
+/// char followed by its combining marks, in grid order.
+fn auto_paragraph_dir(chars: impl IntoIterator<Item = char>) -> ParagraphDir {
+    match chars.into_iter().find_map(strong_paragraph_char) {
+        Some(true) => ParagraphDir::Rtl,
+        Some(false) => ParagraphDir::Ltr,
+        None => ParagraphDir::Default,
+    }
+}
+
+/// Direction of a mouse snapshot's first strong letter, as `draw_pane`
+/// reads it for the history row above the viewport: HIDDEN cells count as
+/// blanks.
+pub(crate) fn snap_paragraph_dir(cells: &[SnapCell]) -> ParagraphDir {
+    auto_paragraph_dir(cells.iter().flat_map(|c| {
+        let base = if c.flags.intersects(Flags::HIDDEN) {
+            ' '
+        } else {
+            c.c
+        };
+        std::iter::once(base).chain(c.zw.iter().copied())
+    }))
+}
+
+/// The per-row direction decision, walked top to bottom over the viewport.
+/// `draw_pane` paints with it and the mouse hit-test replays it
+/// (`viewport_row_layout`), so a click resolves against the drawn layout.
+#[derive(Default)]
+struct ParagraphWalk {
+    /// Direction of the paragraph a soft wrap is still inside. A wrapped
+    /// row does not re-detect from its own first letter.
+    open: ParagraphDir,
+}
+
+impl ParagraphWalk {
+    /// `explicit` is the row's SCP stamp, `continued` whether the row above
+    /// soft-wrapped into it, `auto` its first strong letter. Returns the
+    /// row's direction, and whether it is the wrapped tail of an RTL
+    /// paragraph, which stays on the bidi path with no Arabic letter.
+    fn row(
+        &mut self,
+        explicit: ParagraphDir,
+        continued: bool,
+        auto: ParagraphDir,
+    ) -> (ParagraphDir, bool) {
+        let dir = if explicit != ParagraphDir::Default {
+            explicit
+        } else if continued && self.open != ParagraphDir::Default {
+            self.open
+        } else {
+            auto
+        };
+        if !continued || explicit != ParagraphDir::Default {
+            self.open = if explicit != ParagraphDir::Default {
+                explicit
+            } else {
+                auto
+            };
+        }
+        (dir, continued && dir == ParagraphDir::Rtl)
+    }
+}
+
+/// How `draw_pane` lays out viewport row `row`: its paragraph direction,
+/// and whether the row takes the bidi path (an RTL letter, or the wrapped
+/// tail of an RTL paragraph) when the pane reorders. `explicit` gives each
+/// viewport row's SCP stamp, as `PaneView::line_dir` does.
+pub fn viewport_row_layout<T: alacritty_terminal::event::EventListener>(
+    term: &Term<T>,
+    row: usize,
+    explicit: impl Fn(usize) -> ParagraphDir,
+) -> (ParagraphDir, bool) {
+    use alacritty_terminal::index::{Column, Line};
+    let off = term.grid().display_offset() as i32;
+    let row = row.min(term.screen_lines().saturating_sub(1));
+    // the cells draw_pane collects: spacers skipped, HIDDEN drawn blank
+    let base_chars = |li: usize| {
+        let line = &term.grid()[Line(li as i32 - off)];
+        (0..term.columns())
+            .map(move |c| &line[Column(c)])
+            .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+            .map(|cell| {
+                let base = if cell.flags.intersects(Flags::HIDDEN) {
+                    ' '
+                } else {
+                    cell.c
+                };
+                (base, cell.zerowidth())
+            })
+    };
+    let mut walk = ParagraphWalk::default();
+    let mut dir = (ParagraphDir::Default, false);
+    for li in 0..=row {
+        let auto = auto_paragraph_dir(
+            base_chars(li)
+                .flat_map(|(c, zw)| std::iter::once(c).chain(zw.into_iter().flatten().copied())),
+        );
+        dir = walk.row(explicit(li), line_wrapped_into(term, li, off), auto);
+    }
+    let arabic = base_chars(row).any(|(c, _)| is_rtl(c));
+    (dir.0, arabic || dir.1)
+}
+
+/// The previous grid row ended in a soft wrap, so this viewport row is the
+/// same paragraph. `display_offset` is the scroll into history.
+fn line_wrapped_into<T: alacritty_terminal::event::EventListener>(
+    term: &Term<T>,
+    viewport_row: usize,
+    display_offset: i32,
+) -> bool {
+    use alacritty_terminal::index::{Column, Line};
+    let prev = Line(viewport_row as i32 - display_offset - 1);
+    if prev < term.grid().topmost_line() {
+        return false;
+    }
+    let col = Column(term.columns().saturating_sub(1));
+    term.grid()[prev][col].flags.contains(Flags::WRAPLINE)
+}
+
+fn is_tui_row(cells: &[CellInfo]) -> bool {
+    tui_row(cells.len(), |i| (cells[i].col, cells[i].w, cells[i].c))
+}
+
+/// The same test for a mouse snapshot. A click has to follow the path
+/// `draw_pane` took, or a right-aligned row and a TUI field disagree.
+pub(crate) fn snap_is_tui(cells: &[SnapCell]) -> bool {
+    tui_row(cells.len(), |i| (cells[i].col, cells[i].w, cells[i].c))
+}
+
+fn tui_row(n: usize, at: impl Fn(usize) -> (usize, usize, char)) -> bool {
+    let mut end = n;
+    while end > 0 && at(end - 1).2 == ' ' {
+        end -= 1;
+    }
+    if end == 0 {
+        return false;
+    }
+    let mut first_text = None;
+    let mut spaces = 0u8;
+    let mut gap = false;
+    let mut boxy = false;
+    let mut prev: Option<(usize, usize)> = None;
+    for i in 0..end {
+        let (col, w, c) = at(i);
+        if first_text.is_none() && c != ' ' {
+            first_text = Some(c);
+        }
+        if c == ' ' {
+            spaces = spaces.saturating_add(1);
+            if spaces >= 3 {
+                return true;
+            }
+        } else {
+            spaces = 0;
+        }
+        if matches!(c, '\u{2500}'..='\u{259f}' | '\u{e000}'..='\u{f8ff}') {
+            boxy = true;
+        }
+        if let Some((prev_col, prev_w)) = prev {
+            if col > prev_col + prev_w + 1 {
+                gap = true;
+            }
+        }
+        prev = Some((col, w));
+    }
+    boxy || gap || matches!(first_text, Some('>' | '❯' | '›'))
+}
+
+/// Horizontal shift that puts an RTL paragraph's rightmost glyph on the
+/// pane's right edge. `content_right` is that glyph's x in the shaped
+/// buffer (align-left, so it sits near 0). LTR, a TUI field, and the
+/// alternate screen pass `align_edge = false` and stay put.
+fn rtl_edge(
+    align_edge: bool,
+    paragraph_rtl: bool,
+    pane_w: i32,
+    content_right: f32,
+    scale: f32,
+) -> i32 {
+    if align_edge && paragraph_rtl {
+        (pane_w as f32 - content_right * scale).round().max(0.0) as i32
+    } else {
+        0
+    }
 }
 
 impl CellInfo {
@@ -1249,6 +1654,174 @@ fn fit_past_end_cursor(x: i32, w: i32, rtl: bool, letters: &[(i32, i32)]) -> (i3
     (lo, (hi - lo).max(2))
 }
 
+/// Raster ink of one laid-out glyph, in the same pixel space as `glyph.x`.
+/// The advance box is the pen's slot; Cairo's joined letters draw outside it,
+/// so a block sized to the slot covers the next letter's edge and misses
+/// its own.
+fn glyph_ink(
+    atlas: &mut Atlas,
+    fs: &mut FontSystem,
+    cache: &mut SwashCache,
+    glyph: &cosmic_text::LayoutGlyph,
+) -> Option<(f32, f32)> {
+    let phys = glyph.physical((0.0, 0.0), 1.0);
+    let entry = atlas.entry(fs, cache, phys.cache_key)?;
+    let w = entry.w as f32;
+    if w <= 0.0 {
+        return None;
+    }
+    Some((phys.x as f32 + entry.left as f32, w))
+}
+
+fn is_alef(c: char) -> bool {
+    matches!(c, 'ا' | 'أ' | 'إ' | 'آ' | 'ٱ')
+}
+
+/// «لا» is one joined cluster even when the face emits two glyphs and the
+/// alef's bitmap sits on the lam. Fold the pair into one span so the ink
+/// is split from the right afterwards: lam on the right half, alef on the
+/// left. A lone alef is not a ligature and stays where it was shaped.
+fn merge_lam_alef(spans: Vec<crate::mouse::GlyphSpan>, text: &str) -> Vec<crate::mouse::GlyphSpan> {
+    let mut out = Vec::with_capacity(spans.len());
+    let mut i = 0;
+    while i < spans.len() {
+        let pair = spans.get(i + 1).and_then(|next| {
+            let (a, b) = (&spans[i], next);
+            let (first, second) = if a.start <= b.start { (a, b) } else { (b, a) };
+            let alef = |span: &crate::mouse::GlyphSpan| {
+                text[span.start..span.end]
+                    .chars()
+                    .find(|c| !crate::bidi::is_combining(*c))
+                    .is_some_and(is_alef)
+            };
+            // Adjacent: «لا» and «لَا», lam's cluster ends where alef's starts.
+            let adjacent = first.end == second.start
+                && without_trailing_marks(&text[first.start..first.end]).ends_with('ل')
+                && alef(second);
+            // Contained: Amiri «لاً». Tanween on the alef makes HarfBuzz give
+            // the lam bytes (3, 9) and the alef (5, 9), so the ranges share
+            // an end and the adjacent test rejects the pair. The alef block
+            // then overlaps the lam.
+            let contained = second.start > first.start
+                && second.end == first.end
+                && alef(second)
+                && is_lam_alef_cluster(&text[first.start..first.end]);
+            (adjacent || contained).then(|| {
+                let x = a.x.min(b.x);
+                crate::mouse::GlyphSpan {
+                    x,
+                    w: (a.x + a.w).max(b.x + b.w) - x,
+                    start: first.start,
+                    end: first.end.max(second.end),
+                    rtl: true,
+                }
+            })
+        });
+        if let Some(span) = pair {
+            out.push(span);
+            i += 2;
+        } else {
+            let g = &spans[i];
+            out.push(crate::mouse::GlyphSpan {
+                x: g.x,
+                w: g.w,
+                start: g.start,
+                end: g.end,
+                rtl: g.rtl,
+            });
+            i += 1;
+        }
+    }
+    out
+}
+
+/// «لا» plus any marks on either letter, and nothing after the alef.
+/// «لاً» and «لَا» both match; a longer word does not.
+fn is_lam_alef_cluster(text: &str) -> bool {
+    let text = without_trailing_marks(text);
+    let mut bases = text.chars().filter(|c| !crate::bidi::is_combining(*c));
+    bases.next() == Some('ل') && bases.next().is_some_and(is_alef) && bases.next().is_none()
+}
+
+/// Drop tashkeel that sits on the last base, so «لَ» still reads as lam.
+fn without_trailing_marks(s: &str) -> &str {
+    let mut end = s.len();
+    while let Some(c) = s[..end].chars().next_back() {
+        if !crate::bidi::is_combining(c) {
+            break;
+        }
+        end -= c.len_utf8();
+    }
+    &s[..end]
+}
+
+/// Bases in a cluster. Marks and joiners stay on the letter before them,
+/// so «بَ» is one and «لا» is two.
+fn cluster_unit_count(cluster: &str) -> usize {
+    let mut n = 0usize;
+    let mut joined = false;
+    for c in cluster.chars() {
+        let glue = crate::bidi::is_combining(c)
+            || c == '\u{200d}'
+            || joined
+            || matches!(c as u32, 0xFE00..=0xFE0F | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F);
+        joined = c == '\u{200d}';
+        if n == 0 || !glue {
+            n += 1;
+        }
+    }
+    n.max(1)
+}
+
+/// Cursor rectangle for the byte range. A single letter is the union of
+/// its advance (the cell) and its ink, so a thin `l` or alef stays a block
+/// and reh/seen still stick out of the cell. A ligature is the ink alone,
+/// split from the right by [`highlight_spans`]: «ل» keeps the right half
+/// of «لا» and «ا» the left half.
+fn ink_cover(
+    spans: &[crate::mouse::GlyphSpan],
+    inks: &[(usize, usize, f32, f32)],
+    text: &str,
+    b0: usize,
+    b1: usize,
+) -> Option<(f32, f32)> {
+    let mut adjusted = Vec::with_capacity(spans.len());
+    for g in spans {
+        let mut lo = f32::MAX;
+        let mut hi = f32::MIN;
+        for &(start, end, x, w) in inks {
+            if end > g.start && start < g.end && w > 0.0 {
+                lo = lo.min(x);
+                hi = hi.max(x + w);
+            }
+        }
+        let units = cluster_unit_count(&text[g.start..g.end]);
+        let (x, w) = if hi > lo && units > 1 {
+            (lo, hi - lo)
+        } else if hi > lo {
+            let left = lo.min(g.x);
+            let right = hi.max(g.x + g.w);
+            (left, right - left)
+        } else {
+            (g.x, g.w)
+        };
+        if w <= 0.0 {
+            continue;
+        }
+        adjusted.push(crate::mouse::GlyphSpan {
+            x,
+            w,
+            start: g.start,
+            end: g.end,
+            rtl: g.rtl,
+        });
+    }
+    let parts = highlight_spans(&adjusted, text, b0, b1);
+    let lo = parts.iter().map(|s| s.0).reduce(f32::min)?;
+    let hi = parts.iter().map(|s| s.0 + s.1).reduce(f32::max)?;
+    (hi > lo).then_some((lo, hi - lo))
+}
+
 /// Claude's prompt uses a logical cursor offset even though its output
 /// cells are visual. Resolve that offset through the same permutation.
 fn claude_logical_cursor_cell(cells: &[CellInfo], offset: usize) -> Option<usize> {
@@ -1319,6 +1892,51 @@ pub fn snapshot_row<T: alacritty_terminal::event::EventListener>(
             bg: cell.bg,
             flags: cell.flags,
         });
+    }
+    cells
+}
+
+/// Cells of one grid line, including a history line above the viewport.
+/// `line` is the grid's own index (`0` is the top of the screen when the
+/// view is at the bottom; negative lines are scrollback).
+pub fn snapshot_grid_line<T: alacritty_terminal::event::EventListener>(
+    term: &Term<T>,
+    line: i32,
+) -> Vec<SnapCell> {
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::{Column, Line};
+    let at = Line(line);
+    if at < term.topmost_line() || at > term.bottommost_line() {
+        return Vec::new();
+    }
+    let grid_row = &term.grid()[at];
+    let mut cells = Vec::new();
+    let mut col = 0;
+    while col < term.columns() {
+        let cell = &grid_row[Column(col)];
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            col += 1;
+            continue;
+        }
+        let w = if cell.flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else {
+            1
+        };
+        cells.push(SnapCell {
+            col,
+            w,
+            c: if cell.flags.intersects(Flags::HIDDEN) {
+                ' '
+            } else {
+                cell.c
+            },
+            zw: cell.zerowidth().map(|z| z.to_vec()).unwrap_or_default(),
+            fg: cell.fg,
+            bg: cell.bg,
+            flags: cell.flags,
+        });
+        col += 1;
     }
     cells
 }
@@ -1659,6 +2277,20 @@ impl Seg {
 struct ShapedRun {
     buffer: Buffer,
     natw: f32,
+    /// Ink box per cell byte range. Filled for the cursor during a frame and
+    /// for the other cells on click. A new `RunKey` (the line changed) starts
+    /// empty, so a stale box cannot outlive the text it was measured on.
+    ink: std::collections::HashMap<(usize, usize), Option<(f32, f32)>>,
+}
+
+/// What a frame drew for one bidi row, so a later click can measure ink
+/// without shaping the line again. Not read by selection or search.
+#[derive(Clone)]
+struct RowShape {
+    key: RunKey,
+    cells: Vec<(usize, usize, usize)>,
+    text_x0: i32,
+    scale: f32,
 }
 
 /// Cache key: the exact rich-text content (text + color + style) + alignment.
@@ -1674,6 +2306,14 @@ const CACHE_CAP: usize = 4096;
 pub struct Renderer {
     cell_geometry: std::collections::HashMap<(Rect, usize, usize), CellGeometry>,
     row_hits: std::collections::HashMap<(Rect, usize), Vec<RowHit>>,
+    /// Ink union for clicks and the cursor block. Never copied into
+    /// `cell_geometry`: selection and search draw one rect per span there,
+    /// and a second box on an Arabic cell darkens it twice.
+    click_boxes: std::collections::HashMap<(Rect, usize, usize), (i32, i32, bool)>,
+    row_shape: std::collections::HashMap<(Rect, usize), RowShape>,
+    /// Cells whose ink was measured since `begin_frame`. A paint measures
+    /// the cursor cell only; the rest wait for a click.
+    ink_cells: u32,
     mapping_context: Option<(Rect, usize)>,
     /// which caption button the pointer is over (0..2) — hover feedback
     pub hover_caption: Option<usize>,
@@ -1692,6 +2332,14 @@ pub struct Renderer {
     terminal_metrics: Metrics,
     terminal_cell_w: f32,
     dpi_scale: f32,
+    /// Accessibility text size (1.0 at 100%, up to 2.25). 1.0 when
+    /// `follow_system_text_size` is off. Independent of `dpi_scale`.
+    system_text_scale: f32,
+    /// Windows High Contrast is on. Chrome paints [`Self::chrome`].
+    high_contrast: bool,
+    /// High Contrast is on and the grid follows it (fg/bg/selection/cursor).
+    grid_follows_hc: bool,
+    chrome: crate::a11y::ChromeColors,
     cache_hot: std::collections::HashMap<RunKey, ShapedRun>,
     cache_cold: std::collections::HashMap<RunKey, ShapedRun>,
     pub atlas: Atlas,
@@ -1737,8 +2385,12 @@ pub struct PasteCard<'a> {
     pub chars: usize,
     pub reason: &'a str,
     /// One row per entry. A paste shows one elided row; a plugin command
-    /// shows its whole payload, wrapped (R-03).
+    /// shows its whole payload, wrapped (R-03). A Lua file uses the same
+    /// rows so the card shows the source being approved.
     pub preview: &'a [String],
+    /// Replaces the "Paste N lines?" title. Lua approval uses it; a paste
+    /// leaves it empty and keeps the original question.
+    pub heading: Option<&'a str>,
 }
 
 /// Hint under the command palette. The number is the filtered list the
@@ -1780,8 +2432,21 @@ pub(crate) fn palette_hint(count: usize) -> String {
 
 impl Renderer {
     /// `extra_pts` is the live Ctrl+wheel zoom delta on top of the
-    /// configured base size.
+    /// configured base size. Accessibility state is neutral, so a unit
+    /// test does not pick up the machine's High Contrast theme.
     pub fn new(scale: f32, cfg: &crate::config::UserConfig, extra_pts: f32) -> Self {
+        Self::with_a11y(scale, cfg, extra_pts, crate::a11y::A11ySnapshot::neutral())
+    }
+
+    /// `extra_pts` is the live Ctrl+wheel zoom delta on top of the
+    /// configured base size. `a11y` is the last High Contrast / text-size
+    /// read. DPI (`scale`) and the text-size multiplier stay separate.
+    pub fn with_a11y(
+        scale: f32,
+        cfg: &crate::config::UserConfig,
+        extra_pts: f32,
+        a11y: crate::a11y::A11ySnapshot,
+    ) -> Self {
         let mut font_system = FontSystem::new();
         font_system.db_mut().load_font_data(AMIRI.to_vec());
         font_system.db_mut().load_font_data(AMIRI_BOLD.to_vec());
@@ -1794,8 +2459,20 @@ impl Renderer {
             .arabic_font
             .clone()
             .filter(|f| face_covers_arabic(font_system.db(), f));
-        let size =
-            (cfg.font_size.unwrap_or(DEFAULT_FONT_SIZE) + extra_pts).clamp(8.0, 40.0) * scale;
+        // Points are the size at 100% text scale, clamped before either
+        // multiplier. Text scale (when followed) and DPI each multiply once.
+        let points = (cfg.font_size.unwrap_or(DEFAULT_FONT_SIZE) + extra_pts).clamp(8.0, 40.0);
+        let system_text_scale = if cfg.follow_system_text_size() {
+            a11y.text_scale
+        } else {
+            1.0
+        };
+        let size = crate::a11y::compose_terminal_font_px(
+            points,
+            a11y.text_scale,
+            scale,
+            cfg.follow_system_text_size(),
+        );
         let metrics = Metrics::new(size, (size * 1.4).ceil());
         // cell width = the primary monospace font's advance for an ASCII probe
         let mut probe = Buffer::new(&mut font_system, metrics);
@@ -1814,33 +2491,59 @@ impl Renderer {
             .map(|r| r.line_w)
             .filter(|w| *w > 1.0)
             .unwrap_or(size * 0.6);
-        // start from a named theme (if any), then let explicit config
-        // bg/fg/palette override individual colors on top of it
-        let theme = cfg
-            .theme
-            .as_deref()
-            .and_then(theme_by_name)
-            .or_else(|| theme_by_name(DEFAULT_THEME));
-        let (mut bg, mut fg, mut palette) = match theme {
-            Some(t) => (t.bg, t.fg, t.palette),
-            None => (BG, FG, PALETTE),
+        let colors = resolved_colors(cfg);
+        let (mut bg, mut fg, palette) = (colors.bg, colors.fg, colors.palette);
+        let shade = |c: (u8, u8, u8), f: f32| {
+            (
+                (c.0 as f32 * f) as u8,
+                (c.1 as f32 * f) as u8,
+                (c.2 as f32 * f) as u8,
+            )
         };
-        if let Some(c) = cfg.bg.as_deref().and_then(crate::config::parse_hex) {
-            bg = c;
-        }
-        if let Some(c) = cfg.fg.as_deref().and_then(crate::config::parse_hex) {
-            fg = c;
-        }
-        if let Some(p) = &cfg.palette {
-            for (slot, hex) in palette.iter_mut().zip(p.iter()) {
-                if let Some(c) = crate::config::parse_hex(hex) {
-                    *slot = c;
-                }
-            }
+        // Theme side of the mapping. High Contrast off returns it unchanged,
+        // so the stored chrome matches the colors the drawers fall back to.
+        let theme_chrome = crate::a11y::ChromeColors {
+            tab_bar: shade(bg, 0.80),
+            title_bar: shade(bg, 0.80),
+            title_text: (0xb6, 0xc2, 0xcf),
+            palette: (0x16, 0x1b, 0x22),
+            palette_text: fg,
+            palette_sel: (0x21, 0x36, 0x50),
+            palette_sel_text: (0xf0, 0xf6, 0xfc),
+            card: (0x14, 0x19, 0x20),
+            card_text: fg,
+            scrollbar: fg,
+            focus: (0x2e, 0xa0, 0x43),
+            selection: SELECTION_RGBA.0,
+            selection_text: fg,
+            cursor: fg,
+            muted: (0x9a, 0xa4, 0xb2),
+            accent: LINK_UNDER,
+        };
+        let chrome = crate::a11y::map_chrome(a11y.high_contrast, a11y.colors, theme_chrome);
+        let grid_follows_hc = a11y.high_contrast && cfg.terminal_follows_high_contrast();
+        let grid = crate::a11y::map_terminal(
+            a11y.high_contrast,
+            cfg.terminal_follows_high_contrast(),
+            a11y.colors,
+            crate::a11y::TerminalGridColors {
+                bg,
+                fg,
+                selection: SELECTION_RGBA.0,
+                selection_text: fg,
+                cursor: fg,
+            },
+        );
+        if grid_follows_hc {
+            bg = grid.bg;
+            fg = grid.fg;
         }
         Self {
             cell_geometry: std::collections::HashMap::new(),
             row_hits: std::collections::HashMap::new(),
+            click_boxes: std::collections::HashMap::new(),
+            row_shape: std::collections::HashMap::new(),
+            ink_cells: 0,
             mapping_context: None,
             hover_caption: None,
             hover_gear: false,
@@ -1852,6 +2555,10 @@ impl Renderer {
             terminal_metrics: metrics,
             terminal_cell_w: cell_w,
             dpi_scale: scale,
+            system_text_scale,
+            high_contrast: a11y.high_contrast,
+            grid_follows_hc,
+            chrome,
             cache_hot: std::collections::HashMap::new(),
             cache_cold: std::collections::HashMap::new(),
             atlas: Atlas::new(),
@@ -1869,6 +2576,17 @@ impl Renderer {
             hover_tab: None,
             title_fit: std::collections::HashMap::new(),
         }
+    }
+
+    /// Swap the terminal colours without rebuilding the font system.
+    /// While High Contrast owns the grid, its background and foreground
+    /// stay the system pair; the 16 ANSI colours still follow the theme.
+    pub fn set_colors(&mut self, bg: (u8, u8, u8), fg: (u8, u8, u8), palette: [(u8, u8, u8); 16]) {
+        if !self.grid_follows_hc {
+            self.bg = bg;
+            self.fg = fg;
+        }
+        self.palette = palette;
     }
 
     /// The app resolves "hide the bar with a single tab" each layout pass.
@@ -1914,21 +2632,151 @@ impl Renderer {
     pub fn begin_frame(&mut self) {
         self.cell_geometry.clear();
         self.row_hits.clear();
+        self.click_boxes.clear();
+        self.row_shape.clear();
+        self.ink_cells = 0;
         self.mapping_context = None;
         self.ime_spot = None;
     }
 
     fn ui_cell_w(&self) -> f32 {
-        self.terminal_cell_w * (16.0 * self.dpi_scale) / self.terminal_metrics.font_size
+        self.terminal_cell_w * self.ui_font_px() / self.terminal_metrics.font_size
     }
 
     fn ui_cell_h(&self) -> f32 {
-        22.4 * self.dpi_scale
+        crate::a11y::compose_ui_line_px(
+            crate::a11y::UI_LINE_PX,
+            self.system_text_scale,
+            self.dpi_scale,
+        )
+    }
+
+    /// Chrome face size. Terminal zoom does not move this; the system text
+    /// size and the monitor DPI both do, as separate multipliers.
+    pub fn ui_font_px(&self) -> f32 {
+        crate::a11y::compose_ui_font_px(
+            crate::a11y::UI_FONT_PX,
+            self.system_text_scale,
+            self.dpi_scale,
+        )
+    }
+
+    fn surface(&self, theme: (u8, u8, u8)) -> (u8, u8, u8) {
+        if self.high_contrast {
+            self.chrome.card
+        } else {
+            theme
+        }
+    }
+
+    fn palette_fill(&self, theme: (u8, u8, u8)) -> (u8, u8, u8) {
+        if self.high_contrast {
+            self.chrome.palette
+        } else {
+            theme
+        }
+    }
+
+    fn palette_sel_fill(&self, theme: (u8, u8, u8)) -> (u8, u8, u8) {
+        if self.high_contrast {
+            self.chrome.palette_sel
+        } else {
+            theme
+        }
+    }
+
+    fn palette_sel_text(&self, theme: (u8, u8, u8)) -> (u8, u8, u8) {
+        if self.high_contrast {
+            self.chrome.palette_sel_text
+        } else {
+            theme
+        }
+    }
+
+    fn window_fill(&self, theme: (u8, u8, u8)) -> (u8, u8, u8) {
+        if self.high_contrast {
+            self.chrome.tab_bar
+        } else {
+            theme
+        }
+    }
+
+    fn edge_color(&self, theme: (u8, u8, u8)) -> (u8, u8, u8) {
+        if self.high_contrast {
+            self.chrome.title_text
+        } else {
+            theme
+        }
+    }
+
+    fn focus_color(&self, theme: (u8, u8, u8)) -> (u8, u8, u8) {
+        if self.high_contrast {
+            self.chrome.focus
+        } else {
+            theme
+        }
+    }
+
+    fn accent_color(&self, theme: (u8, u8, u8)) -> (u8, u8, u8) {
+        if self.high_contrast {
+            self.chrome.accent
+        } else {
+            theme
+        }
+    }
+
+    fn muted_color(&self, theme: (u8, u8, u8)) -> (u8, u8, u8) {
+        if self.high_contrast {
+            self.chrome.muted
+        } else {
+            theme
+        }
+    }
+
+    fn chrome_fg(&self) -> (u8, u8, u8) {
+        if self.high_contrast {
+            self.chrome.title_text
+        } else {
+            self.fg
+        }
+    }
+
+    fn chrome_fg_or(&self, theme: (u8, u8, u8)) -> (u8, u8, u8) {
+        if self.high_contrast {
+            self.chrome.title_text
+        } else {
+            theme
+        }
+    }
+
+    fn on_control_text(&self) -> (u8, u8, u8) {
+        if self.high_contrast {
+            self.chrome.selection_text
+        } else {
+            (0xff, 0xff, 0xff)
+        }
+    }
+
+    fn cursor_color(&self) -> (u8, u8, u8) {
+        if self.grid_follows_hc {
+            self.chrome.cursor
+        } else {
+            self.fg
+        }
+    }
+
+    /// The scrollbar's colour, and whether it is drawn solid (High Contrast).
+    fn scrollbar_paint(&self) -> ((u8, u8, u8), bool) {
+        if self.high_contrast {
+            (self.chrome.scrollbar, true)
+        } else {
+            (self.fg, false)
+        }
     }
 
     pub fn use_ui_metrics(&mut self, active: bool) {
         self.metrics = if active {
-            Metrics::new(16.0 * self.dpi_scale, self.ui_cell_h())
+            Metrics::new(self.ui_font_px(), self.ui_cell_h())
         } else {
             self.terminal_metrics
         };
@@ -1960,6 +2808,16 @@ impl Renderer {
         }
     }
 
+    /// One shaped span, so a test can click a column `hit_cell` returns
+    /// without drawing a frame.
+    #[cfg(test)]
+    pub(crate) fn plant_hit(&mut self, pane: Rect, row: usize, x: i32, width: i32, col: usize) {
+        self.row_hits
+            .entry((pane, row))
+            .or_default()
+            .push((x, width, col, false));
+    }
+
     pub fn hit_cell(
         &self,
         pane: Rect,
@@ -1967,12 +2825,37 @@ impl Renderer {
         x: f64,
     ) -> Option<(usize, alacritty_terminal::index::Side)> {
         use alacritty_terminal::index::Side;
-        let spans = self.row_hits.get(&(pane, row))?;
-        let &(left, width, col, rtl) = spans
-            .iter()
-            .take_while(|s| s.0 as f64 <= x)
-            .filter(|s| x < (s.0 + s.1) as f64)
-            .min_by_key(|s| (s.1, s.2))?;
+        let contains = |bx: i32, bw: i32| bx as f64 <= x && x < (bx + bw) as f64;
+        let advance_contains = |col: usize| {
+            self.cell_geometry
+                .get(&(pane, row, col))
+                .is_some_and(|spans| spans.iter().any(|&(bx, bw, _)| contains(bx, bw)))
+        };
+        // Ink that also covers its own cell wins over a neighbor's ink that
+        // merely reaches in («م» must not take the left of «ك»). Ink that
+        // sticks out of its cell is what a click there hits (reh's overhang).
+        let mut inks = Vec::new();
+        for (&(p, r, col), &(bx, bw, rtl)) in &self.click_boxes {
+            if p == pane && r == row && contains(bx, bw) {
+                inks.push((bx, bw, col, rtl));
+            }
+        }
+        let on_own_cell = inks.iter().copied().filter(|hit| advance_contains(hit.2));
+        let (left, width, col, rtl) =
+            if let Some(hit) = on_own_cell.min_by_key(|hit| (hit.1, hit.2)) {
+                hit
+            } else if let Some(hit) = inks.iter().copied().min_by_key(|hit| (hit.1, hit.2)) {
+                hit
+            } else {
+                self.row_hits.get(&(pane, row)).and_then(|spans| {
+                    spans
+                        .iter()
+                        .take_while(|s| s.0 as f64 <= x)
+                        .filter(|s| contains(s.0, s.1))
+                        .min_by_key(|s| (s.1, s.2))
+                        .copied()
+                })?
+            };
         let right_half = x >= left as f64 + width as f64 / 2.0;
         Some((
             col,
@@ -2037,6 +2920,17 @@ impl Renderer {
             Background => self.bg,
             _ => self.fg, // Foreground / BrightForeground / DimForeground
         }
+    }
+
+    /// What an OSC 4/10/11/12 query should hear: the colours this renderer
+    /// paints with. The cursor is drawn in the foreground colour.
+    pub fn query_colors(&self) -> crate::term::QueryColors {
+        let mut c = [self.fg; 259];
+        for (i, slot) in c.iter_mut().take(256).enumerate() {
+            *slot = self.ansi_rgb(AnsiColor::Indexed(i as u8));
+        }
+        c[257] = self.bg;
+        c
     }
 
     fn ansi_rgb(&self, color: AnsiColor) -> (u8, u8, u8) {
@@ -2145,8 +3039,14 @@ impl Renderer {
         if self.cache_hot.len() >= CACHE_CAP {
             self.cache_cold = std::mem::take(&mut self.cache_hot);
         }
-        self.cache_hot
-            .insert(key.clone(), ShapedRun { buffer, natw });
+        self.cache_hot.insert(
+            key.clone(),
+            ShapedRun {
+                buffer,
+                natw,
+                ink: std::collections::HashMap::new(),
+            },
+        );
         key
     }
 
@@ -2274,9 +3174,131 @@ impl Renderer {
         (fg, bg, style)
     }
 
+    /// Ink box of one cell. A cache hit does not rasterize. A miss rasterizes
+    /// only the glyphs that belong to this cell (both halves of «لا»), and
+    /// counts the cell in `ink_cells`.
+    fn ink_box(&mut self, key: &RunKey, b0: usize, b1: usize) -> Option<(f32, f32)> {
+        if let Some(hit) = self
+            .cache_hot
+            .get(key)
+            .and_then(|run| run.ink.get(&(b0, b1)))
+        {
+            return *hit;
+        }
+        self.ink_cells += 1;
+        let cover = self.measure_cell_ink(key, b0, b1);
+        if let Some(run) = self.cache_hot.get_mut(key) {
+            run.ink.insert((b0, b1), cover);
+        }
+        cover
+    }
+
+    fn measure_cell_ink(&mut self, key: &RunKey, b0: usize, b1: usize) -> Option<(f32, f32)> {
+        let extracted: Vec<(String, Vec<cosmic_text::LayoutGlyph>)> = {
+            let buffer = &self.cache_hot.get(key)?.buffer;
+            buffer
+                .layout_runs()
+                .map(|run| (run.text.to_string(), run.glyphs.to_vec()))
+                .collect()
+        };
+        let mut cover: Option<(f32, f32)> = None;
+        for (text, glyphs) in &extracted {
+            let raw: Vec<_> = glyphs
+                .iter()
+                .map(|glyph| crate::mouse::GlyphSpan {
+                    x: glyph.x,
+                    w: glyph.w,
+                    start: glyph.start,
+                    end: glyph.end,
+                    rtl: glyph.level.is_rtl(),
+                })
+                .collect();
+            let spans = merge_lam_alef(crate::mouse::fold_empty_letters(raw, text), text);
+            let relevant: Vec<_> = spans
+                .iter()
+                .filter(|g| g.start < b1 && b0 < g.end)
+                .copied()
+                .collect();
+            if relevant.is_empty() {
+                continue;
+            }
+            let mut inks = Vec::new();
+            for glyph in glyphs {
+                let overlaps = relevant
+                    .iter()
+                    .any(|g| glyph.start < g.end && g.start < glyph.end);
+                if !overlaps {
+                    continue;
+                }
+                if let Some((x, w)) = glyph_ink(
+                    &mut self.atlas,
+                    &mut self.font_system,
+                    &mut self.cache,
+                    glyph,
+                ) {
+                    inks.push((glyph.start, glyph.end, x, w));
+                }
+            }
+            let Some((x, w)) = ink_cover(&spans, &inks, text, b0, b1) else {
+                continue;
+            };
+            cover = Some(match cover {
+                Some((left, width)) => {
+                    let right = (left + width).max(x + w);
+                    let left = left.min(x);
+                    (left, right - left)
+                }
+                None => (x, w),
+            });
+        }
+        cover
+    }
+
+    /// Round both edges the way the cell quads do. Rounding the width alone
+    /// leaves the block a pixel narrower than the cell. A ligature half is
+    /// already ink-only, so this must not grow it back to the advance.
+    fn snap_ink_box(&self, text_x0: i32, scale: f32, x: f32, w: f32) -> (i32, i32) {
+        let left = text_x0 + (x * scale).round() as i32;
+        let right = text_x0 + ((x + w) * scale).round() as i32;
+        (left, (right - left).max(2))
+    }
+
+    /// Measure ink for every cell of a row the last frame shaped, and store
+    /// the boxes where clicks read them. Selection never sees this map.
+    /// Cached per shaped line: a second click does not rasterize again.
+    pub fn warm_row_ink(&mut self, pane: Rect, row: usize) {
+        let pending = self.row_shape.get(&(pane, row)).is_some_and(|shape| {
+            shape
+                .cells
+                .iter()
+                .any(|(col, _, _)| !self.click_boxes.contains_key(&(pane, row, *col)))
+        });
+        if !pending {
+            return;
+        }
+        let shape = self.row_shape[&(pane, row)].clone();
+        for (col, b0, b1) in shape.cells {
+            let Some((x, w)) = self.ink_box(&shape.key, b0, b1) else {
+                continue;
+            };
+            let (left, iw) = self.snap_ink_box(shape.text_x0, shape.scale, x, w);
+            let rtl = self
+                .cell_geometry
+                .get(&(pane, row, col))
+                .and_then(|spans| spans.first())
+                .map(|span| span.2)
+                .unwrap_or(false);
+            self.click_boxes.insert((pane, row, col), (left, iw, rtl));
+        }
+    }
+
     /// A row containing Arabic: shape the WHOLE line so cosmic-text applies
     /// UAX#9 BiDi (mixed directions, LTR islands). Compressed to the pane
     /// when overflowing; the cursor resolves THROUGH the shaped layout.
+    ///
+    /// `align_edge`: an RTL paragraph (SCP, or the first strong character)
+    /// is drawn flush with the right edge of `pane_w`. TUI fields and the
+    /// alternate screen pass false and keep the left origin.
     #[allow(clippy::too_many_arguments)]
     fn draw_line_bidi(
         &mut self,
@@ -2290,6 +3312,7 @@ impl Renderer {
         cursor_col: Option<usize>,
         dir: ParagraphDir,
         hover: Option<(usize, usize)>,
+        align_edge: bool,
     ) -> Option<(i32, i32)> {
         let mut end = cells.len();
         while end > 0 && cells[end - 1].c == ' ' {
@@ -2405,7 +3428,11 @@ impl Renderer {
             .filter(|c| c.bg != self.bg)
             .map(|c| (c.col, c.bg))
             .collect();
-        // shape unconstrained (cached), then compress to the pane on overflow
+        // shape unconstrained (cached), then compress to the pane on overflow.
+        // Align-left keeps glyph x near 0. An RTL paragraph is then shifted
+        // so its rightmost glyph lands on the pane's right edge; the shaped
+        // run itself does not change, so lam-alef and tashkeel stay put
+        // relative to each other.
         let natw = self.measure(&segs, true);
         let mut scale = if natw > pane_w as f32 {
             pane_w as f32 / natw
@@ -2414,18 +3441,26 @@ impl Renderer {
         };
         let key = self.ensure_shaped(&segs, true);
         let mut mapped_cursor = None;
-        let paragraph_rtl = self.cache_hot[&key]
-            .buffer
-            .layout_runs()
-            .next()
-            .is_some_and(|run| run.rtl);
+        let (paragraph_rtl, content_right) = {
+            let buffer = &self.cache_hot[&key].buffer;
+            let paragraph_rtl = buffer.layout_runs().next().is_some_and(|run| run.rtl);
+            let content_right = buffer
+                .layout_runs()
+                .flat_map(|run| run.glyphs.iter().map(|g| g.x + g.w))
+                .fold(0.0_f32, f32::max);
+            (paragraph_rtl, content_right)
+        };
         // Keep Claude's inverse trailing blank inside the shaped field.
-        let claude_reserve =
-            if claude && paragraph_rtl && cells[end..].iter().any(|c| c.bg != self.bg) {
-                self.cell_w.round() as i32
-            } else {
-                0
-            };
+        // A right-aligned paragraph already has that room on its left.
+        let claude_reserve = if !align_edge
+            && claude
+            && paragraph_rtl
+            && cells[end..].iter().any(|c| c.bg != self.bg)
+        {
+            self.cell_w.round() as i32
+        } else {
+            0
+        };
         // Where the cells after the text (the cursor waiting at a prompt,
         // inverse blanks) attach: the edge of the LOGICALLY last cell, on
         // the side its direction grows toward. cosmic's past-the-end
@@ -2490,18 +3525,34 @@ impl Renderer {
         // what the clip would hide.
         let text_end_col = last_col + cells[end - 1].w;
         let cursor_end = cursor_col.and_then(|col| end_for(col > text_end_col));
-        let cursor_reserve = match (cursor_col, cursor_end) {
-            (Some(col), Some((end_x, true))) if col >= text_end_col => {
-                let need = ((col - text_end_col + 1) as f32 * self.cell_w).round() as i32;
-                (clip.0 - (x0 + (end_x * scale).round() as i32 - need)).max(0)
+        // How far the end cursor hangs past the anchor, and how far left of
+        // the clip that puts it when the line is drawn at `x0 + edge`.
+        let deficit = |scale: f32, edge: i32| -> i32 {
+            match (cursor_col, cursor_end) {
+                (Some(col), Some((end_x, true))) if col >= text_end_col => {
+                    let need = ((col - text_end_col + 1) as f32 * self.cell_w).round() as i32;
+                    (clip.0 - (x0 + edge + (end_x * scale).round() as i32 - need)).max(0)
+                }
+                _ => 0,
             }
-            _ => 0,
         };
-        let reserve = claude_reserve.max(cursor_reserve);
-        if cursor_reserve > 0 && natw * scale + reserve as f32 > pane_w as f32 {
-            scale = ((pane_w - reserve).max(1) as f32 / natw).min(1.0);
+        let mut edge = rtl_edge(align_edge, paragraph_rtl, pane_w, content_right, scale);
+        let mut cursor_reserve = deficit(scale, edge);
+        // The cursor grew off the left of the clip. Shrink until the flush
+        // line and that cursor both fit, then measure the deficit again:
+        // a shorter line sits further right, so the cursor usually comes
+        // back inside without a second shove.
+        if cursor_reserve > 0 {
+            let reserve = claude_reserve.max(cursor_reserve);
+            let drawn = edge + reserve + (content_right * scale).round() as i32;
+            if drawn > pane_w {
+                scale = ((pane_w - reserve).max(1) as f32 / natw).min(scale);
+                edge = rtl_edge(align_edge, paragraph_rtl, pane_w, content_right, scale);
+                cursor_reserve = deficit(scale, edge);
+            }
         }
-        let text_x0 = x0 + reserve;
+        let reserve = claude_reserve.max(cursor_reserve);
+        let text_x0 = x0 + edge + reserve;
         let mut backgrounds = Vec::new();
         // drawn letter boxes, so a cursor past the text can avoid them
         let blank_cols: std::collections::HashSet<usize> = cells[..end]
@@ -2538,7 +3589,7 @@ impl Renderer {
                             y + self.cell_h.round() as i32 - th,
                             bounds.1,
                             th,
-                            c4(LINK_UNDER, 255),
+                            c4(link_underline(self.bg), 255),
                         );
                     }
                     if let Some((pane, row)) = self.mapping_context {
@@ -2581,6 +3632,46 @@ impl Renderer {
         if let Some(col) = cursor_col.filter(|col| *col >= text_end_col) {
             if let Some((x, rtl)) = x_at(col, col > text_end_col) {
                 mapped_cursor = Some(fit_past_end_cursor(x, width, rtl, &letters));
+            }
+        }
+        // A single letter's block is the union of its cell and its ink, so
+        // reh and seen stick out and a thin `l` or alef does not shrink into
+        // a bar. Lam-alef stays an ink split. The cell past the text is
+        // unchanged: on 22bc5d66 that cursor already sits at the logical end.
+        //
+        // Only the cursor cell is measured while painting. The other cells
+        // wait for a click (`warm_row_ink`), and the box goes to `click_boxes`,
+        // never to `cell_geometry`. Selection and search draw one rect per
+        // span of `cell_geometry`; a second box there darkens the cell twice.
+        if !claude {
+            if let Some(col) = cursor_col.filter(|col| *col < text_end_col) {
+                if let Some(&(_, b0, b1)) = cell_bytes.iter().find(|cell| cell.0 == col) {
+                    if let Some((x, w)) = self.ink_box(&key, b0, b1) {
+                        let (left, iw) = self.snap_ink_box(text_x0, scale, x, w);
+                        mapped_cursor = Some((left, iw));
+                        if let Some((pane, row)) = self.mapping_context {
+                            let rtl = self
+                                .cell_geometry
+                                .get(&(pane, row, col))
+                                .and_then(|spans| spans.first())
+                                .map(|span| span.2)
+                                .unwrap_or(false);
+                            self.click_boxes.insert((pane, row, col), (left, iw, rtl));
+                        }
+                    }
+                }
+            }
+            // moved, not cloned: this runs for every bidi row every frame
+            if let Some((pane, row)) = self.mapping_context {
+                self.row_shape.insert(
+                    (pane, row),
+                    RowShape {
+                        key,
+                        cells: cell_bytes,
+                        text_x0,
+                        scale,
+                    },
+                );
             }
         }
         backgrounds.sort_unstable();
@@ -2644,13 +3735,14 @@ impl Renderer {
     }
 
     /// Logical grid column under a pane-local pixel, for a row that takes
-    /// the bidi path. `None` when the row has no Arabic — the caller's
-    /// `x / cell_w` column is already the cell the program stored.
+    /// the bidi path: the caller asks `viewport_row_layout` for that and for
+    /// `dir`. A grid row's `x / cell_w` column is already the stored cell.
     ///
     /// The shaped run is the one `draw_line_bidi` just cached, so the glyph
     /// under the pointer and the glyph on screen are the same box. Claude
     /// rows go through `restore_bidi_map` first: the display is restored
     /// logical order, the column we report is still Claude's grid column.
+    #[allow(clippy::too_many_arguments)]
     pub fn logical_column_for(
         &mut self,
         cells: &[SnapCell],
@@ -2659,10 +3751,8 @@ impl Renderer {
         claude: bool,
         dir: ParagraphDir,
         grid_cols: usize,
+        align_edge: bool,
     ) -> Option<usize> {
-        if !cells.iter().any(|c| is_rtl(c.c)) {
-            return None;
-        }
         let infos: Vec<CellInfo> = cells
             .iter()
             .map(|c| {
@@ -2691,17 +3781,27 @@ impl Renderer {
             1.0
         };
         let key = self.ensure_shaped(&plan.segs, true);
-        let glyphs = {
+        let (paragraph_rtl, content_right, glyphs) = {
             let buffer = &self.cache_hot[&key].buffer;
+            let paragraph_rtl = buffer.layout_runs().next().is_some_and(|run| run.rtl);
+            let content_right = buffer
+                .layout_runs()
+                .flat_map(|run| run.glyphs.iter().map(|g| g.x + g.w))
+                .fold(0.0_f32, f32::max);
             let mut glyphs = Vec::new();
             for run in buffer.layout_runs() {
                 glyphs.extend(run_spans(&run));
             }
-            glyphs
+            (paragraph_rtl, content_right, glyphs)
         };
-        let boxes = crate::mouse::boxes_for_glyphs(&glyphs, scale, |byte| {
+        let origin = rtl_edge(align_edge, paragraph_rtl, pane_w, content_right, scale) as f32;
+        let mut boxes = crate::mouse::boxes_for_glyphs(&glyphs, scale, |byte| {
             crate::mouse::col_for_byte(&plan.byte_cols, byte)
         });
+        for b in &mut boxes {
+            b.x0 += origin;
+            b.x1 += origin;
+        }
         let last = grid_cols.saturating_sub(1);
         let fallback = cells.first().map(|c| c.col).unwrap_or(0).min(last);
         Some(crate::mouse::column_for_click(
@@ -2820,17 +3920,25 @@ impl Renderer {
                 if ci.c != ' ' {
                     let mut s = String::new();
                     ci.push_text(&mut s);
+                    // A lone Arabic letter is an RTL paragraph. Shaped with
+                    // no alignment it sits at the far end of the 1_000_000 px
+                    // buffer and the clip throws it away, so `bidi.mode = off`
+                    // (and explicit BDSM, which also takes this path) drew
+                    // nothing. Pin it to the cell: storage order, left to
+                    // right, no reordering across cells. LTR glyphs already
+                    // start at 0 either way and keep the old alignment.
+                    let align_left = s.chars().any(is_rtl);
                     let seg = [Seg {
                         text: s,
                         fg: ci.fg,
                         style: ci.style,
                     }];
-                    let natw = self.measure(&seg, false);
+                    let natw = self.measure(&seg, align_left);
                     let boxw = ci.w as f32 * self.cell_w;
                     let scale = if natw > boxw + 0.5 { boxw / natw } else { 1.0 };
                     self.draw_run(
                         &seg,
-                        false,
+                        align_left,
                         out,
                         clip,
                         x0 as f32 + ci.col as f32 * self.cell_w,
@@ -2862,7 +3970,7 @@ impl Renderer {
                     uy,
                     (dx1 - dx0).max(1),
                     th,
-                    c4(LINK_UNDER, 255),
+                    c4(link_underline(self.bg), 255),
                 );
             }
         }
@@ -2959,6 +4067,7 @@ impl Renderer {
                     source_cursor,
                     dir,
                     hover,
+                    false,
                 );
                 cursor = mapped.or(cursor);
             } else {
@@ -2966,6 +4075,110 @@ impl Renderer {
             }
         }
         cursor
+    }
+
+    /// One grid line, in the same cell order `display_iter` feeds a row.
+    fn cells_of_line<T: alacritty_terminal::event::EventListener>(
+        &self,
+        term: &Term<T>,
+        line: alacritty_terminal::index::Line,
+    ) -> Vec<CellInfo> {
+        use alacritty_terminal::index::Column;
+        let row = &term.grid()[line];
+        let mut cells = Vec::new();
+        for col in 0..term.columns() {
+            let cell = &row[Column(col)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            let w = if cell.flags.contains(Flags::WIDE_CHAR) {
+                2
+            } else {
+                1
+            };
+            let (fg, bg, style) = self.cell_paint(cell.fg, cell.bg, cell.flags);
+            let ch = if cell.flags.intersects(Flags::HIDDEN) {
+                ' '
+            } else {
+                cell.c
+            };
+            cells.push(CellInfo {
+                col,
+                w,
+                c: ch,
+                zw: cell.zerowidth().map(|z| z.to_vec()),
+                fg,
+                bg,
+                style,
+                ul: cell.underline_color().map_or(fg, |c| self.ansi_rgb(c)),
+            });
+        }
+        cells
+    }
+
+    /// Paint one viewport row. `vis` is the row's place in the pane (`-1`
+    /// is the history line above it); the geometry key is that row, or
+    /// [`crate::scroll::PEEK_ROW`] for the line above. Shaping is the same
+    /// path a fully visible row takes.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_row(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        clip: Rect,
+        px: i32,
+        pw: i32,
+        y: i32,
+        vis: i32,
+        cells: &[CellInfo],
+        view: &PaneView,
+        alt: bool,
+        cursor_vrow: i32,
+        ccol: usize,
+        dir: ParagraphDir,
+        follow_rtl: bool,
+    ) -> Option<(i32, i32)> {
+        if cells.is_empty() {
+            return None;
+        }
+        let key = if vis < 0 {
+            crate::scroll::PEEK_ROW
+        } else {
+            vis as usize
+        };
+        self.mapping_context = Some((view.rect, key));
+        let hover_key = if vis < 0 {
+            crate::scroll::PEEK_ROW
+        } else {
+            vis as usize
+        };
+        let hover = view
+            .link_hover
+            .and_then(|(row, a, b)| (row == hover_key).then_some((a, b)));
+        // Explicit BDSM: the application sent visual order (and, per the
+        // recommendation, presentation forms). The grid path does not
+        // run UAX#9 and does not reshape. Implicit mode keeps the
+        // whole-line shaper, with SCP's base direction if one was set.
+        let arabic = cells.iter().any(|ci| is_rtl(ci.c));
+        let row_claude = view.claude && view.claude_from.is_none_or(|start| vis as i64 >= start);
+        // A wrapped tail of an RTL paragraph (`follow_rtl`) stays on the
+        // bidi path even when this row itself has no Arabic letter.
+        if (arabic || follow_rtl) && view.reorder {
+            let on_row = cursor_vrow == vis;
+            let col = if on_row { Some(ccol) } else { None };
+            // Alternate-screen rows stay in their grid columns: a TUI
+            // positioned the cells. The primary screen's prose aligns
+            // an RTL paragraph to the pane's right edge.
+            if (row_claude || alt) && is_tui_row(cells) {
+                self.draw_line_tui(out, clip, px, y, cells, row_claude, col, dir, hover)
+            } else {
+                self.draw_line_bidi(
+                    out, clip, px, y, pw, cells, row_claude, col, dir, hover, !alt,
+                )
+            }
+        } else {
+            self.draw_line_grid(out, clip, px, y, cells, hover);
+            None
+        }
     }
 
     /// Draw one pane's terminal into its rect.
@@ -2984,8 +4197,16 @@ impl Renderer {
         let content = term.renderable_content();
         let cursor = content.cursor;
         let selection = content.selection;
-        // scrolled into history: viewport row = grid line + display offset
+        // scrolled into history: viewport row = grid line + display offset.
+        // `shift` is the sub-line remainder, in pixels downward. Zero keeps
+        // every y on the row it had before smooth scroll.
         let off = content.display_offset as i32;
+        let shift = view.scroll_px.max(0);
+        let cell_h = self.cell_h;
+        let y_at = |row: i32| crate::scroll::content_y(py, row, cell_h, shift);
+        let alt = term
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
 
         // collect the visible grid; paint non-default cell backgrounds as
         // pixel-snapped rects (EasyTer lesson: snap both edges so adjacent
@@ -3013,7 +4234,7 @@ impl Renderer {
             // under/strike draw as rects; DIM fades the color; HIDDEN blanks).
             // cell_paint is shared with the mouse hit-test so a click resolves
             // through the same shaped run this frame drew.
-            let (fg, bg, style) = self.cell_paint(cell.fg, cell.bg, cell.flags);
+            let (mut fg, mut bg, style) = self.cell_paint(cell.fg, cell.bg, cell.flags);
             let ch = if cell.flags.intersects(Flags::HIDDEN) {
                 ' '
             } else {
@@ -3021,6 +4242,13 @@ impl Renderer {
             };
             if selection.is_some_and(|s| s.contains(cell.point)) {
                 sel_cells.push((li, col, w));
+                // The overlay path is translucent and sits on top of the
+                // glyphs. High Contrast needs an opaque system selection
+                // with system text, painted as the cell itself.
+                if self.grid_follows_hc {
+                    fg = self.chrome.selection_text;
+                    bg = self.chrome.selection;
+                }
             }
             if view
                 .search_match
@@ -3045,40 +4273,84 @@ impl Renderer {
         let cursor_vrow = cursor.point.line.0 + off;
         let ccol = cursor.point.column.0;
         let mut cursor_rect: Option<(i32, i32)> = None; // (x, w) via shaped layout
+        let mut walk = ParagraphWalk::default();
         for (li, cells) in lines.iter().enumerate() {
-            self.mapping_context = Some((view.rect, li));
-            if cells.is_empty() {
-                continue;
+            // The row's direction: SCP stamp, then the wrapped paragraph's
+            // direction, then its own first strong letter.
+            let explicit = view.line_dir.get(li).copied().unwrap_or_default();
+            let continued = line_wrapped_into(term, li, off);
+            let auto = auto_paragraph_dir(
+                cells
+                    .iter()
+                    .flat_map(|ci| std::iter::once(ci.c).chain(ci.zw.iter().flatten().copied())),
+            );
+            let (dir, follow_rtl) = walk.row(explicit, continued, auto);
+            if let Some(r) = self.paint_row(
+                out,
+                clip,
+                px,
+                pw,
+                y_at(li as i32),
+                li as i32,
+                cells,
+                view,
+                alt,
+                cursor_vrow,
+                ccol,
+                dir,
+                follow_rtl,
+            ) {
+                cursor_rect = Some(r);
             }
-            let y = py + (li as f32 * self.cell_h).round() as i32;
-            let hover = view
-                .link_hover
-                .and_then(|(row, a, b)| (row == li).then_some((a, b)));
-            // Explicit BDSM: the application sent visual order (and, per the
-            // recommendation, presentation forms). The grid path does not
-            // run UAX#9 and does not reshape. Implicit mode keeps the
-            // whole-line shaper, with SCP's base direction if one was set.
-            let arabic = cells.iter().any(|ci| is_rtl(ci.c));
-            let row_claude = view.claude && view.claude_from.is_none_or(|start| li as i64 >= start);
-            if arabic && view.reorder {
-                let on_row = cursor_vrow >= 0 && cursor_vrow as usize == li;
-                let dir = view.line_dir.get(li).copied().unwrap_or_default();
-                let col = if on_row { Some(ccol) } else { None };
-                let r = if (row_claude
-                    || term
-                        .mode()
-                        .contains(alacritty_terminal::term::TermMode::ALT_SCREEN))
-                    && is_tui_row(cells)
-                {
-                    self.draw_line_tui(out, clip, px, y, cells, row_claude, col, dir, hover)
-                } else {
-                    self.draw_line_bidi(out, clip, px, y, pw, cells, row_claude, col, dir, hover)
-                };
-                if r.is_some() {
-                    cursor_rect = r;
+        }
+        // One extra history row, shifted into the pane by `shift` and
+        // clipped to the pane rect by every quad. A zero shift draws nothing
+        // here, so the frame matches the unshifted viewport.
+        if shift > 0 && off >= 0 && (off as usize) < history {
+            let line = alacritty_terminal::index::Line(-(off + 1));
+            let extra = self.cells_of_line(term, line);
+            for c in &extra {
+                let point = alacritty_terminal::index::Point::new(
+                    line,
+                    alacritty_terminal::index::Column(c.col),
+                );
+                if selection.is_some_and(|sel| sel.contains(point)) {
+                    sel_cells.push((crate::scroll::PEEK_ROW, c.col, c.w));
                 }
-            } else {
-                self.draw_line_grid(out, clip, px, y, cells, hover);
+                if view
+                    .search_match
+                    .is_some_and(|m| *m.start() <= point && point <= *m.end())
+                {
+                    hit_cells.push((crate::scroll::PEEK_ROW, c.col, c.w));
+                }
+            }
+            // The peek row starts its own walk: an SCP stamp, else its
+            // first strong letter. Row 0 does the same when the line above
+            // it is off screen.
+            let peek_dir =
+                if view.peek_dir != ParagraphDir::Default {
+                    view.peek_dir
+                } else {
+                    auto_paragraph_dir(extra.iter().flat_map(|ci| {
+                        std::iter::once(ci.c).chain(ci.zw.iter().flatten().copied())
+                    }))
+                };
+            if let Some(r) = self.paint_row(
+                out,
+                clip,
+                px,
+                pw,
+                y_at(-1),
+                -1,
+                &extra,
+                view,
+                alt,
+                cursor_vrow,
+                ccol,
+                peek_dir,
+                false,
+            ) {
+                cursor_rect = Some(r);
             }
         }
         self.mapping_context = None;
@@ -3086,10 +4358,29 @@ impl Renderer {
 
         // translucent overlays above the text (EasyTer's stacking): selection
         // blue, current search hit amber
-        for (cells, ((r, g, b), a)) in [(&sel_cells, SELECTION_RGBA), (&hit_cells, SEARCH_RGBA)] {
+        let overlays = [
+            (
+                sel_cells.as_slice(),
+                if self.grid_follows_hc {
+                    None
+                } else {
+                    Some(SELECTION_RGBA)
+                },
+            ),
+            (hit_cells.as_slice(), Some(SEARCH_RGBA)),
+        ];
+        for (cells, paint) in overlays {
+            let Some(((r, g, b), a)) = paint else {
+                continue;
+            };
             for &(li, col, w) in cells.iter() {
+                let vis = if li == crate::scroll::PEEK_ROW {
+                    -1
+                } else {
+                    li as i32
+                };
+                let y0 = y_at(vis);
                 if let Some(spans) = self.cell_geometry.get(&(view.rect, li, col)) {
-                    let y0 = py + (li as f32 * self.cell_h).round() as i32;
                     for &(x0, width, _) in spans {
                         push_rect(
                             out,
@@ -3105,8 +4396,7 @@ impl Renderer {
                 }
                 let x0 = px + (col as f32 * self.cell_w).round() as i32;
                 let x1 = px + ((col + w) as f32 * self.cell_w).round() as i32;
-                let y0 = py + (li as f32 * self.cell_h).round() as i32;
-                let y1 = py + ((li + 1) as f32 * self.cell_h).round() as i32;
+                let y1 = y_at(vis + 1);
                 push_rect(out, clip, x0, y0, x1 - x0, y1 - y0, c4((r, g, b), a as u8));
             }
         }
@@ -3119,7 +4409,7 @@ impl Renderer {
                 px + (ccol as f32 * self.cell_w).round() as i32,
                 self.cell_w.round() as i32,
             ));
-            let y0 = py + (cursor_vrow as f32 * self.cell_h).round() as i32;
+            let y0 = y_at(cursor_vrow);
             let hpx = self.cell_h.round() as i32;
             self.ime_spot = Some((x0, y0, wpx, hpx));
             if let Some(text) = self.preedit.clone().filter(|t| !t.is_empty()) {
@@ -3147,19 +4437,27 @@ impl Renderer {
                 px + (ccol as f32 * self.cell_w).round() as i32,
                 self.cell_w.round() as i32,
             ));
-            let y0 = py + (cursor_vrow as f32 * self.cell_h).round() as i32;
+            let y0 = y_at(cursor_vrow);
             let hpx = self.cell_h.round() as i32;
             use crate::config::CursorStyle::*;
             match view.cursor {
-                Block => push_rect(out, clip, x0, y0, wpx, hpx, c4(self.fg, 170)),
+                Block => push_rect(out, clip, x0, y0, wpx, hpx, c4(self.cursor_color(), 170)),
                 // thin shapes don't cover the glyph, so they draw opaque
                 Bar => {
                     let bw = ((self.cell_w * 0.15).round() as i32).max(2);
-                    push_rect(out, clip, x0, y0, bw, hpx, c4(self.fg, 230));
+                    push_rect(out, clip, x0, y0, bw, hpx, c4(self.cursor_color(), 230));
                 }
                 Underline => {
                     let bh = ((self.cell_h * 0.1).round() as i32).max(2);
-                    push_rect(out, clip, x0, y0 + hpx - bh, wpx, bh, c4(self.fg, 230));
+                    push_rect(
+                        out,
+                        clip,
+                        x0,
+                        y0 + hpx - bh,
+                        wpx,
+                        bh,
+                        c4(self.cursor_color(), 230),
+                    );
                 }
             }
         }
@@ -3167,7 +4465,8 @@ impl Renderer {
         // command-block lights in the pane's left gutter (EasyTer's bars)
         for &(abs, exit) in view.marks {
             let vrow = abs as i64 - history as i64 + off as i64;
-            if vrow < 0 || vrow >= rows as i64 {
+            let min_row = if shift > 0 { -1 } else { 0 };
+            if vrow < min_row || vrow >= rows as i64 {
                 continue;
             }
             let color = match exit {
@@ -3175,7 +4474,7 @@ impl Renderer {
                 Some(_) => (0xcf, 0x22, 0x2e),
                 None => (0x6e, 0x76, 0x81),
             };
-            let y0 = py + (vrow as f32 * self.cell_h).round() as i32;
+            let y0 = y_at(vrow as i32);
             push_rect(
                 out,
                 clip,
@@ -3187,19 +4486,12 @@ impl Renderer {
             );
         }
 
-        // scroll position indicator while in history (EasyTer's slim bar)
-        if off > 0 && history > 0 {
-            let th = ((ph as f32 * rows as f32 / (history + rows) as f32) as i32).max(24);
-            let ty = py + ((ph - th) as f32 * (1.0 - off as f32 / history as f32)) as i32;
-            push_rect(out, clip, px + pw - 7, ty, 4, th, c4(self.fg, 70));
-        }
-
         // pane border when split: green marks the focused pane (EasyTer)
         if view.bordered {
             let c = if view.focused {
-                c4((0x2e, 0xa0, 0x43), 255)
+                c4(self.focus_color((0x2e, 0xa0, 0x43)), 255)
             } else {
-                c4((0x30, 0x36, 0x3d), 255)
+                c4(self.edge_color((0x30, 0x36, 0x3d)), 255)
             };
             push_rect(out, clip, px, py, pw, 1, c);
             push_rect(out, clip, px, py + ph - 1, pw, 1, c);
@@ -3207,9 +4499,64 @@ impl Renderer {
             push_rect(out, clip, px + pw - 1, py, 1, ph, c);
         }
 
+        self.draw_bidi_badge(out, clip, view.bidi_mode);
+
         if let Some(tip) = view.link_tip {
             self.draw_link_status(out, clip, tip);
         }
+    }
+
+    /// A small chip in the pane's top corner when this pane is not on the
+    /// default BiDi mode. `Full` draws nothing.
+    fn draw_bidi_badge(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        rect: Rect,
+        mode: crate::bidi_ctl::BidiReorder,
+    ) {
+        let Some(label) = mode.badge() else {
+            return;
+        };
+        let (px, py, pw, ph) = rect;
+        if pw < 64 || ph < 16 {
+            return;
+        }
+        let segs = [Seg::plain(label.to_string(), (0xc9, 0xdc, 0xf2))];
+        let text_w = self.measure(&segs, true).ceil() as i32;
+        let pad = 6;
+        let bw = text_w + pad * 2;
+        let bh = (self.cell_h.round() as i32).max(1);
+        let bx = px + pw - bw - 8;
+        let by = py + 4;
+        if bx <= px {
+            return;
+        }
+        push_rect(out, rect, bx, by, bw, bh, c4((0x1f, 0x3a, 0x5c), 230));
+        self.draw_run(&segs, true, out, rect, (bx + pad) as f32, by, 1.0);
+    }
+
+    /// The pane's scrollbar: a faint track and a thumb, both solid quads on
+    /// the same pipeline as the cells. `clip` is the gutter outside the grid,
+    /// so the bar cannot land on a cell. Geometry comes from `scrollbar`.
+    pub fn draw_scrollbar(
+        &self,
+        out: &mut Vec<Vertex>,
+        clip: Rect,
+        track: Rect,
+        thumb: Rect,
+        hot: bool,
+    ) {
+        let (tx, ty, tw, th) = track;
+        let (ux, uy, uw, uh) = thumb;
+        // High Contrast: an opaque thumb in the system colour, no tint
+        let (color, solid) = self.scrollbar_paint();
+        if solid {
+            push_rect(out, clip, ux, uy, uw, uh, c4(color, 255));
+            return;
+        }
+        push_rect(out, clip, tx, ty, tw, th, c4(color, 40));
+        let alpha = if hot { 200 } else { 130 };
+        push_rect(out, clip, ux, uy, uw, uh, c4(color, alpha));
     }
 
     /// The link under the pointer, pinned to the bottom of the pane so a
@@ -3228,8 +4575,17 @@ impl Renderer {
         }
         let th = self.cell_h.round() as i32 + 4;
         let y = py + ph - th;
-        push_rect(out, rect, px, y, pw, th, c4((0x0d, 0x11, 0x14), 235));
-        push_rect(out, rect, px, y, pw, 1, c4(LINK_UNDER, 255));
+        push_rect(
+            out,
+            rect,
+            px,
+            y,
+            pw,
+            th,
+            c4(self.surface((0x0d, 0x11, 0x14)), 235),
+        );
+        let link_c = self.accent_color(LINK_UNDER);
+        push_rect(out, rect, px, y, pw, 1, c4(link_c, 255));
         // Columns, not pixels: the host is kept whole unless it alone is
         // wider than the pane, and the path is cut from the right. The
         // line is then shaped LTR with the path isolated.
@@ -3239,7 +4595,7 @@ impl Renderer {
         if text.is_empty() {
             return;
         }
-        let seg = [Seg::plain(text, LINK_UNDER)];
+        let seg = [Seg::plain(text, link_c)];
         let key = self.ensure_shaped_dir(&seg, false, true);
         self.draw_key(key, out, rect, (px + 8) as f32, y + 2, 1.0);
     }
@@ -3292,13 +4648,29 @@ impl Renderer {
         let (x, y, w, h) = self.cockpit_rect(fw, fh, entries.len());
         // dim the world behind the card
         push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 110));
-        push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 255));
-        push_rect(out, whole, x, y, w, 2, c4((0x2e, 0xa0, 0x43), 255)); // accent
+        push_rect(
+            out,
+            whole,
+            x,
+            y,
+            w,
+            h,
+            c4(self.surface((0x1c, 0x21, 0x28)), 255),
+        );
+        push_rect(
+            out,
+            whole,
+            x,
+            y,
+            w,
+            2,
+            c4(self.focus_color((0x2e, 0xa0, 0x43)), 255),
+        );
         let row_h = self.cockpit_row_h();
         // header (bold — and a live proof the style pipeline works)
         let head = [Seg {
             text: crate::lang::tr("مقصورة الوكلاء", "Agent cockpit").into(),
-            fg: self.fg,
+            fg: self.chrome_fg(),
             style: ST_BOLD,
         }];
         self.draw_run(&head, true, out, whole, (x + 14) as f32, y + 8, 1.0);
@@ -3313,11 +4685,19 @@ impl Renderer {
                     ry,
                     w - 8,
                     row_h,
-                    c4((0x24, 0x2b, 0x36), 255),
+                    c4(self.palette_sel_fill((0x24, 0x2b, 0x36)), 255),
                 );
             }
             // state dot: attention (amber) beats busy (green) beats idle (dim)
-            let dot = if e.attention {
+            let dot = if self.high_contrast {
+                if e.attention {
+                    self.chrome.accent
+                } else if e.busy {
+                    self.chrome.focus
+                } else {
+                    self.chrome.muted
+                }
+            } else if e.attention {
                 (0xf2, 0xcc, 0x60)
             } else if e.busy {
                 (0x56, 0xd3, 0x64)
@@ -3334,7 +4714,15 @@ impl Renderer {
                 d,
                 c4(dot, 255),
             );
-            let fg = if e.active {
+            let fg = if self.high_contrast {
+                if i == sel {
+                    self.chrome.palette_sel_text
+                } else if e.active {
+                    self.chrome.title_text
+                } else {
+                    self.chrome.muted
+                }
+            } else if e.active {
                 self.fg
             } else {
                 (0xb0, 0xb8, 0xc4)
@@ -3348,13 +4736,13 @@ impl Renderer {
             };
             let segs = [
                 Seg::plain(format!("{mark}{title}"), fg),
-                Seg::plain("   —   ", (0x6e, 0x76, 0x81)),
+                Seg::plain("   —   ", self.muted_color((0x6e, 0x76, 0x81))),
                 Seg {
                     text: pct,
                     fg: pct_fg,
                     style: ST_BOLD,
                 },
-                Seg::plain(status, (0x9a, 0xa4, 0xb2)),
+                Seg::plain(status, self.muted_color((0x9a, 0xa4, 0xb2))),
             ];
             self.draw_run(&segs, true, out, whole, (x + 32) as f32, ry + 6, 1.0);
         }
@@ -3397,10 +4785,11 @@ impl Renderer {
         // The ledger grammar: every row is [control]···dotted leader···[label],
         // controls left, labels right (RTL), one shared control height.
         let pad = 24;
-        let w = ((self.ui_cell_w() * 52.0) as i32).clamp(430, fw as i32 - 60);
+        let w = ((self.ui_cell_w() * 52.0) as i32)
+            .clamp((430.0 * self.system_text_scale) as i32, fw as i32 - 60);
         let head_h = (self.ui_cell_h() + 18.0 * self.dpi_scale) as i32;
         let foot_h = (self.ui_cell_h() + 18.0 * self.dpi_scale) as i32;
-        // 15 rows since the Arabic-font row: at the roomy height the card
+        // 16 rows since the system-theme row: at the roomy height the card
         // ran past a 700px window's bottom edge, so rows tighten to fit the
         // window, down to a floor that still holds a control around text
         let bar = self.tab_bar_h() as i32;
@@ -3408,7 +4797,8 @@ impl Renderer {
         let roomy = (self.ui_cell_h() + 12.0 * self.dpi_scale) as i32;
         let tight = (self.ui_cell_h() + 6.0 * self.dpi_scale) as i32;
         let room = fh as i32 - bar - 24 - head_h - 6 - theme_h - foot_h;
-        let rowh = (room / 15).clamp(tight, roomy);
+        const SETTINGS_ROWS: i32 = 16;
+        let rowh = (room / SETTINGS_ROWS).clamp(tight, roomy);
         let ctl = rowh - 4;
         // the theme row obeys the same grammar: tiles left, label right,
         // so the strip leaves room for the "المظهر" label
@@ -3419,7 +4809,7 @@ impl Renderer {
         let tile_w = ((w - pad * 2 - label_reserve - 6 * (n_tiles - 1)) / n_tiles).max(30);
         let tile_h = (self.ui_cell_h() * 1.3) as i32;
         let theme_rowh = tile_h + 14;
-        let h = head_h + 6 + theme_rowh + rowh * 15 + foot_h;
+        let h = head_h + 6 + theme_rowh + rowh * SETTINGS_ROWS + foot_h;
         let x = (fw as i32 - w) / 2;
         // a third of the spare height above, but never past the bottom
         let y = (bar + (fh as i32 - h) / 3)
@@ -3515,6 +4905,20 @@ impl Renderer {
         let close_y = row_y(14);
         let close_toggle = (x + pad, pcy(close_y), pill_w, pill_h);
 
+        // system / dark / light. «النظام» is wider than the bell's «صامت»;
+        // English "System" needs the same extra room the bell's "Silent" does.
+        let appearance_y = row_y(15);
+        let appear_cells = if crate::lang::rtl() { 6.5 } else { 8.0 };
+        let appear_w = (self.ui_cell_w() * appear_cells) as i32;
+        let appearance_btns = [0, 1, 2].map(|i| {
+            (
+                x + pad + i * (appear_w + 6),
+                cy(appearance_y),
+                appear_w,
+                ctl,
+            )
+        });
+
         let mut lay = SettingsLayout {
             card: (x, y, w, h),
             head_h,
@@ -3559,6 +4963,8 @@ impl Renderer {
             bar_toggle,
             close_label_y: close_y,
             close_toggle,
+            appearance_label_y: appearance_y,
+            appearance_btns,
         };
         if !crate::lang::rtl() {
             lay.mirror(x, w);
@@ -3571,14 +4977,25 @@ impl Renderer {
     /// control height, one border color, labels vertically centered — the
     /// grid IS the design. Every control is a hit region in SettingsLayout.
     pub fn draw_settings(&mut self, out: &mut Vec<Vertex>, fw: usize, fh: usize, v: &SettingsView) {
-        const CARD: (u8, u8, u8) = (0x14, 0x19, 0x20);
-        const EDGE: (u8, u8, u8) = (0x2a, 0x31, 0x3a); // card + control borders
-        const CTL_BG: (u8, u8, u8) = (0x24, 0x2b, 0x34);
-        const GREEN: (u8, u8, u8) = (0x2e, 0xa0, 0x43);
-        const GREEN_DIM: (u8, u8, u8) = (0x1c, 0x33, 0x24);
-        const VALUE: (u8, u8, u8) = (0x7e, 0xe7, 0x87);
-        const MUTED: (u8, u8, u8) = (0x9a, 0xa4, 0xb2);
-        const DOT: (u8, u8, u8) = (0x33, 0x3b, 0x45);
+        let card_c = self.surface((0x14, 0x19, 0x20));
+        let edge_c = self.edge_color((0x2a, 0x31, 0x3a));
+        let ctl_c = self.surface((0x24, 0x2b, 0x34));
+        let focus_c = self.focus_color((0x2e, 0xa0, 0x43));
+        let focus_dim = if self.high_contrast {
+            self.chrome.selection
+        } else {
+            (0x1c, 0x33, 0x24)
+        };
+        let value_c = self.chrome_fg_or((0x7e, 0xe7, 0x87));
+        let muted_c = self.muted_color((0x9a, 0xa4, 0xb2));
+        let dot_c = self.muted_color((0x33, 0x3b, 0x45));
+        let on_text = self.on_control_text();
+        let fg_c = self.chrome_fg();
+        let knob_off = if self.high_contrast {
+            self.chrome.muted
+        } else {
+            (0x8a, 0x94, 0xa3)
+        };
 
         let whole: Rect = (0, 0, fw as i32, fh as i32);
         let lay = self.settings_layout(fw, fh);
@@ -3588,14 +5005,14 @@ impl Renderer {
         let tc = (lay.rowh as f32 - self.cell_h) as i32 / 2;
 
         push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 140));
-        push_rect(out, whole, x - 1, y - 1, w + 2, h + 2, c4(EDGE, 255)); // border
-        push_rect(out, whole, x, y, w, h, c4(CARD, 255));
-        push_rect(out, whole, x, y, w, 3, c4(GREEN, 255)); // accent
+        push_rect(out, whole, x - 1, y - 1, w + 2, h + 2, c4(edge_c, 255)); // border
+        push_rect(out, whole, x, y, w, h, c4(card_c, 255));
+        push_rect(out, whole, x, y, w, 3, c4(focus_c, 255)); // accent
 
         // title + hairline under it
         let head = [Seg {
             text: crate::lang::tr("الإعدادات", "Settings").into(),
-            fg: self.fg,
+            fg: fg_c,
             style: ST_BOLD,
         }];
         let hw = self.measure(&head, true);
@@ -3615,7 +5032,7 @@ impl Renderer {
             y + lay.head_h,
             w - pad * 2,
             1,
-            c4(EDGE, 255),
+            c4(edge_c, 255),
         );
 
         // the shortcuts-editor and language buttons (header, far edge). The
@@ -3630,9 +5047,9 @@ impl Renderer {
             (lay.lang_btn, other),
         ] {
             let (bx, by, bw, bh) = rect;
-            push_rect(out, whole, bx - 1, by - 1, bw + 2, bh + 2, c4(EDGE, 255));
-            push_rect(out, whole, bx, by, bw, bh, c4(CTL_BG, 255));
-            let seg = [Seg::plain(text, MUTED)];
+            push_rect(out, whole, bx - 1, by - 1, bw + 2, bh + 2, c4(edge_c, 255));
+            push_rect(out, whole, bx, by, bw, bh, c4(ctl_c, 255));
+            let seg = [Seg::plain(text, muted_c)];
             let lw = self.measure(&seg, true);
             self.draw_run(
                 &seg,
@@ -3648,7 +5065,7 @@ impl Renderer {
         // row label at the reading edge; returns its INNER edge, where the
         // leader dots must stop (its left in Arabic, its right in English)
         let label = |r: &mut Self, out: &mut Vec<Vertex>, text: &str, row_top: i32| -> i32 {
-            let seg = [Seg::plain(text, MUTED)];
+            let seg = [Seg::plain(text, muted_c)];
             let lw = r.measure(&seg, true).ceil() as i32;
             let lx = crate::lang::lead_x(x, w, pad, lw);
             r.draw_run(&seg, true, out, whole, lx as f32, row_top + tc, 1.0);
@@ -3670,7 +5087,7 @@ impl Renderer {
             let dy = row_top + lay.rowh / 2 - 1;
             let mut dx = from_x + 16;
             while dx + 2 <= to_x - 14 {
-                push_rect(out, whole, dx, dy, 2, 2, c4(DOT, 255));
+                push_rect(out, whole, dx, dy, 2, 2, c4(dot_c, 255));
                 dx += 9;
             }
         };
@@ -3691,14 +5108,14 @@ impl Renderer {
         for (i, tile) in lay.theme_tiles.iter().enumerate() {
             let (tx, ty, tw2, th) = *tile;
             let Some(t) = all.get(i) else { continue };
-            let edge = if i == v.theme { GREEN } else { EDGE };
+            let edge = if v.theme == Some(i) { focus_c } else { edge_c };
             bordered(out, (tx, ty, tw2, th), t.bg, edge);
-            if i == v.theme {
+            if v.theme == Some(i) {
                 // second border ring so the active tile reads at a glance
-                push_rect(out, whole, tx, ty, tw2, 2, c4(GREEN, 255));
-                push_rect(out, whole, tx, ty + th - 2, tw2, 2, c4(GREEN, 255));
-                push_rect(out, whole, tx, ty, 2, th, c4(GREEN, 255));
-                push_rect(out, whole, tx + tw2 - 2, ty, 2, th, c4(GREEN, 255));
+                push_rect(out, whole, tx, ty, tw2, 2, c4(focus_c, 255));
+                push_rect(out, whole, tx, ty + th - 2, tw2, 2, c4(focus_c, 255));
+                push_rect(out, whole, tx, ty, 2, th, c4(focus_c, 255));
+                push_rect(out, whole, tx + tw2 - 2, ty, 2, th, c4(focus_c, 255));
             }
             // four palette dots as a mini preview
             let dots = [t.palette[1], t.palette[2], t.palette[4], t.palette[3]];
@@ -3717,11 +5134,11 @@ impl Renderer {
         }
 
         let draw_btn = |r: &mut Self, out: &mut Vec<Vertex>, rect: Rect, glyph: &str| {
-            bordered(out, rect, CTL_BG, EDGE);
+            bordered(out, rect, ctl_c, edge_c);
             let (bx, by, bw, bh) = rect;
             let seg = [Seg {
                 text: glyph.into(),
-                fg: r.fg,
+                fg: fg_c,
                 style: ST_BOLD,
             }];
             let lw = r.measure(&seg, false);
@@ -3757,7 +5174,7 @@ impl Renderer {
             loop {
                 let seg = [Seg {
                     text: text.clone(),
-                    fg: VALUE,
+                    fg: value_c,
                     style: ST_BOLD,
                 }];
                 let vw = r.measure(&seg, true);
@@ -3782,15 +5199,11 @@ impl Renderer {
         };
         let draw_toggle = |out: &mut Vec<Vertex>, rect: Rect, on: bool| {
             let (gx, gy, gw, gh) = rect;
-            let track = if on { GREEN } else { CTL_BG };
-            bordered(out, rect, track, if on { GREEN } else { EDGE });
+            let track = if on { focus_c } else { ctl_c };
+            bordered(out, rect, track, if on { focus_c } else { edge_c });
             let knob = gh - 8;
             let kx = if on { gx + gw - knob - 4 } else { gx + 4 };
-            let kc = if on {
-                (0xff, 0xff, 0xff)
-            } else {
-                (0x8a, 0x94, 0xa3)
-            };
+            let kc = if on { on_text } else { knob_off };
             push_rect(out, whole, kx, gy + 4, knob, knob, c4(kc, 255));
         };
 
@@ -3864,11 +5277,11 @@ impl Renderer {
             bordered(
                 out,
                 (bx, by, bw, bh),
-                if active { GREEN_DIM } else { CTL_BG },
-                if active { GREEN } else { EDGE },
+                if active { focus_dim } else { ctl_c },
+                if active { focus_c } else { edge_c },
             );
             // the shape itself, drawn as rects — no glyphs to go missing
-            let c = c4(if active { (0xff, 0xff, 0xff) } else { MUTED }, 255);
+            let c = c4(if active { on_text } else { muted_c }, 255);
             match crate::config::CursorStyle::ALL[i] {
                 crate::config::CursorStyle::Block => {
                     push_rect(out, whole, bx + 8, by + 7, bw - 16, bh - 14, c)
@@ -3998,10 +5411,10 @@ impl Renderer {
             bordered(
                 out,
                 (bx, by, bw, bh),
-                if active { GREEN_DIM } else { CTL_BG },
-                if active { GREEN } else { EDGE },
+                if active { focus_dim } else { ctl_c },
+                if active { focus_c } else { edge_c },
             );
-            let fg = if active { (0xff, 0xff, 0xff) } else { MUTED };
+            let fg = if active { on_text } else { muted_c };
             let seg = [Seg {
                 text: names[i].into(),
                 fg,
@@ -4075,6 +5488,42 @@ impl Renderer {
         leader(out, &[lay.close_toggle], ll, lay.close_label_y);
         draw_toggle(out, lay.close_toggle, v.confirm_close);
 
+        // ---- Windows light/dark: النظام / داكن / فاتح ----
+        let ll = label(
+            self,
+            out,
+            crate::lang::tr("سمة النظام", "System theme"),
+            lay.appearance_label_y,
+        );
+        leader(out, &lay.appearance_btns, ll, lay.appearance_label_y);
+        for (i, &(bx, by, bw, bh)) in lay.appearance_btns.iter().enumerate() {
+            let mode = crate::theme::APPEARANCE_SEGMENTS[i];
+            let active = v.appearance == Some(mode);
+            bordered(
+                out,
+                (bx, by, bw, bh),
+                if active { focus_dim } else { ctl_c },
+                if active { focus_c } else { edge_c },
+            );
+            let fg = if active { on_text } else { muted_c };
+            let seg = [Seg {
+                text: mode.label().into(),
+                fg,
+                style: if active { ST_BOLD } else { 0 },
+            }];
+            let lw = self.measure(&seg, true);
+            let gy = by + ((bh as f32 - self.cell_h) / 2.0) as i32;
+            self.draw_run(
+                &seg,
+                true,
+                out,
+                whole,
+                bx as f32 + (bw as f32 - lw) / 2.0,
+                gy,
+                1.0,
+            );
+        }
+
         // footer: hairline + hint
         push_rect(
             out,
@@ -4083,14 +5532,14 @@ impl Renderer {
             y + h - (self.cell_h as i32 + 24),
             w - pad * 2,
             1,
-            c4(EDGE, 255),
+            c4(edge_c, 255),
         );
         let hint = [Seg::plain(
             crate::lang::tr(
                 "انقر للتغيير · Esc للإغلاق والحفظ",
                 "Click to change · Esc closes and saves",
             ),
-            (0x6e, 0x78, 0x85),
+            self.muted_color((0x6e, 0x78, 0x85)),
         )];
         let fw2 = self.measure(&hint, true);
         self.draw_run(
@@ -4115,15 +5564,26 @@ impl Renderer {
         // roomy row height (20 actions with tab groups), so rows tighten
         // to fit the window, down to a floor that still holds the keycaps.
         let roomy = (self.ui_cell_h() + 18.0) as i32;
-        let tight = (self.ui_cell_h() + 12.0) as i32;
+        // 22 actions (BiDi toggle included) still have to fit a 900px
+        // window. The floor stays tall enough for the keycap chips.
+        let tight = (self.ui_cell_h() + 8.0) as i32;
         let room = fh as i32 - bar - 24 - head_h - 6 - foot_h;
         let rowh = (room / (n as i32).max(1)).clamp(tight, roomy);
         let h = head_h + 6 + rowh * n as i32 + foot_h;
         let x = (fw as i32 - w) / 2;
-        // a third of the spare height above, but never past the bottom
-        let y = (bar + (fh as i32 - h) / 3)
-            .min(fh as i32 - h - 12)
-            .max(bar + 12);
+        // a third of the spare height above, but never past the bottom.
+        // A registry that fills the window sits against the tab bar instead
+        // of running off the bottom edge.
+        let y = {
+            let placed = (bar + (fh as i32 - h) / 3)
+                .min(fh as i32 - h - 12)
+                .max(bar + 12);
+            if placed + h > fh as i32 {
+                bar.max(fh as i32 - h)
+            } else {
+                placed
+            }
+        };
         let rows_top = y + head_h + 6;
         let rows = (0..n as i32)
             .map(|i| (x + 8, rows_top + rowh * i, w - 16, rowh))
@@ -4149,14 +5609,15 @@ impl Renderer {
         capturing: bool,
         flash: Option<&str>,
     ) {
-        const CARD: (u8, u8, u8) = (0x14, 0x19, 0x20);
-        const EDGE: (u8, u8, u8) = (0x2a, 0x31, 0x3a);
-        const CTL_BG: (u8, u8, u8) = (0x24, 0x2b, 0x34);
-        const GREEN: (u8, u8, u8) = (0x2e, 0xa0, 0x43);
-        const VALUE: (u8, u8, u8) = (0x7e, 0xe7, 0x87);
-        const MUTED: (u8, u8, u8) = (0x9a, 0xa4, 0xb2);
-        const DOT: (u8, u8, u8) = (0x33, 0x3b, 0x45);
-        const AMBER: (u8, u8, u8) = (0xf2, 0xcc, 0x60);
+        let card_c = self.surface((0x14, 0x19, 0x20));
+        let edge_c = self.edge_color((0x2a, 0x31, 0x3a));
+        let ctl_c = self.surface((0x24, 0x2b, 0x34));
+        let focus_c = self.focus_color((0x2e, 0xa0, 0x43));
+        let value_c = self.chrome_fg_or((0x7e, 0xe7, 0x87));
+        let muted_c = self.muted_color((0x9a, 0xa4, 0xb2));
+        let dot_c = self.muted_color((0x33, 0x3b, 0x45));
+        let fg_c = self.chrome_fg();
+        let amber_c = self.accent_color((0xf2, 0xcc, 0x60));
 
         let whole: Rect = (0, 0, fw as i32, fh as i32);
         let lay = self.shortcuts_layout(fw, fh, rows.len());
@@ -4165,13 +5626,13 @@ impl Renderer {
         let tc = (lay.rowh as f32 - self.cell_h) as i32 / 2;
 
         push_rect(out, whole, 0, 0, fw as i32, fh as i32, c4((0, 0, 0), 140));
-        push_rect(out, whole, x - 1, y - 1, w + 2, h + 2, c4(EDGE, 255));
-        push_rect(out, whole, x, y, w, h, c4(CARD, 255));
-        push_rect(out, whole, x, y, w, 3, c4(GREEN, 255));
+        push_rect(out, whole, x - 1, y - 1, w + 2, h + 2, c4(edge_c, 255));
+        push_rect(out, whole, x, y, w, h, c4(card_c, 255));
+        push_rect(out, whole, x, y, w, 3, c4(focus_c, 255));
 
         let head = [Seg {
             text: crate::lang::tr("الاختصارات", "Shortcuts").into(),
-            fg: self.fg,
+            fg: fg_c,
             style: ST_BOLD,
         }];
         let hw = self.measure(&head, true);
@@ -4191,7 +5652,7 @@ impl Renderer {
             y + (self.cell_h + 30.0) as i32,
             w - pad * 2,
             1,
-            c4(EDGE, 255),
+            c4(edge_c, 255),
         );
 
         for (i, row) in rows.iter().enumerate() {
@@ -4201,12 +5662,12 @@ impl Renderer {
                 // the accent bar hugs the reading edge: right in Arabic
                 push_rect(out, whole, rx, ry, rw, rh, c4((0x1b, 0x21, 0x29), 255));
                 let bar_x = if crate::lang::rtl() { rx + rw - 3 } else { rx };
-                push_rect(out, whole, bar_x, ry + 2, 3, rh - 4, c4(GREEN, 255));
+                push_rect(out, whole, bar_x, ry + 2, 3, rh - 4, c4(focus_c, 255));
             }
             // label at the reading edge
             let lseg = [Seg::plain(
                 row.label.clone(),
-                if selected { self.fg } else { MUTED },
+                if selected { fg_c } else { muted_c },
             )];
             let lw = self.measure(&lseg, true);
             let label_x = crate::lang::lead_x(x, w, pad, lw.ceil() as i32) as f32;
@@ -4217,7 +5678,7 @@ impl Renderer {
                 // amber capture prompt in place of the chips
                 let seg = [Seg {
                     text: crate::lang::tr("اضغط الاختصار الجديد…", "Press the new shortcut…").into(),
-                    fg: AMBER,
+                    fg: amber_c,
                     style: ST_BOLD,
                 }];
                 let cw = self.measure(&seg, true).ceil() as i32;
@@ -4232,14 +5693,14 @@ impl Renderer {
                 let widths: Vec<i32> = row
                     .chord
                     .split('+')
-                    .map(|t| self.measure(&[Seg::plain(t, self.fg)], false) as i32 + 14)
+                    .map(|t| self.measure(&[Seg::plain(t, fg_c)], false) as i32 + 14)
                     .collect();
                 let total = widths.iter().sum::<i32>() + 6 * (widths.len() as i32 - 1).max(0);
                 let start = crate::lang::trail_x(x, w, pad, total);
                 let mut cx = start;
                 let cy = ry + (lay.rowh - ch) / 2;
                 for token in row.chord.split('+') {
-                    let fg = if row.custom { VALUE } else { self.fg };
+                    let fg = if row.custom { value_c } else { fg_c };
                     let seg = [Seg {
                         text: token.to_string(),
                         fg,
@@ -4247,8 +5708,8 @@ impl Renderer {
                     }];
                     let tw = self.measure(&seg, false);
                     let cw = tw as i32 + 14;
-                    push_rect(out, whole, cx - 1, cy - 1, cw + 2, ch + 2, c4(EDGE, 255));
-                    push_rect(out, whole, cx, cy, cw, ch, c4(CTL_BG, 255));
+                    push_rect(out, whole, cx - 1, cy - 1, cw + 2, ch + 2, c4(edge_c, 255));
+                    push_rect(out, whole, cx, cy, cw, ch, c4(ctl_c, 255));
                     self.draw_run(
                         &seg,
                         false,
@@ -4271,7 +5732,7 @@ impl Renderer {
             };
             let mut dx = from + 16;
             while dx + 2 <= to - 14 {
-                push_rect(out, whole, dx, dy, 2, 2, c4(DOT, 255));
+                push_rect(out, whole, dx, dy, 2, 2, c4(dot_c, 255));
                 dx += 9;
             }
         }
@@ -4284,17 +5745,17 @@ impl Renderer {
             y + h - (self.cell_h as i32 + 24),
             w - pad * 2,
             1,
-            c4(EDGE, 255),
+            c4(edge_c, 255),
         );
         let (text, color) = match flash {
-            Some(f) => (f.to_string(), AMBER),
+            Some(f) => (f.to_string(), amber_c),
             None => (
                 crate::lang::tr(
                     "Enter تغيير · Delete افتراضي · Esc إغلاق",
                     "Enter change · Delete default · Esc close",
                 )
                 .to_string(),
-                (0x6e, 0x78, 0x85),
+                self.muted_color((0x6e, 0x78, 0x85)),
             ),
         };
         let seg = [Seg::plain(text, color)];
@@ -4324,15 +5785,26 @@ impl Renderer {
         let margin = margin.min(fw / 8).min(fh / 8).max(0);
         let top = (self.tab_bar_h() as i32).min(fh / 5) + margin;
         let available = (fh - top - margin).max(0);
-        let compact = (available as f32 / (240.0 * dpi)).min(1.0);
-        let px = |n: f32| (n * dpi * compact).round().max(1.0) as i32;
+        // `compact` is the short-window squeeze. System text size is a
+        // separate multiplier, so a 150% slider on a tall window stays at
+        // compact 1.0 and the face simply gets larger.
+        let preferred = 240.0 * dpi * self.system_text_scale;
+        let compact = (available as f32 / preferred).min(1.0);
+        let px = |n: f32| {
+            (n * dpi * self.system_text_scale * compact)
+                .round()
+                .max(1.0) as i32
+        };
         let pad = px(12.0);
         let (title_h, query_h, footer_h, row_h) = (px(40.0), px(44.0), px(34.0), px(42.0));
         let fixed = title_h + query_h + footer_h + pad * 4;
         let capacity = ((available - fixed).max(0) / row_h) as usize;
         let shown = count.min(12).min(capacity);
         let width = ((fw as f32 * 0.7).round() as i32)
-            .clamp((560.0 * dpi) as i32, (900.0 * dpi) as i32)
+            .clamp(
+                (560.0 * dpi * self.system_text_scale) as i32,
+                (900.0 * dpi * self.system_text_scale) as i32,
+            )
             .min((fw - margin * 2).max(0));
         let height = (fixed + row_h * shown as i32).min(available);
         let x = (fw - width) / 2;
@@ -4431,9 +5903,9 @@ impl Renderer {
         let seg = [Seg::plain(
             hint,
             if picked {
-                (0xa8, 0xb8, 0xc8)
+                self.palette_sel_text((0xa8, 0xb8, 0xc8))
             } else {
-                (0x76, 0x82, 0x90)
+                self.muted_color((0x76, 0x82, 0x90))
             },
         )];
         self.draw_run(
@@ -4466,14 +5938,25 @@ impl Renderer {
         let layout = self.menu_layout(fw, fh, rows.len(), anchor);
         let saved_metrics = self.metrics;
         let saved_cells = (self.cell_w, self.cell_h);
-        self.metrics = Metrics::new(15.0 * self.dpi_scale, self.ui_cell_h());
+        self.metrics = Metrics::new(
+            15.0 * self.dpi_scale * self.system_text_scale,
+            self.ui_cell_h(),
+        );
         self.cell_w = self.ui_cell_w();
         self.cell_h = self.metrics.line_height;
         let (x, y, w, h) = layout.card;
-        let accent = (0x58, 0xa6, 0xff);
+        let accent = self.focus_color((0x58, 0xa6, 0xff));
         let inset = (12.0 * self.dpi_scale).round() as i32;
         push_rect(out, whole, x + 3, y + 4, w, h, c4((0, 0, 0), 90));
-        push_rect(out, whole, x, y, w, h, c4((0x3d, 0x44, 0x4d), 255));
+        push_rect(
+            out,
+            whole,
+            x,
+            y,
+            w,
+            h,
+            c4(self.edge_color((0x3d, 0x44, 0x4d)), 255),
+        );
         push_rect(
             out,
             whole,
@@ -4481,7 +5964,7 @@ impl Renderer {
             y + 1,
             w - 2,
             h - 2,
-            c4((0x16, 0x1b, 0x22), 255),
+            c4(self.palette_fill((0x16, 0x1b, 0x22)), 255),
         );
         for &(idx, rect @ (rx, ry, rw, rh)) in &layout.rows {
             let picked = idx == sel;
@@ -4493,7 +5976,7 @@ impl Renderer {
                     ry,
                     rw,
                     rh,
-                    c4((0x21, 0x36, 0x50), 255),
+                    c4(self.palette_sel_fill((0x21, 0x36, 0x50)), 255),
                 );
                 let bar_x = if crate::lang::rtl() { rx + rw - 3 } else { rx };
                 push_rect(out, layout.card, bar_x, ry, 3, rh, c4(accent, 255));
@@ -4512,9 +5995,9 @@ impl Renderer {
             let seg = [Seg {
                 text: label,
                 fg: if picked {
-                    (0xf0, 0xf6, 0xfc)
+                    self.palette_sel_text((0xf0, 0xf6, 0xfc))
                 } else {
-                    (0xc9, 0xd1, 0xd9)
+                    self.chrome_fg_or((0xc9, 0xd1, 0xd9))
                 },
                 style: 0,
             }];
@@ -4556,16 +6039,24 @@ impl Renderer {
         // This drawer also works outside the chrome pass: terminal zoom
         // never sizes palette text. Very short windows scale the UI together.
         self.metrics = Metrics::new(
-            16.0 * self.dpi_scale * layout.text_scale,
+            self.ui_font_px() * layout.text_scale,
             self.ui_cell_h() * layout.text_scale,
         );
         self.cell_w = self.ui_cell_w() * layout.text_scale;
         self.cell_h = self.metrics.line_height;
         let (x, y, w, h) = layout.card;
         let inset = (12.0 * self.dpi_scale * layout.text_scale).round() as i32;
-        let accent = (0x58, 0xa6, 0xff);
+        let accent = self.focus_color((0x58, 0xa6, 0xff));
         push_rect_top_rounded(out, whole, x + 4, y + 6, w, h, c4((0, 0, 0), 100));
-        push_rect_top_rounded(out, whole, x, y, w, h, c4((0x3d, 0x44, 0x4d), 255));
+        push_rect_top_rounded(
+            out,
+            whole,
+            x,
+            y,
+            w,
+            h,
+            c4(self.edge_color((0x3d, 0x44, 0x4d)), 255),
+        );
         push_rect_top_rounded(
             out,
             whole,
@@ -4573,11 +6064,11 @@ impl Renderer {
             y + 1,
             w - 2,
             h - 2,
-            c4((0x16, 0x1b, 0x22), 255),
+            c4(self.palette_fill((0x16, 0x1b, 0x22)), 255),
         );
         let title = [Seg {
             text: crate::lang::tr("لوحة الأوامر", "Command palette").into(),
-            fg: (0xe6, 0xed, 0xf3),
+            fg: self.chrome_fg_or((0xe6, 0xed, 0xf3)),
             style: ST_BOLD,
         }];
         let tw = self.measure(&title, true);
@@ -4592,7 +6083,10 @@ impl Renderer {
             1.0,
         );
         if w > (600.0 * self.dpi_scale) as i32 {
-            let keys = [Seg::plain("Ctrl + Shift + P", (0x8b, 0x94, 0x9e))];
+            let keys = [Seg::plain(
+                "Ctrl + Shift + P",
+                self.muted_color((0x8b, 0x94, 0x9e)),
+            )];
             let kw = self.measure(&keys, false).ceil() as i32;
             self.draw_run(
                 &keys,
@@ -4612,7 +6106,7 @@ impl Renderer {
             qy,
             qw,
             qh,
-            c4((0x0d, 0x11, 0x17), 255),
+            c4(self.window_fill((0x0d, 0x11, 0x17)), 255),
         );
         push_rect(out, layout.card, qx, qy + qh - 2, qw, 2, c4(accent, 255));
         let query_text = if query.is_empty() {
@@ -4625,9 +6119,9 @@ impl Renderer {
             &[Seg::plain(
                 query_text,
                 if query.is_empty() {
-                    (0x8b, 0x94, 0x9e)
+                    self.muted_color((0x8b, 0x94, 0x9e))
                 } else {
-                    self.fg
+                    self.chrome_fg()
                 },
             )],
             true,
@@ -4647,7 +6141,7 @@ impl Renderer {
                     ry + 1,
                     rw,
                     rh - 2,
-                    c4((0x21, 0x36, 0x50), 255),
+                    c4(self.palette_sel_fill((0x21, 0x36, 0x50)), 255),
                 );
                 push_rect(out, layout.card, rx, ry + 1, 3, rh - 2, c4(accent, 255));
             }
@@ -4666,9 +6160,9 @@ impl Renderer {
                 &[Seg {
                     text,
                     fg: if picked {
-                        (0xf0, 0xf6, 0xfc)
+                        self.palette_sel_text((0xf0, 0xf6, 0xfc))
                     } else {
-                        (0xad, 0xb7, 0xc3)
+                        self.chrome_fg_or((0xad, 0xb7, 0xc3))
                     },
                     style: if picked { ST_BOLD } else { 0 },
                 }],
@@ -4688,7 +6182,7 @@ impl Renderer {
         let hint = self.guard_label(&hint, (layout.footer.2 - inset * 2).max(0) as f32);
         // Keep shortcut keys in reading order; Arabic labels still shape
         // as RTL runs inside this left-to-right instruction line.
-        let hint = [Seg::plain(hint, (0x9a, 0xa6, 0xb5))];
+        let hint = [Seg::plain(hint, self.muted_color((0x9a, 0xa6, 0xb5)))];
         let key = self.ensure_shaped_dir(&hint, true, true);
         let hint_y = layout.footer.1 + (layout.footer.3 - self.cell_h as i32).max(0) / 2;
         let hint_x = (layout.footer.0 + inset) as f32;
@@ -4783,12 +6277,28 @@ impl Renderer {
         let h = rh * shown as i32 + (self.cell_h * 3.5) as i32 + 20;
         let x = (fw as i32 - w) / 2;
         let y = self.tab_bar_h() as i32 + (fh as i32 - h) / 6;
-        push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 250));
-        push_rect(out, whole, x, y, w, 2, c4((0x2e, 0xa0, 0x43), 255));
+        push_rect(
+            out,
+            whole,
+            x,
+            y,
+            w,
+            h,
+            c4(self.surface((0x1c, 0x21, 0x28)), 250),
+        );
+        push_rect(
+            out,
+            whole,
+            x,
+            y,
+            w,
+            2,
+            c4(self.focus_color((0x2e, 0xa0, 0x43)), 255),
+        );
 
         let title = [Seg::plain(
             crate::lang::tr("شكل الموجِّه — معاينة حيّة", "Prompt style — live preview"),
-            self.fg,
+            self.chrome_fg(),
         )];
         self.draw_run(&title, true, out, whole, (x + 14) as f32, y + 8, 1.0);
 
@@ -4806,13 +6316,13 @@ impl Renderer {
                     ry - 4,
                     w - 12,
                     rh,
-                    c4((0x2c, 0x3a, 0x33), 255),
+                    c4(self.palette_sel_fill((0x2c, 0x3a, 0x33)), 255),
                 );
             }
             let name_fg = if idx == sel {
-                self.fg
+                self.palette_sel_text(self.chrome_fg())
             } else {
-                (0x8a, 0x94, 0xa3)
+                self.muted_color((0x8a, 0x94, 0xa3))
             };
             let n = [Seg {
                 text: names[idx].clone(),
@@ -4838,7 +6348,7 @@ impl Renderer {
                 None => {
                     let m = [Seg::plain(
                         crate::lang::tr("(تعذّر التصيير)", "(could not render)"),
-                        (0x6e, 0x78, 0x85),
+                        self.muted_color((0x6e, 0x78, 0x85)),
                     )];
                     self.draw_run(
                         &m,
@@ -4857,7 +6367,7 @@ impl Renderer {
                 "Enter تطبيق · ↑↓ تنقّل · Esc إغلاق",
                 "Enter apply · ↑↓ move · Esc close",
             ),
-            (0x6e, 0x78, 0x85),
+            self.muted_color((0x6e, 0x78, 0x85)),
         )];
         self.draw_run(
             &hint,
@@ -4884,10 +6394,26 @@ impl Renderer {
             y - 3,
             w + 6,
             h + 6,
-            c4((0x0d, 0x11, 0x14), 255),
+            c4(self.surface((0x0d, 0x11, 0x14)), 255),
         );
-        push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 255));
-        push_rect(out, whole, x, y, w, 3, c4((0xf2, 0xcc, 0x60), 255));
+        push_rect(
+            out,
+            whole,
+            x,
+            y,
+            w,
+            h,
+            c4(self.surface((0x1c, 0x21, 0x28)), 255),
+        );
+        push_rect(
+            out,
+            whole,
+            x,
+            y,
+            w,
+            3,
+            c4(self.accent_color((0xf2, 0xcc, 0x60)), 255),
+        );
         let inner = layout.text;
         let note = crate::lang::tr(
             "الإغلاق سيوقف الأوامر الجارية.",
@@ -4900,7 +6426,7 @@ impl Renderer {
             let text = self.guard_label(text, inner.2 as f32);
             let seg = [Seg {
                 text,
-                fg: self.fg,
+                fg: self.chrome_fg(),
                 style: if bold { ST_BOLD } else { 0 },
             }];
             let tw = self.measure(&seg, true);
@@ -5052,21 +6578,32 @@ impl Renderer {
         let whole = (0, 0, fw, fh);
         let clip = (x + pad, y + pad, inner_w, h - 2 * pad);
         push_rect(out, whole, 0, 0, fw, fh, c4((0, 0, 0), 150));
-        push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 255));
-        push_rect(out, whole, x, y, w, 3, c4((0xcf, 0x22, 0x2e), 255));
+        push_rect(
+            out,
+            whole,
+            x,
+            y,
+            w,
+            h,
+            c4(self.surface((0x1c, 0x21, 0x28)), 255),
+        );
+        let err_stripe = self.focus_color((0xcf, 0x22, 0x2e));
+        let row_fg = self.accent_color((0xf2, 0xcc, 0x60));
+        let keys_fg = self.muted_color((0x9a, 0xa4, 0xb2));
+        push_rect(out, whole, x, y, w, 3, c4(err_stripe, 255));
 
         let keys = crate::lang::tr("Enter أو Esc للإغلاق", "Enter or Esc closes");
         let lines = std::iter::once(Seg {
             text: title.into(),
-            fg: self.fg,
+            fg: self.chrome_fg(),
             style: ST_BOLD,
         })
         .chain(
             rows.iter()
                 .take(max_rows)
-                .map(|row| Seg::plain(*row, (0xf2, 0xcc, 0x60))),
+                .map(move |row| Seg::plain(*row, row_fg)),
         )
-        .chain(std::iter::once(Seg::plain(keys, (0x9a, 0xa4, 0xb2))));
+        .chain(std::iter::once(Seg::plain(keys, keys_fg)));
         for (i, seg) in lines.enumerate() {
             let seg = [seg];
             let tw = self.measure(&seg, true).ceil() as i32;
@@ -5081,6 +6618,45 @@ impl Renderer {
                 1.0,
             );
         }
+    }
+
+    /// A single line at the bottom of the window. A parse error uses the
+    /// amber bar and stays; a "later" notice uses the blue bar and expires.
+    /// The bar does not dim the terminal.
+    pub fn draw_config_notice(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        fw: i32,
+        fh: i32,
+        text: &str,
+        error: bool,
+    ) {
+        if fw < 40 || fh < 20 || text.is_empty() {
+            return;
+        }
+        let margin = 10;
+        let row_h = self.cell_h.ceil() as i32;
+        let h = row_h + 8;
+        let w = fw - margin * 2;
+        let x = margin;
+        let y = (fh - h - margin).max(0);
+        let whole = (0, 0, fw, fh);
+        let bg = if error {
+            (0x3a, 0x2a, 0x12)
+        } else {
+            (0x1a, 0x27, 0x33)
+        };
+        let accent = if error {
+            (0xe0, 0xa0, 0x40)
+        } else {
+            (0x3d, 0x8f, 0xd1)
+        };
+        push_rect(out, whole, x, y, w, h, c4(bg, 235));
+        push_rect(out, whole, x, y, 3, h, c4(accent, 255));
+        let seg = [Seg::plain(text, (0xe6, 0xed, 0xf3))];
+        let tw = self.measure(&seg, true).ceil() as i32;
+        let left = crate::lang::lead_x(x, w, 12, tw);
+        self.draw_run(&seg, true, out, (x, y, w, h), left as f32, y + 4, 1.0);
     }
 
     /// A link card. `may_open` is the confirm card (mint bar, Enter opens).
@@ -5107,7 +6683,13 @@ impl Renderer {
         let h = (self.cell_h * (4.0 + extra)) as i32 + pad * 2 + 12;
         let x = (fw as i32 - w) / 2;
         let y = self.tab_bar_h() as i32 + (fh as i32 - h) / 3;
-        let accent = if may_open {
+        let accent = if self.high_contrast {
+            if may_open {
+                self.chrome.accent
+            } else {
+                self.chrome.focus
+            }
+        } else if may_open {
             (0x58, 0xd1, 0xc0)
         } else {
             (0xcf, 0x22, 0x2e)
@@ -5119,20 +6701,28 @@ impl Renderer {
             y - 3,
             w + 6,
             h + 6,
-            c4((0x0d, 0x11, 0x14), 235),
+            c4(self.surface((0x0d, 0x11, 0x14)), 235),
         );
-        push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 255));
+        push_rect(
+            out,
+            whole,
+            x,
+            y,
+            w,
+            h,
+            c4(self.surface((0x1c, 0x21, 0x28)), 255),
+        );
         push_rect(out, whole, x, y, w, 3, c4(accent, 255));
         let prefix = crate::link::card_title_prefix(may_open);
         let title = [Seg {
             text: format!("{prefix} — {reason}"),
-            fg: self.fg,
+            fg: self.chrome_fg(),
             style: ST_BOLD,
         }];
         self.draw_run(&title, true, out, whole, (x + pad) as f32, y + pad, 1.0);
         // Wider than the card: drop characters from the left so the
         // registrable suffix stays visible. Refuse cards are unchanged.
-        let host_color = (0xf2, 0xcc, 0x60);
+        let host_color = self.accent_color((0xf2, 0xcc, 0x60));
         let inner = (w - pad * 2 - 2).max(8) as f32;
         let host_draw = if may_open {
             self.elide_left(host_line, inner, host_color)
@@ -5175,7 +6765,10 @@ impl Renderer {
             y + pad + (self.cell_h * keys_at) as i32 + 4,
             1.0,
         );
-        let keys_en = [Seg::plain(en.to_string(), (0x6e, 0x78, 0x85))];
+        let keys_en = [Seg::plain(
+            en.to_string(),
+            self.muted_color((0x6e, 0x78, 0x85)),
+        )];
         self.draw_run(
             &keys_en,
             true,
@@ -5251,30 +6844,50 @@ impl Renderer {
             y - 3,
             w + 6,
             h + 6,
-            c4((0x0d, 0x11, 0x14), 235),
+            c4(self.surface((0x0d, 0x11, 0x14)), 235),
         );
-        push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 255));
-        push_rect(out, whole, x, y, w, 3, c4((0xf2, 0xcc, 0x60), 255)); // warn accent
+        push_rect(
+            out,
+            whole,
+            x,
+            y,
+            w,
+            h,
+            c4(self.surface((0x1c, 0x21, 0x28)), 255),
+        );
+        push_rect(
+            out,
+            whole,
+            x,
+            y,
+            w,
+            3,
+            c4(self.accent_color((0xf2, 0xcc, 0x60)), 255),
+        ); // warn accent
 
+        let paste_title = if crate::lang::rtl() {
+            format!(
+                "لصق {} ({})؟",
+                arabic_lines(card.lines),
+                arabic_chars(card.chars)
+            )
+        } else {
+            format!(
+                "Paste {} ({})?",
+                english_count(card.lines, "line"),
+                english_count(card.chars, "char")
+            )
+        };
         let title = [Seg {
-            text: if crate::lang::rtl() {
-                format!(
-                    "لصق {} ({})؟",
-                    arabic_lines(card.lines),
-                    arabic_chars(card.chars)
-                )
-            } else {
-                format!(
-                    "Paste {} ({})?",
-                    english_count(card.lines, "line"),
-                    english_count(card.chars, "char")
-                )
-            },
-            fg: self.fg,
+            text: card.heading.unwrap_or(&paste_title).to_string(),
+            fg: self.chrome_fg(),
             style: ST_BOLD,
         }];
         self.draw_run(&title, true, out, whole, (x + pad) as f32, y + pad, 1.0);
-        let why = [Seg::plain(card.reason, (0xf2, 0xcc, 0x60))];
+        let why = [Seg::plain(
+            card.reason,
+            self.accent_color((0xf2, 0xcc, 0x60)),
+        )];
         self.draw_run(
             &why,
             true,
@@ -5315,6 +6928,9 @@ impl Renderer {
     }
 
     /// Window-level chrome: tab bar, search bar, Claude badge.
+    /// The argument count is the frame's inputs; folding them into a struct
+    /// would touch every caller for one badge.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_chrome(
         &mut self,
         out: &mut Vec<Vertex>,
@@ -5323,6 +6939,7 @@ impl Renderer {
         tabs: &[TabInfo],
         bar_text: Option<&str>,
         claude: bool,
+        elevated_label: Option<&str>,
     ) {
         let oy = self.tab_bar_h().round() as i32;
         let whole: Rect = (0, 0, width as i32, height as i32);
@@ -5330,21 +6947,25 @@ impl Renderer {
         // search bar (or the copy-mode hint), top-right below the tab bar;
         // it widens past 34 cells for a longer text
         if let Some(text) = bar_text {
-            let segs = [Seg::plain(text.to_string(), self.fg)];
+            let segs = [Seg::plain(text.to_string(), self.chrome_fg())];
             let text_w = self.measure(&segs, true).ceil() as i32;
             let bar_w = ((self.cell_w * 34.0) as i32).max(text_w + 16);
             let bar_h = (self.cell_h + 10.0) as i32;
             let bx = width as i32 - bar_w - 10;
             let by = oy + 6;
-            push_rect(
-                out,
-                whole,
-                bx,
-                by,
-                bar_w,
-                bar_h,
-                c4((0x1c, 0x21, 0x28), 255),
-            );
+            // Dark pages keep the original slate. A light page uses a
+            // slightly darker paper so the bar is not a dark hole. High
+            // Contrast takes the system card colour.
+            let search_bg = self.surface(if crate::theme::title_bar_dark_for(self.bg) {
+                (0x1c, 0x21, 0x28)
+            } else {
+                (
+                    self.bg.0.saturating_sub(12),
+                    self.bg.1.saturating_sub(12),
+                    self.bg.2.saturating_sub(12),
+                )
+            });
+            push_rect(out, whole, bx, by, bar_w, bar_h, c4(search_bg, 255));
             push_rect(
                 out,
                 whole,
@@ -5352,7 +6973,14 @@ impl Renderer {
                 by + bar_h - 2,
                 bar_w,
                 2,
-                c4(PALETTE[11], 200),
+                c4(
+                    self.accent_color(search_line(self.bg)),
+                    if crate::theme::title_bar_dark_for(self.bg) {
+                        200
+                    } else {
+                        255
+                    },
+                ),
             ); // amber underline = search accent
             self.draw_run(&segs, true, out, whole, (bx + 8) as f32, by + 5, 1.0);
         }
@@ -5362,13 +6990,16 @@ impl Renderer {
         if self.bar_hidden {
             return;
         }
-        let bar_bg = (
-            (self.bg.0 as f32 * 0.80) as u8,
-            (self.bg.1 as f32 * 0.80) as u8,
-            (self.bg.2 as f32 * 0.80) as u8,
-        );
+        let bar_bg = self.window_fill(chrome_bar_bg(self.bg));
+        let page_dark = crate::theme::title_bar_dark_for(self.bg);
         push_rect(out, whole, 0, 0, width as i32, oy, c4(bar_bg, 255));
-        push_rect(out, whole, 0, oy - 1, width as i32, 1, c4(self.fg, 28));
+        let hair = if self.high_contrast {
+            self.chrome.title_text
+        } else {
+            self.fg
+        };
+        let hair_a = if self.high_contrast { 255 } else { 28 };
+        push_rect(out, whole, 0, oy - 1, width as i32, 1, c4(hair, hair_a));
         // the group chip: which group's tabs these are. Blue, so it never
         // reads as a tab (tabs are the content background, or the bar's).
         // A click steps to the next group; the amber dot is a tab in
@@ -5376,8 +7007,16 @@ impl Renderer {
         if let (Some((gx, gy, gw, gh)), Some((label, elsewhere))) =
             (self.group_chip_rect(), self.group_chip.clone())
         {
-            push_rect_top_rounded(out, whole, gx, gy, gw, gh, c4((0x1f, 0x3a, 0x5c), 255));
-            let fg = (0xc9, 0xdc, 0xf2);
+            push_rect_top_rounded(
+                out,
+                whole,
+                gx,
+                gy,
+                gw,
+                gh,
+                c4(self.palette_sel_fill((0x1f, 0x3a, 0x5c)), 255),
+            );
+            let fg = self.palette_sel_text((0xc9, 0xdc, 0xf2));
             let dot_room = if elsewhere { 14 } else { 0 };
             let mark = [Seg::plain("⇄", fg)];
             let mark_w = self.measure(&mark, false).ceil() as i32;
@@ -5403,7 +7042,7 @@ impl Renderer {
                     (oy + 3) / 2 - d / 2,
                     d,
                     d,
-                    c4((0xf2, 0xcc, 0x60), 255),
+                    c4(self.accent_color((0xf2, 0xcc, 0x60)), 255),
                 );
             }
         }
@@ -5425,7 +7064,13 @@ impl Renderer {
                     (c.2 as f32 * f) as u8,
                 )
             };
-            let (bg, fg): ((u8, u8, u8), (u8, u8, u8)) = if tab.active {
+            let (bg, fg): ((u8, u8, u8), (u8, u8, u8)) = if self.high_contrast {
+                if tab.active {
+                    (self.chrome.card, self.chrome.title_text)
+                } else {
+                    (self.chrome.tab_bar, self.chrome.muted)
+                }
+            } else if tab.active {
                 (
                     (
                         self.bg.0.saturating_add(14),
@@ -5454,7 +7099,7 @@ impl Renderer {
                         TAB_TOP + i as i32,
                         tabw - 2 * inset,
                         1,
-                        c4((0x2e, 0xa0, 0x43), 220),
+                        c4(self.focus_color((0x2e, 0xa0, 0x43)), 220),
                     );
                 }
             }
@@ -5487,7 +7132,14 @@ impl Renderer {
                 let ch = (oy - TAB_TOP - 4).min(close_w + 4).max(close_w);
                 let cx = tx + tabw - close_w - 4;
                 let cy = TAB_TOP + ((oy - TAB_TOP - 4) - ch).max(0) / 2;
-                let xseg = [Seg::plain("✕", dim(self.fg, 0.55))];
+                let xseg = [Seg::plain(
+                    "✕",
+                    if self.high_contrast {
+                        self.chrome.title_text
+                    } else {
+                        dim(self.fg, 0.55)
+                    },
+                )];
                 let gw = self.measure(&xseg, false);
                 self.draw_run(
                     &xseg,
@@ -5501,9 +7153,16 @@ impl Renderer {
             }
             // dots: amber attention (a Claude waiting on you) beats green busy
             let dot = if tab.attention {
-                Some((0xf2, 0xcc, 0x60))
+                Some(self.accent_color(crate::theme::bar_accent(
+                    crate::theme::BarAccent::Amber,
+                    page_dark,
+                )))
             } else if tab.busy {
-                Some((0x56, 0xd3, 0x64))
+                Some(self.focus_color(if page_dark {
+                    (0x56, 0xd3, 0x64)
+                } else {
+                    crate::theme::bar_accent(crate::theme::BarAccent::Green, false)
+                }))
             } else {
                 None
             };
@@ -5539,14 +7198,39 @@ impl Renderer {
             self.draw_title_tip(out, whole, width, tx, &full);
         }
 
+        let elevated_w = elevated_label
+            .map(|text| {
+                let segs = [Seg::plain(text, (0xf2, 0xcc, 0x60))];
+                self.measure(&segs, false).ceil() as i32 + 16
+            })
+            .unwrap_or(0);
+        let end = self
+            .tab_rects(width, &titles, active)
+            .last()
+            .map_or(0, |r| r.1 + r.2);
         if claude {
-            let label = [Seg::plain("● Claude", (0x7e, 0xe7, 0x87))];
+            let label = [Seg::plain(
+                "● Claude",
+                crate::theme::bar_accent(crate::theme::BarAccent::Green, page_dark),
+            )];
             let tw = self.measure(&label, false);
-            let x = self.tab_controls(width)[0].0 - tw.ceil() as i32 - 18;
-            let end = self
-                .tab_rects(width, &titles, active)
-                .last()
-                .map_or(0, |r| r.1 + r.2);
+            let x = self.tab_controls(width)[0].0 - tw.ceil() as i32 - 18 - elevated_w;
+            if x >= end + 12 {
+                self.draw_run(
+                    &label,
+                    false,
+                    out,
+                    whole,
+                    x as f32,
+                    (oy - self.cell_h.ceil() as i32) / 2,
+                    1.0,
+                );
+            }
+        }
+        if let Some(text) = elevated_label {
+            let label = [Seg::plain(text, (0xf2, 0xcc, 0x60))];
+            let tw = self.measure(&label, false);
+            let x = self.tab_controls(width)[0].0 - tw.ceil() as i32 - 12;
             if x >= end + 12 {
                 self.draw_run(
                     &label,
@@ -5563,7 +7247,7 @@ impl Renderer {
         for (rect, glyph) in self.tab_controls(width).iter().zip(["‹", "›", "+"]) {
             let (bx, by, bw, bh) = *rect;
             push_rect(out, whole, bx, by, bw, bh, c4(bar_bg, 255));
-            let seg = [Seg::plain(glyph, self.fg)];
+            let seg = [Seg::plain(glyph, self.chrome_fg())];
             let gw = self.measure(&seg, false);
             self.draw_run(
                 &seg,
@@ -5586,20 +7270,29 @@ impl Renderer {
             .enumerate()
         {
             let (bx, by, bw, bh) = *rect;
+            let close = i == 2;
             if self.hover_caption == Some(i) {
-                let tint = if i == 2 {
-                    (0xc4, 0x2b, 0x1c)
+                let tint = if self.high_contrast {
+                    if close {
+                        self.chrome.focus
+                    } else {
+                        self.chrome.card
+                    }
                 } else {
-                    (0x33, 0x3c, 0x48)
+                    caption_hover(self.bg, close)
                 };
                 push_rect(out, whole, bx, by, bw, bh, c4(tint, 255));
             }
             let seg = [Seg::plain(
                 glyph,
-                if self.hover_caption == Some(2) && i == 2 {
-                    (0xff, 0xff, 0xff)
+                if self.high_contrast {
+                    if self.hover_caption == Some(2) && close {
+                        self.chrome.selection_text
+                    } else {
+                        self.chrome.title_text
+                    }
                 } else {
-                    (0xb6, 0xc2, 0xcf)
+                    caption_glyph(self.fg, self.hover_caption == Some(2) && close)
                 },
             )];
             let gw = self.measure(&seg, false);
@@ -5618,9 +7311,27 @@ impl Renderer {
         // and layout-proof (a shortcut fights an Arabic layout)
         let (bx, by, bw, bh) = self.settings_button_rect(width);
         if self.hover_gear {
-            push_rect(out, whole, bx, by, bw, bh, c4((0x33, 0x3c, 0x48), 255));
+            push_rect(
+                out,
+                whole,
+                bx,
+                by,
+                bw,
+                bh,
+                c4(
+                    if self.high_contrast {
+                        self.chrome.card
+                    } else {
+                        caption_hover(self.bg, false)
+                    },
+                    255,
+                ),
+            );
         }
-        let seg = [Seg::plain("⚙", (0xb6, 0xc2, 0xcf))];
+        let seg = [Seg::plain(
+            "⚙",
+            self.chrome_fg_or(caption_glyph(self.fg, false)),
+        )];
         let gw = self.measure(&seg, false);
         self.draw_run(
             &seg,
@@ -5719,15 +7430,24 @@ impl Renderer {
         full: &str,
     ) {
         let avail = (width as f32 - 24.0).max(40.0);
-        let shown = self.fit_title(full, self.fg, avail);
-        let segs = [Seg::plain(shown, self.fg)];
+        let tip_fg = self.chrome_fg();
+        let shown = self.fit_title(full, tip_fg, avail);
+        let segs = [Seg::plain(shown, tip_fg)];
         let tw = self.measure(&segs, true);
         let pad = 8;
         let w = tw.ceil() as i32 + pad * 2;
         let h = self.cell_h.ceil() as i32 + 10;
         let x = tx.min((width as i32 - w).max(0));
         let y = self.tab_bar_h().round() as i32 + 2;
-        push_rect(out, whole, x, y, w, h, c4((0x1c, 0x21, 0x28), 245));
+        push_rect(
+            out,
+            whole,
+            x,
+            y,
+            w,
+            h,
+            c4(self.surface((0x1c, 0x21, 0x28)), 245),
+        );
         self.draw_run(&segs, true, out, whole, (x + pad) as f32, y + 4, 1.0);
     }
 
@@ -5915,6 +7635,7 @@ mod tests {
             Some(3),
             ParagraphDir::Default,
             None,
+            true,
         );
         r.finish_pane_layout(pane);
         assert!(
@@ -5953,12 +7674,45 @@ mod tests {
                 Some(8),
                 ParagraphDir::Default,
                 None,
+                true,
             )
             .unwrap();
-        assert_eq!(
-            cursor.0,
-            30 - r.cell_w.round() as i32,
-            "RTL insertion precedes the leftmost glyph"
+        // The paragraph is RTL, so the word sits on the right of the 300px
+        // field and the cursor waits one cell to its left.
+        r.mapping_context = Some(((0, 0, 500, 200), 0));
+        r.draw_line_bidi(
+            &mut Vec::new(),
+            (0, 0, 500, 200),
+            30,
+            40,
+            300,
+            &cells,
+            true,
+            None,
+            ParagraphDir::Default,
+            None,
+            true,
+        );
+        let right = cells
+            .iter()
+            .map(|c| {
+                let (x, w, _) = r.cell_geometry[&((0, 0, 500, 200), 0, c.col)][0];
+                x + w
+            })
+            .max()
+            .unwrap();
+        let left = cells
+            .iter()
+            .map(|c| r.cell_geometry[&((0, 0, 500, 200), 0, c.col)][0].0)
+            .min()
+            .unwrap();
+        assert!(
+            (right - (30 + 300)).abs() <= 2,
+            "RTL word must end at the field's right edge, got {right}"
+        );
+        assert!(
+            cursor.0 + cursor.1 <= left + 1,
+            "cursor {cursor:?} must sit left of the word (x={left})"
         );
     }
 
@@ -5989,6 +7743,7 @@ mod tests {
                     Some(cursor_col),
                     ParagraphDir::Default,
                     None,
+                    true,
                 )
                 .expect("a cursor past the text still maps");
             r.finish_pane_layout(pane);
@@ -6027,6 +7782,7 @@ mod tests {
             Some(3),
             ParagraphDir::Default,
             None,
+            true,
         );
         assert!(inside.is_some_and(|c| c.0 >= pane.0));
     }
@@ -6054,6 +7810,7 @@ mod tests {
             None,
             ParagraphDir::Default,
             None,
+            true,
         );
         r.finish_pane_layout(pane);
         let lam_x = r.cell_geometry[&(pane, 0, lam)][0].0;
@@ -6101,6 +7858,7 @@ mod tests {
                     Some(end),
                     ParagraphDir::Default,
                     None,
+                    true,
                 )
                 .expect("end cursor maps");
             r.finish_pane_layout(pane);
@@ -6156,6 +7914,7 @@ mod tests {
                 Some(col),
                 ParagraphDir::Default,
                 None,
+                true,
             )
         };
         let on_lam = cursor_at(&mut r, lam).expect("cursor on ل");
@@ -6193,6 +7952,7 @@ mod tests {
                     Some(cursor_col),
                     ParagraphDir::Default,
                     None,
+                    true,
                 )
                 .expect("a cursor past the text still maps");
             r.finish_pane_layout(pane);
@@ -6272,6 +8032,7 @@ mod tests {
                     Some(end),
                     ParagraphDir::Default,
                     None,
+                    true,
                 )
                 .expect("the end cursor maps");
             r.finish_pane_layout(pane);
@@ -6323,10 +8084,13 @@ mod tests {
             claude_from: None,
             reorder: true,
             line_dir: &[],
+            bidi_mode: crate::bidi_ctl::BidiReorder::Full,
             search_match: None,
             marks: &[],
             link_hover: None,
             link_tip: None,
+            scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
         };
         let block = c4(r.fg, 170);
         let opaque_bg = c4(r.bg, 255);
@@ -6376,6 +8140,66 @@ mod tests {
         assert!(blink.iter().any(|v| v.color == opaque_bg));
     }
 
+    /// DECTCEM (`CSI ? 25 l`) hides the cursor. Claude Code does this.
+    /// The candidate window still has to sit on the cell the program is
+    /// writing into, not on the origin and not on nothing.
+    #[test]
+    fn ime_spot_stays_on_the_real_cell_when_the_cursor_is_hidden() {
+        use alacritty_terminal::{
+            event::VoidListener,
+            term::{Config, Term},
+            vte::ansi::Processor,
+        };
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 40, rows: 3 };
+        let mut t = Term::new(Config::default(), &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        p.advance(&mut t, b"ab\x1b[?25l");
+        assert!(
+            !t.mode()
+                .contains(alacritty_terminal::term::TermMode::SHOW_CURSOR),
+            "DECTCEM cleared"
+        );
+        let pane = (0, 0, 600, 120);
+        let view = PaneView {
+            rect: pane,
+            focused: true,
+            cursor: crate::config::CursorStyle::Block,
+            cursor_on: true,
+            bordered: false,
+            claude: false,
+            claude_from: None,
+            reorder: true,
+            line_dir: &[],
+            search_match: None,
+            marks: &[],
+            link_hover: None,
+            bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+            link_tip: None,
+            scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
+        };
+        let mut out = Vec::new();
+        r.begin_frame();
+        r.draw_pane(&mut out, &view, &t);
+        let spot = (
+            (2.0 * r.cell_w).round() as i32,
+            0,
+            r.cell_w.round() as i32,
+            r.cell_h.round() as i32,
+        );
+        assert_eq!(
+            r.ime_spot,
+            Some(spot),
+            "a hidden cursor still anchors the candidates on column 2"
+        );
+        let block = c4(r.fg, 170);
+        assert!(
+            !out.iter().any(|v| v.color == block),
+            "DECTCEM hides the block; the spot above is the cell, not the glyph"
+        );
+    }
+
     #[test]
     fn claude_inverse_space_cursor_stays_attached_to_arabic_input() {
         use alacritty_terminal::{
@@ -6399,10 +8223,13 @@ mod tests {
             claude_from: None,
             reorder: true,
             line_dir: &[],
+            bidi_mode: crate::bidi_ctl::BidiReorder::Full,
             search_match: None,
             marks: &[],
             link_hover: None,
             link_tip: None,
+            scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
         };
         r.draw_pane(&mut Vec::new(), &view, &t);
         let inverse = r
@@ -6441,10 +8268,13 @@ mod tests {
             claude_from: None,
             reorder: true,
             line_dir: &[],
+            bidi_mode: crate::bidi_ctl::BidiReorder::Full,
             search_match: None,
             marks: &[],
             link_hover: None,
             link_tip: None,
+            scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
         };
         r.draw_pane(&mut Vec::new(), &view, &t);
         let x = |col: usize| {
@@ -6541,6 +8371,9 @@ mod tests {
             link_tip: None,
             reorder: true,
             line_dir: &[],
+            bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+            scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
         };
         let mut out = Vec::new();
         r.draw_pane(&mut out, &view, &t);
@@ -6626,6 +8459,7 @@ mod tests {
             None,
             ParagraphDir::Default,
             None,
+            false,
         );
         assert!(!actual.is_empty());
         let geometry = |out: Vec<Vertex>| {
@@ -6701,6 +8535,9 @@ mod tests {
                 link_tip: None,
                 reorder: true,
                 line_dir: &[],
+                bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+                scroll_px: 0,
+                peek_dir: ParagraphDir::Default,
             };
             let mut out = Vec::new();
             r.draw_pane(&mut out, &view, &t);
@@ -6873,6 +8710,72 @@ mod tests {
         // a hidden bar has no chip to hit
         r.set_bar_hidden(true);
         assert!(!r.group_chip_hit((cx + cw / 2) as f64, 20.0));
+    }
+
+    /// An image in some cells of a row must not change how the Arabic in
+    /// the other cells is shaped. The grid still holds logical text, and
+    /// the bidi path produces the same boxes it would without the image.
+    #[test]
+    fn arabic_beside_an_image_keeps_the_same_shaping() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+        use base64::Engine;
+
+        let size = crate::term::TermSize { cols: 40, rows: 4 };
+        let mut with_img = Term::new(Config::default(), &size, VoidListener);
+        let mut plain = Term::new(Config::default(), &size, VoidListener);
+        let mut p1 = Processor::new();
+        let mut p2 = Processor::new();
+        let mut m1 = crate::term::SessionMeta::default();
+        let mut m2 = crate::term::SessionMeta::default();
+        let mut c1 = Vec::new();
+        let mut c2 = Vec::new();
+        let px = base64::engine::general_purpose::STANDARD.encode([255u8, 0, 0]);
+        let img = format!("\x1b_Ga=T,f=24,s=1,v=1,c=2,r=1,C=1,q=2;{px}\x1b\\");
+        let arabic = "\x1b[1;12Hمرحبا";
+        crate::term::process_chunk(&mut p1, &mut with_img, &mut m1, &mut c1, img.as_bytes());
+        crate::term::process_chunk(&mut p1, &mut with_img, &mut m1, &mut c1, arabic.as_bytes());
+        crate::term::process_chunk(&mut p2, &mut plain, &mut m2, &mut c2, arabic.as_bytes());
+        assert_eq!(m1.images.placement_count(), 1);
+
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let pane = (0, 0, 800, 200);
+        let view = PaneView {
+            rect: pane,
+            focused: true,
+            cursor: crate::config::CursorStyle::Block,
+            cursor_on: false,
+            bordered: false,
+            claude: false,
+            claude_from: None,
+            reorder: true,
+            line_dir: &[],
+            search_match: None,
+            marks: &[],
+            link_hover: None,
+            link_tip: None,
+            bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+            scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
+        };
+        let boxes = |r: &mut Renderer, term: &Term<VoidListener>| {
+            r.begin_frame();
+            r.draw_pane(&mut Vec::new(), &view, term);
+            (11..16)
+                .map(|col| r.cell_geometry.get(&(pane, 0, col)).cloned())
+                .collect::<Vec<_>>()
+        };
+        let shaped = boxes(&mut r, &with_img);
+        let alone = boxes(&mut r, &plain);
+        assert!(
+            shaped.iter().any(|b| b.is_some()),
+            "the row took the bidi path"
+        );
+        assert_eq!(
+            shaped, alone,
+            "Arabic boxes changed because an image shared the row"
+        );
     }
 
     /// Arabic must shape to real glyphs (no .notdef) through the fallback
@@ -7168,6 +9071,512 @@ mod tests {
         assert_eq!(rtl.byte_cols[1].2, 0);
     }
 
+    /// Cairo Regular, subset to Arabic, SIL OFL (`tests/fixtures/OFL-Cairo.txt`).
+    /// The block-cursor test loads it itself so CI does not need the font installed.
+    const CAIRO_ARABIC: &[u8] = include_bytes!("../tests/fixtures/Cairo-Arabic.ttf");
+
+    fn box_of(r: &Renderer, pane: Rect, col: usize) -> (i32, i32) {
+        if let Some(&(x, w, _)) = r.click_boxes.get(&(pane, 0, col)) {
+            return (x, w);
+        }
+        let spans = &r.cell_geometry[&(pane, 0, col)];
+        let left = spans.iter().map(|s| s.0).min().unwrap();
+        let right = spans.iter().map(|s| s.0 + s.1).max().unwrap();
+        (left, right - left)
+    }
+
+    fn cairo_renderer() -> Renderer {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        r.font_system.db_mut().load_font_data(CAIRO_ARABIC.to_vec());
+        r.arabic_family = Some("Cairo".into());
+        r
+    }
+
+    /// The advance box `draw_line_bidi` stored before ink was united with it.
+    /// Rounded the same way as the cell quads: each edge, then the gap.
+    fn advance_box(r: &mut Renderer, text: &str, ch: char) -> (i32, i32) {
+        let b0 = text.find(ch).unwrap_or_else(|| panic!("no {ch}"));
+        let b1 = b0 + ch.len_utf8();
+        let key = r.ensure_shaped(&[Seg::plain(text, FG)], true);
+        let mut left = i32::MAX;
+        let mut right = i32::MIN;
+        let buffer = &r.cache_hot[&key].buffer;
+        for run in buffer.layout_runs() {
+            let spans = run_spans(&run);
+            for (x, w) in highlight_spans(&spans, run.text, b0, b1) {
+                left = left.min(x.round() as i32);
+                right = right.max((x + w).round() as i32);
+            }
+        }
+        (left, (right - left).max(1))
+    }
+
+    fn cursor_on(r: &mut Renderer, pane: Rect, cells: &[CellInfo], col: usize) -> (i32, i32) {
+        r.draw_line_bidi(
+            &mut Vec::new(),
+            pane,
+            0,
+            0,
+            pane.2,
+            cells,
+            false,
+            Some(col),
+            ParagraphDir::Default,
+            None,
+            true,
+        )
+        .unwrap_or_else(|| panic!("no block on col {col}"))
+    }
+
+    /// Cairo reh joins outside its advance. The block must be that ink,
+    /// which is wider than the cell box the advance path draws. On
+    /// 22bc5d66 the block is the cell box, so this fails there.
+    #[test]
+    fn cairo_reh_block_extends_outside_its_cell() {
+        let mut r = cairo_renderer();
+        let pane = (0, 0, 800, 140);
+        let text = "go مرحبا";
+        let cells = row_cells(text, 0);
+        let reh = cells.iter().position(|c| c.c == 'ر').unwrap();
+        r.mapping_context = Some((pane, 0));
+        let (bx, bw) = advance_box(&mut r, text, 'ر');
+        let cursor = cursor_on(&mut r, pane, &cells, cells[reh].col);
+        r.finish_pane_layout(pane);
+        let (hx, hw) = box_of(&r, pane, cells[reh].col);
+        assert_eq!(
+            (hx, hw),
+            cursor,
+            "a click on reh must use the same box as the block"
+        );
+        assert!(
+            cursor.0 < bx,
+            "reh block x {} did not move left of the cell {bx}",
+            cursor.0
+        );
+        let overhang = (cursor.0..bx).find(|&x| {
+            r.hit_cell(pane, 0, x as f64 + 0.5).map(|hit| hit.0) == Some(cells[reh].col)
+        });
+        assert!(
+            overhang.is_some(),
+            "no point of the ink left of the cell hits reh"
+        );
+        assert!(
+            cursor.1 >= bw + 2,
+            "reh block width {} is not wider than its cell {bw}",
+            cursor.1
+        );
+        assert!(
+            cursor.0 < bx + bw / 2 && cursor.0 + cursor.1 > bx + bw / 2,
+            "reh block {cursor:?} does not cover the cell center {bx}+{bw}"
+        );
+        assert_ne!(
+            (cursor.0, cursor.1),
+            (bx, bw),
+            "reh block is still the cell box"
+        );
+    }
+
+    /// Cairo seen is the wide join. Its ink runs past the cell on both
+    /// sides; the base build's block is that cell.
+    #[test]
+    fn cairo_seen_block_extends_outside_its_cell() {
+        let mut r = cairo_renderer();
+        let pane = (0, 0, 800, 140);
+        let text = "go السلام";
+        let cells = row_cells(text, 0);
+        let seen = cells.iter().position(|c| c.c == 'س').unwrap();
+        r.mapping_context = Some((pane, 0));
+        let (bx, bw) = advance_box(&mut r, text, 'س');
+        let cursor = cursor_on(&mut r, pane, &cells, cells[seen].col);
+        r.finish_pane_layout(pane);
+        assert!(
+            cursor.1 >= bw + 2,
+            "seen block width {} is not wider than its cell {bw}",
+            cursor.1
+        );
+        assert!(
+            cursor.0 < bx && cursor.0 + cursor.1 > bx + bw,
+            "seen block {cursor:?} does not stick out of the cell {bx}+{bw}"
+        );
+    }
+
+    /// Each half of Cairo «لا» is half of one ink box, lam on the right and
+    /// alef on the left. The base build's halves are the advance split, which
+    /// is a different width from the ink split.
+    #[test]
+    fn cairo_lam_alef_halves_split_the_ink_right_to_left() {
+        let mut r = cairo_renderer();
+        let pane = (0, 0, 800, 140);
+        let text = "go لا";
+        let cells = row_cells(text, 0);
+        let lam = cells.iter().position(|c| c.c == 'ل').unwrap();
+        r.mapping_context = Some((pane, 0));
+        let (lx, lw) = advance_box(&mut r, text, 'ل');
+        let (ax, aw) = advance_box(&mut r, text, 'ا');
+        let on_lam = cursor_on(&mut r, pane, &cells, cells[lam].col);
+        let on_alef = cursor_on(&mut r, pane, &cells, cells[lam + 1].col);
+        assert!(
+            on_alef.0 + on_alef.1 <= on_lam.0 + 1,
+            "ا {on_alef:?} must be the left half of ل {on_lam:?}"
+        );
+        assert!(
+            on_lam.0 - on_alef.0 >= 4,
+            "the halves are not split, ا {on_alef:?} ل {on_lam:?}"
+        );
+        assert!(
+            (on_lam.1 - lw).abs() >= 1 || (on_alef.1 - aw).abs() >= 1 || on_lam.0 != lx,
+            "lam-alef block is still the cell split ل {on_lam:?}/{lx}+{lw} ا {on_alef:?}/{ax}+{aw}"
+        );
+        let cell_w = r.cell_w.round() as i32;
+        assert!(
+            on_lam.1 + 2 < cell_w && on_alef.1 + 2 < cell_w,
+            "a half is still a cell: ل {on_lam:?} ا {on_alef:?} cell {cell_w}"
+        );
+    }
+
+    /// Beh's ink is a pixel narrower than its advance. The block is the
+    /// union, so it still covers the cell instead of shrinking into a bar.
+    #[test]
+    fn cairo_beh_block_covers_its_cell() {
+        let mut r = cairo_renderer();
+        let pane = (0, 0, 800, 140);
+        let text = "go ب";
+        let cells = row_cells(text, 0);
+        let beh = cells.iter().position(|c| c.c == 'ب').unwrap();
+        let (bx, bw) = advance_box(&mut r, text, 'ب');
+        let cursor = cursor_on(&mut r, pane, &cells, cells[beh].col);
+        assert!(
+            cursor.1 >= bw,
+            "beh block width {} shrank under its cell {bw}",
+            cursor.1
+        );
+        assert!(
+            cursor.0 <= bx && cursor.0 + cursor.1 >= bx + bw,
+            "beh block {cursor:?} does not cover its cell {bx}+{bw}"
+        );
+    }
+
+    /// A mixed line shapes the Latin too. `l` and `.` have ink a few pixels
+    /// wide; the block must stay at least the advance cell, or it reads as
+    /// the bar cursor. Fails when the block is the ink alone.
+    #[test]
+    fn mixed_line_thin_latin_block_keeps_the_cell() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let pane = (0, 0, 900, 140);
+        let text = "C:\\Users\\me.l>مرحبا";
+        let cells = row_cells(text, 0);
+        for ch in ['.', 'l'] {
+            let col = cells.iter().position(|c| c.c == ch).unwrap();
+            let (bx, bw) = advance_box(&mut r, text, ch);
+            let cursor = cursor_on(&mut r, pane, &cells, cells[col].col);
+            assert!(
+                cursor.1 >= bw,
+                "{ch:?} block width {} shrank under its cell {bw}",
+                cursor.1
+            );
+            assert!(
+                cursor.0 <= bx && cursor.0 + cursor.1 >= bx + bw,
+                "{ch:?} block {cursor:?} does not cover its cell {bx}+{bw}"
+            );
+        }
+    }
+
+    /// «لَا» is lam, a fatha, then alef. The fatha used to hide the lam from
+    /// the ligature check, so the two halves were not one ink box.
+    #[test]
+    fn lam_alef_with_fatha_still_splits_right_to_left() {
+        let text = "لَا";
+        let lam_end = "لَ".len();
+        let spans = vec![
+            crate::mouse::GlyphSpan {
+                x: 8.0,
+                w: 10.0,
+                start: 0,
+                end: lam_end,
+                rtl: true,
+            },
+            crate::mouse::GlyphSpan {
+                x: 0.0,
+                w: 6.0,
+                start: lam_end,
+                end: text.len(),
+                rtl: true,
+            },
+        ];
+        let merged = merge_lam_alef(spans, text);
+        assert_eq!(merged.len(), 1, "fatha kept lam and alef apart: {merged:?}");
+        assert_eq!(merged[0].start, 0);
+        assert_eq!(merged[0].end, text.len());
+        assert!(merged[0].rtl);
+    }
+
+    /// Amiri, the bundled face, gets the same union: a thin alef does not
+    /// shrink under its cell, and «لا» still splits with alef on the left.
+    #[test]
+    fn amiri_block_covers_the_cell_and_splits_lam_alef() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        r.font_system.db_mut().load_font_data(AMIRI.to_vec());
+        r.arabic_family = Some("Amiri".into());
+        let pane = (0, 0, 800, 140);
+        let text = "go ا";
+        let cells = row_cells(text, 0);
+        let alef = cells.iter().position(|c| c.c == 'ا').unwrap();
+        let (bx, bw) = advance_box(&mut r, text, 'ا');
+        let cursor = cursor_on(&mut r, pane, &cells, cells[alef].col);
+        assert!(
+            cursor.1 >= bw,
+            "Amiri alef width {} shrank under its cell {bw}",
+            cursor.1
+        );
+        assert!(
+            cursor.0 <= bx && cursor.0 + cursor.1 >= bx + bw,
+            "Amiri alef {cursor:?} does not cover its cell {bx}+{bw}"
+        );
+
+        let lig = "go لا";
+        let lig_cells = row_cells(lig, 0);
+        let lam = lig_cells.iter().position(|c| c.c == 'ل').unwrap();
+        let on_lam = cursor_on(&mut r, pane, &lig_cells, lig_cells[lam].col);
+        let on_alef = cursor_on(&mut r, pane, &lig_cells, lig_cells[lam + 1].col);
+        assert!(
+            on_alef.0 + on_alef.1 <= on_lam.0 + 1,
+            "Amiri ا {on_alef:?} must be left of ل {on_lam:?}"
+        );
+        assert!(
+            on_lam.0 - on_alef.0 >= 4,
+            "Amiri halves are not split, ا {on_alef:?} ل {on_lam:?}"
+        );
+    }
+
+    /// Amiri puts tanween on the alef inside the lam's cluster, so the two
+    /// byte ranges share an end. They still have to merge, or the alef block
+    /// overlaps the lam. «أهلاً» and «مثلاً» are the same cluster.
+    #[test]
+    fn lam_alef_with_tanween_is_one_cluster() {
+        let text = "abcلاً";
+        assert_eq!("abc".len(), 3, "the lam cluster starts at byte 3");
+        let lam_cluster = crate::mouse::GlyphSpan {
+            x: 37.0,
+            w: 7.0,
+            start: 3,
+            end: 9,
+            rtl: true,
+        };
+        let alef_cluster = crate::mouse::GlyphSpan {
+            x: 30.0,
+            w: 11.0,
+            start: 5,
+            end: 9,
+            rtl: true,
+        };
+        let merged = merge_lam_alef(vec![lam_cluster, alef_cluster], text);
+        assert_eq!(
+            merged.len(),
+            1,
+            "tanween kept lam and alef apart: {merged:?}"
+        );
+        assert_eq!(merged[0].start, 3);
+        assert_eq!(merged[0].end, 9);
+        assert!(merged[0].rtl);
+    }
+
+    /// The live Amiri face: «لاً» splits with alef on the left and the two
+    /// blocks do not overlap.
+    #[test]
+    fn amiri_lam_alef_tanween_halves_do_not_overlap() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        r.font_system.db_mut().load_font_data(AMIRI.to_vec());
+        r.arabic_family = Some("Amiri".into());
+        let pane = (0, 0, 800, 140);
+        let text = "go لاً";
+        let cells = row_cells(text, 0);
+        let lam = cells.iter().position(|c| c.c == 'ل').unwrap();
+        let on_lam = cursor_on(&mut r, pane, &cells, cells[lam].col);
+        let on_alef = cursor_on(&mut r, pane, &cells, cells[lam + 1].col);
+        assert!(
+            on_alef.0 < on_lam.0,
+            "Amiri اً {on_alef:?} is not left of ل {on_lam:?}"
+        );
+        assert!(
+            on_alef.0 + on_alef.1 <= on_lam.0 + 1,
+            "Amiri اً {on_alef:?} overlaps ل {on_lam:?}"
+        );
+    }
+
+    /// A click in the left quarter of «ك» belongs to «ك» even when «م»'s ink
+    /// reaches it. The advance wins; ink is only the overhang.
+    #[test]
+    fn amiri_click_on_the_left_of_kaf_stays_on_kaf() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        r.font_system.db_mut().load_font_data(AMIRI.to_vec());
+        r.arabic_family = Some("Amiri".into());
+        let pane = (0, 0, 800, 140);
+        let text = "مرحبا بكم";
+        let cells = row_cells(text, 0);
+        let kaf = cells.iter().position(|c| c.c == 'ك').unwrap();
+        let meem = cells.iter().rposition(|c| c.c == 'م').unwrap();
+        r.begin_frame();
+        r.mapping_context = Some((pane, 0));
+        r.draw_line_bidi(
+            &mut Vec::new(),
+            pane,
+            0,
+            0,
+            pane.2,
+            &cells,
+            false,
+            None,
+            ParagraphDir::Default,
+            None,
+            true,
+        );
+        r.finish_pane_layout(pane);
+        r.warm_row_ink(pane, 0);
+        let (kx, kw, _) = r.cell_geometry[&(pane, 0, cells[kaf].col)][0];
+        let x = kx as f64 + (kw as f64 / 8.0);
+        let meem_box = r.click_boxes[&(pane, 0, cells[meem].col)];
+        assert!(
+            (meem_box.0 as f64) <= x && x < (meem_box.0 + meem_box.1) as f64,
+            "meem ink {meem_box:?} does not cover the left quarter of kaf at {x} ({kx}+{kw})"
+        );
+        assert_eq!(
+            r.hit_cell(pane, 0, x).map(|hit| hit.0),
+            Some(cells[kaf].col),
+            "the left of kaf was given to meem"
+        );
+    }
+
+    /// Paint measures ink for the cursor cell and no other. The next frame
+    /// reuses the box cached on the shaped line.
+    #[test]
+    fn ink_is_measured_only_for_the_cursor_cell() {
+        let mut r = cairo_renderer();
+        let pane = (0, 0, 1600, 140);
+        let text = "مرحبا بالعالم مرحبا بالعالم مرحبا بالعالم";
+        let cells = row_cells(text, 0);
+        assert!(
+            cells.len() > 8,
+            "the line has to be long enough to show the old cost"
+        );
+        let draw = |r: &mut Renderer, col: Option<usize>| {
+            r.begin_frame();
+            r.mapping_context = Some((pane, 0));
+            r.draw_line_bidi(
+                &mut Vec::new(),
+                pane,
+                0,
+                0,
+                pane.2,
+                &cells,
+                false,
+                col,
+                ParagraphDir::Default,
+                None,
+                true,
+            );
+        };
+        draw(&mut r, None);
+        assert_eq!(r.ink_cells, 0, "a frame with no cursor measured ink");
+        draw(&mut r, Some(cells[0].col));
+        assert_eq!(
+            r.ink_cells, 1,
+            "a frame measured ink for cells other than the cursor"
+        );
+        draw(&mut r, Some(cells[0].col));
+        assert_eq!(
+            r.ink_cells, 0,
+            "the cursor cell was measured again instead of using the shaped line"
+        );
+        draw(&mut r, Some(cells[4].col));
+        assert_eq!(
+            r.ink_cells, 1,
+            "moving the cursor measured more than that cell"
+        );
+    }
+
+    /// Selection (and search, which reads the same spans) draws one rect per
+    /// cell. On 80e64f0 the ink box was stored next to the advance, so an
+    /// Arabic line went from 78 rect-vertices to 156 and a mixed line from
+    /// 114 to 228.
+    #[test]
+    fn selection_on_arabic_and_mixed_lines_is_one_rect_per_cell() {
+        fn rects_for(text: &str) -> usize {
+            use alacritty_terminal::{
+                event::VoidListener,
+                index::{Column, Point, Side},
+                selection::{Selection, SelectionType},
+                term::{Config, Term},
+                vte::ansi::Processor,
+            };
+            let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+            let size = crate::term::TermSize { cols: 80, rows: 3 };
+            let mut t = Term::new(Config::default(), &size, VoidListener);
+            let mut p: Processor = Processor::new();
+            p.advance(&mut t, text.as_bytes());
+            let n = text.chars().count();
+            let mut sel = Selection::new(
+                SelectionType::Simple,
+                Point::new(alacritty_terminal::index::Line(0), Column(0)),
+                Side::Left,
+            );
+            sel.update(
+                Point::new(alacritty_terminal::index::Line(0), Column(n - 1)),
+                Side::Right,
+            );
+            t.selection = Some(sel);
+            let pane = (0, 0, 2400, 400);
+            let view = PaneView {
+                rect: pane,
+                focused: true,
+                cursor: crate::config::CursorStyle::Block,
+                cursor_on: true,
+                bordered: false,
+                claude: false,
+                claude_from: None,
+                reorder: true,
+                line_dir: &[],
+                search_match: None,
+                marks: &[],
+                link_hover: None,
+                link_tip: None,
+                bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+                scroll_px: 0,
+                peek_dir: ParagraphDir::Default,
+            };
+            let mut out = Vec::new();
+            r.begin_frame();
+            r.draw_pane(&mut out, &view, &t);
+            let color = c4(SELECTION_RGBA.0, SELECTION_RGBA.1 as u8);
+            let verts = out.iter().filter(|v| v.color == color).count();
+            assert_eq!(verts % 6, 0, "{text}: a selection rect is 6 vertices");
+            let rects = verts / 6;
+            let spans: usize = r
+                .cell_geometry
+                .iter()
+                .filter(|((p, row, col), _)| *p == pane && *row == 0 && *col < n)
+                .map(|(_, spans)| spans.len())
+                .sum();
+            // A Latin row is a grid: it has no shaped spans and the overlay
+            // draws one rect per cell anyway. An Arabic or mixed row stores
+            // the spans the overlay walks, and there must be one per cell.
+            if spans > 0 {
+                assert_eq!(spans, n, "{text}: overlay source has one span per cell");
+            }
+            assert!(
+                r.ink_cells <= 1,
+                "{text}: painting measured ink for {} cells",
+                r.ink_cells
+            );
+            rects
+        }
+        let arabic = "مرحبا بالعالم";
+        let mixed = r"C:\Users\me.l>مرحبا";
+        let latin = "hello world abc";
+        assert_eq!(rects_for(arabic), arabic.chars().count());
+        assert_eq!(rects_for(mixed), mixed.chars().count());
+        assert_eq!(rects_for(latin), latin.chars().count());
+    }
+
     /// The line classifier: Arabic rows take the BiDi path, others the grid.
     #[test]
     fn arabic_detection_ranges() {
@@ -7273,6 +9682,144 @@ mod cache_tests {
             ..Default::default()
         };
         assert_eq!(Renderer::new(1.0, &stale, 0.0).arabic_family(), None);
+    }
+
+    /// Logical endpoints of an aligned terminal row: x of the first char,
+    /// x of the last char, natural width, whether the paragraph is RTL,
+    /// and how many .notdef glyphs were produced.
+    fn arabic_row_shape(r: &mut Renderer, text: &str) -> (f32, f32, f32, bool, usize) {
+        let key = r.ensure_shaped(&[Seg::plain(text, (255, 255, 255))], true);
+        let shaped = r.cache_hot.get(&key).expect("shaped");
+        let buf = &shaped.buffer;
+        let hl = |b0: usize, b1: usize| -> f32 {
+            for run in buf.layout_runs() {
+                if let Some((x, _)) = run
+                    .highlight(
+                        cosmic_text::Cursor::new(0, b0),
+                        cosmic_text::Cursor::new(0, b1),
+                    )
+                    .next()
+                {
+                    return x;
+                }
+            }
+            panic!("no highlight for byte range {b0}..{b1}");
+        };
+        let first_len = text.chars().next().expect("text").len_utf8();
+        let last_len = text.chars().next_back().expect("text").len_utf8();
+        let notdef = buf
+            .layout_runs()
+            .flat_map(|run| run.glyphs.iter())
+            .filter(|glyph| glyph.glyph_id == 0)
+            .count();
+        (
+            hl(0, first_len),
+            hl(text.len() - last_len, text.len()),
+            shaped.natw,
+            buf.is_rtl(0) == Some(true),
+            notdef,
+        )
+    }
+
+    /// A font-size reload rebuilds the renderer. The one already drawing
+    /// keeps its Arabic fallback and the row it has shaped; the replacement
+    /// shapes that row again at the new size, still RTL, still Amiri.
+    #[test]
+    fn font_size_reload_reshapes_an_arabic_row_without_changing_bidi_or_fallback() {
+        let before = crate::config::UserConfig {
+            font_size: Some(16.0),
+            arabic_font: Some("Amiri".into()),
+            bidi: Some(crate::config::BidiConfig {
+                honor_bdsm: false,
+                mode: crate::bidi_ctl::BidiReorder::Full,
+            }),
+            ..Default::default()
+        };
+        let before_bytes = crate::config::encode(&before).unwrap();
+        let mut live = Renderer::new(1.0, &before, 0.0);
+        assert_eq!(live.arabic_family(), Some("Amiri"));
+        let text = "مرحبا";
+        let old = arabic_row_shape(&mut live, text);
+        let (old_first, old_last, old_w, old_rtl, old_notdef) = old;
+        assert!(old_rtl, "مرحبا is an RTL paragraph");
+        assert!(
+            old_first > old_last,
+            "logical start x {old_first} is not right of the logical end {old_last}"
+        );
+        assert_eq!(
+            old_notdef, 0,
+            "Arabic fell through to .notdef before the reload"
+        );
+        assert!(old_w > 0.0);
+
+        let after = crate::config::UserConfig {
+            font_size: Some(28.0),
+            ..before.clone()
+        };
+        let next = crate::config::encode(&after).unwrap();
+        let msg = crate::config_watch::reload_from_bytes(before, &before_bytes, &next)
+            .expect("a font-size change reloads");
+        let crate::config_watch::ReloadMsg::Applied {
+            config,
+            plan,
+            deferred,
+            ..
+        } = msg
+        else {
+            panic!("font-size reload was rejected");
+        };
+        assert!(plan.font);
+        assert!(deferred.is_empty());
+        assert_eq!(config.font_size, Some(28.0));
+        assert_eq!(config.arabic_font.as_deref(), Some("Amiri"));
+        assert!(
+            !config.honor_bdsm(),
+            "the reload must not flip the BiDi policy back to the default"
+        );
+
+        // The renderer that is mid-frame is not retargeted: same fallback,
+        // same shaped row.
+        assert_eq!(live.arabic_family(), Some("Amiri"));
+        assert_eq!(arabic_row_shape(&mut live, text), old);
+
+        let mut replaced = Renderer::new(1.0, &config, 0.0);
+        assert_eq!(replaced.arabic_family(), Some("Amiri"));
+        assert!(
+            replaced.cell_h > live.cell_h,
+            "the replacement is built at the new size"
+        );
+        let (new_first, new_last, new_w, new_rtl, new_notdef) =
+            arabic_row_shape(&mut replaced, text);
+        assert!(new_rtl);
+        assert!(
+            new_first > new_last,
+            "re-shaped row is still RTL: start {new_first}, end {new_last}"
+        );
+        assert_eq!(new_notdef, 0);
+        assert!(
+            new_w > old_w,
+            "the row was shaped again at 28pt ({new_w}) rather than reused at 16pt ({old_w})"
+        );
+        let families = {
+            let key = replaced.ensure_shaped(&[Seg::plain(text, (255, 255, 255))], true);
+            let shaped = replaced.cache_hot.get(&key).expect("shaped");
+            let db = replaced.font_system.db();
+            shaped
+                .buffer
+                .layout_runs()
+                .flat_map(|run| run.glyphs.iter())
+                .map(|glyph| {
+                    db.face(glyph.font_id)
+                        .and_then(|face| face.families.first().map(|(name, _)| name.clone()))
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(!families.is_empty());
+        assert!(
+            families.iter().all(|family| family == "Amiri"),
+            "Arabic fallback changed across the reload: {families:?}"
+        );
     }
 
     /// x of every glyph in a shaped run, relative to where it is drawn.
@@ -7597,6 +10144,24 @@ mod cache_tests {
     /// heart of "settings change the appearance" — the complaint that started
     /// M15. Verified without any GUI.
     #[test]
+    fn the_query_table_holds_the_colours_this_renderer_paints() {
+        let dracula = theme_by_name("Dracula").unwrap();
+        let cfg = crate::config::UserConfig {
+            theme: Some("Dracula".into()),
+            ..Default::default()
+        };
+        let r = Renderer::new(1.0, &cfg, 0.0);
+        let q = r.query_colors();
+        assert_eq!(q[257], dracula.bg, "OSC 11 hears the painted background");
+        assert_eq!(q[256], dracula.fg, "OSC 10");
+        assert_eq!(q[258], dracula.fg, "OSC 12: the cursor is drawn in fg");
+        assert_eq!(&q[..16], &dracula.palette[..]);
+        for i in [16u8, 100, 231, 232, 255] {
+            assert_eq!(q[i as usize], r.ansi_rgb(AnsiColor::Indexed(i)), "{i}");
+        }
+    }
+
+    #[test]
     fn a_theme_changes_the_renderer_colors() {
         // default theme = بيان (dark GitHub-ish)
         let def = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
@@ -7649,6 +10214,298 @@ mod cache_tests {
             serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(saved.theme.as_deref(), Some("Dracula"));
         assert_eq!(saved.bg.as_deref(), Some("#123456"));
+    }
+
+    #[test]
+    fn high_contrast_renderer_maps_chrome_and_keeps_the_theme_when_off() {
+        let sys = crate::a11y::SystemColors {
+            window: (0x00, 0x00, 0x00),
+            window_text: (0xff, 0xff, 0x00),
+            highlight: (0x00, 0x00, 0xff),
+            highlight_text: (0xff, 0xff, 0xff),
+            hotlight: (0xff, 0x00, 0xff),
+            gray_text: (0x80, 0x80, 0x80),
+            btn_face: (0xff, 0xff, 0xff),
+        };
+        let off = Renderer::with_a11y(
+            1.0,
+            &crate::config::UserConfig::default(),
+            0.0,
+            crate::a11y::A11ySnapshot::neutral(),
+        );
+        let theme = theme_by_name(DEFAULT_THEME).unwrap();
+        assert!(!off.high_contrast);
+        assert_eq!(off.bg, theme.bg);
+        assert_eq!(off.fg, theme.fg);
+        assert_eq!(off.chrome.focus, (0x2e, 0xa0, 0x43));
+
+        let on = Renderer::with_a11y(
+            1.0,
+            &crate::config::UserConfig::default(),
+            0.0,
+            crate::a11y::A11ySnapshot {
+                high_contrast: true,
+                colors: sys,
+                text_scale: 1.0,
+            },
+        );
+        assert!(on.high_contrast);
+        assert!(on.grid_follows_hc);
+        assert_eq!(on.bg, sys.window);
+        assert_eq!(on.fg, sys.window_text);
+        assert_eq!(on.chrome.tab_bar, sys.window);
+        assert_eq!(on.chrome.title_bar, sys.window);
+        assert_eq!(on.chrome.palette, sys.btn_face);
+        assert_eq!(on.chrome.card, sys.btn_face);
+        assert_eq!(on.chrome.scrollbar, sys.gray_text);
+        assert_eq!(on.chrome.focus, sys.highlight);
+        assert_eq!(on.chrome.selection, sys.highlight);
+        assert_eq!(on.chrome.cursor, sys.window_text);
+        assert_eq!(on.cursor_color(), sys.window_text);
+        assert_eq!(on.scrollbar_paint().0, sys.gray_text);
+
+        let keep = crate::config::UserConfig {
+            terminal_follow_high_contrast: Some(false),
+            ..Default::default()
+        };
+        let grid = Renderer::with_a11y(
+            1.0,
+            &keep,
+            0.0,
+            crate::a11y::A11ySnapshot {
+                high_contrast: true,
+                colors: sys,
+                text_scale: 1.0,
+            },
+        );
+        assert!(grid.high_contrast);
+        assert!(!grid.grid_follows_hc);
+        assert_eq!(grid.bg, theme.bg, "the grid keeps the theme");
+        assert_eq!(grid.fg, theme.fg);
+        assert_eq!(grid.chrome.tab_bar, sys.window, "chrome still follows");
+        assert_eq!(grid.cursor_color(), theme.fg);
+    }
+
+    #[test]
+    fn text_scale_150_composes_with_dpi_and_leaves_palette_compression_alone() {
+        let snap = crate::a11y::A11ySnapshot {
+            text_scale: 1.5,
+            ..crate::a11y::A11ySnapshot::neutral()
+        };
+        let mut r = Renderer::with_a11y(1.5, &crate::config::UserConfig::default(), 0.0, snap);
+        assert!((r.terminal_metrics.font_size - 40.5).abs() < 0.01);
+        assert!((r.ui_font_px() - 36.0).abs() < 0.01);
+        assert!((r.ui_cell_h() - 22.4 * 1.5 * 1.5).abs() < 0.01);
+        // A roomy window does not compress the palette. That field stays the
+        // compact factor, not the 1.5 system text size.
+        let layout = r.palette_layout(1400, 900, 4, 0);
+        assert!(
+            (layout.text_scale - 1.0).abs() < 0.05,
+            "palette compression was {0}, system text scale must not land here",
+            layout.text_scale
+        );
+        let arabic = glyph_ids(&mut r, "مرحبا");
+        assert!(
+            arabic.iter().any(|id| *id != 0),
+            "Arabic still shapes at the larger size"
+        );
+    }
+
+    #[test]
+    fn follow_system_text_size_off_keeps_an_explicit_point_size() {
+        let cfg = crate::config::UserConfig {
+            font_size: Some(16.0),
+            follow_system_text_size: Some(false),
+            ..Default::default()
+        };
+        let snap = crate::a11y::A11ySnapshot {
+            text_scale: 1.5,
+            ..crate::a11y::A11ySnapshot::neutral()
+        };
+        let held = Renderer::with_a11y(1.5, &cfg, 0.0, snap);
+        assert!((held.terminal_metrics.font_size - 24.0).abs() < 0.01);
+        assert!((held.ui_font_px() - 24.0).abs() < 0.01);
+
+        let follow = crate::config::UserConfig {
+            font_size: Some(16.0),
+            ..Default::default()
+        };
+        let grown = Renderer::with_a11y(1.5, &follow, 0.0, snap);
+        assert!((grown.terminal_metrics.font_size - 36.0).abs() < 0.01);
+        assert!((grown.ui_font_px() - 36.0).abs() < 0.01);
+    }
+
+    /// A system light sample reaches the renderer. A named scheme, and an
+    /// explicit dark/light word, do not move when that sample disagrees.
+    #[test]
+    fn system_light_reaches_the_renderer_unless_the_user_locked_a_theme() {
+        let mut cfg = crate::config::UserConfig {
+            system_apps_light: Some(true),
+            ..Default::default()
+        };
+        let r = Renderer::new(1.0, &cfg, 0.0);
+        assert_eq!(r.bg, crate::theme::LIGHT.bg);
+        assert_eq!(r.fg, crate::theme::LIGHT.fg);
+        assert_eq!(r.palette, crate::theme::LIGHT.palette);
+
+        cfg.theme = Some("Dracula".into());
+        let locked = Renderer::new(1.0, &cfg, 0.0);
+        assert_eq!(locked.bg, theme_by_name("Dracula").unwrap().bg);
+
+        cfg.theme = Some("dark".into());
+        let forced = Renderer::new(1.0, &cfg, 0.0);
+        assert_eq!(forced.bg, crate::theme::DARK.bg);
+        assert_eq!(forced.palette, crate::theme::DARK.palette);
+
+        // The event path's new colours land on the renderer the app paints.
+        let mut live = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let before = crate::theme::ThemeSurface {
+            colors: resolved_colors(&crate::config::UserConfig::default()),
+            follows_system: true,
+        };
+        let after = before.apply_event(crate::theme::SystemThemeEvent::Winit { light: true });
+        live.set_colors(after.colors.bg, after.colors.fg, after.colors.palette);
+        assert_eq!(live.palette, crate::theme::LIGHT.palette);
+        assert!(!after.colors.title_bar_dark);
+    }
+
+    fn vertex_rgb(c: [f32; 4]) -> (u8, u8, u8) {
+        (
+            (c[0] * 255.0).round() as u8,
+            (c[1] * 255.0).round() as u8,
+            (c[2] * 255.0).round() as u8,
+        )
+    }
+
+    /// Minimise, maximise, close, and the gear. Their ink is the page
+    /// foreground (the same as ‹ › +), and each pairing with the bar or
+    /// the hover fill clears 3:1 in both themes. The old `#b6c2cf` glyph
+    /// and `#333c48` hover are a dark-bar pair; on the light bar they vanish.
+    #[test]
+    fn title_bar_glyphs_clear_three_to_one_in_light_and_dark() {
+        for (bg, fg) in [
+            (crate::theme::LIGHT.bg, crate::theme::LIGHT.fg),
+            (crate::theme::DARK.bg, crate::theme::DARK.fg),
+        ] {
+            let bar = chrome_bar_bg(bg);
+            let glyph = caption_glyph(fg, false);
+            let on_close = caption_glyph(fg, true);
+            let rest = caption_hover(bg, false);
+            let close = caption_hover(bg, true);
+            for (ink, ground, name) in [
+                (glyph, bar, "glyph on the bar"),
+                (glyph, rest, "glyph on the hover"),
+                (on_close, close, "close glyph on red"),
+            ] {
+                let ratio = crate::theme::contrast_ratio(ink, ground);
+                assert!(ratio >= 3.0, "{name} is {ratio}:1 on {bg:?}, want >= 3");
+            }
+        }
+
+        let mut cfg = crate::config::UserConfig {
+            system_apps_light: Some(true),
+            ..Default::default()
+        };
+        let mut r = Renderer::new(1.0, &cfg, 0.0);
+        r.use_ui_metrics(true);
+        let tabs = vec![TabInfo {
+            title: "hi".into(),
+            busy: true,
+            attention: true,
+            active: true,
+            progress: None,
+        }];
+        let mut out = Vec::new();
+        r.draw_chrome(&mut out, 1400, 800, &tabs, Some("بحث"), true, None);
+        let painted: Vec<(u8, u8, u8)> = out.iter().map(|v| vertex_rgb(v.color)).collect();
+        let glyph = caption_glyph(r.fg, false);
+        let accent = crate::theme::bar_accent(crate::theme::BarAccent::Green, false);
+        let amber = crate::theme::bar_accent(crate::theme::BarAccent::Amber, false);
+        assert!(
+            painted.contains(&glyph),
+            "caption ink is not the page foreground"
+        );
+        assert!(
+            painted.contains(&accent),
+            "the Claude mark is not the light green"
+        );
+        assert!(
+            painted.contains(&amber),
+            "the attention dot is not the light amber"
+        );
+        assert!(
+            painted.contains(&search_line(r.bg)),
+            "the search line is not the light amber"
+        );
+        assert!(!painted.contains(&(0xb6, 0xc2, 0xcf)));
+        assert!(!painted.contains(&(0x33, 0x3c, 0x48)));
+
+        r.hover_caption = Some(0);
+        r.hover_gear = true;
+        out.clear();
+        r.draw_chrome(&mut out, 1400, 800, &tabs, None, false, None);
+        let hovered: Vec<(u8, u8, u8)> = out.iter().map(|v| vertex_rgb(v.color)).collect();
+        assert!(hovered.contains(&caption_hover(r.bg, false)));
+        assert!(!hovered.contains(&(0x33, 0x3c, 0x48)));
+
+        r.hover_caption = Some(2);
+        r.hover_gear = false;
+        out.clear();
+        r.draw_chrome(&mut out, 1400, 800, &tabs, None, false, None);
+        let closing: Vec<(u8, u8, u8)> = out.iter().map(|v| vertex_rgb(v.color)).collect();
+        assert!(closing.contains(&caption_glyph(r.fg, true)));
+        assert!(closing.contains(&caption_hover(r.bg, true)));
+
+        cfg.system_apps_light = Some(false);
+        cfg.theme = Some("dark".into());
+        let mut dark = Renderer::new(1.0, &cfg, 0.0);
+        dark.use_ui_metrics(true);
+        let mut dark_out = Vec::new();
+        dark.draw_chrome(&mut dark_out, 1400, 800, &tabs, None, true, None);
+        let dark_painted: Vec<(u8, u8, u8)> =
+            dark_out.iter().map(|v| vertex_rgb(v.color)).collect();
+        assert!(dark_painted.contains(&caption_glyph(dark.fg, false)));
+        assert!(dark_painted.contains(&crate::theme::bar_accent(
+            crate::theme::BarAccent::Green,
+            true
+        )));
+    }
+
+    #[test]
+    fn link_underline_and_search_line_clear_three_to_one() {
+        let light = crate::theme::LIGHT.bg;
+        let dark = crate::theme::DARK.bg;
+        let light_search = (
+            light.0.saturating_sub(12),
+            light.1.saturating_sub(12),
+            light.2.saturating_sub(12),
+        );
+        let dark_search = (0x1c, 0x21, 0x28);
+        for (ink, ground, name) in [
+            (
+                link_underline(light),
+                light,
+                "link underline on the light page",
+            ),
+            (
+                link_underline(dark),
+                dark,
+                "link underline on the dark page",
+            ),
+            (
+                search_line(light),
+                light_search,
+                "search line on the light bar",
+            ),
+            (
+                search_line(dark),
+                dark_search,
+                "search line on the dark bar",
+            ),
+        ] {
+            let ratio = crate::theme::contrast_ratio(ink, ground);
+            assert!(ratio >= 3.0, "{name} is {ratio}:1, want >= 3");
+        }
     }
 
     /// The ligatures toggle picks a Mono-leading font family when off (so a
@@ -7737,6 +10594,7 @@ mod cache_tests {
         ];
         controls.extend(lay.cursor_btns);
         controls.extend(lay.bell_btns);
+        controls.extend(lay.appearance_btns);
         for (i, &(rx, ry, rw, rh)) in controls.iter().enumerate() {
             assert!(
                 rx >= cx && rx + rw <= cx + cw && ry >= cy && ry + rh <= cy + ch,
@@ -7930,6 +10788,9 @@ mod cache_tests {
                 link_tip: None,
                 reorder: true,
                 line_dir: &[],
+                bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+                scroll_px: 0,
+                peek_dir: ParagraphDir::Default,
             };
             // an underline is a solid quad (page 0, white texel) th px tall
             let th = (r.cell_h / 14.0).max(1.0) as i32;
@@ -7950,6 +10811,231 @@ mod cache_tests {
         assert!(
             underlined > plain,
             "no underline quads on the Arabic row ({underlined} vs {plain})"
+        );
+    }
+
+    /// A smooth scroll that has landed on a whole line draws an Arabic and
+    /// Hebrew row the same way a `Scroll::Delta` of those lines does. While
+    /// the fraction is still on screen the shaped boxes (x, width, RTL) do
+    /// not move; only the pixels do.
+    #[test]
+    fn settled_smooth_scroll_matches_the_whole_line_bidi_frame() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::grid::{Dimensions, Scroll};
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let mut renderer = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 40, rows: 4 };
+        let bytes: String = [
+            "latin-aaa\r\n",
+            "مرحبا واحد\r\n",
+            "latin-bbb\r\n",
+            "שלום שתיים\r\n",
+            "latin-ccc\r\n",
+            "مرحبا ثلاثة\r\n",
+            "latin-ddd\r\n",
+            "שלום ארבע\r\n",
+        ]
+        .concat();
+        let term = || {
+            let mut t = Term::new(Config::default(), &size, VoidListener);
+            let mut parser: Processor = Processor::new();
+            parser.advance(&mut t, bytes.as_bytes());
+            t
+        };
+        let pane = (0, 0, 800, 200);
+        type SpanBox = (i32, i32, bool);
+        type RowGeom = ((usize, usize), Vec<SpanBox>);
+        let frame = |renderer: &mut Renderer, term: &Term<VoidListener>, scroll_px: i32| {
+            let mut out = Vec::new();
+            let view = PaneView {
+                rect: pane,
+                focused: false,
+                cursor: crate::config::CursorStyle::Block,
+                cursor_on: false,
+                bordered: false,
+                claude: false,
+                claude_from: None,
+                reorder: true,
+                line_dir: &[],
+                search_match: None,
+                marks: &[],
+                link_hover: None,
+                link_tip: None,
+                scroll_px,
+                peek_dir: ParagraphDir::Default,
+                bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+            };
+            renderer.draw_pane(&mut out, &view, term);
+            let mut geom: Vec<RowGeom> = renderer
+                .cell_geometry
+                .iter()
+                .filter(|((_, row, _), _)| *row != crate::scroll::PEEK_ROW)
+                .map(|((_, row, col), spans)| ((*row, *col), spans.clone()))
+                .collect();
+            geom.sort_by_key(|entry| entry.0);
+            (out, geom)
+        };
+        let same_quads = |a: &[crate::gpu::Vertex], b: &[crate::gpu::Vertex]| {
+            a.len() == b.len()
+                && a.iter().zip(b).all(|(p, q)| {
+                    p.pos == q.pos && p.uv == q.uv && p.layer == q.layer && p.color == q.color
+                })
+        };
+
+        let mut held = term();
+        let (whole_now, geom_now) = frame(&mut renderer, &held, 0);
+        let shift = crate::scroll::offset_px(0.5, renderer.cell_h);
+        assert!(shift > 0, "half a line must be a visible pixel offset");
+        let (_shifted, geom_shifted) = frame(&mut renderer, &held, shift);
+        assert_eq!(
+            geom_shifted, geom_now,
+            "a fractional offset moved the Arabic/Hebrew shaping"
+        );
+        assert!(
+            geom_now.iter().any(|(_, spans)| spans.iter().any(|s| s.2)),
+            "the row was not shaped as RTL"
+        );
+        // settling the same half plus another half is one whole line
+        let history = held.grid().history_size() as i32;
+        assert!(history >= 1);
+        let mut smooth = crate::scroll::PaneScroll::default();
+        let mut offset = smooth.apply_pixels(0, history, 0.5);
+        assert!(smooth.subline > 0.0);
+        offset = smooth.apply_pixels(offset, history, 0.5);
+        assert_eq!(smooth.subline, 0.0);
+        assert_eq!(offset, 1);
+        assert_eq!(crate::scroll::offset_px(smooth.subline, renderer.cell_h), 0);
+        held.scroll_display(Scroll::Delta(offset));
+        let (settled, geom_settled) = frame(&mut renderer, &held, 0);
+
+        let mut jumped = term();
+        jumped.scroll_display(Scroll::Delta(1));
+        let (whole_line, geom_line) = frame(&mut renderer, &jumped, 0);
+        assert!(
+            same_quads(&settled, &whole_line),
+            "settled smooth scroll diverged from a one-line wheel"
+        );
+        assert_eq!(geom_settled, geom_line);
+        assert!(
+            !same_quads(&settled, &whole_now),
+            "scrolling one line should reveal a different row"
+        );
+    }
+
+    /// The history line peeking in keeps its SCP direction, and a search hit
+    /// on that line is drawn in the sliver.
+    #[test]
+    fn the_peek_row_keeps_its_paragraph_direction_and_search_hit() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::index::{Column, Line, Point};
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let mut renderer = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 40, rows: 4 };
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(
+            &mut term,
+            "aaa\r\nbbb\r\nA\u{645}\u{631}\u{62d}\u{628}\u{627}\r\nccc\r\nddd\r\neee\r\n"
+                .as_bytes(),
+        );
+        let above = &term.grid()[Line(-1)];
+        assert_eq!(above[Column(0)].c, 'A', "the peek line is the mixed row");
+        let shift = 12;
+        let pane = (0, 40, 800, 160);
+        let draw = |renderer: &mut Renderer, dir: ParagraphDir, search: bool| {
+            let start = Point::new(Line(-1), Column(0));
+            let end = Point::new(Line(-1), Column(2));
+            let range = start..=end;
+            let mut out = Vec::new();
+            let view = PaneView {
+                rect: pane,
+                focused: false,
+                cursor: crate::config::CursorStyle::Block,
+                cursor_on: false,
+                bordered: false,
+                claude: false,
+                claude_from: None,
+                reorder: true,
+                line_dir: &[],
+                search_match: search.then_some(&range),
+                marks: &[],
+                link_hover: None,
+                link_tip: None,
+                scroll_px: shift,
+                peek_dir: dir,
+                bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+            };
+            renderer.draw_pane(&mut out, &view, &term);
+            let geom: Vec<(i32, i32, bool)> = renderer
+                .cell_geometry
+                .iter()
+                .filter(|((_, row, _), _)| *row == crate::scroll::PEEK_ROW)
+                .flat_map(|(_, spans)| spans.iter().copied())
+                .collect();
+            let top = out
+                .chunks(6)
+                .filter(|q| q[0].pos[1] < pane.1 as f32 + shift as f32)
+                .count();
+            (geom, top, out.len())
+        };
+        let (ltr, _, _) = draw(&mut renderer, ParagraphDir::Default, false);
+        let (rtl, _, _) = draw(&mut renderer, ParagraphDir::Rtl, false);
+        assert!(!ltr.is_empty(), "the peek row was not shaped");
+        assert_ne!(ltr, rtl, "an SCP RTL stamp must move the mixed peek row");
+        let (_, plain, _) = draw(&mut renderer, ParagraphDir::Default, false);
+        let (_, hit, _) = draw(&mut renderer, ParagraphDir::Default, true);
+        assert!(
+            hit > plain,
+            "the search hit on the peek row added no quads ({hit} vs {plain})"
+        );
+    }
+
+    /// The history line peeking in keeps its SGR 58 underline colour, as the
+    /// same line does once it scrolls fully into the viewport.
+    #[test]
+    fn the_peek_row_keeps_its_underline_colour() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let mut renderer = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 30, rows: 3 };
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(
+            &mut term,
+            "\x1b[4;58;2;255;0;0mabcdef\x1b[0m\r\nb\r\nc\r\nd".as_bytes(),
+        );
+        let shift = renderer.cell_h as i32 - 1;
+        let mut out = Vec::new();
+        let view = PaneView {
+            rect: (0, 0, 600, 90),
+            focused: false,
+            cursor: crate::config::CursorStyle::Block,
+            cursor_on: false,
+            bordered: false,
+            claude: false,
+            claude_from: None,
+            reorder: true,
+            line_dir: &[],
+            search_match: None,
+            marks: &[],
+            link_hover: None,
+            link_tip: None,
+            scroll_px: shift,
+            peek_dir: ParagraphDir::Default,
+            bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+        };
+        renderer.draw_pane(&mut out, &view, &term);
+        let red = [1.0, 0.0, 0.0, 1.0];
+        assert!(
+            out.chunks(6)
+                .any(|q| q[0].uv == [WHITE_UV, WHITE_UV] && q[0].color == red),
+            "the peek row drew its underline without the SGR 58 colour"
         );
     }
 
@@ -7982,6 +11068,9 @@ mod cache_tests {
                 link_tip: None,
                 reorder: true,
                 line_dir: &[],
+                bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+                scroll_px: 0,
+                peek_dir: ParagraphDir::Default,
             };
             let th = (r.cell_h / 14.0).max(1.0) as i32;
             r.draw_pane(&mut out, &view, &t);
@@ -8041,7 +11130,7 @@ mod cache_tests {
         let by = r.tab_bar_h().round() + 6.0;
         let bar = |r: &mut Renderer, text: Option<&str>| -> Option<f32> {
             let mut out = Vec::new();
-            r.draw_chrome(&mut out, 1600, 600, &[], text, false);
+            r.draw_chrome(&mut out, 1600, 600, &[], text, false, None);
             out.chunks(6)
                 .find(|q| q[0].pos[1] == by)
                 .map(|q| q[1].pos[0] - q[0].pos[0])
@@ -8069,7 +11158,7 @@ mod cache_tests {
         let bar_y = r.tab_bar_h().round() - 3.0;
         let quads = |r: &mut Renderer, p: Option<Progress>| -> Vec<(f32, [f32; 4])> {
             let mut out = Vec::new();
-            r.draw_chrome(&mut out, 800, 400, &[tab(p)], None, false);
+            r.draw_chrome(&mut out, 800, 400, &[tab(p)], None, false, None);
             out.chunks(6)
                 .filter(|q| q[0].pos[1] == bar_y && q[5].pos[1] - q[0].pos[1] == 3.0)
                 .map(|q| (q[1].pos[0] - q[0].pos[0], q[0].color))
@@ -8166,6 +11255,695 @@ mod cache_tests {
             "PROBE 100 cached frames   = {warm_100:?} (per frame: {:?})",
             warm_100 / 100
         );
+    }
+}
+
+#[cfg(test)]
+mod paragraph_align {
+    use super::*;
+
+    fn row_cells(text: &str, start: usize) -> Vec<CellInfo> {
+        text.chars()
+            .enumerate()
+            .map(|(i, c)| CellInfo {
+                col: start + i,
+                w: 1,
+                c,
+                zw: None,
+                fg: FG,
+                bg: BG,
+                style: 0,
+                ul: FG,
+            })
+            .collect()
+    }
+
+    /// An RTL paragraph's glyphs end on the pane's right edge. An LTR
+    /// paragraph, including Arabic inside an LTR line, stays on the left.
+    /// SCP 2 forces the right edge even for Latin; SCP 1 forces the left
+    /// edge even for Arabic.
+    #[test]
+    fn rtl_paragraph_glyphs_flush_right_and_ltr_stays_left() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let pane_w = 600;
+        let pane = (0, 0, pane_w, 80);
+        let extents = |r: &mut Renderer, text: &str, dir: ParagraphDir| -> (i32, i32) {
+            let cells = row_cells(text, 0);
+            r.begin_frame();
+            r.mapping_context = Some((pane, 0));
+            r.draw_line_bidi(
+                &mut Vec::new(),
+                pane,
+                0,
+                0,
+                pane_w,
+                &cells,
+                false,
+                None,
+                dir,
+                None,
+                true,
+            );
+            let boxes: Vec<_> = cells
+                .iter()
+                .filter(|c| c.c != ' ')
+                .map(|c| r.cell_geometry[&(pane, 0, c.col)][0])
+                .collect();
+            let left = boxes.iter().map(|b| b.0).min().unwrap();
+            let right = boxes.iter().map(|b| b.0 + b.1).max().unwrap();
+            (left, right)
+        };
+        let (left, right) = extents(&mut r, "سلام", ParagraphDir::Default);
+        assert!(
+            (right - pane_w).abs() <= 2,
+            "auto RTL (first strong is Arabic) must end at {pane_w}, got {right}"
+        );
+        assert!(
+            left > pane_w / 4,
+            "auto RTL must leave the left edge, left={left}"
+        );
+        let (left, right) = extents(&mut r, "hello", ParagraphDir::Rtl);
+        assert!(
+            (right - pane_w).abs() <= 2,
+            "SCP 2 must flush right, got {right}"
+        );
+        assert!(left > pane_w / 4, "SCP 2 left the left edge, left={left}");
+        let (left, right) = extents(&mut r, "سلام", ParagraphDir::Ltr);
+        assert!(left <= 2, "SCP 1 stays on the left, left={left}");
+        assert!(
+            right < pane_w - 40,
+            "SCP 1 is not flush right, right={right}"
+        );
+        let (left, right) = extents(&mut r, "C:\\>مرحبا", ParagraphDir::Default);
+        assert!(left <= 2, "an LTR prompt stays on the left, left={left}");
+        assert!(
+            right < pane_w / 2,
+            "an LTR prompt is not flush right, right={right}"
+        );
+    }
+
+    /// English then Arabic is an LTR paragraph and stays left. Arabic then
+    /// English is an RTL paragraph: the Arabic starts at the right edge and
+    /// the English sits to its left.
+    #[test]
+    fn mixed_arabic_and_english_follow_the_paragraph_direction() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let pane_w = 600;
+        let pane = (0, 0, pane_w, 80);
+        let place = |r: &mut Renderer, text: &str| {
+            let cells = row_cells(text, 0);
+            r.begin_frame();
+            r.mapping_context = Some((pane, 0));
+            r.draw_line_bidi(
+                &mut Vec::new(),
+                pane,
+                0,
+                0,
+                pane_w,
+                &cells,
+                false,
+                None,
+                ParagraphDir::Default,
+                None,
+                true,
+            );
+            cells
+                .iter()
+                .map(|c| {
+                    let (x, w, _) = r.cell_geometry[&(pane, 0, c.col)][0];
+                    (c.c, x, w)
+                })
+                .collect::<Vec<_>>()
+        };
+        let ltr = place(&mut r, "hello سلام");
+        let h = ltr.iter().find(|c| c.0 == 'h').unwrap();
+        let meem = ltr.iter().find(|c| c.0 == 'م').unwrap();
+        assert!(h.1 <= 2, "English-first stays on the left, h at {}", h.1);
+        assert!(
+            meem.1 > h.1,
+            "the Arabic follows hello, م at {} h at {}",
+            meem.1,
+            h.1
+        );
+        let line_right = ltr.iter().map(|c| c.1 + c.2).max().unwrap();
+        assert!(
+            line_right < pane_w / 2,
+            "an LTR mixed line is not flush right, right={line_right}"
+        );
+
+        let rtl = place(&mut r, "سلام hello");
+        let seen = rtl.iter().find(|c| c.0 == 'س').unwrap();
+        let h = rtl.iter().find(|c| c.0 == 'h').unwrap();
+        let line_right = rtl.iter().map(|c| c.1 + c.2).max().unwrap();
+        assert!(
+            (line_right - pane_w).abs() <= 2,
+            "Arabic-first must end at {pane_w}, got {line_right}"
+        );
+        assert!(
+            seen.1 + seen.2 >= h.1 + h.2,
+            "س must be right of hello (س {}, h {})",
+            seen.1,
+            h.1
+        );
+    }
+
+    /// The cursor, a click, and a copy all use the logical column. On a
+    /// right-aligned `سلام` the first letter is the rightmost glyph.
+    #[test]
+    fn right_aligned_cursor_hit_test_and_copy_use_logical_columns() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::index::{Column, Line, Point, Side};
+        use alacritty_terminal::selection::{Selection, SelectionType};
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let pane_w = 600;
+        let pane = (0, 0, pane_w, 80);
+        let text = "سلام";
+        let cells = row_cells(text, 0);
+        let end = cells.len();
+        r.mapping_context = Some((pane, 0));
+        let cursor = r
+            .draw_line_bidi(
+                &mut Vec::new(),
+                pane,
+                0,
+                0,
+                pane_w,
+                &cells,
+                false,
+                Some(end),
+                ParagraphDir::Default,
+                None,
+                true,
+            )
+            .expect("end cursor maps");
+        r.finish_pane_layout(pane);
+        let box_of = |col: usize| r.cell_geometry[&(pane, 0, col)][0];
+        let right = (0..end).map(|c| box_of(c).0 + box_of(c).1).max().unwrap();
+        let left = (0..end).map(|c| box_of(c).0).min().unwrap();
+        assert!((right - pane_w).abs() <= 2, "flush right, got {right}");
+        assert!(
+            cursor.0 + cursor.1 <= left + 1,
+            "cursor {cursor:?} must sit left of the word (x={left})"
+        );
+        assert!(cursor.0 >= pane.0, "cursor left the pane at {}", cursor.0);
+        // س is column 0 and the rightmost glyph; م is the leftmost.
+        assert!(box_of(0).0 > box_of(end - 1).0);
+        let hit = |col: usize| {
+            let (x, w, _) = box_of(col);
+            r.hit_cell(pane, 0, x as f64 + w as f64 / 2.0).map(|h| h.0)
+        };
+        assert_eq!(hit(0), Some(0), "a click on the rightmost glyph is س");
+        assert_eq!(
+            hit(end - 1),
+            Some(end - 1),
+            "a click on the leftmost glyph is م"
+        );
+
+        let mut term = Term::new(
+            Config::default(),
+            &crate::term::TermSize { cols: 40, rows: 3 },
+            VoidListener,
+        );
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, text.as_bytes());
+        let snaps = snapshot_row(&term, 0);
+        let (x, w, _) = box_of(0);
+        assert_eq!(
+            r.logical_column_for(
+                &snaps,
+                x as f32 + w as f32 / 2.0,
+                pane_w,
+                false,
+                ParagraphDir::Default,
+                40,
+                true,
+            ),
+            Some(0)
+        );
+        let mut sel = Selection::new(
+            SelectionType::Simple,
+            Point::new(Line(0), Column(0)),
+            Side::Left,
+        );
+        sel.update(Point::new(Line(0), Column(end - 1)), Side::Right);
+        term.selection = Some(sel);
+        let copied = term.selection_to_string().unwrap_or_default();
+        assert_eq!(
+            copied.trim(),
+            text,
+            "copying the hit columns returns logical order, got {copied:?}"
+        );
+    }
+
+    /// Right alignment is a shift of the same shaped boxes. Lam stays right
+    /// of alef, and a fatha on the first letter is still part of that cell.
+    #[test]
+    fn right_align_keeps_lam_alef_and_tashkeel() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let mut cells = row_cells("إصلاح", 0);
+        cells[0].zw = Some(vec!['\u{064e}']);
+        let pane_w = 600;
+        let pane = (0, 0, pane_w, 80);
+        let boxes = |r: &mut Renderer, align: bool| {
+            r.begin_frame();
+            r.mapping_context = Some((pane, 0));
+            r.draw_line_bidi(
+                &mut Vec::new(),
+                pane,
+                0,
+                0,
+                pane_w,
+                &cells,
+                false,
+                None,
+                ParagraphDir::Default,
+                None,
+                align,
+            );
+            cells
+                .iter()
+                .map(|c| {
+                    let spans = r
+                        .cell_geometry
+                        .get(&(pane, 0, c.col))
+                        .unwrap_or_else(|| panic!("col {} ({}) has no box", c.col, c.c));
+                    let (x, w, _) = spans[0];
+                    (x, w)
+                })
+                .collect::<Vec<_>>()
+        };
+        let left_aligned = boxes(&mut r, false);
+        let right_aligned = boxes(&mut r, true);
+        let shift = right_aligned[0].0 - left_aligned[0].0;
+        assert!(shift > 100, "the line did not move right, shift={shift}");
+        for (a, b) in left_aligned.iter().zip(&right_aligned) {
+            assert_eq!(a.1, b.1, "a cell changed width");
+            assert!(
+                (b.0 - a.0 - shift).abs() <= 1,
+                "alignment reshaped the line ({a:?} -> {b:?}, shift {shift})"
+            );
+        }
+        let lam = cells.iter().position(|c| c.c == 'ل').unwrap();
+        assert_eq!(cells[lam + 1].c, 'ا');
+        assert!(left_aligned[lam].0 > left_aligned[lam + 1].0);
+        assert!(right_aligned[lam].0 > right_aligned[lam + 1].0);
+        let edge = right_aligned.iter().map(|(x, w)| x + w).max().unwrap();
+        assert!((edge - pane_w).abs() <= 2, "flush right, got {edge}");
+    }
+
+    /// `bidi.mode = off` draws stored order. A line an external tool already
+    /// ordered (`ابحرم`, the visual of مرحبا) stays left to right instead of
+    /// being reversed again and pushed to the right edge.
+    #[test]
+    fn bidi_off_keeps_logical_order() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let mut term = Term::new(
+            Config::default(),
+            &crate::term::TermSize { cols: 40, rows: 3 },
+            VoidListener,
+        );
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, "ابحرم".as_bytes());
+        let pane = (0, 0, 600, 80);
+        let view = |reorder: bool, mode: crate::bidi_ctl::BidiReorder| PaneView {
+            rect: pane,
+            focused: false,
+            cursor: crate::config::CursorStyle::Block,
+            cursor_on: false,
+            bordered: false,
+            claude: false,
+            claude_from: None,
+            reorder,
+            bidi_mode: mode,
+            line_dir: &[],
+            search_match: None,
+            marks: &[],
+            link_hover: None,
+            link_tip: None,
+            scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
+        };
+        let glyph_xs = |out: &[Vertex]| -> Vec<f32> {
+            out.iter()
+                .filter(|v| v.uv != [WHITE_UV, WHITE_UV])
+                .map(|v| v.pos[0])
+                .collect()
+        };
+        let mut off_out = Vec::new();
+        r.begin_frame();
+        // `reorder: false` is what `off` selects. The mode stays `full` here
+        // so the corner chip does not add glyphs on the right.
+        r.draw_pane(
+            &mut off_out,
+            &view(false, crate::bidi_ctl::BidiReorder::Full),
+            &term,
+        );
+        assert!(
+            r.cell_geometry.is_empty(),
+            "off takes the grid path and does not shape the row"
+        );
+        let off = glyph_xs(&off_out);
+        let off_min = off.iter().copied().fold(f32::MAX, f32::min);
+        let off_max = off.iter().copied().fold(0.0_f32, f32::max);
+        assert!(
+            off_min < r.cell_w,
+            "the first stored cell stays on the left, x={off_min}"
+        );
+        assert!(
+            off_max < 8.0 * r.cell_w && off_max > 3.0 * r.cell_w,
+            "later cells follow it in storage order, max={off_max}"
+        );
+
+        let mut full_out = Vec::new();
+        r.begin_frame();
+        r.draw_pane(
+            &mut full_out,
+            &view(true, crate::bidi_ctl::BidiReorder::Full),
+            &term,
+        );
+        let full = glyph_xs(&full_out);
+        let full_max = full.iter().copied().fold(0.0_f32, f32::max);
+        assert!(
+            full_max > pane.2 as f32 - 2.0 * r.cell_w,
+            "full reorders and flush-right is a different picture, max={full_max}"
+        );
+    }
+
+    /// The corner chip is the per-pane indicator. The default mode draws none.
+    #[test]
+    fn bidi_badge_is_drawn_only_when_the_mode_is_not_full() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let mut term = Term::new(
+            Config::default(),
+            &crate::term::TermSize { cols: 20, rows: 2 },
+            VoidListener,
+        );
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, b"ok");
+        let pane = (0, 0, 400, 80);
+        let quads = |r: &mut Renderer, mode: crate::bidi_ctl::BidiReorder| {
+            let view = PaneView {
+                rect: pane,
+                focused: true,
+                cursor: crate::config::CursorStyle::Block,
+                cursor_on: false,
+                bordered: false,
+                claude: false,
+                claude_from: None,
+                reorder: true,
+                bidi_mode: mode,
+                line_dir: &[],
+                search_match: None,
+                marks: &[],
+                link_hover: None,
+                link_tip: None,
+                scroll_px: 0,
+                peek_dir: ParagraphDir::Default,
+            };
+            let mut out = Vec::new();
+            r.begin_frame();
+            r.draw_pane(&mut out, &view, &term);
+            out.len()
+        };
+        let full = quads(&mut r, crate::bidi_ctl::BidiReorder::Full);
+        let off = quads(&mut r, crate::bidi_ctl::BidiReorder::Off);
+        let alt = quads(&mut r, crate::bidi_ctl::BidiReorder::AltOff);
+        assert!(off > full, "off must draw the BiDi 0 chip");
+        assert!(alt > full, "alt_off must draw the BiDi 1 chip");
+        assert_eq!(crate::bidi_ctl::BidiReorder::Off.badge(), Some("BiDi 0"));
+        assert_eq!(crate::bidi_ctl::BidiReorder::AltOff.badge(), Some("BiDi 1"));
+        assert_eq!(crate::bidi_ctl::BidiReorder::Full.badge(), None);
+    }
+
+    fn pane_view(rect: Rect, reorder: bool) -> PaneView<'static> {
+        PaneView {
+            rect,
+            focused: false,
+            cursor: crate::config::CursorStyle::Block,
+            cursor_on: false,
+            bordered: false,
+            claude: false,
+            claude_from: None,
+            reorder,
+            bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+            line_dir: &[],
+            search_match: None,
+            marks: &[],
+            link_hover: None,
+            link_tip: None,
+            scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
+        }
+    }
+
+    /// A soft-wrapped RTL paragraph keeps one direction. The tail is flush
+    /// right too, not re-detected as its own paragraph.
+    #[test]
+    fn wrapped_rtl_line_keeps_paragraph_alignment() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let mut term = Term::new(
+            Config::default(),
+            &crate::term::TermSize { cols: 8, rows: 4 },
+            VoidListener,
+        );
+        let mut processor: Processor = Processor::new();
+        // 5 Arabic + space + hello = 11 columns. At width 8 the tail is
+        // the Latin `llo`, which would re-detect as LTR if the wrap were
+        // a new paragraph.
+        processor.advance(&mut term, "مرحبا hello".as_bytes());
+        let pane = (0, 0, 600, 160);
+        r.begin_frame();
+        r.draw_pane(&mut Vec::new(), &pane_view(pane, true), &term);
+        for row in 0..2 {
+            let boxes: Vec<_> = (0..8)
+                .filter_map(|col| r.cell_geometry.get(&(pane, row, col)).map(|s| s[0]))
+                .collect();
+            assert!(
+                !boxes.is_empty(),
+                "row {row} left the bidi path (a wrap must keep the paragraph)"
+            );
+            let left = boxes.iter().map(|b| b.0).min().unwrap();
+            let right = boxes.iter().map(|b| b.0 + b.1).max().unwrap();
+            assert!(
+                (right - pane.2).abs() <= 2,
+                "row {row} must stay flush right, right={right}"
+            );
+            assert!(left > 40, "row {row} left the left edge, left={left}");
+        }
+        let arabic_first = r.cell_geometry[&(pane, 0, 0)][0].0;
+        let arabic_later = (1..5)
+            .filter_map(|col| r.cell_geometry.get(&(pane, 0, col)).map(|s| s[0].0))
+            .min()
+            .unwrap();
+        assert!(
+            arabic_first > arabic_later,
+            "the Arabic head lost RTL order"
+        );
+        let latin = (0..3)
+            .map(|col| r.cell_geometry[&(pane, 1, col)][0].0)
+            .collect::<Vec<_>>();
+        assert!(
+            latin.windows(2).all(|w| w[0] < w[1]),
+            "the Latin tail was reversed: {latin:?}"
+        );
+    }
+
+    /// A click on the Latin tail of a wrapped RTL paragraph, resolved by the
+    /// shaping fallback (no recorded box), lands on the glyph drawn there:
+    /// the hit-test takes the row's direction and path from the same walk
+    /// `draw_pane` used, not from the SCP stamp alone.
+    #[test]
+    fn a_click_on_a_wrapped_rtl_tail_maps_through_the_drawn_layout() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let mut term = Term::new(
+            Config::default(),
+            &crate::term::TermSize { cols: 8, rows: 4 },
+            VoidListener,
+        );
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, "مرحبا hello".as_bytes());
+        let pane = (0, 0, 600, 160);
+        r.begin_frame();
+        r.draw_pane(&mut Vec::new(), &pane_view(pane, true), &term);
+        let no_stamp = |_| ParagraphDir::Default;
+        assert_eq!(
+            viewport_row_layout(&term, 1, no_stamp),
+            (ParagraphDir::Rtl, true),
+            "the Latin tail is drawn as an RTL bidi row"
+        );
+        assert_eq!(
+            viewport_row_layout(&term, 2, no_stamp),
+            (ParagraphDir::Default, false)
+        );
+        let (dir, _) = viewport_row_layout(&term, 1, no_stamp);
+        let snaps = snapshot_row(&term, 1);
+        for col in 0..3 {
+            let (x, w, _) = r.cell_geometry[&(pane, 1, col)][0];
+            let click = x as f32 + w as f32 / 2.0;
+            assert_eq!(
+                r.logical_column_for(&snaps, click, pane.2, false, dir, 8, true),
+                Some(col),
+                "a click on the drawn glyph of column {col} at x={click}"
+            );
+        }
+    }
+
+    /// ZWJ and ZWNJ travel with the Arabic. `full` still orders the word
+    /// right to left. `off` draws storage order from the left.
+    #[test]
+    fn zwj_and_zwnj_keep_order_in_full_and_storage_order_when_off() {
+        for joiner in ['\u{200D}', '\u{200C}'] {
+            let text = format!("مر{joiner}حبا");
+            let (full_first, full_last, full_right) = edge_of(&text, true);
+            assert!(
+                full_first > full_last,
+                "{joiner:?}: full mode lost RTL order ({full_first} vs {full_last})"
+            );
+            assert!(
+                (full_right - 600).abs() <= 2,
+                "{joiner:?}: full mode not flush right ({full_right})"
+            );
+            let (off_first, off_last, off_right) = edge_of(&text, false);
+            assert!(
+                off_first < off_last,
+                "{joiner:?}: off mode reordered storage ({off_first} vs {off_last})"
+            );
+            assert!(
+                off_right < 300,
+                "{joiner:?}: off mode was pushed right ({off_right})"
+            );
+        }
+    }
+
+    /// European digits inside Arabic stay in numeric order under `full`
+    /// (an LTR run) and in storage order under `off`.
+    #[test]
+    fn digits_inside_arabic_keep_order_in_full_and_storage_order_when_off() {
+        let text = "عام 2026";
+        let full = digit_xs(text, true);
+        assert!(
+            full.windows(2).all(|w| w[0] < w[1]),
+            "full mode reversed 2026: {full:?}"
+        );
+        let off = digit_xs(text, false);
+        assert!(
+            off.windows(2).all(|w| w[0] < w[1]),
+            "off mode did not keep storage order of 2026: {off:?}"
+        );
+        assert!(
+            off[0] < 8.0 * 20.0,
+            "off mode did not start at the left, x={}",
+            off[0]
+        );
+    }
+
+    /// x of the first logical glyph, the last logical glyph, and the row's
+    /// right edge. `reorder` selects full vs off.
+    fn edge_of(text: &str, reorder: bool) -> (i32, i32, i32) {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let mut term = Term::new(
+            Config::default(),
+            &crate::term::TermSize { cols: 40, rows: 2 },
+            VoidListener,
+        );
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, text.as_bytes());
+        let pane = (0, 0, 600, 80);
+        r.begin_frame();
+        r.draw_pane(&mut Vec::new(), &pane_view(pane, reorder), &term);
+        let mut xs = Vec::new();
+        for col in 0..20 {
+            if let Some(spans) = r.cell_geometry.get(&(pane, 0, col)) {
+                xs.push(spans[0].0);
+            }
+        }
+        if reorder {
+            assert!(!xs.is_empty(), "full mode drew no Arabic boxes");
+            let right = (0..20)
+                .filter_map(|col| r.cell_geometry.get(&(pane, 0, col)))
+                .map(|s| s[0].0 + s[0].1)
+                .max()
+                .unwrap();
+            (*xs.first().unwrap(), *xs.last().unwrap(), right)
+        } else {
+            let mut out = Vec::new();
+            r.begin_frame();
+            r.draw_pane(&mut out, &pane_view(pane, false), &term);
+            let at = |col: usize| ink_in_column(&out, r.cell_w, col);
+            let first = at(0).expect("off mode drew nothing in column 0");
+            let last_col = (1..20).rev().find(|col| at(*col).is_some()).unwrap();
+            let last = at(last_col).unwrap();
+            (first as i32, last as i32, last as i32)
+        }
+    }
+
+    fn ink_in_column(out: &[Vertex], cell_w: f32, col: usize) -> Option<f32> {
+        let x0 = col as f32 * cell_w;
+        let x1 = x0 + cell_w;
+        out.iter()
+            .filter(|v| v.uv != [WHITE_UV, WHITE_UV] && v.pos[0] >= x0 - 1.0 && v.pos[0] < x1)
+            .map(|v| v.pos[0])
+            .reduce(f32::min)
+    }
+
+    fn digit_xs(text: &str, reorder: bool) -> Vec<f32> {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::index::Column;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let mut term = Term::new(
+            Config::default(),
+            &crate::term::TermSize { cols: 40, rows: 2 },
+            VoidListener,
+        );
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, text.as_bytes());
+        let pane = (0, 0, 600, 80);
+        let mut out = Vec::new();
+        r.begin_frame();
+        r.draw_pane(&mut out, &pane_view(pane, reorder), &term);
+        let row = &term.grid()[alacritty_terminal::index::Line(0)];
+        let mut cols = Vec::new();
+        for col in 0..20 {
+            if row[Column(col)].c.is_ascii_digit() {
+                cols.push(col);
+            }
+        }
+        assert_eq!(cols.len(), 4, "expected the four digits of 2026");
+        if reorder {
+            cols.iter()
+                .map(|col| r.cell_geometry[&(pane, 0, *col)][0].0 as f32)
+                .collect()
+        } else {
+            cols.iter()
+                .map(|col| ink_in_column(&out, r.cell_w, *col).unwrap_or(f32::MAX))
+                .collect()
+        }
     }
 }
 

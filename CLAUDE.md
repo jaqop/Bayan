@@ -13,6 +13,7 @@ selection and BiDi paths must do.
 | `main.rs` | event loop, tabs, panes, settings panel, cockpit, OSC handling; `window_event` only dispatches |
 | `chrome.rs` | window chrome hit-testing (edges, caption buttons, tab bar, dividers, drag strip) and the left-press order |
 | `input.rs` | pointer routing: buttons, motion, wheel, drops, and the pointer side of the close guard and palette |
+| `scroll.rs` | smooth scrollback: sub-line pixel offset, wheel easing, and when that offset is cleared |
 | `keyroute.rs` | keyboard routing: which overlay owns a press, then the window chords before `keys.rs` encodes it |
 | `render.rs` | the dual text engine + shaped-run cache (see below) |
 | `gpu.rs` | wgpu: one pipeline, one 2048² atlas, one draw call per frame |
@@ -27,21 +28,37 @@ selection and BiDi paths must do.
 | `lang.rs` | interface language (Arabic default, English): `tr("عربي", "English")` pairs at the point of use, `rtl()`, `lead_x`/`trail_x` for which edge text starts from |
 | `keys.rs` | keyboard → VT byte sequences (ported from EasyTer) |
 | `kitty.rs` | kitty keyboard protocol encoder, layout-aware alternate keys |
-| `layout.rs` | a tab's split tree: side-by-side and stacked splits nest in any mix; leaves index the tab's flat pane list |
+| `layout.rs` | a tab's split tree: side-by-side and stacked splits nest in any mix; leaves index the tab's flat pane list. The side-by-side seam widens to hold a scrollbar |
 | `groups.rs` | tab groups: a group id TAG on each tab (tabs never move in the flat list), the group order and labels, the stay-in-group close rule |
 | `localpath.rs` | no-follow walk: is a drive path local in every component, links read but not followed (link probe, new-tab cwd) |
 | `mru.rs` | most-recently-used tab order for Ctrl+Tab, walkable within one group |
 | `shells.rs` | installed-shell detection (ported from EasyTer's `profiles.py`) |
+| `cli.rs` | argv: `#45`'s `-d`/`--cwd`, plus profile, `--` command, `--elevated`, handoff, help, version |
+| `context_menu.rs` | per-user Explorer "Open Bayan here" (HKCU only, behind `RegistryStore`) |
+| `elevate.rs` | `--elevated` → `ShellExecuteW` verb `runas` only; argv is `--elevated` and optional `-p <name>` |
+| `jumplist.rs` | taskbar Jump List (`ICustomDestinationList`) and the explicit AppUserModelID |
+| `handoff.rs` | per-user `ITerminalHandoff` COM class, default off; not the Windows default terminal |
+| `shellint.rs` | OSC 133 injection for Git Bash, WSL bash/zsh, and cmd (PowerShell's wrapper stays in `term.rs`) |
+| `ssh.rs` | OpenSSH tab: System32 `ssh.exe`, `~/.ssh/config` hosts, injection-safe argv |
+| `mux.rs` | opt-in per-user mux: named-pipe server, detach / reattach / kill |
 | `posh.rs` | oh-my-posh theme picker with a live ANSI preview |
 | `plugins.rs` | declarative JSON plugin host (`~/.bayan/plugins/`) |
-| `config.rs` | `~/.bayan/config.json`, optional and BOM-tolerant |
+| `lua_host.rs` | sandboxed `config.lua` and allowlisted executable plugins |
+| `scrollbar.rs` | per-pane scrollbar in the padding or the split seam: thumb from viewport/total and `display_offset`, hit-tested only outside the grid |
+| `config.rs` | `~/.bayan/config.json`, optional and BOM-tolerant. `scrollbar.position` (`right`/`left`/`hidden`), `scrollbar.width`, `scrollbar.autohide` |
+| `config_watch.rs` | reload that file on change: debounce, rename-replace saves, keep the last good config on a parse error |
+| `theme.rs` | Windows light/dark: `system`/`dark`/`light`, the palette pair, and the theme-change event |
+| `a11y.rs` | High Contrast color mapping and the system text-size multiplier, pure and tested; the Win32 read sits behind `read_snapshot` |
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
+| `screen_reader.rs` | screen-reader tree: each pane is a document in logical order, with the caret, the selection, and a coalesced live region (AccessKit, which speaks UIA on Windows) |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-500 tests across the tree. `term.rs` (82), `link.rs` (61) and `render.rs` (65)
-carry the most; `localpath.rs` has 21. Three more in `term.rs` are `#[ignore]`d
-probes, run by hand (see Measuring).
+831 tests across the tree. `render.rs` (100), `term.rs` (99) and `link.rs`
+(66) carry the most; `lua_host.rs` has 46, `shellint.rs` 24, `images.rs` and
+`localpath.rs` 21 each, `mux.rs` 15, `config_watch.rs` 14, `screen_reader.rs`
+11 and `ssh.rs` 7. Three more in `term.rs` are `#[ignore]`d probes, run by
+hand (see Measuring).
 
 ## Measuring
 
@@ -136,6 +153,17 @@ renderer lays words in logical order left-to-right with no BiDi reordering and
 ignores RLM/RLO (established by A/B capture). So Arabic handed to a toast must
 be pre-reversed into VISUAL word order — the opposite direction from `bidi.rs`.
 
+**Smooth scroll is a pixel offset on the primary screen only.** `scroll.smooth`
+defaults on. A touchpad fraction shifts the viewport and draws one extra
+history row, clipped to the pane; a wheel notch eases in. `false` is the
+old whole-line wheel. Alt-screen wheels stay arrows, and mouse reports use
+the shifted row (the history sliver above the viewport is not row 0). A
+stale idle fraction is cleared when output arrives at the bottom. A wheel
+notch still easing, or a touch that moved within the last easing window,
+is kept — continuous output must not swallow the scroll. An alt-screen
+transition, a resize, and a font change clear it too. Copy-mode keys snap
+it onto a whole line first.
+
 **Chords resolve by PHYSICAL key.** Ctrl+T must fire when that key's logical
 char is "ف". This is the Arabic-layout guarantee and it extends to user
 rebindings. Note the scar: Ctrl+, for settings lost this fight, which is why
@@ -160,6 +188,49 @@ bypasses DWM's blur, so the layered-window transparency Bayan already has and
 the accent blur are mutually exclusive. The existing `opacity` setting is the
 only transparency available on this path.
 
+**Elevation is a UAC prompt and nothing else.** `--elevated` calls
+`ShellExecuteW` with verb `runas` and exits. The new process receives
+`--elevated` and, if a profile was named, `-p <name>` only. It resolves
+that name with `shells::find_profile_by_name` (the stored command does not
+match). It does not restore `session.json` and does not spawn
+`config.shell`. It does not load `~/.bayan/plugins`, does not inject oh-my-posh, and does
+not open the prompt picker. It does not use `config.json`'s `editor`
+template. `Code.exe` comes only from Program Files via
+`SHGetKnownFolderPath`. A missing editor is a reveal-only card: Enter runs
+`explorer.exe /select` and does not association-open. `explorer.exe` comes
+from `GetWindowsDirectoryW`, not `WINDIR`. A host card stores Browse or
+RevealOnly, so `HTTPS://` still opens in the browser. `pwsh.exe` is only
+`Program Files\PowerShell\7\pwsh.exe`. `save_state` does not write
+`session.json` while elevated. A failed elevation query is treated as
+elevated. No environment block, registry value,
+pipe, or file carries the request. The jump list's admin task is
+`--elevated` with no profile.
+
+**Shell integration is opt-out and shell-specific.** PowerShell's prompt
+wrapper stays in `term.rs`. Git Bash, MSYS bash, WSL bash and WSL zsh
+are built in `shellint.rs` and produce the same nonce-checked OSC 133 A/B/D
+bytes. cmd wraps the user's `PROMPT` in A and B with **no nonce**: every
+child of cmd inherits `PROMPT`, so a nonce there could be read and used to
+forge trusted marks. Its marks are untrusted, like any forged mark. Never
+give cmd the nonce in any form. `git-bash.exe`, `bash -c`, and
+`bash script.sh` are not injected. An unknown program is never injected.
+`$?` is restored before the user's `PROMPT_COMMAND`. A login shell sources
+`/etc/profile` and one user profile, not `~/.bashrc` as well. `"shell_integration": false` skips all of them. The nonce is
+`BAYAN_PROMPT_NONCE` and is unset before a child inherits it. Do not write
+the user's rc files. An elevated token must not source `~/.bashrc`,
+`~/.bash_profile`, `~/.inputrc`, or the zsh home files: set `INPUTRC` and
+`HISTFILE` to `/dev/null`. Elevated Git Bash is `--noprofile` and must
+not source `/etc/profile` (its `git-prompt.sh` runs user files); set
+`PATH` and `MSYSTEM` from the bash install. Elevated WSL bash still reads the
+distro profile with `HOME` pointed at the rcfile directory. A failed
+elevation query is treated as elevated. `shellint` takes the `elevated` flag `Session::spawn` is given, which is
+`elevate::process_is_elevated`, the one token query in the tree.
+The script directory comes from `SHGetKnownFolderPath(FOLDERID_ProgramData)`
+when elevated, never from the `PROGRAMDATA` environment variable. It is a
+random name with a DACL that is not world-writable, and zsh's `ZDOTDIR` is
+restored to the user's value before the first prompt. Only a directory
+whose name we minted is deleted.
+
 **Start-directory precedence, in order:** a restored session's saved cwd, then
 the launcher's directory (a shortcut's "Start in"), then `USERPROFILE`. The
 session wins deliberately — restoring a tab in the wrong folder is worse than
@@ -170,6 +241,34 @@ because Explorer and the Start menu often hand a process `System32`, and
 except when it is Bayan's own folder (Explorer's default cwd — a pane opened
 in Downloads would let cmd run a planted `git.bat`). It passes the same
 `accept_local_cwd` + `usable_spawn_dir` gate as every other start directory.
+
+**High Contrast and text size are not the palette's `text_scale`.**
+`PaletteLayout.text_scale` compresses the command palette when the window
+is short. Windows Accessibility text size is `a11y::text_scale_factor`
+(100–225%, clamped), stored on the renderer as `system_text_scale`, and
+multiplied separately from DPI: pixels = points × text scale × dpi. An
+explicit `font_size` is the size at 100% and is still multiplied while
+`follow_system_text_size` is on. High Contrast maps chrome through
+`a11y::map_chrome` and, unless `terminal_follow_high_contrast` is false,
+the grid's fg/bg/selection/cursor through `a11y::map_terminal`. The 16
+ANSI colors stay on the theme. Both are re-read on `WM_SETTINGCHANGE` and
+`WM_SYSCOLORCHANGE`.
+**The accessibility tree stays off the paint hot path.** Until the first
+UIA client, `update_if_active` does not run the builder and a redraw does
+not even stamp. On Windows that client leaves the adapter active for the
+session (deactivate is ignored), so later frames use a stamp — output
+generation, cursor, selection, focus, tabs, palette, card — and
+[`screen_reader::TreePace`]: unchanged means no rebuild, and a moving stamp is
+built at about 10 Hz with a trailing update so the last state is sent.
+The full cell copy happens only on those builds. The terminal lock for a
+build is held only long enough to copy the visible cells; Claude
+restoration and the node tree happen after it is dropped. Pane text is
+logical grid order, so Arabic is read as the program emitted it — not the
+visually reordered line the shaper draws. Claude rows use the same
+visual→logical map as copy. A burst of output is one announcement per
+500ms (the tail, not every line), and an OSC 133 finish replaces that
+tail with the exit code. Do not build this tree on an unchanged stamp,
+and do not hand it shaped glyphs.
 
 **Two performance properties are load-bearing.** The shaped-run cache reshapes
 only changed lines (~1.5ms → ~4µs on a cached frame). Differential redraw skips

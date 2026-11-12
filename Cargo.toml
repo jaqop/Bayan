@@ -26,9 +26,20 @@ cosmic-text = "0.19"
 arboard = "3"
 # OSC 52 payloads (programs setting the clipboard, e.g. yank over SSH)
 base64 = "0.23"
+# Kitty f=100 and iTerm2 inline images. PNG only: sixel has its own decoder,
+# and raw RGB/RGBA never touches this crate. JPEG and the default image
+# codecs stay out so the dependency stays on the png crate.
+image = { version = "0.25", default-features = false, features = ["png"] }
 # session persistence (~/.bayan/session.json)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# config.lua and executable plugins. 0.12.2's rust-version is 1.88, so the
+# 1.89 MSRV job can compile it. lua54+vendored builds Lua 5.4 with the
+# platform C compiler (MSVC on Windows); LuaJIT is not used because its
+# MSVC build is not the one upstream supports.
+mlua = { version = "0.12.2", default-features = false, features = ["lua54", "vendored"] }
+# Approval is the SHA-256 of the file bytes. A changed file is a new hash.
+sha2 = "0.10"
 # global quake hotkey (RegisterHotKey + WM_HOTKEY via the msg hook);
 # Diagnostics_Debug carries MessageBeep (the bell's "sound" mode)
 windows-sys = { version = "0.61", features = [
@@ -43,9 +54,50 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_LibraryLoader", # SetDllDirectoryW; ConPTY comes from kernel32, not conpty.dll
     "Win32_System_ProcessStatus", # EnumProcessModules in the planted-conpty.dll test
     "Win32_System_Threading", # GetCurrentProcess for that module walk
+    "Win32_Security", # TokenElevation: an elevated token does not run Lua
+    "Win32_System_JobObjects", # spawn: kill child processes when the job closes
     "Win32_System_SystemInformation", # GetSystemDirectoryW: loaded kernel32 must sit under System32
     "Win32_System_IO", # DeviceIoControl: read a link's target without following it (localpath.rs)
+    "Win32_System_Registry", # HKCU Explorer "Open Bayan here" (no HKLM); AppsUseLightTheme; TextScaleFactor
+    "Win32_System_Console", # --help / --version attach to the parent console
+    "Win32_System_Pipes", # mux server: CreateNamedPipeW / ConnectNamedPipe
+    "Win32_Security", # TokenElevation; DACL on shell-integration temp files; the mux pipe DACL
+    "Win32_Security_Authorization", # SDDL for those files (not world-writable, high integrity when elevated)
+    "Win32_Graphics_Gdi", # GetSysColor: High Contrast system colors
+    "Win32_UI_Accessibility", # HIGHCONTRASTW / HCF_HIGHCONTRASTON
 ] }
+# Hot-reload of ~/.bayan/config.json. On Windows the recommended backend
+# is ReadDirectoryChangesW (a target dependency, not a crate feature).
+# config_watch watches the parent directory so an editor that saves by
+# renaming a temp file over config.json is seen, then debounces itself.
+# notify 8.2.2 accepts notify-types ^2. 2.3.0 needs rustc 1.91, above
+# this crate's 1.89 floor, so the lock stays on 2.2.0 (rustc 1.88).
+notify = { version = "8.2.2", default-features = false }
+notify-types = "=2.2.0"
+
+# Jump List (ICustomDestinationList) and the terminal-handoff class
+# factory. windows-sys stays for the rest of the Win32 surface.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Storage_EnhancedStorage", # PKEY_Title, PKEY_AppUserModel_ID
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common", # IObjectCollection for jump-list tasks
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# The `implement` macro emits `windows_core::` paths, so the crate has to
+# be a direct dependency even though `windows` re-exports it.
+windows-core = "0.61"
+# Screen readers (NVDA, JAWS, Narrator) via UI Automation. accesskit_winit's
+# Windows backend is accesskit_windows; default features stay off so the
+# Windows build does not pull the AT-SPI/unix adapter. The tree is built
+# only after a client connects (`Adapter::update_if_active`).
+accesskit = "0.25.2"
+accesskit_winit = { version = "0.34.2", default-features = false, features = ["rwh_06"] }
 
 [features]
 # BAYAN_* environment debug hooks (BAYAN_TYPE, BAYAN_PASTE, BAYAN_PROFILE, …)

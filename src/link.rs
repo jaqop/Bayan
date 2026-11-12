@@ -143,8 +143,9 @@ pub enum Action {
     /// Only an allowlisted document or media extension, after `settle`
     /// has expanded an 8.3 name and re-checked the long path.
     OpenPath(String),
-    /// `%WINDIR%\explorer.exe` with `/select,"<path>"` passed via
-    /// `CommandExt::raw_arg`. Not an association open.
+    /// `GetWindowsDirectoryW()\explorer.exe` with `/select,"<path>"` passed
+    /// via `CommandExt::raw_arg`. Not an association open. `WINDIR` is not
+    /// read: a standard user can set it in `HKCU\Environment`.
     Reveal(String),
     /// `Command::new(argv[0]).args(&argv[1..])`. No association fallback:
     /// a spawn failure is reported, and the file is not opened by its type.
@@ -1681,6 +1682,7 @@ fn settle_edit_default<E, P, L, C>(
     exists: &E,
     long_path: &L,
     code_exe: &C,
+    confirm_if_missing: bool,
 ) -> Action
 where
     E: Fn(&str) -> P,
@@ -1693,7 +1695,8 @@ where
         Ok(DiskPath::Ready(path)) => path,
         Err(refusal) => return refusal,
     };
-    // Still never association-open. No editor means reveal.
+    // Still never association-open. No trusted editor means reveal, unless
+    // this is an elevated window: then the caller shows the path and waits.
     if let Some(exe) = code_exe() {
         let exe = exe.trim();
         if !exe.is_empty() && !is_shell_program(exe) {
@@ -1705,6 +1708,12 @@ where
             }
         }
     }
+    if confirm_if_missing {
+        return Action::Confirm {
+            uri: path.clone(),
+            host: path,
+        };
+    }
     Action::Reveal(path)
 }
 
@@ -1712,6 +1721,22 @@ where
 /// `long_path` returns the expanded path (already without a `\\?\` prefix,
 /// or with one — it is stripped). `None` means expansion failed.
 pub fn settle<E, P, L, C>(action: Action, exists: E, long_path: L, code_exe: C) -> Action
+where
+    E: Fn(&str) -> P,
+    P: Into<Probe>,
+    L: Fn(&str) -> Option<String>,
+    C: Fn() -> Option<String>,
+{
+    settle_choosing(action, exists, long_path, code_exe, false)
+}
+
+fn settle_choosing<E, P, L, C>(
+    action: Action,
+    exists: E,
+    long_path: L,
+    code_exe: C,
+    confirm_if_missing: bool,
+) -> Action
 where
     E: Fn(&str) -> P,
     P: Into<Probe>,
@@ -1734,17 +1759,33 @@ where
                 Action::Edit { argv, path: full }
             }
         },
-        Action::EditDefault { path, line, col } => {
-            settle_edit_default(path, line, col, &exists, &long_path, &code_exe)
-        }
+        Action::EditDefault { path, line, col } => settle_edit_default(
+            path,
+            line,
+            col,
+            &exists,
+            &long_path,
+            &code_exe,
+            confirm_if_missing,
+        ),
         other => other,
     }
 }
 
-pub fn settle_live(action: Action) -> Action {
-    settle(action, local_file_probe, win_long_path, || {
-        find_code_exe().map(|p| p.to_string_lossy().into_owned())
-    })
+pub fn settle_live(action: Action, elevated: bool) -> Action {
+    if elevated {
+        settle_choosing(
+            action,
+            local_file_probe,
+            win_long_path,
+            || code_exe(true).map(|p| p.to_string_lossy().into_owned()),
+            true,
+        )
+    } else {
+        settle(action, local_file_probe, win_long_path, || {
+            code_exe(false).map(|p| p.to_string_lossy().into_owned())
+        })
+    }
 }
 
 /// Apartment COM, before `ShellExecuteW`. Called on the `bayan-link` thread.
@@ -1760,11 +1801,54 @@ pub fn init_link_thread() {
     }
 }
 
-/// Absolute `explorer.exe`. `WINDIR` is used only when it is a local drive
-/// path whose last component is `Windows`. Otherwise `C:\Windows\explorer.exe`.
-pub fn explorer_from_windir(windir: Option<&str>) -> String {
+/// What Enter does with a confirm card. Chosen when the card is built.
+/// Enter does not look at the link text again: `HTTPS://` is still a
+/// browser URI, and a missing-editor path is never reclassified.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfirmOpen {
+    /// `ShellExecuteW` of this URI. The scheme was already accepted.
+    Browse(String),
+    /// `explorer.exe /select` only. The caller must not pass this through
+    /// [`settle`]: that would turn `config.json` into an association open.
+    RevealOnly(String),
+}
+
+/// `http` or `https`, in any case. `plan_uri` keeps the scheme as written.
+pub fn is_browser_uri(uri: &str) -> bool {
+    scheme_name(uri).is_some_and(|scheme| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    })
+}
+
+/// A host-confirm card. A browser URI is stored as [`ConfirmOpen::Browse`]
+/// so Enter does not match the scheme again. Anything else is reveal-only.
+pub fn confirm_open_from_uri(uri: &str) -> ConfirmOpen {
+    if is_browser_uri(uri) {
+        ConfirmOpen::Browse(uri.to_string())
+    } else {
+        ConfirmOpen::RevealOnly(uri.to_string())
+    }
+}
+
+/// The action Enter performs. [`ConfirmOpen::RevealOnly`] stays `Reveal`.
+pub fn confirm_enter(open: &ConfirmOpen) -> Action {
+    match open {
+        ConfirmOpen::Browse(uri) => Action::Browse(uri.clone()),
+        ConfirmOpen::RevealOnly(path) => Action::Reveal(path.clone()),
+    }
+}
+
+/// Whether Enter's action may go through [`settle`]. Reveal-only must not.
+pub fn confirm_enter_settles(open: &ConfirmOpen) -> bool {
+    matches!(open, ConfirmOpen::Browse(_))
+}
+
+/// `explorer.exe` under `windows_dir`. That directory is the result of
+/// `GetWindowsDirectoryW`, never `WINDIR`. A path that is not a local
+/// directory named `Windows` falls back to `C:\Windows\explorer.exe`.
+pub fn explorer_exe(windows_dir: Option<&str>) -> String {
     const FALLBACK: &str = r"C:\Windows\explorer.exe";
-    let Some(dir) = windir.map(str::trim).filter(|s| !s.is_empty()) else {
+    let Some(dir) = windows_dir.map(str::trim).filter(|s| !s.is_empty()) else {
         return FALLBACK.to_string();
     };
     let Some(norm) = crate::term::accept_local_cwd(dir) else {
@@ -1778,8 +1862,34 @@ pub fn explorer_from_windir(windir: Option<&str>) -> String {
     }
 }
 
+/// Absolute `explorer.exe` from `GetWindowsDirectoryW`. `WINDIR` is not
+/// read. A failed call uses `C:\Windows\explorer.exe`.
 pub fn explorer_program() -> String {
-    explorer_from_windir(std::env::var("WINDIR").ok().as_deref())
+    explorer_exe(windows_directory().as_deref())
+}
+
+#[cfg(windows)]
+fn windows_directory() -> Option<String> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
+    let mut buf = [0u16; 260];
+    // SAFETY: the length passed is `buf`'s own, so the write stays inside it.
+    // Zero, or a length that does not fit, falls back to `C:\Windows`
+    // instead of reading `WINDIR`.
+    let n = unsafe { GetWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
+    if n == 0 || n as usize >= buf.len() {
+        return None;
+    }
+    Some(
+        std::ffi::OsString::from_wide(&buf[..n as usize])
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+#[cfg(not(windows))]
+fn windows_directory() -> Option<String> {
+    None
 }
 
 /// One raw argument: `/select,"<path>"`. The path has already rejected
@@ -2010,14 +2120,100 @@ pub fn spawn_editor(argv: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `code.exe` on PATH, or the `Code.exe` that sits next to the `code.cmd`
-/// shim VS Code puts on PATH. A `.cmd` is not returned: `Command` would
+/// `Code.exe` for this window. A `.cmd` is not returned: `Command` would
 /// not start it, and wrapping it in `cmd /c` is the thing this module
 /// does not do. `None` means a `path:line` link opens its folder with
 /// `explorer.exe /select` instead of an editor.
-pub fn find_code_exe() -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    find_code_exe_in(std::env::split_paths(&path))
+///
+/// Not elevated: `code.exe` on `PATH`, or the `Code.exe` next to the
+/// `code.cmd` shim. Elevated: `PATH` and `%LOCALAPPDATA%` are ignored.
+/// The lookup is only Program Files and Program Files (x86), from
+/// `SHGetKnownFolderPath`, not from environment variables. `None` means
+/// the file is not opened by an editor; the window asks with the full path.
+pub fn code_exe(elevated: bool) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH");
+    let trusted = if elevated {
+        trusted_vscode_dirs(
+            known_program_files().as_deref(),
+            known_program_files_x86().as_deref(),
+        )
+    } else {
+        Vec::new()
+    };
+    code_exe_from(
+        elevated,
+        path.as_ref()
+            .map(|path| std::env::split_paths(path))
+            .into_iter()
+            .flatten(),
+        trusted,
+    )
+}
+
+/// VS Code's per-machine install folders. Nothing under the user profile.
+pub fn trusted_vscode_dirs(
+    program_files: Option<&Path>,
+    program_files_x86: Option<&Path>,
+) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    for root in [program_files, program_files_x86].into_iter().flatten() {
+        let install = root.join("Microsoft VS Code");
+        dirs.push(install.join("bin"));
+        dirs.push(install);
+    }
+    dirs
+}
+
+/// `FOLDERID_ProgramFiles` via `SHGetKnownFolderPath`. Not the
+/// `ProgramFiles` environment variable.
+pub fn known_program_files() -> Option<std::path::PathBuf> {
+    known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles)
+}
+
+/// `FOLDERID_ProgramFilesX86` via `SHGetKnownFolderPath`.
+pub fn known_program_files_x86() -> Option<std::path::PathBuf> {
+    known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramFilesX86)
+}
+
+fn known_folder(id: &windows_sys::core::GUID) -> Option<std::path::PathBuf> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::SHGetKnownFolderPath;
+    // SAFETY: the folder id is a static GUID. On success `path` is a
+    // CoTaskMemAlloc string, freed before return. A failed call leaves it null.
+    unsafe {
+        let mut path = std::ptr::null_mut();
+        let hr = SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut path);
+        if hr != 0 || path.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while *path.add(len) != 0 {
+            len += 1;
+        }
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(path, len));
+        CoTaskMemFree(path.cast());
+        Some(std::path::PathBuf::from(text))
+    }
+}
+
+/// `path_dirs` is `PATH`. `trusted` is [`trusted_vscode_dirs`]. Elevated
+/// uses only the second.
+pub fn code_exe_from<A, B, P, Q>(
+    elevated: bool,
+    path_dirs: A,
+    trusted: B,
+) -> Option<std::path::PathBuf>
+where
+    A: IntoIterator<Item = P>,
+    B: IntoIterator<Item = Q>,
+    P: AsRef<Path>,
+    Q: AsRef<Path>,
+{
+    if elevated {
+        find_code_exe_in(trusted)
+    } else {
+        find_code_exe_in(path_dirs)
+    }
 }
 
 /// NTFS names are case-insensitive, so one spelling of each finds them all.
@@ -2136,6 +2332,53 @@ pub fn links_on_row<T: EventListener>(term: &Term<T>, viewport_row: usize) -> Ve
                 .filter(|u| !u.is_empty()),
             hidden,
         });
+    }
+    links_in_row(&cells)
+}
+
+/// Links on viewport row `vrow`, which may be `-1` when a smooth scroll
+/// has drawn the history line above the screen. Row 0 and below are the
+/// same scan as [`links_on_row`].
+pub fn links_on_viewport<T: EventListener>(term: &Term<T>, vrow: i32) -> Vec<LinkSpan> {
+    if vrow >= 0 {
+        return links_on_row(term, vrow as usize);
+    }
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::{Column, Line};
+    let off = term.grid().display_offset() as i32;
+    let line = Line(vrow - off);
+    if line < term.topmost_line() || line > term.bottommost_line() {
+        return Vec::new();
+    }
+    let grid_row = &term.grid()[line];
+    let mut cells = Vec::new();
+    let mut col = 0;
+    while col < term.columns() {
+        let cell = &grid_row[Column(col)];
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            col += 1;
+            continue;
+        }
+        let width = if cell.flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else {
+            1
+        };
+        let hidden = cell.flags.intersects(Flags::HIDDEN);
+        let href = if hidden { None } else { cell.hyperlink() };
+        let ch = if hidden { ' ' } else { cell.c };
+        cells.push(RowCell {
+            col,
+            width,
+            ch,
+            osc_id: href.as_ref().map(|h| h.id().to_string()),
+            osc_uri: href
+                .as_ref()
+                .map(|h| h.uri().to_string())
+                .filter(|u| !u.is_empty()),
+            hidden,
+        });
+        col += 1;
     }
     links_in_row(&cells)
 }
@@ -2647,6 +2890,68 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A partial pixel offset: the sliver at the top is the history line,
+    /// not viewport row 0. The link path asks [`links_on_viewport`] for
+    /// that row.
+    #[test]
+    fn a_partial_offset_reads_the_link_on_the_shifted_row() {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::Column;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let size = crate::term::TermSize { cols: 48, rows: 4 };
+        let mut t = Term::new(
+            Config::default(),
+            &size,
+            alacritty_terminal::event::VoidListener,
+        );
+        let mut parser: Processor = Processor::new();
+        let text = concat!(
+            "http://peek.example/old\r\n",
+            "http://top.example/row0\r\n",
+            "http://mid.example/row1\r\n",
+            "http://low.example/row2\r\n",
+        );
+        parser.advance(&mut t, text.as_bytes());
+        assert!(t.grid().history_size() >= 1, "the first url scrolled away");
+        let peek = &t.grid()[alacritty_terminal::index::Line(-1)];
+        assert_eq!(peek[Column(0)].c, 'h', "line above the viewport");
+
+        let cell_h = 20.0;
+        let shift = 8.0;
+        let sliver = crate::scroll::selection_row(3.0, cell_h, shift, 4);
+        let below = crate::scroll::selection_row(10.0, cell_h, shift, 4);
+        assert_eq!(sliver, -1);
+        assert_eq!(below, 0);
+        // cell_at would have called the sliver row 0
+        assert_eq!((3.0f64 / cell_h).floor() as i32, 0);
+
+        let peek_urls: Vec<_> = links_on_viewport(&t, sliver)
+            .into_iter()
+            .filter_map(|sp| match sp.kind {
+                LinkKind::Url { uri } => Some(uri),
+                _ => None,
+            })
+            .collect();
+        let top_urls: Vec<_> = links_on_viewport(&t, below)
+            .into_iter()
+            .filter_map(|sp| match sp.kind {
+                LinkKind::Url { uri } => Some(uri),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            peek_urls.iter().any(|u| u.contains("peek.example")),
+            "peek row links: {peek_urls:?}"
+        );
+        assert!(
+            top_urls.iter().any(|u| u.contains("top.example")),
+            "top row links: {top_urls:?}"
+        );
+        assert!(peek_urls.iter().all(|u| !u.contains("top.example")));
     }
 
     fn files_in(s: &str) -> Vec<(String, u32, Option<u32>, String)> {
@@ -3179,6 +3484,53 @@ mod tests {
     }
 
     #[test]
+    fn an_elevated_editor_lookup_ignores_path_and_user_installs() {
+        let root = std::env::temp_dir().join(format!("bayan-code-elev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let path_bin = root.join("user-path");
+        let program_files = root.join("Program Files");
+        let local = root.join("Local");
+        let install = program_files.join("Microsoft VS Code");
+        let user_install = local.join("Programs").join("Microsoft VS Code");
+        std::fs::create_dir_all(&path_bin).unwrap();
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::create_dir_all(&user_install).unwrap();
+        std::fs::write(path_bin.join("Code.exe"), b"MZ").unwrap();
+        std::fs::write(user_install.join("Code.exe"), b"MZ").unwrap();
+        let trusted = trusted_vscode_dirs(Some(&program_files), None);
+        assert!(
+            trusted.iter().all(|dir| !dir.starts_with(&local)),
+            "LocalAppData is not a trusted editor folder"
+        );
+        assert!(
+            code_exe_from(true, [&path_bin, &user_install], trusted.iter()).is_none(),
+            "PATH and the user installer are not elevated editors"
+        );
+        assert!(code_exe_from(false, std::iter::once(&path_bin), trusted.iter()).is_some());
+        std::fs::write(install.join("Code.exe"), b"MZ").unwrap();
+        let trusted = trusted_vscode_dirs(Some(&program_files), None);
+        let found = code_exe_from(true, std::iter::once(&path_bin), trusted.iter()).unwrap();
+        assert_eq!(found, install.join("Code.exe"));
+        let file = r"C:\src\main.rs";
+        match settle_edit_default(
+            file.to_string(),
+            10,
+            None,
+            &|_: &str| true,
+            &|_: &str| None,
+            &|| None,
+            true,
+        ) {
+            Action::Confirm { uri, host } => {
+                assert_eq!(uri, file);
+                assert_eq!(host, file);
+            }
+            other => panic!("expected a confirm card, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn rtl_click_lands_on_the_link_under_the_glyph() {
         use crate::mouse::{column_for_click, GlyphBox};
         // The link is logical columns 3 and 4. The shaped RTL line draws
@@ -3563,7 +3915,7 @@ mod tests {
                     Action::Reveal(path) => {
                         assert_eq!(path, bat);
                         assert_eq!(select_arg(&path), format!(r#"/select,"{path}""#));
-                        let prog = explorer_from_windir(Some(r"C:\Windows"));
+                        let prog = explorer_exe(Some(r"C:\Windows"));
                         assert_eq!(prog, r"C:\Windows\explorer.exe");
                         assert!(!prog.to_ascii_lowercase().contains("cmd"));
                         assert!(!select_arg(&path).contains("/c"));
@@ -4167,30 +4519,80 @@ mod tests {
             Some(r"C:\b")
         );
         assert_eq!(
-            explorer_from_windir(Some(r"C:\Windows")),
+            explorer_exe(Some(r"C:\Windows")),
+            r"C:\Windows\explorer.exe"
+        );
+        assert_eq!(explorer_exe(Some(r"C:\evil")), r"C:\Windows\explorer.exe");
+        assert_eq!(
+            explorer_exe(Some(r"\\evil\share")),
             r"C:\Windows\explorer.exe"
         );
         assert_eq!(
-            explorer_from_windir(Some(r"D:\Windows")),
-            r"D:\Windows\explorer.exe"
-        );
-        assert_eq!(
-            explorer_from_windir(Some(r"C:\evil")),
+            explorer_exe(Some(r"C:\Windows\..\evil")),
             r"C:\Windows\explorer.exe"
         );
-        assert_eq!(
-            explorer_from_windir(Some(r"\\evil\share")),
-            r"C:\Windows\explorer.exe"
-        );
-        assert_eq!(
-            explorer_from_windir(Some(r"C:\Windows\..\evil")),
-            r"C:\Windows\explorer.exe"
-        );
-        assert_eq!(explorer_from_windir(None), r"C:\Windows\explorer.exe");
+        assert_eq!(explorer_exe(None), r"C:\Windows\explorer.exe");
         assert_eq!(select_arg(r"C:\qa\note.txt"), r#"/select,"C:\qa\note.txt""#);
-        let prog = explorer_from_windir(Some(r"C:\Windows"));
+        let prog = explorer_exe(Some(r"C:\Windows"));
         assert!(prog.to_ascii_lowercase().ends_with(r"\explorer.exe"));
         assert!(!prog.to_ascii_lowercase().contains("cmd"));
+    }
+
+    #[test]
+    fn enter_on_an_uppercase_scheme_opens_the_browser() {
+        let uri = "HTTPS://u@host/";
+        // The old Enter check was case-sensitive and would reveal this.
+        assert!(!uri.starts_with("https://"));
+        assert!(!uri.starts_with("http://"));
+        let open = confirm_open_from_uri(uri);
+        assert_eq!(open, ConfirmOpen::Browse(uri.to_string()));
+        assert_eq!(confirm_enter(&open), Action::Browse(uri.to_string()));
+        assert!(confirm_enter_settles(&open));
+    }
+
+    #[test]
+    fn enter_on_an_elevated_missing_editor_only_reveals() {
+        let path = r"C:\Users\me\.bayan\config.json";
+        let open = ConfirmOpen::RevealOnly(path.to_string());
+        assert_eq!(confirm_enter(&open), Action::Reveal(path.to_string()));
+        assert!(
+            !confirm_enter_settles(&open),
+            "Enter must not send this card through settle"
+        );
+        let reclassified = settle(
+            Action::Reveal(path.to_string()),
+            |_| true,
+            |p: &str| Some(p.to_string()),
+            || None,
+        );
+        assert!(
+            matches!(reclassified, Action::OpenPath(ref got) if got == path),
+            "settle would association-open the json file"
+        );
+    }
+
+    #[test]
+    fn a_planted_windir_does_not_choose_explorer() {
+        let root = std::env::temp_dir().join(format!("bayan-windir-{}", std::process::id()));
+        let windows = root.join("Windows");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&windows).unwrap();
+        let planted = windows.display().to_string();
+        let previous = std::env::var_os("WINDIR");
+        std::env::set_var("WINDIR", &windows);
+        let got = explorer_program();
+        match &previous {
+            Some(value) => std::env::set_var("WINDIR", value),
+            None => std::env::remove_var("WINDIR"),
+        }
+        let planted_exe = format!(r"{planted}\explorer.exe");
+        assert_ne!(
+            got, planted_exe,
+            "WINDIR is user-writable and must not choose explorer.exe"
+        );
+        assert!(got.to_ascii_lowercase().ends_with(r"\explorer.exe"));
+        assert!(!got.to_ascii_lowercase().contains("users"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

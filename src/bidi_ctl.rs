@@ -17,6 +17,117 @@
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::Term;
 
+/// How far Bayan reorders a pane, mintty's `Bidi=0/1/2`.
+///
+/// The config key is `bidi.mode`. A pane may override it at runtime; `None`
+/// on the pane means "use the config". `Full` is the default and is what
+/// Bayan did before the setting existed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BidiReorder {
+    /// `0` / `"off"`. Cells are drawn in storage order. An agent that
+    /// already ordered Arabic is not reversed a second time. Shaping of
+    /// each glyph still follows the font; only UAX#9 reordering is skipped.
+    Off,
+    /// `1` / `"alt_off"`. The primary screen reorders. The alternate screen
+    /// does not. `?1049` is alacritty's own alt-screen bit. `?47` and
+    /// `?1047` are tracked beside it, for this decision only, and the
+    /// bytes the parser sees are not rewritten.
+    AltOff,
+    /// `2` / `"full"`. Reorder on both screens, still gated by BDSM when
+    /// `honor_bdsm` is set. The default.
+    #[default]
+    Full,
+}
+
+impl BidiReorder {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::AltOff => "alt_off",
+            Self::Full => "full",
+        }
+    }
+
+    /// `"off"` / `"alt_off"` / `"full"`, or the mintty digits `"0"` / `"1"`
+    /// / `"2"`. Anything else is not a mode.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "0" => Some(Self::Off),
+            "alt_off" | "1" => Some(Self::AltOff),
+            "full" | "2" => Some(Self::Full),
+            _ => None,
+        }
+    }
+
+    /// `full → alt_off → off → full`. One press from the default reaches
+    /// the mode full-screen programs that order their own text want.
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Full => Self::AltOff,
+            Self::AltOff => Self::Off,
+            Self::Off => Self::Full,
+        }
+    }
+
+    /// Alt-screen bit this mode should consult.
+    ///
+    /// `full` and `off` use only alacritty's `TermMode::ALT_SCREEN` (`?1049`).
+    /// `alt_off` also honors the side tracker for `?47` and `?1047`, which
+    /// do not change the parser's screen.
+    pub fn effective_alt(self, term_alt: bool, tracked_alt: bool) -> bool {
+        match self {
+            Self::AltOff => term_alt || tracked_alt,
+            Self::Off | Self::Full => term_alt,
+        }
+    }
+
+    /// Whether this setting itself reorders. BDSM is applied separately,
+    /// so explicit mode can still turn reordering off on top.
+    pub fn reorders_on(self, alt_screen: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::AltOff => !alt_screen,
+            Self::Full => true,
+        }
+    }
+
+    /// User mode AND BDSM. `bdsm_reorders` is the flag `for_display` already
+    /// computed (including the idle-prompt rule). `off` never reorders.
+    /// `alt_off` never reorders while `alt_screen` is set. Otherwise BDSM
+    /// wins, which is how `CSI 8 h/l` stays in force when `honor_bdsm` is on.
+    pub fn allows(self, alt_screen: bool, bdsm_reorders: bool) -> bool {
+        self.reorders_on(alt_screen) && bdsm_reorders
+    }
+
+    /// Corner chip. `Full` draws nothing, so a default pane looks as before.
+    pub fn badge(self) -> Option<&'static str> {
+        match self {
+            Self::Full => None,
+            Self::AltOff => Some("BiDi 1"),
+            Self::Off => Some("BiDi 0"),
+        }
+    }
+
+    /// Palette row, naming the mode the focused pane is in now.
+    pub fn palette_label(self) -> String {
+        let which = match self {
+            Self::Off => crate::lang::tr("إيقاف", "off"),
+            Self::AltOff => crate::lang::tr("الشاشة البديلة", "alt screen"),
+            Self::Full => crate::lang::tr("كامل", "full"),
+        };
+        if crate::lang::rtl() {
+            format!("اتجاه النص: {which}")
+        } else {
+            format!("BiDi mode: {which}")
+        }
+    }
+
+    pub fn is_full(self) -> bool {
+        self == Self::Full
+    }
+}
+
 /// `CSI 8 h` — the terminal applies the BiDi algorithm.
 /// `CSI 8 l` — the application already ordered the text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -96,6 +207,25 @@ impl BidiState {
         }
     }
 
+    /// The reorder flag a frame should use.
+    ///
+    /// `mode` is the pane's effective setting (its override, or the config).
+    /// `alt_screen` must be `TermMode::ALT_SCREEN` on that pane's term: the
+    /// three ways in (`?1049`, `?1047`, `?47`) all set the same bit, and a
+    /// program that gets there any other way is the same case. The second
+    /// flag is SCP stamps, and only while this frame actually reorders.
+    pub fn presentation(
+        &self,
+        mode: BidiReorder,
+        honor_bdsm: bool,
+        command_running: bool,
+        alt_screen: bool,
+    ) -> (bool, bool) {
+        let (bdsm, stamps) = self.for_display(honor_bdsm, command_running, alt_screen);
+        let reorder = mode.allows(alt_screen, bdsm);
+        (reorder, stamps && reorder)
+    }
+
     /// Record an SCP. Column 0 updates the line the cursor is on; anywhere
     /// else, the new direction starts on the next line.
     pub fn note_scp(&mut self, dir: ParagraphDir, abs_line: u64, column: usize) {
@@ -145,6 +275,108 @@ pub fn viewport_line_abs(evicted: u64, history: u64, display_offset: u64, vrow: 
         .saturating_add(history)
         .saturating_add(vrow)
         .saturating_sub(display_offset)
+}
+
+/// Side state for mintty `Bidi=1` (`alt_off`).
+///
+/// vte 0.15 only enters the alternate screen for `?1049`. `?47` and `?1047`
+/// are the other two ways a full-screen program gets there. This tracker
+/// records set/reset of all three so `alt_off` can stop reordering, and it
+/// does not change the bytes the parser receives. A sequence split across
+/// PTY reads stays open until its final byte.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct AltScreenTrack {
+    on: bool,
+    phase: AltPhase,
+    /// CSI body after `ESC [`, before the final byte.
+    body: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum AltPhase {
+    #[default]
+    Ground,
+    Esc,
+    Csi,
+}
+
+impl AltScreenTrack {
+    pub fn on(&self) -> bool {
+        self.on
+    }
+
+    /// Watch one PTY read. The slice is not modified.
+    pub fn observe(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.byte(b);
+        }
+    }
+
+    fn byte(&mut self, b: u8) {
+        match self.phase {
+            AltPhase::Ground => {
+                if b == 0x1b {
+                    self.phase = AltPhase::Esc;
+                }
+            }
+            AltPhase::Esc => match b {
+                0x1b => {}
+                b'[' => {
+                    self.body.clear();
+                    self.phase = AltPhase::Csi;
+                }
+                b'c' => {
+                    self.on = false;
+                    self.phase = AltPhase::Ground;
+                }
+                0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f..=0xff => {}
+                0x18 | 0x1a => self.phase = AltPhase::Ground,
+                _ => self.phase = AltPhase::Ground,
+            },
+            AltPhase::Csi => {
+                if b == 0x18 || b == 0x1a {
+                    self.body.clear();
+                    self.phase = AltPhase::Ground;
+                } else if b == 0x1b {
+                    self.body.clear();
+                    self.phase = AltPhase::Esc;
+                } else if b < 0x20 || b == 0x7f || b > 0x7e {
+                    // C0 is executed, DEL and high bytes are ignored, and
+                    // the CSI stays open. Same rule as the BDSM filter.
+                } else if (0x40..=0x7e).contains(&b) {
+                    self.finish(b);
+                } else if self.body.len() < 64 {
+                    self.body.push(b);
+                } else {
+                    self.body.clear();
+                    self.phase = AltPhase::Ground;
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self, final_byte: u8) {
+        let body = std::mem::take(&mut self.body);
+        self.phase = AltPhase::Ground;
+        if final_byte != b'h' && final_byte != b'l' {
+            return;
+        }
+        let Some(params) = body.strip_prefix(b"?") else {
+            return;
+        };
+        let enter = final_byte == b'h';
+        for param in params.split(|b| *b == b';') {
+            let head = param.split(|b| *b == b':').next().unwrap_or(param);
+            if matches!(head, b"47" | b"1047" | b"1049") {
+                self.on = enter;
+            }
+        }
+    }
+}
+
+/// Absolute line of the history row drawn above viewport row 0.
+pub fn peek_line_abs(evicted: u64, history: u64, display_offset: u64) -> u64 {
+    viewport_line_abs(evicted, history, display_offset, 0).saturating_sub(1)
 }
 
 /// UAX#9 base-direction mark. cosmic-text chooses the paragraph level from
@@ -562,6 +794,24 @@ mod tests {
             SessionMeta::default(),
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn the_peek_line_is_the_one_above_the_viewport() {
+        let top = viewport_line_abs(4, 10, 2, 0);
+        assert_eq!(peek_line_abs(4, 10, 2), top - 1);
+        let mut state = BidiState {
+            mode: BidiMode::Implicit,
+            direction: ParagraphDir::Default,
+            stamps: Vec::new(),
+        };
+        state.note_scp(ParagraphDir::Rtl, peek_line_abs(4, 10, 2), 0);
+        state.note_scp(ParagraphDir::Ltr, top, 0);
+        assert_eq!(
+            state.direction_at(peek_line_abs(4, 10, 2)),
+            ParagraphDir::Rtl
+        );
+        assert_eq!(state.direction_at(top), ParagraphDir::Ltr);
     }
 
     fn feed(
@@ -1075,6 +1325,180 @@ mod tests {
         }
         assert!(saw_ris, "seeded streams contained no RIS");
         assert!(saw_alt, "seeded streams contained no alt-screen CSI");
+    }
+
+    fn alt_for(mode: BidiReorder, t: &Term<VoidListener>, meta: &SessionMeta) -> bool {
+        mode.effective_alt(t.mode().contains(TermMode::ALT_SCREEN), meta.alt_track.on())
+    }
+
+    /// `?47` and `?1047` must reach the parser unchanged. Rewriting them to
+    /// `?1049` would switch the screen buffer even in `full` mode. `alt_off`
+    /// still sees them via the tracker. `?1049` is the one sequence that
+    /// really sets `TermMode::ALT_SCREEN`.
+    #[test]
+    fn full_mode_leaves_47_and_1047_bytes_unchanged() {
+        for seq in ["47", "1047"] {
+            let (mut t, mut p, mut meta, mut carry) = fresh();
+            feed(
+                &mut t,
+                &mut p,
+                &mut meta,
+                &mut carry,
+                format!("AB\x1b[?{seq}hZ").as_bytes(),
+            );
+            assert!(
+                !t.mode().contains(TermMode::ALT_SCREEN),
+                "?{seq}h must not be rewritten into ?1049"
+            );
+            assert_eq!(cell(&t, 0), 'A', "?{seq}: the primary screen was swapped");
+            assert_eq!(cell(&t, 1), 'B');
+            assert_eq!(cell(&t, 2), 'Z');
+            assert!(meta.alt_track.on(), "?{seq}h is tracked for alt_off");
+            let term_alt = t.mode().contains(TermMode::ALT_SCREEN);
+            assert!(
+                meta.bidi
+                    .presentation(BidiReorder::Full, true, false, term_alt)
+                    .0,
+                "full keeps reordering"
+            );
+            let alt = alt_for(BidiReorder::AltOff, &t, &meta);
+            assert!(
+                !meta
+                    .bidi
+                    .presentation(BidiReorder::AltOff, true, false, alt)
+                    .0,
+                "alt_off stops while ?{seq} is set"
+            );
+            feed(
+                &mut t,
+                &mut p,
+                &mut meta,
+                &mut carry,
+                format!("\x1b[?{seq}l").as_bytes(),
+            );
+            assert!(!meta.alt_track.on());
+            let alt = alt_for(BidiReorder::AltOff, &t, &meta);
+            assert!(
+                meta.bidi
+                    .presentation(BidiReorder::AltOff, true, false, alt)
+                    .0,
+                "?{seq}l restores reordering"
+            );
+        }
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"AB\x1b[?1049hZ");
+        assert!(
+            t.mode().contains(TermMode::ALT_SCREEN),
+            "?1049 is the sequence that actually switches screens"
+        );
+        assert_ne!(
+            cell(&t, 0),
+            'A',
+            "the primary screen's A is not what ?1049 shows"
+        );
+    }
+
+    /// `?1047h` split across two reads still turns alt_off off, and the
+    /// reset turns it back on. The term bit stays clear: the bytes were
+    /// not promoted to `?1049`.
+    #[test]
+    fn alt_off_detects_1047_split_across_reads() {
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[?104");
+        assert!(!meta.alt_track.on(), "half a CSI is not alt screen yet");
+        assert!(!t.mode().contains(TermMode::ALT_SCREEN));
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"7h");
+        assert!(meta.alt_track.on(), "the final byte closes the split CSI");
+        assert!(
+            !t.mode().contains(TermMode::ALT_SCREEN),
+            "the parser must still see ?1047, not ?1049"
+        );
+        let alt = alt_for(BidiReorder::AltOff, &t, &meta);
+        assert!(
+            !meta
+                .bidi
+                .presentation(BidiReorder::AltOff, true, false, alt)
+                .0
+        );
+        assert!(
+            meta.bidi
+                .presentation(
+                    BidiReorder::Full,
+                    true,
+                    false,
+                    t.mode().contains(TermMode::ALT_SCREEN)
+                )
+                .0
+        );
+        feed(&mut t, &mut p, &mut meta, &mut carry, b"\x1b[?1047l");
+        assert!(!meta.alt_track.on());
+        let alt = alt_for(BidiReorder::AltOff, &t, &meta);
+        assert!(
+            meta.bidi
+                .presentation(BidiReorder::AltOff, true, false, alt)
+                .0,
+            "reset restores bidi"
+        );
+    }
+
+    /// BDSM still sits on top of a mode that would reorder. `off` does not
+    /// come back on because the application sent `CSI 8 h`.
+    #[test]
+    fn bidi_mode_keeps_bdsm_and_does_not_reorder_when_off() {
+        let state = BidiState::default();
+        assert_eq!(
+            state.presentation(BidiReorder::Full, true, false, false),
+            (true, false),
+            "idle full still reorders"
+        );
+        let mut explicit = state.clone();
+        explicit.mode = BidiMode::Explicit;
+        assert_eq!(
+            explicit.presentation(BidiReorder::Full, true, true, false),
+            (false, false),
+            "explicit BDSM while a command runs still wins under full"
+        );
+        assert!(
+            explicit
+                .presentation(BidiReorder::Full, false, true, false)
+                .0,
+            "honor_bdsm = false keeps reordering"
+        );
+        assert!(
+            !state.presentation(BidiReorder::Off, true, false, false).0,
+            "off does not reorder at the prompt"
+        );
+        assert!(
+            !state.presentation(BidiReorder::Off, true, true, true).0,
+            "off does not reorder because BDSM is implicit"
+        );
+        assert_eq!(BidiReorder::Full.cycle(), BidiReorder::AltOff);
+        assert_eq!(BidiReorder::AltOff.cycle(), BidiReorder::Off);
+        assert_eq!(BidiReorder::Off.cycle(), BidiReorder::Full);
+    }
+
+    /// The toggle is stored on the pane, not in BDSM state, so resetting
+    /// BiDi on an alt-screen switch does not forget it. A second pane is
+    /// untouched.
+    #[test]
+    fn bidi_toggle_is_per_pane() {
+        let cfg = BidiReorder::Full;
+        let mut a = SessionMeta::default();
+        let b = SessionMeta::default();
+        assert_eq!(a.bidi_reorder.unwrap_or(cfg), BidiReorder::Full);
+        a.bidi_reorder = Some(a.bidi_reorder.unwrap_or(cfg).cycle());
+        assert_eq!(a.bidi_reorder, Some(BidiReorder::AltOff));
+        assert_eq!(b.bidi_reorder.unwrap_or(cfg), BidiReorder::Full);
+        a.bidi_mut().reset();
+        assert_eq!(
+            a.bidi_reorder,
+            Some(BidiReorder::AltOff),
+            "a BiDi reset must not clear the pane's mode"
+        );
+        a.bidi_reorder = Some(a.bidi_reorder.unwrap().cycle());
+        assert_eq!(a.bidi_reorder, Some(BidiReorder::Off));
+        assert!(a.bidi_reorder.unwrap().badge().is_some());
+        assert!(BidiReorder::Full.badge().is_none());
     }
 
     /// The Ground fast path in `pull` emits exactly what the byte-at-a-time

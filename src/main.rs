@@ -7,14 +7,23 @@
 // release builds are pure GUI apps: no companion console window
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod a11y;
 mod bidi;
 mod bidi_ctl;
 mod chrome;
+mod cli;
 mod config;
+mod config_watch;
+mod context_menu;
+mod copyclean;
 mod copymode;
+mod elevate;
 mod gpu;
 mod groups;
+mod handoff;
+mod images;
 mod input;
+mod jumplist;
 mod keybinds;
 mod keyroute;
 mod keys;
@@ -24,8 +33,10 @@ mod latency;
 mod layout;
 mod link;
 mod localpath;
+mod lua_host;
 mod mouse;
 mod mru;
+mod mux;
 mod osc7;
 mod persist;
 mod plugins;
@@ -33,8 +44,14 @@ mod posh;
 mod process;
 mod pty_writer;
 mod render;
+mod screen_reader;
+mod scroll;
+mod scrollbar;
+mod shellint;
 mod shells;
+mod ssh;
 mod term;
+mod theme;
 mod toast;
 
 #[cfg(test)]
@@ -59,6 +76,8 @@ type PaneSnap = (
     std::sync::Arc<bidi_ctl::BidiState>,
     u64,
     Option<u64>,
+    Option<bidi_ctl::BidiReorder>,
+    bool,
 );
 
 /// The Windows caret rhythm; kitty's idea on top: stop after 15s idle.
@@ -125,6 +144,9 @@ fn beep() {
 static QUAKE_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// A toast/tray click wants the window raised (summon, never hide).
 static SUMMON_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `WM_SETTINGCHANGE` / `WM_SYSCOLORCHANGE` arrived. `about_to_wait` re-reads
+/// High Contrast and the text-size slider; the hook only sets the bit.
+static A11Y_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const QUAKE_ID: usize = 0xB1AA;
 
 /// The letter a Ctrl+<letter> event represents, resolved the way real
@@ -420,6 +442,10 @@ pub enum UserEvent {
     /// `allow_osc52_write` says so — the default is to drop it, and a write
     /// from any pane but the focused one of the active tab is dropped too.
     ClipboardSet(u64, String),
+    /// Pane `id` asked to read the clipboard (OSC 52). Forwarded so a later
+    /// change can answer it. This build writes no reply. The read flag
+    /// defaults off; see [`config::UserConfig::osc52_read_enabled`].
+    ClipboardLoad(u64, alacritty_terminal::term::ClipboardType),
     /// Pane `id`'s shell reported its working directory (OSC 7 or OSC 9;9).
     Cwd(u64, String),
     /// Pane `id` rang the bell (Claude waiting for an approval).
@@ -444,6 +470,31 @@ pub enum UserEvent {
         reason: String,
         shown: String,
     },
+    /// Elevated `path:line` with no Program Files `Code.exe`. The card shows
+    /// the full path; Enter reveals it in Explorer.
+    LinkConfirm {
+        path: String,
+    },
+    /// `config.json` changed on disk (or failed to parse). Never a panel save.
+    ConfigReloaded(config_watch::ReloadMsg),
+    /// AccessKit: a reader connected, asked for an action, or disconnected.
+    /// The proxy path delivers these; the tree is built only on the first.
+    AccessKit(accesskit_winit::Event),
+}
+
+/// A one-line notice for a config reload. A parse error stays until the file
+/// is valid. A "takes effect later" line expires on its own. Neither blocks
+/// the terminal.
+#[derive(Clone)]
+struct ConfigNotice {
+    text: String,
+    until: Option<Instant>,
+}
+
+impl From<accesskit_winit::Event> for UserEvent {
+    fn from(event: accesskit_winit::Event) -> Self {
+        UserEvent::AccessKit(event)
+    }
 }
 
 /// The link under the pointer. Stable while the pointer stays inside it,
@@ -451,19 +502,22 @@ pub enum UserEvent {
 #[derive(PartialEq, Eq)]
 struct LinkHover {
     pane_id: u64,
-    row: usize,
+    /// Viewport row. `-1` is the history line a smooth scroll has
+    /// brought into the top of the pane.
+    row: i32,
     start_col: usize,
     end_col: usize,
     target: link::StatusParts,
 }
 
-/// A Ctrl+click that was refused, or a userinfo URL waiting for Enter.
-/// Esc dismisses either. Enter opens only when `confirm_uri` is set;
-/// a refusal leaves it empty so Enter cannot launch the target.
+/// A Ctrl+click that was refused, or a confirm card waiting for Enter.
+/// Esc dismisses either. Enter runs `confirm` when it is set. A refusal
+/// leaves it empty so Enter cannot launch the target. The variant is the
+/// action: Enter does not guess from the text.
 struct BlockedLink {
     reason: String,
     shown: String,
-    confirm_uri: Option<String>,
+    confirm: Option<link::ConfirmOpen>,
     is_app_error: bool,
 }
 
@@ -479,6 +533,9 @@ enum PendingKind {
     /// A plugin action's command (BAYAN-007): the focused pane only,
     /// unbracketed, so a trailing CR still runs it.
     Command,
+    /// config.lua or an executable plugin, approved by content hash.
+    /// Enter does not type the source into the shell.
+    ApproveLua,
 }
 
 /// Text held for the confirm card: the bytes to send, and why the card is up.
@@ -492,6 +549,12 @@ struct PendingPaste {
     lines: usize,
     chars: usize,
     reason: String,
+    /// Set when Enter approves a Lua file instead of typing `text`.
+    lua: Option<lua_host::PendingScript>,
+    /// Rows of a long approval card already scrolled off the top.
+    scroll: usize,
+    /// The last row of that card has been inside the window.
+    saw_end: bool,
 }
 
 /// One terminal pane (a tab holds one or more).
@@ -505,6 +568,14 @@ struct Pane {
     last_output: Option<Instant>,
     /// the program's OSC 9;4 progress report, until it clears it
     progress: Option<term::Progress>,
+    /// Set when the ConPTY lives in the mux server. `armed` is cleared to
+    /// detach: the session's kill hook then leaves the remote process running.
+    mux: Option<MuxBind>,
+}
+
+struct MuxBind {
+    id: u64,
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -865,6 +936,10 @@ fn restored_shell(saved: Option<String>, default: &str, installed: &[shells::She
 }
 
 fn state_path() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = SESSION_FILE.with(|slot| slot.borrow().clone()) {
+        return Some(path);
+    }
     let home = std::env::var("USERPROFILE").ok()?;
     Some(
         std::path::Path::new(&home)
@@ -873,9 +948,15 @@ fn state_path() -> Option<std::path::PathBuf> {
     )
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static SESSION_FILE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Multi-click detection: 1 = simple, 2 = word (semantic), 3 = line.
 struct ClickTracker {
-    last: Option<(Instant, (usize, usize))>,
+    last: Option<(Instant, (i32, usize))>,
     count: u8,
 }
 
@@ -887,7 +968,7 @@ impl ClickTracker {
         }
     }
 
-    fn click(&mut self, now: Instant, cell: (usize, usize)) -> u8 {
+    fn click(&mut self, now: Instant, cell: (i32, usize)) -> u8 {
         const DOUBLE_MS: u128 = 400;
         self.count = match self.last {
             Some((t, c)) if now.duration_since(t).as_millis() <= DOUBLE_MS && c == cell => {
@@ -980,6 +1061,18 @@ enum PaletteRow {
     OpenShellMenu,
     /// name the active group; `None` gives it back its number
     RenameGroup(Option<String>),
+    /// open the SSH host list
+    OpenSsh,
+    /// one host from that list (the token ssh receives after `--`)
+    SshHost(String),
+    /// detach the focused mux session
+    DetachSession,
+    /// list sessions the server is still running
+    OpenDetached,
+    /// bring a detached session back into a tab
+    Reattach(u64),
+    /// end a detached session
+    KillSession(u64),
 }
 
 /// Rows of the right-click menu, most used first. Each one is a keymap
@@ -997,6 +1090,7 @@ fn context_menu_rows(
     };
     if has_selection {
         add(Copy, Copy.label());
+        add(CopyClean, CopyClean.label());
     }
     for a in [Paste, CopyLastOutput, Search, SplitH, SplitV] {
         add(a, a.label());
@@ -1024,7 +1118,7 @@ fn context_menu_rows(
         PaletteRow::OpenShellMenu,
         tr("تبويب جديد بطرفية…", "New tab with shell…").to_string(),
     ));
-    for a in [NewGroup, RenameTab, ClosePane, Settings] {
+    for a in [NewGroup, RenameTab, ClosePane, Settings, BidiToggle] {
         rows.push((PaletteRow::Builtin(a), a.label().to_string()));
     }
     rows
@@ -1225,13 +1319,74 @@ fn dismiss_paste_for(pending: &mut Option<PendingPaste>, removed: &[u64]) {
 
 /// Chars of preview per card row; the card is 62 cells wide.
 const CARD_ROW_CHARS: usize = 56;
+/// Visible rows of a Lua approval card. The rest scroll.
+const LUA_CARD_ROWS: usize = 12;
+/// After Enter reveals a script, the next Enter is ignored until this
+/// passes, so a held key cannot approve on autorepeat.
+const LUA_APPROVE_DELAY: std::time::Duration = std::time::Duration::from_millis(700);
+
+/// Change one action on the saved map and the same action on the runtime
+/// map. A chord that exists only on the runtime map — a `config.lua`
+/// binding — is left where it is.
+fn apply_shortcut(
+    saved: &mut Option<std::collections::HashMap<String, String>>,
+    runtime: &mut Option<std::collections::HashMap<String, String>>,
+    action_id: &str,
+    chord: Option<String>,
+) {
+    put_binding(saved, action_id, chord.clone());
+    put_binding(runtime, action_id, chord);
+}
+
+fn put_binding(
+    map: &mut Option<std::collections::HashMap<String, String>>,
+    action_id: &str,
+    chord: Option<String>,
+) {
+    match chord {
+        Some(c) => {
+            map.get_or_insert_with(Default::default)
+                .insert(action_id.to_string(), c);
+        }
+        None => {
+            let empty = map.as_mut().is_some_and(|m| {
+                m.remove(action_id);
+                m.is_empty()
+            });
+            if empty {
+                *map = None;
+            }
+        }
+    }
+}
+
+/// The rows the approval card paints, and whether the last row is in view.
+fn lua_card_window(rows: &[String], scroll: usize) -> (Vec<String>, usize, bool) {
+    if rows.len() <= LUA_CARD_ROWS {
+        return (rows.to_vec(), 0, true);
+    }
+    let max = rows.len() - LUA_CARD_ROWS;
+    let scroll = scroll.min(max);
+    let at_end = scroll >= max;
+    (
+        rows[scroll..scroll + LUA_CARD_ROWS].to_vec(),
+        scroll,
+        at_end,
+    )
+}
+
+fn lua_enter_ready(not_before: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    not_before.is_none_or(|t| now >= t)
+}
 
 /// The card's preview rows. A paste shows one elided row, as before. A
 /// plugin command shows ALL of what Enter will type (R-03), wrapped into
 /// rows, with CR as ␍. The 512-char cap stays within ten rows because
 /// plugin load rejects every character this preview would expand.
 fn card_preview(kind: PendingKind, text: &str) -> Vec<String> {
-    if kind != PendingKind::Command {
+    // A plugin command and a Lua file show every character the card is
+    // holding (R-03). A paste stays one elided row.
+    if !matches!(kind, PendingKind::Command | PendingKind::ApproveLua) {
         return vec![term::paste_preview(text, 48)];
     }
     let full = term::paste_preview(text, usize::MAX);
@@ -1283,6 +1438,9 @@ fn plugin_pending(label: &str, send: &str, pane: Option<u64>) -> PendingPaste {
             "{} — {label}",
             tr("إضافة تريد كتابة نص", "A plugin wants to type text")
         ),
+        lua: None,
+        scroll: 0,
+        saw_end: true,
     }
 }
 
@@ -1344,6 +1502,10 @@ struct Palette {
     /// the menu lists the installed shells (`shell_menu_rows`) instead of
     /// the pane actions: a right-click on the tab bar
     shells_menu: bool,
+    /// the rows are SSH hosts
+    ssh_menu: bool,
+    /// the rows are detached mux sessions
+    detached_menu: bool,
     sel: usize,
     extras: Vec<(PaletteRow, String)>,
     pressed: Option<(usize, PaletteRow)>,
@@ -1452,6 +1614,10 @@ struct App {
     spawn_group: Option<u32>,
     /// the command palette, when open
     palette: Option<Palette>,
+    /// Live connection to `bayan --mux-server`. Absent unless `mux.enabled`
+    /// and a mux action has already needed it. Closing the window does not
+    /// kill this process when a session was detached.
+    mux_client: Option<mux::MuxClient>,
     shell_profiles: Vec<shells::Shell>,
     shell_profiles_ready: bool,
     startup_pending: bool,
@@ -1475,6 +1641,10 @@ struct App {
     cursor_pos: PhysicalPosition<f64>,
     /// The cursor box last given to `set_ime_cursor_area`.
     ime_spot: Option<(i32, i32, i32, i32)>,
+    /// The IME context was rebuilt (`Ime::Enabled`) or the window focused
+    /// again. Windows forgot the composition window; send the same box
+    /// again even when it has not moved (winit#2569).
+    ime_area_reset: bool,
     /// Grab, motion dedupe, focus-in memory, and the local selection drag.
     /// A focus loss drops all of them together.
     mouse: mouse::Route,
@@ -1482,6 +1652,8 @@ struct App {
     sel_pane: usize,
     /// divider being dragged (between pane i and i+1)
     drag_divider: Option<usize>,
+    /// Per-pane scrollbar: hover, thumb drag, and when it was last scrolled.
+    bars: scrollbar::Bars,
     /// the agent cockpit overlay (Ctrl+Shift+D): one glance at every tab
     cockpit: bool,
     cockpit_sel: usize,
@@ -1507,6 +1679,14 @@ struct App {
     focused: bool,
     clicks: ClickTracker,
     wheel_accum: f32,
+    /// Per-pane sub-line scroll. Empty unless `scroll.smooth` is on, so a
+    /// disabled wheel never shifts a row.
+    smooth: std::collections::HashMap<u64, scroll::PaneScroll>,
+    /// Last time an easing notch was sampled. None while nothing is pending.
+    smooth_at: Option<Instant>,
+    /// Last alt-screen bit seen per pane, so a transition clears the offset
+    /// even when no wheel notch is still easing.
+    alt_seen: std::collections::HashMap<u64, bool>,
     search: Option<SearchState>,
     clipboard: Option<arboard::Clipboard>,
     /// Claude mode follows (alt screen + claude command) automatically;
@@ -1514,8 +1694,27 @@ struct App {
     auto_follow: bool,
     claude_manual: bool,
     config: config::UserConfig,
+    /// Pixel budget shared by every pane. Caps are the ones from config at
+    /// startup; a later edit applies to the next launch, like scrollback.
+    image_budget: Arc<images::ImageBudget>,
+    /// The config.json document. Lua overrides live only in `config`.
+    json_config: config::UserConfig,
     config_load_error: Option<String>,
     startup_error: Option<String>,
+    /// Executable Lua plugins that passed the allowlist and the hash approval.
+    lua_plugins: lua_host::PluginSet,
+    /// config.lua and plugins the confirm card has not approved yet.
+    lua_pending: Vec<lua_host::PendingScript>,
+    /// Hashes dismissed this session, so a reload does not raise them again.
+    lua_skipped: Vec<String>,
+    /// Text a Lua callback wants typed. Shown on the plugin confirm card.
+    lua_send_queue: std::collections::VecDeque<lua_host::PluginSend>,
+    /// Lua failures to show once the window exists. Never fatal.
+    lua_errors: Vec<String>,
+    /// Set when the token is elevated and scripts were left unloaded.
+    lua_notice: Option<String>,
+    /// Enter on a revealed Lua card is ignored until this instant.
+    lua_approve_not_before: Option<std::time::Instant>,
     /// every rebindable action's effective chord (defaults + config)
     keymap: Vec<(keybinds::Action, keybinds::Chord)>,
     /// the shortcuts editor overlay, when open
@@ -1525,7 +1724,10 @@ struct App {
     /// Ctrl+wheel zoom, in points on top of the configured size.
     font_delta: f32,
     renderer_building: bool,
-    inflight_delta: f32,
+    /// Last High Contrast / text-size read. The renderer in flight was
+    /// built from `inflight_a11y`; a change during the build is chased.
+    a11y: a11y::A11ySnapshot,
+    inflight_a11y: a11y::A11ySnapshot,
     /// the last rectangle the window had while NOT maximized — what a
     /// maximized window restores down to, and what the session saves
     normal_geom: Option<WindowGeom>,
@@ -1539,53 +1741,343 @@ struct App {
     /// needs cell metrics to land on a pane.
     debug_paste: Option<String>,
     /// `--cwd`'s folder, already gated, until the first tab opens in it.
+    /// `#45`: with saved tabs restored, they come back first and this folder
+    /// opens as the active extra tab.
     start_dir: Option<String>,
+    /// UI Automation adapter. `None` until the window exists. The first
+    /// client turns it on for the rest of the session on Windows.
+    reader: Option<accesskit_winit::Adapter>,
+    /// Set when a client has asked for the tree. Before that, redraws do
+    /// not stamp or build. After that, [`screen_reader::TreePace`] decides.
+    reader_seen_client: bool,
+    /// Bumped when pane text changes without the cursor or the selection
+    /// necessarily moving (a PTY chunk, a relayout).
+    reader_gen: u64,
+    reader_pace: screen_reader::TreePace,
+    /// Trailing tree build, when a stamp changed inside the 10 Hz window.
+    reader_tree_at: Option<Instant>,
+    /// Epoch for the announcer's millisecond clock.
+    reader_origin: Instant,
+    /// When the held output burst may be spoken. `about_to_wait` wakes then.
+    reader_deadline: Option<Instant>,
+    reader_gate: screen_reader::OutputGate,
+    /// Document text last given to the tree. Held still across a flood.
+    reader_bodies: Vec<screen_reader::PaneItem>,
+    /// Focused pane the gate is diffing. A change resets the gate.
+    reader_pane: Option<u64>,
+    /// Last command line seen while it was running, for the finish sentence.
+    reader_cmd: String,
+    /// OSC 133 mark already observed. A new absolute row is a new finish.
+    reader_mark: Option<u64>,
+    /// The mark present when a reader first looked is not announced.
+    reader_mark_ready: bool,
+    /// Last live-region name. Unchanged text does not raise another event.
+    reader_live: Option<String>,
+    /// Resolved `-p` command line for that same tab. `None` keeps the
+    /// configured shell. Ignored when `start_command` is set.
+    start_profile_command: Option<String>,
+    /// argv after `--`. When set, that program is the tab's process.
+    start_command: Option<Vec<String>>,
+    /// This process token is elevated. Session restore and `config.shell`
+    /// are not consulted: both are files a standard user can write.
+    elevated: bool,
+    /// Replaces the window content rect in tests, so `locate` and the
+    /// wakeup path can run without a real window.
+    #[cfg(test)]
+    test_content: Option<render::Rect>,
+    /// Watches config.json. A panel save tells it to ignore that write.
+    config_watch: config_watch::ConfigWatcher,
+    /// Which config the in-flight renderer build captured, and which one
+    /// the session wants. A reload during a build is finished when that
+    /// build lands.
+    config_build: config_watch::RendererSlot,
+    /// Parse error, or the list of settings that wait for a new pane.
+    config_notice: Option<ConfigNotice>,
+}
+
+/// What a reload does to the session. The watcher's plan is not kept:
+/// `plan` is `diff(live, merged)`.
+struct ReloadDecision {
+    config: config::UserConfig,
+    load_error: Option<String>,
+    plan: config_watch::ApplyPlan,
+    deferred: Vec<config_watch::DeferredSetting>,
+    /// Notice when the file overrode a value the open panel had edited.
+    replaced: Option<String>,
+}
+
+fn decide_reload(
+    live: &config::UserConfig,
+    panel_open: bool,
+    msg: config_watch::ReloadMsg,
+) -> ReloadDecision {
+    match msg {
+        config_watch::ReloadMsg::Rejected { error } => ReloadDecision {
+            config: live.clone(),
+            load_error: Some(error),
+            plan: config_watch::ApplyPlan::default(),
+            deferred: Vec::new(),
+            replaced: None,
+        },
+        config_watch::ReloadMsg::Applied { config, base, .. } => {
+            // File fields that moved since `base` win. Everything else stays
+            // as the panel left it. The plan is then live versus that merge,
+            // not live versus the raw file and not the watcher's disk diff.
+            let (merged, overrode) = config_watch::merge_reload(&base, live, &config);
+            let (plan, deferred) = plan_against_live(live, &merged);
+            let replaced = open_panel_file_notice(panel_open && overrode, live, &merged);
+            ReloadDecision {
+                config: merged,
+                load_error: None,
+                plan,
+                deferred,
+                replaced,
+            }
+        }
+    }
+}
+
+/// Bytes to write, or the load error that blocks the save. A missing file
+/// is not a load error: the caller can recreate config.json.
+fn save_bytes(load_error: &Option<String>, config: &config::UserConfig) -> Result<Vec<u8>, String> {
+    if let Some(error) = load_error {
+        return Err(error.clone());
+    }
+    config::encode(config).map_err(|error| error.to_string())
+}
+
+/// How an external reload meets an open settings panel.
+///
+/// `plan_against_live` is `diff(live, merged)`. It must stay that
+/// comparison: diffing the raw file against itself, or the live config
+/// against the raw file, either rebuilds a font the merge kept or skips
+/// a font the file actually changed.
+fn plan_against_live(
+    live: &config::UserConfig,
+    incoming: &config::UserConfig,
+) -> (config_watch::ApplyPlan, Vec<config_watch::DeferredSetting>) {
+    config_watch::diff(live, incoming)
+}
+
+/// Set when the open panel had edited a field and the file changed that
+/// same field to something else. The file's value is the one kept.
+fn open_panel_file_notice(
+    panel_open: bool,
+    live: &config::UserConfig,
+    incoming: &config::UserConfig,
+) -> Option<String> {
+    if panel_open && live != incoming {
+        Some(
+            tr(
+                "تغيّر ملف الإعدادات قيمة عدّلتها اللوحة، فصارت قيمة الملف هي المعتمدة.",
+                "The settings file changed a value the panel had edited, so the file's value is now in effect.",
+            )
+            .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+fn reload_notice(
+    replaced: Option<String>,
+    deferred: &[config_watch::DeferredSetting],
+) -> Option<ConfigNotice> {
+    let later = config_watch::deferred_notice(deferred);
+    let text = match (replaced, later) {
+        (Some(replaced), Some(later)) => format!("{replaced} {later}"),
+        (Some(text), None) | (None, Some(text)) => text,
+        (None, None) => return None,
+    };
+    Some(ConfigNotice {
+        text,
+        until: Some(Instant::now() + std::time::Duration::from_secs(8)),
+    })
 }
 
 impl App {
+    /// The only `App { ... }` in the crate. `run` and the tests both call
+    /// this, so a new field is added here and nowhere else. A test that
+    /// needs a different size or id counter changes that field afterwards.
+    /// It must not write its own struct literal: another branch's new field
+    /// would then be missing, and the tests would fail to build with no
+    /// textual conflict.
+    pub(crate) fn new(
+        proxy: EventLoopProxy<UserEvent>,
+        config: config::UserConfig,
+        config_load_error: Option<String>,
+        start_dir: Option<String>,
+    ) -> Self {
+        let keymap = keybinds::effective_map(&config);
+        // no thread and no file: `run` swaps in the real watcher, and a
+        // test never watches `~/.bayan`
+        let config_watch = config_watch::ConfigWatcher::idle(config.clone());
+        let config_build = config_watch::RendererSlot::new(config.clone());
+        Self {
+            posh: None,
+            last_toast: None,
+            mru: mru::Mru::new(),
+            groups: groups::Groups::new(),
+            spawn_group: None,
+            palette: None,
+            shell_profiles: Vec::new(),
+            shell_profiles_ready: false,
+            startup_pending: true,
+            last_strip_click: None,
+            proxy,
+            window: None,
+            gpu: None,
+            renderer: None,
+            tabs: Vec::new(),
+            active: 0,
+            next_id: 0,
+            size: TermSize {
+                cols: 110,
+                rows: 32,
+            },
+            modifiers: ModifiersState::default(),
+            first_frame: false,
+            first_output: false,
+            last_frame: Vec::new(),
+            last_frame_size: None,
+            cursor_pos: PhysicalPosition::new(0.0, 0.0),
+            ime_spot: None,
+            ime_area_reset: false,
+            mouse: mouse::Route::default(),
+            sel_pane: 0,
+            drag_divider: None,
+            bars: scrollbar::Bars::default(),
+            cockpit: false,
+            cockpit_sel: 0,
+            pending_paste: None,
+            pending_close: None,
+            swallow_guard_release: false,
+            link_hover: None,
+            blocked_link: None,
+            link_cache: link::SpanCache::default(),
+            last_input: Instant::now(),
+            blink_drawn_on: true,
+            settings: None,
+            focused: false,
+            clicks: ClickTracker::new(),
+            wheel_accum: 0.0,
+            smooth: std::collections::HashMap::new(),
+            smooth_at: None,
+            alt_seen: std::collections::HashMap::new(),
+            search: None,
+            clipboard: None,
+            auto_follow: true,
+            claude_manual: false,
+            image_budget: Arc::new(images::ImageBudget::new(config.images.limits())),
+            json_config: config.clone(),
+            lua_plugins: lua_host::PluginSet::default(),
+            lua_pending: Vec::new(),
+            lua_skipped: Vec::new(),
+            lua_send_queue: std::collections::VecDeque::new(),
+            lua_errors: Vec::new(),
+            lua_notice: None,
+            lua_approve_not_before: None,
+            config,
+            config_load_error,
+            startup_error: None,
+            keymap,
+            shortcuts: None,
+            atlas_generation: 0,
+            font_delta: 0.0,
+            renderer_building: false,
+            normal_geom: None,
+            keys_held_away: Vec::new(),
+            debug_paste: None,
+            start_dir,
+            start_profile_command: None,
+            start_command: None,
+            elevated: false,
+            #[cfg(test)]
+            test_content: None,
+            config_watch,
+            config_build,
+            config_notice: None,
+            mux_client: None,
+            a11y: a11y::A11ySnapshot::neutral(),
+            inflight_a11y: a11y::A11ySnapshot::neutral(),
+            reader: None,
+            reader_seen_client: false,
+            reader_gen: 0,
+            reader_pace: screen_reader::TreePace::default(),
+            reader_tree_at: None,
+            reader_origin: Instant::now(),
+            reader_deadline: None,
+            reader_gate: screen_reader::OutputGate::default(),
+            reader_bodies: Vec::new(),
+            reader_pane: None,
+            reader_cmd: String::new(),
+            reader_mark: None,
+            reader_mark_ready: false,
+            reader_live: None,
+        }
+    }
+
     fn request_redraw(&self) {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
     }
 
+    /// Re-read High Contrast and the text-size slider. A real change
+    /// rebuilds the renderer so chrome colors and font metrics update
+    /// without a restart. An unrelated `WM_SETTINGCHANGE` (a wallpaper,
+    /// a policy) that leaves both values alone does not rebuild.
+    fn reload_a11y(&mut self) {
+        let next = a11y::read_snapshot();
+        if next == self.a11y {
+            return;
+        }
+        self.a11y = next;
+        self.rebuild_renderer();
+        self.request_redraw();
+    }
+
     /// (Re)build the renderer off-thread for the current scale, config and
-    /// zoom. Debounced: one build in flight; a stale result triggers another.
+    /// zoom. One build runs at a time. A newer config that arrives while
+    /// it runs is kept by `config_build` and started from `RendererReady`.
     fn rebuild_renderer(&mut self) {
+        scroll::apply_font_change(&mut self.smooth);
+        self.config_build.note_wanted(&self.config);
         if self.renderer_building {
             return;
         }
         let Some(w) = &self.window else { return };
+        if !self.config_build.try_begin(self.font_delta) {
+            return;
+        }
         self.renderer_building = true;
-        self.inflight_delta = self.font_delta;
         let proxy = self.proxy.clone();
         let scale = w.scale_factor() as f32;
-        let cfg = self.config.clone();
+        let cfg = self.config_build.snapshot().clone();
         let delta = self.font_delta;
+        let snap = self.a11y;
+        self.inflight_a11y = snap;
         std::thread::spawn(move || {
-            let r = render::Renderer::new(scale, &cfg, delta);
+            let r = render::Renderer::with_a11y(scale, &cfg, delta, snap);
             let _ = proxy.send_event(UserEvent::RendererReady(Box::new(r)));
         });
     }
 
     // ---- settings panel ----
 
-    /// Index of the active theme in the gallery order (built-ins, then
-    /// plugin themes) — the index the panel highlights and apply_theme takes.
-    fn active_theme(&self) -> usize {
-        let name = self
-            .config
-            .theme
-            .as_deref()
-            .unwrap_or(render::DEFAULT_THEME);
+    /// Index of the active named theme in the gallery order (built-ins, then
+    /// plugin themes). `None` while the user is on system/dark/light, so a
+    /// mode word does not light a tile it does not name.
+    fn active_theme(&self) -> Option<usize> {
+        let name = self.config.theme.as_deref()?;
         if let Some(i) = render::THEMES.iter().position(|t| t.name == name) {
-            return i;
+            return Some(i);
         }
         plugins::registry()
             .themes
             .iter()
             .position(|t| t.name == name)
-            .map_or(0, |i| render::THEMES.len() + i)
+            .map(|i| render::THEMES.len() + i)
     }
 
     /// Apply theme `idx` (copy its colors into the config), live.
@@ -1600,26 +2092,79 @@ impl App {
             } else {
                 plugins::registry().themes[idx - builtin].name.clone()
             };
-            self.config.theme = Some(name);
-            self.config.bg = Some(hex(t.bg));
-            self.config.fg = Some(hex(t.fg));
-            self.config.palette = Some(t.palette.iter().map(|&c| hex(c)).collect());
-            self.rebuild_renderer();
-            self.request_redraw();
+            self.remember(name, |c, v| c.theme = Some(v));
+            self.remember(hex(t.bg), |c, v| c.bg = Some(v));
+            self.remember(hex(t.fg), |c, v| c.fg = Some(v));
+            self.remember(
+                t.palette.iter().map(|&c| hex(c)).collect::<Vec<_>>(),
+                |c, v| c.palette = Some(v),
+            );
+            self.push_colors();
         }
+    }
+
+    /// النظام / داكن / فاتح. Clears a named scheme and hand-set colours so
+    /// the pair can show; that clear is the user's new choice.
+    fn set_appearance(&mut self, choice: theme::ThemeChoice) {
+        let theme = match choice {
+            theme::ThemeChoice::System => None,
+            theme::ThemeChoice::Dark => Some("dark".to_string()),
+            theme::ThemeChoice::Light => Some("light".to_string()),
+        };
+        self.remember(theme, |c, v| {
+            c.bg = None;
+            c.fg = None;
+            c.palette = None;
+            c.theme = v;
+        });
+        self.push_colors();
+    }
+
+    /// Paint the colours `resolved_colors` names, and match the caption to them.
+    fn push_colors(&mut self) {
+        let colors = render::resolved_colors(&self.config);
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_colors(colors.bg, colors.fg, colors.palette);
+            // OSC 10/11 answer with what is on screen now
+            term::set_query_colors(r.query_colors());
+        }
+        self.set_title_bar_dark(colors.title_bar_dark);
+        self.request_redraw();
+    }
+
+    fn theme_surface(&self) -> theme::ThemeSurface {
+        theme::ThemeSurface {
+            colors: render::resolved_colors(&self.config),
+            follows_system: render::follows_system_theme(&self.config),
+        }
+    }
+
+    /// A Windows theme signal. The tested `apply_event` decides the palette
+    /// and the caption flag; an explicit scheme comes back unchanged.
+    fn on_system_theme(&mut self, event: theme::SystemThemeEvent) {
+        let after = self.theme_surface().apply_event(event);
+        // a runtime sample: both documents carry it, neither writes it
+        self.remember(Some(event.is_light()), |c, v| c.system_apps_light = v);
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_colors(after.colors.bg, after.colors.fg, after.colors.palette);
+            // a program that asks OSC 11 after the switch sees the new side
+            term::set_query_colors(r.query_colors());
+        }
+        self.set_title_bar_dark(after.colors.title_bar_dark);
+        self.request_redraw();
     }
 
     fn change_font_size(&mut self, delta: i32) {
         let s = (self.config.font_size.unwrap_or(render::DEFAULT_FONT_SIZE) + delta as f32)
             .clamp(8.0, 40.0);
-        self.config.font_size = Some(s);
+        self.remember(s, |c, v| c.font_size = Some(v));
         self.rebuild_renderer();
         self.request_redraw();
     }
 
     fn toggle_ligatures(&mut self) {
         let v = !self.config.ligatures.unwrap_or(true);
-        self.config.ligatures = Some(v);
+        self.remember(v, |c, v| c.ligatures = Some(v));
         self.rebuild_renderer();
         self.request_redraw();
     }
@@ -1637,7 +2182,7 @@ impl App {
         let cur = r.family();
         let i = choices.iter().position(|c| c == cur).unwrap_or(0);
         let next = choices[keyroute::cycle(i, dir, choices.len())].clone();
-        self.config.font_family = Some(next);
+        self.remember(next, |c, v| c.font_family = Some(v));
         self.rebuild_renderer();
         self.request_redraw();
     }
@@ -1649,18 +2194,20 @@ impl App {
         };
         let choices = r.arabic_font_choices();
         let current = r.arabic_family().map(str::to_string);
-        self.config.arabic_font = step_arabic_font(&choices, current.as_deref(), dir);
+        let next = step_arabic_font(&choices, current.as_deref(), dir);
+        self.remember(next, |c, v| c.arabic_font = v);
         self.rebuild_renderer();
         self.request_redraw();
     }
 
     fn set_cursor_style(&mut self, s: config::CursorStyle) {
-        self.config.cursor_style = Some(s.as_str().to_string());
+        self.remember(s.as_str().to_string(), |c, v| c.cursor_style = Some(v));
         self.request_redraw(); // read per-frame; no rebuild needed
     }
 
     fn toggle_blink(&mut self) {
-        self.config.cursor_blink = Some(!self.config.cursor_blink_on());
+        let on = !self.config.cursor_blink_on();
+        self.remember(on, |c, v| c.cursor_blink = Some(v));
         self.last_input = Instant::now(); // preview the blink right away
         self.request_redraw();
     }
@@ -1669,17 +2216,19 @@ impl App {
     /// terminal convention — live sessions keep their buffer).
     fn change_scrollback(&mut self, dir: i32) {
         let cur = self.config.scrollback_lines();
-        self.config.scrollback = Some(step_preset(&config::SCROLLBACK_STEPS, cur, dir) as u32);
+        let n = step_preset(&config::SCROLLBACK_STEPS, cur, dir) as u32;
+        self.remember(n, |c, v| c.scrollback = Some(v));
         self.request_redraw();
     }
 
     fn toggle_copy_on_select(&mut self) {
-        self.config.copy_on_select = Some(!self.config.copy_on_select_on());
+        let on = !self.config.copy_on_select_on();
+        self.remember(on, |c, v| c.copy_on_select = Some(v));
         self.request_redraw();
     }
 
     fn set_bell(&mut self, mode: config::BellMode) {
-        self.config.bell = Some(mode.as_str().to_string());
+        self.remember(mode.as_str().to_string(), |c, v| c.bell = Some(v));
         if mode == config::BellMode::Sound {
             beep(); // preview the mode you just picked
         }
@@ -1694,24 +2243,25 @@ impl App {
         }
         let cur = self.config.shell_program();
         let i = shells::index_of(choices, &cur).unwrap_or(0);
-        self.config.shell = Some(
-            choices[keyroute::cycle(i, dir, choices.len())]
-                .command
-                .clone(),
-        );
+        let command = choices[keyroute::cycle(i, dir, choices.len())]
+            .command
+            .clone();
+        self.remember(command, |c, v| c.shell = Some(v));
         self.request_redraw();
     }
 
     fn change_padding(&mut self, dir: i32) {
         let cur = self.config.padding_px() as u32;
-        self.config.padding = Some(step_preset(&config::PADDING_STEPS, cur, dir));
+        let n = step_preset(&config::PADDING_STEPS, cur, dir);
+        self.remember(n, |c, v| c.padding = Some(v));
         self.relayout_active(); // pane rects (and PTY sizes) follow the inset
         self.request_redraw();
     }
 
     fn change_opacity(&mut self, dir: i32) {
         let cur = (self.config.opacity_level() * 100.0).round() as u32;
-        self.config.opacity = Some(step_preset(&config::OPACITY_STEPS, cur, dir) as f32 / 100.0);
+        let n = step_preset(&config::OPACITY_STEPS, cur, dir) as f32 / 100.0;
+        self.remember(n, |c, v| c.opacity = Some(v));
         self.apply_opacity();
         self.request_redraw();
     }
@@ -1735,8 +2285,9 @@ impl App {
         if let Some(h) = self.hwnd() {
             toast::remove(h);
         }
-        // tabs + cwds greet you tomorrow
-        if !self.save_state() {
+        // tabs + cwds greet you tomorrow. An elevated window does not write
+        // session.json: that file is the next launch's command list.
+        if elevate::may_write_bayan(self.elevated) && !self.save_state() {
             // The window is about to close, so its error card cannot be seen.
             // An explicit save failure must be acknowledged before exit.
             if let Some(error) = &self.blocked_link {
@@ -1795,12 +2346,16 @@ impl App {
     }
 
     fn apply_window_frame(&self) {
+        self.set_title_bar_dark(render::resolved_colors(&self.config).title_bar_dark);
+    }
+
+    fn set_title_bar_dark(&self, title_bar_dark: bool) {
         let Some(hwnd) = self.hwnd() else { return };
         use windows_sys::Win32::Graphics::Dwm::{
             DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
             DWMWCP_ROUND,
         };
-        let dark = 1i32;
+        let dark = i32::from(title_bar_dark);
         let corner = DWMWCP_ROUND;
         // Windows 10 ignores unsupported corner preferences; the native
         // resize frame and shadow remain available there.
@@ -1824,19 +2379,21 @@ impl App {
     }
 
     fn toggle_hide_bar(&mut self) {
-        self.config.hide_single_tab = Some(!self.config.hide_single_tab_on());
+        let on = !self.config.hide_single_tab_on();
+        self.remember(on, |c, v| c.hide_single_tab = Some(v));
         self.relayout_active(); // the content area gains/loses the bar strip
         self.request_redraw();
     }
 
     fn toggle_confirm_close(&mut self) {
-        self.config.confirm_close = Some(!self.config.confirm_close_on());
+        let on = !self.config.confirm_close_on();
+        self.remember(on, |c, v| c.confirm_close = Some(v));
         self.request_redraw();
     }
 
     fn toggle_notifications(&mut self) {
         let on = !self.config.notifications_on();
-        self.config.notifications = Some(on);
+        self.remember(on, |c, v| c.notifications = Some(v));
         if on {
             // preview the toast you just turned on
             if let Some(h) = self.hwnd() {
@@ -1862,6 +2419,17 @@ impl App {
     /// ones it skipped, so coming back asks again. Closing or reopening
     /// stops the worker.
     fn open_posh(&mut self) {
+        if self.elevated {
+            let (title, body) = elevate::prompt_picker_notice();
+            self.blocked_link = Some(BlockedLink {
+                reason: title.to_string(),
+                shown: body.to_string(),
+                confirm: None,
+                is_app_error: true,
+            });
+            self.request_redraw();
+            return;
+        }
         use std::sync::atomic::Ordering;
         let names = posh::available();
         if names.is_empty() {
@@ -1961,9 +2529,19 @@ impl App {
             Key::Named(NamedKey::Enter) => {
                 let name = p.names[p.sel].clone();
                 self.close_posh();
-                match posh::set_theme(&name) {
-                    Ok(()) => eprintln!("bayan: prompt theme set to {name} (new tabs)"),
-                    Err(e) => eprintln!("bayan: prompt theme failed: {e}"),
+                if self.elevated {
+                    let (title, body) = elevate::prompt_picker_notice();
+                    self.blocked_link = Some(BlockedLink {
+                        reason: title.to_string(),
+                        shown: body.to_string(),
+                        confirm: None,
+                        is_app_error: true,
+                    });
+                } else {
+                    match posh::set_theme(&name) {
+                        Ok(()) => eprintln!("bayan: prompt theme set to {name} (new tabs)"),
+                        Err(e) => eprintln!("bayan: prompt theme failed: {e}"),
+                    }
                 }
             }
             _ => {}
@@ -1983,12 +2561,19 @@ impl App {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let extras = palette_extras(&self.shell_profiles, &links);
+        let mut extras = palette_extras(&self.shell_profiles, &links);
+        extras.push((PaletteRow::OpenSsh, ssh::label_open().to_string()));
+        if self.config.mux_enabled() {
+            extras.push((PaletteRow::DetachSession, mux::label_detach().to_string()));
+            extras.push((PaletteRow::OpenDetached, mux::label_reattach().to_string()));
+        }
         self.palette = Some(Palette {
             query,
             rename: None,
             menu: None,
             shells_menu: false,
+            ssh_menu: false,
+            detached_menu: false,
             sel: 0,
             extras,
             pressed: None,
@@ -2071,6 +2656,22 @@ impl App {
         if let Some(target) = self.palette.as_ref().and_then(|p| p.rename) {
             return rename_rows(target, query);
         }
+        if self
+            .palette
+            .as_ref()
+            .is_some_and(|p| p.ssh_menu || p.detached_menu)
+        {
+            let q = query.trim().to_lowercase();
+            return self
+                .palette
+                .as_ref()
+                .unwrap()
+                .extras
+                .iter()
+                .filter(|(_, label)| q.is_empty() || label.to_lowercase().contains(&q))
+                .cloned()
+                .collect();
+        }
         if self.palette.as_ref().is_some_and(|p| p.menu.is_some()) {
             let q = query.trim().to_lowercase();
             let rows = if self.palette.as_ref().is_some_and(|p| p.shells_menu) {
@@ -2086,9 +2687,17 @@ impl App {
         let q = query.trim().to_lowercase();
         let hit = |label: &str| q.is_empty() || label.to_lowercase().contains(&q);
         let mut rows: Vec<(PaletteRow, String)> = Vec::new();
+        let bidi_now = self.focused_bidi_mode();
         for a in keybinds::Action::ALL {
-            if hit(a.label()) {
-                rows.push((PaletteRow::Builtin(a), a.label().to_string()));
+            let label = if a == keybinds::Action::BidiToggle {
+                bidi_now.palette_label()
+            } else {
+                a.label().to_string()
+            };
+            // The live row names the current mode. The static label still
+            // matches, so a search for the shortcut's name finds it.
+            if hit(&label) || (a == keybinds::Action::BidiToggle && hit(a.label())) {
+                rows.push((PaletteRow::Builtin(a), label));
             }
         }
         let group_labels: Vec<(u32, String)> = self
@@ -2129,12 +2738,12 @@ impl App {
                     .session()
                     .and_then(|s| s.meta.lock_or_recover().spawn_cwd());
                 let before = self.tabs.len();
-                self.spawn_tab_command(cwd, &command);
+                self.spawn_tab_command(cwd, &command, None);
                 if self.tabs.len() == before && self.blocked_link.is_none() {
                     self.blocked_link = Some(BlockedLink {
                         reason: tr("تعذر تشغيل الطرفية", "Could not start the shell").into(),
                         shown: link::preview(&command, 240),
-                        confirm_uri: None,
+                        confirm: None,
                         is_app_error: false,
                     });
                 }
@@ -2146,6 +2755,12 @@ impl App {
             PaletteRow::OpenRenameGroup => self.open_rename_group(),
             PaletteRow::OpenShellMenu => self.open_shell_menu(),
             PaletteRow::RenameGroup(name) => self.rename_group(name),
+            PaletteRow::OpenSsh => self.open_ssh_menu(),
+            PaletteRow::SshHost(token) => self.open_ssh_host(&token),
+            PaletteRow::DetachSession => self.detach_focused(el),
+            PaletteRow::OpenDetached => self.open_detached_menu(),
+            PaletteRow::Reattach(id) => self.reattach_session(id),
+            PaletteRow::KillSession(id) => self.kill_detached(id),
             PaletteRow::InsertCommand(text) => {
                 self.pending_paste = Some(PendingPaste {
                     kind: PendingKind::Paste,
@@ -2158,6 +2773,9 @@ impl App {
                         "Insert a command from the palette",
                     )
                     .into(),
+                    lua: None,
+                    scroll: 0,
+                    saw_end: true,
                 });
             }
             PaletteRow::Plugin(i) => {
@@ -2236,6 +2854,7 @@ impl App {
                 }
                 self.request_redraw();
             }
+            BidiToggle => self.toggle_bidi_reorder(),
             ResetKeyboard => {
                 if let Some(s) = self.session_mut() {
                     s.reset_keyboard();
@@ -2249,6 +2868,9 @@ impl App {
             NextGroup => self.step_group(false),
             PrevGroup => self.step_group(true),
             CopyMode => self.toggle_copy_mode(),
+            CopyClean => {
+                self.copy_selection_clean();
+            }
         }
     }
 
@@ -2338,26 +2960,28 @@ impl App {
     /// Store a binding (pruned back out if it IS the default) and rebuild
     /// the live keymap.
     fn set_binding(&mut self, action: keybinds::Action, chord: keybinds::Chord) {
-        let kb = self.config.keybinds.get_or_insert_with(Default::default);
-        if chord == action.default_chord() {
-            kb.remove(action.id());
+        let stored = if chord == action.default_chord() {
+            None
         } else {
-            kb.insert(action.id().to_string(), chord.to_config());
-        }
-        if self.config.keybinds.as_ref().is_some_and(|m| m.is_empty()) {
-            self.config.keybinds = None;
-        }
+            Some(chord.to_config())
+        };
+        apply_shortcut(
+            &mut self.json_config.keybinds,
+            &mut self.config.keybinds,
+            action.id(),
+            stored,
+        );
         self.keymap = keybinds::effective_map(&self.config);
         self.request_redraw();
     }
 
     fn clear_binding(&mut self, action: keybinds::Action) {
-        if let Some(kb) = self.config.keybinds.as_mut() {
-            kb.remove(action.id());
-            if kb.is_empty() {
-                self.config.keybinds = None;
-            }
-        }
+        apply_shortcut(
+            &mut self.json_config.keybinds,
+            &mut self.config.keybinds,
+            action.id(),
+            None,
+        );
         self.keymap = keybinds::effective_map(&self.config);
         self.request_redraw();
     }
@@ -2436,7 +3060,7 @@ impl App {
     /// mirrored, with the button now naming the way back.
     fn switch_language(&mut self) {
         let next = self.config.lang().other();
-        self.config.language = Some(next.id().to_string());
+        self.remember(next.id().to_string(), |c, v| c.language = Some(v));
         lang::set(next);
         self.save_config();
         self.request_redraw();
@@ -2447,23 +3071,131 @@ impl App {
         self.blocked_link = Some(BlockedLink {
             reason: reason.to_string(),
             shown: link::preview_with(detail, 240, |c| c != '\n' && link::is_forbidden(c)),
-            confirm_uri: None,
+            confirm: None,
             is_app_error: true,
         });
         self.request_redraw();
     }
 
-    fn save_config(&mut self) {
-        if self.config_load_error.is_some() {
-            self.report_config_load_error();
+    /// A panel edit lands in the runtime config and in the JSON document.
+    /// Lua-only values stay on `config` and are not copied here.
+    fn remember<T: Clone>(&mut self, value: T, write: impl Fn(&mut config::UserConfig, T)) {
+        write(&mut self.config, value.clone());
+        write(&mut self.json_config, value);
+    }
+
+    /// The Arabic admin card. A config-load error already on the card stays;
+    /// the notice is appended instead of replacing it.
+    fn apply_admin_notice(&mut self) {
+        if !self.elevated {
             return;
         }
-        if let Err(error) = config::save(&self.config) {
+        let (title, body) = elevate::admin_notice();
+        if let Some(block) = self.blocked_link.as_mut() {
+            block.shown = elevate::with_admin_notice(Some(&block.shown), title, body);
+        } else {
+            self.blocked_link = Some(BlockedLink {
+                reason: title.to_string(),
+                shown: body.to_string(),
+                confirm: None,
+                is_app_error: true,
+            });
+        }
+    }
+
+    fn save_config(&mut self) {
+        if !elevate::may_write_bayan(self.elevated) {
+            self.report_error(
+                tr("نافذة مسؤول", "Administrator window"),
+                tr(
+                    "لا يُحفظ الإعداد من نافذة المسؤول.",
+                    "Settings are not saved from an administrator window.",
+                ),
+            );
+            return;
+        }
+        let bytes = match save_bytes(&self.config_load_error, &self.json_config) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if self.config_load_error.is_some() {
+                    self.report_config_load_error();
+                } else {
+                    self.report_error(tr("تعذر حفظ الإعدادات", "Could not save settings"), &error);
+                }
+                return;
+            }
+        };
+        // Arm the watcher before the rename, so the event that rename
+        // produces is recognized as ours and not loaded back.
+        self.config_watch.note_self_write(&bytes);
+        if let Err(error) = config::write_bytes(&bytes) {
+            self.config_watch.finish_self_write(false);
             self.report_error(
                 tr("تعذر حفظ الإعدادات", "Could not save settings"),
                 &error.to_string(),
             );
+        } else {
+            self.config_watch.finish_self_write(true);
         }
+    }
+
+    /// Apply a config.json change that did not come from the settings panel.
+    ///
+    /// Fields the file changed since the last load take the file's value.
+    /// Every other field keeps the live panel value. The plan is
+    /// `diff(live, merged)` via [`decide_reload`]. A bad file leaves
+    /// `self.config` as it was. Font and color changes rebuild the renderer;
+    /// when that renderer arrives, `relayout_active` resizes every PTY.
+    /// Padding alone resizes with the metrics already on screen.
+    fn apply_config_reload(&mut self, msg: config_watch::ReloadMsg) {
+        // The merge runs on the JSON document, where panel edits also land.
+        let decision = decide_reload(&self.json_config, self.settings.is_some(), msg);
+        if let Some(error) = decision.load_error {
+            self.config_load_error = Some(error.clone());
+            self.config_notice = Some(ConfigNotice {
+                text: config_watch::parse_error_notice(&error),
+                until: None,
+            });
+            self.request_redraw();
+            return;
+        }
+        self.config_load_error = None;
+        // The running config also holds config.lua's overrides. A field the
+        // file changed takes the file's value there too; every other field
+        // keeps what is on screen. No script runs on a reload: a new hash in
+        // `lua_approvals` is honoured by the confirm card or the next launch.
+        let (runtime, _) =
+            config_watch::merge_reload(&self.json_config, &self.config, &decision.config);
+        let (plan, deferred) = plan_against_live(&self.config, &runtime);
+        let decision = ReloadDecision {
+            plan,
+            deferred,
+            ..decision
+        };
+        self.json_config = decision.config.clone();
+        let language = decision.plan.language && runtime.lang() != self.config.lang();
+        // the bar's side and width decide the gutter, so the grid moves
+        let bar_moved = runtime.scrollbar != self.config.scrollbar;
+        self.config = runtime;
+        // published once at startup; a reload has to publish it again
+        term::set_osc52_read(self.config.osc52_read_enabled());
+        if language {
+            lang::set(self.config.lang());
+        }
+        if decision.plan.keybinds {
+            self.keymap = keybinds::effective_map(&self.config);
+        }
+        if decision.plan.opacity {
+            self.apply_opacity();
+        }
+        let rebuild = decision.plan.font || decision.plan.colors;
+        if rebuild {
+            self.rebuild_renderer();
+        } else if decision.plan.padding || decision.plan.hide_bar || bar_moved {
+            self.relayout_active();
+        }
+        self.config_notice = reload_notice(decision.replaced, &decision.deferred);
+        self.request_redraw();
     }
 
     fn report_config_load_error(&mut self) {
@@ -2472,8 +3204,8 @@ impl App {
                 "{}\n{}",
                 error,
                 tr(
-                    "أصلح ملف config.json ثم أعد تشغيل بيان لحفظ الإعدادات.",
-                    "Fix config.json and restart Bayan to save settings.",
+                    "أصلح ملف config.json. بيان يُبقي آخر إعدادات سليمة ويعيد التحميل عند إصلاح الملف.",
+                    "Fix config.json. Bayan is keeping the last good settings and will reload when the file is valid.",
                 )
             );
             self.report_error(
@@ -2570,6 +3302,12 @@ impl App {
             self.toggle_hide_bar();
         } else if render::rect_hit(lay.close_toggle, px, py) {
             self.toggle_confirm_close();
+        } else if let Some(i) = lay
+            .appearance_btns
+            .iter()
+            .position(|&b| render::rect_hit(b, px, py))
+        {
+            self.set_appearance(theme::APPEARANCE_SEGMENTS[i]);
         }
     }
 
@@ -2687,6 +3425,9 @@ impl App {
                 t.scroll_display(Scroll::Delta(new_off as i32 - off as i32));
             }
         }
+        if let Some(id) = self.focused_pane_id() {
+            self.drop_smooth(id);
+        }
         self.invalidate_focused_links();
         self.request_redraw();
     }
@@ -2723,10 +3464,27 @@ impl App {
     }
 
     fn spawn_pane(&mut self, cwd: Option<&str>) -> Option<Pane> {
-        self.spawn_pane_command(cwd, &self.config.shell_program())
+        let shell = self.spawn_shell();
+        self.spawn_pane_command(cwd, &shell, None)
     }
 
-    fn spawn_pane_command(&mut self, cwd: Option<&str>, command: &str) -> Option<Pane> {
+    /// The shell a new tab starts. Elevated windows use the profile this
+    /// process already resolved from its own detection, never `config.shell`.
+    fn spawn_shell(&self) -> String {
+        elevate::spawn_shell_command(
+            self.elevated,
+            self.start_profile_command.as_deref(),
+            &self.shell_profiles,
+            &self.config.shell_program(),
+        )
+    }
+
+    fn spawn_pane_command(
+        &mut self,
+        cwd: Option<&str>,
+        command: &str,
+        raw: Option<&[String]>,
+    ) -> Option<Pane> {
         let id = self.next_id;
         self.next_id += 1;
         match Session::spawn(
@@ -2737,6 +3495,10 @@ impl App {
             self.config.scrollback_lines(),
             command,
             self.config.kitty_protocol_on(),
+            raw,
+            self.elevated,
+            Arc::clone(&self.image_budget),
+            self.config.shell_integration_on(),
         ) {
             Ok(session) => Some(Pane {
                 id,
@@ -2744,6 +3506,7 @@ impl App {
                 command: command.to_string(),
                 last_output: None,
                 progress: None,
+                mux: None,
             }),
             Err(e) => {
                 eprintln!("bayan: spawn failed: {e}");
@@ -2753,10 +3516,33 @@ impl App {
     }
 
     fn spawn_tab(&mut self, cwd: Option<String>) {
-        self.spawn_tab_command(cwd, &self.config.shell_program());
+        let shell = self.spawn_shell();
+        self.spawn_tab_command(cwd, &shell, None);
     }
 
-    fn spawn_tab_command(&mut self, cwd: Option<String>, command: &str) {
+    fn spawn_tab_command(&mut self, cwd: Option<String>, command: &str, raw: Option<&[String]>) {
+        self.spawn_tab_named(cwd, command, raw, None);
+    }
+
+    fn spawn_tab_named(
+        &mut self,
+        cwd: Option<String>,
+        command: &str,
+        raw: Option<&[String]>,
+        name: Option<String>,
+    ) {
+        let cwd_for_spawn = cwd.as_deref().and_then(term::accept_local_cwd);
+        match self.spawn_pane_command(cwd_for_spawn.as_deref(), command, raw) {
+            Some(pane) => self.adopt_tab(cwd, pane, name),
+            // The group this tab was being made for is not kept for the
+            // next one: no tab opened in it.
+            None => self.spawn_group = None,
+        }
+    }
+
+    /// Put `pane` in a new tab in the group on screen. `name` wins over the
+    /// folder title (an SSH tab is named for the host).
+    fn adopt_tab(&mut self, cwd: Option<String>, pane: Pane, name: Option<String>) {
         // Same gate as spawn: a restored UNC path must not become the tab
         // title either. accept_local_cwd does not touch the filesystem.
         let cwd = cwd.and_then(|c| term::accept_local_cwd(&c));
@@ -2769,42 +3555,370 @@ impl App {
             .spawn_group
             .take()
             .unwrap_or_else(|| self.active_group());
-        if let Some(pane) = self.spawn_pane_command(cwd.as_deref(), command) {
-            // this becomes the active tab without switch_tab, so a button
-            // held on the previous tab has to go up first
-            self.abandon_mouse();
-            self.tabs.push(Tab {
-                group,
-                panes: vec![pane],
-                layout: layout::Node::single(),
-                focused: 0,
-                title,
-                name: None,
-                attention: false,
-                broadcast: false,
-                zoomed: false,
+        // this becomes the active tab without switch_tab, so a button
+        // held on the previous tab has to go up first
+        self.abandon_mouse();
+        self.tabs.push(Tab {
+            group,
+            panes: vec![pane],
+            layout: layout::Node::single(),
+            focused: 0,
+            title,
+            name: name.and_then(|n| clean_tab_name(&n)),
+            attention: false,
+            broadcast: false,
+            zoomed: false,
+        });
+        self.active = self.tabs.len() - 1;
+        self.mru.touch(self.active);
+        self.enter_tab();
+        self.relayout_active();
+        self.sync_focus(None);
+        let index = self.active.to_string();
+        // A tab the user opened, not bytes from the pane.
+        self.emit_lua_event("tab-opened", &[("index", &index)]);
+    }
+
+    /// `mux.enabled` is the only way here. While it is false this returns
+    /// before any pipe probe or `bayan --mux-server` spawn, the same branch
+    /// `connect_if_enabled` tests.
+    fn ensure_mux(&mut self) -> bool {
+        if !mux::mux_may_run(self.config.mux_enabled(), mux::is_elevated()) {
+            return false;
+        }
+        if self.mux_client.as_ref().is_some_and(|c| c.is_alive()) {
+            return true;
+        }
+        self.mux_client = mux::connect_or_spawn(true).ok();
+        self.mux_client.as_ref().is_some_and(|c| c.is_alive())
+    }
+
+    fn open_ssh_menu(&mut self) {
+        let hosts = ssh::host_list(&self.config.ssh_hosts, &ssh::read_user_config());
+        if hosts.is_empty() {
+            self.blocked_link = Some(BlockedLink {
+                reason: tr("لا مضيفين محفوظين", "No saved hosts").into(),
+                shown: tr(
+                    "أضف المضيف في الإعداد أو في ملف الإعداد",
+                    "Add a host in config.json or in the ssh config file",
+                )
+                .into(),
+                confirm: None,
+                is_app_error: false,
             });
-            self.active = self.tabs.len() - 1;
-            self.mru.touch(self.active);
-            self.enter_tab();
-            self.relayout_active();
-            self.sync_focus(None);
+            return;
+        }
+        self.open_palette(String::new());
+        if let Some(p) = self.palette.as_mut() {
+            p.ssh_menu = true;
+            p.extras = hosts
+                .into_iter()
+                .map(|h| {
+                    (
+                        PaletteRow::SshHost(h.token),
+                        format!("{} — {}", ssh::label_open(), h.title),
+                    )
+                })
+                .collect();
+        }
+    }
+
+    fn open_ssh_host(&mut self, token: &str) {
+        let dir = ssh::system32_dir();
+        let launch = match ssh::prepare_launch(dir.as_deref(), |p| p.is_file(), token) {
+            Ok(launch) => launch,
+            Err(ssh::SshError::NoClient) => {
+                self.blocked_link = Some(BlockedLink {
+                    reason: tr(
+                        "تعذر العثور على عميل الاتصال",
+                        "Could not find the OpenSSH client",
+                    )
+                    .into(),
+                    shown: tr(
+                        "العميل يأتي من مجلد النظام",
+                        "The client comes from the system directory",
+                    )
+                    .into(),
+                    confirm: None,
+                    is_app_error: false,
+                });
+                return;
+            }
+            Err(ssh::SshError::BadHost) => {
+                self.blocked_link = Some(BlockedLink {
+                    reason: tr("اسم المضيف مرفوض", "That host name was rejected").into(),
+                    shown: String::new(),
+                    confirm: None,
+                    is_app_error: false,
+                });
+                return;
+            }
+        };
+        let cwd = self
+            .session()
+            .and_then(|s| s.meta.lock_or_recover().spawn_cwd());
+        if self.config.mux_enabled() && self.spawn_mux_command(cwd.clone(), &launch) {
+            return;
+        }
+        let before = self.tabs.len();
+        // The resolved argv is the process: System32's ssh.exe and its
+        // arguments, with no shell wrapper and no second split.
+        let argv: Vec<String> = std::iter::once(launch.program.to_string_lossy().into_owned())
+            .chain(launch.args.iter().cloned())
+            .collect();
+        self.spawn_tab_named(cwd, &launch.command_line, Some(&argv), Some(launch.title));
+        if self.tabs.len() == before && self.blocked_link.is_none() {
+            self.blocked_link = Some(BlockedLink {
+                reason: tr("تعذر تشغيل الاتصال", "Could not start the connection").into(),
+                shown: link::preview(&launch.command_line, 240),
+                confirm: None,
+                is_app_error: false,
+            });
+        }
+    }
+
+    /// Start `launch` inside the mux server and attach a tab to it.
+    /// False means the server was not used; the caller starts a local tab.
+    fn spawn_mux_command(&mut self, cwd: Option<String>, launch: &ssh::SshLaunch) -> bool {
+        if !self.ensure_mux() {
+            return false;
+        }
+        let Some(client) = self.mux_client.clone() else {
+            return false;
+        };
+        let spec = mux::SpawnSpec {
+            title: launch.title.clone(),
+            cwd: cwd.clone().unwrap_or_default(),
+            program: launch.program.display().to_string(),
+            args: launch.args.clone(),
+            cols: self.size.cols.max(1) as u16,
+            rows: self.size.rows.max(1) as u16,
+        };
+        let attached = match client.spawn(spec) {
+            Ok(attached) => attached,
+            Err(error) => {
+                eprintln!("bayan: mux spawn failed: {error}");
+                return false;
+            }
+        };
+        let title = launch.title.clone();
+        let command = launch.command_line.clone();
+        let Some(pane) = self.pane_from_attached(attached, &command) else {
+            return false;
+        };
+        self.adopt_tab(cwd, pane, Some(title));
+        true
+    }
+
+    fn pane_from_attached(&mut self, attached: mux::Attached, command: &str) -> Option<Pane> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let remote = attached.id;
+        let armed = std::sync::Arc::clone(&attached.armed);
+        let session = term::Session::from_parts(term::SessionArgs {
+            size: self.size,
+            proxy: self.proxy.clone(),
+            id,
+            scrollback: self.config.scrollback_lines(),
+            shell: command.to_string(),
+            kitty_protocol: self.config.kitty_protocol_on(),
+            prompt_nonce: term::NONCE_OFF.to_string(),
+            images: Arc::clone(&self.image_budget),
+            // the scripts, if any, belong to the server's process
+            integration: shellint::IntegrationDir(None),
+            io: term::SessionIo {
+                reader: attached.reader,
+                writer: attached.writer,
+                master: None,
+                child: None,
+                on_resize: Some(attached.on_resize),
+                on_kill: Some(attached.on_kill),
+            },
+        })
+        .map_err(|error| {
+            eprintln!("bayan: mux pane failed: {error}");
+            error
+        })
+        .ok()?;
+        Some(Pane {
+            id,
+            session,
+            command: command.to_string(),
+            last_output: None,
+            progress: None,
+            mux: Some(MuxBind { id: remote, armed }),
+        })
+    }
+
+    fn focused_is_mux(&self) -> bool {
+        self.tabs
+            .get(self.active)
+            .and_then(|t| t.panes.get(t.focused))
+            .is_some_and(|p| p.mux.is_some())
+    }
+
+    fn detach_focused(&mut self, el: &ActiveEventLoop) {
+        if !self.ensure_mux() {
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let Some(pane) = tab.panes.get_mut(tab.focused) else {
+            return;
+        };
+        let Some(bind) = pane.mux.as_ref() else {
+            return;
+        };
+        bind.armed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let remote = bind.id;
+        let pi = tab.focused;
+        if let Some(client) = &self.mux_client {
+            let _ = client.detach(remote);
+        }
+        self.remove_pane(self.active, pi, el);
+    }
+
+    fn open_detached_menu(&mut self) {
+        if !self.ensure_mux() {
+            return;
+        }
+        let sessions = self
+            .mux_client
+            .as_ref()
+            .and_then(|c| c.list().ok())
+            .unwrap_or_default();
+        if sessions.is_empty() {
+            self.blocked_link = Some(BlockedLink {
+                reason: tr("لا جلسات مفصولة", "No detached sessions").into(),
+                shown: String::new(),
+                confirm: None,
+                is_app_error: false,
+            });
+            return;
+        }
+        self.open_palette(String::new());
+        if let Some(p) = self.palette.as_mut() {
+            p.detached_menu = true;
+            p.extras = sessions
+                .into_iter()
+                .flat_map(|s| {
+                    let title = if s.title.is_empty() {
+                        s.command.clone()
+                    } else {
+                        s.title.clone()
+                    };
+                    [
+                        (
+                            PaletteRow::Reattach(s.id),
+                            format!("{} — {title}", mux::label_reattach()),
+                        ),
+                        (
+                            PaletteRow::KillSession(s.id),
+                            format!("{} — {title}", mux::label_kill()),
+                        ),
+                    ]
+                })
+                .collect();
+        }
+    }
+
+    fn reattach_session(&mut self, id: u64) {
+        if !self.ensure_mux() {
+            return;
+        }
+        let Some(client) = self.mux_client.clone() else {
+            return;
+        };
+        let attached = match client.reattach(id) {
+            Ok(attached) => attached,
+            Err(error) => {
+                eprintln!("bayan: reattach failed: {error}");
+                return;
+            }
+        };
+        let title = attached.title.clone();
+        let command = attached.command.clone();
+        if let Some(pane) = self.pane_from_attached(attached, &command) {
+            self.adopt_tab(None, pane, Some(title));
+        }
+    }
+
+    fn kill_detached(&mut self, id: u64) {
+        if let Some(client) = &self.mux_client {
+            client.kill_remote(id);
         }
     }
 
     /// The window's content area: below the tab bar, inside the padding.
     pub(crate) fn content_rect(&self) -> Option<render::Rect> {
+        #[cfg(test)]
+        if let Some(rect) = self.test_content {
+            return Some(rect);
+        }
         let (r, w) = (self.renderer.as_ref()?, self.window.as_ref()?);
         let px = w.inner_size();
         let bar = r.tab_bar_h().round() as i32;
         // the padding setting insets the whole content area evenly
-        let pad = self.config.padding_px();
+        let pad = self.padding_physical();
         Some((
             pad,
             bar + pad,
             (px.width as i32 - pad * 2).max(1),
             (px.height as i32 - bar - pad * 2).max(1),
         ))
+    }
+
+    /// Side-by-side seam, wide enough for the scrollbar when one is shown.
+    /// A hidden bar, or no padding to sit in, keeps the one-pixel seam so
+    /// the grid (and the ConPTY column count) does not move.
+    pub(crate) fn split_gaps(&self) -> layout::Gaps {
+        let room = self.scrollbar_gutter();
+        if room <= 1 {
+            layout::Gaps::HAIRLINE
+        } else {
+            layout::Gaps {
+                beside: room,
+                stacked: 1,
+            }
+        }
+    }
+
+    /// Configured thickness in physical pixels (`width` × the window scale).
+    pub(crate) fn scrollbar_width_px(&self) -> i32 {
+        let scale = self
+            .window
+            .as_ref()
+            .map(|w| w.scale_factor() as f32)
+            .unwrap_or(1.0);
+        self.config.scrollbar.width_px_at(scale)
+    }
+
+    /// Bar thickness that fits in the padding. Never wider than the padding,
+    /// so the outer bar cannot enter the grid.
+    pub(crate) fn scrollbar_gutter(&self) -> i32 {
+        if self.config.scrollbar.side() == scrollbar::Side::Hidden {
+            return 0;
+        }
+        let pad = self.padding_physical();
+        if pad <= 0 {
+            return 0;
+        }
+        let width = self.scrollbar_width_px();
+        if width <= 1 {
+            return 0;
+        }
+        width.min(pad)
+    }
+
+    fn padding_physical(&self) -> i32 {
+        let scale = self
+            .window
+            .as_ref()
+            .map(|w| w.scale_factor() as f32)
+            .unwrap_or(1.0);
+        self.config.padding_px_at(scale)
     }
 
     /// Pane rects for the active tab within the window's content area.
@@ -2815,7 +3929,8 @@ impl App {
         if t.zoomed && t.panes.len() > 1 {
             zoom_rects(content, t.panes.len(), t.focused)
         } else {
-            t.layout.rects(content, t.panes.len())
+            t.layout
+                .rects_spaced(content, t.panes.len(), self.split_gaps())
         }
     }
 
@@ -2823,7 +3938,7 @@ impl App {
     pub(crate) fn dividers(&self) -> Vec<layout::Divider> {
         match (self.content_rect(), self.tabs.get(self.active)) {
             (Some(content), Some(t)) if t.panes.len() > 1 && !t.zoomed => {
-                t.layout.dividers(content)
+                t.layout.dividers_spaced(content, self.split_gaps())
             }
             _ => Vec::new(),
         }
@@ -2838,6 +3953,7 @@ impl App {
         let Some(content) = self.content_rect() else {
             return;
         };
+        let gaps = self.split_gaps();
         let Some(t) = self.tabs.get_mut(self.active) else {
             return;
         };
@@ -2845,7 +3961,7 @@ impl App {
             Orientation::Row => pos.x,
             Orientation::Column => pos.y,
         };
-        t.layout.drag(&d, content, p);
+        t.layout.drag_spaced(&d, content, p, gaps);
         self.relayout_active();
         self.request_redraw();
     }
@@ -2853,8 +3969,12 @@ impl App {
     /// Resize every pane of the ACTIVE tab to its rect (background tabs
     /// re-layout when they become active — the standard terminal tradeoff).
     fn relayout_active(&mut self) {
-        // Pane rows moved. Cached link spans would underline the wrong cells.
+        // Pane rows moved. Cached link spans would underline the wrong cells,
+        // and a pixel offset belongs to the old cell height.
         self.link_cache.clear();
+        scroll::apply_resize(&mut self.smooth);
+        // A wrap changes what the reader sees even when the cursor does not.
+        self.bump_reader();
         // resolve "hide the bar with one tab" BEFORE measuring the content
         let hide = self.config.hide_single_tab_on() && self.tabs.len() <= 1;
         if let Some(r) = self.renderer.as_mut() {
@@ -2865,13 +3985,18 @@ impl App {
             return;
         };
         let (cw, ch) = (r.cell_w, r.cell_h);
+        // Same cell the grid was measured with. `CSI 14 t` multiplies it
+        // by each pane's columns and rows.
+        term::set_text_area_cell(cw, ch);
         if let Some(t) = self.tabs.get_mut(self.active) {
             for (pane, rect) in t.panes.iter_mut().zip(&rects) {
                 if !rect_visible(rect) {
                     continue; // zoomed away: keep the size it had
                 }
                 let g = TermSize {
-                    cols: ((rect.2 as f32 / cw) as usize).max(10),
+                    // the grid only: the scrollbar lives in the padding or
+                    // the seam, so it is not a column
+                    cols: scrollbar::grid_columns(rect.2, cw),
                     rows: ((rect.3 as f32 / ch) as usize).max(3),
                 };
                 pane.session.resize(g);
@@ -3148,6 +4273,11 @@ impl App {
     }
 
     fn save_state(&mut self) -> bool {
+        // Every caller (close, rename, group assign) comes through here.
+        // An elevated process must not create or replace session.json.
+        if !elevate::may_write_bayan(self.elevated) {
+            return true;
+        }
         // Closing while discovery is pending must not replace the saved
         // session with an empty window that has not restored it yet.
         if self.startup_pending {
@@ -3254,18 +4384,38 @@ impl App {
         // start it immediately with a default grid; the exact grid follows
         // once cell metrics exist (EasyTer starts 110x32 the same way).
         // Start one fresh tab unless saved-tab restoration is explicitly enabled.
-        match self.start_dir.take() {
-            // `--cwd` adds the active tab; saved tabs still come back first,
-            // so the next save does not drop them
-            Some(dir) => {
-                if self.config.restore_tabs.unwrap_or(false)
-                    && load_saved_state().is_some_and(|s| !s.tabs.is_empty())
-                {
-                    self.restore_state();
-                }
-                self.spawn_tab(Some(dir));
+        // `#45` opens `--cwd` as the active tab after any restored tabs. A
+        // profile or a `--` command rides on that same tab; with neither, and
+        // no folder, startup is unchanged.
+        let explicit = self.start_dir.is_some()
+            || self.start_profile_command.is_some()
+            || self.start_command.is_some();
+        if explicit {
+            // Elevated: do not replay session.json. Its commands and folders
+            // were written by a process that was not elevated.
+            if elevate::may_restore_saved_tabs(
+                self.elevated,
+                self.config.restore_tabs.unwrap_or(false),
+                load_saved_state().is_some_and(|s| !s.tabs.is_empty()),
+            ) {
+                self.restore_state();
             }
-            None => self.restore_state(),
+            let default = self.spawn_shell();
+            let process = cli::launch_process(
+                self.start_profile_command.as_deref(),
+                self.start_command.as_deref(),
+                &default,
+            );
+            self.spawn_tab_command(
+                self.start_dir.clone(),
+                &process.command_line,
+                process.raw_argv.as_deref(),
+            );
+        } else if self.elevated {
+            let shell = self.spawn_shell();
+            self.spawn_tab_command(None, &shell, None);
+        } else {
+            self.restore_state();
         }
         // debug hook: BAYAN_SPLIT=1 opens the first tab pre-split, so the
         // pane machinery can be verified without injecting any input
@@ -3400,7 +4550,7 @@ impl App {
                     self.spawn_group = Some(group as u32);
                     let cwd = cwds.next().flatten();
                     let first = shell();
-                    self.spawn_tab_command(cwd.clone(), &first);
+                    self.spawn_tab_command(cwd.clone(), &first, None);
                     if self.tabs.len() == before && first != default {
                         // the saved shell is gone (PowerShell 7 uninstalled,
                         // a WSL distro removed): the tab still comes back
@@ -3421,7 +4571,7 @@ impl App {
                         // re-split with the saved axis; weights come after
                         let cmd = shell();
                         let pane = self
-                            .spawn_pane_command(cwd.as_deref(), &cmd)
+                            .spawn_pane_command(cwd.as_deref(), &cmd, None)
                             .or_else(|| self.spawn_pane(cwd.as_deref()));
                         if let Some(pane) = pane {
                             if let Some(t) = self.tabs.last_mut() {
@@ -3520,19 +4670,41 @@ impl App {
     /// both: the application already ordered the text, so this pane does
     /// not reorder.
     fn claude_active(&self) -> bool {
-        let Some(s) = self.session() else {
+        let Some(tab) = self.tabs.get(self.active) else {
             return false;
         };
-        // term first, then meta — the crate's lock order
-        let alt = s.term.lock().mode().contains(TermMode::ALT_SCREEN);
-        let (bidi_state, running) = {
-            let m = s.meta.lock_or_recover();
-            (m.bidi.clone(), m.running_cmd.clone())
+        let Some(pane) = tab.panes.get(tab.focused) else {
+            return false;
+        };
+        self.pane_claude(pane)
+    }
+
+    /// Claude restoration for one pane. Term lock, then meta, never both:
+    /// the same order as every other pane read.
+    fn pane_claude(&self, pane: &Pane) -> bool {
+        let term_alt = pane
+            .session
+            .term
+            .lock()
+            .mode()
+            .contains(TermMode::ALT_SCREEN);
+        let (bidi_state, running, pane_mode, tracked_alt) = {
+            let m = pane.session.meta.lock_or_recover();
+            (
+                m.bidi.clone(),
+                m.running_cmd.clone(),
+                m.bidi_reorder,
+                m.alt_track.on(),
+            )
         };
         // Idle explicit mode (a command that forgot to reset) must not
         // suppress restoration at the prompt. A live explicit mode still does.
+        // The pane's BiDi mode (off / alt screen) is the same kind of gate.
+        // `alt_off` also counts ?47 and ?1047, which do not set the term bit.
+        let mode = pane_mode.unwrap_or_else(|| self.config.bidi_mode());
+        let alt = mode.effective_alt(term_alt, tracked_alt);
         let (reorder, _) =
-            bidi_state.for_display(self.config.honor_bdsm(), !running.is_empty(), alt);
+            bidi_state.presentation(mode, self.config.honor_bdsm(), !running.is_empty(), alt);
         if !reorder {
             return false;
         }
@@ -3542,24 +4714,324 @@ impl App {
         bidi::cmd_is_claude(&running)
     }
 
-    /// Pixel position -> (pane index, viewport row, col, cell side).
-    /// None inside the tab bar, the padding, or a divider gap.
-    fn pane_cell_at(&self, pos: PhysicalPosition<f64>) -> Option<(usize, usize, usize, Side)> {
-        let r = self.renderer.as_ref()?;
-        let hit = mouse::cell_at(
-            pos.x,
-            pos.y,
-            &self.pane_rects(),
-            r.cell_w as f64,
-            r.cell_h as f64,
-        )?;
-        let side = if hit.left { Side::Left } else { Side::Right };
-        if let Some(rect) = self.pane_rects().get(hit.pane) {
-            if let Some((col, side)) = r.hit_cell(*rect, hit.row, pos.x) {
-                return Some((hit.pane, hit.row, col, side));
+    /// Pixel offset of one pane. Zero on the alt screen and when smooth
+    /// scroll is off, so those paths stay on `cell_at`'s rows.
+    fn pane_offset_px(&self, pane_id: u64, cell_h: f32) -> i32 {
+        if !self.config.smooth_scroll_on() || self.mode_of(pane_id).contains(TermMode::ALT_SCREEN) {
+            return 0;
+        }
+        let sub = self.smooth.get(&pane_id).map(|s| s.subline).unwrap_or(0.0);
+        scroll::offset_px(sub, cell_h)
+    }
+
+    /// Viewport row under a pane-local y, including `-1` for the history
+    /// line a smooth scroll has pulled into the pane.
+    fn signed_row(&self, pane_id: u64, local_y: f64, cell_h: f64, rows: usize) -> i32 {
+        scroll::locate_row(
+            local_y,
+            cell_h,
+            self.pane_offset_px(pane_id, cell_h as f32) as f64,
+            rows,
+        )
+    }
+
+    fn close_message(&self, target: CloseTarget) -> String {
+        match target {
+            CloseTarget::Pane(ti, pi) => {
+                let cmd = chrome_text(&self.running_command(ti, pi).unwrap_or_default());
+                screen_reader::close_pane_message(&cmd)
+            }
+            CloseTarget::Tab(ti) => {
+                let n = self
+                    .tabs
+                    .get(ti)
+                    .map(|t| {
+                        t.panes
+                            .iter()
+                            .filter(|p| !p.session.meta.lock_or_recover().running_cmd.is_empty())
+                            .count()
+                    })
+                    .unwrap_or(0);
+                screen_reader::close_count_message(n, true)
+            }
+            CloseTarget::Window => screen_reader::close_count_message(self.running_count(), false),
+        }
+    }
+
+    /// Push a full tree when a client is connected and the stamp changed.
+    /// Before the first client this returns without taking the terminal
+    /// lock. Afterwards an unchanged frame does not build, and a burst is
+    /// at most one build per [`screen_reader::TREE_MIN_MS`], with the last stamp
+    /// delivered on [`Self::reader_tree_at`].
+    fn publish_reader(&mut self) {
+        if !self.reader_seen_client || self.reader.is_none() {
+            return;
+        }
+        let now_ms = self.reader_origin.elapsed().as_millis() as u64;
+        let announce_due = self.reader_deadline.is_some_and(|t| Instant::now() >= t);
+        let fp = self.reader_fp();
+        let pace = self.reader_pace.consider(fp, now_ms);
+        let build = pace.publish || announce_due;
+        if build && !pace.publish {
+            self.reader_pace.note_published(fp, now_ms);
+        }
+        if build {
+            let Some(mut adapter) = self.reader.take() else {
+                return;
+            };
+            adapter.update_if_active(|| self.reader_update(now_ms));
+            self.reader = Some(adapter);
+            self.reader_tree_at = None;
+        } else {
+            self.reader_tree_at = pace
+                .wake_ms
+                .map(|ms| self.reader_origin + std::time::Duration::from_millis(ms));
+        }
+    }
+
+    /// Cursor, selection, focus, tabs, palette, and card. Not the cells.
+    fn reader_fp(&self) -> u64 {
+        let mut h = screen_reader::stamp_mix(self.reader_gen, self.active as u64);
+        h = screen_reader::stamp_mix(h, u64::from(lang::rtl()));
+        let (vis, _) = self.visible_tabs();
+        for i in vis {
+            h = screen_reader::stamp_str(h, &self.tabs[i].label());
+            h = screen_reader::stamp_mix(h, u64::from(i == self.active));
+        }
+        if let Some(tab) = self.tabs.get(self.active) {
+            h = screen_reader::stamp_mix(h, tab.focused as u64);
+            for pane in &tab.panes {
+                let term = pane.session.term.lock();
+                h = screen_reader::stamp_mix(h, screen_reader::pane_stamp(&term));
             }
         }
-        Some((hit.pane, hit.row, hit.col, side))
+        h = match &self.palette {
+            None => screen_reader::stamp_mix(h, 0),
+            Some(p) => {
+                let mut h = screen_reader::stamp_mix(h, 1);
+                h = screen_reader::stamp_mix(h, p.sel as u64);
+                h = screen_reader::stamp_mix(h, u64::from(p.menu.is_some()));
+                h = screen_reader::stamp_mix(h, u64::from(p.shells_menu));
+                h = screen_reader::stamp_str(h, &p.query);
+                screen_reader::stamp_mix(h, p.extras.len() as u64)
+            }
+        };
+        h = match self.pending_close {
+            None => screen_reader::stamp_mix(h, 0),
+            Some(CloseTarget::Pane(ti, pi)) => {
+                let h = screen_reader::stamp_mix(h, 1);
+                let h = screen_reader::stamp_mix(h, ti as u64);
+                screen_reader::stamp_mix(h, pi as u64)
+            }
+            Some(CloseTarget::Tab(ti)) => {
+                let h = screen_reader::stamp_mix(h, 2);
+                screen_reader::stamp_mix(h, ti as u64)
+            }
+            Some(CloseTarget::Window) => screen_reader::stamp_mix(h, 3),
+        };
+        if let Some(block) = &self.blocked_link {
+            h = screen_reader::stamp_str(h, &block.reason);
+            h = screen_reader::stamp_str(h, &block.shown);
+            h = screen_reader::stamp_mix(h, u64::from(block.confirm.is_some()));
+        } else {
+            h = screen_reader::stamp_mix(h, 0);
+        }
+        if let Some(paste) = &self.pending_paste {
+            h = screen_reader::stamp_mix(h, paste.lines as u64);
+            h = screen_reader::stamp_mix(h, paste.chars as u64);
+            h = screen_reader::stamp_str(h, &paste.reason);
+        }
+        h
+    }
+
+    fn bump_reader(&mut self) {
+        self.reader_gen = self.reader_gen.wrapping_add(1);
+    }
+
+    fn reader_update(&mut self, now_ms: u64) -> accesskit::TreeUpdate {
+        let view = self.reader_view(now_ms);
+        self.reader_deadline = self
+            .reader_gate
+            .flush_at_ms()
+            .map(|ms| self.reader_origin + std::time::Duration::from_millis(ms));
+        screen_reader::build_tree(&view)
+    }
+
+    fn reader_view(&mut self, now_ms: u64) -> screen_reader::View {
+        let (vis, _) = self.visible_tabs();
+        let tabs: Vec<screen_reader::TabItem> = vis
+            .iter()
+            .map(|&i| screen_reader::TabItem {
+                index: i,
+                name: self.tabs[i].label(),
+                selected: i == self.active,
+            })
+            .collect();
+        let active = self.active;
+        let focused = self.tabs.get(active).map(|t| t.focused).unwrap_or(0);
+        let mut bodies = Vec::new();
+        let mut focused_lines = Vec::new();
+        let mut focused_id = None;
+        let mut finished = None;
+        let mut running = String::new();
+        if let Some(tab) = self.tabs.get(active) {
+            let count = tab.panes.len();
+            for (pi, pane) in tab.panes.iter().enumerate() {
+                let claude = self.pane_claude(pane);
+                // Copy under the lock, then restore BiDi and build nodes
+                // after it is released. A reader must not stall the PTY.
+                let raw = {
+                    let term = pane.session.term.lock();
+                    screen_reader::copy_pane(&term)
+                };
+                let text = screen_reader::pane_text(raw, claude);
+                if pi == focused {
+                    focused_id = Some(pane.id);
+                    focused_lines = text.lines.iter().map(|line| line.text.clone()).collect();
+                    let meta = pane.session.meta.lock_or_recover();
+                    running = meta.running_cmd.clone();
+                    finished = meta
+                        .marks
+                        .iter()
+                        .rev()
+                        .find(|mark| mark.exit.is_some())
+                        .map(|mark| (mark.abs, mark.exit));
+                }
+                bodies.push(screen_reader::PaneItem {
+                    index: pi,
+                    name: screen_reader::pane_name(pi, count),
+                    text,
+                });
+            }
+        }
+        if focused_id != self.reader_pane {
+            self.reader_gate.reset();
+            self.reader_pane = focused_id;
+            self.reader_mark = None;
+            self.reader_mark_ready = false;
+            self.reader_cmd.clear();
+            self.reader_bodies.clear();
+        }
+        if !running.is_empty() {
+            self.reader_cmd = running;
+        }
+        if let Some((abs, exit)) = finished {
+            if self.reader_mark != Some(abs) {
+                let announce = self.reader_mark_ready;
+                self.reader_mark = Some(abs);
+                if announce {
+                    self.reader_gate
+                        .command_finished(exit, &self.reader_cmd, now_ms);
+                }
+            }
+        }
+        self.reader_mark_ready = true;
+        let update = self.reader_gate.push(&focused_lines, now_ms);
+        // A selection is the user's, not the flood's: show it immediately.
+        let selecting = bodies.iter().any(|pane| pane.text.selection.is_some());
+        let panes =
+            if selecting || update.refresh_document || self.reader_bodies.len() != bodies.len() {
+                self.reader_bodies = bodies;
+                self.reader_bodies.clone()
+            } else {
+                self.reader_bodies.clone()
+            };
+        if let Some(live) = update.live.clone() {
+            let on_screen = self
+                .reader_live
+                .as_deref()
+                .unwrap_or(screen_reader::live_name());
+            self.reader_live = Some(screen_reader::live_label(on_screen, live));
+        }
+        let palette = self.palette.as_ref().map(|p| {
+            let menu = p.menu.is_some();
+            screen_reader::PaletteItem {
+                name: if menu {
+                    screen_reader::menu_name()
+                } else {
+                    screen_reader::palette_name()
+                }
+                .to_string(),
+                query: p.query.clone(),
+                rows: self
+                    .palette_rows(&p.query)
+                    .into_iter()
+                    .map(|(_, label)| label)
+                    .collect(),
+                selected: p.sel,
+                menu,
+            }
+        });
+        let dialog = self.reader_dialog();
+        screen_reader::View {
+            tabs,
+            active_tab: active,
+            panes,
+            focused_pane: focused,
+            live: self
+                .reader_live
+                .clone()
+                .unwrap_or_else(|| screen_reader::live_name().to_string()),
+            palette,
+            dialog,
+        }
+    }
+
+    fn reader_dialog(&self) -> Option<screen_reader::DialogItem> {
+        if let Some(target) = self.pending_close {
+            let name = self.close_message(target);
+            return Some(screen_reader::DialogItem {
+                body: name.clone(),
+                name,
+            });
+        }
+        if let Some(block) = &self.blocked_link {
+            if block.is_app_error {
+                return Some(screen_reader::DialogItem {
+                    name: block.reason.clone(),
+                    body: block.shown.clone(),
+                });
+            }
+            let name = format!(
+                "{} — {}",
+                link::card_title_prefix(block.confirm.is_some()),
+                block.reason
+            );
+            let (ar, en) = link::card_key_lines(block.confirm.is_some());
+            return Some(screen_reader::DialogItem {
+                name,
+                body: format!("{}\n{ar}\n{en}", block.shown),
+            });
+        }
+        let paste = self.pending_paste.as_ref()?;
+        let preview = card_preview(paste.kind, &paste.text);
+        let shown = preview.first().map(String::as_str).unwrap_or("");
+        Some(screen_reader::DialogItem {
+            name: screen_reader::paste_dialog_name().to_string(),
+            body: format!("{}\n{shown}", paste.reason),
+        })
+    }
+
+    /// Pixel position -> (pane index, viewport row, col, cell side).
+    /// None inside the tab bar, the padding, or a divider gap.
+    fn pane_cell_at(&self, pos: PhysicalPosition<f64>) -> Option<(usize, i32, usize, Side)> {
+        let r = self.renderer.as_ref()?;
+        let rects = self.pane_rects();
+        let hit = mouse::cell_at(pos.x, pos.y, &rects, r.cell_w as f64, r.cell_h as f64)?;
+        let rect = rects.get(hit.pane).copied()?;
+        let rows = ((rect.3 as f64 / r.cell_h as f64).floor() as usize).max(1);
+        let pane_id = self.tabs.get(self.active)?.panes.get(hit.pane)?.id;
+        let row = self.signed_row(pane_id, pos.y - rect.1 as f64, r.cell_h as f64, rows);
+        let geom_row = if row < 0 {
+            scroll::PEEK_ROW
+        } else {
+            row as usize
+        };
+        if let Some((col, side)) = r.hit_cell(rect, geom_row, pos.x) {
+            return Some((hit.pane, row, col, side));
+        }
+        let side = if hit.left { Side::Left } else { Side::Right };
+        Some((hit.pane, row, hit.col, side))
     }
 
     fn mode_of(&self, id: u64) -> TermMode {
@@ -3657,16 +5129,19 @@ impl App {
     }
 
     /// Viewport cell under `pos`, with a bidi row's column mapped back to
-    /// the grid cell the program stored. `hit` is the raw grid cell.
+    /// the grid cell the program stored. `row` is the offset-aware viewport
+    /// row (`-1` is the history line above the screen). `hit` still names
+    /// the pane and the unshifted column.
     fn finish_locate(
         &mut self,
         hit: mouse::CellHit,
+        row: i32,
         pos: PhysicalPosition<f64>,
         rects: &[render::Rect],
-    ) -> Option<(u64, usize, usize)> {
+    ) -> Option<(u64, i32, usize)> {
         // copy what the locks need, then drop the pane borrow so the term
         // lock below can re-borrow the tab
-        let (pane_id, running, bidi_state, evicted, claude_from) = {
+        let (pane_id, running, bidi_state, evicted, claude_from, pane_mode, tracked_alt) = {
             let pane = self.tabs.get(self.active)?.panes.get(hit.pane)?;
             let m = pane.session.meta.lock_or_recover();
             (
@@ -3675,21 +5150,96 @@ impl App {
                 m.bidi.clone(),
                 m.evicted,
                 m.claude_from_abs,
+                m.bidi_reorder,
+                m.alt_track.on(),
             )
         };
         let (auto, manual) = (self.auto_follow, self.claude_manual);
         let honor = self.config.honor_bdsm();
-        let (cols, row, cells, claude, vis, reorder, dir) = {
+        let mode = pane_mode.unwrap_or_else(|| self.config.bidi_mode());
+        let geom_row = if row < 0 {
+            scroll::PEEK_ROW
+        } else {
+            row as usize
+        };
+        if row < 0 {
+            let (cols, alt, history, off, cells) = {
+                let t = self.tabs[self.active].panes[hit.pane].session.term.lock();
+                let off = t.grid().display_offset() as u64;
+                (
+                    t.columns().max(1),
+                    mode.effective_alt(t.mode().contains(TermMode::ALT_SCREEN), tracked_alt),
+                    t.grid().history_size() as u64,
+                    off,
+                    render::snapshot_grid_line(&t, scroll::grid_line(row, off as i32)),
+                )
+            };
+            // Same gate as a fully visible row: explicit BDSM (`CSI 8 l`),
+            // and the `off` and `alt_off` modes, do not reorder, so the
+            // column is the grid's.
+            let (reorder, use_stamps) =
+                bidi_state.presentation(mode, honor, !running.is_empty(), alt);
+            let abs = bidi_ctl::peek_line_abs(evicted, history, off);
+            let mut claude = reorder
+                && if !auto {
+                    manual
+                } else {
+                    bidi::cmd_is_claude(&running)
+                };
+            if !alt && auto {
+                claude &= claude_from.is_none_or(|start| abs >= start);
+            }
+            // The painter's direction for this row: its SCP stamp, else
+            // its own first strong letter.
+            let stamped = if use_stamps {
+                bidi_state.direction_at(abs)
+            } else {
+                bidi_ctl::ParagraphDir::Default
+            };
+            let dir = if stamped == bidi_ctl::ParagraphDir::Default {
+                render::snap_paragraph_dir(&cells)
+            } else {
+                stamped
+            };
+            // Same split as draw_pane: TUI fields and the alternate screen
+            // are not flush-right.
+            let align_edge = reorder && !alt && !((claude || alt) && render::snap_is_tui(&cells));
+            let shaped = rects.get(hit.pane).and_then(|rect| {
+                self.renderer
+                    .as_mut()
+                    .and_then(|r| {
+                        r.warm_row_ink(*rect, geom_row);
+                        r.hit_cell(*rect, geom_row, pos.x)
+                    })
+                    .map(|h| h.0)
+            });
+            let shaped = shaped.or_else(|| {
+                if !reorder || !cells.iter().any(|c| render::is_rtl(c.c)) {
+                    return None;
+                }
+                let rect = rects.get(hit.pane).copied().unwrap_or((0, 0, 1, 1));
+                let x = (pos.x - rect.0 as f64) as f32;
+                self.renderer.as_mut().and_then(|r| {
+                    r.logical_column_for(&cells, x, rect.2, claude, dir, cols, align_edge)
+                })
+            });
+            let col = scroll::history_click_column(reorder, shaped, hit.col.min(cols - 1));
+            return Some((pane_id, row, col.min(cols - 1)));
+        }
+        let (cols, row, cells, claude, vis, reorder, dir, align_edge, bidi_row) = {
             let t = self.tabs[self.active].panes[hit.pane].session.term.lock();
             let cols = t.columns().max(1);
             let rows = t.screen_lines().max(1);
-            let row = hit.row.min(rows - 1);
+            let row = row.min(rows as i32 - 1);
             // Explicit BDSM draws Arabic on the grid, so the click column
             // is x / cell_w. Implicit mode uses the same plan as the painter,
             // SCP mark included. Neither applies once the command has ended
-            // and the pane is back on the primary screen.
-            let alt = t.mode().contains(TermMode::ALT_SCREEN);
-            let (reorder, use_stamps) = bidi_state.for_display(honor, !running.is_empty(), alt);
+            // and the pane is back on the primary screen. `off` and
+            // `alt_off` on the alternate screen take the grid path too.
+            let term_alt = t.mode().contains(TermMode::ALT_SCREEN);
+            let alt = mode.effective_alt(term_alt, tracked_alt);
+            let (reorder, use_stamps) =
+                bidi_state.presentation(mode, honor, !running.is_empty(), alt);
             let mut claude = reorder
                 && if !auto {
                     manual
@@ -3702,14 +5252,22 @@ impl App {
                 let abs = bidi_ctl::viewport_line_abs(evicted, history, off, row as u64);
                 claude &= claude_from.is_none_or(|start| abs >= start);
             }
-            let dir = if use_stamps {
-                bidi_state.direction_at(bidi_ctl::viewport_line_abs(
-                    evicted, history, off, row as u64,
-                ))
-            } else {
-                bidi_ctl::ParagraphDir::Default
-            };
-            let cells = render::snapshot_row(&t, row);
+            // The row's direction and path as draw_pane picks them: SCP
+            // stamp, then the wrapped paragraph's direction, then its own
+            // first strong letter. A wrapped RTL tail is bidi without Arabic.
+            let (dir, bidi_row) = render::viewport_row_layout(&t, row as usize, |li| {
+                if use_stamps {
+                    bidi_state.direction_at(bidi_ctl::viewport_line_abs(
+                        evicted, history, off, li as u64,
+                    ))
+                } else {
+                    bidi_ctl::ParagraphDir::Default
+                }
+            });
+            let cells = render::snapshot_row(&t, row as usize);
+            // Same split as draw_pane: TUI fields and the alternate screen
+            // are not flush-right, so a click must not assume they are.
+            let align_edge = reorder && !alt && !((claude || alt) && render::snap_is_tui(&cells));
             (
                 cols,
                 row,
@@ -3718,24 +5276,31 @@ impl App {
                 hit.col.min(cols - 1),
                 reorder,
                 dir,
+                align_edge,
+                bidi_row,
             )
         };
         let mapped = rects
             .get(hit.pane)
             .and_then(|rect| {
-                self.renderer
-                    .as_ref()
-                    .and_then(|r| r.hit_cell(*rect, row, pos.x))
+                self.renderer.as_mut().and_then(|r| {
+                    // Ink for the row is measured here, on the click, not
+                    // while the frame was painted.
+                    r.warm_row_ink(*rect, row as usize);
+                    r.hit_cell(*rect, row as usize, pos.x)
+                })
             })
             .map(|h| h.0);
         let col = if let Some(col) = mapped {
             col
-        } else if reorder && cells.iter().any(|c| render::is_rtl(c.c)) {
+        } else if reorder && bidi_row {
             let rect = rects.get(hit.pane).copied().unwrap_or((0, 0, 1, 1));
             let x = (pos.x - rect.0 as f64) as f32;
             self.renderer
                 .as_mut()
-                .and_then(|r| r.logical_column_for(&cells, x, rect.2, claude, dir, cols))
+                .and_then(|r| {
+                    r.logical_column_for(&cells, x, rect.2, claude, dir, cols, align_edge)
+                })
                 .unwrap_or(vis)
         } else {
             vis
@@ -3744,7 +5309,8 @@ impl App {
     }
 
     /// The cell under the pointer, or None when it isn't over a pane.
-    fn locate(&mut self, pos: PhysicalPosition<f64>) -> Option<(usize, u64, usize, usize)> {
+    /// The row is offset-aware and may be `-1`.
+    fn locate(&mut self, pos: PhysicalPosition<f64>) -> Option<(usize, u64, i32, usize)> {
         let rects = self.pane_rects();
         let (cw, ch) = {
             let r = self.renderer.as_ref()?;
@@ -3752,7 +5318,11 @@ impl App {
         };
         let hit = mouse::cell_at(pos.x, pos.y, &rects, cw, ch)?;
         let pane = hit.pane;
-        let (id, row, col) = self.finish_locate(hit, pos, &rects)?;
+        let rect = *rects.get(pane)?;
+        let rows = ((rect.3 as f64 / ch).floor() as usize).max(1);
+        let pane_id = self.tabs.get(self.active)?.panes.get(pane)?.id;
+        let row = self.signed_row(pane_id, pos.y - rect.1 as f64, ch, rows);
+        let (id, row, col) = self.finish_locate(hit, row, pos, &rects)?;
         Some((pane, id, row, col))
     }
 
@@ -3762,7 +5332,7 @@ impl App {
         &mut self,
         pane_id: u64,
         pos: PhysicalPosition<f64>,
-    ) -> Option<(usize, usize)> {
+    ) -> Option<(i32, usize)> {
         let (ti, pi) = self.find_pane(pane_id)?;
         if ti != self.active {
             return None;
@@ -3783,7 +5353,9 @@ impl App {
         // cell_at's pane index is 0 for the one-rect slice; the real index
         // is `pi`, which finish_locate uses to read the grid.
         let hit = mouse::CellHit { pane: pi, ..hit };
-        let (_, row, col) = self.finish_locate(hit, PhysicalPosition::new(cx, cy), &rects)?;
+        let rows = ((h as f64 / ch).floor() as usize).max(1);
+        let row = self.signed_row(pane_id, cy - y as f64, ch, rows);
+        let (_, row, col) = self.finish_locate(hit, row, PhysicalPosition::new(cx, cy), &rects)?;
         Some((row, col))
     }
 
@@ -3824,8 +5396,13 @@ impl App {
         link::cwd_hook(raw.as_deref())
     }
 
-    fn links_on(&mut self, id: u64, row: usize) -> Vec<link::LinkSpan> {
-        if let Some(spans) = self.link_cache.get(id, row) {
+    fn links_on(&mut self, id: u64, row: i32) -> Vec<link::LinkSpan> {
+        let key = if row < 0 {
+            scroll::PEEK_ROW
+        } else {
+            row as usize
+        };
+        if let Some(spans) = self.link_cache.get(id, key) {
             return spans;
         }
         let Some((ti, pi)) = self.find_pane(id) else {
@@ -3833,9 +5410,9 @@ impl App {
         };
         let spans = {
             let term = self.tabs[ti].panes[pi].session.term.lock();
-            link::links_on_row(&term, row)
+            link::links_on_viewport(&term, row)
         };
-        self.link_cache.insert(id, row, spans.clone());
+        self.link_cache.insert(id, key, spans.clone());
         spans
     }
 
@@ -3853,7 +5430,7 @@ impl App {
     /// Recompute the hover from `pos`. Returns the logical cell so mouse
     /// motion can be reported without a second hit-test. `None` when the
     /// pointer is not over a pane.
-    fn refresh_link_hover(&mut self, pos: PhysicalPosition<f64>) -> Option<(u64, usize, usize)> {
+    fn refresh_link_hover(&mut self, pos: PhysicalPosition<f64>) -> Option<(u64, i32, usize)> {
         if self.overlay_blocks_mouse() {
             self.clear_link_hover();
             return None;
@@ -3902,7 +5479,10 @@ impl App {
         let cwd = self.pane_link_cwd(id);
         // `exists` and `find_code_exe` run on the link thread. A disconnected
         // network drive must not stall this handler.
-        match span.activate(cwd.as_deref(), self.config.editor.as_deref()) {
+        match span.activate(
+            cwd.as_deref(),
+            elevate::configured_editor(self.elevated, self.config.editor.as_deref()),
+        ) {
             action @ (link::Action::Browse(_)
             | link::Action::OpenPath(_)
             | link::Action::Reveal(_)
@@ -3912,7 +5492,7 @@ impl App {
                 self.blocked_link = Some(BlockedLink {
                     reason: link::host_confirm().to_string(),
                     shown: link::confirm_card_shown(&host, &uri),
-                    confirm_uri: Some(uri),
+                    confirm: Some(link::confirm_open_from_uri(&uri)),
                     is_app_error: false,
                 });
                 self.clear_link_hover();
@@ -3942,11 +5522,25 @@ impl App {
         };
         let proxy = self.proxy.clone();
         let shown_for_fail = shown.clone();
+        let elevated = self.elevated;
         let spawned = std::thread::Builder::new()
             .name("bayan-link".into())
             .spawn(move || {
                 link::init_link_thread();
-                let action = link::settle_live(action);
+                let action = link::settle_live(action, elevated);
+                if let link::Action::Confirm { uri, host } = &action {
+                    if link::is_browser_uri(uri) {
+                        if !link::perform_open(&link::Action::Browse(uri.clone())) {
+                            let _ = proxy.send_event(UserEvent::LinkFailed {
+                                reason: link::RefuseReason::Editor.label().to_string(),
+                                shown: uri.clone(),
+                            });
+                        }
+                    } else {
+                        let _ = proxy.send_event(UserEvent::LinkConfirm { path: host.clone() });
+                    }
+                    return;
+                }
                 if let link::Action::Refuse { reason, shown } = &action {
                     let _ = proxy.send_event(UserEvent::LinkFailed {
                         reason: reason.label().to_string(),
@@ -3966,11 +5560,33 @@ impl App {
         }
     }
 
+    /// Explorer `/select` for a reveal-only card. This does not call
+    /// `settle`: an allowlisted extension would become an association open.
+    fn spawn_reveal_only(&mut self, path: &str) {
+        let path = path.to_string();
+        let proxy = self.proxy.clone();
+        let owned = path.clone();
+        let spawned = std::thread::Builder::new()
+            .name("bayan-link".into())
+            .spawn(move || {
+                link::init_link_thread();
+                if link::spawn_reveal(&owned).is_err() {
+                    let _ = proxy.send_event(UserEvent::LinkFailed {
+                        reason: link::RefuseReason::Editor.label().to_string(),
+                        shown: owned,
+                    });
+                }
+            });
+        if spawned.is_err() {
+            self.refuse_link(link::RefuseReason::Editor, &path);
+        }
+    }
+
     fn refuse_link(&mut self, reason: link::RefuseReason, shown: &str) {
         self.blocked_link = Some(BlockedLink {
             reason: reason.label().to_string(),
             shown: link::preview(shown, 160),
-            confirm_uri: None,
+            confirm: None,
             is_app_error: false,
         });
         self.clear_link_hover();
@@ -4021,6 +5637,9 @@ impl App {
         let Some((pane, id, row, col)) = self.locate(self.cursor_pos) else {
             return false;
         };
+        let Some(row) = scroll::screen_row(row) else {
+            return false;
+        };
         let proto = mouse::Proto::from_mode(self.mode_of(id));
         let cell = mouse::Cell { pane: id, row, col };
         let Some(bytes) = self.mouse.press(cell, button, proto, self.mods_now()) else {
@@ -4047,10 +5666,12 @@ impl App {
         let proto = mouse::Proto::from_mode(self.mode_of(pane_id));
         let cell = self
             .cell_in_pane_clamped(pane_id, self.cursor_pos)
-            .map(|(row, col)| mouse::Cell {
-                pane: pane_id,
-                row,
-                col,
+            .and_then(|(row, col)| {
+                scroll::screen_row(row).map(|row| mouse::Cell {
+                    pane: pane_id,
+                    row,
+                    col,
+                })
             });
         match self.mouse.release(button, cell, proto, self.mods_now()) {
             mouse::Take::Ignore => false,
@@ -4072,6 +5693,9 @@ impl App {
         };
         let proto = mouse::Proto::from_mode(self.mode_of(pane_id));
         let Some((row, col)) = self.cell_in_pane_clamped(pane_id, pos) else {
+            return;
+        };
+        let Some(row) = scroll::screen_row(row) else {
             return;
         };
         let cell = mouse::Cell {
@@ -4129,27 +5753,44 @@ impl App {
     }
 
     /// Copy the current selection to the system clipboard; optionally clear it.
+    ///
+    /// `copy.clean` decides whether the TUI margin, trailing spaces and soft
+    /// wraps come off. Copy-mode yanks come through here too, so the same
+    /// setting covers `y`.
     fn copy_selection(&mut self, clear: bool) -> bool {
+        self.copy_clipboard(clear, false)
+    }
+
+    /// Copy the selection cleaned, whatever `copy.clean` says.
+    fn copy_selection_clean(&mut self) -> bool {
+        self.copy_clipboard(false, true)
+    }
+
+    fn copy_clipboard(&mut self, clear: bool, force_clean: bool) -> bool {
         let Some(session) = self.session() else {
             return false;
         };
         let text = {
             let mut t = session.term.lock();
             let txt = t.selection_to_string();
+            let rows = copyclean::selection_rows(&t);
             if clear {
                 t.selection = None;
             }
-            txt
+            txt.map(|raw| (raw, rows))
         };
+        // claude_active locks the term too; take it only after the guard above
+        let claude = self.claude_active();
+        let clean = force_clean || self.config.clean_copy().enabled(claude);
         match text {
-            Some(s) if !s.is_empty() => {
+            Some((raw, rows)) if !raw.is_empty() => {
                 // Claude rows hold VISUAL-order Arabic: restore logical so a
-                // paste elsewhere reads correctly (M7 gap closed)
-                let s = if self.claude_active() {
-                    bidi::restore_block(&s)
-                } else {
-                    s
-                };
+                // paste elsewhere reads correctly (M7 gap closed). Clean copy
+                // runs that same restore; it does not reorder by visual x.
+                let s = copyclean::clipboard_text(&raw, &rows, clean, claude);
+                if s.is_empty() {
+                    return false;
+                }
                 self.set_clipboard(s);
                 true
             }
@@ -4181,6 +5822,28 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Ctrl+Shift+F3. Cycles the focused pane only: full → alt screen off → off.
+    /// The config stays the default for panes that have not been toggled.
+    fn toggle_bidi_reorder(&mut self) {
+        let config_mode = self.config.bidi_mode();
+        let Some(session) = self.session_mut() else {
+            return;
+        };
+        let mut meta = session.meta.lock_or_recover();
+        let next = meta.bidi_reorder.unwrap_or(config_mode).cycle();
+        meta.bidi_reorder = Some(next);
+        drop(meta);
+        self.request_redraw();
+    }
+
+    /// The focused pane's effective BiDi mode: its toggle, or the config.
+    fn focused_bidi_mode(&self) -> bidi_ctl::BidiReorder {
+        let stored = self
+            .session()
+            .map(|s| s.meta.lock_or_recover().bidi_reorder);
+        stored.flatten().unwrap_or_else(|| self.config.bidi_mode())
+    }
+
     /// Ctrl+Shift+B. A tab with one pane has nobody to broadcast to.
     fn toggle_broadcast(&mut self) {
         if let Some(t) = self.tabs.get_mut(self.active) {
@@ -4209,7 +5872,15 @@ impl App {
             self.tabs.get(self.active).map_or((1, false, false), |t| {
                 (t.panes.len(), t.zoomed, t.broadcast)
             });
-        context_menu_rows(self.has_selection(), panes, zoomed, broadcast)
+        let mut rows = context_menu_rows(self.has_selection(), panes, zoomed, broadcast);
+        rows.push((PaletteRow::OpenSsh, ssh::label_open().to_string()));
+        if self.config.mux_enabled() {
+            rows.push((PaletteRow::OpenDetached, mux::label_reattach().to_string()));
+            if self.focused_is_mux() {
+                rows.push((PaletteRow::DetachSession, mux::label_detach().to_string()));
+            }
+        }
+        rows
     }
 
     /// Right-click: the menu opens under the pointer, on the pane that was
@@ -4328,6 +5999,7 @@ impl App {
             match kind {
                 PendingKind::Paste => self.send_paste(&txt),
                 PendingKind::Drop | PendingKind::Command => self.send_focused(kind, &txt),
+                PendingKind::ApproveLua => {}
             }
             return;
         };
@@ -4344,6 +6016,9 @@ impl App {
             lines,
             chars,
             reason,
+            lua: None,
+            scroll: 0,
+            saw_end: true,
         });
         self.request_redraw();
     }
@@ -4354,6 +6029,12 @@ impl App {
         let Some(p) = self.pending_paste.take() else {
             return;
         };
+        if p.kind == PendingKind::ApproveLua {
+            self.approve_lua(p);
+            self.after_confirm_card();
+            self.request_redraw();
+            return;
+        }
         if !card_still_targets(p.pane, self.focused_pane_id()) {
             self.request_redraw();
             return;
@@ -4361,8 +6042,222 @@ impl App {
         match p.kind {
             PendingKind::Paste => self.send_paste(&p.text),
             PendingKind::Drop | PendingKind::Command => self.send_focused(p.kind, &p.text),
+            PendingKind::ApproveLua => {}
+        }
+        self.after_confirm_card();
+        self.request_redraw();
+    }
+
+    /// Esc on the confirm card. A Lua file that was refused stays unapproved
+    /// for this session; the next waiting file is raised.
+    pub(crate) fn dismiss_paste_card(&mut self) {
+        if let Some(hash) = self
+            .pending_paste
+            .as_ref()
+            .and_then(|p| p.lua.as_ref())
+            .map(|s| s.hash.clone())
+        {
+            self.lua_skipped.push(hash);
+        }
+        self.pending_paste = None;
+        self.lua_approve_not_before = None;
+        self.after_confirm_card();
+        self.request_redraw();
+    }
+
+    fn after_confirm_card(&mut self) {
+        if self.pending_paste.is_some() {
+            return;
+        }
+        self.show_next_lua_card();
+        if self.pending_paste.is_none() {
+            self.pump_lua_sends();
+        }
+    }
+
+    fn show_next_lua_card(&mut self) {
+        if self.pending_paste.is_some() {
+            return;
+        }
+        let skipped = self.lua_skipped.clone();
+        let Some(index) = self
+            .lua_pending
+            .iter()
+            .position(|p| !skipped.iter().any(|h| h == &p.hash))
+        else {
+            return;
+        };
+        let script = self.lua_pending.remove(index);
+        self.raise_lua_card(script);
+    }
+
+    fn raise_lua_card(&mut self, script: lua_host::PendingScript) {
+        let text = script.preview.clone();
+        let rows = card_preview(PendingKind::ApproveLua, &text);
+        let saw_end = rows.len() <= LUA_CARD_ROWS;
+        let mut reason = script.reason();
+        if !saw_end {
+            reason.push_str(tr(" — مرّر حتى آخر السكربت", " — scroll to the end"));
+        }
+        let lines = text.lines().count().max(1);
+        let chars = text.chars().count();
+        self.pending_paste = Some(PendingPaste {
+            kind: PendingKind::ApproveLua,
+            pane: None,
+            text,
+            lines,
+            chars,
+            reason,
+            lua: Some(script),
+            scroll: 0,
+            saw_end,
+        });
+    }
+
+    /// Wheel and arrows while the approval card is up. Returns whether the
+    /// card consumed the input.
+    fn scroll_lua_card(&mut self, delta: i32) -> bool {
+        let Some(p) = self.pending_paste.as_mut() else {
+            return false;
+        };
+        if p.kind != PendingKind::ApproveLua {
+            return false;
+        }
+        let rows = card_preview(p.kind, &p.text);
+        let (_, scroll, _) = lua_card_window(&rows, p.scroll);
+        if rows.len() <= LUA_CARD_ROWS {
+            p.saw_end = true;
+            p.scroll = scroll;
+            return true;
+        }
+        let max = rows.len() - LUA_CARD_ROWS;
+        let next = (scroll as i32 + delta).clamp(0, max as i32) as usize;
+        p.scroll = next;
+        if next >= max {
+            p.saw_end = true;
+        }
+        true
+    }
+
+    fn scroll_lua_card_key(&mut self, key: &winit::keyboard::Key) -> bool {
+        let lua = self
+            .pending_paste
+            .as_ref()
+            .is_some_and(|p| p.kind == PendingKind::ApproveLua);
+        if !lua {
+            return false;
+        }
+        let delta = match key {
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowDown) => 1,
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp) => -1,
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::PageDown) => {
+                LUA_CARD_ROWS as i32
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::PageUp) => {
+                -(LUA_CARD_ROWS as i32)
+            }
+            _ => return false,
+        };
+        self.scroll_lua_card(delta);
+        true
+    }
+
+    fn approve_lua(&mut self, card: PendingPaste) {
+        let Some(script) = card.lua.clone() else {
+            return;
+        };
+        if !script.shows_everything() {
+            self.lua_approve_not_before = Some(std::time::Instant::now() + LUA_APPROVE_DELAY);
+            self.raise_lua_card(script.reveal());
+            self.request_redraw();
+            return;
+        }
+        if !lua_enter_ready(self.lua_approve_not_before, std::time::Instant::now()) || !card.saw_end
+        {
+            self.pending_paste = Some(card);
+            self.request_redraw();
+            return;
+        }
+        self.lua_approve_not_before = None;
+        match lua_host::unchanged(&script) {
+            Ok(()) => {
+                lua_host::grant(&mut self.json_config, &script.hash);
+                self.save_config();
+                let outcome = lua_host::reload(&self.json_config, &config::bayan_dir());
+                self.apply_lua_outcome(outcome);
+            }
+            Err(err) => {
+                eprintln!("bayan: {err}");
+                self.report_error(
+                    tr("تعذر اعتماد السكربت", "Could not approve the script"),
+                    "تغيّر الملف ويحتاج اعتمادًا جديدًا.",
+                );
+                let outcome = lua_host::reload(&self.json_config, &config::bayan_dir());
+                self.apply_lua_outcome(outcome);
+            }
+        }
+    }
+
+    fn apply_lua_outcome(&mut self, outcome: lua_host::Outcome) {
+        self.json_config = outcome.persisted;
+        self.config = outcome.config;
+        self.keymap = keybinds::effective_map(&self.config);
+        lang::set(self.config.lang());
+        self.lua_plugins = outcome.plugins;
+        self.lua_pending = outcome.pending;
+        self.lua_errors = outcome.shown;
+        self.lua_notice = outcome.notice;
+        if self.renderer.is_some() && !self.renderer_building {
+            self.rebuild_renderer();
+        }
+        self.apply_opacity();
+        self.report_lua_errors();
+    }
+
+    fn report_lua_errors(&mut self) {
+        if let Some(notice) = self.lua_notice.take() {
+            self.report_error(tr("مسؤول", "Administrator"), &notice);
+        }
+        if self.lua_errors.is_empty() {
+            return;
+        }
+        let detail = self.lua_errors.join("\n");
+        self.lua_errors.clear();
+        self.report_error(tr("تعذر تشغيل لوا", "Lua did not run"), &detail);
+    }
+
+    fn fire_lua_chord(&mut self, chord: &str) -> bool {
+        if !self.lua_plugins.has_binding(chord) {
+            return false;
+        }
+        let sends = self.lua_plugins.fire(chord);
+        self.lua_send_queue.extend(sends);
+        if self.pending_paste.is_none() {
+            self.pump_lua_sends();
         }
         self.request_redraw();
+        true
+    }
+
+    fn pump_lua_sends(&mut self) {
+        if self.pending_paste.is_some() {
+            return;
+        }
+        if let Some(send) = self.lua_send_queue.pop_front() {
+            let pane = self.focused_pane_id();
+            self.pending_paste = Some(plugin_pending(&send.plugin, &send.text, pane));
+        }
+    }
+
+    fn emit_lua_event(&mut self, event: &str, fields: &[(&str, &str)]) {
+        let sends = self.lua_plugins.emit(event, fields);
+        if sends.is_empty() {
+            return;
+        }
+        self.lua_send_queue.extend(sends);
+        if self.pending_paste.is_none() {
+            self.pump_lua_sends();
+        }
     }
 
     /// A drop or a plugin command into the FOCUSED pane only. A drop keeps
@@ -4399,6 +6294,9 @@ impl App {
     }
 
     fn scroll_lines(&mut self, n: i32) {
+        if let Some(id) = self.focused_pane_id() {
+            self.drop_smooth(id);
+        }
         if let Some(s) = self.session() {
             s.term.lock().scroll_display(Scroll::Delta(n));
         }
@@ -4431,6 +6329,9 @@ impl App {
             }
             m
         };
+        if let Some(id) = self.focused_pane_id() {
+            self.drop_smooth(id);
+        }
         self.invalidate_focused_links();
         if let (Some(st), Some(m)) = (self.search.as_mut(), found) {
             st.hl = Some(m);
@@ -4483,6 +6384,9 @@ impl App {
     }
 
     fn redraw(&mut self) {
+        // Before a client, this is a flag check. After one, an unchanged
+        // stamp does not walk the grid; a flood builds at about 10 Hz.
+        self.publish_reader();
         // A scroll under a still pointer moves the link. Refresh only while
         // a hover is showing, and never during a drag: that path must not
         // redraw on every pixel.
@@ -4554,42 +6458,11 @@ impl App {
             let sel = p.sel.min(rows.len().saturating_sub(1));
             (p.query.clone(), rows, sel, p.menu)
         });
-        let close_msg: Option<String> = self.pending_close.map(|target| match target {
-            CloseTarget::Pane(ti, pi) => {
-                let cmd = chrome_text(&self.running_command(ti, pi).unwrap_or_default());
-                if lang::rtl() {
-                    format!("الأمر «{cmd}» ما يزال يعمل — إغلاق اللوحة؟")
-                } else {
-                    format!("“{cmd}” is still running — close the pane?")
-                }
-            }
-            CloseTarget::Tab(ti) => {
-                let n = self
-                    .tabs
-                    .get(ti)
-                    .map(|t| {
-                        t.panes
-                            .iter()
-                            .filter(|p| !p.session.meta.lock_or_recover().running_cmd.is_empty())
-                            .count()
-                    })
-                    .unwrap_or(0);
-                if lang::rtl() {
-                    format!("{n} أمر ما يزال يعمل — إغلاق التبويب؟")
-                } else {
-                    format!("{n} command(s) still running — close the tab?")
-                }
-            }
-            CloseTarget::Window => {
-                let n = self.running_count();
-                if lang::rtl() {
-                    format!("{n} أمر ما يزال يعمل — إغلاق بيان؟")
-                } else {
-                    format!("{n} command(s) still running — close Bayan?")
-                }
-            }
-        });
+        let close_msg = self.pending_close.map(|target| self.close_message(target));
         let rects = self.pane_rects();
+        let sb_content = self.content_rect();
+        let sb_pad = self.padding_physical();
+        let sb_width = self.scrollbar_width_px();
         // the bar shows the active group's tabs only
         let tab_infos: Vec<render::TabInfo> = self
             .visible_tabs()
@@ -4604,6 +6477,7 @@ impl App {
                 progress: t.progress(),
             })
             .collect();
+        let config_notice = self.config_notice.clone();
         let Some(window) = self.window.as_ref() else {
             return;
         };
@@ -4612,9 +6486,11 @@ impl App {
             return;
         }
         let mut verts: Vec<gpu::Vertex> = Vec::new();
+        let mut sprites: Vec<render::ImageSprite> = Vec::new();
         match (self.renderer.as_mut(), self.tabs.get(self.active)) {
             (Some(renderer), Some(tab)) if !rects.is_empty() => {
                 renderer.begin_frame();
+                self.bars.begin_frame();
                 let bordered = tab.panes.len() > 1 && !tab.zoomed;
                 let (auto_follow, claude_manual) = (self.auto_follow, self.claude_manual);
                 let mut focused_claude = false;
@@ -4626,7 +6502,15 @@ impl App {
                     let focused = pi == tab.focused;
                     // meta snapshot BEFORE the term lock (lock order term>meta
                     // only applies when holding both; here they don't overlap)
-                    let (marks, running_cmd, bidi_state, evicted, claude_from): PaneSnap = {
+                    let (
+                        marks,
+                        running_cmd,
+                        bidi_state,
+                        evicted,
+                        claude_from,
+                        pane_mode,
+                        tracked_alt,
+                    ): PaneSnap = {
                         let m = pane.session.meta.lock_or_recover();
                         (
                             // global -> grid space: subtract the evictions
@@ -4639,16 +6523,31 @@ impl App {
                             m.bidi.clone(),
                             m.evicted,
                             m.claude_from_abs,
+                            m.bidi_reorder,
+                            m.alt_track.on(),
                         )
+                    };
+                    // Cell size is published before the term lock. Taking meta
+                    // again while `term` is held deadlocks the reader, which
+                    // locks term and then meta.
+                    let cw = renderer.cell_w.round().max(1.0) as u32;
+                    let ch = renderer.cell_h.round().max(1.0) as u32;
+                    let image_snaps = {
+                        let mut m = pane.session.meta.lock_or_recover();
+                        m.images.set_cell_px(cw, ch);
+                        m.images.snapshot()
                     };
                     let t = pane.session.term.lock();
                     // Explicit BDSM suppresses reordering for the whole pane,
                     // Claude restoration included, and only while the command
                     // is running or the alt screen is up. honor_bdsm defaults on.
                     // The Arc is the frame's snapshot: cloning it does not copy
-                    // the stamp list.
-                    let alt = t.mode().contains(TermMode::ALT_SCREEN);
-                    let (reorder, use_stamps) = bidi_state.for_display(
+                    // the stamp list. alt_off also counts ?47 and ?1047.
+                    let term_alt = t.mode().contains(TermMode::ALT_SCREEN);
+                    let mode = pane_mode.unwrap_or_else(|| self.config.bidi_mode());
+                    let alt = mode.effective_alt(term_alt, tracked_alt);
+                    let (reorder, use_stamps) = bidi_state.presentation(
+                        mode,
                         self.config.honor_bdsm(),
                         !running_cmd.is_empty(),
                         alt,
@@ -4679,9 +6578,19 @@ impl App {
                     } else {
                         Vec::new()
                     };
+                    let peek_dir = if use_stamps {
+                        bidi_state.direction_at(bidi_ctl::peek_line_abs(evicted, history, off))
+                    } else {
+                        bidi_ctl::ParagraphDir::Default
+                    };
                     let (link_hover, link_tip) = match &self.link_hover {
                         Some(h) if h.pane_id == pane.id => {
-                            (Some((h.row, h.start_col, h.end_col)), Some(&h.target))
+                            let row = if h.row < 0 {
+                                scroll::PEEK_ROW
+                            } else {
+                                h.row as usize
+                            };
+                            (Some((row, h.start_col, h.end_col)), Some(&h.target))
                         }
                         _ => (None, None),
                     };
@@ -4704,6 +6613,7 @@ impl App {
                             })
                         },
                         reorder,
+                        bidi_mode: mode,
                         line_dir: &line_dir,
                         search_match: if focused {
                             self.search.as_ref().and_then(|s| s.hl.as_ref())
@@ -4713,8 +6623,56 @@ impl App {
                         marks: &marks,
                         link_hover,
                         link_tip,
+                        peek_dir,
+                        scroll_px: if alt || !self.config.smooth_scroll_on() {
+                            0
+                        } else {
+                            let sub = self.smooth.get(&pane.id).map(|s| s.subline).unwrap_or(0.0);
+                            scroll::offset_px(sub, renderer.cell_h)
+                        },
                     };
+                    // after the view: an image rides the same sub-line
+                    // shift as the row it is anchored to
+                    sprites.extend(render::image_sprites(
+                        *rect,
+                        renderer.cell_w,
+                        renderer.cell_h,
+                        evicted.saturating_add(history),
+                        off,
+                        view.scroll_px,
+                        &image_snaps,
+                    ));
+                    let rows = t.screen_lines();
                     renderer.draw_pane(&mut verts, &view, &t);
+                    // Smooth scroll's sub-line remainder is the fraction's
+                    // unit: lines in [0, 1) added to display_offset. Zero on
+                    // the alternate screen and with smooth scroll off.
+                    let fraction = if view.scroll_px > 0 {
+                        self.smooth.get(&pane.id).map_or(0.0, |s| s.subline)
+                    } else {
+                        0.0
+                    };
+                    let place = scrollbar::Place::new(history as usize + rows, rows, off as usize)
+                        .with_fraction(fraction);
+                    let side = self.config.scrollbar.side();
+                    let width = sb_width;
+                    let autohide = self.config.scrollbar.autohide_on();
+                    let room = sb_content
+                        .map(|c| scrollbar::room_px(pi, &rects, side, c, sb_pad))
+                        .unwrap_or(0);
+                    let now = Instant::now();
+                    self.bars.observe(pane.id, off as usize, now);
+                    let engaged = self.bars.hover == Some(pane.id) || self.bars.dragging(pane.id);
+                    if scrollbar::shown(autohide, engaged, self.bars.last_of(pane.id), now) {
+                        if let Some(geom) = scrollbar::layout(*rect, side, width, room, place, alt)
+                        {
+                            // clip to the gutter, so a quad cannot land on a cell
+                            renderer.draw_scrollbar(
+                                &mut verts, geom.track, geom.track, geom.thumb, engaged,
+                            );
+                            self.bars.mark_painted(pane.id);
+                        }
+                    }
                 }
                 renderer.use_ui_metrics(true);
                 renderer.draw_chrome(
@@ -4725,6 +6683,7 @@ impl App {
                     bar_text(self.search.as_ref().map(|s| s.query.as_str()), focused_copy)
                         .as_deref(),
                     focused_claude,
+                    elevate::title_badge(self.elevated),
                 );
                 if self.cockpit {
                     renderer.draw_cockpit(
@@ -4742,6 +6701,7 @@ impl App {
                         px.height as usize,
                         &render::SettingsView {
                             theme: settings_theme,
+                            appearance: theme::appearance_highlight(&self.config),
                             font_family: &settings_family,
                             font_size: settings_size,
                             arabic_font: &settings_arabic,
@@ -4764,7 +6724,14 @@ impl App {
                     );
                 }
                 if let Some(p) = &self.pending_paste {
-                    let preview = card_preview(p.kind, &p.text);
+                    let all = card_preview(p.kind, &p.text);
+                    let preview = if p.kind == PendingKind::ApproveLua {
+                        lua_card_window(&all, p.scroll).0
+                    } else {
+                        all
+                    };
+                    let heading = (p.kind == PendingKind::ApproveLua)
+                        .then(|| tr("تشغيل سكربت لوا؟", "Run this Lua script?"));
                     renderer.draw_paste_guard(
                         &mut verts,
                         px.width as usize,
@@ -4774,6 +6741,7 @@ impl App {
                             chars: p.chars,
                             reason: &p.reason,
                             preview: &preview,
+                            heading,
                         },
                     );
                 }
@@ -4793,7 +6761,7 @@ impl App {
                             px.height as usize,
                             &block.reason,
                             &block.shown,
-                            block.confirm_uri.is_some(),
+                            block.confirm.is_some(),
                         );
                     }
                 }
@@ -4853,14 +6821,28 @@ impl App {
             // renderer still warming up on its thread: clear-only dark frame
             _ => {}
         }
-        // the IME candidate window sits at the focused cursor
+        if let (Some(notice), Some(renderer)) = (&config_notice, self.renderer.as_mut()) {
+            renderer.use_ui_metrics(true);
+            renderer.draw_config_notice(
+                &mut verts,
+                px.width as i32,
+                px.height as i32,
+                &notice.text,
+                notice.until.is_none(),
+            );
+            renderer.use_ui_metrics(false);
+        }
+        // the IME candidate window sits at the focused cursor. After the
+        // IME context is rebuilt the same box has to be sent again.
         let spot = self.renderer.as_ref().and_then(|r| r.ime_spot);
-        if let Some((x, y, w, h)) = spot.filter(|_| spot != self.ime_spot) {
+        if let Some((x, y, w, h)) = keyroute::ime_area_due(self.ime_spot, spot, self.ime_area_reset)
+        {
             window.set_ime_cursor_area(
                 PhysicalPosition::new(x, y),
                 winit::dpi::PhysicalSize::new(w.max(1) as u32, h.max(1) as u32),
             );
-            self.ime_spot = spot;
+            self.ime_spot = Some((x, y, w, h));
+            self.ime_area_reset = false;
         }
         let Some(gpu) = self.gpu.as_mut() else { return };
         // During a Windows resize, the live client size can advance ahead of
@@ -4899,13 +6881,34 @@ impl App {
         // the frame is pixel-for-pixel the last one — skip the submit. (An
         // atlas upload this frame always redraws; so does a heal.)
         let frame_bytes = bytemuck::cast_slice::<gpu::Vertex, u8>(&verts);
+        let mut extended = Vec::new();
+        let frame_key: &[u8] = if sprites.is_empty() {
+            frame_bytes
+        } else {
+            extended.extend_from_slice(frame_bytes);
+            for sprite in &sprites {
+                extended.extend_from_slice(&sprite.cookie.to_le_bytes());
+                extended.extend_from_slice(bytemuck::cast_slice(&sprite.verts));
+            }
+            &extended
+        };
         let unchanged =
-            self.last_frame_size == Some(px) && !heal && frame_bytes == self.last_frame.as_slice();
+            self.last_frame_size == Some(px) && !heal && frame_key == self.last_frame.as_slice();
         if unchanged {
             return;
         }
         let bg = self.renderer.as_ref().map_or(render::BG, |r| r.bg);
-        if !gpu.render(&verts, bg) {
+        let quads: Vec<gpu::ImageQuad<'_>> = sprites
+            .iter()
+            .map(|sprite| gpu::ImageQuad {
+                cookie: sprite.cookie,
+                width: sprite.width,
+                height: sprite.height,
+                rgba: &sprite.rgba,
+                verts: &sprite.verts,
+            })
+            .collect();
+        if !gpu.render(&verts, &quads, bg) {
             // Retry once after reconfiguring, without spinning on occlusion.
             self.last_frame_size = None;
             if surface_resized || heal {
@@ -4915,7 +6918,7 @@ impl App {
         }
         crate::prof::frame_presented();
         self.last_frame.clear();
-        self.last_frame.extend_from_slice(frame_bytes);
+        self.last_frame.extend_from_slice(frame_key);
         self.last_frame_size = Some(px);
         if heal {
             window.request_redraw();
@@ -4929,6 +6932,48 @@ impl App {
             crate::prof::mark("first frame presented");
         }
     }
+
+    /// One PTY read. A live wheel or a touch still inside [`scroll::WHEEL_MS`]
+    /// is kept; only a stale fraction at the bottom is dropped.
+    fn wakeup(&mut self, id: u64) {
+        self.link_cache.invalidate_pane(id);
+        // The row that was hovered may have moved. Drop the tooltip
+        // and the click target together, or they can disagree.
+        if self.link_hover.as_ref().is_some_and(|h| h.pane_id == id) {
+            self.clear_link_hover();
+        }
+        if !self.first_output {
+            self.first_output = true;
+            crate::prof::mark("first pty output");
+        }
+        if let Some((ti, pi)) = self.find_pane(id) {
+            self.tabs[ti].panes[pi].last_output = Some(Instant::now());
+            let (alt, following) = {
+                let t = self.tabs[ti].panes[pi].session.term.lock();
+                (
+                    t.mode().contains(TermMode::ALT_SCREEN),
+                    t.grid().display_offset() == 0,
+                )
+            };
+            let was_alt = self.alt_seen.insert(id, alt).unwrap_or(false);
+            let now = Instant::now();
+            scroll::apply_alt_screen(&mut self.smooth, id, was_alt, alt);
+            scroll::apply_output(&mut self.smooth, id, following, now);
+            let ris = {
+                let mut meta = self.tabs[ti].panes[pi].session.meta.lock_or_recover();
+                let ris = meta.saw_ris;
+                meta.saw_ris = false;
+                ris
+            };
+            if ris {
+                self.mouse.note_ris(id);
+            }
+        }
+        // the chunk may have enabled focus reporting; tell the
+        // program whether the window is looking at it
+        self.sync_focus(None);
+        self.request_redraw();
+    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -4938,8 +6983,9 @@ impl ApplicationHandler<UserEvent> for App {
         }
         // hidden until the GPU presents the first dark frame (~0.4s): a
         // fully-drawn window appearing beats a white flash while DX12 warms up.
-        // BAYAN_SHOW_NOW forces it visible at creation (for on-screen capture).
-        let visible = dev_hook("BAYAN_SHOW_NOW").is_some();
+        // BAYAN_SHOW_NOW shows it as soon as the accessibility adapter exists.
+        // AccessKit panics if the adapter is created on an already-visible window.
+        let show_now = dev_hook("BAYAN_SHOW_NOW").is_some();
         // The exe's embedded resource covers Explorer and the taskbar, but the
         // title bar and Alt-Tab read the WINDOW icon, which winit only sets if
         // we hand it pixels. Raw RGBA rather than a decoder: 16KB, no new crate,
@@ -4953,9 +6999,9 @@ impl ApplicationHandler<UserEvent> for App {
             // caption buttons and handle drag/resize ourselves below.
             .with_decorations(false)
             .with_undecorated_shadow(true)
-            .with_title("Bayan — بيان")
+            .with_title(elevate::window_title(self.elevated))
             .with_window_icon(icon)
-            .with_visible(visible)
+            .with_visible(false)
             .with_inner_size(LogicalSize::new(1100.0, 700.0));
         // yesterday's rectangle, if it is still on a connected monitor
         let monitors: Vec<(i32, i32, u32, u32)> = el
@@ -4986,6 +7032,16 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         crate::prof::mark("window created");
+        // Before the first show: a reader that connects later is answered
+        // from the UI thread, and nothing is built until then.
+        self.reader = Some(accesskit_winit::Adapter::with_event_loop_proxy(
+            el,
+            &window,
+            self.proxy.clone(),
+        ));
+        if show_now {
+            window.set_visible(true);
+        }
         // winit turns the IME off on every new window: CJK input, the
         // emoji panel (Win+.) and dictation (Win+H) need it on
         window.set_ime_allowed(true);
@@ -5002,12 +7058,23 @@ impl ApplicationHandler<UserEvent> for App {
         self.gpu = Some(gpu);
         self.window = Some(window.clone());
         self.report_config_load_error();
+        self.apply_admin_notice();
+        self.report_lua_errors();
+        self.show_next_lua_card();
         self.apply_opacity(); // the configured window alpha, from frame one
         self.apply_window_frame();
         if let Some(h) = self.hwnd() {
             // the tray icon: toast anchor + summon target
             if !toast::init(h) {
                 eprintln!("bayan: tray icon registration failed — no toasts");
+            }
+            if let Ok(exe) = std::env::current_exe() {
+                if let Ok(path) = cli::exe_display(&exe) {
+                    let app_id = jumplist::app_user_model_id(&path);
+                    if let Err(error) = jumplist::set_window_app_id(h, &app_id) {
+                        eprintln!("bayan: window AppUserModelID: {error}");
+                    }
+                }
             }
         }
         // first frame NOW: a dark window on screen beats a frozen launcher.
@@ -5051,38 +7118,20 @@ impl ApplicationHandler<UserEvent> for App {
                         )
                     }));
                 }
+                if let Err(error) =
+                    jumplist::refresh(&profiles, elevate::may_write_bayan(self.elevated))
+                {
+                    eprintln!("bayan: jump list: {error}");
+                }
                 self.shell_profiles = profiles;
                 self.shell_profiles_ready = true;
+                self.bump_reader();
                 self.start_sessions();
                 self.request_redraw();
             }
             UserEvent::Wakeup(id) => {
-                self.link_cache.invalidate_pane(id);
-                // The row that was hovered may have moved. Drop the tooltip
-                // and the click target together, or they can disagree.
-                if self.link_hover.as_ref().is_some_and(|h| h.pane_id == id) {
-                    self.clear_link_hover();
-                }
-                if !self.first_output {
-                    self.first_output = true;
-                    crate::prof::mark("first pty output");
-                }
-                if let Some((ti, pi)) = self.find_pane(id) {
-                    self.tabs[ti].panes[pi].last_output = Some(Instant::now());
-                    let ris = {
-                        let mut meta = self.tabs[ti].panes[pi].session.meta.lock_or_recover();
-                        let ris = meta.saw_ris;
-                        meta.saw_ris = false;
-                        ris
-                    };
-                    if ris {
-                        self.mouse.note_ris(id);
-                    }
-                }
-                // the chunk may have enabled focus reporting; tell the
-                // program whether the window is looking at it
-                self.sync_focus(None);
-                self.request_redraw();
+                self.bump_reader();
+                self.wakeup(id);
             }
             UserEvent::PtyWrite(id, text) => {
                 if let Some((ti, pi)) = self.find_pane(id) {
@@ -5095,6 +7144,11 @@ impl ApplicationHandler<UserEvent> for App {
                     self.tabs[ti].panes[pi].session.write_error_shown();
                     self.report_error(tr("تعذر إرسال الإدخال", "Could not send input"), &error);
                 }
+            }
+            UserEvent::ClipboardLoad(_id, _kind) => {
+                // No PTY reply. The read flag defaults off, and even when
+                // it is on this build does not read the clipboard or write
+                // an empty OSC 52. Item 31 is the read.
             }
             UserEvent::ClipboardSet(id, text) => {
                 // has_focus, not the startup value of self.focused: that flag
@@ -5110,6 +7164,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Bell(id) => {
+                // Terminal output does not run Lua. The helper's result is empty.
+                let _ = lua_host::plugin_sends_from_pty(
+                    &self.lua_plugins,
+                    &lua_host::PtyFacts {
+                        bell: true,
+                        ..lua_host::PtyFacts::default()
+                    },
+                );
                 // the cockpit signal: a pane you're NOT looking at wants you
                 let mode = self.config.bell_mode();
                 if mode == config::BellMode::Silent {
@@ -5202,6 +7264,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Cwd(id, cwd) => {
+                let _ = lua_host::plugin_sends_from_pty(
+                    &self.lua_plugins,
+                    &lua_host::PtyFacts {
+                        cwd: Some(cwd.clone()),
+                        title: Some(cwd.clone()),
+                        ..lua_host::PtyFacts::default()
+                    },
+                );
                 let base = cwd.rsplit(['\\', '/']).next().unwrap_or(&cwd).to_string();
                 if let Some((ti, pi)) = self.find_pane(id) {
                     // the tab is named after its FOCUSED pane's directory
@@ -5213,12 +7283,22 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::RendererReady(r) => {
                 crate::prof::mark("renderer ready");
-                self.renderer = Some(*r);
+                // The build cloned the config when it started. A theme
+                // signal during that build has a newer sample; paint it.
+                let mut r = *r;
+                let colors = render::resolved_colors(&self.config);
+                r.set_colors(colors.bg, colors.fg, colors.palette);
+                term::set_query_colors(r.query_colors());
+                self.renderer = Some(r);
                 self.renderer_building = false;
+                self.apply_window_frame();
                 // now that cell metrics exist, snap every pane to its rect
                 self.relayout_active();
-                // the zoom moved again while this build ran: chase it
-                if (self.font_delta - self.inflight_delta).abs() > f32::EPSILON {
+                // A reload, a zoom, or an accessibility change that arrived
+                // while this build ran is not in the renderer we just
+                // installed. Start the next one from what the session wants
+                // now.
+                if self.config_build.finish(self.font_delta) || self.a11y != self.inflight_a11y {
                     self.rebuild_renderer();
                 }
                 if let Some(text) = self.debug_paste.take() {
@@ -5259,12 +7339,52 @@ impl ApplicationHandler<UserEvent> for App {
                 self.blocked_link = Some(BlockedLink {
                     reason,
                     shown: link::preview(&shown, 160),
-                    confirm_uri: None,
+                    confirm: None,
                     is_app_error: false,
                 });
                 self.clear_link_hover();
                 self.request_redraw();
             }
+            UserEvent::LinkConfirm { path } => {
+                self.blocked_link = Some(BlockedLink {
+                    reason: tr(
+                        "لا يوجد محرّر في Program Files",
+                        "No editor under Program Files",
+                    )
+                    .to_string(),
+                    shown: path.clone(),
+                    confirm: Some(link::ConfirmOpen::RevealOnly(path)),
+                    is_app_error: false,
+                });
+                self.clear_link_hover();
+                self.request_redraw();
+            }
+            UserEvent::ConfigReloaded(msg) => self.apply_config_reload(msg),
+            UserEvent::AccessKit(event) => match event.window_event {
+                accesskit_winit::WindowEvent::InitialTreeRequested => {
+                    // The next consider must build even if the stamp matches
+                    // a tree we never managed to send.
+                    self.reader_seen_client = true;
+                    self.reader_pace = screen_reader::TreePace::default();
+                    self.publish_reader();
+                }
+                accesskit_winit::WindowEvent::AccessibilityDeactivated => {
+                    // Windows does not deliver this. Other backends do,
+                    // and then the redraw path goes quiet again.
+                    self.reader_seen_client = false;
+                    self.reader_pace = screen_reader::TreePace::default();
+                    self.reader_tree_at = None;
+                    self.reader_gate.reset();
+                    self.reader_bodies.clear();
+                    self.reader_pane = None;
+                    self.reader_mark = None;
+                    self.reader_mark_ready = false;
+                    self.reader_deadline = None;
+                    self.reader_live = None;
+                    self.reader_cmd.clear();
+                }
+                accesskit_winit::WindowEvent::ActionRequested(_) => {}
+            },
         }
     }
 
@@ -5291,6 +7411,11 @@ impl ApplicationHandler<UserEvent> for App {
                 self.apply_opacity(); // set_visible wipes the layered bit
             }
         }
+        // High Contrast or the text-size slider changed. Re-read now; a
+        // rebuild applies it on the next frame, without restarting.
+        if A11Y_DIRTY.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            self.reload_a11y();
+        }
         // busy dots decay after ~2s of quiet: keep repainting on a slow
         // heartbeat only while any background tab is (or just was) active
         let any_busy = self
@@ -5312,6 +7437,43 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(b) = blink_wake {
             wake = Some(wake.map_or(b, |w| w.min(b)));
         }
+        if let Some(t) = self.tick_smooth_scroll() {
+            wake = Some(wake.map_or(t, |w| w.min(t)));
+        }
+        // a scrollbar that auto-hides wakes once, then the next frame drops
+        // it and the window goes back to sleeping
+        let tick = self
+            .bars
+            .tick(self.config.scrollbar.autohide_on(), Instant::now());
+        if tick.redraw {
+            self.request_redraw();
+        }
+        if let Some(t) = tick.wake {
+            wake = Some(wake.map_or(t, |w| w.min(t)));
+        }
+        if let Some(until) = self.config_notice.as_ref().and_then(|notice| notice.until) {
+            if Instant::now() >= until {
+                self.config_notice = None;
+                self.request_redraw();
+            } else {
+                wake = Some(wake.map_or(until, |w| w.min(until)));
+            }
+        }
+        // The burst is spoken once the hold elapses, and a stamp that
+        // arrived inside the 10 Hz window is published when that window ends.
+        let now = Instant::now();
+        if self.reader_deadline.is_some_and(|t| now >= t)
+            || self.reader_tree_at.is_some_and(|t| now >= t)
+        {
+            self.publish_reader();
+        }
+        let soon = match (self.reader_deadline, self.reader_tree_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if let Some(at) = soon {
+            wake = Some(wake.map_or(at, |w| w.min(at)));
+        }
         match wake {
             Some(t) => el.set_control_flow(ControlFlow::WaitUntil(t)),
             None => el.set_control_flow(ControlFlow::Wait),
@@ -5319,6 +7481,9 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if let (Some(adapter), Some(window)) = (self.reader.as_mut(), self.window.as_ref()) {
+            adapter.process_event(window, &event);
+        }
         if self.modal_pointer(&event, el) {
             return;
         }
@@ -5338,6 +7503,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => self.cursor_moved(position),
             WindowEvent::CursorLeft { .. } => {
                 self.clear_link_hover();
+                self.clear_scrollbar_pointer();
                 if let Some(r) = self.renderer.as_mut() {
                     if r.hover_tab.take().is_some() {
                         self.request_redraw();
@@ -5349,6 +7515,19 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::KeyboardInput { event, .. } => self.key_input(&event, el),
             WindowEvent::Ime(ime) => self.ime_input(ime),
             WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::ThemeChanged(theme) => {
+                // The registry DWORD is the app theme. winit's value covers a
+                // read that fails (the key is missing, or this is not Windows).
+                let event = match theme::read_apps_use_light_theme() {
+                    Some(value) => theme::SystemThemeEvent::ImmersiveColorSet {
+                        apps_use_light_theme: Some(value),
+                    },
+                    None => theme::SystemThemeEvent::Winit {
+                        light: matches!(theme, winit::window::Theme::Light),
+                    },
+                };
+                self.on_system_theme(event);
+            }
             _ => {}
         }
     }
@@ -5456,8 +7635,43 @@ fn show_error_dialog(
     }
 }
 
+fn show_info_dialog(text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+
+    let title: Vec<u16> = "Bayan".encode_utf16().chain(Some(0)).collect();
+    let text: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    // SAFETY: both buffers are NUL-terminated and live for the call.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
+/// Help, version, and menu registration have no terminal yet. A console
+/// parent (cmd) sees the text; Explorer gets a dialog instead of silence.
+fn present(text: &str) {
+    if !cli::write_console(text) {
+        show_info_dialog(text);
+    }
+}
+
+/// What a normal launch carries into the window. The folder is already gated.
+struct Startup {
+    directory: Option<String>,
+    profile_command: Option<String>,
+    command: Option<Vec<String>>,
+    /// `Some` when `-p` already ran shell detection, so the window does not
+    /// detect a second time.
+    shells: Option<Vec<shells::Shell>>,
+    elevated: bool,
+}
+
 fn main() -> std::process::ExitCode {
-    match run() {
+    match dispatch() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("bayan: {error}");
@@ -5467,48 +7681,134 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// `-d <folder>`, `--cwd <folder>` or `--cwd=<folder>`: where the first tab
-/// opens. A relative folder is taken from the current one. The folder goes
-/// through the start-directory gate, and a refused one is an error rather
-/// than a quiet fall back to home: the user named it.
+fn dispatch() -> Result<(), String> {
+    // The mux server is this executable started with exactly this one
+    // argument. It is not a user-facing flag, so `cli::parse` does not know
+    // it, and it never opens a window.
+    let mut args = std::env::args_os().skip(1);
+    if args.next().is_some_and(|a| a == "--mux-server") && args.next().is_none() {
+        return mux::run_mux_server();
+    }
+    match cli::parse(std::env::args_os().skip(1))? {
+        cli::CliAction::Help => {
+            present(cli::HELP);
+            Ok(())
+        }
+        cli::CliAction::Version => {
+            present(&format!("bayan {}", env!("CARGO_PKG_VERSION")));
+            Ok(())
+        }
+        cli::CliAction::RegisterContextMenu => {
+            context_menu::set_enabled(true)?;
+            present(context_menu::REGISTERED_NOTE);
+            Ok(())
+        }
+        cli::CliAction::UnregisterContextMenu => {
+            context_menu::set_enabled(false)?;
+            present(context_menu::REMOVED_NOTE);
+            Ok(())
+        }
+        cli::CliAction::RegisterTerminalHandoff => {
+            handoff::set_enabled(true)?;
+            present(handoff::REGISTERED_NOTE);
+            Ok(())
+        }
+        cli::CliAction::UnregisterTerminalHandoff => {
+            handoff::set_enabled(false)?;
+            present(handoff::REMOVED_NOTE);
+            Ok(())
+        }
+        cli::CliAction::Handoff => handoff::serve(),
+        cli::CliAction::Launch(launch) => {
+            let requested = launch.elevated;
+            // The badge follows the token, including a window Explorer
+            // started with "Run as administrator" and no `--elevated`.
+            // A failed token query counts as elevated, so the restrictions
+            // stay on. Only the flag relaunches, and only when the query
+            // succeeds and says this process is not elevated.
+            let elevated = requested || elevate::process_is_elevated();
+            // `--elevated` relaunches through UAC unless this process is
+            // already the elevated one. The child receives only the
+            // allowlisted argv, then resolves `-p` from its own detection.
+            let launch = if requested {
+                let forwarded = elevate::forward_args(&launch)?;
+                // A name that is not installed fails before the UAC prompt.
+                // The command that goes with it is not kept: the elevated
+                // process detects its shells again and matches the name.
+                if let Some(name) = launch.profile.as_deref() {
+                    let found = shells::detect();
+                    shells::require_profile_by_name(&found, name)?;
+                }
+                if !elevate::process_is_elevated() {
+                    let exe = std::env::current_exe()
+                        .map_err(|error| format!("could not find bayan.exe: {error}"))?;
+                    elevate::relaunch(&exe, &forwarded)?;
+                    return Ok(());
+                }
+                match cli::parse(forwarded)? {
+                    cli::CliAction::Launch(clean) => clean,
+                    _ => {
+                        return Err("elevation relaunch was not a launch".into());
+                    }
+                }
+            } else {
+                launch
+            };
+            // Gate the folder before shell detection: a refused path should
+            // not wait on `wsl.exe`. An elevated launch has no folder.
+            let directory = match launch.directory {
+                Some(raw) if !elevated => Some(cli::gate_start_dir(&raw)?),
+                Some(_) | None => None,
+            };
+            let (profile_command, shells) = if elevated {
+                let found = shells::detect();
+                let command = match launch.profile.as_deref() {
+                    Some(name) => shells::require_profile_by_name(&found, name)?
+                        .command
+                        .clone(),
+                    None => shells::elevated_default_command(&found),
+                };
+                (Some(command), Some(found))
+            } else {
+                match launch.profile {
+                    Some(name) => {
+                        let found = shells::detect();
+                        let shell = shells::require_profile(&found, &name)?;
+                        (Some(shell.command.clone()), Some(found))
+                    }
+                    None => (None, None),
+                }
+            };
+            run(Startup {
+                directory,
+                profile_command,
+                command: if elevated { None } else { launch.command },
+                shells,
+                elevated,
+            })
+        }
+    }
+}
+
+/// The directory half of [`cli::parse`], gated the way `#45` gated it.
+/// The test below calls this so those cases stay on the same function.
+#[cfg(test)]
 fn cli_start_dir(
     args: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> Result<Option<String>, String> {
-    const USAGE: &str = "usage: bayan [-d | --cwd <folder>]";
-    let text = |a: std::ffi::OsString| {
-        a.into_string()
-            .map_err(|_| format!("an argument is not valid Unicode\n{USAGE}"))
-    };
-    let mut args = args.into_iter();
-    let mut raw = None;
-    while let Some(a) = args.next() {
-        let a = text(a)?;
-        raw = Some(match a.as_str() {
-            "-d" | "--cwd" => text(
-                args.next()
-                    .ok_or_else(|| format!("{a} needs a folder\n{USAGE}"))?,
-            )?,
-            _ => match a.strip_prefix("--cwd=") {
-                Some(v) => v.to_string(),
-                None => return Err(format!("unknown argument {a:?}\n{USAGE}")),
-            },
-        });
-    }
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    // GetFullPathNameW: string work only, so a UNC name is not opened here
-    std::path::absolute(&raw)
-        .ok()
-        .and_then(|p| p.to_str().and_then(term::accept_local_cwd))
-        .filter(|d| term::usable_spawn_dir(d))
-        .map(Some)
-        .ok_or_else(|| format!("--cwd {raw:?} is not a local folder Bayan can open"))
+    cli::start_directory(args)
 }
 
-fn run() -> Result<(), String> {
+fn run(startup: Startup) -> Result<(), String> {
     harden_dll_search();
-    let start_dir = cli_start_dir(std::env::args_os().skip(1))?;
+    if let Ok(exe) = std::env::current_exe() {
+        if let Ok(path) = cli::exe_display(&exe) {
+            let app_id = jumplist::app_user_model_id(&path);
+            if let Err(error) = jumplist::set_process_app_id(&app_id) {
+                eprintln!("bayan: AppUserModelID: {error}");
+            }
+        }
+    }
     prof::init();
     prof::mark("main start");
     use winit::platform::windows::EventLoopBuilderExtWindows;
@@ -5518,6 +7818,9 @@ fn run() -> Result<(), String> {
             // SAFETY: winit's msg hook is handed a pointer to the MSG being
             // dispatched, valid for the duration of the callback. It is only read.
             let m = unsafe { &*(msg as *const MSG) };
+            if a11y::message_triggers_reread(m.message) {
+                A11Y_DIRTY.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             if m.message == WM_HOTKEY && m.wParam == QUAKE_ID {
                 QUAKE_HIT.store(true, std::sync::atomic::Ordering::Relaxed);
                 return true; // consumed
@@ -5537,14 +7840,35 @@ fn run() -> Result<(), String> {
     event_loop.set_control_flow(ControlFlow::Wait);
     prof::mark("event loop built");
     let proxy = event_loop.create_proxy();
-    let profiles_proxy = proxy.clone();
-    std::thread::spawn(move || {
-        let _ = profiles_proxy.send_event(UserEvent::ShellProfiles(shells::detect()));
-    });
+    let shells_ready = startup.shells.is_some();
+    if !shells_ready {
+        let profiles_proxy = proxy.clone();
+        std::thread::spawn(move || {
+            let _ = profiles_proxy.send_event(UserEvent::ShellProfiles(shells::detect()));
+        });
+    }
     let (mut cfg, config_load_error) = match config::load() {
         Ok(cfg) => (cfg, None),
         Err(error) => (config::UserConfig::default(), Some(error.to_string())),
     };
+    cfg.system_apps_light =
+        theme::read_apps_use_light_theme().map(|v| theme::apps_use_light_theme(Some(v)));
+    // config.lua merges over JSON only when its bytes are already approved
+    // and the token is not elevated. An elevated token (UAC or Explorer's
+    // Run as administrator) keeps the JSON and runs no script and no plugin.
+    let lua = lua_host::load_with(&cfg, &config::bayan_dir(), startup.elevated);
+    for err in &lua.errors {
+        eprintln!("bayan: {err}");
+    }
+    if let Some(notice) = &lua.notice {
+        eprintln!("bayan: {notice}");
+    }
+    let lua_pending = lua.pending;
+    let lua_plugins = lua.plugins;
+    let lua_errors = lua.shown;
+    let lua_notice = lua.notice;
+    let json_config = lua.persisted;
+    cfg = lua.config;
     // debug hook: BAYAN_ARABIC_FONT=<family> draws terminal Arabic in that
     // font for this run only (config.json is not written unless a setting
     // is changed in the panel), so the setting is screenshot-verifiable
@@ -5552,8 +7876,10 @@ fn run() -> Result<(), String> {
         cfg.arabic_font = v.to_str().map(str::to_string);
     }
     // plugins load once, before the first renderer, so a plugin theme named in
-    // the config resolves on the very first frame
-    let plug = plugins::init(&cfg.disabled_plugins());
+    // the config resolves on the very first frame. An elevated token loads
+    // none: ~/.bayan/plugins is writable before UAC, and a send would reach
+    // the elevated shell after the confirm card.
+    let plug = plugins::init(startup.elevated, &cfg.disabled_plugins());
     if !plug.failed.is_empty() {
         eprintln!(
             "bayan: {} plugin(s) failed — see {}",
@@ -5561,82 +7887,90 @@ fn run() -> Result<(), String> {
             config::bayan_dir().join("plugins.log").display()
         );
     }
+    // Optional installer / settings hook: the key is absent unless someone
+    // set it. Failure here must not stop the terminal from opening.
+    if let Some(enabled) = cfg.explorer_context_menu {
+        // Skip the write when the verbs already match this exe, or are already gone.
+        if let Err(error) = context_menu::sync_enabled(enabled) {
+            eprintln!("bayan: Explorer menu: {error}");
+        }
+    }
+    if let Some(enabled) = cfg.terminal_handoff {
+        if let Err(error) = handoff::set_enabled(enabled) {
+            eprintln!("bayan: terminal handoff: {error}");
+        }
+    }
     lang::set(cfg.lang());
+    if let Some(shells) = &startup.shells {
+        if let Err(error) = jumplist::refresh(shells, elevate::may_write_bayan(startup.elevated)) {
+            eprintln!("bayan: jump list: {error}");
+        }
+    }
     // debug hook: BAYAN_LANG=en starts in English without touching
     // config.json, so the English layout can be screenshot-verified
     if let Some(v) = dev_hook("BAYAN_LANG") {
         lang::set(lang::Lang::from_config(v.to_str()));
     }
-    let keymap = keybinds::effective_map(&cfg);
-    let mut app = App {
-        posh: None,
-        last_toast: None,
-        mru: mru::Mru::new(),
-        groups: groups::Groups::new(),
-        spawn_group: None,
-        palette: None,
-        shell_profiles: Vec::new(),
-        shell_profiles_ready: false,
-        startup_pending: true,
-        last_strip_click: None,
-        proxy,
-        window: None,
-        gpu: None,
-        renderer: None,
-        tabs: Vec::new(),
-        active: 0,
-        next_id: 0,
-        size: TermSize {
-            cols: 110,
-            rows: 32,
+    term::set_osc52_read(cfg.osc52_read_enabled());
+    let config_path = config::config_path();
+    let baseline_bytes = std::fs::read(&config_path).ok();
+    let reload_proxy = proxy.clone();
+    let config_watch = config_watch::spawn(
+        config_path,
+        // the file's own content: config.lua's overrides are not in it
+        json_config.clone(),
+        baseline_bytes.as_deref(),
+        move |msg| {
+            let _ = reload_proxy.send_event(UserEvent::ConfigReloaded(msg));
         },
-        modifiers: ModifiersState::default(),
-        first_frame: false,
-        first_output: false,
-        last_frame: Vec::new(),
-        last_frame_size: None,
-        cursor_pos: PhysicalPosition::new(0.0, 0.0),
-        ime_spot: None,
-        mouse: mouse::Route::default(),
-        sel_pane: 0,
-        drag_divider: None,
-        cockpit: false,
-        cockpit_sel: 0,
-        pending_paste: None,
-        pending_close: None,
-        swallow_guard_release: false,
-        link_hover: None,
-        blocked_link: None,
-        link_cache: link::SpanCache::default(),
-        last_input: Instant::now(),
-        blink_drawn_on: true,
-        settings: None,
-        focused: false,
-        clicks: ClickTracker::new(),
-        wheel_accum: 0.0,
-        search: None,
-        clipboard: None,
-        auto_follow: true,
-        claude_manual: false,
-        config: cfg,
-        config_load_error,
-        startup_error: None,
-        keymap,
-        shortcuts: None,
-        atlas_generation: 0,
-        font_delta: 0.0,
-        renderer_building: false,
-        inflight_delta: 0.0,
-        normal_geom: None,
-        keys_held_away: Vec::new(),
-        debug_paste: None,
-        start_dir,
-    };
+    );
+    let mut app = App::new(proxy, cfg, config_load_error, startup.directory);
+    app.config_watch = config_watch;
+    app.shell_profiles = startup.shells.unwrap_or_default();
+    app.shell_profiles_ready = shells_ready;
+    app.start_profile_command = startup.profile_command;
+    app.start_command = startup.command;
+    app.elevated = startup.elevated;
+    // App::new starts neutral so a test never reads the machine's High
+    // Contrast theme; the running window reads it here.
+    app.a11y = a11y::read_snapshot();
+    app.inflight_a11y = app.a11y;
+    app.json_config = json_config;
+    app.lua_plugins = lua_plugins;
+    app.lua_pending = lua_pending;
+    app.lua_errors = lua_errors;
+    app.lua_notice = lua_notice;
     let result = event_loop.run_app(&mut app);
     if let Some(error) = app.startup_error {
         return Err(error);
     }
     result.map_err(|error| format!("The event loop failed: {error}"))
+}
+
+/// The one winit event loop this process may own, as a proxy.
+///
+/// winit 0.30 allows a single `EventLoop` per process. A second `build`
+/// fails with `EventLoopError::RecreationAttempt`, and dropping the loop does not clear
+/// that flag. Every test that needs a proxy must call this and must not
+/// build its own loop — a second builder in another test module panics
+/// whichever of the two runs second. The loop is leaked so the proxy's
+/// window target stays alive for the rest of the process.
+#[cfg(test)]
+pub(crate) fn test_proxy() -> EventLoopProxy<UserEvent> {
+    use std::sync::OnceLock;
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    static PROXY: OnceLock<EventLoopProxy<UserEvent>> = OnceLock::new();
+    PROXY
+        .get_or_init(|| {
+            let el = EventLoop::<UserEvent>::with_user_event()
+                .with_any_thread(true)
+                .build()
+                .expect("event loop");
+            let proxy = el.create_proxy();
+            std::mem::forget(el);
+            proxy
+        })
+        .clone()
 }
 
 /// OSC 52 writes only from the focused pane of the active tab.
@@ -5653,6 +7987,287 @@ fn osc52_pane_is_focused(tabs: &[(usize, &[u64])], active: usize, source: u64) -
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bayan-save-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn panel_cursor_survives_an_external_padding_edit() {
+        // The last loaded file has the default cursor. The open panel set
+        // the cursor to bar and has not saved. An external edit changes
+        // only padding. The cursor stays bar; padding comes from the file.
+        let base = config::UserConfig::default();
+        let disk = config::encode(&base).unwrap();
+        let from_editor = config::UserConfig {
+            padding: Some(16),
+            ..config::UserConfig::default()
+        };
+        let msg = config_watch::reload_from_bytes(
+            base.clone(),
+            &disk,
+            &config::encode(&from_editor).unwrap(),
+        )
+        .expect("padding edit reloads");
+        let config_watch::ReloadMsg::Applied {
+            base: loaded_base, ..
+        } = &msg
+        else {
+            panic!("padding edit parsed");
+        };
+        assert_eq!(
+            loaded_base.padding, None,
+            "the merge base is the previous file"
+        );
+        let live = config::UserConfig {
+            cursor_style: Some("bar".into()),
+            copy_on_select: Some(false),
+            ..config::UserConfig::default()
+        };
+        let decision = decide_reload(&live, true, msg);
+        assert_eq!(decision.config.cursor(), config::CursorStyle::Bar);
+        assert!(!decision.config.copy_on_select_on());
+        assert_eq!(decision.config.padding_px(), 16);
+        assert!(decision.plan.padding);
+        assert!(!decision.plan.cursor);
+        assert!(
+            decision.replaced.is_none(),
+            "the file did not touch the cursor, so it does not announce an override"
+        );
+        // The next reload's base is the file we just loaded, not the merge.
+        // A later file that still leaves the cursor unset keeps bar.
+        let again = config::UserConfig {
+            padding: Some(8),
+            ..from_editor.clone()
+        };
+        let second = config_watch::ReloadMsg::Applied {
+            config: Box::new(again),
+            base: Box::new(from_editor),
+            plan: config_watch::ApplyPlan::default(),
+            deferred: Vec::new(),
+        };
+        let decision = decide_reload(&decision.config, true, second);
+        assert_eq!(decision.config.cursor(), config::CursorStyle::Bar);
+        assert_eq!(decision.config.padding_px(), 8);
+    }
+
+    /// The panel and the file both changed the font. The file wins that
+    /// field. The panel's other unsaved edits stay.
+    #[test]
+    fn file_wins_when_the_panel_and_the_file_change_the_same_field() {
+        let base = config::UserConfig {
+            font_size: Some(14.0),
+            ..config::UserConfig::default()
+        };
+        let live = config::UserConfig {
+            font_size: Some(20.0),
+            cursor_style: Some("bar".into()),
+            ..base.clone()
+        };
+        let file = config::UserConfig {
+            font_size: Some(18.0),
+            ..base.clone()
+        };
+        let msg = config_watch::ReloadMsg::Applied {
+            config: Box::new(file),
+            base: Box::new(base),
+            plan: config_watch::ApplyPlan::default(),
+            deferred: Vec::new(),
+        };
+        let decision = decide_reload(&live, true, msg);
+        assert_eq!(
+            decision.config.font_size,
+            Some(18.0),
+            "the file's font wins the field both sides changed"
+        );
+        assert_eq!(decision.config.cursor(), config::CursorStyle::Bar);
+        assert!(decision.plan.font, "20 on screen versus 18 from the file");
+        assert!(decision.replaced.is_some());
+    }
+
+    /// `apply_config_reload` takes its plan from [`decide_reload`], which
+    /// diffs the live config against the merge. Comparing the raw file to
+    /// itself would drop the padding rebuild; comparing the live config to
+    /// the raw file would rebuild a font the merge kept.
+    #[test]
+    fn reload_plan_compares_the_live_config_with_the_merge() {
+        let base = config::UserConfig {
+            font_size: Some(14.0),
+            ..config::UserConfig::default()
+        };
+        let disk = config::encode(&base).unwrap();
+        let from_editor = config::UserConfig {
+            font_size: Some(14.0),
+            padding: Some(12),
+            ..config::UserConfig::default()
+        };
+        let msg =
+            config_watch::reload_from_bytes(base, &disk, &config::encode(&from_editor).unwrap())
+                .expect("padding edit reloads");
+        let config_watch::ReloadMsg::Applied {
+            plan: disk_plan,
+            config: file,
+            ..
+        } = &msg
+        else {
+            panic!("the external edit parsed");
+        };
+        assert!(!disk_plan.font);
+        assert!(disk_plan.padding);
+        let live = config::UserConfig {
+            font_size: Some(20.0),
+            ..config::UserConfig::default()
+        };
+        // The comparison this test guards. Dropping `live` (diffing the
+        // file with itself) makes padding false. Diffing `live` with the
+        // raw file makes font true.
+        let against_raw = plan_against_live(&live, file);
+        assert!(against_raw.0.font);
+        let decision = decide_reload(&live, false, msg);
+        assert_eq!(decision.config.font_size, Some(20.0));
+        assert_eq!(decision.config.padding_px(), 12);
+        assert!(
+            !decision.plan.font,
+            "the merge kept 20, which is already on screen"
+        );
+        assert!(decision.plan.padding);
+        assert!(decision.replaced.is_none());
+    }
+
+    #[test]
+    fn truncated_config_reload_blocks_saving() {
+        let current = config::UserConfig {
+            font_size: Some(22.0),
+            cursor_style: Some("bar".into()),
+            osc52: Some("copy".into()),
+            ..config::UserConfig::default()
+        };
+        let bytes = config::encode(&current).unwrap();
+        let msg = config_watch::reload_from_bytes(
+            current.clone(),
+            &bytes,
+            br#"{"font_size":99.0,"cursor_style":"underline""#,
+        )
+        .expect("a truncated file is a reload message");
+        let decision = decide_reload(&current, false, msg);
+        assert!(
+            decision.load_error.is_some(),
+            "truncated json is a load error"
+        );
+        assert_eq!(decision.config.font_size, Some(22.0));
+        assert_eq!(decision.config.cursor(), config::CursorStyle::Bar);
+        assert!(decision.config.osc52_copy_enabled());
+        assert!(save_bytes(&decision.load_error, &decision.config).is_err());
+        let dir = temp_dir("truncated");
+        let path = dir.join("config.json");
+        assert!(!path.exists(), "a blocked save must not create config.json");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_json_reload_blocks_saving() {
+        let current = config::UserConfig {
+            font_size: Some(22.0),
+            arabic_font: Some("Amiri".into()),
+            ..config::UserConfig::default()
+        };
+        let bytes = config::encode(&current).unwrap();
+        let msg = config_watch::reload_from_bytes(current.clone(), &bytes, b"{oops")
+            .expect("invalid json is a reload message");
+        let decision = decide_reload(&current, false, msg);
+        assert!(decision.load_error.is_some());
+        assert_eq!(decision.config.arabic_font.as_deref(), Some("Amiri"));
+        assert_eq!(decision.config.font_size, Some(22.0));
+        assert!(save_bytes(&decision.load_error, &decision.config).is_err());
+    }
+
+    #[test]
+    fn deleting_config_json_clears_the_load_error_and_save_recreates_the_file() {
+        let current = config::UserConfig {
+            font_size: Some(22.0),
+            cursor_style: Some("bar".into()),
+            ..config::UserConfig::default()
+        };
+        // An earlier bad file is blocking saves. Deleting the file is not
+        // another bad file: the running config stays, and a save writes it
+        // back, never defaults over the user's settings.
+        let [bad, deleted] = config_watch::reload_bad_then_missing(current.clone(), b"{oops");
+        let mut blocked = decide_reload(&current, false, bad.unwrap());
+        assert!(blocked.load_error.is_some());
+        blocked = decide_reload(&blocked.config, false, deleted.expect("delete is noticed"));
+        assert!(
+            blocked.load_error.is_none(),
+            "a missing file must not block save_config"
+        );
+        assert_eq!(blocked.config, current);
+        let bytes = save_bytes(&blocked.load_error, &blocked.config).unwrap();
+        let dir = temp_dir("deleted");
+        let path = dir.join("config.json");
+        config::write_bytes_at(&path, &bytes).unwrap();
+        let restored = config::parse_bytes(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(restored, current);
+        assert!(path.is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Enough of an `App` to run `on_system_theme`. No window, so the caption
+    /// flag is computed and then has nowhere to go; the renderer and the
+    /// config sample are what the test can see.
+    fn app_for_theme(cfg: config::UserConfig) -> App {
+        let renderer = render::Renderer::new(1.0, &cfg, 0.0);
+        let mut app = App::new(test_proxy(), cfg, None, None);
+        app.startup_pending = false;
+        app.renderer = Some(renderer);
+        app.size = TermSize { cols: 80, rows: 24 };
+        app
+    }
+
+    /// The window loop's theme handler. Removing `on_system_theme` fails
+    /// this test: the renderer must take the new palette, and the config
+    /// must record the sample. A named scheme stays put.
+    #[test]
+    fn on_system_theme_paints_the_renderer_and_records_the_sample() {
+        let cfg = config::UserConfig {
+            system_apps_light: Some(false),
+            ..Default::default()
+        };
+        let mut app = app_for_theme(cfg);
+        assert_eq!(app.renderer.as_ref().map(|r| r.bg), Some(theme::DARK.bg));
+        app.on_system_theme(theme::SystemThemeEvent::Winit { light: true });
+        assert_eq!(app.config.system_apps_light, Some(true));
+        assert_eq!(
+            app.renderer.as_ref().map(|r| r.bg),
+            Some(theme::LIGHT.bg),
+            "a light ThemeChanged must reach the renderer"
+        );
+        app.on_system_theme(theme::SystemThemeEvent::Winit { light: false });
+        assert_eq!(app.config.system_apps_light, Some(false));
+        assert_eq!(app.renderer.as_ref().map(|r| r.bg), Some(theme::DARK.bg));
+
+        let locked = config::UserConfig {
+            theme: Some("Dracula".into()),
+            system_apps_light: Some(false),
+            ..Default::default()
+        };
+        let dracula = render::theme_by_name("Dracula").unwrap().bg;
+        let mut app = app_for_theme(locked);
+        app.on_system_theme(theme::SystemThemeEvent::Winit { light: true });
+        assert_eq!(app.config.system_apps_light, Some(true));
+        assert_eq!(
+            app.renderer.as_ref().map(|r| r.bg),
+            Some(dracula),
+            "a named scheme is not replaced"
+        );
+    }
 
     #[test]
     fn the_cwd_argument_opens_a_local_folder_and_refuses_the_rest() {
@@ -5701,6 +8316,66 @@ mod tests {
     }
 
     #[test]
+    fn a_shortcut_edit_does_not_copy_lua_bindings_into_json() {
+        use std::collections::HashMap;
+        let mut saved = Some(HashMap::from([(
+            "copy".to_string(),
+            "ctrl+shift+c".to_string(),
+        )]));
+        let mut runtime = Some(HashMap::from([
+            ("copy".to_string(), "ctrl+shift+c".to_string()),
+            ("new-tab".to_string(), "ctrl+alt+t".to_string()),
+        ]));
+        apply_shortcut(
+            &mut saved,
+            &mut runtime,
+            "copy",
+            Some("ctrl+shift+x".into()),
+        );
+        assert_eq!(
+            saved.as_ref().unwrap().get("copy").map(String::as_str),
+            Some("ctrl+shift+x")
+        );
+        assert!(
+            saved.as_ref().unwrap().get("new-tab").is_none(),
+            "a lua binding must not be written into config.json: {saved:?}"
+        );
+        assert_eq!(
+            runtime.as_ref().unwrap().get("new-tab").map(String::as_str),
+            Some("ctrl+alt+t")
+        );
+        apply_shortcut(&mut saved, &mut runtime, "copy", None);
+        assert!(
+            !saved.as_ref().is_some_and(|m| m.contains_key("new-tab")),
+            "clearing a shortcut must not copy the lua map: {saved:?}"
+        );
+        assert!(runtime.as_ref().unwrap().contains_key("new-tab"));
+    }
+
+    #[test]
+    fn a_long_approval_card_scrolls_and_enter_waits() {
+        let rows: Vec<String> = (0..40).map(|i| format!("row {i}")).collect();
+        let (window, scroll, at_end) = lua_card_window(&rows, 0);
+        assert_eq!(window.len(), LUA_CARD_ROWS);
+        assert_eq!(scroll, 0);
+        assert!(!at_end);
+        assert_eq!(window[0], "row 0");
+        let (end, _, at_end) = lua_card_window(&rows, 1000);
+        assert!(at_end);
+        assert_eq!(end.last().map(String::as_str), Some("row 39"));
+        let short = vec!["only".to_string()];
+        assert!(lua_card_window(&short, 0).2);
+
+        let now = std::time::Instant::now();
+        assert!(lua_enter_ready(None, now));
+        assert!(!lua_enter_ready(Some(now + LUA_APPROVE_DELAY), now));
+        assert!(lua_enter_ready(
+            Some(now - std::time::Duration::from_millis(1)),
+            now
+        ));
+    }
+
+    #[test]
     fn a_confirm_card_goes_away_with_its_pane() {
         // The card is keyed by pane id (R-02 keeps the send safe). When that
         // pane is removed — shell exit, pane close, or the whole tab — the
@@ -5714,6 +8389,9 @@ mod tests {
                 lines: 1,
                 chars: 8,
                 reason: "test".into(),
+                lua: None,
+                scroll: 0,
+                saw_end: true,
             })
         };
         let mut pending = card(Some(7));
@@ -6853,7 +9531,7 @@ mod m38_tests {
             .into_iter()
             .map(|(_, l)| l)
             .collect();
-        assert_eq!(&labels[..2], ["Copy selection", "Paste"]);
+        assert_eq!(&labels[..3], ["Copy selection", "Copy clean", "Paste"]);
         assert!(labels.iter().any(|l| l == "New tab with shell…"));
         let rows = shell_menu_rows(&[], "cmd.exe");
         assert_eq!(rows[1].1, "Command Prompt · default");
@@ -6915,15 +9593,20 @@ mod m38_tests {
             "copy stays off the menu until something is selected"
         );
         assert!(
+            !one.iter().any(|l| l == keybinds::Action::CopyClean.label()),
+            "clean copy stays off the menu until something is selected"
+        );
+        assert!(
             !one.iter().any(|l| l.contains("تكبير")),
             "no zoom with one pane"
         );
         assert!(one.iter().any(|l| l == "الإعدادات"));
         let sel = labels(context_menu_rows(true, 1, false, false));
         assert_eq!(
-            &sel[..2],
+            &sel[..3],
             [
                 keybinds::Action::Copy.label(),
+                keybinds::Action::CopyClean.label(),
                 keybinds::Action::Paste.label(),
             ]
         );
@@ -7001,5 +9684,340 @@ mod m38_tests {
         );
         let old = r#"{"tabs":[{"cwds":[null]}],"active":0}"#;
         assert_eq!(parse_state(old).unwrap().tabs[0].name, None);
+    }
+
+    #[test]
+    fn an_elevated_rename_or_group_change_does_not_write_session_json() {
+        let dir = std::env::temp_dir().join(format!("bayan-session-elev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.json");
+        std::fs::write(&path, b"ORIGINAL").unwrap();
+        super::SESSION_FILE.with(|slot| *slot.borrow_mut() = Some(path.clone()));
+        let mut app = super::session_app(super::test_proxy(), true);
+        app.rename_tab(Some("مسؤول".into()));
+        app.rename_group(Some("مجموعة".into()));
+        app.move_tab_to_group(None);
+        app.blocked_link = Some(BlockedLink {
+            reason: "load".into(),
+            shown: "config.json is unreadable".into(),
+            confirm: None,
+            is_app_error: true,
+        });
+        app.apply_admin_notice();
+        let both = app
+            .blocked_link
+            .as_ref()
+            .expect("config error and admin notice");
+        assert!(both.shown.contains("config.json"));
+        assert!(both.shown.contains("الإضافات"));
+        app.open_posh();
+        SESSION_FILE.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(std::fs::read(&path).unwrap(), b"ORIGINAL");
+        assert!(app.posh.is_none());
+        let card = app.blocked_link.as_ref().expect("the picker refusal");
+        assert!(card.shown.contains("منتقي"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+fn session_app(proxy: EventLoopProxy<UserEvent>, elevated: bool) -> App {
+    let mut app = App::new(proxy, config::UserConfig::default(), None, None);
+    app.shell_profiles_ready = true;
+    app.startup_pending = false;
+    app.tabs = vec![Tab {
+        panes: Vec::new(),
+        layout: layout::Node::single(),
+        focused: 0,
+        title: "بيان".into(),
+        name: None,
+        attention: false,
+        broadcast: false,
+        zoomed: false,
+        group: 0,
+    }];
+    app.next_id = 1;
+    app.size = TermSize { cols: 80, rows: 24 };
+    app.elevated = elevated;
+    app
+}
+
+/// Smooth-scroll resets and pointer hits, through the `App` methods that
+/// own them. Deleting the call inside `wakeup`, `relayout_active`,
+/// `rebuild_renderer`, `locate`, or `try_report_press` fails one of these.
+#[cfg(test)]
+mod scroll_app_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn bare() -> App {
+        let mut app = App::new(test_proxy(), config::UserConfig::default(), None, None);
+        app.startup_pending = false;
+        app.next_id = 1;
+        app.size = TermSize { cols: 40, rows: 12 };
+        app
+    }
+
+    fn host(draw: bool) -> (App, u64, term::HeadlessWrite) {
+        let mut app = bare();
+        if draw {
+            app.renderer = Some(render::Renderer::new(1.0, &app.config, 0.0));
+        }
+        let (cw, ch) = app
+            .renderer
+            .as_ref()
+            .map(|r| (r.cell_w, r.cell_h))
+            .unwrap_or((8.0, 16.0));
+        let cols = 40usize;
+        let rows = 12usize;
+        app.test_content = Some((
+            0,
+            0,
+            (cw * cols as f32).ceil() as i32,
+            (ch * rows as f32).ceil() as i32,
+        ));
+        let (session, written) =
+            term::Session::headless(TermSize { cols, rows }, app.proxy.clone(), 0);
+        app.tabs.push(Tab {
+            panes: vec![Pane {
+                id: 0,
+                session,
+                command: String::new(),
+                last_output: None,
+                progress: None,
+                mux: None,
+            }],
+            layout: layout::Node::single(),
+            focused: 0,
+            title: "t".into(),
+            name: None,
+            attention: false,
+            broadcast: false,
+            zoomed: false,
+            group: 0,
+        });
+        (app, 0, written)
+    }
+
+    fn feed(app: &App, bytes: &[u8]) {
+        let mut t = app.tabs[0].panes[0].session.term.lock();
+        let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+        parser.advance(&mut *t, bytes);
+    }
+
+    fn display_offset(app: &App) -> usize {
+        app.tabs[0].panes[0]
+            .session
+            .term
+            .lock()
+            .grid()
+            .display_offset()
+    }
+
+    fn stale_fraction(app: &mut App, id: u64) {
+        let mut st = scroll::PaneScroll::with_subline(0.4);
+        let then = Instant::now()
+            .checked_sub(Duration::from_millis(1_000))
+            .unwrap_or_else(Instant::now);
+        st.note_motion(then);
+        app.smooth.insert(id, st);
+    }
+
+    fn fill_history(app: &App) {
+        feed(app, "x\r\n".repeat(40).as_bytes());
+    }
+
+    #[test]
+    fn new_output_at_the_bottom_clears_the_offset() {
+        let (mut app, id, _) = host(false);
+        stale_fraction(&mut app, id);
+        app.wakeup(id);
+        assert!(
+            app.smooth.is_empty(),
+            "a stale fraction at the bottom must go on output"
+        );
+    }
+
+    #[test]
+    fn new_output_while_scrolled_up_keeps_the_offset() {
+        let (mut app, id, _) = host(false);
+        fill_history(&app);
+        app.tabs[0].panes[0]
+            .session
+            .term
+            .lock()
+            .scroll_display(alacritty_terminal::grid::Scroll::Delta(3));
+        assert!(display_offset(&app) > 0);
+        stale_fraction(&mut app, id);
+        app.wakeup(id);
+        let sub = app.smooth.get(&id).map(|s| s.subline).unwrap_or(0.0);
+        assert!((sub - 0.4).abs() < 0.001, "scrolled-up offset was {sub}");
+    }
+
+    #[test]
+    fn entering_the_alt_screen_clears_a_resting_offset() {
+        let (mut app, id, _) = host(false);
+        // A live notch would survive output. Only the alt transition drops it.
+        app.smooth_scroll_pane(id, 3.0, false);
+        app.wakeup(id);
+        assert!(app.smooth.contains_key(&id), "output ate a live notch");
+        feed(&app, b"\x1b[?1049h");
+        app.wakeup(id);
+        assert!(
+            app.smooth.is_empty(),
+            "entering the alt screen left the offset"
+        );
+    }
+
+    #[test]
+    fn leaving_the_alt_screen_clears_a_resting_offset() {
+        let (mut app, id, _) = host(false);
+        feed(&app, b"\x1b[?1049h");
+        app.wakeup(id);
+        app.smooth_scroll_pane(id, 3.0, false);
+        app.wakeup(id);
+        assert!(app.smooth.contains_key(&id));
+        feed(&app, b"\x1b[?1049l");
+        app.wakeup(id);
+        assert!(
+            app.smooth.is_empty(),
+            "leaving the alt screen left the offset"
+        );
+    }
+
+    #[test]
+    fn resize_clears_the_offset() {
+        let mut app = bare();
+        stale_fraction(&mut app, 1);
+        stale_fraction(&mut app, 2);
+        app.relayout_active();
+        assert!(app.smooth.is_empty());
+    }
+
+    #[test]
+    fn font_change_clears_the_offset() {
+        let mut app = bare();
+        stale_fraction(&mut app, 1);
+        app.rebuild_renderer();
+        assert!(app.smooth.is_empty());
+    }
+
+    /// Wheel-up while output is streaming. On b3746d5 every wakeup at the
+    /// bottom called `drop_smooth`, so the notch never became a line.
+    #[test]
+    fn wheel_up_followed_by_output_wakeups_still_scrolls() {
+        let (mut app, id, _) = host(false);
+        fill_history(&app);
+        app.smooth_scroll_pane(id, 3.0, false);
+        // The loop finishes in microseconds, so a fresh `last_motion` would
+        // keep the notch even if `scrolling` ignored `pending`. Age the
+        // touch: only the pending notch may protect it from the wakeups.
+        let aged = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        app.smooth.get_mut(&id).unwrap().note_motion(aged);
+        for _ in 0..40 {
+            app.smooth_at = Some(Instant::now() - Duration::from_millis(16));
+            app.tick_smooth_scroll();
+            app.wakeup(id);
+        }
+        let offset = display_offset(&app);
+        assert!(
+            offset >= 1,
+            "output wiped the wheel; display offset stayed {offset}"
+        );
+    }
+
+    #[test]
+    fn a_slow_touchpad_drag_survives_output_at_the_bottom() {
+        let (mut app, id, _) = host(false);
+        fill_history(&app);
+        for _ in 0..20 {
+            app.smooth_scroll_pane(id, 0.1, true);
+            app.wakeup(id);
+        }
+        let offset = display_offset(&app);
+        assert!(
+            offset >= 1,
+            "slow touch motion was cleared before a line, offset {offset}"
+        );
+    }
+
+    #[test]
+    fn a_partial_offset_reports_the_shifted_row() {
+        let (mut app, id, written) = host(true);
+        feed(&app, b"\x1b[?1000h\x1b[?1006h");
+        let mode = app.mode_of(id);
+        assert!(mode.contains(TermMode::MOUSE_REPORT_CLICK));
+        assert!(mode.contains(TermMode::SGR_MOUSE));
+        let (cw, ch) = {
+            let r = app.renderer.as_ref().unwrap();
+            (r.cell_w, r.cell_h)
+        };
+        app.smooth.insert(id, scroll::PaneScroll::with_subline(0.4));
+        let shift = scroll::offset_px(0.4, ch);
+        assert!(shift >= 2, "cell {ch} shifted only {shift}px");
+        let x = cw as f64 * 2.0 + 1.0;
+        let y = ch as f64 + 1.0;
+        assert_eq!((x / cw as f64).floor() as usize, 2);
+        assert_eq!((y / ch as f64).floor() as usize, 1);
+        app.cursor_pos = PhysicalPosition::new(x, y);
+        let hit = app.locate(app.cursor_pos).unwrap();
+        assert_eq!(hit.2, 0, "locate ignored the offset");
+        assert!(app.try_report_press(mouse::Btn::Left));
+        assert_eq!(written.wait(), b"\x1b[<0;3;1M");
+
+        app.smooth.remove(&id);
+        app.cursor_pos = PhysicalPosition::new(x, y);
+        let hit = app.locate(app.cursor_pos).unwrap();
+        assert_eq!(hit.2, 1);
+        assert!(app.try_report_press(mouse::Btn::Left));
+        assert_eq!(written.wait(), b"\x1b[<0;3;2M");
+    }
+
+    #[test]
+    fn the_peek_sliver_is_not_reported_as_the_top_row() {
+        let (mut app, id, _) = host(true);
+        feed(&app, b"\x1b[?1000h\x1b[?1006h");
+        let ch = app.renderer.as_ref().unwrap().cell_h;
+        app.smooth.insert(id, scroll::PaneScroll::with_subline(0.4));
+        let shift = scroll::offset_px(0.4, ch) as f64;
+        let y = 1.0;
+        assert!(shift > y, "no peek sliver: shift {shift}");
+        assert_eq!((y / ch as f64).floor() as usize, 0);
+        app.cursor_pos = PhysicalPosition::new(4.0, y);
+        let hit = app.locate(app.cursor_pos).unwrap();
+        assert_eq!(hit.2, -1);
+        assert!(!app.try_report_press(mouse::Btn::Left));
+    }
+
+    #[test]
+    fn history_row_click_keeps_the_grid_column_when_reordering_is_off() {
+        let (mut app, id, _) = host(true);
+        let ch = app.renderer.as_ref().unwrap().cell_h;
+        app.smooth.insert(id, scroll::PaneScroll::with_subline(0.5));
+        let shift = scroll::offset_px(0.5, ch);
+        assert!(shift >= 4, "cell {ch} shift {shift}");
+        let rect = app.pane_rects()[0];
+        app.renderer
+            .as_mut()
+            .unwrap()
+            .plant_hit(rect, scroll::PEEK_ROW, 0, rect.2.max(1), 7);
+        {
+            let mut meta = app.tabs[0].panes[0].session.meta.lock_or_recover();
+            meta.running_cmd = "demo".into();
+        }
+        app.cursor_pos = PhysicalPosition::new(2.0, 1.0);
+        let on = app.locate(app.cursor_pos).unwrap();
+        assert_eq!(on.2, -1);
+        assert_eq!(on.3, 7, "implicit mode uses the shaped column");
+        {
+            let mut meta = app.tabs[0].panes[0].session.meta.lock_or_recover();
+            meta.bidi_mut().mode = bidi_ctl::BidiMode::Explicit;
+        }
+        let off = app.locate(app.cursor_pos).unwrap();
+        assert_eq!(off.2, -1);
+        assert_eq!(off.3, 0, "explicit BDSM stays on the grid column");
     }
 }

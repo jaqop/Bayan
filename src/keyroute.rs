@@ -100,6 +100,68 @@ pub(crate) fn commit_target(owner: Option<KeyOwner>) -> CommitTo {
     }
 }
 
+/// The cursor box last handed to `set_ime_cursor_area`, in physical pixels.
+pub(crate) type ImeSpot = (i32, i32, i32, i32);
+
+/// Windows reports a key the IME has already consumed as
+/// `NamedKey::Process` (`VK_PROCESSKEY`). winit 0.30.13 still delivers
+/// that `KeyboardInput` (winit#4508), often before `Ime::Preedit` stores
+/// a composition string. The text arrives separately as preedit or
+/// commit, so the key must not be encoded for the PTY.
+pub(crate) fn is_ime_process_key(key: &Key) -> bool {
+    matches!(key, Key::Named(NamedKey::Process))
+}
+
+/// Swallow a key the IME owns. A visible preedit owns every key (the
+/// IME is composing). `NamedKey::Process` is swallowed even before that
+/// string exists, which is when Windows emits it.
+pub(crate) fn ime_swallows_key(composing: bool, key: &Key) -> bool {
+    composing || is_ime_process_key(key)
+}
+
+/// A window event that may rebuild the IME context.
+///
+/// `ImeEnabled` is `WindowEvent::Ime(Ime::Enabled)`. `FocusGained` is
+/// `WindowEvent::Focused(true)`, handled in `input::focus_changed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CursorAreaEvent {
+    ImeEnabled,
+    ImePreedit,
+    ImeCommit,
+    ImeDisabled,
+    FocusGained,
+    FocusLost,
+}
+
+/// Windows drops the composition window on these two events, so the
+/// cursor box has to be sent again even when it has not moved
+/// (winit#2569). Every other IME phase and a focus loss leave it.
+pub(crate) fn cursor_area_reset(event: CursorAreaEvent) -> bool {
+    matches!(
+        event,
+        CursorAreaEvent::ImeEnabled | CursorAreaEvent::FocusGained
+    )
+}
+
+/// The rectangle to pass to `set_ime_cursor_area`, if a call is due.
+///
+/// An unchanged box is not sent again. `reset` comes from
+/// [`cursor_area_reset`]: `Ime::Enabled` and a focus return both set it.
+/// `None` current means there is no cell to anchor yet; the caller keeps
+/// `reset` set.
+pub(crate) fn ime_area_due(
+    last_sent: Option<ImeSpot>,
+    current: Option<ImeSpot>,
+    reset: bool,
+) -> Option<ImeSpot> {
+    let current = current?;
+    if reset || last_sent != Some(current) {
+        Some(current)
+    } else {
+        None
+    }
+}
+
 /// Enter is `Some(true)`, Esc `Some(false)`, anything else `None`.
 pub(crate) fn enter_or_escape(key: &Key) -> Option<bool> {
     match key {
@@ -202,6 +264,15 @@ impl App {
 
     /// IME composition and commits: CJK input, the emoji panel, dictation.
     pub(crate) fn ime_input(&mut self, ime: Ime) {
+        let area = match &ime {
+            Ime::Enabled => CursorAreaEvent::ImeEnabled,
+            Ime::Preedit(_, _) => CursorAreaEvent::ImePreedit,
+            Ime::Commit(_) => CursorAreaEvent::ImeCommit,
+            Ime::Disabled => CursorAreaEvent::ImeDisabled,
+        };
+        // Only Enabled rebuilds the IME context. The other phases leave
+        // the candidate window where it is (winit#2569).
+        self.note_cursor_area(area);
         match ime {
             Ime::Preedit(text, _) => self.set_preedit(Some(text)),
             Ime::Disabled => self.set_preedit(None),
@@ -216,6 +287,13 @@ impl App {
             }
         }
         self.request_redraw();
+    }
+
+    /// Ask for `set_ime_cursor_area` again when `event` rebuilt the context.
+    pub(crate) fn note_cursor_area(&mut self, event: CursorAreaEvent) {
+        if cursor_area_reset(event) {
+            self.ime_area_reset = true;
+        }
     }
 
     fn set_preedit(&mut self, text: Option<String>) {
@@ -259,8 +337,9 @@ impl App {
         // early return above the write leaves the key here, so its release
         // stays out of the PTY too.
         self.note_held_away(event);
-        // the IME owns every key while it composes
-        if self.composing() {
+        // Preedit owns every key. `NamedKey::Process` is the IME's too,
+        // and it arrives before the preedit string does (winit#4508).
+        if ime_swallows_key(self.composing(), &event.logical_key) {
             return;
         }
         let m = self.modifiers;
@@ -330,10 +409,12 @@ impl App {
                 self.request_redraw();
             }
             KeyOwner::PasteGuard => {
-                match enter_or_escape(&event.logical_key) {
-                    Some(true) => self.confirm_pending(),
-                    Some(false) => self.pending_paste = None,
-                    None => {}
+                if !self.scroll_lua_card_key(&event.logical_key) {
+                    match enter_or_escape(&event.logical_key) {
+                        Some(true) => self.confirm_pending(),
+                        Some(false) => self.dismiss_paste_card(),
+                        None => {}
+                    }
                 }
                 self.request_redraw();
             }
@@ -353,6 +434,9 @@ impl App {
     pub(crate) fn toggle_copy_mode(&mut self) {
         let entering = !self.term_mode().contains(TermMode::VI);
         if entering {
+            if let Some(id) = self.focused_pane_id() {
+                self.snap_smooth(id);
+            }
             if let Some(s) = self.session() {
                 let mut t = s.term.lock();
                 t.selection = None;
@@ -368,6 +452,9 @@ impl App {
     /// Leave copy mode: the selection goes and the view returns to the
     /// prompt, where typing would have taken it anyway.
     fn exit_copy_mode(&mut self) {
+        if let Some(id) = self.focused_pane_id() {
+            self.drop_smooth(id);
+        }
         if let Some(s) = self.session() {
             let mut t = s.term.lock();
             if t.mode().contains(TermMode::VI) {
@@ -385,6 +472,18 @@ impl App {
     fn copy_mode_key(&mut self, event: &KeyEvent, shift: bool) {
         use copymode::Cmd;
         let ctrl = self.modifiers.control_key();
+        let alt = self.modifiers.alt_key();
+        // The copy-clean chord yanks and leaves even when `copy.clean` is
+        // off, and even though copy mode would otherwise swallow it. `y`,
+        // Enter and Ctrl+C stay on copy_selection, so the setting (including
+        // claude_mode) covers an ordinary copy-mode yank.
+        if let Some(chord) = keybinds::chord_from(event.physical_key, ctrl, shift, alt) {
+            if keybinds::lookup(&self.keymap, chord) == Some(keybinds::Action::CopyClean) {
+                self.copy_selection_clean();
+                self.exit_copy_mode();
+                return;
+            }
+        }
         let rtl = self.copy_cursor_rtl();
         let Some(cmd) = copymode::command(event.physical_key, &event.logical_key, ctrl, shift, rtl)
         else {
@@ -400,7 +499,11 @@ impl App {
                 self.exit_copy_mode();
                 return;
             }
-            _ => {}
+            _ => {
+                if let Some(id) = self.focused_pane_id() {
+                    self.snap_smooth(id);
+                }
+            }
         }
         if let Some(s) = self.session() {
             copymode::apply(&mut s.term.lock(), cmd);
@@ -438,12 +541,19 @@ impl App {
         let may_open = self
             .blocked_link
             .as_ref()
-            .is_some_and(|c| c.confirm_uri.is_some());
+            .is_some_and(|c| c.confirm.is_some());
         match link::card_decision(enter, escape, may_open) {
             link::CardDecision::Open => {
                 if let Some(card) = self.blocked_link.take() {
-                    if let Some(uri) = card.confirm_uri {
-                        self.spawn_link_open(link::Action::Browse(uri));
+                    if let Some(open) = card.confirm {
+                        let action = link::confirm_enter(&open);
+                        if link::confirm_enter_settles(&open) {
+                            self.spawn_link_open(action);
+                        } else if let link::Action::Reveal(path) = action {
+                            // Direct explorer /select. settle would classify
+                            // config.json as an association open.
+                            self.spawn_reveal_only(&path);
+                        }
                     }
                 }
                 self.request_redraw();
@@ -472,6 +582,14 @@ impl App {
         let alt_screen = self.term_mode().contains(TermMode::ALT_SCREEN);
         let Some(action) = keybinds::resolve(&self.keymap, chord, alt_screen, self.has_selection())
         else {
+            // A plain Ctrl+letter on the alt screen belongs to the TUI, the
+            // same rule as the built-in map. Any other chord may be a Lua
+            // plugin binding. The binding's send still waits on the card.
+            if !(alt_screen && chord.is_plain_ctrl_letter())
+                && self.fire_lua_chord(&chord.to_config())
+            {
+                return true;
+            }
             return false;
         };
         if is_plain_ctrl_c_copy(action, chord) {
@@ -562,6 +680,8 @@ impl App {
             let Some(other) = self.encode_key_event_for(event, false, mode) else {
                 continue;
             };
+            let id = self.tabs[self.active].panes[pi].id;
+            self.drop_smooth(id);
             let session = &mut self.tabs[self.active].panes[pi].session;
             {
                 let mut t = session.term.lock();
@@ -569,6 +689,9 @@ impl App {
                 t.scroll_display(Scroll::Bottom);
             }
             session.write(&other);
+        }
+        if let Some(id) = self.focused_pane_id() {
+            self.drop_smooth(id);
         }
         if let Some(s) = self.session_mut() {
             {
@@ -586,6 +709,13 @@ impl App {
     /// still own every shortcut; a release only reports, and only when the
     /// press itself reached the PTY.
     fn key_released(&mut self, event: &KeyEvent) {
+        // A Process release must not be reported either: the press was
+        // the IME's, and a TUI that asked for key-up would see a release
+        // whose press it never got.
+        if is_ime_process_key(&event.logical_key) {
+            let _ = self.take_held_away(event);
+            return;
+        }
         let held_away = self.take_held_away(event);
         if held_away {
             return;
@@ -638,6 +768,75 @@ mod tests {
             ..Open::default()
         };
         assert_eq!(commit_target(key_owner(&both)), CommitTo::Drop);
+    }
+
+    #[test]
+    fn ime_process_keys_are_swallowed_and_ordinary_letters_are_not() {
+        let process = Key::Named(NamedKey::Process);
+        let arabic = Key::Character(SmolStr::new("ب"));
+        let ctrl_letter = Key::Character(SmolStr::new("ؤ"));
+        // Process is the IME's even before a preedit string exists, so it
+        // is not encoded beside the later Commit.
+        assert!(is_ime_process_key(&process));
+        assert!(ime_swallows_key(false, &process));
+        assert!(ime_swallows_key(true, &process));
+        // a visible composition still owns every other key
+        assert!(ime_swallows_key(true, &arabic));
+        // Arabic letters and the logical char of an Arabic-layout Ctrl
+        // chord are not Process, so they keep the normal key path
+        assert!(!is_ime_process_key(&arabic));
+        assert!(!ime_swallows_key(false, &arabic));
+        assert!(!is_ime_process_key(&ctrl_letter));
+        assert!(!ime_swallows_key(false, &ctrl_letter));
+        assert!(!ime_swallows_key(false, &Key::Named(NamedKey::Enter)));
+    }
+
+    #[test]
+    fn ime_cursor_area_is_sent_again_after_the_context_is_rebuilt() {
+        let spot = (40, 80, 10, 20);
+        let moved = (50, 80, 10, 20);
+        // unchanged and no reset: winit already has this rectangle
+        assert_eq!(ime_area_due(Some(spot), Some(spot), false), None);
+        // Ime::Enabled or a focus return: Windows dropped it, send again
+        assert_eq!(ime_area_due(Some(spot), Some(spot), true), Some(spot));
+        // a real move is sent whether or not the context was rebuilt
+        assert_eq!(ime_area_due(Some(spot), Some(moved), false), Some(moved));
+        assert_eq!(ime_area_due(None, Some(spot), false), Some(spot));
+        // nothing to anchor yet: the caller keeps the reset flag
+        assert_eq!(ime_area_due(Some(spot), None, true), None);
+    }
+
+    /// Both context rebuilds ask for the candidate window again, and the
+    /// other IME phases and a blur do not. The handlers call
+    /// `cursor_area_reset` with these same variants: `Ime::Enabled` in
+    /// `ime_input`, and `Focused(true)` in `input::focus_changed`.
+    #[test]
+    fn ime_enabled_and_focus_regained_both_resend_the_cursor_area() {
+        let spot = (12, 48, 9, 18);
+        // already on screen, and the cell has not moved
+        assert_eq!(ime_area_due(Some(spot), Some(spot), false), None);
+        for event in [CursorAreaEvent::ImeEnabled, CursorAreaEvent::FocusGained] {
+            assert!(
+                cursor_area_reset(event),
+                "{event:?} rebuilds the IME context"
+            );
+            assert_eq!(
+                ime_area_due(Some(spot), Some(spot), cursor_area_reset(event)),
+                Some(spot),
+                "{event:?} re-sends the same cursor box"
+            );
+        }
+        for event in [
+            CursorAreaEvent::ImePreedit,
+            CursorAreaEvent::ImeCommit,
+            CursorAreaEvent::ImeDisabled,
+            CursorAreaEvent::FocusLost,
+        ] {
+            assert!(
+                !cursor_area_reset(event),
+                "{event:?} must leave the candidate window where it is"
+            );
+        }
     }
 
     #[test]

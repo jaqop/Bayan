@@ -296,6 +296,116 @@ pub fn is_restorable(command: &str, installed: &[Shell]) -> bool {
     }
 }
 
+/// The shell a `-p` / `--profile` name refers to.
+///
+/// Matches the stored command, then the name, then the English label of the
+/// fast PowerShell entry (`PowerShell (fast)`), whose stored name is Arabic.
+/// ASCII case does not matter. An empty or unknown name is `None`.
+pub fn find_profile<'a>(installed: &'a [Shell], query: &str) -> Option<&'a Shell> {
+    let query = query.trim();
+    if query.is_empty() {
+        return None;
+    }
+    let same = |candidate: &str| candidate == query || candidate.eq_ignore_ascii_case(query);
+    installed
+        .iter()
+        .find(|shell| same(&shell.command))
+        .or_else(|| installed.iter().find(|shell| same(&shell.name)))
+        .or_else(|| {
+            installed
+                .iter()
+                .find(|shell| shell.command == FAST_POWERSHELL && same("PowerShell (fast)"))
+        })
+}
+
+/// The shell an elevated `-p` name refers to.
+///
+/// Name only. A stored command (`powershell.exe`, a `wsl.exe` line, a path)
+/// does not match, even when [`find_profile`] would accept it: the elevated
+/// process must not trust a command line that arrived as text.
+pub fn find_profile_by_name<'a>(installed: &'a [Shell], query: &str) -> Option<&'a Shell> {
+    let query = query.trim();
+    if query.is_empty() {
+        return None;
+    }
+    let same = |candidate: &str| candidate == query || candidate.eq_ignore_ascii_case(query);
+    installed
+        .iter()
+        .find(|shell| same(&shell.name))
+        .or_else(|| {
+            installed
+                .iter()
+                .find(|shell| shell.command == FAST_POWERSHELL && same("PowerShell (fast)"))
+        })
+}
+
+/// [`find_profile_by_name`], or an error that names what is installed.
+pub fn require_profile_by_name<'a>(
+    installed: &'a [Shell],
+    query: &str,
+) -> Result<&'a Shell, String> {
+    find_profile_by_name(installed, query).ok_or_else(|| {
+        let names = installed
+            .iter()
+            .map(|shell| shell.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("unknown profile {query:?}; installed: {names}")
+    })
+}
+
+/// `pwsh.exe` for an elevated window: only
+/// `{Program Files}\PowerShell\7\pwsh.exe`. A bare name becomes that path.
+/// A copy anywhere else, including on `PATH`, is refused. Other programs
+/// are unchanged.
+pub fn resolve_elevated_pwsh(
+    prog: &str,
+    program_files: Option<&Path>,
+    is_file: impl Fn(&Path) -> bool,
+) -> Result<String, String> {
+    let base = prog.rsplit(['\\', '/']).next().unwrap_or(prog);
+    if !base.eq_ignore_ascii_case("pwsh.exe") {
+        return Ok(prog.to_string());
+    }
+    let Some(root) = program_files else {
+        return Err("pwsh.exe is not under Program Files".into());
+    };
+    let trusted = root.join("PowerShell").join("7").join("pwsh.exe");
+    if !is_file(&trusted) {
+        return Err("pwsh.exe is not under Program Files\\PowerShell\\7".into());
+    }
+    let bare = !prog.contains(['\\', '/']);
+    let trusted_text = trusted.display().to_string();
+    let same = prog.replace('/', "\\").eq_ignore_ascii_case(&trusted_text);
+    if bare || same {
+        Ok(trusted_text)
+    } else {
+        Err("refusing pwsh.exe outside Program Files".into())
+    }
+}
+
+/// The shell an elevated window starts when no profile was named.
+/// The first entry `detect` itself offers, or PowerShell. Never a string
+/// read from config.json.
+pub fn elevated_default_command(installed: &[Shell]) -> String {
+    installed
+        .first()
+        .map(|shell| shell.command.clone())
+        .unwrap_or_else(|| crate::term::DEFAULT_SHELL.to_string())
+}
+
+/// [`find_profile`], or an error that names what is installed.
+pub fn require_profile<'a>(installed: &'a [Shell], query: &str) -> Result<&'a Shell, String> {
+    find_profile(installed, query).ok_or_else(|| {
+        let names = installed
+            .iter()
+            .map(|shell| shell.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("unknown profile {query:?}; installed: {names}")
+    })
+}
+
 /// Friendly label for a stored command line, for the settings panel. Falls
 /// back to a trimmed command so a hand-edited config.json still reads sanely.
 /// `found` is the app's one background `detect()`: this runs inside the frame
@@ -589,5 +699,114 @@ mod tests {
             "wsl discovery must take the System32 path"
         );
         assert!(!prod.contains("Command::new(\"wsl\")"));
+    }
+
+    #[test]
+    fn a_profile_name_or_command_selects_one_shell() {
+        let installed = vec![
+            Shell::new("PowerShell", "powershell.exe"),
+            Shell::new("PowerShell سريع", FAST_POWERSHELL),
+            Shell::new("Command Prompt", "cmd.exe"),
+            Shell::new("WSL · Ubuntu", r"C:\Windows\System32\wsl.exe -d Ubuntu"),
+        ];
+        assert_eq!(
+            find_profile(&installed, "PowerShell").map(|s| s.command.as_str()),
+            Some("powershell.exe")
+        );
+        assert_eq!(
+            find_profile(&installed, "powershell.exe").map(|s| s.command.as_str()),
+            Some("powershell.exe")
+        );
+        assert_eq!(
+            find_profile(&installed, "PowerShell سريع").map(|s| s.command.as_str()),
+            Some(FAST_POWERSHELL)
+        );
+        assert_eq!(
+            find_profile(&installed, "PowerShell (fast)").map(|s| s.command.as_str()),
+            Some(FAST_POWERSHELL)
+        );
+        assert_eq!(
+            find_profile(&installed, "command prompt").map(|s| s.name.as_str()),
+            Some("Command Prompt")
+        );
+        assert_eq!(
+            find_profile(&installed, r"C:\Windows\System32\wsl.exe -d Ubuntu")
+                .map(|s| s.name.as_str()),
+            Some("WSL · Ubuntu")
+        );
+        assert!(find_profile(&installed, "no such shell").is_none());
+        assert!(find_profile(&installed, "   ").is_none());
+        assert!(require_profile(&installed, "nope").is_err());
+    }
+
+    #[test]
+    fn an_elevated_profile_matches_the_name_and_not_the_command() {
+        let installed = vec![
+            Shell::new("PowerShell", "powershell.exe"),
+            Shell::new("PowerShell سريع", FAST_POWERSHELL),
+            Shell::new("Calculator", "calc.exe"),
+            Shell::new("WSL · Ubuntu", r"C:\Windows\System32\wsl.exe -d Ubuntu"),
+        ];
+        assert_eq!(
+            find_profile_by_name(&installed, "PowerShell سريع").map(|s| s.command.as_str()),
+            Some(FAST_POWERSHELL)
+        );
+        assert_eq!(
+            find_profile_by_name(&installed, "PowerShell (fast)").map(|s| s.command.as_str()),
+            Some(FAST_POWERSHELL)
+        );
+        assert_eq!(
+            find_profile_by_name(&installed, "wsl · ubuntu").map(|s| s.name.as_str()),
+            Some("WSL · Ubuntu")
+        );
+        for command in [
+            "powershell.exe",
+            FAST_POWERSHELL,
+            "calc.exe",
+            r"C:\Windows\System32\wsl.exe -d Ubuntu",
+            r"D:\مجلد العمل\ملف.exe",
+        ] {
+            assert!(
+                find_profile_by_name(&installed, command).is_none(),
+                "{command} is a command, not a profile name"
+            );
+            assert!(require_profile_by_name(&installed, command).is_err());
+        }
+        // The ordinary -p path still accepts a command. Elevation must not.
+        assert!(find_profile(&installed, "calc.exe").is_some());
+        assert_eq!(
+            elevated_default_command(&installed),
+            "powershell.exe",
+            "config.json is not an argument of this function"
+        );
+        assert_eq!(elevated_default_command(&[]), crate::term::DEFAULT_SHELL);
+    }
+
+    #[test]
+    fn an_elevated_pwsh_is_the_program_files_copy_or_nothing() {
+        let root = std::env::temp_dir().join(format!("bayan-pwsh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let program_files = root.join("Program Files");
+        let user = root.join("path");
+        let trusted = program_files.join("PowerShell").join("7");
+        std::fs::create_dir_all(&trusted).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(user.join("pwsh.exe"), b"MZ").unwrap();
+        assert!(resolve_elevated_pwsh("pwsh.exe", Some(&program_files), |p| p.is_file()).is_err());
+        std::fs::write(trusted.join("pwsh.exe"), b"MZ").unwrap();
+        let got = resolve_elevated_pwsh("pwsh.exe", Some(&program_files), |p| p.is_file()).unwrap();
+        assert_eq!(got, trusted.join("pwsh.exe").display().to_string());
+        assert!(got.contains("Program Files"));
+        assert!(resolve_elevated_pwsh(
+            &user.join("pwsh.exe").display().to_string(),
+            Some(&program_files),
+            |p| p.is_file()
+        )
+        .is_err());
+        assert_eq!(
+            resolve_elevated_pwsh("powershell.exe", Some(&program_files), |p| p.is_file()).unwrap(),
+            "powershell.exe"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

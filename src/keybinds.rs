@@ -25,6 +25,7 @@ pub enum Action {
     PromptPrev,
     PromptNext,
     ClaudeToggle,
+    BidiToggle,
     ResetKeyboard,
     RenameTab,
     Broadcast,
@@ -34,10 +35,11 @@ pub enum Action {
     NextGroup,
     PrevGroup,
     CopyMode,
+    CopyClean,
 }
 
 impl Action {
-    pub const ALL: [Action; 21] = [
+    pub const ALL: [Action; 23] = [
         Action::NewTab,
         Action::ClosePane,
         Action::Search,
@@ -50,6 +52,7 @@ impl Action {
         Action::PromptPrev,
         Action::PromptNext,
         Action::ClaudeToggle,
+        Action::BidiToggle,
         Action::ResetKeyboard,
         Action::RenameTab,
         Action::Broadcast,
@@ -59,6 +62,7 @@ impl Action {
         Action::NextGroup,
         Action::PrevGroup,
         Action::CopyMode,
+        Action::CopyClean,
     ];
 
     /// The config.json key.
@@ -76,6 +80,7 @@ impl Action {
             Action::PromptPrev => "prompt-prev",
             Action::PromptNext => "prompt-next",
             Action::ClaudeToggle => "claude-toggle",
+            Action::BidiToggle => "bidi-toggle",
             Action::ResetKeyboard => "reset-keyboard",
             Action::RenameTab => "rename-tab",
             Action::Broadcast => "broadcast",
@@ -85,6 +90,7 @@ impl Action {
             Action::NextGroup => "next-group",
             Action::PrevGroup => "prev-group",
             Action::CopyMode => "copy-mode",
+            Action::CopyClean => "copy-clean",
         }
     }
 
@@ -110,6 +116,7 @@ impl Action {
             Action::PromptPrev => crate::lang::pick(lang, "الأمر السابق", "Previous command"),
             Action::PromptNext => crate::lang::pick(lang, "الأمر التالي", "Next command"),
             Action::ClaudeToggle => crate::lang::pick(lang, "وضع كلود", "Claude mode"),
+            Action::BidiToggle => crate::lang::pick(lang, "اتجاه النص", "BiDi mode"),
             Action::ResetKeyboard => {
                 crate::lang::pick(lang, "إعادة ضبط لوحة المفاتيح", "Reset keyboard")
             }
@@ -125,6 +132,7 @@ impl Action {
             Action::NextGroup => crate::lang::pick(lang, "المجموعة التالية", "Next group"),
             Action::PrevGroup => crate::lang::pick(lang, "المجموعة السابقة", "Previous group"),
             Action::CopyMode => crate::lang::pick(lang, "وضع النسخ", "Copy mode"),
+            Action::CopyClean => crate::lang::pick(lang, "نسخ نظيف", "Copy clean"),
         }
     }
 
@@ -149,6 +157,11 @@ impl Action {
             Action::PromptPrev => c(true, true, Up),
             Action::PromptNext => c(true, true, Down),
             Action::ClaudeToggle => c(false, false, F(2)),
+            // Cycles this pane's BiDi mode (full → alt screen off → off).
+            // Ctrl+Shift, not bare F3: htop and mc search and view on F3.
+            // Physical F3, so an Arabic layout still reaches it, and it can
+            // be rebound.
+            Action::BidiToggle => c(true, true, F(3)),
             // Ctrl+Shift+K: the leaked-flags escape hatch. Physical K, so an
             // Arabic layout still reaches it.
             Action::ResetKeyboard => c(true, true, Letter('k')),
@@ -167,6 +180,8 @@ impl Action {
             Action::PrevGroup => c(true, true, PageUp),
             // X: WezTerm's ActivateCopyMode chord
             Action::CopyMode => c(true, true, Letter('x')),
+            // Y for yank, cleaned. X is copy mode.
+            Action::CopyClean => c(true, true, Letter('y')),
         }
     }
 }
@@ -564,6 +579,43 @@ mod tests {
         assert_eq!(
             lookup(&defaults, Action::ResetKeyboard.default_chord()),
             Some(Action::ResetKeyboard)
+        );
+    }
+
+    #[test]
+    fn copy_clean_reaches_a_full_screen_tui_and_does_not_take_copy_mode() {
+        let map = effective_map(&crate::config::UserConfig::default());
+        let clean = Action::CopyClean.default_chord();
+        assert_eq!(clean, Chord::parse("ctrl+shift+y").unwrap());
+        for alt_screen in [false, true] {
+            assert_eq!(
+                resolve(&map, clean, alt_screen, true),
+                Some(Action::CopyClean),
+                "alt_screen={alt_screen}"
+            );
+            assert_eq!(
+                resolve(&map, clean, alt_screen, false),
+                Some(Action::CopyClean)
+            );
+        }
+        assert_eq!(
+            resolve(&map, Chord::parse("ctrl+shift+x").unwrap(), true, false),
+            Some(Action::CopyMode)
+        );
+    }
+
+    #[test]
+    fn bidi_toggle_defaults_to_ctrl_shift_f3_and_leaves_f3_to_programs() {
+        let map = effective_map(&crate::config::UserConfig::default());
+        assert_eq!(
+            lookup(&map, Chord::parse("ctrl+shift+f3").unwrap()),
+            Some(Action::BidiToggle)
+        );
+        // htop and mc search on bare F3
+        assert_eq!(lookup(&map, Chord::parse("f3").unwrap()), None);
+        assert_ne!(
+            Action::BidiToggle.default_chord(),
+            Action::ClaudeToggle.default_chord()
         );
     }
 
