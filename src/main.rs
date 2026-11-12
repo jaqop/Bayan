@@ -3179,6 +3179,7 @@ impl App {
         self.config = runtime;
         // published once at startup; a reload has to publish it again
         term::set_osc52_read(self.config.osc52_read_enabled());
+        self.reapply_image_limits();
         if language {
             lang::set(self.config.lang());
         }
@@ -3196,6 +3197,23 @@ impl App {
         }
         self.config_notice = reload_notice(decision.replaced, &decision.deferred);
         self.request_redraw();
+    }
+
+    /// Image caps are live. The shared budget and every open pane pick up
+    /// the file's `images` block; placements already drawn stay, and the
+    /// next Sixel or Kitty image is charged against the new caps.
+    fn reapply_image_limits(&mut self) {
+        let limits = self.config.images.limits();
+        self.image_budget.set_limits(limits);
+        let limits = self.image_budget.limits();
+        for tab in &self.tabs {
+            for pane in &tab.panes {
+                pane.session
+                    .meta
+                    .lock_or_recover()
+                    .apply_image_limits(limits);
+            }
+        }
     }
 
     fn report_config_load_error(&mut self) {

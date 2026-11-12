@@ -401,6 +401,21 @@ pub fn native_pty_system() -> Box<dyn PtySystem + Send> {
     Box::new(NativePtySystem::default())
 }
 
+/// True after this process has created a pseudoconsole on a bundled
+/// OpenConsole 1.22+ (`conpty.dll` next to the executable, with
+/// `OpenConsole.exe` beside it). Inbox `kernel32` leaves this false:
+/// that host still strips DCS and APC, so primary DA must not advertise
+/// Sixel.
+#[cfg(windows)]
+pub fn conpty_passthrough_active() -> bool {
+    win::passthrough_active()
+}
+
+#[cfg(not(windows))]
+pub fn conpty_passthrough_active() -> bool {
+    false
+}
+
 #[cfg(unix)]
 pub type NativePtySystem = unix::UnixPtySystem;
 #[cfg(windows)]

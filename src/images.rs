@@ -6,14 +6,13 @@
 //! stripped and OSC 133 is split: the cursor the store anchors to is the
 //! cursor the bytes before the image left behind.
 //!
-//! ConPTY is opened **without** `PSEUDOCONSOLE_PASSTHROUGH_MODE` (`0x8`).
-//! The flags in `vendor/portable-pty/src/win/psuedocon.rs` are inherit-cursor,
-//! resize-quirk, and Win32 input. In that mode conhost parses DCS and APC
-//! and does not forward them, so Sixel and Kitty graphics do not arrive from
-//! a real console host. OSC does get forwarded (OSC 7 / 9 / 52 / 133 already
-//! do), so iTerm2 can. The parsers, the store, and the quad builder do not
-//! depend on that path: a byte slice fed to [`crate::term::process_chunk`]
-//! is enough.
+//! Inbox ConPTY strips DCS and APC, so Sixel and Kitty graphics do not
+//! arrive from kernel32's conhost. OSC does get forwarded (OSC 7 / 9 / 52 /
+//! 133 already do), so iTerm2 can. A bundled `conpty.dll` + `OpenConsole.exe`
+//! from Windows Terminal 1.22+ passes DCS and APC through; primary DA
+//! advertises Sixel only then. The parsers, the store, and the quad builder
+//! do not depend on that path: a byte slice fed to
+//! [`crate::term::process_chunk`] is enough.
 //!
 //! `t=f`, `t=t`, and `t=s` (file, temp file, shared memory) are rejected.
 //! Nothing in this module opens a path or a mapping, and there is no switch
@@ -119,8 +118,10 @@ fn saturating_fetch_sub(atom: &AtomicUsize, n: usize) {
 
 /// Pixel bytes and image count shared by every pane. Charged when an image
 /// is stored, released when it is deleted, scrolled out, or the pane resets.
+/// The caps can be replaced on a config reload while a reader is charging,
+/// so they sit behind a lock. The counters stay atomic.
 pub struct ImageBudget {
-    limits: ImageLimits,
+    limits: std::sync::RwLock<ImageLimits>,
     bytes: AtomicUsize,
     images: AtomicUsize,
 }
@@ -128,14 +129,25 @@ pub struct ImageBudget {
 impl ImageBudget {
     pub fn new(limits: ImageLimits) -> Self {
         Self {
-            limits,
+            limits: std::sync::RwLock::new(limits),
             bytes: AtomicUsize::new(0),
             images: AtomicUsize::new(0),
         }
     }
 
     pub fn limits(&self) -> ImageLimits {
-        self.limits
+        *self
+            .limits
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Config reload. Existing charges stay; the next image uses `limits`.
+    pub fn set_limits(&self, limits: ImageLimits) {
+        *self
+            .limits
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = limits;
     }
 
     pub fn charged_bytes(&self) -> usize {
@@ -143,18 +155,20 @@ impl ImageBudget {
     }
 
     fn fits(&self, bytes: usize, images: usize) -> bool {
+        let limits = self.limits();
         let b = self.bytes.load(Ordering::Relaxed);
         let n = self.images.load(Ordering::Relaxed);
-        b.saturating_add(bytes) <= self.limits.max_session_bytes
-            && n.saturating_add(images) <= self.limits.max_session_images
+        b.saturating_add(bytes) <= limits.max_session_bytes
+            && n.saturating_add(images) <= limits.max_session_images
     }
 
     fn try_charge(&self, bytes: usize, images: usize) -> bool {
+        let limits = self.limits();
         if images > 0 {
             let mut n = self.images.load(Ordering::Relaxed);
             loop {
                 let next = n.saturating_add(images);
-                if next > self.limits.max_session_images {
+                if next > limits.max_session_images {
                     return false;
                 }
                 match self
@@ -169,7 +183,7 @@ impl ImageBudget {
         let mut n = self.bytes.load(Ordering::Relaxed);
         loop {
             let next = n.saturating_add(bytes);
-            if next > self.limits.max_session_bytes || next < n {
+            if next > limits.max_session_bytes || next < n {
                 if images > 0 {
                     self.images.fetch_sub(images, Ordering::AcqRel);
                 }
@@ -449,6 +463,14 @@ impl ImageStore {
         self.reset();
         self.limits = budget.limits();
         self.budget = budget;
+    }
+
+    /// Config reload. Does not drop placements. The shared budget's caps
+    /// move with this pane's copy, so a later image on any pane that shares
+    /// it is charged against `limits`.
+    pub(crate) fn apply_limits(&mut self, limits: ImageLimits) {
+        self.limits = limits;
+        self.budget.set_limits(limits);
     }
 
     #[cfg(test)]
@@ -2665,6 +2687,56 @@ mod tests {
         assert_eq!(img.w, 3);
         assert_eq!(img.h, 6);
         assert!(img.rgba.chunks(4).all(|p| p == [255, 0, 0, 255]));
+    }
+
+    /// One read carries a Sixel and a Kitty image. Both land under the
+    /// default budget. After the caps are reapplied the way a config
+    /// reload does, a further image over the new per-image cap is dropped
+    /// and the two already stored stay.
+    #[test]
+    fn sixel_and_kitty_in_one_read_stay_inside_the_reapplied_budget() {
+        let (mut t, mut p, mut meta, mut carry) = fresh();
+        let px = b64(&[9, 8, 7]);
+        let mut seq = red_green_sixel().to_vec();
+        seq.extend(kitty(&format!("a=T,f=24,s=1,v=1,C=1,q=2;{px}")));
+        feed(&mut t, &mut p, &mut meta, &mut carry, &seq);
+        assert_eq!(
+            meta.images.placement_count(),
+            2,
+            "sixel and kitty both land"
+        );
+        let snaps = meta.images.snapshot();
+        assert_eq!(snaps.len(), 2);
+        assert!(
+            snaps.iter().any(|s| s.width == 2 && s.height == 6),
+            "sixel raster {snaps:?}"
+        );
+        assert!(
+            snaps.iter().any(|s| s.width == 1 && s.height == 1),
+            "kitty raster {snaps:?}"
+        );
+        let before = meta.images.pane_bytes();
+        assert!(before > 0);
+        let tight = ImageLimits {
+            max_bytes: 3,
+            ..ImageLimits::default()
+        };
+        meta.apply_image_limits(tight);
+        assert_eq!(meta.images.limits().max_bytes, 3);
+        let again = b64(&[1, 2, 3]);
+        feed(
+            &mut t,
+            &mut p,
+            &mut meta,
+            &mut carry,
+            &kitty(&format!("a=T,f=24,s=1,v=1,C=1,q=2;{again}")),
+        );
+        assert_eq!(
+            meta.images.placement_count(),
+            2,
+            "the reapplied cap drops the next image"
+        );
+        assert_eq!(meta.images.pane_bytes(), before);
     }
 
     #[test]

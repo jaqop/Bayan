@@ -453,6 +453,14 @@ impl SessionMeta {
         self.images.attach(budget);
     }
 
+    /// A config reload's image caps. Placements already on the grid stay.
+    /// The next Sixel or Kitty image is charged against `limits`, including
+    /// the shared session budget.
+    pub fn apply_image_limits(&mut self, limits: crate::images::ImageLimits) {
+        self.image_in.set_limits(limits);
+        self.images.apply_limits(limits);
+    }
+
     #[cfg(test)]
     pub fn set_image_limits(&mut self, limits: crate::images::ImageLimits) {
         self.share_image_budget(Arc::new(crate::images::ImageBudget::new(limits)));
@@ -1940,13 +1948,14 @@ fn apply_image_pieces<T: EventListener>(
                 let effect = meta.images.ingest(other, &at);
                 ev.pty_replies.extend(effect.replies);
                 // The cursor is not moved past the image, whatever the
-                // protocol asks. Conhost owns the cursor and does not know
-                // the image: it keeps counting rows without it and repaints
-                // with absolute positions, so rows reserved here put its
-                // later output on the wrong lines (text after the image was
-                // lost). The image stays on the rows it arrived on and the
-                // text that follows draws over it. Revisit only if
-                // PSEUDOCONSOLE_PASSTHROUGH_MODE is turned on.
+                // protocol asks. Inbox conhost owns the cursor and does not
+                // know the image: it keeps counting rows without it and
+                // repaints with absolute positions, so rows reserved here
+                // put its later output on the wrong lines (text after the
+                // image was lost). A bundled OpenConsole does pass the DCS
+                // through, and reserving rows would then be right, but only
+                // after a live check that the host is not still repainting.
+                // Until then the image stays on the rows it arrived on.
             }
         }
     }
@@ -2590,6 +2599,47 @@ fn color_reply(
     Some(format(alacritty_terminal::vte::ansi::Rgb { r, g, b }))
 }
 
+/// Primary DA (CSI `c`). Alacritty answers VT102, `\x1b[?6c`, which does
+/// not list Sixel. With a passthrough host the reply is VT420 plus
+/// parameter 4, the Sixel attribute. Parameter 4 is never the level
+/// `64`: apps look for a `;4` parameter, and inbox conhost still strips
+/// DCS, so advertising it there makes `img2sixel` and `chafa` emit a
+/// sequence that never arrives.
+pub(crate) fn da1_reply(passthrough: bool) -> &'static str {
+    if passthrough {
+        "\u{1b}[?64;4c"
+    } else {
+        "\u{1b}[?6c"
+    }
+}
+
+/// True when `reply` is a primary DA whose parameters, after the terminal
+/// level, include `4`.
+pub(crate) fn da1_advertises_sixel(reply: &str) -> bool {
+    let Some(rest) = reply.strip_prefix("\u{1b}[?") else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix('c') else {
+        return false;
+    };
+    rest.split(';').skip(1).any(|param| param == "4")
+}
+
+/// Alacritty's primary DA becomes [`da1_reply`]. Cursor reports and every
+/// other write are left as they are.
+pub(crate) fn map_pty_reply(text: String, passthrough: bool) -> String {
+    if text == "\u{1b}[?6c" {
+        let reply = da1_reply(passthrough);
+        if reply == text {
+            text
+        } else {
+            reply.to_string()
+        }
+    } else {
+        text
+    }
+}
+
 /// A colour query becomes its reply; an unanswerable one is dropped
 /// (`None`); every other event passes through.
 fn answer_color_query(event: Event, colors: Option<&QueryColors>) -> Option<Event> {
@@ -2814,6 +2864,13 @@ impl EventListener for EventProxy {
         // become one window event per query.
         let Some(event) = prepare_event(self.1, event) else {
             return;
+        };
+        let event = match event {
+            Event::PtyWrite(text) => Event::PtyWrite(map_pty_reply(
+                text,
+                portable_pty::conpty_passthrough_active(),
+            )),
+            other => other,
         };
         let Some(event) = self.2.lock_or_recover().absorb(event) else {
             return;
@@ -5611,6 +5668,30 @@ mod tests {
         batch
             .lock_or_recover()
             .finish(ev.clean_claude, ev.pty_replies)
+    }
+
+    /// Primary DA lists Sixel (parameter 4, not the VT420 level 64) only
+    /// when the ConPTY host actually passes DCS through. A cursor report
+    /// is not rewritten.
+    #[test]
+    fn da1_advertises_sixel_only_when_passthrough_is_active() {
+        let off = da1_reply(false);
+        let on = da1_reply(true);
+        assert_eq!(off, "\u{1b}[?6c");
+        assert!(!da1_advertises_sixel(off), "{off:?}");
+        assert!(da1_advertises_sixel(on), "{on:?}");
+        assert!(on.starts_with("\u{1b}[?64;"), "{on:?}");
+        assert!(on.contains(";4c"), "{on:?}");
+        // The level itself contains the digit 4. That is not the attribute.
+        assert!(!da1_advertises_sixel("\u{1b}[?64c"));
+        assert!(da1_advertises_sixel("\u{1b}[?64;1;4;6c"));
+        assert_eq!(map_pty_reply("\u{1b}[?6c".into(), false), "\u{1b}[?6c");
+        assert_eq!(map_pty_reply("\u{1b}[?6c".into(), true), on);
+        assert_eq!(
+            map_pty_reply("\u{1b}[1;1R".into(), true),
+            "\u{1b}[1;1R",
+            "a cursor report is not a DA"
+        );
     }
 
     /// RESEXHAUST-001: one read of BEL bytes and terminal queries used to

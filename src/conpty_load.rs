@@ -74,10 +74,156 @@ fn resolver_never_calls_a_bare_name_load() {
 }
 
 #[test]
+fn create_flags_follow_the_host() {
+    use crate::conpty_resolve::{
+        create_flags, ConptyCapability, ConptyCreate, BUNDLED_LOAD_FLAGS, CONPTY_BASE_FLAGS,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
+        PSEUDOCONSOLE_PASSTHROUGH_MODE,
+    };
+
+    let inbox = create_flags(ConptyCapability::Inbox);
+    let legacy = create_flags(ConptyCapability::LegacyPassthrough);
+    let bundled = create_flags(ConptyCapability::BundledRewrite);
+    assert_eq!(
+        inbox,
+        ConptyCreate {
+            flags: CONPTY_BASE_FLAGS,
+            passthrough: false,
+        }
+    );
+    assert_eq!(inbox.flags & PSEUDOCONSOLE_PASSTHROUGH_MODE, 0);
+    // The pre-rewrite host is the only one that is asked for bit 0x8.
+    // On a 1.22+ conpty.dll that bit is glyph width, and passthrough is
+    // the default, so the flags stay the base set.
+    assert_eq!(
+        legacy,
+        ConptyCreate {
+            flags: CONPTY_BASE_FLAGS | PSEUDOCONSOLE_PASSTHROUGH_MODE,
+            passthrough: true,
+        }
+    );
+    assert_eq!(legacy.flags, 0x1 | 0x2 | 0x4 | 0x8);
+    assert_eq!(
+        bundled,
+        ConptyCreate {
+            flags: CONPTY_BASE_FLAGS,
+            passthrough: true,
+        }
+    );
+    assert_eq!(bundled.flags, inbox.flags);
+    assert_ne!(bundled.passthrough, inbox.passthrough);
+    // A bundled load is an absolute path with both search flags. Flags 0
+    // would search the exe directory, the current directory, and PATH.
+    assert_eq!(
+        BUNDLED_LOAD_FLAGS,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32
+    );
+    assert_ne!(BUNDLED_LOAD_FLAGS, 0);
+    assert_ne!(BUNDLED_LOAD_FLAGS, LOAD_LIBRARY_SEARCH_SYSTEM32);
+}
+
+#[test]
+fn bundled_pair_is_passthrough_only_at_1_22_with_both_files() {
+    use crate::conpty_resolve::{
+        capability_from_probe, file_version_from_fixed, BundleProbe, ConptyCapability,
+    };
+
+    let rewrite = Some((1, 24, 2604, 2001));
+    assert_eq!(
+        capability_from_probe(BundleProbe {
+            dll_is_file: true,
+            open_console_is_file: true,
+            version: rewrite,
+        }),
+        ConptyCapability::BundledRewrite
+    );
+    assert_eq!(
+        capability_from_probe(BundleProbe {
+            dll_is_file: true,
+            open_console_is_file: true,
+            version: Some((1, 22, 0, 0)),
+        }),
+        ConptyCapability::BundledRewrite
+    );
+    // The planted-DLL case: conpty.dll beside the exe, no OpenConsole.exe.
+    assert_eq!(
+        capability_from_probe(BundleProbe {
+            dll_is_file: true,
+            open_console_is_file: false,
+            version: rewrite,
+        }),
+        ConptyCapability::Inbox
+    );
+    assert_eq!(
+        capability_from_probe(BundleProbe {
+            dll_is_file: false,
+            open_console_is_file: true,
+            version: rewrite,
+        }),
+        ConptyCapability::Inbox
+    );
+    // 1.21 still has the old engine. Do not advertise passthrough.
+    assert_eq!(
+        capability_from_probe(BundleProbe {
+            dll_is_file: true,
+            open_console_is_file: true,
+            version: Some((1, 21, 0, 0)),
+        }),
+        ConptyCapability::Inbox
+    );
+    // No version resource: do not guess.
+    assert_eq!(
+        capability_from_probe(BundleProbe {
+            dll_is_file: true,
+            open_console_is_file: true,
+            version: None,
+        }),
+        ConptyCapability::Inbox
+    );
+    // Inbox conhost is 10.0.x. A major other than 1 is not the NuGet pair.
+    assert_eq!(
+        capability_from_probe(BundleProbe {
+            dll_is_file: true,
+            open_console_is_file: true,
+            version: Some((10, 0, 26100, 1)),
+        }),
+        ConptyCapability::Inbox
+    );
+
+    let mut fixed = [0u8; 16];
+    fixed[0..4].copy_from_slice(&0xFEEF_04BDu32.to_le_bytes());
+    // 1.24.2604.2001
+    let ms: u32 = (1u32 << 16) | 24;
+    let ls: u32 = (2604u32 << 16) | 2001;
+    fixed[8..12].copy_from_slice(&ms.to_le_bytes());
+    fixed[12..16].copy_from_slice(&ls.to_le_bytes());
+    assert_eq!(file_version_from_fixed(&fixed), Some((1, 24, 2604, 2001)));
+    assert!(file_version_from_fixed(&fixed[..15]).is_none());
+    fixed[0] = 0;
+    assert!(file_version_from_fixed(&fixed).is_none());
+}
+
+#[test]
+fn kernel32_file_version_is_readable() {
+    let path = system32_dir().join("kernel32.dll");
+    let text = path.to_str().expect("system32 path is unicode");
+    let version = conpty_resolve::read_file_version(text);
+    assert!(
+        version.is_some(),
+        "GetFileVersionInfoW(kernel32.dll) returned nothing for {}",
+        path.display()
+    );
+}
+
+#[test]
 fn search_flag_matches_windows_sys() {
     assert_eq!(
         LOAD_LIBRARY_SEARCH_SYSTEM32,
         windows_sys::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_SYSTEM32
+    );
+    assert_eq!(
+        crate::conpty_resolve::LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+        windows_sys::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
     );
 }
 

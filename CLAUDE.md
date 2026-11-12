@@ -51,14 +51,14 @@ selection and BiDi paths must do.
 | `a11y.rs` | High Contrast color mapping and the system text-size multiplier, pure and tested; the Win32 read sits behind `read_snapshot` |
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `screen_reader.rs` | screen-reader tree: each pane is a document in logical order, with the caret, the selection, and a coalesced live region (AccessKit, which speaks UIA on Windows) |
-| `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
+| `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, the passthrough flag choice, and vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-831 tests across the tree. `render.rs` (100), `term.rs` (99) and `link.rs`
-(66) carry the most; `lua_host.rs` has 46, `shellint.rs` 24, `images.rs` and
-`localpath.rs` 21 each, `mux.rs` 15, `config_watch.rs` 14, `screen_reader.rs`
-11 and `ssh.rs` 7. Three more in `term.rs` are `#[ignore]`d probes, run by
-hand (see Measuring).
+836 tests across the tree. `render.rs` and `term.rs` (100 each) and
+`link.rs` (66) carry the most; `lua_host.rs` has 46, `shellint.rs` 24,
+`images.rs` 22, `localpath.rs` 21, `mux.rs` 15, `config_watch.rs` 14,
+`screen_reader.rs` 11 and `ssh.rs` 7. Three more in `term.rs` are
+`#[ignore]`d probes, run by hand (see Measuring).
 
 ## Measuring
 
@@ -187,6 +187,22 @@ desktop behind the window — `LWA_ALPHA` blends the whole window uniformly and
 bypasses DWM's blur, so the layered-window transparency Bayan already has and
 the accent blur are mutually exclusive. The existing `opacity` setting is the
 only transparency available on this path.
+
+**ConPTY passthrough is a bundled OpenConsole, not bit 0x8.** Inbox
+kernel32 still strips DCS and APC on Windows 11 24H2/25H2, so Sixel and
+Kitty do not arrive and primary DA stays `CSI ? 6 c`. Bit `0x8` was
+`--passthrough` on old OpenConsole and is `PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES`
+on conpty.dll 1.22+; do not set it. The host that passes VT through is
+`<exe_dir>\conpty.dll` plus `<exe_dir>\OpenConsole.exe`, file version 1.22
+or newer, loaded by that absolute path (`LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+LOAD_LIBRARY_SEARCH_SYSTEM32`). A DLL alone, a bare name, the current
+directory, and `PATH` are not a host. If that `CreatePseudoConsole` fails,
+the pane opens on kernel32. DA advertises Sixel (`CSI ? 64 ; 4 c`) only
+after a bundled pseudoconsole has been created. The binaries are not in
+the repo. Image caps still come from `images` in config.json and are
+reapplied to open panes on reload. Do not move the cursor for an image:
+conhost, and a host that is not actually passing DCS through, would
+desync the rows.
 
 **Elevation is a UAC prompt and nothing else.** `--elevated` calls
 `ShellExecuteW` with verb `runas` and exits. The new process receives
