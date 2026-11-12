@@ -7911,10 +7911,11 @@ fn try_set_window_subclass(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
     let Some(sym) = sym else {
         return false;
     };
-    // SAFETY: the export name is SetWindowSubclass, whose ABI is the
-    // function type below. The hwnd is this window's live handle.
+    // SAFETY: the export name is SetWindowSubclass, whose ABI is SetSubclass.
     let set =
         unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, SetSubclass>(sym) };
+    // SAFETY: hwnd is this window's live handle, and the procedure is the
+    // subclass installed for it.
     unsafe { set(hwnd, Some(a11y_subclass_proc), A11Y_SUBCLASS_ID, 0) != 0 }
 }
 
@@ -8126,6 +8127,8 @@ mod tests {
             );
         }
         A11Y_DIRTY.store(false, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: a null hwnd returns before DefSubclassProc. WM_PAINT is
+        // not a settings message, so the dirty bit stays clear.
         unsafe {
             a11y_subclass_proc(std::ptr::null_mut(), 0x000F, 0, 0, 0, 0);
         }

@@ -411,6 +411,14 @@ fn dim((r, g, b): (u8, u8, u8)) -> (u8, u8, u8) {
 /// A preferred width between `min_w` and `max_w`. `i32::clamp` panics when
 /// the floor is above the ceiling, which a 150% text size does to a 700px
 /// window (`430 * 1.5` against `fw - 60`). The ceiling wins.
+fn clamp_rect_bottom(r: Rect, limit: i32) -> Rect {
+    if r.1 + r.3 > limit {
+        (r.0, r.1, r.2, (limit - r.1).max(1))
+    } else {
+        r
+    }
+}
+
 fn span_in(preferred: i32, min_w: i32, max_w: i32) -> i32 {
     let max_w = max_w.max(0);
     preferred.max(min_w).min(max_w)
@@ -1247,15 +1255,8 @@ impl SettingsLayout {
         if self.card.1 + self.card.3 > limit {
             self.card.3 = (limit - self.card.1).max(1);
         }
-        let clamp_bottom = |r: Rect| {
-            if r.1 + r.3 > limit {
-                (r.0, r.1, r.2, (limit - r.1).max(1))
-            } else {
-                r
-            }
-        };
-        self.close_toggle = clamp_bottom(self.close_toggle);
-        self.appearance_btns = self.appearance_btns.map(clamp_bottom);
+        self.close_toggle = clamp_rect_bottom(self.close_toggle, limit);
+        self.appearance_btns = self.appearance_btns.map(|r| clamp_rect_bottom(r, limit));
     }
 }
 
