@@ -1110,7 +1110,12 @@ Git's own prompt is kept. Elevated WSL bash still reads the distro's
 read. Inherited `XDG_DATA_DIRS`, `XDG_CONFIG_HOME`,
 `BASH_COMPLETION_USER_FILE` and `BASH_COMPLETION_COMPAT_DIR` are cleared
 first. After `HOME` returns, `BASH_COMPLETION_USER_DIR` stays on the
-integration directory so Tab does not source the user's completions. Elevated zsh ends `.zlogin` with
+integration directory. Tab completion then runs with a `PATH` that was
+filtered before it was made local, and is never empty: `/mnt` entries,
+relative entries, and directories that are not root-owned or that are
+group- or world-writable are removed, and a command path is reduced to
+its name so a completion beside `/mnt/c/.../bin` or `./zzcmd` is not
+sourced. ssh and the other system completions still load. Elevated zsh ends `.zlogin` with
 `unsetopt rcs`, so exit does not read `~/.zlogout`. oh-my-posh is not inited from the user
 profile. A failed elevation query is treated as elevated. Elevated scripts
 are created under the real ProgramData folder

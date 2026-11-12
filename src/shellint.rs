@@ -448,22 +448,22 @@ unset __bayan_completion_dir
 # beside every PATH entry that ends in /bin. WSL appends /mnt/c/...
 # directories the user can write. Run the loaders with those removed.
 __bayan_safe_path() {
-  local _p _out= _uid _mode
+  local _p _q _out= _uid _mode
   local IFS=:
   for _p in $PATH; do
     case "$_p" in
-      ''|/mnt|/*/mnt/*) continue ;;
+      /mnt|/mnt/*|*/mnt/*) continue ;;
+      /*) ;;
+      *) continue ;;
     esac
-    if [ -e "$_p" ]; then
-      _uid=$(stat -c %u "$_p" 2>/dev/null) || _uid=
-      _mode=$(stat -c %a "$_p" 2>/dev/null) || _mode=
-      if [ -n "$_uid" ] && [ "$_uid" != 0 ]; then
-        continue
-      fi
-      case "$_mode" in
-        *[2367]) continue ;;
-      esac
-    fi
+    [ -d "$_p" ] || continue
+    for _q in "$_p" "${_p%/*}"; do
+      [ -n "$_q" ] || _q=/
+      _uid=$(/usr/bin/stat -L -c %u -- "$_q" 2>/dev/null) || continue 2
+      _mode=$(/usr/bin/stat -L -c %a -- "$_q" 2>/dev/null) || continue 2
+      [ "$_uid" = 0 ] || continue 2
+      case "$_mode" in *[2367]?|*[2367]) continue 2 ;; esac
+    done
     _out="${_out:+$_out:}$_p"
   done
   printf '%s\n' "$_out"
@@ -474,7 +474,14 @@ __bayan_wrap_loader() {
   _orig=__bayan_orig_${_name}
   _def=$(declare -f "$_name") || return 0
   eval "${_def/$_name/$_orig}"
-  eval "$_name() { local PATH; PATH=\$(__bayan_safe_path); $_orig \"\$@\"; }"
+  eval "$_name() {
+    local __bayan_sp
+    __bayan_sp=\$(__bayan_safe_path)
+    local PATH=\${__bayan_sp:-/usr/sbin:/usr/bin:/sbin:/bin}
+    local -a __bayan_a=(\"\$@\")
+    (( \${#__bayan_a[@]} )) && __bayan_a[-1]=\${__bayan_a[-1]##*/}
+    $_orig \"\${__bayan_a[@]}\"
+  }"
 }
 __bayan_wrap_loader _comp_load
 __bayan_wrap_loader __load_completion
@@ -2452,6 +2459,17 @@ mod tests {
             "{git}"
         );
         assert!(wsl.contains("__bayan_completion_dir=$__bayan_safe/bash-completion"));
+        // The loader must see the real PATH, then a non-empty safe one.
+        // Returning `$PATH` unchanged, or assigning PATH before the filter
+        // runs, fails the planted-completion test below.
+        assert!(wsl.contains("local __bayan_sp"));
+        assert!(wsl.contains(r"__bayan_sp=\$(__bayan_safe_path)"));
+        assert!(wsl.contains(r"local PATH=\${__bayan_sp:-/usr/sbin:/usr/bin:/sbin:/bin}"));
+        assert!(wsl.contains("/mnt|/mnt/*|*/mnt/*"));
+        assert!(wsl.contains("/usr/bin/stat -L"));
+        assert!(wsl.contains(r#"[ "$_uid" = 0 ]"#));
+        assert!(wsl.contains("*[2367]?|*[2367]"));
+        assert!(wsl.contains(r"__bayan_a[-1]=\${__bayan_a[-1]##*/}"));
     }
 
     #[test]
@@ -2642,15 +2660,22 @@ mod tests {
     #[test]
     fn materialize_saves_the_real_home_for_elevated_bash() {
         let plan = plan(bash_git(), true, true, NONCE).unwrap();
+        let previous = std::env::var_os("HOME");
+        std::env::set_var("HOME", r"C:\Users\bayan-fixed-home");
         let done = materialize(&plan).expect("elevated materialize");
-        let dir = done.dir.clone().expect("dir");
+        match &previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
         let saved = done
             .env
             .iter()
             .find(|(k, _)| k == REAL_HOME_ENV)
             .map(|(_, v)| v.clone());
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(saved.as_deref(), Some(saved_home().as_str()));
+        if let Some(dir) = done.dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        assert_eq!(saved.as_deref(), Some(r"C:\Users\bayan-fixed-home"));
     }
 
     #[test]
@@ -2666,34 +2691,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let bin = root.join("mnt/c/cargo/bin");
         let comp = root.join("mnt/c/cargo/share/bash-completion/completions");
+        let proj = root.join("proj");
+        let rel_comp = root.join("share/bash-completion/completions");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&comp).unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(&rel_comp).unwrap();
         let marker = root.join("PWNED");
         let marker_bash = marker.display().to_string().replace('\\', "/");
-        std::fs::write(
-            comp.join("zzcmd"),
-            format!("printf 'PWN\\n' > '{marker_bash}'\n"),
-        )
-        .unwrap();
+        let plant = format!("printf 'PWN\\n' >> '{marker_bash}'\n");
+        std::fs::write(comp.join("zzcmd"), &plant).unwrap();
+        std::fs::write(rel_comp.join("zzcmd"), &plant).unwrap();
+        std::fs::write(proj.join("zzcmd"), "#!/usr/bin/bash\nexit 0\n").unwrap();
+        std::fs::write(proj.join("realpath"), format!("#!/usr/bin/bash\n{plant}")).unwrap();
         let wsl = plan(r"C:\Windows\System32\wsl.exe -d Ubuntu", true, true, NONCE).unwrap();
         let guard = file(&wsl, "bash.sh");
         let start = guard.find("__bayan_safe_path()").expect("filter");
         let script = format!(
             r#"
 _comp_load() {{
+  printf 'CMD=%s\n' "${{@: -1}}"
+  printf 'PATHSEEN=%s\n' "$PATH"
+  realpath / >/dev/null 2>&1 || true
+  local cmd="${{@: -1}}"
+  if [[ $cmd == /* || $cmd == ./* ]]; then
+    local base="${{cmd##*/}}"
+    local here="${{cmd%/*}}"
+    local f="$here/../share/bash-completion/completions/$base"
+    if [ -f "$f" ]; then . "$f"; fi
+  fi
   local dir
   local IFS=:
   for dir in $PATH; do
     case "$dir" in
       */bin|*/sbin)
-        dir="${{dir%/*}}/share/bash-completion/completions"
-        if [ -f "$dir/$1" ]; then . "$dir/$1"; fi
+        local hit="${{dir%/*}}/share/bash-completion/completions/${{cmd##*/}}"
+        if [ -f "$hit" ]; then . "$hit"; fi
         ;;
     esac
   done
 }}
 {guard}
-_comp_load zzcmd
+_comp_load "$MNT_BIN/zzcmd"
+_comp_load ./zzcmd
+_comp_load /usr/bin/ssh
 printf 'DONE\n'
 "#,
             guard = &guard[start..]
@@ -2724,20 +2765,30 @@ printf 'DONE\n'
             .arg("--norc")
             .arg("-c")
             .arg(&script)
+            .current_dir(&proj)
             .env("PATH", format!("{bin_posix}:/usr/bin"))
+            .env("MNT_BIN", &bin_posix)
             .output()
             .expect("bash");
         let text = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
         let pwned = std::fs::read_to_string(&marker).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&root);
         assert!(
             text.contains("DONE"),
-            "loader did not finish: {text}\n{}",
-            String::from_utf8_lossy(&output.stderr)
+            "loader did not finish: {text}\n{err}"
         );
         assert!(
             pwned.is_empty(),
-            "planted completion under {bin_posix} ran: {pwned}"
+            "planted realpath or completion ran ({bin_posix}): {pwned}\n{text}"
+        );
+        assert!(
+            text.contains("PATHSEEN=") && text.contains("/usr/bin"),
+            "filtered PATH dropped /usr/bin, so ssh completion cannot load:\n{text}"
+        );
+        assert!(
+            text.contains("CMD=zzcmd") && text.contains("CMD=ssh"),
+            "command paths were not reduced to a basename:\n{text}"
         );
     }
 }

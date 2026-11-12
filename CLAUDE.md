@@ -230,9 +230,15 @@ profile with `HOME` pointed at the rcfile directory, after clearing
 inherited `XDG_DATA_DIRS`, `XDG_CONFIG_HOME`, `BASH_COMPLETION_USER_FILE`
 and `BASH_COMPLETION_COMPAT_DIR`. Once `HOME` is real again,
 `BASH_COMPLETION_USER_DIR` is the integration directory for both Git Bash
-and WSL. The WSL loaders `_comp_load` and `__load_completion` then run
-with `/mnt` and user-owned or world-writable `PATH` entries removed, so a
-completion planted beside a Windows `bin` directory is not sourced. A failed
+and WSL. The WSL loaders `_comp_load` and `__load_completion` compute a
+safe `PATH` before `local`, and never leave it empty (the fallback is
+`/usr/sbin:/usr/bin:/sbin:/bin`). Entries that are not absolute, are under
+`/mnt`, or are not a root-owned directory (the entry and its parent,
+following links) with no group or world write are dropped, using
+`/usr/bin/stat`. The command name is passed without its directory, so
+`/mnt/c/.../bin/zzcmd` and `./zzcmd` do not load a completion from that
+folder. System completions such as ssh still load from the remaining
+`PATH`. A failed
 elevation query is treated as elevated. `shellint` takes the `elevated` flag `Session::spawn` is given, which is
 `elevate::process_is_elevated`, the one token query in the tree.
 The script directory comes from `SHGetKnownFolderPath(FOLDERID_ProgramData)`
