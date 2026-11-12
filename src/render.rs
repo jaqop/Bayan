@@ -420,7 +420,6 @@ fn clamp_rect_bottom(r: Rect, limit: i32) -> Rect {
 /// A preferred width between `min_w` and `max_w`. `i32::clamp` panics when
 /// the floor is above the ceiling, which a 150% text size does to a 700px
 /// window (`430 * 1.5` against `fw - 60`). The ceiling wins.
-
 fn span_in(preferred: i32, min_w: i32, max_w: i32) -> i32 {
     let max_w = max_w.max(0);
     preferred.max(min_w).min(max_w)
@@ -2421,6 +2420,7 @@ struct RowShape {
 
 /// Cache key: the exact rich-text content (text + color + style) + alignment.
 type RunKey = (Vec<Seg>, bool, bool, u32, bool);
+type ContrastCache = std::collections::HashMap<((u8, u8, u8), (u8, u8, u8)), (u8, u8, u8)>;
 type CellGeometry = Vec<(i32, i32, bool)>; // visual x, width, logical RTL
 type RowHit = (i32, i32, usize, bool); // x, width, column, logical RTL
 
@@ -2468,7 +2468,7 @@ pub struct Renderer {
     chrome: crate::a11y::ChromeColors,
     /// `(fg, bg) -> adjusted fg` for High Contrast cell text. Cleared with
     /// the renderer, so a theme change cannot serve a stale pair.
-    contrast_cache: std::collections::HashMap<((u8, u8, u8), (u8, u8, u8)), (u8, u8, u8)>,
+    contrast_cache: ContrastCache,
     cache_hot: std::collections::HashMap<RunKey, ShapedRun>,
     cache_cold: std::collections::HashMap<RunKey, ShapedRun>,
     pub atlas: Atlas,
@@ -10485,8 +10485,10 @@ mod cache_tests {
             (Some((0, 0, 128)), false, (255, 255, 255)),
         ];
         for (hotlight, _dark_page, bg) in cases {
-            let mut cfg = crate::config::UserConfig::default();
-            cfg.bg = Some(format!("#{:02x}{:02x}{:02x}", bg.0, bg.1, bg.2));
+            let cfg = crate::config::UserConfig {
+                bg: Some(format!("#{:02x}{:02x}{:02x}", bg.0, bg.1, bg.2)),
+                ..crate::config::UserConfig::default()
+            };
             let high_contrast = hotlight.is_some();
             let mut colors = crate::a11y::A11ySnapshot::neutral().colors;
             colors.window = (255, 255, 255);
@@ -10586,8 +10588,10 @@ mod cache_tests {
 
     #[test]
     fn paused_progress_bar_clears_three_to_one_on_white() {
-        let mut cfg = crate::config::UserConfig::default();
-        cfg.bg = Some("#ffffff".into());
+        let cfg = crate::config::UserConfig {
+            bg: Some("#ffffff".into()),
+            ..crate::config::UserConfig::default()
+        };
         let mut r = Renderer::with_a11y(1.0, &cfg, 0.0, crate::a11y::A11ySnapshot::neutral());
         let expected = r.accent_color(crate::theme::bar_accent(
             crate::theme::BarAccent::Amber,

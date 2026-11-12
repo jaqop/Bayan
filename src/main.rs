@@ -7977,17 +7977,14 @@ fn load_comctl() -> Option<ComctlFns> {
     let remove = proc_of(b"RemoveWindowSubclass\0")?;
     // SAFETY: each name is the export of that exact ABI. A function
     // pointer is the same size as every other function pointer.
-    Some(ComctlFns {
-        set: unsafe {
-            std::mem::transmute::<unsafe extern "system" fn() -> isize, SetSubclassFn>(set)
-        },
-        def: unsafe {
-            std::mem::transmute::<unsafe extern "system" fn() -> isize, DefSubclassFn>(def)
-        },
-        remove: unsafe {
-            std::mem::transmute::<unsafe extern "system" fn() -> isize, RemoveSubclassFn>(remove)
-        },
-    })
+    let (set, def, remove) = unsafe {
+        (
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, SetSubclassFn>(set),
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, DefSubclassFn>(def),
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, RemoveSubclassFn>(remove),
+        )
+    };
+    Some(ComctlFns { set, def, remove })
 }
 
 fn try_set_window_subclass(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
