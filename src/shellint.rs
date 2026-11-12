@@ -2563,7 +2563,7 @@ mod tests {
         let _ = writeln!(stdin, "printf 'MSYSTEM=%s\\n' \"$MSYSTEM\"");
         let _ = writeln!(stdin, "printf 'AFTER=%s\\n' \"$HOME\"");
         let _ = writeln!(stdin, "printf 'BCUD=%s\\n' \"$BASH_COMPLETION_USER_DIR\"");
-        let _ = writeln!(stdin, "printf 'SAVED=%s\\n' \"${BAYAN_SI_HOME-}\"");
+        let _ = writeln!(stdin, "printf 'SAVED=%s\\n' \"${{BAYAN_SI_HOME-}}\"");
         let _ = writeln!(
             stdin,
             "command -v ls >/dev/null && printf 'LS=ok\\n' || printf 'LS=missing\\n'"
