@@ -1129,6 +1129,8 @@ fn context_menu_rows(
 /// (PowerShell, PowerShell 7, cmd, Git Bash, each WSL distro), the default
 /// for new tabs marked. Detection runs on a background thread at startup;
 /// until it reports, the two shells every Windows has stand in.
+/// The live menu is [`shellmenu::build`]; this remains for the row tests.
+#[cfg(test)]
 fn shell_menu_rows(profiles: &[shells::Shell], default: &str) -> Vec<(PaletteRow, String)> {
     let listed: Vec<(String, String)> = if profiles.is_empty() {
         [
@@ -2627,16 +2629,20 @@ impl App {
         };
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => {
-                self.palette = None;
-                if arrow_menu {
-                    self.shell_arrow_focused = true;
+                let close = matches!(
+                    shellmenu::menu_action(shellmenu::MenuKey::Escape, lang::rtl()),
+                    shellmenu::MenuAction::Close
+                );
+                if close {
+                    self.palette = None;
+                    if arrow_menu && shellmenu::focus_after(false) == shellmenu::FocusAfter::Arrow {
+                        self.shell_arrow_focused = true;
+                    }
                 }
             }
-            Key::Named(NamedKey::Backspace) => {
-                if !p.shell_arrow {
-                    p.query.pop();
-                    p.sel = 0;
-                }
+            Key::Named(NamedKey::Backspace) if !p.shell_arrow => {
+                p.query.pop();
+                p.sel = 0;
             }
             Key::Named(
                 k @ (NamedKey::ArrowDown
@@ -2676,29 +2682,32 @@ impl App {
                 }
             }
             Key::Named(NamedKey::Enter) => {
-                let q = p.query.clone();
-                let sel = p.sel;
-                if let Some((row, _)) = self.palette_rows(&q).into_iter().nth(sel) {
-                    self.palette_run(row, el);
-                    return;
+                let pick = !p.shells_menu
+                    || matches!(
+                        shellmenu::menu_action(shellmenu::MenuKey::Enter, lang::rtl()),
+                        shellmenu::MenuAction::Pick
+                    );
+                if pick {
+                    let q = p.query.clone();
+                    let sel = p.sel;
+                    if let Some((row, _)) = self.palette_rows(&q).into_iter().nth(sel) {
+                        self.palette_run(row, el);
+                        return;
+                    }
+                    self.palette = None;
                 }
-                self.palette = None;
             }
-            Key::Character(c) => {
+            Key::Character(c) if !p.shell_arrow => {
                 // The arrow's menu is a menu, not a search field.
-                if !p.shell_arrow {
-                    p.query.push_str(c);
-                    p.sel = 0; // a new filter invalidates the old position
-                }
+                p.query.push_str(c);
+                p.sel = 0; // a new filter invalidates the old position
             }
             // winit names the space bar; without this a label with a space
             // in it (most Arabic labels, every tab name of two words) could
             // not be typed
-            Key::Named(NamedKey::Space) => {
-                if !p.shell_arrow {
-                    p.query.push(' ');
-                    p.sel = 0;
-                }
+            Key::Named(NamedKey::Space) if !p.shell_arrow => {
+                p.query.push(' ');
+                p.sel = 0;
             }
             _ => {}
         }
@@ -2797,11 +2806,24 @@ impl App {
     fn palette_run(&mut self, row: PaletteRow, el: &ActiveEventLoop) {
         self.palette = None;
         // A pick leaves the menu. Focus goes to the new tab, not the arrow.
-        self.shell_arrow_focused = false;
+        if shellmenu::focus_after(true) == shellmenu::FocusAfter::Tab {
+            self.shell_arrow_focused = false;
+        }
         match row {
             // the SAME dispatch a keybinding uses, not a parallel copy
             PaletteRow::Builtin(a) => self.perform_action(a, el),
             PaletteRow::Shell(command) => {
+                let chosen = shellmenu::Row {
+                    kind: shellmenu::Kind::Shell,
+                    label: String::new(),
+                    announce: String::new(),
+                    command,
+                };
+                let mut opened = Vec::new();
+                if !shellmenu::open_tab(std::slice::from_ref(&chosen), 0, &mut opened) {
+                    return;
+                }
+                let command = opened.remove(0).command;
                 let cwd = self
                     .session()
                     .and_then(|s| s.meta.lock_or_recover().spawn_cwd());

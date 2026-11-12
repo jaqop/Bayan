@@ -16,7 +16,7 @@
 //! which is the path that pins an elevated Git Bash `HOME` and sets its
 //! integration environment.
 
-use crate::lang::{self, tr};
+use crate::lang::tr;
 use crate::shells::{self, Shell};
 
 /// What a row does.
