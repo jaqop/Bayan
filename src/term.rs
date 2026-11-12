@@ -2033,10 +2033,14 @@ pub(crate) fn commit_replies(mut out: ChunkOutput, suppress: bool) -> ChunkOutpu
 
 /// Paint `data` and throw away every reply it provoked, including one that
 /// a still-open synchronized update would emit when it is closed.
-fn feed_replay(
-    term: &FairMutex<Term<EventProxy>>,
-    meta: &Mutex<SessionMeta>,
-    parser: &Mutex<Processor>,
+///
+/// `batch` must be the listener's batch. `begin` keeps `PtyWrite` inside
+/// that batch; without it the listener posts the reply immediately and it
+/// can be written into the live session.
+pub(crate) fn feed_replay<T: EventListener>(
+    term: &mut Term<T>,
+    meta: &mut SessionMeta,
+    parser: &mut Processor,
     batch: &Mutex<EventBatch>,
     data: &[u8],
 ) {
@@ -2044,11 +2048,8 @@ fn feed_replay(
         return;
     }
     let mut carry = Vec::new();
-    let mut t = term.lock();
-    let mut m = meta.lock_or_recover();
-    let mut p = parser.lock_or_recover();
     batch.lock_or_recover().begin();
-    let ev = process_chunk(&mut p, &mut t, &mut m, &mut carry, data);
+    let ev = process_chunk(parser, term, meta, &mut carry, data);
     let _ = commit_replies(
         batch
             .lock_or_recover()
@@ -2056,7 +2057,7 @@ fn feed_replay(
         true,
     );
     batch.lock_or_recover().begin();
-    p.stop_sync(&mut *t);
+    parser.stop_sync(term);
     let _ = commit_replies(batch.lock_or_recover().finish(false, Vec::new()), true);
 }
 
@@ -2384,7 +2385,12 @@ impl Session {
             ..SessionMeta::default()
         }));
         let parser = Arc::new(Mutex::new(Processor::new()));
-        feed_replay(&term, &meta, &parser, &batch, &replay);
+        {
+            let mut t = term.lock();
+            let mut m = meta.lock_or_recover();
+            let mut p = parser.lock_or_recover();
+            feed_replay(&mut t, &mut m, &mut p, &batch, &replay);
+        }
         let capture_term = Arc::clone(&term);
         let capture_meta = Arc::clone(&meta);
         let error_proxy = proxy.clone();
@@ -4446,6 +4452,35 @@ mod tests {
             dropped.replies.is_empty(),
             "a replay must not write any query reply: {}",
             dropped.replies
+        );
+    }
+
+    /// DECRQM and `CSI 18 t` are not stripped from the saved bytes. They are
+    /// answered by the parser, and `feed_replay` has to hold those answers
+    /// inside the batch. Without `batch.begin` they post immediately.
+    #[test]
+    fn feed_replay_posts_nothing_for_dec_rqm_window_size_or_dsr() {
+        let data = b"\x1b[?2004$p\x1b[18t\x1b[6n";
+        let (mut term, batch, posted) = batch_term();
+        let mut parser = Processor::new();
+        let mut meta = SessionMeta::default();
+        feed_replay(&mut term, &mut meta, &mut parser, &batch, data);
+        let posts = posted.lock_or_recover().clone();
+        assert!(
+            posts.iter().all(|event| !event.contains("PtyWrite")),
+            "replay wrote into the session: {posts:?}"
+        );
+
+        let (mut live, live_batch, live_posted) = batch_term();
+        let mut parser = Processor::new();
+        let mut meta = SessionMeta::default();
+        let mut carry = Vec::new();
+        process_chunk(&mut parser, &mut live, &mut meta, &mut carry, data);
+        let _ = live_batch;
+        let live_posts = live_posted.lock_or_recover().clone();
+        assert!(
+            live_posts.iter().any(|event| event.contains("PtyWrite")),
+            "these queries must be answered when they are not a replay: {live_posts:?}"
         );
     }
 

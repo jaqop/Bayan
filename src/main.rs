@@ -1308,6 +1308,21 @@ fn plugin_pending(label: &str, send: &str, pane: Option<u64>) -> PendingPaste {
     }
 }
 
+/// SSH and mux rows shared by the command palette and the right-click menu.
+/// An elevated window gets neither: SSH would run `~/.ssh/config` as admin,
+/// and the mux pipe is not labeled for a High server.
+fn ssh_and_mux_rows(mux_enabled: bool, elevated: bool) -> Vec<(PaletteRow, String)> {
+    let mut rows = Vec::new();
+    if ssh::offered(elevated) {
+        rows.push((PaletteRow::OpenSsh, ssh::label_open().to_string()));
+    }
+    if mux::mux_may_run(mux_enabled, elevated) {
+        rows.push((PaletteRow::DetachSession, mux::label_detach().to_string()));
+        rows.push((PaletteRow::OpenDetached, mux::label_reattach().to_string()));
+    }
+    rows
+}
+
 fn palette_extras(
     profiles: &[shells::Shell],
     links: &[link::LinkSpan],
@@ -2014,14 +2029,10 @@ impl App {
             })
             .unwrap_or_default();
         let mut extras = palette_extras(&self.shell_profiles, &links);
-        let elevated = mux::is_elevated();
-        if ssh::offered(elevated) {
-            extras.push((PaletteRow::OpenSsh, ssh::label_open().to_string()));
-        }
-        if mux::mux_may_run(self.config.mux_enabled(), elevated) {
-            extras.push((PaletteRow::DetachSession, mux::label_detach().to_string()));
-            extras.push((PaletteRow::OpenDetached, mux::label_reattach().to_string()));
-        }
+        extras.extend(ssh_and_mux_rows(
+            self.config.mux_enabled(),
+            mux::is_elevated(),
+        ));
         self.palette = Some(Palette {
             query,
             rename: None,
@@ -4555,15 +4566,11 @@ impl App {
                 (t.panes.len(), t.zoomed, t.broadcast)
             });
         let mut rows = context_menu_rows(self.has_selection(), panes, zoomed, broadcast);
-        let elevated = mux::is_elevated();
-        if ssh::offered(elevated) {
-            rows.push((PaletteRow::OpenSsh, ssh::label_open().to_string()));
-        }
-        if mux::mux_may_run(self.config.mux_enabled(), elevated) {
-            rows.push((PaletteRow::OpenDetached, mux::label_reattach().to_string()));
-            if self.focused_is_mux() {
-                rows.push((PaletteRow::DetachSession, mux::label_detach().to_string()));
+        for (row, label) in ssh_and_mux_rows(self.config.mux_enabled(), mux::is_elevated()) {
+            if matches!(row, PaletteRow::DetachSession) && !self.focused_is_mux() {
+                continue;
             }
+            rows.push((row, label));
         }
         rows
     }
@@ -6949,6 +6956,28 @@ mod palette_tests {
             format!("{extra} نتيجة · Enter تشغيل · ↑↓ تنقّل · Esc إغلاق"),
         );
         assert_eq!(render::palette_hint(0), "لا نتائج · Esc إغلاق");
+    }
+
+    #[test]
+    fn elevated_palette_rows_hide_ssh_and_the_mux() {
+        assert!(
+            ssh_and_mux_rows(true, true).is_empty(),
+            "the rows the palette and the menu share must be absent when elevated"
+        );
+        let normal = ssh_and_mux_rows(true, false);
+        assert!(normal
+            .iter()
+            .any(|(row, _)| matches!(row, PaletteRow::OpenSsh)));
+        assert!(normal
+            .iter()
+            .any(|(row, _)| matches!(row, PaletteRow::DetachSession)));
+        let mux_off = ssh_and_mux_rows(false, false);
+        assert!(mux_off
+            .iter()
+            .any(|(row, _)| matches!(row, PaletteRow::OpenSsh)));
+        assert!(!mux_off
+            .iter()
+            .any(|(row, _)| matches!(row, PaletteRow::DetachSession)));
     }
 }
 

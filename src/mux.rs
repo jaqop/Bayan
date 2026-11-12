@@ -40,21 +40,6 @@ pub fn label_kill() -> &'static str {
     crate::lang::tr("إنهاء الجلسة", "End session")
 }
 
-/// Palette rows for the mux. Detach and reattach are absent unless the
-/// user opted in, so a default config cannot ask the window to start a server.
-#[cfg(test)]
-pub fn palette_labels(enabled: bool, elevated: bool) -> Vec<&'static str> {
-    let mut labels = Vec::new();
-    if crate::ssh::offered(elevated) {
-        labels.push(crate::ssh::label_open());
-    }
-    if mux_may_run(enabled, elevated) {
-        labels.push(label_detach());
-        labels.push(label_reattach());
-    }
-    labels
-}
-
 /// What to do with the server process. `None` does not connect and does not spawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Launch {
@@ -551,6 +536,46 @@ fn is_query(seq: &[u8]) -> bool {
         b']' => seq.contains(&b'?'),
         _ => false,
     }
+}
+
+/// Mandatory-label RIDs. A Low process is `0x1000`, Medium `0x2000`.
+#[cfg(test)]
+pub const IL_LOW: u32 = 0x1000;
+#[cfg(test)]
+pub const IL_MEDIUM: u32 = 0x2000;
+#[cfg(test)]
+pub const IL_HIGH: u32 = 0x3000;
+
+/// The server's integrity must be at least the client's. A Low process of
+/// the same user can own a pipe with that user's SID; Medium keystrokes
+/// must not be sent to it.
+pub fn server_il_acceptable(server: u32, client: u32) -> bool {
+    server >= client
+}
+
+/// Last sub-authority of a binary SID. For a mandatory label (`S-1-16-<rid>`)
+/// that sub-authority is the integrity RID.
+pub fn integrity_rid(sid: &[u8]) -> Option<u32> {
+    if sid.first() != Some(&1) || sid.len() < 8 {
+        return None;
+    }
+    let count = sid[1] as usize;
+    if count == 0 {
+        return None;
+    }
+    let start = 8 + (count - 1) * 4;
+    let bytes: [u8; 4] = sid.get(start..start + 4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+/// Drop every session's byte channel. Each pane's reader then sees EOF and
+/// the tab closes, instead of hanging after the server process is gone.
+pub fn sever_session_links<T>(
+    routes: &mut std::collections::HashMap<u64, T>,
+    pending: &mut std::collections::HashMap<u64, T>,
+) {
+    routes.clear();
+    pending.clear();
 }
 
 /// An elevated window must not own the mux. The pipe name is only the user
@@ -1190,9 +1215,15 @@ fn finish_attached(
 
 /// Entry point for `bayan --mux-server`.
 pub fn run_mux_server() -> Result<(), String> {
+    run_mux_server_if(is_elevated())
+}
+
+/// `elevated` is injected so the refusal can be tested without a token.
+/// The process entry point passes [`is_elevated`].
+pub fn run_mux_server_if(elevated: bool) -> Result<(), String> {
     // Unknown elevation is treated as elevated: a failed check must not
     // leave an admin server on a Medium-accessible pipe.
-    if !mux_may_run(true, is_elevated()) {
+    if !mux_may_run(true, elevated) {
         return Err("the mux server does not run in an elevated process".into());
     }
     #[cfg(windows)]
@@ -1564,6 +1595,13 @@ mod os {
                         }
                         Err(_) => {
                             alive_read.store(false, Ordering::Relaxed);
+                            // Dropping the senders unblocks each pane reader.
+                            // The session then exits and the tab closes.
+                            {
+                                let mut routes = lock_map(&routes_read);
+                                let mut pending = lock_map(&pending_read);
+                                sever_session_links(&mut routes, &mut pending);
+                            }
                             let _ = control_tx.send(Message::Error {
                                 message: "mux pipe closed".into(),
                             });
@@ -1768,7 +1806,8 @@ mod os {
     }
 
     /// Open `name` and refuse it unless the owner and the server process
-    /// are the current user. This is the check `dial` runs.
+    /// are the current user at an integrity level at least as high as ours.
+    /// This is the check `dial` runs.
     fn open_and_verify(name: &str) -> Result<File, String> {
         let wide = wstr(name);
         // SAFETY: `wide` is NUL-terminated and lives for the call. WaitNamedPipeW
@@ -2106,9 +2145,13 @@ mod os {
         if !owner_is_client(&owner, client_sid) {
             return Err("pipe owner is not this user".into());
         }
-        let server = server_process_user(file)?;
-        if !owner_is_client(&server, client_sid) {
+        let server = server_process_identity(file)?;
+        if !owner_is_client(&server.sid, client_sid) {
             return Err("pipe server process is not this user".into());
+        }
+        let client_il = current_integrity_rid()?;
+        if !server_il_acceptable(server.integrity, client_il) {
+            return Err("pipe server integrity is below this process".into());
         }
         Ok(())
     }
@@ -2148,7 +2191,12 @@ mod os {
         }
     }
 
-    fn server_process_user(file: &File) -> Result<Vec<u8>, String> {
+    struct ProcessIdentity {
+        sid: Vec<u8>,
+        integrity: u32,
+    }
+
+    fn server_process_identity(file: &File) -> Result<ProcessIdentity, String> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY};
@@ -2204,11 +2252,76 @@ mod os {
             }
             let user = &*(buf.as_ptr() as *const windows_sys::Win32::Security::TOKEN_USER);
             let bytes = sid_bytes(user.User.Sid);
+            let integrity = match integrity_rid_of(token) {
+                Ok(rid) => rid,
+                Err(error) => {
+                    CloseHandle(token);
+                    return Err(error);
+                }
+            };
             CloseHandle(token);
             if bytes.is_empty() {
                 return Err("server user sid is empty".into());
             }
-            Ok(bytes)
+            Ok(ProcessIdentity {
+                sid: bytes,
+                integrity,
+            })
+        }
+    }
+
+    fn current_integrity_rid() -> Result<u32, String> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Security::TOKEN_QUERY;
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        // SAFETY: the token is this process's and is closed before return.
+        unsafe {
+            let mut token = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return Err(format!("OpenProcessToken failed ({})", last_error()));
+            }
+            let rid = integrity_rid_of(token);
+            CloseHandle(token);
+            rid
+        }
+    }
+
+    /// `token` stays open. The mandatory-label SID's last sub-authority is the RID.
+    fn integrity_rid_of(token: windows_sys::Win32::Foundation::HANDLE) -> Result<u32, String> {
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TokenIntegrityLevel, TOKEN_MANDATORY_LABEL,
+        };
+        // SAFETY: `token` is open. The buffer outlives the SID pointer copied
+        // out of it. A failed query is a refusal, not a default level.
+        unsafe {
+            let mut needed = 0u32;
+            GetTokenInformation(
+                token,
+                TokenIntegrityLevel,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+            if needed == 0 || needed > 256 {
+                return Err("token has no integrity label".into());
+            }
+            let mut buf = vec![0u8; needed as usize];
+            if GetTokenInformation(
+                token,
+                TokenIntegrityLevel,
+                buf.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            ) == 0
+            {
+                return Err(format!(
+                    "GetTokenInformation(integrity) failed ({})",
+                    last_error()
+                ));
+            }
+            let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+            let bytes = sid_bytes(label.Label.Sid);
+            integrity_rid(&bytes).ok_or_else(|| "integrity label is not a SID".into())
         }
     }
 
@@ -2464,14 +2577,6 @@ mod tests {
         let up = connect_if_enabled(true, || false, || spawned = true);
         assert!(!up, "spawn still needs the second connect to succeed");
         assert!(spawned);
-        let labels = palette_labels(false, false);
-        assert_eq!(labels, vec![crate::ssh::label_open()]);
-        assert!(palette_labels(true, false).contains(&label_detach()));
-        assert!(palette_labels(true, false).contains(&label_reattach()));
-        assert!(
-            palette_labels(true, true).is_empty(),
-            "an elevated window offers neither SSH nor the mux"
-        );
         crate::lang::set(crate::lang::Lang::Ar);
         assert_eq!(label_detach(), "فصل الجلسة");
         assert_eq!(label_reattach(), "إعادة الاتصال");
@@ -2583,21 +2688,47 @@ mod tests {
         assert!(!mux_may_run(false, true));
         assert!(!mux_may_run(false, false));
         assert!(mux_may_run(true, false));
-        // The server entry point uses the same gate. An elevated caller does
-        // not reach the pipe.
+        let err = run_mux_server_if(true).unwrap_err();
         assert!(
-            run_gated(true).is_err(),
-            "an elevated process must not become the mux server"
+            err.contains("elevated"),
+            "run_mux_server must refuse before listening: {err}"
         );
     }
 
-    /// What `run_mux_server` does with a known elevation bit, before any pipe.
-    fn run_gated(elevated: bool) -> Result<(), String> {
-        if !mux_may_run(true, elevated) {
-            Err("the mux server does not run in an elevated process".into())
-        } else {
-            Ok(())
-        }
+    #[test]
+    fn a_lower_integrity_server_is_refused() {
+        // S-1-16-0x2000 is Medium. The last sub-authority is the RID.
+        let medium = mandatory_label(IL_MEDIUM);
+        assert_eq!(integrity_rid(&medium), Some(IL_MEDIUM));
+        assert!(server_il_acceptable(IL_MEDIUM, IL_MEDIUM));
+        assert!(server_il_acceptable(IL_HIGH, IL_MEDIUM));
+        assert!(
+            !server_il_acceptable(IL_LOW, IL_MEDIUM),
+            "a Low process of this user must not receive Medium keystrokes"
+        );
+        assert!(!server_il_acceptable(IL_LOW, IL_HIGH));
+        assert!(integrity_rid(&[]).is_none());
+    }
+
+    fn mandatory_label(rid: u32) -> Vec<u8> {
+        let mut sid = vec![1, 1, 0, 0, 0, 0, 0, 16];
+        sid.extend_from_slice(&rid.to_le_bytes());
+        sid
+    }
+
+    #[test]
+    fn server_loss_closes_attached_session_streams() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let (pending_tx, pending_rx) = mpsc::channel::<Vec<u8>>();
+        let mut routes = std::collections::HashMap::new();
+        let mut pending = std::collections::HashMap::new();
+        routes.insert(7u64, tx);
+        pending.insert(8u64, pending_tx);
+        sever_session_links(&mut routes, &mut pending);
+        assert!(routes.is_empty());
+        assert!(pending.is_empty());
+        assert!(rx.recv().is_err(), "the pane reader must see EOF");
+        assert!(pending_rx.recv().is_err());
     }
 
     #[test]

@@ -907,7 +907,10 @@ DACL allows only the current user's SID, the first instance is created with
 `FILE_FLAG_FIRST_PIPE_INSTANCE`, and the mode includes
 `PIPE_REJECT_REMOTE_CLIENTS`. The client opens the pipe with identification
 QoS and accepts it only when the owner and the server process are that same
-SID, so another account cannot sit on the name and read keystrokes. An
+SID and the server's integrity level is at least this process's, so another
+account, or a Low process of this user, cannot sit on the name and read
+keystrokes. If the server process dies, the window drops those byte channels
+and the SSH tabs close instead of hanging. An
 elevated window does not start the server, does not connect, and does not
 offer «فتح SSH», so a `ProxyCommand` in `~/.ssh/config` does not run as
 admin. The pipe name is only the user SID, and a normal process of that
