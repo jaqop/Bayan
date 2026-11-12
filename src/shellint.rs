@@ -2577,7 +2577,9 @@ mod tests {
                 std::fs::create_dir_all(parent).unwrap();
             }
             // Bookends so a hang says whether the rcfile started.
-            let mut marked = String::from("printf 'start\\n' >> \"$BAYAN_STAGE\"\n");
+            let mut marked = String::from(
+                "printf 'start si=%s\\n' \"${__BAYAN_SI-}\" >> \"$BAYAN_STAGE\"\nunset __BAYAN_SI\nprintf 'nonce2\\n' >> \"$BAYAN_STAGE\"\n",
+            );
             let body = body
                 .replace(
                     "unset BAYAN_PROMPT_NONCE\n",
