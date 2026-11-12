@@ -1542,8 +1542,10 @@ Its text keeps its own UI size when the terminal is zoomed.
   PowerShell, Command Prompt, Git Bash, each WSL distro, and any profile the
   `-p` lookup accepts. **Alt+Down** still moves between panes; it opens this
   menu only while the arrow is focused, and so does **Enter**. A row opens a
-  **new** tab in that shell. **Esc** closes the menu and returns to the arrow,
-  which draws a focus ring. The arrow sits just after the last tab (the strip
+  **new** tab in that shell. **Esc** closes the menu and returns to the arrow
+  when the arrow is on screen (the focus ring shows it); if the bar is hidden
+  or there is no room for the arrow, Esc returns to the terminal. The ring
+  hides while the menu is open. The arrow sits just after the last tab (the strip
   is not mirrored). In Arabic, Left moves to the next row, and the labels are
   Arabic (`الطرفيات`, `اختر الطرفية`, `الافتراضية`). A profile with an empty
   name, a control or bidi character,

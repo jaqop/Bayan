@@ -130,6 +130,12 @@ pub fn menu_action(key: MenuKey, rtl: bool) -> MenuAction {
     }
 }
 
+/// The focus ring is the arrow's, and only while the menu is closed.
+/// An open menu already shows its own selection.
+pub fn show_focus_ring(arrow_focused: bool, menu_open: bool) -> bool {
+    arrow_focused && !menu_open
+}
+
 /// Esc returns to the arrow. A pick moves to the tab that opened.
 pub fn focus_after(picked: bool) -> FocusAfter {
     if picked {
@@ -524,6 +530,12 @@ mod tests {
         assert_eq!(menu_action(MenuKey::Enter, true), MenuAction::Pick);
         assert_eq!(menu_action(MenuKey::Escape, true), MenuAction::Close);
         assert_eq!(focus_after(false), FocusAfter::Arrow);
+        assert!(show_focus_ring(true, false));
+        assert!(
+            !show_focus_ring(true, true),
+            "the ring hides while the menu is open"
+        );
+        assert!(!show_focus_ring(false, false));
         lang::set(Lang::En);
         assert_eq!(button_label(), "Shells");
         assert_eq!(menu_label(), "Choose a shell");

@@ -2600,9 +2600,10 @@ impl App {
                     shellmenu::MenuAction::Close
                 );
                 if close {
-                    self.palette = None;
-                    if arrow_menu && shellmenu::focus_after(false) == shellmenu::FocusAfter::Arrow {
-                        self.shell_arrow_focused = true;
+                    if arrow_menu {
+                        self.close_shell_menu();
+                    } else {
+                        self.palette = None;
                     }
                 }
             }
@@ -6004,8 +6005,22 @@ impl App {
     /// state; otherwise Alt+Down stays pane focus.
     fn open_shell_from_arrow(&mut self) {
         let at = self.shell_arrow_anchor();
-        self.shell_arrow_focused = true;
+        // A hidden arrow (one tab with the bar hidden, or no room beside
+        // the tabs) cannot take focus: Esc would otherwise leave Enter
+        // and Esc bound to a button that is not on screen.
+        let drawn = self.shell_arrow_bounds().is_some();
         self.open_shell_picker(true, at);
+        self.shell_arrow_focused = drawn;
+    }
+
+    /// Esc on the shell menu. Focus returns to the arrow only when that
+    /// arrow is drawn; otherwise it returns to the terminal.
+    fn close_shell_menu(&mut self) {
+        let arrow_menu = self.palette.as_ref().is_some_and(|p| p.shell_arrow);
+        self.palette = None;
+        self.shell_arrow_focused = arrow_menu
+            && self.shell_arrow_bounds().is_some()
+            && shellmenu::focus_after(false) == shellmenu::FocusAfter::Arrow;
     }
 
     fn open_shell_picker(&mut self, arrow: bool, at: (f64, f64)) {
@@ -6853,7 +6868,8 @@ impl App {
                     }
                 }
                 renderer.use_ui_metrics(true);
-                renderer.shell_arrow_focused = self.shell_arrow_focused;
+                renderer.shell_arrow_focused =
+                    shellmenu::show_focus_ring(self.shell_arrow_focused, self.palette.is_some());
                 renderer.draw_chrome(
                     &mut verts,
                     px.width as usize,
@@ -9867,9 +9883,25 @@ mod m38_tests {
     }
 
     #[test]
+    fn closing_the_shell_menu_does_not_focus_a_hidden_arrow() {
+        let mut app = super::session_app(super::test_proxy(), false);
+        assert!(
+            app.shell_arrow_bounds().is_none(),
+            "session_app has no window, so the arrow is not drawn"
+        );
+        app.open_shell_from_arrow();
+        assert!(app.palette.as_ref().is_some_and(|p| p.shell_arrow));
+        assert!(!app.shell_arrow_focused);
+        app.close_shell_menu();
+        assert!(app.palette.is_none());
+        assert!(!app.shell_arrow_focused);
+    }
+
+    #[test]
     fn an_elevated_window_hides_ssh_and_the_mux_from_its_menus() {
         let mut elevated = super::session_app(super::test_proxy(), true);
         elevated.config.mux.enabled = true;
+        elevated.config.ssh_hosts = vec!["example.com".into()];
         assert!(
             elevated.context_rows().iter().all(|(row, _)| !matches!(
                 row,
