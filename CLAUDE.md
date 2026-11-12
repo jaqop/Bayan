@@ -39,6 +39,8 @@ selection and BiDi paths must do.
 | `jumplist.rs` | taskbar Jump List (`ICustomDestinationList`) and the explicit AppUserModelID |
 | `handoff.rs` | per-user `ITerminalHandoff` COM class, default off; not the Windows default terminal |
 | `shellint.rs` | OSC 133 injection for Git Bash, WSL bash/zsh, and cmd (PowerShell's wrapper stays in `term.rs`) |
+| `ssh.rs` | OpenSSH tab: System32 `ssh.exe`, `~/.ssh/config` hosts, injection-safe argv |
+| `mux.rs` | opt-in per-user mux: named-pipe server, detach / reattach / kill |
 | `posh.rs` | oh-my-posh theme picker with a live ANSI preview |
 | `plugins.rs` | declarative JSON plugin host (`~/.bayan/plugins/`) |
 | `lua_host.rs` | sandboxed `config.lua` and allowlisted executable plugins |

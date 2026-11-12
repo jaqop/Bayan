@@ -959,6 +959,57 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       with `cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings`
       and `cargo fmt --check`.
 
+## SSH tabs and the session multiplexer
+
+An SSH tab runs the Windows OpenSSH client, `GetSystemDirectoryW()\OpenSSH\ssh.exe`,
+in a new ConPTY tab. A copy on `PATH`, beside `bayan.exe`, or named by an
+environment variable is never used, including when Bayan is elevated. The
+command palette row «فتح SSH» lists hosts from `ssh_hosts` in
+`config.json` and from `Host` lines in `~/.ssh/config`. Wildcard patterns
+(`*`, `?`) and `Match` blocks are not destinations. The host is the tab
+title. A host that starts with `-` is rejected, and `--` is placed before
+the destination so the host cannot become an ssh option. Bayan does not
+store a password; authentication stays with the ssh agent and keys.
+
+```json
+{ "ssh_hosts": ["example.com", "me@bastion.example"] }
+```
+
+`Include` directives inside the ssh config are not followed. An IPv6
+literal is not a palette token; give it a `Host` alias and Bayan will pass
+that alias to `ssh.exe`.
+
+The multiplexer is off unless config says so:
+
+```json
+{ "mux": { "enabled": true } }
+```
+
+With it on, «فتح SSH» asks a per-user server (`bayan --mux-server`) to own
+the ConPTY. The window talks to that process over a named pipe. The pipe's
+DACL allows only the current user's SID, the first instance is created with
+`FILE_FLAG_FIRST_PIPE_INSTANCE`, and the mode includes
+`PIPE_REJECT_REMOTE_CLIENTS`. The client opens the pipe with identification
+QoS and accepts it only when the owner and the server process are that same
+SID, so another account cannot sit on the name and read keystrokes. An
+elevated window does not start the server and does not connect: the pipe
+name is only the user SID, and a normal process of that user must not be
+able to ask an admin server to spawn a program. Several windows can connect
+at once; each gets its own pipe instance. «فصل الجلسة» drops the tab and
+leaves the session running in the server. «إعادة الاتصال» lists those
+sessions and opens one again. The replay is capped at 256 KiB, starts on a
+UTF-8 and escape-sequence boundary, and device queries (`CSI 6n`, `CSI c`,
+OSC `?`) are removed so they are not answered into the live session.
+«إنهاء الجلسة» kills one. Closing the window kills sessions that are still
+attached and leaves the server running while any detached session remains.
+The server process exits when the last session ends, and a child exit keeps
+the process's status code.
+
+A shell Bayan started itself (PowerShell, cmd, WSL) stays in the window
+process, so the existing prompt injection is unchanged. Moving that ConPTY
+into the server with `DuplicateHandle` is not done. Scrollback saved to
+disk is a different item and is not part of this.
+
 ## Settings
 
 Everything lives in the in-app panel (Ctrl+, or the tab-bar gear); the

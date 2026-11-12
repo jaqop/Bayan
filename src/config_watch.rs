@@ -322,6 +322,13 @@ pub fn merge_reload(base: &UserConfig, live: &UserConfig, file: &UserConfig) -> 
             &file.shell_integration,
             &mut overrode,
         ),
+        ssh_hosts: merge_field(
+            &base.ssh_hosts,
+            &live.ssh_hosts,
+            &file.ssh_hosts,
+            &mut overrode,
+        ),
+        mux: merge_field(&base.mux, &live.mux, &file.mux, &mut overrode),
         keyboard: merge_field(
             &base.keyboard,
             &live.keyboard,

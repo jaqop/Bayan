@@ -3,7 +3,7 @@
 //! feeds the emulator behind a mutex and nudges the UI thread to repaint.
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -2841,8 +2841,12 @@ pub struct Session {
     write_error: Arc<AtomicBool>,
     proxy: EventLoopProxy<UserEvent>,
     id: u64,
-    master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
+    master: Option<Box<dyn MasterPty + Send>>,
+    child: Option<Box<dyn Child + Send + Sync>>,
+    /// Once, on kill. A mux pane tells the server; detach clears the armed
+    /// flag inside the hook so the remote process keeps running.
+    on_kill: Option<Box<dyn FnOnce() + Send>>,
+    on_resize: Option<Box<dyn Fn(u16, u16) + Send + Sync>>,
     /// Command line this pane was spawned with. Drag-drop quoting follows it,
     /// not whatever the settings say now — the live shell is the one reading.
     shell: String,
@@ -2875,12 +2879,40 @@ impl<T> LockExt<T> for Mutex<T> {
 /// it. Killing a child that already exited is a harmless error.
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        self.kill();
         clear_text_area_grid(self.id);
         if let Some(dir) = self.integration_dir.take() {
             crate::shellint::remove_integration_dir(&dir);
         }
     }
+}
+
+/// The pipes and the optional process behind a [`Session`]. A local ConPTY
+/// fills `master` and `child`. A mux view leaves them empty and sets the hooks.
+pub struct SessionIo {
+    pub reader: Box<dyn Read + Send>,
+    pub writer: Box<dyn Write + Send>,
+    pub master: Option<Box<dyn MasterPty + Send>>,
+    pub child: Option<Box<dyn Child + Send + Sync>>,
+    pub on_resize: Option<Box<dyn Fn(u16, u16) + Send + Sync>>,
+    pub on_kill: Option<Box<dyn FnOnce() + Send>>,
+}
+
+/// Everything [`Session::from_parts`] needs besides the byte streams.
+pub struct SessionArgs {
+    pub size: TermSize,
+    pub proxy: EventLoopProxy<UserEvent>,
+    pub id: u64,
+    pub scrollback: usize,
+    pub shell: String,
+    pub kitty_protocol: bool,
+    pub prompt_nonce: String,
+    /// The pixel budget every pane of this process charges.
+    pub images: Arc<crate::images::ImageBudget>,
+    /// Shell-integration scripts written for this pane. Dropped (and the
+    /// directory deleted) if the session cannot be built. A mux view has none.
+    pub(crate) integration: crate::shellint::IntegrationDir,
+    pub io: SessionIo,
 }
 
 impl Session {
@@ -3025,11 +3057,55 @@ impl Session {
             // were applied above, already include this chcp.
             cmd.args(["/K", "chcp 65001>nul"]);
         }
-        let mut reader = pair.master.try_clone_reader()?;
+        let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
-        let mut child = pair.slave.spawn_command(cmd)?;
+        let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
+        Self::from_parts(SessionArgs {
+            size,
+            proxy,
+            id,
+            scrollback,
+            shell: shell.to_string(),
+            kitty_protocol,
+            prompt_nonce,
+            images,
+            integration: integration_scripts,
+            io: SessionIo {
+                reader,
+                writer,
+                master: Some(pair.master),
+                child: Some(child),
+                on_resize: None,
+                on_kill: None,
+            },
+        })
+    }
 
+    /// A pane fed by `io` instead of a ConPTY this process opened. Local
+    /// spawn and a mux reattach share the reader thread, so VT handling
+    /// does not fork.
+    pub fn from_parts(args: SessionArgs) -> Result<Self, Box<dyn std::error::Error>> {
+        let SessionArgs {
+            size,
+            proxy,
+            id,
+            scrollback,
+            shell,
+            kitty_protocol,
+            prompt_nonce,
+            images,
+            integration,
+            io,
+        } = args;
+        let SessionIo {
+            mut reader,
+            writer,
+            master,
+            mut child,
+            on_resize,
+            mut on_kill,
+        } = io;
         let config = Config {
             scrolling_history: scrollback,
             // Off unless the user opted in. The flag gates every stack
@@ -3083,7 +3159,12 @@ impl Session {
         ) {
             Ok(writer) => writer,
             Err(error) => {
-                let _ = child.kill();
+                if let Some(child) = child.as_mut() {
+                    let _ = child.kill();
+                }
+                if let Some(hook) = on_kill.take() {
+                    hook();
+                }
                 return Err(error.into());
             }
         };
@@ -3212,10 +3293,12 @@ impl Session {
             write_error,
             proxy: input_proxy,
             id,
-            master: pair.master,
+            master,
             child,
-            shell: shell.to_string(),
-            integration_dir: integration_scripts.disarm(),
+            on_kill,
+            on_resize,
+            shell,
+            integration_dir: integration.disarm(),
             parser,
         })
     }
@@ -3257,8 +3340,10 @@ impl Session {
             write_error: Arc::new(AtomicBool::new(false)),
             proxy,
             id,
-            master: pair.master,
-            child: Box::new(IdleChild),
+            master: Some(pair.master),
+            child: Some(Box::new(IdleChild)),
+            on_kill: None,
+            on_resize: None,
             shell: String::new(),
             parser: Arc::new(Mutex::new(Processor::new())),
             integration_dir: None,
@@ -3272,8 +3357,15 @@ impl Session {
     }
 
     /// Terminate the shell (closing a tab must not leave orphans).
+    /// A mux pane's hook runs once; detach disarms it first so this does
+    /// not kill the server-side process.
     pub fn kill(&mut self) {
-        let _ = self.child.kill();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+        }
+        if let Some(hook) = self.on_kill.take() {
+            hook();
+        }
     }
 
     /// Clear the current screen's keyboard-mode stack (Ctrl+Shift+K, a
@@ -3310,12 +3402,17 @@ impl Session {
                 Some(reflow) => reflow,
             }
         };
-        let _ = self.master.resize(PtySize {
-            rows: size.rows as u16,
-            cols: size.cols as u16,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        if let Some(master) = &self.master {
+            let _ = master.resize(PtySize {
+                rows: size.rows as u16,
+                cols: size.cols as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        }
+        if let Some(hook) = &self.on_resize {
+            hook(size.cols as u16, size.rows as u16);
+        }
         // Drop the term lock before meta. A column change reflows rows, so
         // SCP stamps and image anchors no longer name the text they were
         // written on. The text-area map is taken after both: a query on the
