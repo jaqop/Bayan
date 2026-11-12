@@ -112,7 +112,9 @@ pub(crate) enum ConptyCapability {
     /// The probe does not select this. A 1.22+ DLL reused the bit, and the
     /// older experimental mode was removed because it broke PowerShell
     /// (microsoft/terminal#16954). The arm exists so the flag is requested
-    /// only for a host that still implements it.
+    /// only for a host that still implements it. The bayan tests construct
+    /// it; this crate's loader does not.
+    #[allow(dead_code)]
     LegacyPassthrough,
     /// `conpty.dll` + `OpenConsole.exe` from Windows Terminal 1.22+ (#17510).
     /// VT, including DCS and APC, is passed through without bit `0x8`.

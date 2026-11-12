@@ -2615,6 +2615,7 @@ pub(crate) fn da1_reply(passthrough: bool) -> &'static str {
 
 /// True when `reply` is a primary DA whose parameters, after the terminal
 /// level, include `4`.
+#[cfg(test)]
 pub(crate) fn da1_advertises_sixel(reply: &str) -> bool {
     let Some(rest) = reply.strip_prefix("\u{1b}[?") else {
         return false;
