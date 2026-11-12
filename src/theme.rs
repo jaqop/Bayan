@@ -1,9 +1,9 @@
 //! Windows light/dark following.
 //!
 //! `"theme"` is either a named scheme or one of `system`, `dark`, `light`.
-//! `system` (also the absent key) tracks the app theme: winit's
-//! `ThemeChanged`, and `WM_SETTINGCHANGE` whose lParam is `ImmersiveColorSet`,
-//! both resolved through the `AppsUseLightTheme` registry value. `dark` and
+//! `system` (also the absent key) tracks the app theme. winit emits
+//! `ThemeChanged` from `WM_SETTINGCHANGE` while the window's preferred
+//! theme is unset, and that event reads `AppsUseLightTheme`. `dark` and
 //! `light` lock this file's palette pair. A named scheme, or any hand-set
 //! `bg` / `fg` / `palette`, is left alone when Windows changes.
 //!
@@ -203,14 +203,14 @@ pub struct ThemeSurface {
     pub follows_system: bool,
 }
 
-/// A live theme signal. winit's `ThemeChanged` is the one the window loop
-/// receives (`WM_SETTINGCHANGE` is sent, not posted, so the message hook
-/// never sees it). The registry DWORD is still what that handler reads.
+/// A live theme signal. The window loop receives winit's `ThemeChanged`
+/// (it fires only while the window's preferred theme is unset). The
+/// registry DWORD is what that handler reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SystemThemeEvent {
     /// `WindowEvent::ThemeChanged`. `light` is the appearance to apply.
     Winit { light: bool },
-    /// `WM_SETTINGCHANGE` whose lParam is `ImmersiveColorSet`.
+    /// `AppsUseLightTheme` as read when `ThemeChanged` arrives.
     ImmersiveColorSet { apps_use_light_theme: Option<u32> },
 }
 

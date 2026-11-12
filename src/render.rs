@@ -800,13 +800,17 @@ pub struct TabInfo {
     pub progress: Option<crate::term::Progress>,
 }
 
-/// Bar colour for a progress state: green working, red failed, amber paused.
-fn progress_color(p: crate::term::Progress) -> (u8, u8, u8) {
+/// Bar colour for a progress state. On a light tab bar the paused amber
+/// `#f2cc60` is 1.11:1, so that state takes [`crate::theme::bar_accent`].
+fn progress_color(p: crate::term::Progress, on_light_bar: bool) -> (u8, u8, u8) {
     use crate::term::ProgressState::*;
     match p.state {
+        Normal | Indeterminate if on_light_bar => {
+            crate::theme::bar_accent(crate::theme::BarAccent::Green, false)
+        }
         Normal | Indeterminate => (0x2e, 0xa0, 0x43),
         Error => (0xcf, 0x22, 0x2e),
-        Paused => (0xf2, 0xcc, 0x60),
+        Paused => crate::theme::bar_accent(crate::theme::BarAccent::Amber, !on_light_bar),
     }
 }
 
@@ -1261,19 +1265,31 @@ fn caption_glyph(fg: (u8, u8, u8), close_hovered: bool) -> (u8, u8, u8) {
 }
 
 /// Hover fill. Close stays red. The others are the dark slate on a dark
-/// page, and the page stepped down on a light one — a dark slate on the
-/// light bar is a blob.
+/// bar. On a light bar the hover is a darker step of the bar itself:
+/// subtracting from the page (`bg − 0x20`) lands lighter than the bar
+/// and the chip disappears.
 fn caption_hover(bg: (u8, u8, u8), close: bool) -> (u8, u8, u8) {
     if close {
         (0xc4, 0x2b, 0x1c)
     } else if crate::theme::title_bar_dark_for(bg) {
         (0x33, 0x3c, 0x48)
     } else {
+        let bar = chrome_bar_bg(bg);
         (
-            bg.0.saturating_sub(0x20),
-            bg.1.saturating_sub(0x20),
-            bg.2.saturating_sub(0x20),
+            bar.0.saturating_sub(0x18),
+            bar.1.saturating_sub(0x18),
+            bar.2.saturating_sub(0x18),
         )
+    }
+}
+
+/// Ink for a dark card when the page is light. Dark pages keep their own
+/// foreground, which is already light.
+fn theme_card_ink(bg: (u8, u8, u8), fg: (u8, u8, u8)) -> (u8, u8, u8) {
+    if crate::theme::title_bar_dark_for(bg) {
+        fg
+    } else {
+        crate::theme::DARK.fg
     }
 }
 
@@ -2502,23 +2518,28 @@ impl Renderer {
         };
         // Theme side of the mapping. High Contrast off returns it unchanged,
         // so the stored chrome matches the colors the drawers fall back to.
+        let card_ink = theme_card_ink(bg, fg);
         let theme_chrome = crate::a11y::ChromeColors {
             tab_bar: shade(bg, 0.80),
             title_bar: shade(bg, 0.80),
-            title_text: (0xb6, 0xc2, 0xcf),
+            title_text: caption_glyph(fg, false),
             palette: (0x16, 0x1b, 0x22),
-            palette_text: fg,
+            palette_text: card_ink,
             palette_sel: (0x21, 0x36, 0x50),
             palette_sel_text: (0xf0, 0xf6, 0xfc),
             card: (0x14, 0x19, 0x20),
-            card_text: fg,
+            card_text: card_ink,
             scrollbar: fg,
-            focus: (0x2e, 0xa0, 0x43),
+            focus: if crate::theme::title_bar_dark_for(bg) {
+                (0x2e, 0xa0, 0x43)
+            } else {
+                crate::theme::bar_accent(crate::theme::BarAccent::Green, false)
+            },
             selection: SELECTION_RGBA.0,
             selection_text: fg,
             cursor: fg,
             muted: (0x9a, 0xa4, 0xb2),
-            accent: LINK_UNDER,
+            accent: link_underline(bg),
         };
         let chrome = crate::a11y::map_chrome(a11y.high_contrast, a11y.colors, theme_chrome);
         let grid_follows_hc = a11y.high_contrast && cfg.terminal_follows_high_contrast();
@@ -2738,6 +2759,17 @@ impl Renderer {
             self.chrome.title_text
         } else {
             self.fg
+        }
+    }
+
+    /// Ink on a dark card or popup. The cards stay dark in both themes, so a
+    /// light page cannot lend them its dark foreground. High Contrast has
+    /// already replaced `chrome.card_text` through `map_chrome`.
+    fn card_ink(&self) -> (u8, u8, u8) {
+        if self.high_contrast {
+            self.chrome.card_text
+        } else {
+            theme_card_ink(self.bg, self.fg)
         }
     }
 
@@ -4670,7 +4702,7 @@ impl Renderer {
         // header (bold — and a live proof the style pipeline works)
         let head = [Seg {
             text: crate::lang::tr("مقصورة الوكلاء", "Agent cockpit").into(),
-            fg: self.chrome_fg(),
+            fg: self.card_ink(),
             style: ST_BOLD,
         }];
         self.draw_run(&head, true, out, whole, (x + 14) as f32, y + 8, 1.0);
@@ -4723,7 +4755,7 @@ impl Renderer {
                     self.chrome.muted
                 }
             } else if e.active {
-                self.fg
+                self.card_ink()
             } else {
                 (0xb0, 0xb8, 0xc4)
             };
@@ -4731,12 +4763,12 @@ impl Renderer {
             let title: String = e.title.chars().take(22).collect();
             let status: String = e.status.chars().take(48).collect();
             let (pct, pct_fg) = match e.progress {
-                Some(p) => (format!("{}  ", progress_label(p)), progress_color(p)),
+                Some(p) => (format!("{}  ", progress_label(p)), progress_color(p, false)),
                 None => (String::new(), fg),
             };
             let segs = [
                 Seg::plain(format!("{mark}{title}"), fg),
-                Seg::plain("   —   ", self.muted_color((0x6e, 0x76, 0x81))),
+                Seg::plain("   —   ", self.muted_color((0x9a, 0xa4, 0xb2))),
                 Seg {
                     text: pct,
                     fg: pct_fg,
@@ -4990,7 +5022,7 @@ impl Renderer {
         let muted_c = self.muted_color((0x9a, 0xa4, 0xb2));
         let dot_c = self.muted_color((0x33, 0x3b, 0x45));
         let on_text = self.on_control_text();
-        let fg_c = self.chrome_fg();
+        let fg_c = self.card_ink();
         let knob_off = if self.high_contrast {
             self.chrome.muted
         } else {
@@ -5539,7 +5571,7 @@ impl Renderer {
                 "انقر للتغيير · Esc للإغلاق والحفظ",
                 "Click to change · Esc closes and saves",
             ),
-            self.muted_color((0x6e, 0x78, 0x85)),
+            self.muted_color((0x9a, 0xa4, 0xb2)),
         )];
         let fw2 = self.measure(&hint, true);
         self.draw_run(
@@ -5616,7 +5648,7 @@ impl Renderer {
         let value_c = self.chrome_fg_or((0x7e, 0xe7, 0x87));
         let muted_c = self.muted_color((0x9a, 0xa4, 0xb2));
         let dot_c = self.muted_color((0x33, 0x3b, 0x45));
-        let fg_c = self.chrome_fg();
+        let fg_c = self.card_ink();
         let amber_c = self.accent_color((0xf2, 0xcc, 0x60));
 
         let whole: Rect = (0, 0, fw as i32, fh as i32);
@@ -5755,7 +5787,7 @@ impl Renderer {
                     "Enter change · Delete default · Esc close",
                 )
                 .to_string(),
-                self.muted_color((0x6e, 0x78, 0x85)),
+                self.muted_color((0x9a, 0xa4, 0xb2)),
             ),
         };
         let seg = [Seg::plain(text, color)];
@@ -6121,7 +6153,7 @@ impl Renderer {
                 if query.is_empty() {
                     self.muted_color((0x8b, 0x94, 0x9e))
                 } else {
-                    self.chrome_fg()
+                    self.card_ink()
                 },
             )],
             true,
@@ -6298,7 +6330,7 @@ impl Renderer {
 
         let title = [Seg::plain(
             crate::lang::tr("شكل الموجِّه — معاينة حيّة", "Prompt style — live preview"),
-            self.chrome_fg(),
+            self.card_ink(),
         )];
         self.draw_run(&title, true, out, whole, (x + 14) as f32, y + 8, 1.0);
 
@@ -6320,7 +6352,7 @@ impl Renderer {
                 );
             }
             let name_fg = if idx == sel {
-                self.palette_sel_text(self.chrome_fg())
+                self.palette_sel_text(self.card_ink())
             } else {
                 self.muted_color((0x8a, 0x94, 0xa3))
             };
@@ -6334,7 +6366,7 @@ impl Renderer {
                 Some(bytes) => {
                     // oh-my-posh's own bytes, through our own renderer: the
                     // preview and the real prompt cannot disagree
-                    let segs = self.ansi_segments(bytes, self.fg);
+                    let segs = self.ansi_segments(bytes, self.card_ink());
                     self.draw_run(
                         &segs,
                         false,
@@ -6348,7 +6380,7 @@ impl Renderer {
                 None => {
                     let m = [Seg::plain(
                         crate::lang::tr("(تعذّر التصيير)", "(could not render)"),
-                        self.muted_color((0x6e, 0x78, 0x85)),
+                        self.muted_color((0x9a, 0xa4, 0xb2)),
                     )];
                     self.draw_run(
                         &m,
@@ -6367,7 +6399,7 @@ impl Renderer {
                 "Enter تطبيق · ↑↓ تنقّل · Esc إغلاق",
                 "Enter apply · ↑↓ move · Esc close",
             ),
-            self.muted_color((0x6e, 0x78, 0x85)),
+            self.muted_color((0x9a, 0xa4, 0xb2)),
         )];
         self.draw_run(
             &hint,
@@ -6426,7 +6458,7 @@ impl Renderer {
             let text = self.guard_label(text, inner.2 as f32);
             let seg = [Seg {
                 text,
-                fg: self.chrome_fg(),
+                fg: self.card_ink(),
                 style: if bold { ST_BOLD } else { 0 },
             }];
             let tw = self.measure(&seg, true);
@@ -6595,7 +6627,7 @@ impl Renderer {
         let keys = crate::lang::tr("Enter أو Esc للإغلاق", "Enter or Esc closes");
         let lines = std::iter::once(Seg {
             text: title.into(),
-            fg: self.chrome_fg(),
+            fg: self.card_ink(),
             style: ST_BOLD,
         })
         .chain(
@@ -6716,7 +6748,7 @@ impl Renderer {
         let prefix = crate::link::card_title_prefix(may_open);
         let title = [Seg {
             text: format!("{prefix} — {reason}"),
-            fg: self.chrome_fg(),
+            fg: self.card_ink(),
             style: ST_BOLD,
         }];
         self.draw_run(&title, true, out, whole, (x + pad) as f32, y + pad, 1.0);
@@ -6767,7 +6799,7 @@ impl Renderer {
         );
         let keys_en = [Seg::plain(
             en.to_string(),
-            self.muted_color((0x6e, 0x78, 0x85)),
+            self.muted_color((0x9a, 0xa4, 0xb2)),
         )];
         self.draw_run(
             &keys_en,
@@ -6880,7 +6912,7 @@ impl Renderer {
         };
         let title = [Seg {
             text: card.heading.unwrap_or(&paste_title).to_string(),
-            fg: self.chrome_fg(),
+            fg: self.card_ink(),
             style: ST_BOLD,
         }];
         self.draw_run(&title, true, out, whole, (x + pad) as f32, y + pad, 1.0);
@@ -7099,7 +7131,14 @@ impl Renderer {
                         TAB_TOP + i as i32,
                         tabw - 2 * inset,
                         1,
-                        c4(self.focus_color((0x2e, 0xa0, 0x43)), 220),
+                        c4(
+                            self.focus_color(if page_dark {
+                                (0x2e, 0xa0, 0x43)
+                            } else {
+                                crate::theme::bar_accent(crate::theme::BarAccent::Green, false)
+                            }),
+                            if page_dark { 220 } else { 255 },
+                        ),
                     );
                 }
             }
@@ -7179,7 +7218,7 @@ impl Renderer {
             // its fill at the reported percent (full-width dim = indeterminate)
             if let Some(p) = tab.progress.filter(|_| tw >= 28) {
                 let (bx, bw, by, bh) = (tx + 6, tabw - 12, oy - 3, 3);
-                let c = progress_color(p);
+                let c = progress_color(p, !page_dark);
                 push_rect(out, whole, bx, by, bw, bh, c4(c, 70));
                 let fill = match p.state {
                     crate::term::ProgressState::Indeterminate => bw,
@@ -7228,7 +7267,14 @@ impl Renderer {
             }
         }
         if let Some(text) = elevated_label {
-            let label = [Seg::plain(text, (0xf2, 0xcc, 0x60))];
+            let label = [Seg::plain(
+                text,
+                if self.high_contrast {
+                    self.chrome.accent
+                } else {
+                    crate::theme::bar_accent(crate::theme::BarAccent::Amber, page_dark)
+                },
+            )];
             let tw = self.measure(&label, false);
             let x = self.tab_controls(width)[0].0 - tw.ceil() as i32 - 12;
             if x >= end + 12 {
@@ -7430,7 +7476,7 @@ impl Renderer {
         full: &str,
     ) {
         let avail = (width as f32 - 24.0).max(40.0);
-        let tip_fg = self.chrome_fg();
+        let tip_fg = self.card_ink();
         let shown = self.fit_title(full, tip_fg, avail);
         let segs = [Seg::plain(shown, tip_fg)];
         let tw = self.measure(&segs, true);
@@ -10408,42 +10454,103 @@ mod cache_tests {
         };
         let mut r = Renderer::new(1.0, &cfg, 0.0);
         r.use_ui_metrics(true);
-        let tabs = vec![TabInfo {
-            title: "hi".into(),
-            busy: true,
-            attention: true,
-            active: true,
-            progress: None,
-        }];
+        let colours_of = |out: &[crate::gpu::Vertex]| -> Vec<(u8, u8, u8)> {
+            out.iter().map(|v| vertex_rgb(v.color)).collect()
+        };
+        // Each mark in its own frame, so one amber cannot hide a revert of
+        // the other.
         let mut out = Vec::new();
-        r.draw_chrome(&mut out, 1400, 800, &tabs, Some("بحث"), true, None);
-        let painted: Vec<(u8, u8, u8)> = out.iter().map(|v| vertex_rgb(v.color)).collect();
+        r.draw_chrome(
+            &mut out,
+            1400,
+            800,
+            &[TabInfo {
+                title: "hi".into(),
+                busy: false,
+                attention: true,
+                active: true,
+                progress: None,
+            }],
+            None,
+            false,
+            None,
+        );
+        let attention = colours_of(&out);
+        assert!(attention.contains(&crate::theme::bar_accent(
+            crate::theme::BarAccent::Amber,
+            false
+        )));
+        assert!(
+            !attention.contains(&(0xf2, 0xcc, 0x60)),
+            "the light attention dot must not stay the dark-bar amber"
+        );
+        out.clear();
+        r.draw_chrome(
+            &mut out,
+            1400,
+            800,
+            &[TabInfo {
+                title: "hi".into(),
+                busy: true,
+                attention: false,
+                active: true,
+                progress: None,
+            }],
+            None,
+            false,
+            None,
+        );
+        let busy = colours_of(&out);
+        assert!(busy.contains(&crate::theme::bar_accent(
+            crate::theme::BarAccent::Green,
+            false
+        )));
+        assert!(!busy.contains(&(0x56, 0xd3, 0x64)));
+        out.clear();
+        r.draw_chrome(
+            &mut out,
+            1400,
+            800,
+            &[TabInfo {
+                title: "hi".into(),
+                busy: false,
+                attention: false,
+                active: true,
+                progress: None,
+            }],
+            Some("بحث"),
+            true,
+            None,
+        );
+        let painted = colours_of(&out);
         let glyph = caption_glyph(r.fg, false);
-        let accent = crate::theme::bar_accent(crate::theme::BarAccent::Green, false);
-        let amber = crate::theme::bar_accent(crate::theme::BarAccent::Amber, false);
         assert!(
             painted.contains(&glyph),
             "caption ink is not the page foreground"
         );
+        assert!(painted.contains(&crate::theme::bar_accent(
+            crate::theme::BarAccent::Green,
+            false
+        )));
+        assert!(painted.contains(&search_line(r.bg)));
         assert!(
-            painted.contains(&accent),
-            "the Claude mark is not the light green"
-        );
-        assert!(
-            painted.contains(&amber),
-            "the attention dot is not the light amber"
-        );
-        assert!(
-            painted.contains(&search_line(r.bg)),
-            "the search line is not the light amber"
+            !painted.contains(&PALETTE[11]),
+            "the light search line must not stay the dark amber"
         );
         assert!(!painted.contains(&(0xb6, 0xc2, 0xcf)));
         assert!(!painted.contains(&(0x33, 0x3c, 0x48)));
 
+        let plain = [TabInfo {
+            title: "hi".into(),
+            busy: false,
+            attention: false,
+            active: true,
+            progress: None,
+        }];
         r.hover_caption = Some(0);
         r.hover_gear = true;
         out.clear();
-        r.draw_chrome(&mut out, 1400, 800, &tabs, None, false, None);
+        r.draw_chrome(&mut out, 1400, 800, &plain, None, false, None);
         let hovered: Vec<(u8, u8, u8)> = out.iter().map(|v| vertex_rgb(v.color)).collect();
         assert!(hovered.contains(&caption_hover(r.bg, false)));
         assert!(!hovered.contains(&(0x33, 0x3c, 0x48)));
@@ -10451,7 +10558,7 @@ mod cache_tests {
         r.hover_caption = Some(2);
         r.hover_gear = false;
         out.clear();
-        r.draw_chrome(&mut out, 1400, 800, &tabs, None, false, None);
+        r.draw_chrome(&mut out, 1400, 800, &plain, None, false, None);
         let closing: Vec<(u8, u8, u8)> = out.iter().map(|v| vertex_rgb(v.color)).collect();
         assert!(closing.contains(&caption_glyph(r.fg, true)));
         assert!(closing.contains(&caption_hover(r.bg, true)));
@@ -10461,7 +10568,7 @@ mod cache_tests {
         let mut dark = Renderer::new(1.0, &cfg, 0.0);
         dark.use_ui_metrics(true);
         let mut dark_out = Vec::new();
-        dark.draw_chrome(&mut dark_out, 1400, 800, &tabs, None, true, None);
+        dark.draw_chrome(&mut dark_out, 1400, 800, &plain, None, true, None);
         let dark_painted: Vec<(u8, u8, u8)> =
             dark_out.iter().map(|v| vertex_rgb(v.color)).collect();
         assert!(dark_painted.contains(&caption_glyph(dark.fg, false)));
@@ -10506,6 +10613,264 @@ mod cache_tests {
             let ratio = crate::theme::contrast_ratio(ink, ground);
             assert!(ratio >= 3.0, "{name} is {ratio}:1, want >= 3");
         }
+    }
+
+    /// Glyph quads against the opaque fill behind them. A 4.5:1 miss is the
+    /// light-page foreground sitting on a dark card.
+    fn card_text_failures(verts: &[crate::gpu::Vertex]) -> (usize, Vec<String>) {
+        let mut solids = Vec::new();
+        let mut glyphs = Vec::new();
+        for quad in verts.as_chunks::<6>().0 {
+            let x0 = quad.iter().map(|v| v.pos[0]).fold(f32::MAX, f32::min);
+            let y0 = quad.iter().map(|v| v.pos[1]).fold(f32::MAX, f32::min);
+            let x1 = quad.iter().map(|v| v.pos[0]).fold(f32::MIN, f32::max);
+            let y1 = quad.iter().map(|v| v.pos[1]).fold(f32::MIN, f32::max);
+            let rgb = vertex_rgb(quad[0].color);
+            let alpha = quad[0].color[3];
+            let solid =
+                (quad[0].uv[0] - WHITE_UV).abs() < 1e-5 && (quad[0].uv[1] - WHITE_UV).abs() < 1e-5;
+            if solid {
+                solids.push((x0, y0, x1, y1, rgb, alpha));
+            } else if alpha > 0.2 && x1 > x0 && y1 > y0 {
+                glyphs.push(((x0 + x1) * 0.5, (y0 + y1) * 0.5, rgb));
+            }
+        }
+        let mut checked = 0usize;
+        let mut bad = Vec::new();
+        for (x, y, ink) in glyphs {
+            let ground = solids.iter().rev().find(|s| {
+                s.5 >= 0.75
+                    && s.2 - s.0 >= 8.0
+                    && s.3 - s.1 >= 8.0
+                    && x >= s.0
+                    && x < s.2
+                    && y >= s.1
+                    && y < s.3
+            });
+            let Some(fill) = ground else { continue };
+            checked += 1;
+            let ratio = crate::theme::contrast_ratio(ink, fill.4);
+            if ratio < 4.5 {
+                bad.push(format!("{ink:?} on {:?} is {ratio:.2}:1", fill.4));
+            }
+        }
+        (checked, bad)
+    }
+
+    fn settings_view<'a>() -> SettingsView<'a> {
+        SettingsView {
+            theme: None,
+            appearance: Some(crate::theme::ThemeChoice::System),
+            font_family: "Cascadia Mono",
+            font_size: 18,
+            arabic_font: "تلقائي",
+            cursor: crate::config::CursorStyle::Block,
+            cursor_blink: true,
+            scrollback: 10_000,
+            copy_on_select: true,
+            ligatures: true,
+            bell: crate::config::BellMode::Attention,
+            notifications: true,
+            padding: 8,
+            opacity_pct: 100,
+            shell: "PowerShell",
+            hide_single_tab: false,
+            confirm_close: true,
+        }
+    }
+
+    /// Every card and popup in the light-theme checklist. Text is read off
+    /// the quads, not off a helper, so a header that goes back to the page
+    /// foreground fails here.
+    #[test]
+    fn card_text_clears_four_point_five_against_its_background() {
+        let paint = |light: bool| {
+            let cfg = crate::config::UserConfig {
+                system_apps_light: Some(light),
+                theme: if light { None } else { Some("dark".into()) },
+                ..Default::default()
+            };
+            let mut r = Renderer::new(1.0, &cfg, 0.0);
+            r.use_ui_metrics(true);
+            let mut frames: Vec<(&str, Vec<crate::gpu::Vertex>)> = Vec::new();
+            let mut out = Vec::new();
+            r.draw_settings(&mut out, 1400, 900, &settings_view());
+            frames.push(("settings", std::mem::take(&mut out)));
+            r.draw_shortcuts(
+                &mut out,
+                1400,
+                900,
+                &[ShortcutRow {
+                    label: "تبويب جديد".into(),
+                    chord: "Ctrl+T".into(),
+                    custom: false,
+                }],
+                0,
+                false,
+                None,
+            );
+            frames.push(("shortcuts", std::mem::take(&mut out)));
+            r.draw_cockpit(
+                &mut out,
+                1400,
+                900,
+                &[CockpitEntry {
+                    title: "الصدفة".into(),
+                    status: "جاهز".into(),
+                    busy: false,
+                    attention: false,
+                    active: true,
+                    progress: None,
+                }],
+                0,
+            );
+            frames.push(("cockpit", std::mem::take(&mut out)));
+            r.draw_palette(
+                &mut out,
+                1400,
+                900,
+                "نسخ",
+                &[MenuRow {
+                    label: "نسخ".into(),
+                    hint: "Ctrl+C".into(),
+                }],
+                0,
+            );
+            frames.push(("palette", std::mem::take(&mut out)));
+            r.draw_posh(
+                &mut out,
+                1400,
+                900,
+                &["موجّه".into()],
+                &[Some(b"ready".to_vec())],
+                0,
+            );
+            frames.push(("posh", std::mem::take(&mut out)));
+            r.draw_close_guard(&mut out, 1400, 900, "ثلاثة تبويبات ما زالت تعمل");
+            frames.push(("close", std::mem::take(&mut out)));
+            let preview = vec!["سطر أول".into(), "سطر ثانٍ".into()];
+            r.draw_paste_guard(
+                &mut out,
+                1400,
+                900,
+                &PasteCard {
+                    lines: 2,
+                    chars: 16,
+                    reason: "أكثر من سطر",
+                    preview: &preview,
+                    heading: None,
+                },
+            );
+            frames.push(("paste", std::mem::take(&mut out)));
+            r.draw_app_error(&mut out, 1400, 900, "تعذّر الحفظ", "المجلد غير متاح");
+            frames.push(("error", std::mem::take(&mut out)));
+            r.draw_link_block(&mut out, 1400, 900, "ليس محلياً", "\\\\server\\share", false);
+            frames.push(("link", std::mem::take(&mut out)));
+            r.hover_tab = Some(0);
+            r.draw_chrome(
+                &mut out,
+                1400,
+                800,
+                &[TabInfo {
+                    title: "عنوان طويل جداً لهذا التبويب حتى يُقص ويظهر التلميح".into(),
+                    busy: false,
+                    attention: false,
+                    active: true,
+                    progress: None,
+                }],
+                None,
+                false,
+                None,
+            );
+            frames.push(("tab tip", std::mem::take(&mut out)));
+            r.hover_tab = None;
+            frames
+        };
+        for light in [true, false] {
+            for (name, verts) in paint(light) {
+                let (checked, bad) = card_text_failures(&verts);
+                assert!(checked > 0, "{name} (light={light}) drew no text on a card");
+                assert!(
+                    bad.is_empty(),
+                    "{name} (light={light}) text is under 4.5:1: {bad:?}"
+                );
+            }
+        }
+        let mut hc = Renderer::with_a11y(
+            1.0,
+            &crate::config::UserConfig {
+                system_apps_light: Some(true),
+                ..Default::default()
+            },
+            0.0,
+            crate::a11y::A11ySnapshot {
+                high_contrast: true,
+                colors: crate::a11y::SystemColors {
+                    window: (0xff, 0xff, 0xff),
+                    window_text: (0x00, 0x00, 0x00),
+                    highlight: (0x00, 0x00, 0x80),
+                    highlight_text: (0xff, 0xff, 0xff),
+                    hotlight: (0x00, 0x00, 0x80),
+                    gray_text: (0x40, 0x40, 0x40),
+                    btn_face: (0xff, 0xff, 0xff),
+                },
+                text_scale: 1.0,
+            },
+        );
+        hc.use_ui_metrics(true);
+        let mut out = Vec::new();
+        hc.draw_settings(&mut out, 1400, 900, &settings_view());
+        let (checked, bad) = card_text_failures(&out);
+        assert!(checked > 0, "high contrast settings drew no text");
+        assert!(bad.is_empty(), "high contrast settings: {bad:?}");
+    }
+
+    #[test]
+    fn hovered_link_underline_comes_from_the_drawn_row() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+        let cfg = crate::config::UserConfig {
+            system_apps_light: Some(true),
+            ..Default::default()
+        };
+        let mut r = Renderer::new(1.0, &cfg, 0.0);
+        let size = crate::term::TermSize { cols: 20, rows: 2 };
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, b"hello");
+        let mut out = Vec::new();
+        r.draw_pane(
+            &mut out,
+            &PaneView {
+                rect: (0, 0, 400, 80),
+                focused: true,
+                cursor: crate::config::CursorStyle::Block,
+                cursor_on: false,
+                bordered: false,
+                claude: false,
+                claude_from: None,
+                reorder: true,
+                line_dir: &[],
+                search_match: None,
+                marks: &[],
+                link_hover: Some((0, 0, 5)),
+                bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+                link_tip: None,
+                scroll_px: 0,
+                peek_dir: ParagraphDir::Default,
+            },
+            &term,
+        );
+        let painted: Vec<(u8, u8, u8)> = out.iter().map(|v| vertex_rgb(v.color)).collect();
+        assert!(
+            painted.contains(&link_underline(r.bg)),
+            "the hover underline was not drawn"
+        );
+        assert!(
+            !painted.contains(&LINK_UNDER),
+            "a light page must not keep the mint underline"
+        );
     }
 
     /// The ligatures toggle picks a Mono-leading font family when off (so a

@@ -2139,6 +2139,12 @@ impl App {
         }
     }
 
+    /// `ThemeChanged` while the preferred theme is unset. The registry
+    /// DWORD wins; winit's light/dark is the fallback when the read fails.
+    fn on_theme_changed(&mut self, winit_light: bool, registry: Option<u32>) {
+        self.on_system_theme(theme_event_from(winit_light, registry));
+    }
+
     /// A Windows theme signal. The tested `apply_event` decides the palette
     /// and the caption flag; an explicit scheme comes back unchanged.
     fn on_system_theme(&mut self, event: theme::SystemThemeEvent) {
@@ -7516,20 +7522,30 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Ime(ime) => self.ime_input(ime),
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::ThemeChanged(theme) => {
-                // The registry DWORD is the app theme. winit's value covers a
-                // read that fails (the key is missing, or this is not Windows).
-                let event = match theme::read_apps_use_light_theme() {
-                    Some(value) => theme::SystemThemeEvent::ImmersiveColorSet {
-                        apps_use_light_theme: Some(value),
-                    },
-                    None => theme::SystemThemeEvent::Winit {
-                        light: matches!(theme, winit::window::Theme::Light),
-                    },
-                };
-                self.on_system_theme(event);
+                // winit emits this from WM_SETTINGCHANGE only while the
+                // window's preferred theme is unset. Do not call set_theme.
+                self.on_theme_changed(
+                    matches!(theme, winit::window::Theme::Light),
+                    theme::read_apps_use_light_theme(),
+                );
             }
             _ => {}
         }
+    }
+}
+
+/// The event `WindowEvent::ThemeChanged` becomes. `registry` is
+/// `AppsUseLightTheme`. winit only emits the event while the window's
+/// preferred theme is unset, so this function does not take one.
+pub(crate) fn theme_event_from(
+    winit_light: bool,
+    registry: Option<u32>,
+) -> theme::SystemThemeEvent {
+    match registry {
+        Some(value) => theme::SystemThemeEvent::ImmersiveColorSet {
+            apps_use_light_theme: Some(value),
+        },
+        None => theme::SystemThemeEvent::Winit { light: winit_light },
     }
 }
 
@@ -8267,6 +8283,32 @@ mod tests {
             Some(dracula),
             "a named scheme is not replaced"
         );
+    }
+
+    /// winit 0.30 emits `ThemeChanged` from `WM_SETTINGCHANGE` only while
+    /// the window's preferred theme is unset. The registry sample wins;
+    /// winit's own light/dark is the fallback. `on_theme_changed` is the
+    /// function the event arm calls.
+    #[test]
+    fn theme_changed_follows_the_registry_while_preferred_theme_is_unset() {
+        assert!(theme_event_from(false, Some(1)).is_light());
+        assert!(!theme_event_from(true, Some(0)).is_light());
+        assert!(theme_event_from(true, None).is_light());
+        assert!(!theme_event_from(false, None).is_light());
+        assert!(!theme_event_from(true, Some(2)).is_light());
+
+        let cfg = config::UserConfig {
+            system_apps_light: Some(false),
+            ..Default::default()
+        };
+        let mut app = app_for_theme(cfg);
+        app.on_theme_changed(false, Some(1));
+        assert_eq!(app.config.system_apps_light, Some(true));
+        assert_eq!(app.renderer.as_ref().map(|r| r.bg), Some(theme::LIGHT.bg));
+        app.on_theme_changed(true, None);
+        assert_eq!(app.renderer.as_ref().map(|r| r.bg), Some(theme::LIGHT.bg));
+        app.on_theme_changed(false, None);
+        assert_eq!(app.renderer.as_ref().map(|r| r.bg), Some(theme::DARK.bg));
     }
 
     #[test]
