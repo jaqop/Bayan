@@ -1186,7 +1186,7 @@ fn finish_attached(
 pub fn run_mux_server() -> Result<(), String> {
     // Unknown elevation is treated as elevated: a failed check must not
     // leave an admin server on a Medium-accessible pipe.
-    if !mux_may_run(true, is_elevated()) {
+    if !mux_may_run(true, crate::elevate::process_is_elevated()) {
         return Err("the mux server does not run in an elevated process".into());
     }
     #[cfg(windows)]
@@ -1199,23 +1199,12 @@ pub fn run_mux_server() -> Result<(), String> {
     }
 }
 
-/// Token elevation. A failed query counts as elevated so the mux stays off.
-pub fn is_elevated() -> bool {
-    #[cfg(windows)]
-    {
-        // the one token query in the tree; a failed query is elevated
-        crate::elevate::process_is_elevated()
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
-
 /// Dial the current user's pipe, starting the server process if it is down.
 /// `enabled` false does not dial and does not spawn (`Launch::None`).
 pub fn connect_or_spawn(enabled: bool) -> Result<MuxClient, String> {
-    if !mux_may_run(enabled, is_elevated()) || server_launch(enabled, false) == Launch::None {
+    if !mux_may_run(enabled, crate::elevate::process_is_elevated())
+        || server_launch(enabled, false) == Launch::None
+    {
         return Err("mux is disabled".into());
     }
     #[cfg(windows)]

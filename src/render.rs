@@ -408,6 +408,14 @@ fn dim((r, g, b): (u8, u8, u8)) -> (u8, u8, u8) {
     (f(r), f(g), f(b))
 }
 
+/// A preferred width between `min_w` and `max_w`. `i32::clamp` panics when
+/// the floor is above the ceiling, which a 150% text size does to a 700px
+/// window (`430 * 1.5` against `fw - 60`). The ceiling wins.
+fn span_in(preferred: i32, min_w: i32, max_w: i32) -> i32 {
+    let max_w = max_w.max(0);
+    preferred.max(min_w).min(max_w)
+}
+
 /// Straight-alpha color for the quad batch.
 fn c4((r, g, b): (u8, u8, u8), a: u8) -> [f32; 4] {
     [
@@ -1011,6 +1019,43 @@ pub struct ShortcutsLayout {
     pub rowh: i32,
     /// full-width hit strip per action row
     pub rows: Vec<Rect>,
+    /// 1 when the card fits. Below 1 every row was scaled into the window.
+    pub fit: f32,
+}
+
+impl ShortcutsLayout {
+    fn fit_into(&mut self, top: i32, frame_h: i32) {
+        let (_, y, _, h) = self.card;
+        let span = y.saturating_sub(top) + h;
+        let room = frame_h.saturating_sub(top).saturating_sub(8);
+        if room <= 0 || span <= room {
+            self.fit = 1.0;
+            return;
+        }
+        let fit = room as f32 / span as f32;
+        self.fit = fit;
+        let sy = |v: i32| top + ((v - top) as f32 * fit).round() as i32;
+        let sh = |v: i32| ((v as f32) * fit).round().max(1.0) as i32;
+        let (x, _, w, _) = self.card;
+        let ny = sy(y);
+        let nh = sh(h).min((frame_h - 8 - ny).max(1));
+        self.card = (x, ny, w, nh);
+        self.rowh = sh(self.rowh);
+        let limit = frame_h - 8;
+        self.rows = self
+            .rows
+            .iter()
+            .copied()
+            .map(|r| {
+                let y = sy(r.1);
+                let mut h = sh(r.3);
+                if y + h > limit {
+                    h = (limit - y).max(1);
+                }
+                (r.0, y, r.2, h)
+            })
+            .collect();
+    }
 }
 
 pub struct CloseGuardLayout {
@@ -1084,6 +1129,9 @@ pub struct SettingsLayout {
     pub appearance_label_y: i32,
     /// segmented control, left→right: النظام، داكن، فاتح
     pub appearance_btns: [Rect; 3],
+    /// 1 when the card fits. Below 1 the whole ledger was scaled so the
+    /// last row stays inside the window. Drawing uses the same factor.
+    pub fit: f32,
 }
 
 /// Move a group of rects to the mirror-image position across the card
@@ -1133,6 +1181,81 @@ impl SettingsLayout {
         ] {
             mirror_group(std::slice::from_mut(t), x, w);
         }
+    }
+
+    /// Shrink the ledger from `top` when it would run past `frame_h`.
+    /// A card that already fits is left byte-for-byte alone.
+    fn fit_into(&mut self, top: i32, frame_h: i32) {
+        let (_, y, _, h) = self.card;
+        let span = y.saturating_sub(top) + h;
+        let room = frame_h.saturating_sub(top).saturating_sub(8);
+        if room <= 0 || span <= room {
+            self.fit = 1.0;
+            return;
+        }
+        let fit = room as f32 / span as f32;
+        self.fit = fit;
+        let sy = |v: i32| top + ((v - top) as f32 * fit).round() as i32;
+        let sh = |v: i32| ((v as f32) * fit).round().max(1.0) as i32;
+        let sr = |r: Rect| (r.0, sy(r.1), r.2, sh(r.3));
+        self.card = sr(self.card);
+        self.head_h = sh(self.head_h);
+        self.rowh = sh(self.rowh);
+        self.shortcuts_btn = sr(self.shortcuts_btn);
+        self.lang_btn = sr(self.lang_btn);
+        self.theme_tiles = self.theme_tiles.iter().copied().map(sr).collect();
+        self.font_label_y = sy(self.font_label_y);
+        self.font_prev = sr(self.font_prev);
+        self.font_next = sr(self.font_next);
+        self.size_label_y = sy(self.size_label_y);
+        self.size_minus = sr(self.size_minus);
+        self.size_plus = sr(self.size_plus);
+        self.arabic_label_y = sy(self.arabic_label_y);
+        self.arabic_prev = sr(self.arabic_prev);
+        self.arabic_next = sr(self.arabic_next);
+        self.cursor_label_y = sy(self.cursor_label_y);
+        self.cursor_btns = self.cursor_btns.map(sr);
+        self.blink_label_y = sy(self.blink_label_y);
+        self.blink_toggle = sr(self.blink_toggle);
+        self.scroll_label_y = sy(self.scroll_label_y);
+        self.scroll_minus = sr(self.scroll_minus);
+        self.scroll_plus = sr(self.scroll_plus);
+        self.copy_label_y = sy(self.copy_label_y);
+        self.copy_toggle = sr(self.copy_toggle);
+        self.liga_label_y = sy(self.liga_label_y);
+        self.liga_toggle = sr(self.liga_toggle);
+        self.bell_label_y = sy(self.bell_label_y);
+        self.bell_btns = self.bell_btns.map(sr);
+        self.notif_label_y = sy(self.notif_label_y);
+        self.notif_toggle = sr(self.notif_toggle);
+        self.pad_label_y = sy(self.pad_label_y);
+        self.pad_minus = sr(self.pad_minus);
+        self.pad_plus = sr(self.pad_plus);
+        self.opacity_label_y = sy(self.opacity_label_y);
+        self.opacity_minus = sr(self.opacity_minus);
+        self.opacity_plus = sr(self.opacity_plus);
+        self.shell_label_y = sy(self.shell_label_y);
+        self.shell_prev = sr(self.shell_prev);
+        self.shell_next = sr(self.shell_next);
+        self.bar_label_y = sy(self.bar_label_y);
+        self.bar_toggle = sr(self.bar_toggle);
+        self.close_label_y = sy(self.close_label_y);
+        self.close_toggle = sr(self.close_toggle);
+        self.appearance_label_y = sy(self.appearance_label_y);
+        self.appearance_btns = self.appearance_btns.map(sr);
+        let limit = frame_h - 8;
+        if self.card.1 + self.card.3 > limit {
+            self.card.3 = (limit - self.card.1).max(1);
+        }
+        let clamp_bottom = |r: Rect| {
+            if r.1 + r.3 > limit {
+                (r.0, r.1, r.2, (limit - r.1).max(1))
+            } else {
+                r
+            }
+        };
+        self.close_toggle = clamp_bottom(self.close_toggle);
+        self.appearance_btns = self.appearance_btns.map(clamp_bottom);
     }
 }
 
@@ -2774,6 +2897,26 @@ impl Renderer {
         }
     }
 
+    /// Shrink the chrome face to `fit` for one card, and hand back the
+    /// metrics to restore. `fit` of 1 leaves the current face alone.
+    fn apply_panel_fit(&mut self, fit: f32) -> (Metrics, f32, f32) {
+        let saved = (self.metrics, self.cell_w, self.cell_h);
+        if fit < 0.999 {
+            let px = (self.ui_font_px() * fit).max(1.0);
+            let lh = (self.ui_cell_h() * fit).max(1.0);
+            self.metrics = Metrics::new(px, lh);
+            self.cell_w = (self.ui_cell_w() * fit).max(1.0);
+            self.cell_h = lh;
+        }
+        saved
+    }
+
+    fn restore_panel(&mut self, saved: (Metrics, f32, f32)) {
+        self.metrics = saved.0;
+        self.cell_w = saved.1;
+        self.cell_h = saved.2;
+    }
+
     pub fn use_ui_metrics(&mut self, active: bool) {
         self.metrics = if active {
             Metrics::new(self.ui_font_px(), self.ui_cell_h())
@@ -4250,6 +4393,9 @@ impl Renderer {
                     bg = self.chrome.selection;
                 }
             }
+            if self.grid_follows_hc {
+                fg = crate::a11y::ensure_contrast(fg, bg, crate::a11y::MIN_CELL_CONTRAST);
+            }
             if view
                 .search_match
                 .is_some_and(|m| *m.start() <= cell.point && cell.point <= *m.end())
@@ -4785,8 +4931,11 @@ impl Renderer {
         // The ledger grammar: every row is [control]···dotted leader···[label],
         // controls left, labels right (RTL), one shared control height.
         let pad = 24;
-        let w = ((self.ui_cell_w() * 52.0) as i32)
-            .clamp((430.0 * self.system_text_scale) as i32, fw as i32 - 60);
+        let w = span_in(
+            (self.ui_cell_w() * 52.0) as i32,
+            (430.0 * self.system_text_scale) as i32,
+            fw as i32 - 60,
+        );
         let head_h = (self.ui_cell_h() + 18.0 * self.dpi_scale) as i32;
         let foot_h = (self.ui_cell_h() + 18.0 * self.dpi_scale) as i32;
         // 16 rows since the system-theme row: at the roomy height the card
@@ -4965,10 +5114,12 @@ impl Renderer {
             close_toggle,
             appearance_label_y: appearance_y,
             appearance_btns,
+            fit: 1.0,
         };
         if !crate::lang::rtl() {
             lay.mirror(x, w);
         }
+        lay.fit_into(bar, fh as i32);
         lay
     }
 
@@ -4999,6 +5150,7 @@ impl Renderer {
 
         let whole: Rect = (0, 0, fw as i32, fh as i32);
         let lay = self.settings_layout(fw, fh);
+        let saved_panel = self.apply_panel_fit(lay.fit);
         let (x, y, w, h) = lay.card;
         let pad = 24;
         // label baseline offset: text vertically centered in its row
@@ -5551,12 +5703,13 @@ impl Renderer {
             y + h - (self.cell_h as i32 + 14),
             1.0,
         );
+        self.restore_panel(saved_panel);
     }
 
     /// Geometry of the shortcuts editor: one full-width clickable strip per
     /// action row (draw + hit-test agree, like the settings panel).
     pub fn shortcuts_layout(&self, fw: usize, fh: usize, n: usize) -> ShortcutsLayout {
-        let w = ((self.ui_cell_w() * 44.0) as i32).clamp(380, fw as i32 - 60);
+        let w = span_in((self.ui_cell_w() * 44.0) as i32, 380, fw as i32 - 60);
         let head_h = (self.ui_cell_h() + 30.0) as i32;
         let foot_h = (self.ui_cell_h() + 30.0) as i32;
         let bar = self.tab_bar_h() as i32;
@@ -5588,11 +5741,14 @@ impl Renderer {
         let rows = (0..n as i32)
             .map(|i| (x + 8, rows_top + rowh * i, w - 16, rowh))
             .collect();
-        ShortcutsLayout {
+        let mut lay = ShortcutsLayout {
             card: (x, y, w, h),
             rowh,
             rows,
-        }
+            fit: 1.0,
+        };
+        lay.fit_into(bar, fh as i32);
+        lay
     }
 
     /// The shortcuts editor: the settings ledger grammar again — keycap
@@ -5621,6 +5777,7 @@ impl Renderer {
 
         let whole: Rect = (0, 0, fw as i32, fh as i32);
         let lay = self.shortcuts_layout(fw, fh, rows.len());
+        let saved_panel = self.apply_panel_fit(lay.fit);
         let (x, y, w, h) = lay.card;
         let pad = 24;
         let tc = (lay.rowh as f32 - self.cell_h) as i32 / 2;
@@ -5660,14 +5817,26 @@ impl Renderer {
             let selected = i == sel;
             if selected {
                 // the accent bar hugs the reading edge: right in Arabic
-                push_rect(out, whole, rx, ry, rw, rh, c4((0x1b, 0x21, 0x29), 255));
+                push_rect(
+                    out,
+                    whole,
+                    rx,
+                    ry,
+                    rw,
+                    rh,
+                    c4(self.palette_sel_fill((0x1b, 0x21, 0x29)), 255),
+                );
                 let bar_x = if crate::lang::rtl() { rx + rw - 3 } else { rx };
                 push_rect(out, whole, bar_x, ry + 2, 3, rh - 4, c4(focus_c, 255));
             }
             // label at the reading edge
             let lseg = [Seg::plain(
                 row.label.clone(),
-                if selected { fg_c } else { muted_c },
+                if selected {
+                    self.palette_sel_text(fg_c)
+                } else {
+                    muted_c
+                },
             )];
             let lw = self.measure(&lseg, true);
             let label_x = crate::lang::lead_x(x, w, pad, lw.ceil() as i32) as f32;
@@ -5769,6 +5938,7 @@ impl Renderer {
             y + h - (self.cell_h as i32 + 14),
             1.0,
         );
+        self.restore_panel(saved_panel);
     }
 
     /// Shared geometry for painting and pointer input, independent of terminal zoom.
@@ -6740,7 +6910,10 @@ impl Renderer {
             1.0,
         );
         let keys_at = if let Some(rest) = rest_line {
-            let path = [Seg::plain(rest.to_string(), (0xc5, 0xcd, 0xd6))];
+            let path = [Seg::plain(
+                rest.to_string(),
+                self.chrome_fg_or((0xc5, 0xcd, 0xd6)),
+            )];
             self.draw_run(
                 &path,
                 false,
@@ -6755,7 +6928,10 @@ impl Renderer {
             2.0
         };
         let (ar, en) = crate::link::card_key_lines(may_open);
-        let keys_ar = [Seg::plain(ar.to_string(), (0x9a, 0xa4, 0xb2))];
+        let keys_ar = [Seg::plain(
+            ar.to_string(),
+            self.chrome_fg_or((0x9a, 0xa4, 0xb2)),
+        )];
         self.draw_run(
             &keys_ar,
             true,
@@ -6898,7 +7074,10 @@ impl Renderer {
             1.0,
         );
         for (i, line) in card.preview.iter().enumerate() {
-            let shown = [Seg::plain(line.clone(), (0xc5, 0xcd, 0xd6))];
+            let shown = [Seg::plain(
+                line.clone(),
+                self.chrome_fg_or((0xc5, 0xcd, 0xd6)),
+            )];
             self.draw_run(
                 &shown,
                 true,
@@ -6914,7 +7093,7 @@ impl Renderer {
                 "Enter تأكيد   ·   Esc إلغاء",
                 "Enter confirm   ·   Esc cancel",
             ),
-            (0x9a, 0xa4, 0xb2),
+            self.chrome_fg_or((0x9a, 0xa4, 0xb2)),
         )];
         self.draw_run(
             &keys,
@@ -7211,7 +7390,10 @@ impl Renderer {
         if claude {
             let label = [Seg::plain(
                 "● Claude",
-                crate::theme::bar_accent(crate::theme::BarAccent::Green, page_dark),
+                self.accent_color(crate::theme::bar_accent(
+                    crate::theme::BarAccent::Green,
+                    page_dark,
+                )),
             )];
             let tw = self.measure(&label, false);
             let x = self.tab_controls(width)[0].0 - tw.ceil() as i32 - 18 - elevated_w;
@@ -10096,6 +10278,161 @@ mod cache_tests {
             .layout_runs()
             .flat_map(|run| run.glyphs.iter().map(|g| g.glyph_id).collect::<Vec<_>>())
             .collect()
+    }
+
+    fn quad_has(out: &[crate::gpu::Vertex], rgb: (u8, u8, u8)) -> bool {
+        let want = c4(rgb, 255);
+        out.chunks(6).any(|q| {
+            q.iter().all(|v| {
+                (v.color[0] - want[0]).abs() < 0.01
+                    && (v.color[1] - want[1]).abs() < 0.01
+                    && (v.color[2] - want[2]).abs() < 0.01
+            })
+        })
+    }
+
+    #[test]
+    fn settings_card_survives_a_narrow_window_and_stays_on_screen() {
+        let cases = [
+            (1.0_f32, 1.0_f32, 480usize, 700usize),
+            (1.5, 1.0, 700, 800),
+            (2.25, 1.0, 1000, 800),
+            (1.25, 1.5, 1920, 1030),
+            (2.25, 1.0, 1920, 1080),
+        ];
+        for (ts, dpi, fw, fh) in cases {
+            let snap = crate::a11y::A11ySnapshot {
+                text_scale: ts,
+                ..crate::a11y::A11ySnapshot::neutral()
+            };
+            let r = Renderer::with_a11y(dpi, &crate::config::UserConfig::default(), 0.0, snap);
+            let lay = r.settings_layout(fw, fh);
+            let (x, y, w, h) = lay.card;
+            assert!(x >= 0 && y >= 0, "origin {ts} {dpi} {fw}x{fh}");
+            assert!(x + w <= fw as i32, "width {x}+{w} > {fw}");
+            assert!(y + h <= fh as i32, "settings bottom {} > {fh}", y + h);
+            let last = lay.close_toggle;
+            assert!(
+                last.1 >= 0 && last.1 + last.3 <= fh as i32,
+                "last settings row {}..{} leaves {fh}",
+                last.1,
+                last.1 + last.3
+            );
+            let keys = r.shortcuts_layout(fw, fh, 24);
+            let (sx, sy, sw, sh) = keys.card;
+            assert!(sx >= 0 && sy >= 0 && sx + sw <= fw as i32);
+            assert!(sy + sh <= fh as i32, "shortcuts bottom {} > {fh}", sy + sh);
+            let row = keys.rows.last().copied().unwrap();
+            assert!(
+                row.1 + row.3 <= fh as i32,
+                "last shortcut row leaves the window"
+            );
+        }
+    }
+
+    #[test]
+    fn high_contrast_draw_path_paints_system_colors() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+        let sys = crate::a11y::SystemColors {
+            window: (255, 255, 255),
+            window_text: (0, 0, 0),
+            highlight: (0, 0, 180),
+            highlight_text: (255, 255, 255),
+            hotlight: (0, 0, 128),
+            gray_text: (90, 90, 90),
+            btn_face: (255, 255, 255),
+        };
+        let mut r = Renderer::with_a11y(
+            1.0,
+            &crate::config::UserConfig::default(),
+            0.0,
+            crate::a11y::A11ySnapshot {
+                high_contrast: true,
+                colors: sys,
+                text_scale: 1.0,
+            },
+        );
+        let mut out = Vec::new();
+        r.use_ui_metrics(true);
+        r.draw_chrome(
+            &mut out,
+            1400,
+            800,
+            &[TabInfo {
+                title: "بيان".into(),
+                busy: false,
+                attention: false,
+                active: true,
+                progress: None,
+            }],
+            None,
+            true,
+            None,
+        );
+        assert!(
+            quad_has(&out, sys.window),
+            "the tab bar was not painted with COLOR_WINDOW"
+        );
+        assert!(
+            quad_has(&out, sys.hotlight)
+                || out.iter().any(|v| {
+                    let c = (
+                        (v.color[0] * 255.0).round() as u8,
+                        (v.color[1] * 255.0).round() as u8,
+                        (v.color[2] * 255.0).round() as u8,
+                    );
+                    c == sys.hotlight
+                }),
+            "the Claude badge was not COLOR_HOTLIGHT"
+        );
+        out.clear();
+        let rows = [ShortcutRow {
+            label: "تبويب جديد".into(),
+            chord: "Ctrl+T".into(),
+            custom: false,
+        }];
+        r.draw_shortcuts(&mut out, 1400, 800, &rows, 0, false, None);
+        assert!(
+            quad_has(&out, sys.highlight),
+            "the selected shortcut row was not COLOR_HIGHLIGHT"
+        );
+
+        let size = crate::term::TermSize { cols: 20, rows: 2 };
+        let mut t = Term::new(Config::default(), &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        p.advance(&mut t, b"\x1b[38;2;255;255;255mX");
+        let mut glyphs = Vec::new();
+        let view = PaneView {
+            rect: (0, 0, 400, 80),
+            focused: false,
+            cursor: crate::config::CursorStyle::Block,
+            cursor_on: false,
+            bordered: false,
+            claude: false,
+            claude_from: None,
+            reorder: true,
+            line_dir: &[],
+            bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+            search_match: None,
+            marks: &[],
+            link_hover: None,
+            link_tip: None,
+            scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
+        };
+        r.draw_pane(&mut glyphs, &view, &t);
+        let painted = glyphs.iter().any(|v| {
+            let c = (
+                (v.color[0] * 255.0).round() as u8,
+                (v.color[1] * 255.0).round() as u8,
+                (v.color[2] * 255.0).round() as u8,
+            );
+            c != sys.window
+                && crate::a11y::contrast_ratio(c, sys.window) >= crate::a11y::MIN_CELL_CONTRAST
+        });
+        assert!(painted, "white-on-white cell text was left unreadable");
     }
 
     /// M20: cosmic-text 0.19 shapes through harfrust with default OpenType
