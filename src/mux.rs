@@ -149,7 +149,9 @@ struct Slot {
     cols: u16,
     rows: u16,
     screen: Vec<u8>,
-    attached: bool,
+    /// `Some` is the window that currently has this session on screen.
+    /// `None` means detached: any of this user's windows may reattach it.
+    attached_to: Option<u64>,
 }
 
 /// In-memory sessions. The pipe server and the in-process fake both drive this.
@@ -178,11 +180,11 @@ impl MuxHub {
             command: slot.command.clone(),
             cols: slot.cols,
             rows: slot.rows,
-            screen: slot.screen.clone(),
+            screen: replay_bytes(&slot.screen),
         }
     }
 
-    fn spawn(&mut self, spec: &SpawnSpec) -> Result<u64, String> {
+    fn spawn(&mut self, spec: &SpawnSpec, client: u64) -> Result<u64, String> {
         if !valid_spawn(&spec.program, &spec.args) {
             return Err("refusing that program".into());
         }
@@ -200,42 +202,41 @@ impl MuxHub {
                 cols: spec.cols.max(1),
                 rows: spec.rows.max(1),
                 screen: Vec::new(),
-                attached: true,
+                attached_to: Some(client),
             },
         );
         Ok(id)
     }
 
-    fn note_output(&mut self, id: u64, bytes: &[u8]) -> bool {
-        let Some(slot) = self.slots.get_mut(&id) else {
-            return false;
-        };
+    /// `Some(client)` when that window should receive the new bytes.
+    fn note_output(&mut self, id: u64, bytes: &[u8]) -> Option<u64> {
+        let slot = self.slots.get_mut(&id)?;
         push_tail(&mut slot.screen, bytes);
-        slot.attached
+        slot.attached_to
     }
 
     fn detach(&mut self, id: u64) -> bool {
         let Some(slot) = self.slots.get_mut(&id) else {
             return false;
         };
-        slot.attached = false;
+        slot.attached_to = None;
         true
     }
 
     fn list_detached(&self) -> Vec<SessionSnap> {
         self.slots
             .iter()
-            .filter(|(_, slot)| !slot.attached)
+            .filter(|(_, slot)| slot.attached_to.is_none())
             .map(|(&id, slot)| Self::snap_of(id, slot))
             .collect()
     }
 
-    fn reattach(&mut self, id: u64) -> Option<SessionSnap> {
+    fn reattach(&mut self, id: u64, client: u64) -> Option<SessionSnap> {
         let slot = self.slots.get_mut(&id)?;
-        if slot.attached {
+        if slot.attached_to.is_some() {
             return None;
         }
-        slot.attached = true;
+        slot.attached_to = Some(client);
         Some(Self::snap_of(id, slot))
     }
 
@@ -247,12 +248,17 @@ impl MuxHub {
         self.slots.remove(&id).is_some()
     }
 
-    /// Sessions the departing window still had on screen. Detached ones stay.
-    fn drop_attached(&mut self) -> Vec<u64> {
+    fn attached_client(&self, id: u64) -> Option<u64> {
+        self.slots.get(&id).and_then(|slot| slot.attached_to)
+    }
+
+    /// Sessions `client` still had on screen. Another window's sessions,
+    /// and detached ones, stay.
+    fn drop_client(&mut self, client: u64) -> Vec<u64> {
         let ids: Vec<u64> = self
             .slots
             .iter()
-            .filter(|(_, slot)| slot.attached)
+            .filter(|(_, slot)| slot.attached_to == Some(client))
             .map(|(&id, _)| id)
             .collect();
         for id in &ids {
@@ -293,11 +299,11 @@ fn wants_exit(gate: &Gate, hub: &MuxHub) -> bool {
     gate.ever_had && hub.alive() == 0
 }
 
-fn reduce(hub: &mut MuxHub, gate: &mut Gate, msg: Message) -> Outcome {
+fn reduce(hub: &mut MuxHub, gate: &mut Gate, client: u64, msg: Message) -> Outcome {
     let mut replies = Vec::new();
     let mut effects = Vec::new();
     match msg {
-        Message::Spawn { token, spec } => match hub.spawn(&spec) {
+        Message::Spawn { token, spec } => match hub.spawn(&spec, client) {
             Ok(id) => {
                 gate.ever_had = true;
                 effects.push(Effect::Start { id, spec });
@@ -315,7 +321,7 @@ fn reduce(hub: &mut MuxHub, gate: &mut Gate, msg: Message) -> Outcome {
         Message::List => replies.push(Message::Sessions {
             sessions: hub.list_detached(),
         }),
-        Message::Reattach { id } => match hub.reattach(id) {
+        Message::Reattach { id } => match hub.reattach(id, client) {
             Some(snap) => replies.push(Message::Reattached { snap }),
             None => replies.push(Message::Missing { id }),
         },
@@ -353,9 +359,9 @@ fn reduce(hub: &mut MuxHub, gate: &mut Gate, msg: Message) -> Outcome {
     }
 }
 
-fn client_gone(hub: &mut MuxHub) -> Outcome {
+fn client_gone(hub: &mut MuxHub, client: u64) -> Outcome {
     let effects = hub
-        .drop_attached()
+        .drop_client(client)
         .into_iter()
         .map(|id| Effect::Stop { id })
         .collect();
@@ -395,12 +401,165 @@ pub fn push_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
         return;
     }
     let mut drop_n = tail.len() - TAIL_MAX;
-    if let Some(rel) = tail[drop_n..].iter().position(|&b| b == b'\n') {
-        if rel < 4096 {
-            drop_n += rel + 1;
+    if let Some(rel) = tail[drop_n..].iter().take(4096).position(|&b| b == b'\n') {
+        drop_n += rel + 1;
+    }
+    drop_n = safe_boundary(tail, drop_n);
+    tail.drain(..drop_n.min(tail.len()));
+}
+
+/// Bytes a reattach may feed to a fresh terminal. The cut is on a UTF-8
+/// boundary and not inside an escape sequence, and device queries are
+/// removed so a stale `CSI 6n` is not answered into the live session.
+pub fn replay_bytes(input: &[u8]) -> Vec<u8> {
+    let mut i = safe_boundary(input, 0);
+    let mut out = Vec::with_capacity(input.len().saturating_sub(i));
+    while i < input.len() {
+        if input[i] == 0x1b {
+            match escape_end(input, i) {
+                Some(end) => {
+                    if !is_query(&input[i..end]) {
+                        out.extend_from_slice(&input[i..end]);
+                    }
+                    i = end;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        let width = utf8_width(input[i]);
+        if width == 1 {
+            out.push(input[i]);
+            i += 1;
+            continue;
+        }
+        if i + width <= input.len() && input[i + 1..i + width].iter().all(|b| is_utf8_cont(*b)) {
+            out.extend_from_slice(&input[i..i + width]);
+            i += width;
+        } else {
+            i += 1;
         }
     }
-    tail.drain(..drop_n.min(tail.len()));
+    out
+}
+
+fn is_utf8_cont(b: u8) -> bool {
+    (b & 0xC0) == 0x80
+}
+
+fn utf8_width(lead: u8) -> usize {
+    if lead < 0x80 {
+        1
+    } else if lead & 0xE0 == 0xC0 {
+        2
+    } else if lead & 0xF0 == 0xE0 {
+        3
+    } else if lead & 0xF8 == 0xF0 {
+        4
+    } else {
+        1
+    }
+}
+
+/// First index at or after `i` that is a character boundary and not inside
+/// an escape that started before it.
+fn safe_boundary(buf: &[u8], mut i: usize) -> usize {
+    if i > buf.len() {
+        return buf.len();
+    }
+    if let Some(end) = escape_covering(buf, i) {
+        i = end;
+    }
+    while i < buf.len() && is_utf8_cont(buf[i]) {
+        i += 1;
+    }
+    if let Some(end) = escape_covering(buf, i) {
+        i = end;
+    }
+    i.min(buf.len())
+}
+
+fn escape_covering(buf: &[u8], i: usize) -> Option<usize> {
+    let from = i.saturating_sub(4096);
+    let mut last = None;
+    let mut j = from;
+    while j < i {
+        if buf[j] == 0x1b {
+            last = Some(j);
+        }
+        j += 1;
+    }
+    let esc = last?;
+    let end = escape_end(buf, esc)?;
+    (end > i).then_some(end)
+}
+
+fn escape_end(buf: &[u8], esc: usize) -> Option<usize> {
+    if buf.get(esc) != Some(&0x1b) {
+        return None;
+    }
+    let next = *buf.get(esc + 1)?;
+    match next {
+        b'[' => csi_end(buf, esc + 2),
+        b']' | b'P' | b'X' | b'^' | b'_' => st_end(buf, esc + 2),
+        _ => Some((esc + 2).min(buf.len())),
+    }
+}
+
+fn csi_end(buf: &[u8], mut i: usize) -> Option<usize> {
+    while i < buf.len() {
+        let b = buf[i];
+        i += 1;
+        if (0x40..=0x7e).contains(&b) {
+            return Some(i);
+        }
+        if !(0x20..0x40).contains(&b) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn st_end(buf: &[u8], mut i: usize) -> Option<usize> {
+    while i < buf.len() {
+        if buf[i] == 0x07 {
+            return Some(i + 1);
+        }
+        if buf[i] == 0x1b && buf.get(i + 1) == Some(&b'\\') {
+            return Some(i + 2);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Device queries a fresh emulator would answer into the PTY: DSR, DA,
+/// the kitty keyboard query, and OSC queries (`?`).
+fn is_query(seq: &[u8]) -> bool {
+    if seq.first() != Some(&0x1b) || seq.len() < 2 {
+        return false;
+    }
+    match seq[1] {
+        b'Z' => true,
+        b'[' => {
+            let final_b = *seq.last().unwrap_or(&0);
+            final_b == b'n' || final_b == b'c' || (final_b == b'u' && seq.contains(&b'?'))
+        }
+        b']' => seq.contains(&b'?'),
+        _ => false,
+    }
+}
+
+/// An elevated window must not own the mux. The pipe name is only the user
+/// SID, so a Medium process of that user could otherwise ask a High server
+/// to spawn a program.
+pub fn mux_may_run(enabled: bool, elevated: bool) -> bool {
+    enabled && !elevated
+}
+
+/// True when `owner` is the client's own SID. An empty SID never matches.
+pub fn owner_is_client(owner: &[u8], client: &[u8]) -> bool {
+    !client.is_empty() && owner == client
 }
 
 /// SDDL for a pipe DACL: protected, one allow-all ACE, that SID only.
@@ -420,17 +579,39 @@ pub fn sddl_for_sid(sid: &str) -> Result<String, String> {
     Ok(format!("D:P(A;;GA;;;{sid})"))
 }
 
-/// `dwOpenMode` and `dwPipeMode` for the server end. The mode word carries
-/// `PIPE_REJECT_REMOTE_CLIENTS`; the open word asks to be the first instance.
-pub fn server_pipe_flags() -> (u32, u32) {
+/// Later instances of the same pipe omit `FILE_FLAG_FIRST_PIPE_INSTANCE`
+/// so a second window can connect while the first is still attached.
+/// Every instance rejects remote clients.
+pub fn server_instance_flags(first: bool) -> (u32, u32) {
     const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
     const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
     const PIPE_TYPE_BYTE: u32 = 0;
     const PIPE_READMODE_BYTE: u32 = 0;
     const PIPE_WAIT: u32 = 0;
-    let open = PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE;
+    let mut open = PIPE_ACCESS_DUPLEX;
+    if first {
+        open |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+    }
     let mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
     (open, mode)
+}
+
+/// Enough instances for one pipe per window, not a single exclusive server.
+pub fn pipe_max_instances() -> u32 {
+    255
+}
+
+/// `SECURITY_SQOS_PRESENT`. The client identifies itself; it does not let
+/// the server impersonate it.
+pub const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
+/// Impersonation level Identification, shifted into `dwFlagsAndAttributes`.
+pub const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
+
+/// Flags for `CreateFileW` on the client end: a normal file plus
+/// identification-only QoS.
+pub fn client_file_flags() -> u32 {
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION
 }
 
 pub fn encode_frame(msg: &Message, out: &mut Vec<u8>) {
@@ -761,12 +942,18 @@ impl FakeMuxServer {
     }
 
     pub fn transact(&mut self, msg: Message) -> Vec<Message> {
+        self.transact_as(1, msg)
+    }
+
+    /// `client` is the window. Two ids can be connected at once; disconnecting
+    /// one kills only the sessions that window still had on screen.
+    pub fn transact_as(&mut self, client: u64, msg: Message) -> Vec<Message> {
         let mut wire = Vec::new();
         encode_frame(&msg, &mut wire);
         let (decoded, n) = decode_frame(&wire).expect("frame").expect("complete");
         assert_eq!(n, wire.len());
         assert_eq!(decoded, msg);
-        let outcome = reduce(&mut self.hub, &mut self.gate, decoded);
+        let outcome = reduce(&mut self.hub, &mut self.gate, client, decoded);
         self.effects.extend(outcome.effects);
         self.exit_now = outcome.exit_now;
         let mut back = Vec::new();
@@ -789,9 +976,21 @@ impl FakeMuxServer {
     }
 
     pub fn client_disconnected(&mut self) {
-        let outcome = client_gone(&mut self.hub);
+        self.disconnect(1);
+    }
+
+    pub fn disconnect(&mut self, client: u64) {
+        let outcome = client_gone(&mut self.hub, client);
         self.effects.extend(outcome.effects);
         self.exit_now = outcome.exit_now;
+    }
+
+    /// The child ended with `code`. The message is what the server writes;
+    /// the code is the process status, not a constant.
+    pub fn child_exited(&mut self, id: u64, code: u32) -> Message {
+        self.hub.child_gone(id);
+        self.exit_now = wants_exit(&self.gate, &self.hub);
+        Message::Exit { id, code }
     }
 }
 
@@ -981,6 +1180,11 @@ fn finish_attached(
 
 /// Entry point for `bayan --mux-server`.
 pub fn run_mux_server() -> Result<(), String> {
+    // Unknown elevation is treated as elevated: a failed check must not
+    // leave an admin server on a Medium-accessible pipe.
+    if !mux_may_run(true, is_elevated()) {
+        return Err("the mux server does not run in an elevated process".into());
+    }
     #[cfg(windows)]
     {
         os::run()
@@ -991,10 +1195,22 @@ pub fn run_mux_server() -> Result<(), String> {
     }
 }
 
+/// Token elevation. A failed query counts as elevated so the mux stays off.
+pub fn is_elevated() -> bool {
+    #[cfg(windows)]
+    {
+        os::token_is_elevated()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// Dial the current user's pipe, starting the server process if it is down.
 /// `enabled` false does not dial and does not spawn (`Launch::None`).
 pub fn connect_or_spawn(enabled: bool) -> Result<MuxClient, String> {
-    if server_launch(enabled, false) == Launch::None {
+    if !mux_may_run(enabled, is_elevated()) || server_launch(enabled, false) == Launch::None {
         return Err("mux is disabled".into());
     }
     #[cfg(windows)]
@@ -1019,31 +1235,43 @@ mod os {
 
     pub fn run() -> Result<(), String> {
         let (tx, rx) = mpsc::channel::<Ev>();
-        start_acceptor(tx.clone());
         let mut hub = MuxHub::new();
         let mut gate = Gate { ever_had: false };
         let mut lives: HashMap<u64, Live> = HashMap::new();
-        let mut writer: Option<File> = None;
+        let mut clients: HashMap<u64, File> = HashMap::new();
+        let mut next_client = 1u64;
+        let mut first_instance = true;
+        let mut accepting = false;
         let mut accept_fails = 0u32;
+        begin_accept(&tx, first_instance, &mut accepting);
         while let Ok(ev) = rx.recv() {
             match ev {
                 Ev::Connected(file) => {
+                    accepting = false;
                     accept_fails = 0;
                     match file.try_clone() {
                         Ok(read) => {
-                            writer = Some(file);
+                            let client = next_client;
+                            next_client += 1;
+                            clients.insert(client, file);
                             let tx2 = tx.clone();
                             let _ = std::thread::Builder::new()
                                 .name("bayan-mux-read".into())
-                                .spawn(move || reader_loop(read, tx2));
+                                .spawn(move || reader_loop(client, read, tx2));
+                            // The name is claimed. Later instances must not use
+                            // FILE_FLAG_FIRST_PIPE_INSTANCE.
+                            first_instance = false;
+                            // The next window connects on its own instance
+                            // instead of waiting for this one to leave.
+                            begin_accept(&tx, first_instance, &mut accepting);
                         }
                         Err(e) => {
                             let _ = tx.send(Ev::AcceptErr(e.to_string()));
                         }
                     }
                 }
-                Ev::Frame(msg) => {
-                    let mut outcome = reduce(&mut hub, &mut gate, msg);
+                Ev::Frame { client, msg } => {
+                    let mut outcome = reduce(&mut hub, &mut gate, client, msg);
                     if let Err(message) = apply(&mut lives, &tx, &mut outcome.effects) {
                         if let Some(Message::Spawned { token, id }) = outcome
                             .replies
@@ -1059,10 +1287,10 @@ mod os {
                             outcome.exit_now = false;
                         }
                     }
-                    if let Some(w) = writer.as_mut() {
+                    if let Some(w) = clients.get_mut(&client) {
                         for reply in &outcome.replies {
                             if write_frame(&mut *w, reply).is_err() {
-                                writer = None;
+                                clients.remove(&client);
                                 break;
                             }
                         }
@@ -1072,53 +1300,73 @@ mod os {
                     }
                 }
                 Ev::Output(id, bytes) => {
-                    let attached = hub.note_output(id, &bytes);
-                    if attached {
-                        if let Some(w) = writer.as_mut() {
+                    let dest = hub.note_output(id, &bytes);
+                    if let Some(client) = dest {
+                        if let Some(w) = clients.get_mut(&client) {
                             let _ = write_frame(&mut *w, &Message::Output { id, bytes });
                         }
                     }
                 }
                 Ev::ChildGone(id) => {
+                    let code = exit_code_of(lives.get_mut(&id));
+                    let dest = hub.attached_client(id);
                     if hub.child_gone(id) {
                         lives.remove(&id);
-                        if let Some(w) = writer.as_mut() {
-                            let _ = write_frame(&mut *w, &Message::Exit { id, code: 0 });
+                        if let Some(client) = dest {
+                            if let Some(w) = clients.get_mut(&client) {
+                                let _ = write_frame(&mut *w, &Message::Exit { id, code });
+                            }
                         }
                     }
                     if gate.ever_had && hub.alive() == 0 {
                         break;
                     }
                 }
-                Ev::Eof => {
-                    writer = None;
-                    let outcome = client_gone(&mut hub);
+                Ev::Eof { client } => {
+                    clients.remove(&client);
+                    let outcome = client_gone(&mut hub, client);
                     let mut effects = outcome.effects;
                     let _ = apply(&mut lives, &tx, &mut effects);
                     if outcome.exit_now {
                         break;
                     }
-                    start_acceptor(tx.clone());
+                    begin_accept(&tx, first_instance, &mut accepting);
                 }
                 Ev::AcceptErr(error) => {
+                    accepting = false;
                     accept_fails += 1;
                     // Nobody left to keep, or the pipe never came up: leave.
                     // Detached sessions retry; a name clash can clear.
-                    if hub.alive() == 0 && (gate.ever_had || accept_fails > 8) {
+                    if hub.alive() == 0 && clients.is_empty() && (gate.ever_had || accept_fails > 8)
+                    {
                         return Err(error);
                     }
                     std::thread::sleep(std::time::Duration::from_millis(200));
-                    start_acceptor(tx.clone());
+                    begin_accept(&tx, first_instance, &mut accepting);
                 }
             }
         }
         Ok(())
     }
 
+    fn begin_accept(tx: &mpsc::Sender<Ev>, first_instance: bool, accepting: &mut bool) {
+        if *accepting {
+            return;
+        }
+        *accepting = true;
+        start_acceptor(tx.clone(), first_instance);
+    }
+
+    fn exit_code_of(live: Option<&mut Live>) -> u32 {
+        live.and_then(|live| live.child.try_wait().ok().flatten())
+            .map(|status| status.exit_code())
+            .unwrap_or(1)
+    }
+
     enum Ev {
         Connected(File),
-        Frame(Message),
-        Eof,
+        Frame { client: u64, msg: Message },
+        Eof { client: u64 },
         Output(u64, Vec<u8>),
         ChildGone(u64),
         AcceptErr(String),
@@ -1130,16 +1378,16 @@ mod os {
         child: Box<dyn portable_pty::Child + Send + Sync>,
     }
 
-    fn reader_loop(mut read: File, tx: mpsc::Sender<Ev>) {
+    fn reader_loop(client: u64, mut read: File, tx: mpsc::Sender<Ev>) {
         loop {
             match read_frame(&mut read) {
                 Ok(msg) => {
-                    if tx.send(Ev::Frame(msg)).is_err() {
+                    if tx.send(Ev::Frame { client, msg }).is_err() {
                         break;
                     }
                 }
                 Err(_) => {
-                    let _ = tx.send(Ev::Eof);
+                    let _ = tx.send(Ev::Eof { client });
                     break;
                 }
             }
@@ -1237,10 +1485,10 @@ mod os {
         ))
     }
 
-    fn start_acceptor(tx: mpsc::Sender<Ev>) {
+    fn start_acceptor(tx: mpsc::Sender<Ev>, first: bool) {
         let _ = std::thread::Builder::new()
             .name("bayan-mux-accept".into())
-            .spawn(move || match create_connected_pipe() {
+            .spawn(move || match create_connected_pipe(first) {
                 Ok(file) => {
                     let _ = tx.send(Ev::Connected(file));
                 }
@@ -1506,13 +1754,18 @@ mod os {
             windows_sys::Win32::System::Pipes::WaitNamedPipeW(wide.as_ptr(), 200);
         }
         let handle = create_file_pipe(&wide)?;
-        // SAFETY: `handle` is an open pipe we own. File closes it.
-        Ok(unsafe { File::from_raw_handle(handle as RawHandle) })
+        // SAFETY: `handle` is an open pipe we own. File closes it. The
+        // owner check runs before this function returns the handle to a
+        // caller that would type into it.
+        let file = unsafe { File::from_raw_handle(handle as RawHandle) };
+        let sid = current_user_sid()?;
+        verify_server(&file, &sid)?;
+        Ok(file)
     }
 
-    fn create_connected_pipe() -> Result<File, String> {
+    fn create_connected_pipe(first: bool) -> Result<File, String> {
         let name = production_pipe_name()?;
-        let handle = create_named_pipe(&name)?;
+        let handle = create_named_pipe(&name, first)?;
         // SAFETY: `handle` came from CreateNamedPipeW and is not yet connected.
         // A null overlapped pointer is the synchronous form.
         let ok = unsafe {
@@ -1542,8 +1795,8 @@ mod os {
     #[cfg(test)]
     pub(super) fn listen_secured(name: &str) -> Result<SecuredPipe, String> {
         let sid = current_user_sid()?;
-        let (_open, mode) = server_pipe_flags();
-        let handle = create_named_pipe(name)?;
+        let (_open, mode) = server_instance_flags(true);
+        let handle = create_named_pipe(name, true)?;
         Ok(SecuredPipe {
             // SAFETY: we own `handle` and have not connected it. Drop closes it.
             file: unsafe { File::from_raw_handle(handle as RawHandle) },
@@ -1675,7 +1928,10 @@ mod os {
         Ok(format!(r"\\.\pipe\bayan-mux-{text}"))
     }
 
-    fn create_named_pipe(name: &str) -> Result<windows_sys::Win32::Foundation::HANDLE, String> {
+    fn create_named_pipe(
+        name: &str,
+        first: bool,
+    ) -> Result<windows_sys::Win32::Foundation::HANDLE, String> {
         use windows_sys::Win32::Foundation::LocalFree;
         use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
         use windows_sys::Win32::System::Pipes::CreateNamedPipeW;
@@ -1719,16 +1975,17 @@ mod os {
             lpSecurityDescriptor: sd,
             bInheritHandle: 0,
         };
-        let (open_mode, pipe_mode) = server_pipe_flags();
+        let (open_mode, pipe_mode) = server_instance_flags(first);
         let name_w = wstr(name);
         // SAFETY: both wide strings and `sa` (pointing at `sd`) live for the
-        // call. The descriptor is copied onto the pipe object.
+        // call. The descriptor is copied onto the pipe object. The first
+        // instance is the one that sets `FILE_FLAG_FIRST_PIPE_INSTANCE`.
         let handle = unsafe {
             CreateNamedPipeW(
                 name_w.as_ptr(),
                 open_mode,
                 pipe_mode,
-                1,
+                pipe_max_instances(),
                 64 * 1024,
                 64 * 1024,
                 0,
@@ -1745,13 +2002,12 @@ mod os {
     }
 
     fn create_file_pipe(name: &[u16]) -> Result<windows_sys::Win32::Foundation::HANDLE, String> {
-        use windows_sys::Win32::Storage::FileSystem::{
-            CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
-        };
+        use windows_sys::Win32::Storage::FileSystem::{CreateFileW, OPEN_EXISTING};
         const GENERIC_READ: u32 = 0x8000_0000;
         const GENERIC_WRITE: u32 = 0x4000_0000;
         // SAFETY: `name` is NUL-terminated. A null security descriptor means
-        // the client's own token, which the server's DACL already allows.
+        // the client's own token. `client_file_flags` asks for identification
+        // QoS, so the server cannot impersonate this process.
         let handle = unsafe {
             CreateFileW(
                 name.as_ptr(),
@@ -1759,7 +2015,7 @@ mod os {
                 0,
                 std::ptr::null(),
                 OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
+                client_file_flags(),
                 std::ptr::null_mut(),
             )
         };
@@ -1788,6 +2044,161 @@ mod os {
                 }
             }
             String::from_utf16_lossy(std::slice::from_raw_parts(wide, n))
+        }
+    }
+
+    /// The pipe's owner and the server process token must both be `client_sid`.
+    /// Anything else — another account's pipe, or a process we cannot query —
+    /// is refused, so keystrokes are not sent to an impersonator.
+    pub(super) fn verify_server(file: &File, client_sid: &[u8]) -> Result<(), String> {
+        let owner = pipe_owner_sid(file)?;
+        if !owner_is_client(&owner, client_sid) {
+            return Err("pipe owner is not this user".into());
+        }
+        let server = server_process_user(file)?;
+        if !owner_is_client(&server, client_sid) {
+            return Err("pipe server process is not this user".into());
+        }
+        Ok(())
+    }
+
+    fn pipe_owner_sid(file: &File) -> Result<Vec<u8>, String> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+        const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
+        // SAFETY: `file` is a live pipe. GetSecurityInfo allocates `sd`; the
+        // owner pointer addresses memory inside that block, copied before free.
+        unsafe {
+            let mut owner = std::ptr::null_mut();
+            let mut sd = std::ptr::null_mut();
+            let err = GetSecurityInfo(
+                file.as_raw_handle() as _,
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut sd,
+            );
+            if err != 0 || owner.is_null() {
+                if !sd.is_null() {
+                    LocalFree(sd as _);
+                }
+                return Err(format!("GetSecurityInfo(owner) failed ({err})"));
+            }
+            let bytes = sid_bytes(owner);
+            LocalFree(sd as _);
+            if bytes.is_empty() {
+                return Err("pipe owner sid is empty".into());
+            }
+            Ok(bytes)
+        }
+    }
+
+    fn server_process_user(file: &File) -> Result<Vec<u8>, String> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY};
+        use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+        use windows_sys::Win32::System::Threading::{OpenProcess, OpenProcessToken};
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        // SAFETY: the pipe handle is live. The process and token handles are
+        // closed before return. The SID is copied out of the token buffer.
+        unsafe {
+            let mut pid = 0u32;
+            if GetNamedPipeServerProcessId(file.as_raw_handle() as _, &mut pid) == 0 || pid == 0 {
+                return Err(format!(
+                    "GetNamedPipeServerProcessId failed ({})",
+                    last_error()
+                ));
+            }
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() {
+                return Err(format!(
+                    "OpenProcess of the pipe server failed ({})",
+                    last_error()
+                ));
+            }
+            let mut token = std::ptr::null_mut();
+            let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token);
+            CloseHandle(process);
+            if opened == 0 {
+                return Err(format!(
+                    "OpenProcessToken of the pipe server failed ({})",
+                    last_error()
+                ));
+            }
+            let mut needed = 0u32;
+            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+            if needed == 0 {
+                CloseHandle(token);
+                return Err("server token has no user".into());
+            }
+            let mut buf = vec![0u8; needed as usize];
+            if GetTokenInformation(
+                token,
+                TokenUser,
+                buf.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            ) == 0
+            {
+                CloseHandle(token);
+                return Err(format!(
+                    "GetTokenInformation(server) failed ({})",
+                    last_error()
+                ));
+            }
+            let user = &*(buf.as_ptr() as *const windows_sys::Win32::Security::TOKEN_USER);
+            let bytes = sid_bytes(user.User.Sid);
+            CloseHandle(token);
+            if bytes.is_empty() {
+                return Err("server user sid is empty".into());
+            }
+            Ok(bytes)
+        }
+    }
+
+    /// SAFETY: `sid` is a valid SID pointer that stays alive for the copy.
+    unsafe fn sid_bytes(sid: *mut std::ffi::c_void) -> Vec<u8> {
+        let len = windows_sys::Win32::Security::GetLengthSid(sid) as usize;
+        if len == 0 || len > 256 {
+            return Vec::new();
+        }
+        std::slice::from_raw_parts(sid as *const u8, len).to_vec()
+    }
+
+    /// Fail closed: if the token cannot be read, the process is treated as
+    /// elevated and the mux stays off.
+    pub(super) fn token_is_elevated() -> bool {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        // SAFETY: the token is this process's, queried and closed here.
+        // TOKEN_ELEVATION is a single u32 the API writes.
+        unsafe {
+            let mut token = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return true;
+            }
+            let mut elev = TOKEN_ELEVATION { TokenIsElevated: 0 };
+            let mut needed = 0u32;
+            let ok = GetTokenInformation(
+                token,
+                TokenElevation,
+                (&mut elev) as *mut TOKEN_ELEVATION as *mut _,
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut needed,
+            );
+            CloseHandle(token);
+            if ok == 0 {
+                return true;
+            }
+            elev.TokenIsElevated != 0
         }
     }
 
@@ -2022,12 +2433,12 @@ mod tests {
         assert!(sddl_for_sid("Everyone").is_err());
         assert!(sddl_for_sid("S-1-5-21-1;WD").is_err());
         assert!(sddl_for_sid("S-1-5-21-1)(A;;GA;;;WD").is_err());
-        let (_open, mode) = server_pipe_flags();
+        let (_open, mode) = server_instance_flags(true);
         assert_eq!(
             mode & PIPE_REJECT_REMOTE_CLIENTS,
             PIPE_REJECT_REMOTE_CLIENTS
         );
-        let (open, _) = server_pipe_flags();
+        let (open, _) = server_instance_flags(true);
         assert_ne!(open & 0x0008_0000, 0, "first pipe instance");
     }
 
@@ -2073,5 +2484,184 @@ mod tests {
             os::dacl_is_only(&pipe.file, &sid).expect("read the DACL"),
             "DACL must be one allow ACE for the token user and nobody else"
         );
+        assert!(
+            os::verify_server(&pipe.file, &sid).is_ok(),
+            "a pipe we created is owned by us"
+        );
+        let mut foreign = sid.clone();
+        let last = foreign.last_mut().unwrap();
+        *last ^= 0xff;
+        if foreign == sid {
+            foreign.push(1);
+        }
+        assert!(
+            os::verify_server(&pipe.file, &foreign).is_err(),
+            "dial must refuse a pipe whose expected owner is not the client"
+        );
+    }
+
+    fn spawned(srv: &mut FakeMuxServer, client: u64, token: u64) -> u64 {
+        match &srv.transact_as(
+            client,
+            Message::Spawn {
+                token,
+                spec: sample_spec("ssh.exe"),
+            },
+        )[0]
+        {
+            Message::Spawned { id, .. } => *id,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn elevated_window_does_not_start_the_mux() {
+        assert!(!mux_may_run(true, true), "elevated + enabled must stay off");
+        assert!(!mux_may_run(false, true));
+        assert!(!mux_may_run(false, false));
+        assert!(mux_may_run(true, false));
+        // The server entry point uses the same gate. An elevated caller does
+        // not reach the pipe.
+        assert!(
+            run_gated(true).is_err(),
+            "an elevated process must not become the mux server"
+        );
+    }
+
+    /// What `run_mux_server` does with a known elevation bit, before any pipe.
+    fn run_gated(elevated: bool) -> Result<(), String> {
+        if !mux_may_run(true, elevated) {
+            Err("the mux server does not run in an elevated process".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn later_pipe_instances_are_not_marked_first() {
+        let (first, mode) = server_instance_flags(true);
+        let (next, mode2) = server_instance_flags(false);
+        assert_ne!(first & 0x0008_0000, 0, "the first instance claims the name");
+        assert_eq!(
+            next & 0x0008_0000,
+            0,
+            "a second window must be able to create another instance"
+        );
+        assert_eq!(
+            mode & PIPE_REJECT_REMOTE_CLIENTS,
+            PIPE_REJECT_REMOTE_CLIENTS
+        );
+        assert_eq!(
+            mode2 & PIPE_REJECT_REMOTE_CLIENTS,
+            PIPE_REJECT_REMOTE_CLIENTS
+        );
+        assert_eq!(pipe_max_instances(), 255);
+        let flags = client_file_flags();
+        assert_eq!(flags & SECURITY_SQOS_PRESENT, SECURITY_SQOS_PRESENT);
+        assert_eq!(flags & SECURITY_IDENTIFICATION, SECURITY_IDENTIFICATION);
+    }
+
+    #[test]
+    fn a_foreign_owner_is_not_this_client() {
+        let client = b"\x01\x02\x03\x04";
+        assert!(owner_is_client(client, client));
+        assert!(!owner_is_client(b"\x01\x02\x03\x05", client));
+        assert!(!owner_is_client(b"", client));
+        assert!(!owner_is_client(client, b""));
+    }
+
+    #[test]
+    fn disconnecting_one_window_leaves_the_other_session() {
+        let mut srv = FakeMuxServer::new();
+        let first = spawned(&mut srv, 1, 1);
+        let second = spawned(&mut srv, 2, 2);
+        srv.disconnect(1);
+        assert!(!srv.exit_now, "the other window's session is still alive");
+        let replies = srv.transact_as(2, Message::Kill { id: second });
+        assert_eq!(replies, vec![Message::Killed { id: second }]);
+        let replies = srv.transact_as(2, Message::Kill { id: first });
+        assert!(
+            matches!(replies[0], Message::Missing { .. }),
+            "the disconnected window's session was the one that ended"
+        );
+        // a detached session of window 1 is visible to window 2 without window 1 leaving
+        let kept = spawned(&mut srv, 1, 3);
+        srv.transact_as(1, Message::Detach { id: kept });
+        let replies = srv.transact_as(2, Message::List);
+        let Message::Sessions { sessions } = &replies[0] else {
+            panic!("{replies:?}");
+        };
+        assert_eq!(sessions[0].id, kept);
+    }
+
+    #[test]
+    fn child_exit_keeps_the_real_status_code() {
+        let mut srv = FakeMuxServer::new();
+        let id = spawned(&mut srv, 1, 1);
+        let msg = srv.child_exited(id, 17);
+        assert_eq!(msg, Message::Exit { id, code: 17 });
+        assert_ne!(
+            match msg {
+                Message::Exit { code, .. } => code,
+                _ => 0,
+            },
+            0
+        );
+        assert!(srv.exit_now);
+    }
+
+    #[test]
+    fn replay_cut_keeps_arabic_utf8_and_does_not_split_an_escape() {
+        // م is D9 85. A cut on the second byte must move to the next character.
+        let meem = "\u{0645}".as_bytes();
+        assert_eq!(safe_boundary(meem, 1), 2);
+        let mut mid = vec![meem[1]];
+        mid.extend_from_slice("رحبا".as_bytes());
+        let replay = replay_bytes(&mid);
+        assert!(std::str::from_utf8(&replay).is_ok(), "{replay:?}");
+        assert!(!replay.starts_with(&[meem[1]]));
+
+        // € is three bytes. The cap is not a multiple of three, so a naive
+        // drop lands inside a character.
+        let glyph = "€".as_bytes();
+        assert_eq!(glyph.len(), 3);
+        let mut raw = Vec::new();
+        while raw.len() < TAIL_MAX + 1 {
+            raw.extend_from_slice(glyph);
+        }
+        let mut tail = Vec::new();
+        push_tail(&mut tail, &raw);
+        assert!(
+            std::str::from_utf8(&tail).is_ok(),
+            "replay tail split a character: {tail:?}"
+        );
+        assert!(tail.len() <= TAIL_MAX);
+
+        // The cut falls inside CSI, which the old drop left as `31m...`.
+        let mut raw = vec![b'Z'; 10];
+        raw.extend_from_slice(b"\x1b[31m");
+        raw.extend(std::iter::repeat_n(b'Q', TAIL_MAX - 3));
+        assert_eq!(raw.len(), TAIL_MAX + 12);
+        let mut tail = Vec::new();
+        push_tail(&mut tail, &raw);
+        assert!(
+            !tail.starts_with(b"31m") && !tail.starts_with(b"1m") && tail.first() != Some(&b'3'),
+            "cut landed inside an escape: {tail:?}"
+        );
+    }
+
+    #[test]
+    fn replay_strips_terminal_queries() {
+        let raw = b"hello \x1b[6n\x1b[c\x1b[?u\x1b]10;?\x07world \x1b[31mred";
+        let replay = replay_bytes(raw);
+        let text = String::from_utf8_lossy(&replay);
+        assert!(!replay.windows(3).any(|w| w == b"\x1b[6"), "{text}");
+        assert!(!replay.windows(3).any(|w| w == b"\x1b[c"), "{text}");
+        assert!(!replay.windows(4).any(|w| w == b"\x1b[?u"), "{text}");
+        assert!(!text.contains("10;?"), "{text}");
+        assert!(text.contains("hello"));
+        assert!(text.contains("world"));
+        assert!(text.contains("red"));
+        assert!(replay.windows(5).any(|w| w == b"\x1b[31m"));
     }
 }

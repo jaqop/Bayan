@@ -903,14 +903,23 @@ The multiplexer is off unless config says so:
 
 With it on, «فتح SSH» asks a per-user server (`bayan --mux-server`) to own
 the ConPTY. The window talks to that process over a named pipe. The pipe's
-DACL allows only the current user's SID, and the pipe is created with
-`PIPE_REJECT_REMOTE_CLIENTS`. «فصل الجلسة» drops the tab and leaves the
-session running in the server. «إعادة الاتصال» lists those sessions and
-opens one again, replaying the output tail (capped at 256 KiB) through the
-same VT path as a live read. «إنهاء الجلسة» kills one. Closing the window
-kills sessions that are still attached and leaves the server running while
-any detached session remains. The server process exits when the last
-session ends.
+DACL allows only the current user's SID, the first instance is created with
+`FILE_FLAG_FIRST_PIPE_INSTANCE`, and the mode includes
+`PIPE_REJECT_REMOTE_CLIENTS`. The client opens the pipe with identification
+QoS and accepts it only when the owner and the server process are that same
+SID, so another account cannot sit on the name and read keystrokes. An
+elevated window does not start the server and does not connect: the pipe
+name is only the user SID, and a normal process of that user must not be
+able to ask an admin server to spawn a program. Several windows can connect
+at once; each gets its own pipe instance. «فصل الجلسة» drops the tab and
+leaves the session running in the server. «إعادة الاتصال» lists those
+sessions and opens one again. The replay is capped at 256 KiB, starts on a
+UTF-8 and escape-sequence boundary, and device queries (`CSI 6n`, `CSI c`,
+OSC `?`) are removed so they are not answered into the live session.
+«إنهاء الجلسة» kills one. Closing the window kills sessions that are still
+attached and leaves the server running while any detached session remains.
+The server process exits when the last session ends, and a child exit keeps
+the process's status code.
 
 A shell Bayan started itself (PowerShell, cmd, WSL) stays in the window
 process, so the existing prompt injection is unchanged. Moving that ConPTY
