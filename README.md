@@ -946,10 +946,15 @@ The sandbox is Lua 5.4 via mlua, with `string`, `table`, `math`, and
 `loadfile`, `dofile`, and `string.dump` are removed, and `load` accepts
 text chunks only. A metatable with `__gc` is rejected, because Lua 5.4
 runs finalizers with the instruction hook switched off. `<close>` is
-rejected too: after the budget aborts a call, the `__close` handler
-runs with that hook off, and setting `__close` after `setmetatable`
-still arms it. Every chunk, including one passed to `load`, is refused
-if its bytecode contains `OP_TBC`. The hook also
+rejected too. A generic `for` also closes its fourth value (`OP_TFORPREP`)
+without an `OP_TBC` instruction, so banning that opcode would ban every
+generic loop. `setmetatable` instead refuses a metatable that already has
+`__close`, installs a private copy, and makes `getmetatable` return a
+read-only view. A later `__close` on the caller's table, or on that view,
+is not the metamethod that runs. The string metatable is sealed the same
+way. `rawset` and `rawget` cannot put `__close` back onto those tables.
+Every chunk, including one passed to `load`, is still refused if its
+bytecode contains `OP_TBC`. The hook also
 cannot interrupt one C call, so `string.find`, `match`, `gmatch`, and
 `gsub` first bound the matcher's worst case for that subject and pattern
 (start positions times the ways the subject splits among the `*` `+` `-`

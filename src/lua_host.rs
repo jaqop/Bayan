@@ -50,8 +50,10 @@
 //! Each call into a plugin — loading it, a key binding, one event dispatch —
 //! gets its own instruction budget and its own deadline. Handlers of one
 //! dispatch share that deadline, and one event holds at most 32 of them.
-//! A loop is cut off. The next call starts clean. `__gc` is rejected, and
-//! so is `<close>`: its `OP_TBC` instruction is refused in every loaded
+//! A loop is cut off. The next call starts clean. `__gc` and `__close` are
+//! rejected. A metatable installed by `setmetatable` is a private copy, so
+//! a later write of `__close` cannot reach it, including the fourth value
+//! of a generic `for`. `<close>` (`OP_TBC`) is also refused in every loaded
 //! chunk, including one hidden inside `load`.
 //!
 //! Strings crossing the boundary are UTF-8. Arabic round-trips unchanged.
@@ -1219,35 +1221,56 @@ fn harden(lua: &Lua, fuel: &Arc<Fuel>) -> Result<(), String> {
             .map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
-    // Lua 5.4 runs __gc with hooks disabled, so a finalizer loop never
-    // trips the instruction budget. Finalization is decided at setmetatable
-    // time, from a raw __gc lookup. Adding __gc later does not arm it, but
-    // rawset of that key is refused too.
+    // Lua 5.4 runs __gc and __close with hooks disabled. __gc is armed only
+    // at setmetatable time. __close is not: a generic `for` marks its fourth
+    // iterator value to-be-closed (OP_TFORPREP) and looks the metamethod up
+    // then. The caller's table is therefore never the metatable that runs.
+    let protected = lua.create_table().map_err(|e| e.to_string())?;
+    shield_shared_metatables(lua, &protected)?;
     let orig_setmt: mlua::Function = g.get("setmetatable").map_err(|e| e.to_string())?;
+    let set_protected = protected.clone();
     g.set(
         "setmetatable",
-        lua.create_function(move |_, (obj, mt): (Value, Value)| {
-            if let Value::Table(ref table) = mt {
-                let gc: Value = table.raw_get("__gc").map_err(mlua::Error::external)?;
-                if !matches!(gc, Value::Nil) {
-                    return Err(mlua::Error::runtime("__gc is disabled"));
-                }
+        lua.create_function(move |lua, (obj, mt): (Value, Value)| match mt {
+            Value::Table(src) => {
+                let real = seal_user_metatable(lua, &set_protected, &src)?;
+                orig_setmt.call::<Value>((obj, real))
             }
-            orig_setmt.call::<Value>((obj, mt))
+            other => orig_setmt.call::<Value>((obj, other)),
         })
         .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     let orig_rawset: mlua::Function = g.get("rawset").map_err(|e| e.to_string())?;
+    let rawset_protected = protected.clone();
     g.set(
         "rawset",
         lua.create_function(move |_, (table, key, value): (Value, Value, Value)| {
-            if let Value::String(s) = &key {
-                if s.to_str().ok().as_deref() == Some("__gc") && !matches!(value, Value::Nil) {
-                    return Err(mlua::Error::runtime("__gc is disabled"));
-                }
+            if meta_key(&key, "__gc") && !matches!(value, Value::Nil) {
+                return Err(mlua::Error::runtime("__gc is disabled"));
+            }
+            if guarded(&rawset_protected, &table)
+                && (meta_key(&key, "__close") || meta_key(&key, "__metatable"))
+                && !matches!(value, Value::Nil)
+            {
+                return Err(mlua::Error::runtime("metatable is read-only"));
             }
             orig_rawset.call::<Value>((table, key, value))
+        })
+        .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let orig_rawget: mlua::Function = g.get("rawget").map_err(|e| e.to_string())?;
+    let rawget_protected = protected;
+    g.set(
+        "rawget",
+        lua.create_function(move |_, (table, key): (Value, Value)| {
+            // A protected metatable must not reveal a __close that the VM
+            // would call, and rawget must not be a way to fetch one.
+            if guarded(&rawget_protected, &table) && meta_key(&key, "__close") {
+                return Ok(Value::Nil);
+            }
+            orig_rawget.call::<Value>((table, key))
         })
         .map_err(|e| e.to_string())?,
     )
@@ -1256,6 +1279,113 @@ fn harden(lua: &Lua, fuel: &Arc<Fuel>) -> Result<(), String> {
     // reaches these wrappers too.
     cap_pattern_functions(lua, &string, fuel)?;
     cap_c_loops(lua, &string, &g, fuel)?;
+    Ok(())
+}
+
+/// Tables whose metatable the sandbox owns: the private copy, the view
+/// `getmetatable` returns, and the shared metatables Lua installs itself
+/// (the string metatable in this build).
+fn remember(protected: &mlua::Table, table: &mlua::Table) -> mlua::Result<()> {
+    protected.raw_set(table.clone(), true)
+}
+
+fn guarded(protected: &mlua::Table, value: &Value) -> bool {
+    let Value::Table(table) = value else {
+        return false;
+    };
+    matches!(
+        protected.raw_get::<Value>(table.clone()),
+        Ok(Value::Boolean(true))
+    )
+}
+
+fn meta_key(key: &Value, name: &str) -> bool {
+    match key {
+        Value::String(s) => s.to_str().ok().as_deref() == Some(name),
+        _ => false,
+    }
+}
+
+fn hidden_meta(key: &Value) -> bool {
+    meta_key(key, "__close") || meta_key(key, "__gc") || meta_key(key, "__metatable")
+}
+
+fn copy_meta_fields(src: &mlua::Table, dst: &mlua::Table) -> mlua::Result<()> {
+    for pair in src.pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        if hidden_meta(&key) {
+            continue;
+        }
+        dst.raw_set(key, value)?;
+    }
+    Ok(())
+}
+
+fn readonly_view(
+    lua: &Lua,
+    protected: &mlua::Table,
+    src: &mlua::Table,
+) -> mlua::Result<mlua::Table> {
+    let view = lua.create_table()?;
+    copy_meta_fields(src, &view)?;
+    let guard = lua.create_table()?;
+    guard.raw_set(
+        "__newindex",
+        lua.create_function(|_, _: (Value, Value, Value)| -> mlua::Result<()> {
+            Err(mlua::Error::runtime("metatable is read-only"))
+        })?,
+    )?;
+    guard.raw_set("__metatable", "protected")?;
+    view.set_metatable(Some(guard.clone()))?;
+    remember(protected, &view)?;
+    remember(protected, &guard)?;
+    Ok(view)
+}
+
+/// A private metatable with no `__close` or `__gc`. `getmetatable` returns
+/// a read-only view, not this table, so a later write cannot arm a closer.
+fn seal_user_metatable(
+    lua: &Lua,
+    protected: &mlua::Table,
+    src: &mlua::Table,
+) -> mlua::Result<mlua::Table> {
+    if !matches!(src.raw_get::<Value>("__close")?, Value::Nil) {
+        return Err(mlua::Error::runtime("__close is disabled"));
+    }
+    if !matches!(src.raw_get::<Value>("__gc")?, Value::Nil) {
+        return Err(mlua::Error::runtime("__gc is disabled"));
+    }
+    let real = lua.create_table()?;
+    copy_meta_fields(src, &real)?;
+    let view = readonly_view(lua, protected, &real)?;
+    real.raw_set("__metatable", view)?;
+    remember(protected, &real)?;
+    Ok(real)
+}
+
+fn shield_one(lua: &Lua, protected: &mlua::Table, real: &mlua::Table) -> mlua::Result<()> {
+    real.raw_set("__close", Value::Nil)?;
+    real.raw_set("__gc", Value::Nil)?;
+    let view = readonly_view(lua, protected, real)?;
+    real.raw_set("__metatable", view)?;
+    remember(protected, real)?;
+    Ok(())
+}
+
+/// String (and any other value Lua already gave a metatable) keep that
+/// table, but it is no longer the one `getmetatable` hands back.
+fn shield_shared_metatables(lua: &Lua, protected: &mlua::Table) -> Result<(), String> {
+    let found: MultiValue = lua
+        .load(
+            "return getmetatable(''), getmetatable(0), getmetatable(true), getmetatable(function() end)",
+        )
+        .eval()
+        .map_err(|e| e.to_string())?;
+    for value in found {
+        if let Value::Table(mt) = value {
+            shield_one(lua, protected, &mt).map_err(|e| e.to_string())?;
+        }
+    }
     Ok(())
 }
 
@@ -3105,6 +3235,151 @@ mod tests {
             assert_eq!(sent[0].text, "ran");
             let _ = fs::remove_dir_all(&dir);
         });
+    }
+
+    #[test]
+    fn a_generic_for_cannot_run_a_close_handler() {
+        finish_within(Duration::from_secs(5), || {
+            let dir = scratch("tfor");
+            let src = r#"
+                local ok, obj = pcall(setmetatable, {}, {__close = function() while true do end end})
+                if ok then
+                  for _ in next, {}, nil, obj do end
+                end
+                local sm = getmetatable("")
+                pcall(function() rawset(sm, "__close", function() while true do end end) end)
+                pcall(function() sm.__close = function() while true do end end end)
+                local closed = pcall(function() for _ in next, {}, nil, "z" do end end)
+                if closed then error("a string was closable") end
+                config.font_size = 4
+            "#;
+            fs::write(dir.join("config.lua"), src).unwrap();
+            let mut cfg = json_cfg(r#"{"font_size":12.0}"#);
+            approve(&mut cfg, src.as_bytes());
+            let out = load_with(&cfg, &dir, false);
+            assert!(out.errors.is_empty(), "{:?}", out.errors);
+            assert_eq!(out.config.font_size, Some(4.0));
+
+            let plugins = dir.join("plugins");
+            fs::create_dir_all(&plugins).unwrap();
+            let plug = r#"
+                bayan.bind("f12", function()
+                  local ok, obj = pcall(setmetatable, {}, {__close = function() while true do end end})
+                  if ok then
+                    for _ in next, {}, nil, obj do end
+                  end
+                  local sm = getmetatable("")
+                  pcall(function() rawset(sm, "__close", function() while true do end end) end)
+                  local closed = pcall(function() for _ in next, {}, nil, "z" do end end)
+                  if closed then error("a string was closable") end
+                  bayan.send("ok")
+                end)
+            "#;
+            fs::write(plugins.join("hello.lua"), plug).unwrap();
+            let mut pcfg = plugin_cfg(&plugins, "hello", false);
+            approve(&mut pcfg, plug.as_bytes());
+            let mut out = load_with(&pcfg, &dir, false);
+            assert!(out.errors.is_empty(), "{:?}", out.errors);
+            assert_eq!(out.plugins.fire("f12")[0].text, "ok");
+            let _ = fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn close_added_through_getmetatable_does_not_run() {
+        finish_within(Duration::from_secs(5), || {
+            let dir = scratch("gmt");
+            let src = r#"
+                local o = setmetatable({}, {__index = {a = 1}})
+                local g = getmetatable(o)
+                pcall(function() g.__close = function() while true do end end end)
+                pcall(function() rawset(g, "__close", function() while true do end end) end)
+                local closed = pcall(function() for _ in next, {}, nil, o do end end)
+                if closed then error("the view armed __close") end
+                if rawget(g, "__close") ~= nil then error("rawget saw __close") end
+                if o.a ~= 1 then error("index") end
+                config.font_size = 5
+            "#;
+            fs::write(dir.join("config.lua"), src).unwrap();
+            let mut cfg = json_cfg(r#"{"font_size":12.0}"#);
+            approve(&mut cfg, src.as_bytes());
+            let out = load_with(&cfg, &dir, false);
+            assert!(out.errors.is_empty(), "{:?}", out.errors);
+            assert_eq!(out.config.font_size, Some(5.0));
+            let _ = fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn close_added_to_the_callers_metatable_does_not_run() {
+        finish_within(Duration::from_secs(5), || {
+            let dir = scratch("cmt");
+            let src = r#"
+                local mt = {__index = {a = 1}}
+                local o = setmetatable({}, mt)
+                mt.__close = function() while true do end end
+                rawset(mt, "__close", function() while true do end end)
+                local closed = pcall(function() for _ in next, {}, nil, o do end end)
+                if closed then error("the caller metatable armed __close") end
+                if o.a ~= 1 then error("index") end
+                config.font_size = 6
+            "#;
+            fs::write(dir.join("config.lua"), src).unwrap();
+            let mut cfg = json_cfg(r#"{"font_size":12.0}"#);
+            approve(&mut cfg, src.as_bytes());
+            let out = load_with(&cfg, &dir, false);
+            assert!(out.errors.is_empty(), "{:?}", out.errors);
+            assert_eq!(out.config.font_size, Some(6.0));
+
+            let plugins = dir.join("plugins");
+            fs::create_dir_all(&plugins).unwrap();
+            let plug = r#"
+                bayan.bind("f12", function()
+                  local mt = {}
+                  local o = setmetatable({}, mt)
+                  mt.__close = function() while true do end end
+                  local closed = pcall(function() for _ in next, {}, nil, o do end end)
+                  if closed then error("the caller metatable armed __close") end
+                  bayan.send("ok")
+                end)
+            "#;
+            fs::write(plugins.join("hello.lua"), plug).unwrap();
+            let mut pcfg = plugin_cfg(&plugins, "hello", false);
+            approve(&mut pcfg, plug.as_bytes());
+            let mut out = load_with(&pcfg, &dir, false);
+            assert!(out.errors.is_empty(), "{:?}", out.errors);
+            assert_eq!(out.plugins.fire("f12")[0].text, "ok");
+            let _ = fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn ordinary_generic_for_and_metamethods_still_work() {
+        let dir = scratch("meta-ok");
+        let src = r#"
+            local src = {__index = {n = 2}}
+            local t = setmetatable({}, src)
+            if rawequal(getmetatable(t), src) then error("caller metatable was installed") end
+            getmetatable(t).__index = {n = 9}
+            if t.n ~= 2 then error("view write changed the object") end
+            local calls = 0
+            local u = setmetatable({}, {__newindex = function() calls = calls + 1 end})
+            u.x = true
+            local f = setmetatable({}, {__call = function() return 3 end})
+            local s = 0
+            for _, v in ipairs({10, 20}) do s = s + v end
+            for _, v in pairs({a = 1}) do s = s + v end
+            for _, v in next, {7} do s = s + v end
+            if calls ~= 1 or f() ~= 3 or ("xy"):sub(1, 1) ~= "x" then error("metamethod") end
+            config.font_size = s
+        "#;
+        fs::write(dir.join("config.lua"), src).unwrap();
+        let mut cfg = json_cfg(r#"{"font_size":12.0}"#);
+        approve(&mut cfg, src.as_bytes());
+        let out = load_with(&cfg, &dir, false);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.config.font_size, Some(38.0));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn feed_terminal(bytes: &[u8]) {
