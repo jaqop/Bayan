@@ -31,11 +31,14 @@ use alacritty_terminal::term::Term;
 /// `wrapped` is that row's `WRAPLINE` flag: the next selected row continues
 /// this one. A row without the flag ends a real line. `col` is the grid
 /// column `text` starts at, so a row picked up past the margin has none.
+/// `has_padding` is the TUI's two blank columns, read off the grid. A word
+/// space that the visual order put at the left of an RTL row is not padding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CopyRow {
     pub text: String,
     pub wrapped: bool,
     pub col: usize,
+    pub has_padding: bool,
 }
 
 /// What `copy.clean` in config.json means.
@@ -110,6 +113,7 @@ pub(crate) fn clipboard_text(raw: &str, rows: &[CopyRow], clean: bool, claude: b
                 text: text.to_string(),
                 wrapped: false,
                 col: 0,
+                has_padding: false,
             })
             .collect::<Vec<_>>()
     } else {
@@ -138,7 +142,7 @@ fn logical_rows(rows: &[CopyRow], claude: bool) -> Vec<CopyRow> {
         .map(|(row, bare)| {
             let Some(gutter) = gutter else {
                 return CopyRow {
-                    text: restore_claude_row(&row.text, row.col),
+                    text: restore_claude_row(&row.text, row.col, row.has_padding),
                     ..row.clone()
                 };
             };
@@ -151,18 +155,36 @@ fn logical_rows(rows: &[CopyRow], claude: bool) -> Vec<CopyRow> {
         .collect()
 }
 
-/// One Claude row to logical order without its margin. An RTL row is
-/// reversed whole: its margin ends up trailing (trimmed later) and its
-/// logical-leading spaces are the row's visual-right padding, so they go.
-/// Stripping the margin first would also eat a space the visual order put
-/// at the left. An LTR row keeps its margin in front, so it comes off there.
-fn restore_claude_row(text: &str, col: usize) -> String {
-    let logical = crate::bidi::restore_bidi_line(text).unwrap_or_else(|| text.to_string());
-    if crate::bidi::line_is_rtl_visual(text) {
+/// One Claude row to logical order without its margin.
+///
+/// An RTL row is reversed whole, so a margin left in front becomes trailing
+/// spaces and a mid-word wrap then joins with a space (`مرحب ا بكم`). The
+/// margin comes off first, and only when the grid said the row has it: a
+/// word space that the visual order put at column 0 is text, and stripping
+/// it would glue a real word boundary. After the reverse, spaces at the
+/// logical start are the row's visual-right padding, so they go. An LTR row
+/// keeps its margin in front, so it comes off there.
+fn restore_claude_row(text: &str, col: usize, has_padding: bool) -> String {
+    let (text, col) = if has_padding {
+        let bare = strip_tui_margin(text, col);
+        let taken = leading_spaces(text).min(TUI_MARGIN.saturating_sub(col));
+        (bare.to_string(), col + taken)
+    } else {
+        (text.to_string(), col)
+    };
+    let logical = crate::bidi::restore_bidi_line(&text).unwrap_or_else(|| text.clone());
+    if crate::bidi::line_is_rtl_visual(&text) {
         logical.trim_start_matches(' ').to_string()
     } else {
         strip_tui_margin(&logical, col).to_string()
     }
+}
+
+/// The selection covers the TUI's blank columns, and those columns are spaces.
+/// A single space at column 0 is a word space the visual order put there.
+fn row_has_padding(text: &str, col: usize) -> bool {
+    let room = TUI_MARGIN.saturating_sub(col);
+    room > 0 && leading_spaces(text) >= room
 }
 
 /// Drop the leading spaces that fall inside the TUI margin of a row whose
@@ -308,10 +330,13 @@ pub(crate) fn selection_rows<T: EventListener>(term: &Term<T>) -> Vec<CopyRow> {
             last_col
         };
         let wrapped = !range.is_block && end_col.0 + 1 >= cols && row_wraps(term, line);
+        let text = cells_to_string(term, line, start_col, end_col);
+        let has_padding = row_has_padding(&text, start_col.0);
         rows.push(CopyRow {
-            text: cells_to_string(term, line, start_col, end_col),
+            text,
             wrapped,
             col: start_col.0,
+            has_padding,
         });
     }
     rows
@@ -362,6 +387,17 @@ mod tests {
             text: text.to_string(),
             wrapped,
             col: 0,
+            has_padding: false,
+        }
+    }
+
+    /// A Claude row whose grid columns 0 and 1 are the TUI margin.
+    fn padded(visual: &str, wrapped: bool) -> CopyRow {
+        CopyRow {
+            text: format!("  {visual}"),
+            wrapped,
+            col: 0,
+            has_padding: true,
         }
     }
 
@@ -539,6 +575,47 @@ mod tests {
             logical,
             "restoring the joined visual line is the bug"
         );
+    }
+
+    /// The two blank columns are the margin, not a word space. Reversing
+    /// them with the row turns them into a trailing space, and a mid-word
+    /// wrap then joins with one (`مرحب ا بكم`). They come off first.
+    #[test]
+    fn claude_rtl_margin_does_not_become_a_space_inside_a_word() {
+        let rows = [
+            padded(&visual_of("مرحب"), true),
+            padded(&visual_of("ا بكم"), false),
+        ];
+        assert_eq!(claude(&rows), "مرحبا بكم");
+    }
+
+    /// A wrap that lands on a word boundary keeps that one space. The margin
+    /// in front of the visual word-space is chrome; the word-space is not.
+    #[test]
+    fn claude_rtl_wrap_on_a_word_boundary_keeps_one_space() {
+        let rows = [
+            padded(&visual_of("مرحب "), true),
+            padded(&visual_of("بكم"), false),
+        ];
+        let copied = claude(&rows);
+        assert_eq!(copied, "مرحب بكم");
+        assert_eq!(copied.matches(' ').count(), 1, "{copied:?}");
+    }
+
+    /// Harakat and ZWJ sitting on the wrap stay with their letter, and the
+    /// margin does not push a space in between the two rows.
+    #[test]
+    fn claude_rtl_wrap_edge_keeps_harakat_and_zwj() {
+        let marked = [
+            padded(&visual_of("مَرْحَبً"), true),
+            padded(&visual_of("ا"), false),
+        ];
+        assert_eq!(claude(&marked), "مَرْحَبًا");
+        let zwj = [
+            padded(&visual_of("م\u{200D}"), true),
+            padded(&visual_of("ر"), false),
+        ];
+        assert_eq!(claude(&zwj), "م\u{200D}ر");
     }
 
     #[test]
