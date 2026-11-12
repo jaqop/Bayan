@@ -731,9 +731,12 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       with Git Bash marked default. Not verified on screen: a real mouse
       right-click, picking a row
 - [x] **Shell arrow** — a ▾ beside the tabs opens that same list without a
-      trip through Settings. Alt+Down or Enter on the arrow opens it; in
-      Arabic Left moves down the list and Right moves up; Enter opens a new
-      tab with the chosen shell; Esc closes and returns focus to the arrow.
+      trip through Settings. Ctrl+Shift+Space opens it from anywhere (the
+      chord is rebindable). Alt+Down still moves pane focus, and a single
+      pane hands it to the program; Alt+Down and Enter open the menu only
+      while the arrow itself is focused, and that focus draws a ring.
+      In Arabic Left moves down the list and Right moves up; Enter opens a
+      new tab with the chosen shell; Esc closes and returns focus to the arrow.
       Only installed shells are listed. A corrupt profile is skipped and
       logged. An elevated window hides SSH and the mux and starts the chosen
       shell through the existing elevated spawn, so Git Bash still gets the
@@ -1534,14 +1537,16 @@ Its text keeps its own UI size when the terminal is zoomed.
 
 - Search `تبويب جديد` or a shell name to open that installed shell in a new tab
   without changing the default shell or interrupting the current tab.
-- The tab bar has a ▾ beside the tabs. Click it, press **Alt+Down**, or focus
-  it and press **Enter**, to open a menu of the shells that are actually
-  installed: PowerShell, Command Prompt, Git Bash, each WSL distro, and any
-  profile the `-p` lookup accepts. A row opens a **new** tab in that shell.
-  **Esc** closes the menu and returns to the arrow. In Arabic the arrow sits
-  on the reading side of the tabs when that gap is free, Left moves to the
-  next row, and the labels are Arabic (`الطرفيات`, `اختر الطرفية`,
-  `الافتراضية`). A profile with an empty name, a control or bidi character,
+- The tab bar has a ▾ beside the tabs. Click it, or press **Ctrl+Shift+Space**
+  (rebindable), to open a menu of the shells that are actually installed:
+  PowerShell, Command Prompt, Git Bash, each WSL distro, and any profile the
+  `-p` lookup accepts. **Alt+Down** still moves between panes; it opens this
+  menu only while the arrow is focused, and so does **Enter**. A row opens a
+  **new** tab in that shell. **Esc** closes the menu and returns to the arrow,
+  which draws a focus ring. The arrow sits just after the last tab (the strip
+  is not mirrored). In Arabic, Left moves to the next row, and the labels are
+  Arabic (`الطرفيات`, `اختر الطرفية`, `الافتراضية`). A profile with an empty
+  name, a control or bidi character,
   or a command that is not installed is skipped and logged; it does not
   remove the other rows. An administrator window uses the same elevated
   spawn as every other new tab (Git Bash still pins `HOME` and sets the

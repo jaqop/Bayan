@@ -652,6 +652,10 @@ pub struct ShellButton {
     pub label: String,
     /// The menu is closed and the button has focus (Esc returned here).
     pub focused: bool,
+    /// `aria-expanded`: the menu is open.
+    pub expanded: bool,
+    /// The button's box in window pixels, when it is drawn.
+    pub bounds: Option<accesskit::Rect>,
 }
 
 /// A confirm card or an error card.
@@ -705,6 +709,10 @@ pub fn build_tree(view: &View) -> TreeUpdate {
         let mut node = Node::new(Role::Button);
         node.set_label(button.label.clone());
         node.set_has_popup(HasPopup::Menu);
+        node.set_expanded(button.expanded);
+        if let Some(bounds) = button.bounds {
+            node.set_bounds(bounds);
+        }
         if lang::rtl() {
             node.set_text_direction(TextDirection::RightToLeft);
         }
@@ -1458,16 +1466,34 @@ mod tests {
         view.shell_button = Some(ShellButton {
             label: "الطرفيات".into(),
             focused: true,
+            expanded: false,
+            bounds: Some(accesskit::Rect {
+                x0: 40.0,
+                y0: 4.0,
+                x1: 64.0,
+                y1: 28.0,
+            }),
         });
         let tree = build_tree(&view);
         let button = find(&tree, ID_SHELL_BUTTON);
         assert_eq!(button.role(), Role::Button);
         assert_eq!(button.has_popup(), Some(HasPopup::Menu));
+        assert_eq!(button.is_expanded(), Some(false));
+        assert_eq!(
+            button.bounds(),
+            Some(accesskit::Rect {
+                x0: 40.0,
+                y0: 4.0,
+                x1: 64.0,
+                y1: 28.0,
+            })
+        );
         assert_eq!(button.label(), Some("الطرفيات"));
         assert_eq!(button.text_direction(), Some(TextDirection::RightToLeft));
         assert_eq!(tree.focus, ID_SHELL_BUTTON);
 
         view.shell_button.as_mut().unwrap().focused = false;
+        view.shell_button.as_mut().unwrap().expanded = true;
         view.palette = Some(PaletteItem {
             name: "اختر الطرفية".into(),
             query: String::new(),
@@ -1478,6 +1504,7 @@ mod tests {
             shell_menu: true,
         });
         let tree = build_tree(&view);
+        assert_eq!(find(&tree, ID_SHELL_BUTTON).is_expanded(), Some(true));
         let menu = find(&tree, ID_PALETTE);
         assert_eq!(menu.role(), Role::Menu);
         assert_eq!(menu.label(), Some("اختر الطرفية"));

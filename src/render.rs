@@ -2321,6 +2321,9 @@ pub struct Renderer {
     pub hover_gear: bool,
     /// pointer over the shell-menu arrow beside the tabs
     pub hover_shell_arrow: bool,
+    /// Esc returned focus to the shell-menu arrow. The ring is the only
+    /// sign that the next Enter opens the menu instead of the shell.
+    pub shell_arrow_focused: bool,
     /// IME composition text, drawn at the focused cursor. winit keeps the
     /// IME's own composition window hidden, so this is the only place
     /// the text being composed shows.
@@ -2430,6 +2433,21 @@ pub(crate) fn palette_hint(count: usize) -> String {
     } else {
         format!("{count} results · Enter run · ↑↓ move · Esc close")
     }
+}
+
+/// How far the tab-bar badges must stay clear of. The shell arrow, when
+/// it is drawn, extends past the last tab.
+pub(crate) fn chrome_occupied_end(tab_end: i32, arrow_right: Option<i32>) -> i32 {
+    match arrow_right {
+        Some(right) => tab_end.max(right),
+        None => tab_end,
+    }
+}
+
+/// A badge at `x` clears the occupied end with the same 12px gap the
+/// tab strip has always used.
+pub(crate) fn chrome_badge_fits(x: i32, occupied_end: i32) -> bool {
+    x >= occupied_end + 12
 }
 
 impl Renderer {
@@ -2550,6 +2568,7 @@ impl Renderer {
             hover_caption: None,
             hover_gear: false,
             hover_shell_arrow: false,
+            shell_arrow_focused: false,
             preedit: None,
             ime_spot: None,
             font_system,
@@ -2734,6 +2753,16 @@ impl Renderer {
         } else {
             theme
         }
+    }
+
+    /// The shell-arrow focus ring. High Contrast uses the system highlight
+    /// from [`crate::a11y::map_chrome`]; otherwise the bar accent that
+    /// clears 3:1 on this page.
+    fn shell_arrow_focus_ink(&self) -> (u8, u8, u8) {
+        self.focus_color(crate::theme::bar_accent(
+            crate::theme::BarAccent::Green,
+            crate::theme::title_bar_dark_for(self.bg),
+        ))
     }
 
     fn chrome_fg(&self) -> (u8, u8, u8) {
@@ -7201,7 +7230,8 @@ impl Renderer {
             self.draw_title_tip(out, whole, width, tx, &full);
         }
 
-        if let Some((bx, by, bw, bh)) = self.shell_arrow_rect(width, &titles, active) {
+        let arrow = self.shell_arrow_rect(width, &titles, active);
+        if let Some((bx, by, bw, bh)) = arrow {
             if self.hover_shell_arrow {
                 push_rect(
                     out,
@@ -7219,6 +7249,14 @@ impl Renderer {
                         255,
                     ),
                 );
+            }
+            if self.shell_arrow_focused {
+                let ink = c4(self.shell_arrow_focus_ink(), 255);
+                let t = (2.0 * self.dpi_scale).round().max(2.0) as i32;
+                push_rect(out, whole, bx, by, bw, t, ink);
+                push_rect(out, whole, bx, by + bh - t, bw, t, ink);
+                push_rect(out, whole, bx, by, t, bh, ink);
+                push_rect(out, whole, bx + bw - t, by, t, bh, ink);
             }
             let seg = [Seg::plain("\u{25be}", self.chrome_fg())];
             let gw = self.measure(&seg, false);
@@ -7239,10 +7277,14 @@ impl Renderer {
                 self.measure(&segs, false).ceil() as i32 + 16
             })
             .unwrap_or(0);
-        let end = self
+        // The badges sit in the gap after the tabs. The arrow occupies
+        // the start of that gap, so a badge that only clears the last
+        // tab would paint on top of it and the click would open the menu.
+        let tab_end = self
             .tab_rects(width, &titles, active)
             .last()
             .map_or(0, |r| r.1 + r.2);
+        let end = chrome_occupied_end(tab_end, arrow.map(|(ax, _, aw, _)| ax + aw));
         if claude {
             let label = [Seg::plain(
                 "● Claude",
@@ -7250,7 +7292,7 @@ impl Renderer {
             )];
             let tw = self.measure(&label, false);
             let x = self.tab_controls(width)[0].0 - tw.ceil() as i32 - 18 - elevated_w;
-            if x >= end + 12 {
+            if chrome_badge_fits(x, end) {
                 self.draw_run(
                     &label,
                     false,
@@ -7266,7 +7308,7 @@ impl Renderer {
             let label = [Seg::plain(text, (0xf2, 0xcc, 0x60))];
             let tw = self.measure(&label, false);
             let x = self.tab_controls(width)[0].0 - tw.ceil() as i32 - 12;
-            if x >= end + 12 {
+            if chrome_badge_fits(x, end) {
                 self.draw_run(
                     &label,
                     false,
@@ -7406,23 +7448,12 @@ impl Renderer {
             return None;
         }
         let rects = self.tab_rects(width, titles, active);
-        let min_x = self.tabs_x0();
-        let first = rects.first().map(|r| r.1).unwrap_or(min_x);
-        let last_end = rects.last().map(|r| r.1 + r.2).unwrap_or(min_x);
+        let last_end = rects.last().map(|r| r.1 + r.2).unwrap_or(self.tabs_x0());
         let controls_x = self.tab_controls(width)[0].0;
         let size = (self.ui_cell_w() * 1.7).round().max(22.0 * self.dpi_scale) as i32;
         let bar_h = self.tab_bar_h().round() as i32;
-        crate::shellmenu::arrow_box(
-            first,
-            last_end,
-            controls_x,
-            min_x,
-            size,
-            4,
-            bar_h,
-            crate::lang::rtl(),
-        )
-        .map(|b| (b.x, b.y, b.w, b.h))
+        crate::shellmenu::arrow_box(last_end, controls_x, size, 4, bar_h)
+            .map(|b| (b.x, b.y, b.w, b.h))
     }
 
     pub fn shell_arrow_hit(
@@ -10542,6 +10573,126 @@ mod cache_tests {
             crate::theme::BarAccent::Green,
             true
         )));
+    }
+
+    fn ink_inside(out: &[crate::gpu::Vertex], color: (u8, u8, u8), rect: Rect) -> bool {
+        let (x, y, w, h) = rect;
+        out.iter().any(|v| {
+            vertex_rgb(v.color) == color
+                && v.pos[0] >= x as f32
+                && v.pos[0] <= (x + w) as f32
+                && v.pos[1] >= y as f32
+                && v.pos[1] <= (y + h) as f32
+        })
+    }
+
+    /// Esc leaves focus on the shell arrow. The ring is what makes that
+    /// visible, and it has to clear 3:1 on the bar, including High Contrast
+    /// where the ink is the system highlight from `map_chrome`.
+    #[test]
+    fn the_shell_arrow_focus_ring_clears_three_to_one() {
+        let tabs = vec![TabInfo {
+            title: "hi".into(),
+            busy: false,
+            attention: false,
+            active: true,
+            progress: None,
+        }];
+        for light in [false, true] {
+            let cfg = crate::config::UserConfig {
+                system_apps_light: Some(light),
+                theme: Some((if light { "light" } else { "dark" }).into()),
+                ..Default::default()
+            };
+            let mut r = Renderer::new(1.0, &cfg, 0.0);
+            r.use_ui_metrics(true);
+            let arrow = r.shell_arrow_rect(1200, &["hi"], 0).expect("arrow");
+            let mut out = Vec::new();
+            r.draw_chrome(&mut out, 1200, 800, &tabs, None, false, None);
+            let ink = r.shell_arrow_focus_ink();
+            assert!(
+                !ink_inside(&out, ink, arrow),
+                "no ring until the arrow is focused"
+            );
+            r.shell_arrow_focused = true;
+            out.clear();
+            r.draw_chrome(&mut out, 1200, 800, &tabs, None, false, None);
+            assert!(
+                ink_inside(&out, ink, arrow),
+                "the focus ring is on the arrow"
+            );
+            let ratio = crate::theme::contrast_ratio(ink, chrome_bar_bg(r.bg));
+            assert!(
+                ratio >= 3.0,
+                "focus ring is {ratio}:1 on {:?}, want >= 3",
+                r.bg
+            );
+        }
+        let sys = crate::a11y::SystemColors {
+            window: (0, 0, 0),
+            window_text: (255, 255, 255),
+            highlight: (0, 120, 215),
+            highlight_text: (255, 255, 255),
+            hotlight: (0, 102, 204),
+            gray_text: (128, 128, 128),
+            btn_face: (255, 255, 255),
+        };
+        let mut hc = Renderer::with_a11y(
+            1.0,
+            &crate::config::UserConfig::default(),
+            0.0,
+            crate::a11y::A11ySnapshot {
+                high_contrast: true,
+                colors: sys,
+                text_scale: 1.0,
+            },
+        );
+        hc.use_ui_metrics(true);
+        hc.shell_arrow_focused = true;
+        assert_eq!(hc.shell_arrow_focus_ink(), sys.highlight);
+        assert_eq!(hc.chrome.focus, sys.highlight);
+        let arrow = hc.shell_arrow_rect(1200, &["hi"], 0).expect("arrow");
+        let mut out = Vec::new();
+        hc.draw_chrome(&mut out, 1200, 800, &tabs, None, false, None);
+        assert!(ink_inside(&out, sys.highlight, arrow));
+        let ratio = crate::theme::contrast_ratio(sys.highlight, sys.window);
+        assert!(ratio >= 3.0, "high contrast ring is {ratio}:1");
+    }
+
+    /// «مسؤول» and «● Claude» used to be placed from the last tab only, so
+    /// a gap that cleared the tab still covered the arrow.
+    #[test]
+    fn tab_badges_do_not_cover_the_shell_arrow() {
+        let tab_end = 400;
+        let arrow_right = 428;
+        let occupied = chrome_occupied_end(tab_end, Some(arrow_right));
+        assert_eq!(occupied, arrow_right);
+        let badge_x = 416;
+        assert!(chrome_badge_fits(badge_x, tab_end));
+        assert!(!chrome_badge_fits(badge_x, occupied));
+
+        let amber = (0xf2, 0xcc, 0x60);
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        r.use_ui_metrics(true);
+        let title = "workspace";
+        let tabs = vec![TabInfo {
+            title: title.into(),
+            busy: false,
+            attention: false,
+            active: true,
+            progress: None,
+        }];
+        for width in (480..1400).step_by(17) {
+            let Some(arrow) = r.shell_arrow_rect(width, &[title], 0) else {
+                continue;
+            };
+            let mut out = Vec::new();
+            r.draw_chrome(&mut out, width, 700, &tabs, None, true, Some("مسؤول"));
+            assert!(
+                !ink_inside(&out, amber, arrow),
+                "width {width}: the elevated badge covers the arrow {arrow:?}"
+            );
+        }
     }
 
     #[test]

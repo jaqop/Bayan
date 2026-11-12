@@ -139,45 +139,33 @@ pub fn focus_after(picked: bool) -> FocusAfter {
     }
 }
 
-/// The arrow beside the tab run.
+/// The arrow beside the tab run, just after the last tab.
 ///
-/// English puts it just after the last tab. Arabic puts it on the reading
-/// side, before the first tab, when that gap is free. The bar itself is
-/// not mirrored (the caption buttons stay on the right), so when the group
-/// chip already occupies the left the arrow uses the same gap after the
-/// last tab. It never covers a tab or the ‹ › + cluster.
-#[allow(clippy::too_many_arguments)]
+/// The tab strip is not mirrored: caption buttons stay on the right and
+/// the group chip owns the left, and the first tab starts at `tabs_x0`,
+/// so there is never a free gap before it. Both languages use the gap
+/// after the last tab. The arrow never covers a tab or the ‹ › + cluster.
 pub fn arrow_box(
-    first_tab: i32,
     last_end: i32,
     controls_x: i32,
-    min_x: i32,
     size: i32,
     gap: i32,
     bar_h: i32,
-    rtl: bool,
 ) -> Option<ArrowBox> {
-    if size <= 0 || bar_h <= 4 || controls_x <= min_x {
+    if size <= 0 || bar_h <= 4 || controls_x <= 0 {
         return None;
     }
     let after = last_end.saturating_add(gap);
-    let before = first_tab.saturating_sub(gap).saturating_sub(size);
-    let x = if rtl && before >= min_x {
-        before
-    } else if after.saturating_add(size) <= controls_x {
+    let x = if after.saturating_add(size) <= controls_x {
         after
     } else {
         let squeezed = controls_x - size;
-        if squeezed < last_end.max(min_x) {
+        if squeezed < last_end {
             return None;
         }
         squeezed
     };
-    if x < min_x || x.saturating_add(size) > controls_x {
-        return None;
-    }
-    let covers_a_tab = x < last_end && x.saturating_add(size) > first_tab;
-    if covers_a_tab {
+    if x < last_end || x.saturating_add(size) > controls_x {
         return None;
     }
     let h = size.min(bar_h - 4).max(1);
@@ -516,17 +504,12 @@ mod tests {
         assert!(still.skipped.iter().any(|s| s.reason == "bidi override"));
         assert!(still.rows.iter().all(|r| r.kind == Kind::Shell));
 
-        // Arrow: Arabic uses the reading side when it is free, and the
-        // gap after the tabs when the chip already owns the left.
-        let rtl = arrow_box(80, 280, 800, 0, 24, 6, 40, true).unwrap();
-        assert_eq!(rtl.x, 50, "Arabic: before the first tab");
-        assert!(rtl.x + rtl.w <= 80);
-        let rtl_busy = arrow_box(0, 200, 800, 0, 24, 6, 40, true).unwrap();
-        assert_eq!(rtl_busy.x, 206, "no free reading-side gap: after the tabs");
-        let ltr = arrow_box(0, 200, 800, 0, 24, 6, 40, false).unwrap();
-        assert_eq!(ltr.x, 206);
-        assert!(ltr.x >= 200 && ltr.x + ltr.w <= 800);
-        assert!(arrow_box(0, 790, 800, 0, 24, 6, 40, false).is_none());
+        // The strip is not mirrored, so the arrow follows the last tab
+        // in both languages. A gap that cannot hold it hides the arrow.
+        let beside = arrow_box(200, 800, 24, 6, 40).unwrap();
+        assert_eq!(beside.x, 206);
+        assert!(beside.x >= 200 && beside.x + beside.w <= 800);
+        assert!(arrow_box(790, 800, 24, 6, 40).is_none());
 
         assert!(alt_down_opens(true, false, false, true));
         assert!(!alt_down_opens(true, true, false, true));

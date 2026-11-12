@@ -778,7 +778,10 @@ impl App {
             self.request_redraw();
         } else {
             // A blur does not rebuild the candidate window. Alt+Tab with
-            // the button down must not keep dragging.
+            // the button down must not keep dragging. The arrow's focus
+            // goes with the window: Enter in another app must not be
+            // waiting to open the menu when this window returns.
+            self.shell_arrow_focused = false;
             self.note_cursor_area(CursorAreaEvent::FocusLost);
             self.abandon_mouse();
             self.clear_scrollbar_pointer();

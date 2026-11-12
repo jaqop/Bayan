@@ -55,7 +55,7 @@ selection and BiDi paths must do.
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-834 tests across the tree. `render.rs` (100), `term.rs` (99) and `link.rs`
+838 tests across the tree. `render.rs` (102), `term.rs` (99) and `link.rs`
 (66) carry the most; `lua_host.rs` has 46, `shellint.rs` 24, `images.rs` and
 `localpath.rs` 21 each, `mux.rs` 15, `config_watch.rs` 14, `screen_reader.rs`
 12, `ssh.rs` 7 and `shellmenu.rs` 2. Three more in `term.rs` are `#[ignore]`d

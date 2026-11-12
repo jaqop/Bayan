@@ -1125,40 +1125,6 @@ fn context_menu_rows(
     rows
 }
 
-/// The shell menu's rows: every detected shell, in detection order
-/// (PowerShell, PowerShell 7, cmd, Git Bash, each WSL distro), the default
-/// for new tabs marked. Detection runs on a background thread at startup;
-/// until it reports, the two shells every Windows has stand in.
-/// The live menu is [`shellmenu::build`]; this remains for the row tests.
-#[cfg(test)]
-fn shell_menu_rows(profiles: &[shells::Shell], default: &str) -> Vec<(PaletteRow, String)> {
-    let listed: Vec<(String, String)> = if profiles.is_empty() {
-        [
-            ("PowerShell", "powershell.exe"),
-            ("Command Prompt", "cmd.exe"),
-        ]
-        .iter()
-        .map(|(name, cmd)| (name.to_string(), cmd.to_string()))
-        .collect()
-    } else {
-        profiles
-            .iter()
-            .map(|s| (s.label(), s.command.clone()))
-            .collect()
-    };
-    listed
-        .into_iter()
-        .map(|(name, command)| {
-            let label = if command == default {
-                format!("{name} · {}", tr("الافتراضية", "default"))
-            } else {
-                name
-            };
-            (PaletteRow::Shell(command), label)
-        })
-        .collect()
-}
-
 /// The Arabic-font cycler's step: the ring is Auto (`None`), then each of
 /// `choices` in order, wrapping both ways. An unknown current counts as
 /// Auto.
@@ -1502,7 +1468,7 @@ struct Palette {
     /// the right-click menu: a popup at this window point instead of the
     /// centred palette, listing `context_rows`
     menu: Option<(f64, f64)>,
-    /// the menu lists the installed shells (`shell_menu_rows`) instead of
+    /// the menu lists the installed shells (`shellmenu::build`) instead of
     /// the pane actions: a right-click on the tab bar
     shells_menu: bool,
     /// the rows are SSH hosts
@@ -2961,6 +2927,7 @@ impl App {
             CopyClean => {
                 self.copy_selection_clean();
             }
+            ShellMenu => self.open_shell_from_arrow(),
         }
     }
 
@@ -5085,6 +5052,8 @@ impl App {
         let shell_button = Some(screen_reader::ShellButton {
             label: shellmenu::button_label().to_string(),
             focused: self.shell_arrow_focused && self.palette.is_none(),
+            expanded: self.palette.as_ref().is_some_and(|p| p.shell_arrow),
+            bounds: self.shell_arrow_bounds(),
         });
         let dialog = self.reader_dialog();
         screen_reader::View {
@@ -6030,7 +5999,9 @@ impl App {
         self.open_shell_picker(false, at);
     }
 
-    /// The tab-bar arrow, Alt+Down, or Enter while the arrow is focused.
+    /// The tab-bar arrow, Enter while it is focused, or the shell-menu
+    /// chord (Ctrl+Shift+Space). Alt+Down opens it only in that focused
+    /// state; otherwise Alt+Down stays pane focus.
     fn open_shell_from_arrow(&mut self) {
         let at = self.shell_arrow_anchor();
         self.shell_arrow_focused = true;
@@ -6059,7 +6030,11 @@ impl App {
             self.config.shell_program()
         };
         // Detected shells are the profiles (`shells::detect` / `-p`).
-        // An extra record that is not one of them is skipped inside `build`.
+        // Bayan has no second profile file, so the extra slice stays
+        // empty: passing `shell_profiles` again would only log the same
+        // skip twice. `build` still skips a corrupt entry in the
+        // installed slice, and a caller with a real extra list uses the
+        // second argument.
         shellmenu::build(
             &self.shell_profiles,
             &[],
@@ -6091,6 +6066,22 @@ impl App {
         };
         let ax = if lang::rtl() { x + bw } else { x };
         (ax as f64, (y + bh) as f64)
+    }
+
+    /// The arrow's box for AccessKit, in window pixels. `None` when the
+    /// bar is hidden or the gap cannot hold the button.
+    fn shell_arrow_bounds(&self) -> Option<accesskit::Rect> {
+        let (r, w) = self.renderer.as_ref().zip(self.window.as_ref())?;
+        let pw = w.inner_size().width as usize;
+        let (labels, active) = self.visible_labels();
+        let titles: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let (x, y, bw, bh) = r.shell_arrow_rect(pw, &titles, active)?;
+        Some(accesskit::Rect {
+            x0: x as f64,
+            y0: y as f64,
+            x1: (x + bw) as f64,
+            y1: (y + bh) as f64,
+        })
     }
 
     /// Ctrl+Shift+R: the palette, in naming mode. Whatever is typed becomes
@@ -6862,6 +6853,7 @@ impl App {
                     }
                 }
                 renderer.use_ui_metrics(true);
+                renderer.shell_arrow_focused = self.shell_arrow_focused;
                 renderer.draw_chrome(
                     &mut verts,
                     px.width as usize,
@@ -9720,8 +9712,17 @@ mod m38_tests {
             .collect();
         assert_eq!(&labels[..3], ["Copy selection", "Copy clean", "Paste"]);
         assert!(labels.iter().any(|l| l == "New tab with shell…"));
-        let rows = shell_menu_rows(&[], "cmd.exe");
-        assert_eq!(rows[1].1, "Command Prompt · default");
+        let rows = shellmenu::build(
+            &[],
+            &[],
+            "cmd.exe",
+            false,
+            shellmenu::Offers {
+                ssh: false,
+                mux: false,
+            },
+        );
+        assert_eq!(rows.rows[1].label, "Command Prompt · default");
         assert_eq!(broadcast_note(2).as_deref(), Some(" — goes to 3 panes"));
         assert_eq!(keybinds::Action::NextGroup.label(), "Next group");
         // nothing in the shortcuts registry is left in Arabic
@@ -9835,16 +9836,74 @@ mod m38_tests {
                 command: "wsl.exe -d Ubuntu".into(),
             },
         ];
-        let rows = shell_menu_rows(&detected, "cmd.exe");
-        assert_eq!(rows.len(), 4);
-        assert!(rows[2].0 == PaletteRow::Shell(detected[2].command.clone()));
-        assert_eq!(rows[1].1, "Command Prompt · الافتراضية");
-        assert_eq!(rows[3].1, "WSL · Ubuntu");
+        let menu = shellmenu::build(
+            &detected,
+            &[],
+            "cmd.exe",
+            false,
+            shellmenu::Offers {
+                ssh: false,
+                mux: false,
+            },
+        );
+        assert_eq!(menu.rows.len(), 4);
+        assert_eq!(menu.rows[2].command, detected[2].command);
+        assert_eq!(menu.rows[1].label, "Command Prompt · الافتراضية");
+        assert_eq!(menu.rows[3].label, "WSL · Ubuntu");
         // detection has not reported yet: PowerShell and cmd stand in
-        let early = shell_menu_rows(&[], "powershell.exe");
-        assert_eq!(early.len(), 2);
-        assert!(early[1].0 == PaletteRow::Shell("cmd.exe".into()));
-        assert_eq!(early[0].1, "PowerShell · الافتراضية");
+        let early = shellmenu::build(
+            &[],
+            &[],
+            "powershell.exe",
+            false,
+            shellmenu::Offers {
+                ssh: false,
+                mux: false,
+            },
+        );
+        assert_eq!(early.rows.len(), 2);
+        assert_eq!(early.rows[1].command, "cmd.exe");
+        assert_eq!(early.rows[0].label, "PowerShell · الافتراضية");
+    }
+
+    #[test]
+    fn an_elevated_window_hides_ssh_and_the_mux_from_its_menus() {
+        let mut elevated = super::session_app(super::test_proxy(), true);
+        elevated.config.mux.enabled = true;
+        assert!(
+            elevated.context_rows().iter().all(|(row, _)| !matches!(
+                row,
+                PaletteRow::OpenSsh | PaletteRow::OpenDetached | PaletteRow::DetachSession
+            )),
+            "the right-click menu must not offer SSH or the mux"
+        );
+        elevated.open_ssh_menu();
+        assert!(
+            elevated.palette.as_ref().is_none_or(|p| !p.ssh_menu),
+            "open_ssh_menu returns without a host list"
+        );
+        elevated.open_palette(String::new());
+        let extras = &elevated.palette.as_ref().unwrap().extras;
+        assert!(extras.iter().all(|(row, _)| !matches!(
+            row,
+            PaletteRow::OpenSsh | PaletteRow::OpenDetached | PaletteRow::DetachSession
+        )));
+        let menu = elevated.shell_menu(true);
+        assert!(menu
+            .rows
+            .iter()
+            .all(|row| row.kind == shellmenu::Kind::Shell));
+
+        let mut plain = super::session_app(super::test_proxy(), false);
+        plain.config.mux.enabled = true;
+        assert!(plain
+            .context_rows()
+            .iter()
+            .any(|(row, _)| matches!(row, PaletteRow::OpenSsh)));
+        assert!(plain
+            .context_rows()
+            .iter()
+            .any(|(row, _)| matches!(row, PaletteRow::OpenDetached)));
     }
 
     #[test]
