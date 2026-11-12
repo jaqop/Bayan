@@ -46,6 +46,7 @@ selection and BiDi paths must do.
 | `theme.rs` | Windows light/dark: `system`/`dark`/`light`, the palette pair, and the theme-change event |
 | `a11y.rs` | High Contrast color mapping and the system text-size multiplier, pure and tested; the Win32 read sits behind `read_snapshot` |
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
+| `screen_reader.rs` | screen-reader tree: each pane is a document in logical order, with the caret, the selection, and a coalesced live region (AccessKit, which speaks UIA on Windows) |
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
@@ -221,6 +222,22 @@ explicit `font_size` is the size at 100% and is still multiplied while
 the grid's fg/bg/selection/cursor through `a11y::map_terminal`. The 16
 ANSI colors stay on the theme. Both are re-read on `WM_SETTINGCHANGE` and
 `WM_SYSCOLORCHANGE`.
+**The accessibility tree stays off the paint hot path.** Until the first
+UIA client, `update_if_active` does not run the builder and a redraw does
+not even stamp. On Windows that client leaves the adapter active for the
+session (deactivate is ignored), so later frames use a stamp — output
+generation, cursor, selection, focus, tabs, palette, card — and
+[`screen_reader::TreePace`]: unchanged means no rebuild, and a moving stamp is
+built at about 10 Hz with a trailing update so the last state is sent.
+The full cell copy happens only on those builds. The terminal lock for a
+build is held only long enough to copy the visible cells; Claude
+restoration and the node tree happen after it is dropped. Pane text is
+logical grid order, so Arabic is read as the program emitted it — not the
+visually reordered line the shaper draws. Claude rows use the same
+visual→logical map as copy. A burst of output is one announcement per
+500ms (the tail, not every line), and an OSC 133 finish replaces that
+tail with the exit code. Do not build this tree on an unchanged stamp,
+and do not hand it shaped glyphs.
 
 **Two performance properties are load-bearing.** The shaped-run cache reshapes
 only changed lines (~1.5ms → ~4µs on a cached frame). Differential redraw skips

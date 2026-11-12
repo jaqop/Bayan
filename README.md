@@ -893,6 +893,44 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       registry DWORD, a named scheme and a hand-set background stay put)
       and the event-path test (a theme-changed signal replaces the
       palette and the caption flag, and does not touch a locked scheme).
+- [x] **Screen readers** — NVDA, JAWS and Narrator reach Bayan through
+      AccessKit (`accesskit` + `accesskit_winit`), whose Windows backend is
+      UI Automation. A raw `IRawElementProvider` / `ITextProvider`
+      implementation was the alternative: no extra crates, and the text
+      events would be exactly Windows Terminal's. It would also be a large
+      unsafe COM surface that three readers each interpret slightly
+      differently. AccessKit already maps a document of text runs, a caret
+      and a live region onto those UIA events, and it builds nothing until
+      a client connects. On Windows that first client leaves the adapter
+      active for the session, so afterwards the tree is rebuilt only when
+      the stamp changes, at about 10 Hz, and the last state of a burst is
+      always sent. That laziness is the reason to take the dependency
+      instead of calling UIA directly. Each visible pane is a document whose
+      lines are the grid's logical order (Arabic is not read in the shaped
+      visual order; Claude rows go through the same restoration as copy).
+      The cursor is the caret and the selection is a range on those runs.
+      New output is a polite live region, held for 500ms and then spoken as
+      one tail, so `cargo build` is not a line-by-line flood. An OSC 133
+      finish replaces that tail with one sentence that includes the exit
+      code. AccessKit raises LiveRegionChanged only when the name string
+      changes, so the same sentence twice in a row (two commands finishing
+      alike) toggles a trailing space to be spoken again. Tabs, panes, the
+      command palette, the right-click menu and the
+      confirm cards have names and roles in the UI language (Arabic by
+      default). Focus follows the active pane, and a card or the palette
+      takes it while it is open. The shaping path is unchanged. Proven by
+      11 tests (a mixed Arabic+Latin line stays in storage order, including
+      off a real `Term`; the caret column, including a wide glyph; the
+      selection range; flood coalescing; the exit-code sentence; a repeated
+      sentence re-firing; Arabic
+      names and roles for tabs, panes, the palette and a confirm card;
+      focus following the active pane; an unchanged stamp does not rebuild;
+      a 60 Hz burst stays near 10 builds a second and still publishes the
+      last stamp). Not verified on a machine: NVDA,
+      JAWS or Narrator actually speaking a running Bayan. Character boxes
+      for a magnifier's caret highlight are not provided, and a reader
+      cannot move the selection: the document does not advertise
+      SetTextSelection because nothing handles it.
 
 ## Settings
 

@@ -41,6 +41,7 @@ mod posh;
 mod process;
 mod pty_writer;
 mod render;
+mod screen_reader;
 mod scroll;
 mod scrollbar;
 mod shells;
@@ -471,6 +472,9 @@ pub enum UserEvent {
     },
     /// `config.json` changed on disk (or failed to parse). Never a panel save.
     ConfigReloaded(config_watch::ReloadMsg),
+    /// AccessKit: a reader connected, asked for an action, or disconnected.
+    /// The proxy path delivers these; the tree is built only on the first.
+    AccessKit(accesskit_winit::Event),
 }
 
 /// A one-line notice for a config reload. A parse error stays until the file
@@ -480,6 +484,12 @@ pub enum UserEvent {
 struct ConfigNotice {
     text: String,
     until: Option<Instant>,
+}
+
+impl From<accesskit_winit::Event> for UserEvent {
+    fn from(event: accesskit_winit::Event) -> Self {
+        UserEvent::AccessKit(event)
+    }
 }
 
 /// The link under the pointer. Stable while the pointer stays inside it,
@@ -1609,6 +1619,35 @@ struct App {
     /// `#45`: with saved tabs restored, they come back first and this folder
     /// opens as the active extra tab.
     start_dir: Option<String>,
+    /// UI Automation adapter. `None` until the window exists. The first
+    /// client turns it on for the rest of the session on Windows.
+    reader: Option<accesskit_winit::Adapter>,
+    /// Set when a client has asked for the tree. Before that, redraws do
+    /// not stamp or build. After that, [`screen_reader::TreePace`] decides.
+    reader_seen_client: bool,
+    /// Bumped when pane text changes without the cursor or the selection
+    /// necessarily moving (a PTY chunk, a relayout).
+    reader_gen: u64,
+    reader_pace: screen_reader::TreePace,
+    /// Trailing tree build, when a stamp changed inside the 10 Hz window.
+    reader_tree_at: Option<Instant>,
+    /// Epoch for the announcer's millisecond clock.
+    reader_origin: Instant,
+    /// When the held output burst may be spoken. `about_to_wait` wakes then.
+    reader_deadline: Option<Instant>,
+    reader_gate: screen_reader::OutputGate,
+    /// Document text last given to the tree. Held still across a flood.
+    reader_bodies: Vec<screen_reader::PaneItem>,
+    /// Focused pane the gate is diffing. A change resets the gate.
+    reader_pane: Option<u64>,
+    /// Last command line seen while it was running, for the finish sentence.
+    reader_cmd: String,
+    /// OSC 133 mark already observed. A new absolute row is a new finish.
+    reader_mark: Option<u64>,
+    /// The mark present when a reader first looked is not announced.
+    reader_mark_ready: bool,
+    /// Last live-region name. Unchanged text does not raise another event.
+    reader_live: Option<String>,
     /// Resolved `-p` command line for that same tab. `None` keeps the
     /// configured shell. Ignored when `start_command` is set.
     start_profile_command: Option<String>,
@@ -1826,6 +1865,20 @@ impl App {
             config_notice: None,
             a11y: a11y::A11ySnapshot::neutral(),
             inflight_a11y: a11y::A11ySnapshot::neutral(),
+            reader: None,
+            reader_seen_client: false,
+            reader_gen: 0,
+            reader_pace: screen_reader::TreePace::default(),
+            reader_tree_at: None,
+            reader_origin: Instant::now(),
+            reader_deadline: None,
+            reader_gate: screen_reader::OutputGate::default(),
+            reader_bodies: Vec::new(),
+            reader_pane: None,
+            reader_cmd: String::new(),
+            reader_mark: None,
+            reader_mark_ready: false,
+            reader_live: None,
         }
     }
 
@@ -3418,6 +3471,8 @@ impl App {
         // and a pixel offset belongs to the old cell height.
         self.link_cache.clear();
         scroll::apply_resize(&mut self.smooth);
+        // A wrap changes what the reader sees even when the cursor does not.
+        self.bump_reader();
         // resolve "hide the bar with one tab" BEFORE measuring the content
         let hide = self.config.hide_single_tab_on() && self.tabs.len() <= 1;
         if let Some(r) = self.renderer.as_mut() {
@@ -4113,13 +4168,26 @@ impl App {
     /// both: the application already ordered the text, so this pane does
     /// not reorder.
     fn claude_active(&self) -> bool {
-        let Some(s) = self.session() else {
+        let Some(tab) = self.tabs.get(self.active) else {
             return false;
         };
-        // term first, then meta — the crate's lock order
-        let term_alt = s.term.lock().mode().contains(TermMode::ALT_SCREEN);
+        let Some(pane) = tab.panes.get(tab.focused) else {
+            return false;
+        };
+        self.pane_claude(pane)
+    }
+
+    /// Claude restoration for one pane. Term lock, then meta, never both:
+    /// the same order as every other pane read.
+    fn pane_claude(&self, pane: &Pane) -> bool {
+        let term_alt = pane
+            .session
+            .term
+            .lock()
+            .mode()
+            .contains(TermMode::ALT_SCREEN);
         let (bidi_state, running, pane_mode, tracked_alt) = {
-            let m = s.meta.lock_or_recover();
+            let m = pane.session.meta.lock_or_recover();
             (
                 m.bidi.clone(),
                 m.running_cmd.clone(),
@@ -4163,6 +4231,283 @@ impl App {
             self.pane_offset_px(pane_id, cell_h as f32) as f64,
             rows,
         )
+    }
+
+    fn close_message(&self, target: CloseTarget) -> String {
+        match target {
+            CloseTarget::Pane(ti, pi) => {
+                let cmd = chrome_text(&self.running_command(ti, pi).unwrap_or_default());
+                screen_reader::close_pane_message(&cmd)
+            }
+            CloseTarget::Tab(ti) => {
+                let n = self
+                    .tabs
+                    .get(ti)
+                    .map(|t| {
+                        t.panes
+                            .iter()
+                            .filter(|p| !p.session.meta.lock_or_recover().running_cmd.is_empty())
+                            .count()
+                    })
+                    .unwrap_or(0);
+                screen_reader::close_count_message(n, true)
+            }
+            CloseTarget::Window => screen_reader::close_count_message(self.running_count(), false),
+        }
+    }
+
+    /// Push a full tree when a client is connected and the stamp changed.
+    /// Before the first client this returns without taking the terminal
+    /// lock. Afterwards an unchanged frame does not build, and a burst is
+    /// at most one build per [`screen_reader::TREE_MIN_MS`], with the last stamp
+    /// delivered on [`Self::reader_tree_at`].
+    fn publish_reader(&mut self) {
+        if !self.reader_seen_client || self.reader.is_none() {
+            return;
+        }
+        let now_ms = self.reader_origin.elapsed().as_millis() as u64;
+        let announce_due = self.reader_deadline.is_some_and(|t| Instant::now() >= t);
+        let fp = self.reader_fp();
+        let pace = self.reader_pace.consider(fp, now_ms);
+        let build = pace.publish || announce_due;
+        if build && !pace.publish {
+            self.reader_pace.note_published(fp, now_ms);
+        }
+        if build {
+            let Some(mut adapter) = self.reader.take() else {
+                return;
+            };
+            adapter.update_if_active(|| self.reader_update(now_ms));
+            self.reader = Some(adapter);
+            self.reader_tree_at = None;
+        } else {
+            self.reader_tree_at = pace
+                .wake_ms
+                .map(|ms| self.reader_origin + std::time::Duration::from_millis(ms));
+        }
+    }
+
+    /// Cursor, selection, focus, tabs, palette, and card. Not the cells.
+    fn reader_fp(&self) -> u64 {
+        let mut h = screen_reader::stamp_mix(self.reader_gen, self.active as u64);
+        h = screen_reader::stamp_mix(h, u64::from(lang::rtl()));
+        let (vis, _) = self.visible_tabs();
+        for i in vis {
+            h = screen_reader::stamp_str(h, &self.tabs[i].label());
+            h = screen_reader::stamp_mix(h, u64::from(i == self.active));
+        }
+        if let Some(tab) = self.tabs.get(self.active) {
+            h = screen_reader::stamp_mix(h, tab.focused as u64);
+            for pane in &tab.panes {
+                let term = pane.session.term.lock();
+                h = screen_reader::stamp_mix(h, screen_reader::pane_stamp(&term));
+            }
+        }
+        h = match &self.palette {
+            None => screen_reader::stamp_mix(h, 0),
+            Some(p) => {
+                let mut h = screen_reader::stamp_mix(h, 1);
+                h = screen_reader::stamp_mix(h, p.sel as u64);
+                h = screen_reader::stamp_mix(h, u64::from(p.menu.is_some()));
+                h = screen_reader::stamp_mix(h, u64::from(p.shells_menu));
+                h = screen_reader::stamp_str(h, &p.query);
+                screen_reader::stamp_mix(h, p.extras.len() as u64)
+            }
+        };
+        h = match self.pending_close {
+            None => screen_reader::stamp_mix(h, 0),
+            Some(CloseTarget::Pane(ti, pi)) => {
+                let h = screen_reader::stamp_mix(h, 1);
+                let h = screen_reader::stamp_mix(h, ti as u64);
+                screen_reader::stamp_mix(h, pi as u64)
+            }
+            Some(CloseTarget::Tab(ti)) => {
+                let h = screen_reader::stamp_mix(h, 2);
+                screen_reader::stamp_mix(h, ti as u64)
+            }
+            Some(CloseTarget::Window) => screen_reader::stamp_mix(h, 3),
+        };
+        if let Some(block) = &self.blocked_link {
+            h = screen_reader::stamp_str(h, &block.reason);
+            h = screen_reader::stamp_str(h, &block.shown);
+            h = screen_reader::stamp_mix(h, u64::from(block.confirm.is_some()));
+        } else {
+            h = screen_reader::stamp_mix(h, 0);
+        }
+        if let Some(paste) = &self.pending_paste {
+            h = screen_reader::stamp_mix(h, paste.lines as u64);
+            h = screen_reader::stamp_mix(h, paste.chars as u64);
+            h = screen_reader::stamp_str(h, &paste.reason);
+        }
+        h
+    }
+
+    fn bump_reader(&mut self) {
+        self.reader_gen = self.reader_gen.wrapping_add(1);
+    }
+
+    fn reader_update(&mut self, now_ms: u64) -> accesskit::TreeUpdate {
+        let view = self.reader_view(now_ms);
+        self.reader_deadline = self
+            .reader_gate
+            .flush_at_ms()
+            .map(|ms| self.reader_origin + std::time::Duration::from_millis(ms));
+        screen_reader::build_tree(&view)
+    }
+
+    fn reader_view(&mut self, now_ms: u64) -> screen_reader::View {
+        let (vis, _) = self.visible_tabs();
+        let tabs: Vec<screen_reader::TabItem> = vis
+            .iter()
+            .map(|&i| screen_reader::TabItem {
+                index: i,
+                name: self.tabs[i].label(),
+                selected: i == self.active,
+            })
+            .collect();
+        let active = self.active;
+        let focused = self.tabs.get(active).map(|t| t.focused).unwrap_or(0);
+        let mut bodies = Vec::new();
+        let mut focused_lines = Vec::new();
+        let mut focused_id = None;
+        let mut finished = None;
+        let mut running = String::new();
+        if let Some(tab) = self.tabs.get(active) {
+            let count = tab.panes.len();
+            for (pi, pane) in tab.panes.iter().enumerate() {
+                let claude = self.pane_claude(pane);
+                // Copy under the lock, then restore BiDi and build nodes
+                // after it is released. A reader must not stall the PTY.
+                let raw = {
+                    let term = pane.session.term.lock();
+                    screen_reader::copy_pane(&term)
+                };
+                let text = screen_reader::pane_text(raw, claude);
+                if pi == focused {
+                    focused_id = Some(pane.id);
+                    focused_lines = text.lines.iter().map(|line| line.text.clone()).collect();
+                    let meta = pane.session.meta.lock_or_recover();
+                    running = meta.running_cmd.clone();
+                    finished = meta
+                        .marks
+                        .iter()
+                        .rev()
+                        .find(|mark| mark.exit.is_some())
+                        .map(|mark| (mark.abs, mark.exit));
+                }
+                bodies.push(screen_reader::PaneItem {
+                    index: pi,
+                    name: screen_reader::pane_name(pi, count),
+                    text,
+                });
+            }
+        }
+        if focused_id != self.reader_pane {
+            self.reader_gate.reset();
+            self.reader_pane = focused_id;
+            self.reader_mark = None;
+            self.reader_mark_ready = false;
+            self.reader_cmd.clear();
+            self.reader_bodies.clear();
+        }
+        if !running.is_empty() {
+            self.reader_cmd = running;
+        }
+        if let Some((abs, exit)) = finished {
+            if self.reader_mark != Some(abs) {
+                let announce = self.reader_mark_ready;
+                self.reader_mark = Some(abs);
+                if announce {
+                    self.reader_gate
+                        .command_finished(exit, &self.reader_cmd, now_ms);
+                }
+            }
+        }
+        self.reader_mark_ready = true;
+        let update = self.reader_gate.push(&focused_lines, now_ms);
+        // A selection is the user's, not the flood's: show it immediately.
+        let selecting = bodies.iter().any(|pane| pane.text.selection.is_some());
+        let panes =
+            if selecting || update.refresh_document || self.reader_bodies.len() != bodies.len() {
+                self.reader_bodies = bodies;
+                self.reader_bodies.clone()
+            } else {
+                self.reader_bodies.clone()
+            };
+        if let Some(live) = update.live.clone() {
+            let on_screen = self
+                .reader_live
+                .as_deref()
+                .unwrap_or(screen_reader::live_name());
+            self.reader_live = Some(screen_reader::live_label(on_screen, live));
+        }
+        let palette = self.palette.as_ref().map(|p| {
+            let menu = p.menu.is_some();
+            screen_reader::PaletteItem {
+                name: if menu {
+                    screen_reader::menu_name()
+                } else {
+                    screen_reader::palette_name()
+                }
+                .to_string(),
+                query: p.query.clone(),
+                rows: self
+                    .palette_rows(&p.query)
+                    .into_iter()
+                    .map(|(_, label)| label)
+                    .collect(),
+                selected: p.sel,
+                menu,
+            }
+        });
+        let dialog = self.reader_dialog();
+        screen_reader::View {
+            tabs,
+            active_tab: active,
+            panes,
+            focused_pane: focused,
+            live: self
+                .reader_live
+                .clone()
+                .unwrap_or_else(|| screen_reader::live_name().to_string()),
+            palette,
+            dialog,
+        }
+    }
+
+    fn reader_dialog(&self) -> Option<screen_reader::DialogItem> {
+        if let Some(target) = self.pending_close {
+            let name = self.close_message(target);
+            return Some(screen_reader::DialogItem {
+                body: name.clone(),
+                name,
+            });
+        }
+        if let Some(block) = &self.blocked_link {
+            if block.is_app_error {
+                return Some(screen_reader::DialogItem {
+                    name: block.reason.clone(),
+                    body: block.shown.clone(),
+                });
+            }
+            let name = format!(
+                "{} — {}",
+                link::card_title_prefix(block.confirm.is_some()),
+                block.reason
+            );
+            let (ar, en) = link::card_key_lines(block.confirm.is_some());
+            return Some(screen_reader::DialogItem {
+                name,
+                body: format!("{}\n{ar}\n{en}", block.shown),
+            });
+        }
+        let paste = self.pending_paste.as_ref()?;
+        let preview = card_preview(paste.kind, &paste.text);
+        let shown = preview.first().map(String::as_str).unwrap_or("");
+        Some(screen_reader::DialogItem {
+            name: screen_reader::paste_dialog_name().to_string(),
+            body: format!("{}\n{shown}", paste.reason),
+        })
     }
 
     /// Pixel position -> (pane index, viewport row, col, cell side).
@@ -5305,6 +5650,9 @@ impl App {
     }
 
     fn redraw(&mut self) {
+        // Before a client, this is a flag check. After one, an unchanged
+        // stamp does not walk the grid; a flood builds at about 10 Hz.
+        self.publish_reader();
         // A scroll under a still pointer moves the link. Refresh only while
         // a hover is showing, and never during a drag: that path must not
         // redraw on every pixel.
@@ -5376,41 +5724,7 @@ impl App {
             let sel = p.sel.min(rows.len().saturating_sub(1));
             (p.query.clone(), rows, sel, p.menu)
         });
-        let close_msg: Option<String> = self.pending_close.map(|target| match target {
-            CloseTarget::Pane(ti, pi) => {
-                let cmd = chrome_text(&self.running_command(ti, pi).unwrap_or_default());
-                if lang::rtl() {
-                    format!("الأمر «{cmd}» ما يزال يعمل — إغلاق اللوحة؟")
-                } else {
-                    format!("“{cmd}” is still running — close the pane?")
-                }
-            }
-            CloseTarget::Tab(ti) => {
-                let n = self
-                    .tabs
-                    .get(ti)
-                    .map(|t| {
-                        t.panes
-                            .iter()
-                            .filter(|p| !p.session.meta.lock_or_recover().running_cmd.is_empty())
-                            .count()
-                    })
-                    .unwrap_or(0);
-                if lang::rtl() {
-                    format!("{n} أمر ما يزال يعمل — إغلاق التبويب؟")
-                } else {
-                    format!("{n} command(s) still running — close the tab?")
-                }
-            }
-            CloseTarget::Window => {
-                let n = self.running_count();
-                if lang::rtl() {
-                    format!("{n} أمر ما يزال يعمل — إغلاق بيان؟")
-                } else {
-                    format!("{n} command(s) still running — close Bayan?")
-                }
-            }
-        });
+        let close_msg = self.pending_close.map(|target| self.close_message(target));
         let rects = self.pane_rects();
         let sb_content = self.content_rect();
         let sb_pad = self.padding_physical();
@@ -5884,8 +6198,9 @@ impl ApplicationHandler<UserEvent> for App {
         }
         // hidden until the GPU presents the first dark frame (~0.4s): a
         // fully-drawn window appearing beats a white flash while DX12 warms up.
-        // BAYAN_SHOW_NOW forces it visible at creation (for on-screen capture).
-        let visible = dev_hook("BAYAN_SHOW_NOW").is_some();
+        // BAYAN_SHOW_NOW shows it as soon as the accessibility adapter exists.
+        // AccessKit panics if the adapter is created on an already-visible window.
+        let show_now = dev_hook("BAYAN_SHOW_NOW").is_some();
         // The exe's embedded resource covers Explorer and the taskbar, but the
         // title bar and Alt-Tab read the WINDOW icon, which winit only sets if
         // we hand it pixels. Raw RGBA rather than a decoder: 16KB, no new crate,
@@ -5901,7 +6216,7 @@ impl ApplicationHandler<UserEvent> for App {
             .with_undecorated_shadow(true)
             .with_title(elevate::window_title(self.elevated))
             .with_window_icon(icon)
-            .with_visible(visible)
+            .with_visible(false)
             .with_inner_size(LogicalSize::new(1100.0, 700.0));
         // yesterday's rectangle, if it is still on a connected monitor
         let monitors: Vec<(i32, i32, u32, u32)> = el
@@ -5932,6 +6247,16 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         crate::prof::mark("window created");
+        // Before the first show: a reader that connects later is answered
+        // from the UI thread, and nothing is built until then.
+        self.reader = Some(accesskit_winit::Adapter::with_event_loop_proxy(
+            el,
+            &window,
+            self.proxy.clone(),
+        ));
+        if show_now {
+            window.set_visible(true);
+        }
         // winit turns the IME off on every new window: CJK input, the
         // emoji panel (Win+.) and dictation (Win+H) need it on
         window.set_ime_allowed(true);
@@ -6013,10 +6338,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.shell_profiles = profiles;
                 self.shell_profiles_ready = true;
+                self.bump_reader();
                 self.start_sessions();
                 self.request_redraw();
             }
-            UserEvent::Wakeup(id) => self.wakeup(id),
+            UserEvent::Wakeup(id) => {
+                self.bump_reader();
+                self.wakeup(id);
+            }
             UserEvent::PtyWrite(id, text) => {
                 if let Some((ti, pi)) = self.find_pane(id) {
                     self.tabs[ti].panes[pi].session.write(text.as_bytes());
@@ -6228,6 +6557,31 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_redraw();
             }
             UserEvent::ConfigReloaded(msg) => self.apply_config_reload(msg),
+            UserEvent::AccessKit(event) => match event.window_event {
+                accesskit_winit::WindowEvent::InitialTreeRequested => {
+                    // The next consider must build even if the stamp matches
+                    // a tree we never managed to send.
+                    self.reader_seen_client = true;
+                    self.reader_pace = screen_reader::TreePace::default();
+                    self.publish_reader();
+                }
+                accesskit_winit::WindowEvent::AccessibilityDeactivated => {
+                    // Windows does not deliver this. Other backends do,
+                    // and then the redraw path goes quiet again.
+                    self.reader_seen_client = false;
+                    self.reader_pace = screen_reader::TreePace::default();
+                    self.reader_tree_at = None;
+                    self.reader_gate.reset();
+                    self.reader_bodies.clear();
+                    self.reader_pane = None;
+                    self.reader_mark = None;
+                    self.reader_mark_ready = false;
+                    self.reader_deadline = None;
+                    self.reader_live = None;
+                    self.reader_cmd.clear();
+                }
+                accesskit_winit::WindowEvent::ActionRequested(_) => {}
+            },
         }
     }
 
@@ -6302,6 +6656,21 @@ impl ApplicationHandler<UserEvent> for App {
                 wake = Some(wake.map_or(until, |w| w.min(until)));
             }
         }
+        // The burst is spoken once the hold elapses, and a stamp that
+        // arrived inside the 10 Hz window is published when that window ends.
+        let now = Instant::now();
+        if self.reader_deadline.is_some_and(|t| now >= t)
+            || self.reader_tree_at.is_some_and(|t| now >= t)
+        {
+            self.publish_reader();
+        }
+        let soon = match (self.reader_deadline, self.reader_tree_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if let Some(at) = soon {
+            wake = Some(wake.map_or(at, |w| w.min(at)));
+        }
         match wake {
             Some(t) => el.set_control_flow(ControlFlow::WaitUntil(t)),
             None => el.set_control_flow(ControlFlow::Wait),
@@ -6309,6 +6678,9 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if let (Some(adapter), Some(window)) = (self.reader.as_mut(), self.window.as_ref()) {
+            adapter.process_event(window, &event);
+        }
         if self.modal_pointer(&event, el) {
             return;
         }
