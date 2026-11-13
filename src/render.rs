@@ -12230,6 +12230,63 @@ mod paragraph_align {
         }
     }
 
+    #[test]
+    fn scrolling_inside_a_paragraph_keeps_visible_words_whole() {
+        use alacritty_terminal::{
+            event::VoidListener, grid::Scroll, term::Config, vte::ansi::Processor,
+        };
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let mut term = Term::new(
+            Config::default(),
+            &crate::term::TermSize { cols: 30, rows: 4 },
+            VoidListener,
+        );
+        let mut processor: Processor = Processor::new();
+        let corpus =
+            include_str!("../tests/fixtures/mixed-arabic-english.txt").replace("\r\n", "\n");
+        let text = corpus.split("\n\n").nth(1).unwrap();
+        processor.advance(&mut term, text.as_bytes());
+        term.scroll_display(Scroll::Delta(3));
+        let off = term.grid().display_offset() as i32;
+        assert!(off > 0);
+        assert!(line_wrapped_into(&term, 0, off));
+        assert!(line_wrapped_into(&term, 4, off));
+        let mut visible = String::new();
+        for row in 0..4 {
+            for cell in r.cells_of_line(&term, alacritty_terminal::index::Line(row - off)) {
+                cell.push_text(&mut visible);
+            }
+        }
+        let pane = (0, 0, 600, 160);
+        r.draw_pane(&mut Vec::new(), &pane_view(pane, true), &term);
+        assert!(
+            !r.flow_rows.is_empty(),
+            "viewport edges must not disable prose reflow"
+        );
+        let painted: Vec<String> = r
+            .row_shape
+            .values()
+            .map(|row| row.key.0.iter().map(|s| s.text.as_str()).collect())
+            .collect();
+        let words: Vec<_> = visible.split_whitespace().collect();
+        let mut checked = 0;
+        // The first/last token can be clipped by the viewport, not a break
+        // introduced inside it. Every complete Arabic word stays whole.
+        for word in &words[1..words.len() - 1] {
+            if word
+                .chars()
+                .all(|c| is_arabic(c) || c.is_ascii_punctuation())
+            {
+                assert!(
+                    painted.iter().any(|row| row.contains(word)),
+                    "split visible {word}: {painted:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
+    }
+
     /// A soft-wrapped RTL paragraph keeps one direction. The tail is flush
     /// right too, not re-detected as its own paragraph.
 
