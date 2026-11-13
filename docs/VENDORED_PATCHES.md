@@ -41,6 +41,8 @@ signature/pin acceptance, write locks, and a real console OSC 52 round trip.
 
 Elevated Git Bash uses a mandatory protected startup plan independently of
 OSC prompt integration. Startup/environment hooks are removed from the final
-command builder, including its HKCU environment base. This does not certify
-all of PR #71: completion helper/path ownership and WSL-root isolation need
-separate validation. Do not treat WSL elevation as a security boundary.
+command builder, including its HKCU environment base. The completion
+filter from #71/#81 is integrated; its planted-path branches run in real
+Bash tests, with controlled ownership metadata for branches unavailable
+on Git Bash. Live WSL-root isolation remains unverified. Do not treat WSL
+elevation as a security boundary.

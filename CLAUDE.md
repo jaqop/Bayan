@@ -58,9 +58,6 @@ Test counts come from `cargo test -- --list` and the CI test summary, not
 manual totals in this file. Explicit native host probes and measurement
 probes are ignored by the default suite; see their annotations and Measuring.
 
-
-
-
 ## Measuring
 
 Measure before optimizing, in release builds:
@@ -220,7 +217,9 @@ give cmd the nonce in any form. `git-bash.exe`, `bash -c`, and
 `BAYAN_PROMPT_NONCE` and is unset before a child inherits it. Do not write
 the user's rc files. An elevated token must not source `~/.bashrc`,
 `~/.bash_profile`, `~/.inputrc`, or the zsh home files: set `INPUTRC` and
-`HISTFILE` to `/dev/null`. Elevated Git Bash passes `--noprofile` before
+`HISTFILE` to `/dev/null`. Git Bash protection is mandatory even when
+prompt marks are disabled; startup-file creation failures refuse the spawn.
+Elevated Git Bash passes `--noprofile` and `-p`, with long options before
 `-i` and must not source `/etc/profile` (its `git-prompt.sh` runs user
 files). Login or not, the rcfile restores `HOME` from `BAYAN_SI_HOME`
 with `/usr/bin/cygpath` and then unsets that variable. `PATH` and
