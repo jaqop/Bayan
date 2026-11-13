@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory=$true)][string]$Version,
     [string]$BinaryPath = 'target/release/bayan.exe',
+    [string]$SourceSha = '',
     [string]$OutputDirectory = 'dist'
 )
 $ErrorActionPreference = 'Stop'
@@ -10,6 +11,10 @@ if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$
 }
 if (-not [IO.Path]::IsPathRooted($BinaryPath)) { $BinaryPath = Join-Path $repo $BinaryPath }
 if (-not [IO.Path]::IsPathRooted($OutputDirectory)) { $OutputDirectory = Join-Path $repo $OutputDirectory }
+$checkout = git -C $repo rev-parse HEAD
+if ($LASTEXITCODE -ne 0) { throw 'Cannot identify package source' }
+if (-not $SourceSha) { $SourceSha = $checkout }
+if ($SourceSha -notmatch '^[0-9a-fA-F]{40}$') { throw 'Invalid source commit' }
 $name = "bayan-$Version-x86_64-pc-windows-msvc"
 $dir = Join-Path $OutputDirectory $name
 $zip = Join-Path $OutputDirectory "$name.zip"
@@ -27,7 +32,7 @@ foreach ($file in @('LICENSE','NOTICE','README.md','fonts/OFL.txt','fonts/OFL-Ka
 $files = @(Get-ChildItem -LiteralPath $dir -File | Sort-Object Name | ForEach-Object {
     @{name=$_.Name; sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
 })
-@{version=$Version; architecture='x86_64-pc-windows-msvc'; files=$files} |
+@{version=$Version; source_sha=$SourceSha; checkout_sha=$checkout; configuration='release'; architecture='x86_64-pc-windows-msvc'; files=$files} |
     ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $dir 'build-identity.json') -Encoding utf8
 Compress-Archive -LiteralPath $dir -DestinationPath $zip
 $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
