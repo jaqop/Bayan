@@ -66,3 +66,42 @@ and startup hooks; selected uid/mode metadata is controlled to exercise
 Linux-only ownership branches. No live WSL distro, elevated Bash window,
 or real Linux bash-completion package was exercised in this integration.
 WSL root is not certified as a privilege boundary.
+
+## Arabic wrap correction and visible shell dropdown
+
+Follow-up code: `438f2e10143ea32bb9e42c90d7a60c7b44720a39`.
+Executable SHA-256:
+`5c196d9d69888ce0c09e214bbb7d0e0af170dadccb24561fb482290b40961816`.
+
+The earlier copy check proved data integrity, not word-boundary quality.
+Live inspection reproduced `الإنجل` / `يزية`, `ن` / `عيد`, and `فح` / `ص`
+on adjacent screen rows. The PTY wraps at grid columns and the renderer
+shaped each physical row independently. The view now moves soft breaks to
+word boundaries in fully visible Arabic prose paragraphs, keeping the same
+number of rows. Original grid coordinates are retained for selection,
+search, links, cursor and IME. Grid contents and copied text are unchanged.
+
+The regression first failed through actual `draw_pane`, then passed. A
+279-word mixed corpus also passes at 32, 70 and 100 columns; moved-letter
+hit tests and native-cursor/IME positioning pass. Colour-only Arabic spans
+retain the same connected initial/medial/final glyph forms.
+
+Live Windows testing confirmed whole words in the 1100x700 window, with
+fullscreen tested at 2560x1440. Double-click/copy of the previously split
+`الإنجليزية` returned the exact word. Full keyboard selection/copy of the
+279-word corpus matched all 1789 non-trailing characters. Captures and
+process/window/source/hash sidecars are stored with the local test artifacts.
+
+The new down-arrow beside `+` opens the existing shell menu. Installed
+PowerShell variants, CMD and Git Bash appeared; selecting CMD opened a new
+tab and a real `cmd.exe` child. SSH opens the existing configured-host menu.
+WSL entries depend on successful distribution detection; no working WSL
+distribution is present on this machine.
+
+886 ordinary tests passed; fmt, clippy with warnings denied, build and Rust
+1.89 all-target checking passed. Original native probe results above remain
+separate from these renderer checks. The reflow deliberately leaves clipped
+paragraphs, positioned TUIs, alternate-screen output, explicit application
+direction controls, and visual-order Claude output on their existing path.
+UIA still exposes physical grid rows; this check does not certify NVDA's
+reading across soft wraps.
