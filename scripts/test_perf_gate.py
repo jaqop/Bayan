@@ -17,6 +17,19 @@ PROBE throughput ascii  64 MB: process_chunk   101.0 MB/s, vte alone   148.1 MB/
 PROBE scrollback  10000 lines x 120 cols: +  35.5 MB once full, +  35.5 MB after as much again (history 10000)
 """
 
+STARTUP = """
+--- startup run 1
+      0.4 ms  main start
+    601.7 ms  gpu ready
+    617.0 ms  first frame presented
+   3931.3 ms  renderer ready
+     40.0 ms  latency key->pty-output 0.5 ms, key->frame 1.4 ms
+--- startup run 2
+2026-11-13T13:50:01.1Z       0.3 ms  main start
+2026-11-13T13:50:01.2Z     107.1 ms  first frame presented
+2026-11-13T13:50:01.3Z     138.4 ms  renderer ready
+"""
+
 BASE = {
     "throughput": {"ascii": 79, "sgr": 51, "arabic": 73},
     "scrollback": {"10000": 33, "100000": 303},
@@ -55,6 +68,24 @@ class Gate(unittest.TestCase):
     def test_a_probe_that_printed_nothing_fails(self):
         failures, _, _ = perf_gate.compare(BASE, perf_gate.parse("no probes ran"), 0.10)
         self.assertEqual(len(failures), 5)
+
+    def test_startup_takes_the_warm_start_and_ignores_other_marks(self):
+        got = perf_gate.parse(STARTUP)["startup"]
+        self.assertEqual(got["first frame presented"], 107.1)
+        self.assertEqual(got["renderer ready"], 138.4)
+        self.assertNotIn("latency key", " ".join(got))
+
+    def test_startup_has_its_own_tolerance_and_reports_no_gain(self):
+        base = {
+            "tolerances": {"startup": 0.5},
+            "startup": {"first frame presented": 100, "renderer ready": 135},
+        }
+        ok = {"startup": {"first frame presented": 140.0, "renderer ready": 60.0}}
+        self.assertEqual(perf_gate.compare(base, ok, 0.10)[:2], ([], []))
+        slow = {"startup": {"first frame presented": 151.0, "renderer ready": 135.0}}
+        failures, _, _ = perf_gate.compare(base, slow, 0.10)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("limit 50%", failures[0])
 
 
 if __name__ == "__main__":

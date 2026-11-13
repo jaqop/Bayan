@@ -78,9 +78,10 @@ jobs:
   # probes are the ignored `measure_` tests in term.rs, in a release build;
   # scripts/perf_gate.py compares them with perf/baseline.json. Throughput is
   # gated as a share of the bare vte parser measured in the same run, so a
-  # slow runner does not fail it. Three runs, best of each.
+  # slow runner does not fail it. Three runs, best of each. Startup is the
+  # time to the first frame and to a ready renderer, with a wide limit.
   perf:
-    name: perf gate (reader, scrollback)
+    name: perf gate (reader, scrollback, startup)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (v5.1.0)
@@ -103,17 +104,11 @@ jobs:
             cargo test --locked --release -- --ignored measure_reader_throughput --nocapture --test-threads=1 2>&1 | tee -a probe.log
             cargo test --locked --release -- --ignored measure_scrollback_memory --nocapture --test-threads=1 2>&1 | tee -a probe.log
           done
-      - name: Gate
-        shell: bash
-        run: |
-          python scripts/perf_gate.py probe.log --print
-          python scripts/perf_gate.py probe.log | tee -a "$GITHUB_STEP_SUMMARY"
-      # Report only, for now: can a hosted runner open the window at all,
-      # and how steady are the startup marks? Five cold starts with
-      # BAYAN_PROFILE, each killed after its first frame has had time to
-      # land. Nothing here fails the job until the spread is known.
-      - name: Startup marks (report only)
-        continue-on-error: true
+      # Five starts of a release build with BAYAN_PROFILE, each stopped after
+      # its first frame has had time to land. The gate takes the fastest:
+      # the first start of a job is cold (fonts, shader cache) and several
+      # times slower. A hosted runner does open the window, on WARP.
+      - name: Startup marks
         shell: pwsh
         run: |
           cargo build --locked --release --features dev-hooks
@@ -125,20 +120,20 @@ jobs:
           $log = Join-Path $env:TEMP 'bayan_profile.log'
           foreach ($run in 1..5) {
             if (Test-Path -LiteralPath $log) { Remove-Item -LiteralPath $log }
-            $p = Start-Process -FilePath target/release/bayan.exe -PassThru -RedirectStandardError (Join-Path $env:RUNNER_TEMP "bayan-stderr-$run.txt")
+            $p = Start-Process -FilePath target/release/bayan.exe -PassThru
             Start-Sleep -Seconds 12
-            "bayan processes alive: $(@(Get-Process -Name bayan -ErrorAction SilentlyContinue).Count)"
-            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force } else { "run ${run}: exited with $($p.ExitCode)" }
+            if ($p.HasExited) { throw "bayan exited on its own with $($p.ExitCode)" }
+            Stop-Process -Id $p.Id -Force
             Get-Process -Name bayan -ErrorAction SilentlyContinue | Stop-Process -Force
-            Get-Content -LiteralPath (Join-Path $env:RUNNER_TEMP "bayan-stderr-$run.txt") -ErrorAction SilentlyContinue | Select-Object -First 20
-            "--- startup run $run"
-            if (Test-Path -LiteralPath $log) {
-              "profile log: $((Get-Item -LiteralPath $log).Length) bytes at $log"
-              Get-Content -LiteralPath $log | Where-Object { $_ -notmatch ' key ' }
-            } else {
-              "no profile log at $log"
-            }
+            if (-not (Test-Path -LiteralPath $log)) { throw 'bayan wrote no profile log' }
+            "--- startup run $run" | Tee-Object -FilePath startup.log -Append
+            Get-Content -LiteralPath $log | Where-Object { $_ -notmatch 'latency|  key ' } | Tee-Object -FilePath startup.log -Append
           }
+      - name: Gate
+        shell: bash
+        run: |
+          python scripts/perf_gate.py probe.log startup.log --print
+          python scripts/perf_gate.py probe.log startup.log | tee -a "$GITHUB_STEP_SUMMARY"
 
   # Enforces the rust-version declared in Cargo.toml. That floor is set by the
   # dependency graph (cosmic-text 0.19 wants 1.89), not by our own source, so

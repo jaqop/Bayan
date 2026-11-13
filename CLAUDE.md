@@ -82,7 +82,11 @@ the scrollback is full. `scripts/perf_gate.py` compares the probes'
 10% worse. The baseline is the hosted runner's own figures, not the
 author's machine. When a change makes a figure 10% better the job says
 so: raise the baseline in the same pull request, or the gain can be given
-back unnoticed. Key-to-frame latency is not gated; it needs typed input.
+back unnoticed. The job also starts a release build five times with
+`BAYAN_PROFILE` and gates the fastest time to `first frame presented` and
+`renderer ready`, at 50%: hosted runners differ by a quarter between jobs
+(`perf/README.md` has the figures). Key-to-frame latency is not gated; it
+needs typed input.
 
 Figures from 2026-11-10 on the author's machine (22bc5d6 + this harness):
 `process_chunk` 83 / 49 / 100 MB/s for plain / SGR / Arabic, which is 57 / 27 /

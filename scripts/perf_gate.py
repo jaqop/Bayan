@@ -11,13 +11,20 @@ concatenated) and compares them with perf/baseline.json:
   scrollback: private megabytes once the history is full, per history size.
       The lowest of the runs is used for the same reason.
 
+  startup: milliseconds from process start to a `BAYAN_PROFILE` mark, per
+      mark, lowest of the runs (the first start of a job is cold and several
+      times slower). Hosted runners differ by a quarter from one job to the
+      next, so this group has its own, wide tolerance: it catches work that
+      lands in front of the first frame, not a few milliseconds.
+
 A value more than `tolerance` (10%) worse than the baseline fails. A value
-that much better is reported, so the baseline can be raised and the gain kept.
+that much better is reported, so the baseline can be raised and the gain
+kept. Startup gains are not reported: there they are the runner, not the code.
 
     python scripts/perf_gate.py probe.log              # gate
     python scripts/perf_gate.py probe.log --print      # the baseline this log would be
 
-Startup time and key-to-frame latency are not here: they need a window.
+Key-to-frame latency is not here: it needs typed input.
 """
 import json
 import pathlib
@@ -26,26 +33,36 @@ import sys
 
 THROUGHPUT = re.compile(r"PROBE throughput (\w+)\s.*\((\d+(?:\.\d+)?)% of vte\)")
 SCROLLBACK = re.compile(r"PROBE scrollback\s+(\d+) lines.*?\+\s*(\d+(?:\.\d+)?) MB once full")
+# `     107.1 ms  first frame presented`, as prof::mark writes it. CI log
+# lines carry a timestamp in front, so the match is not anchored there.
+STARTUP = re.compile(r"(\d+(?:\.\d+)?) ms  ([a-z][a-z ]*[a-z])\s*$", re.MULTILINE)
 
 
 def parse(text):
-    """{'throughput': {kind: best %}, 'scrollback': {lines: lowest MB}}"""
-    throughput, scrollback = {}, {}
+    """{'throughput': {kind: best %}, 'scrollback': {lines: lowest MB},
+    'startup': {mark: lowest ms}}"""
+    throughput, scrollback, startup = {}, {}, {}
     for kind, pct in THROUGHPUT.findall(text):
         throughput[kind] = max(float(pct), throughput.get(kind, 0.0))
     for lines, mb in SCROLLBACK.findall(text):
         scrollback[lines] = min(float(mb), scrollback.get(lines, float("inf")))
-    return {"throughput": throughput, "scrollback": scrollback}
+    for ms, mark in STARTUP.findall(text):
+        startup[mark] = min(float(ms), startup.get(mark, float("inf")))
+    return {"throughput": throughput, "scrollback": scrollback, "startup": startup}
 
 
 def compare(baseline, measured, tolerance):
-    """(failures, gains, rows). Higher is better for throughput, lower for memory."""
+    """(failures, gains, rows). Higher is better for throughput, lower for
+    memory and startup. `baseline["tolerances"]` overrides the tolerance per
+    group."""
     failures, gains, rows = [], [], []
     checks = (
-        ("throughput", "% of vte", True),
-        ("scrollback", "MB", False),
+        ("throughput", "% of vte", True, True),
+        ("scrollback", "MB", False, True),
+        ("startup", "ms", False, False),
     )
-    for group, unit, higher_is_better in checks:
+    for group, unit, higher_is_better, report_gains in checks:
+        group_tolerance = float(baseline.get("tolerances", {}).get(group, tolerance))
         for name, base in baseline.get(group, {}).items():
             got = measured.get(group, {}).get(name)
             label = f"{group} {name}"
@@ -55,13 +72,13 @@ def compare(baseline, measured, tolerance):
                 continue
             change = (got - base) / base if base else 0.0
             worse = -change if higher_is_better else change
-            if worse > tolerance:
+            if worse > group_tolerance:
                 verdict = "FAIL"
                 failures.append(
                     f"{label}: {got:g} {unit} against a baseline of {base:g} "
-                    f"({worse * 100:.0f}% worse, limit {tolerance * 100:.0f}%)"
+                    f"({worse * 100:.0f}% worse, limit {group_tolerance * 100:.0f}%)"
                 )
-            elif -worse > tolerance:
+            elif report_gains and -worse > group_tolerance:
                 verdict = "better"
                 gains.append(f"{label}: {got:g} {unit} against {base:g}; raise the baseline")
             else:
@@ -82,7 +99,10 @@ def main(argv):
     if len(argv) < 2:
         print(__doc__)
         return 2
-    measured = parse(pathlib.Path(argv[1]).read_text(encoding="utf-8", errors="replace"))
+    logs = [a for a in argv[1:] if not a.startswith("--")]
+    measured = parse(
+        "\n".join(pathlib.Path(a).read_text(encoding="utf-8", errors="replace") for a in logs)
+    )
     if "--print" in argv:
         print(json.dumps(measured, indent=2, sort_keys=True))
         return 0

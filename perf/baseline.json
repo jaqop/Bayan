@@ -1,5 +1,19 @@
 {
-  "tolerance": 0.10,
-  "throughput": { "ascii": 78, "sgr": 36, "arabic": 70 },
-  "scrollback": { "10000": 32.7, "100000": 302.0 }
+  "tolerance": 0.1,
+  "tolerances": {
+    "startup": 0.5
+  },
+  "throughput": {
+    "ascii": 78,
+    "sgr": 36,
+    "arabic": 70
+  },
+  "scrollback": {
+    "10000": 32.7,
+    "100000": 302.0
+  },
+  "startup": {
+    "first frame presented": 100,
+    "renderer ready": 135
+  }
 }
