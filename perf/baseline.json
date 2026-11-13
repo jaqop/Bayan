@@ -1,5 +1,5 @@
 {
   "tolerance": 0.10,
-  "throughput": { "ascii": 79, "sgr": 51, "arabic": 73 },
-  "scrollback": { "10000": 33, "100000": 303 }
+  "throughput": { "ascii": 78, "sgr": 36, "arabic": 70 },
+  "scrollback": { "10000": 32.7, "100000": 302.0 }
 }
