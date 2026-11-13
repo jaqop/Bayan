@@ -1209,7 +1209,7 @@ fn finish_attached(
 pub fn run_mux_server() -> Result<(), String> {
     // Unknown elevation is treated as elevated: a failed check must not
     // leave an admin server on a Medium-accessible pipe.
-    if !mux_may_run(true, is_elevated()) {
+    if !mux_may_run(true, crate::elevate::process_is_elevated()) {
         return Err("the mux server does not run in an elevated process".into());
     }
     #[cfg(windows)]
@@ -1222,23 +1222,12 @@ pub fn run_mux_server() -> Result<(), String> {
     }
 }
 
-/// Token elevation. A failed query counts as elevated so the mux stays off.
-pub fn is_elevated() -> bool {
-    #[cfg(windows)]
-    {
-        // the one token query in the tree; a failed query is elevated
-        crate::elevate::process_is_elevated()
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
-
 /// Dial the current user's pipe, starting the server process if it is down.
 /// `enabled` false does not dial and does not spawn (`Launch::None`).
 pub fn connect_or_spawn(enabled: bool) -> Result<MuxClient, String> {
-    if !mux_may_run(enabled, is_elevated()) || server_launch(enabled, false) == Launch::None {
+    if !mux_may_run(enabled, crate::elevate::process_is_elevated())
+        || server_launch(enabled, false) == Launch::None
+    {
         return Err("mux is disabled".into());
     }
     #[cfg(windows)]
@@ -2393,7 +2382,10 @@ mod os {
         #[test]
         #[ignore = "live ConPTY child and a standard Windows token; run explicitly with BAYAN_TEST_PYTHON and BAYAN_TEST_OUTPUT"]
         fn native_mux_survives_detach_and_reattach() {
-            assert!(!is_elevated(), "live mux must run under a standard token");
+            assert!(
+                !crate::elevate::process_is_elevated(),
+                "live mux must run under a standard token"
+            );
             assert!(MuxClient::dial().is_err(), "test pipe must be unused");
             std::thread::spawn(|| run().expect("live mux server"));
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
