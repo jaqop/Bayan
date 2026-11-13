@@ -102,8 +102,9 @@ pub struct ImageQuad<'a> {
 impl Gpu {
     pub fn new(window: Arc<Window>, width: u32, height: u32) -> Result<Self, String> {
         // DX12 first (native on Windows, fastest to initialize), GL as the
-        // fallback when DX12 cannot make a device. Vulkan is not a backend:
-        // that feature is off, so vulkan-1.dll is never opened.
+        // fallback when DX12 cannot make a device. This Windows build does
+        // not enable wgpu's vulkan feature, so vulkan-1.dll is not opened.
+        // Non-Windows targets enable it for a later Linux port.
         // wgpu 30 dropped Default for InstanceDescriptor (a display handle is
         // now an explicit choice); DX12/GL ignore it, so "without" is ours.
         //

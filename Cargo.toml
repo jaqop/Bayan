@@ -18,16 +18,9 @@ alacritty_terminal = "0.26.1-dev"
 portable-pty = "0.9"
 # windowing + GPU present + text shaping (HarfBuzz-class, BiDi, fallback)
 winit = "0.30"
-# Vulkan is off so vulkan-1.dll is never loaded. Metal and webgpu are not
-# this target. DX12 and GL stay: GL is the fallback when DX12 cannot make
-# a device, and both are pinned to System32 by dll_search.
-wgpu = { version = "30", default-features = false, features = [
-    "std",
-    "parking_lot",
-    "dx12",
-    "gles",
-    "wgsl",
-] }
+# wgpu is target-specific below. Listing it once and adding `vulkan` in a
+# second table merges the feature into every target, which would link
+# vulkan-1.dll into the Windows exe.
 pollster = "1"
 bytemuck = { version = "1", features = ["derive"] }
 cosmic-text = "0.19"
@@ -116,6 +109,30 @@ dev-hooks = []
 
 [target."cfg(windows)".build-dependencies]
 winresource = "0.1"
+
+# One table per target, not an extra feature on the shared dependency.
+# Windows: DX12 and GL only, so vulkan-1.dll is not linked. GL is the
+# fallback when DX12 cannot make a device; dll_search pins both to System32.
+# Other targets also enable Vulkan so a later Linux port can select it.
+# default-features stays off: the defaults include Metal and webgpu.
+[target.'cfg(windows)'.dependencies]
+wgpu = { version = "30", default-features = false, features = [
+    "std",
+    "parking_lot",
+    "dx12",
+    "gles",
+    "wgsl",
+] }
+
+[target.'cfg(not(windows))'.dependencies]
+wgpu = { version = "30", default-features = false, features = [
+    "std",
+    "parking_lot",
+    "dx12",
+    "gles",
+    "wgsl",
+    "vulkan",
+] }
 
 [profile.release]
 opt-level = 3

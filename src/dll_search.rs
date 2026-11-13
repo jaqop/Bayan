@@ -15,9 +15,10 @@
 //!   normal install, FXC still compiles the WGSL pipeline and the window
 //!   renders. Asking wgpu for dynamic DXC would not fall back if an old
 //!   DLL loaded but then refused to compile.
-//! - The Vulkan backend is not compiled in, so `vulkan-1.dll` is never
-//!   requested. OpenGL stays compiled, as the fallback when DX12 cannot
-//!   make a device.
+//! - The Windows build does not enable wgpu's `vulkan` feature, so
+//!   `vulkan-1.dll` is not linked. Non-Windows targets enable that feature
+//!   for a later Linux port; this process still does not request Vulkan.
+//!   OpenGL stays compiled, as the fallback when DX12 cannot make a device.
 //! - `SetDllDirectoryW("")` drops the current directory.
 //!   `SetDefaultDllDirectories` is called with
 //!   `LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_USER_DIRS`, not
