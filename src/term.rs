@@ -3991,6 +3991,7 @@ mod tests {
         assert!(meta.spawn_cwd().is_none());
     }
 
+    #[cfg(windows)]
     #[test]
     fn elevated_environment_removes_startup_code_even_with_nonunicode_values() {
         use std::os::windows::ffi::OsStringExt;
@@ -7524,6 +7525,7 @@ mod measure_probes {
             .collect()
     }
 
+    #[cfg(windows)]
     fn private_mb() -> f64 {
         use windows_sys::Win32::System::ProcessStatus::{
             GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
@@ -7688,6 +7690,7 @@ mod measure_probes {
 
     /// Private bytes after filling the scrollback, and again after the same
     /// amount once more: a bounded grid stops growing once it is full.
+    #[cfg(windows)]
     #[test]
     #[ignore]
     fn measure_scrollback_memory() {
