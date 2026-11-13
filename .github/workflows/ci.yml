@@ -85,14 +85,14 @@ jobs:
             target/debug/ConPTY-LICENSE.txt
             target/debug/build-identity.json
 
-  # A slower reader or a heavier scrollback fails the pull request. The
-  # probes are the ignored `measure_` tests in term.rs, in a release build;
-  # scripts/perf_gate.py compares them with perf/baseline.json. Throughput is
-  # gated as a share of the bare vte parser measured in the same run, so a
-  # slow runner does not fail it. Three runs, best of each. Startup is the
-  # time to the first frame and to a ready renderer, with a wide limit.
+  # A slower reader, a heavier scrollback, a slower key->frame path, or a
+  # heavier idle process fails the pull request. The reader probes are the
+  # ignored `measure_` tests in term.rs. Startup, latency, and idle share one
+  # `cargo build --release --features dev-hooks` binary. scripts/perf_gate.py
+  # compares them with perf/baseline.json. Throughput is a share of the bare
+  # vte parser measured in the same run, so a slow runner does not fail it.
   perf:
-    name: perf gate (reader, scrollback, startup)
+    name: perf gate (reader, scrollback, startup, latency, idle)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (v5.1.0)
@@ -126,12 +126,22 @@ jobs:
           cargo build --locked --release --features dev-hooks
           if ($LASTEXITCODE -ne 0) { throw 'Startup probe build failed' }
           ./scripts/measure-startup.ps1 -BinaryPath target/release/bayan.exe -OutputPath startup.log
+      # Same bayan.exe. BAYAN_TAP injects 50 keys; no second cargo build.
+      - name: Key-to-frame latency
+        shell: pwsh
+        run: |
+          ./scripts/measure-tap-latency.ps1 -BinaryPath target/release/bayan.exe -OutputPath latency.log
+      # Same bayan.exe. Quiet private memory, then the two 5s redraw windows.
+      - name: Idle memory and redraws
+        shell: pwsh
+        run: |
+          ./scripts/measure-idle.ps1 -BinaryPath target/release/bayan.exe -OutputPath idle.log
       - name: Gate
         shell: bash
         run: |
           set -euo pipefail
-          python scripts/perf_gate.py probe.log startup.log --print
-          python scripts/perf_gate.py probe.log startup.log | tee -a "$GITHUB_STEP_SUMMARY"
+          python scripts/perf_gate.py probe.log startup.log latency.log idle.log --print
+          python scripts/perf_gate.py probe.log startup.log latency.log idle.log | tee -a "$GITHUB_STEP_SUMMARY"
 
   # Enforces the rust-version declared in Cargo.toml. That floor is set by the
   # dependency graph (cosmic-text 0.19 wants 1.89), not by our own source, so

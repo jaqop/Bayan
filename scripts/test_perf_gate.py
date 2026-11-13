@@ -22,6 +22,14 @@ PROBE throughput ascii  64 MB: process_chunk   101.0 MB/s, vte alone   148.1 MB/
 PROBE scrollback  10000 lines x 120 cols: +  35.5 MB once full, +  35.5 MB after as much again (history 10000)
 """
 
+PROBES = """
+PROBE latency key->frame p50=10.0 p95=1000.0 n=50
+PROBE latency render p50=2.0 p95=4.0 n=50
+PROBE idle_memory private=10000.0 MB working_set=12000.0 MB
+PROBE idle_redraw visible presents=0 redraws=0 window_s=5
+PROBE idle_redraw minimized presents=0 redraws=0 window_s=5
+"""
+
 STARTUP = """
 --- startup run 1
       0.4 ms  main start
@@ -103,9 +111,55 @@ class Gate(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertIn("limit 50%", failures[0])
 
+    def test_new_probes_parse(self):
+        got = perf_gate.parse(PROBES)
+        self.assertEqual(got["latency"], {"key->frame p95": 1000.0})
+        self.assertEqual(got["latency_render"], {"p50": 2.0, "p95": 4.0})
+        self.assertEqual(got["idle_memory"], {"private": 10000.0})
+        self.assertEqual(got["idle_redraw"]["visible presents"], 0.0)
+        self.assertEqual(got["idle_redraw"]["minimized redraws"], 0.0)
+
+    def test_idle_redraw_zero_passes_and_one_fails(self):
+        base = {"idle_redraw": {"visible presents": 0, "visible redraws": 0}}
+        ok = {"idle_redraw": {"visible presents": 0.0, "visible redraws": 0.0}}
+        self.assertEqual(perf_gate.compare(base, ok, 0.10)[0], [])
+        bad = {"idle_redraw": {"visible presents": 1.0, "visible redraws": 0.0}}
+        failures, _, _ = perf_gate.compare(base, bad, 0.10)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("visible presents", failures[0])
+        self.assertIn("must be 0", failures[0])
+
+    def test_minimized_redraw_is_report_only_until_the_switch(self):
+        self.assertFalse(perf_gate.MINIMIZED_REDRAW_REQUIRED)
+        base = {"idle_redraw": {"minimized presents": 0, "minimized redraws": 0}}
+        noisy = {"idle_redraw": {"minimized presents": 4.0, "minimized redraws": 9.0}}
+        failures, notes, rows = perf_gate.compare(base, noisy, 0.10)
+        self.assertEqual(failures, [])
+        self.assertTrue(any("report-only" in note for note in notes))
+        self.assertTrue(all(row[-1] == "report-only" for row in rows))
+
+    def test_idle_memory_eleven_percent_fails_and_ten_percent_passes(self):
+        base = {"idle_memory": {"private": 100.0}}
+        self.assertEqual(perf_gate.compare(base, {"idle_memory": {"private": 110.0}}, 0.10)[0], [])
+        failures, _, _ = perf_gate.compare(base, {"idle_memory": {"private": 111.0}}, 0.10)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("idle_memory private", failures[0])
+
+    def test_latency_p95_over_the_ceiling_fails(self):
+        base = {"tolerances": {"latency": 1.0}, "latency": {"key->frame p95": 30}}
+        self.assertEqual(perf_gate.compare(base, {"latency": {"key->frame p95": 60.0}}, 0.10)[0], [])
+        failures, _, _ = perf_gate.compare(base, {"latency": {"key->frame p95": 60.1}}, 0.10)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("limit 100%", failures[0])
+
+    def test_a_short_latency_sample_is_not_a_pass(self):
+        bad = PROBES.replace("n=50", "n=39", 1)
+        with self.assertRaises(ValueError):
+            perf_gate.parse(bad)
+
 
 class CommandLineGate(unittest.TestCase):
-    def run_gate(self, baseline=None, log=LOG + STARTUP):
+    def run_gate(self, baseline=None, log=LOG + STARTUP + PROBES):
         if baseline is None:
             baseline = json.loads((pathlib.Path(__file__).resolve().parent.parent / "perf/baseline.json").read_text())
         with tempfile.TemporaryDirectory() as tmp:
@@ -125,7 +179,7 @@ class CommandLineGate(unittest.TestCase):
     def test_an_empty_or_missing_policy_group_never_passes(self):
         self.assertNotEqual(self.run_gate({}).returncode, 0)
         baseline = json.loads((pathlib.Path(__file__).resolve().parent.parent / "perf/baseline.json").read_text())
-        for group in ("throughput", "scrollback", "startup", "startup_ratio"):
+        for group in ("throughput", "scrollback", "startup", "startup_ratio", "latency", "idle_memory", "idle_redraw"):
             broken = copy.deepcopy(baseline)
             del broken[group]
             with self.subTest(group=group):
@@ -164,6 +218,23 @@ class CommandLineGate(unittest.TestCase):
         baseline = json.loads((pathlib.Path(__file__).resolve().parent.parent / "perf/baseline.json").read_text())
         baseline["tolerence"] = 0.01
         self.assertNotEqual(self.run_gate(baseline).returncode, 0)
+        baseline = json.loads((pathlib.Path(__file__).resolve().parent.parent / "perf/baseline.json").read_text())
+        baseline["latency_ceiling"] = 1
+        self.assertNotEqual(self.run_gate(baseline).returncode, 0)
+
+    def test_visible_redraw_of_one_fails_and_a_noisy_minimized_window_does_not(self):
+        visible = (LOG + STARTUP + PROBES).replace(
+            "idle_redraw visible presents=0 redraws=0",
+            "idle_redraw visible presents=1 redraws=0",
+        )
+        self.assertNotEqual(self.run_gate(log=visible).returncode, 0)
+        minimized = (LOG + STARTUP + PROBES).replace(
+            "idle_redraw minimized presents=0 redraws=0",
+            "idle_redraw minimized presents=4 redraws=9",
+        )
+        result = self.run_gate(log=minimized)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("report-only", result.stdout)
 
     def test_malformed_startup_number_cannot_be_read_as_a_numeric_suffix(self):
         bad = STARTUP.replace(" ms  ", "e2 ms  ")

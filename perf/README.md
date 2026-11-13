@@ -70,5 +70,34 @@ locally and on CI. Run it against a release build with `--features dev-hooks`.
 
 The hosted baseline is retained. Local hardware measurements are evidence,
 not a reason to relax hosted-runner thresholds. The startup ratio/backstops
-remain the documented partial coverage; this does not implement a universal
-10% cold-start limit or a key-to-frame latency gate.
+remain a wide net, not a universal 10% cold-start limit.
+
+## Latency, idle memory, idle redraw
+
+Same `bayan.exe` as the startup step (`cargo build --locked --release
+--features dev-hooks`). No second full build.
+
+| Probe | What it measures | Gate |
+|---|---|---|
+| `latency key->frame p95` | 50 keys via `BAYAN_TAP` (`a`, Backspace, 150 ms apart) through `type_key`. Not `BAYAN_TYPE` (that writes the PTY and skips `key_sent`) and not SendInput. | n < 40 fails. Lower is better. Tolerance is 100% over the slowest hosted p95, the same shape as startup, because WARP + ConPTY + cmd echo move together. |
+| `latency render` | per sample, key->frame minus key->pty-output. Printed so the spread is on the job log. | Not required. Add it with a tighter tolerance only when three hosted runs show it is stable. |
+| `idle_memory private` | `Get-Process` `PrivateMemorySize64` of the Bayan process, one quiet `cmd /d /q` tab, 5 s after the prompt settles. Working set is printed and not gated. cmd and ConPTY are not included. | Lower is better. Median of three hosted runs. 10% when the spread is narrow; wider when it is not, and the spread is recorded here. |
+| `idle_redraw visible` | blink off (`cursor_blink: false`), one quiet tab, 5 s. | presents and redraws must both be 0. |
+| `idle_redraw minimized` | `BAYAN_IDLE_BUSY=1` keeps a background tab busy; the script calls `ShowWindow(SW_MINIMIZE)`. | **Report-only.** `MINIMIZED_REDRAW_REQUIRED` in `scripts/perf_gate.py` is the one-line switch. A missing or malformed line still fails. Non-zero counts do not, until that flag is true. The 600 ms busy-dot pulse and wakeup/title/bell redraws while minimized are stopped by a separate change; this probe is ready for that change. |
+
+`BAYAN_FRAME_COUNTERS=1` (with `BAYAN_PROFILE`) writes
+`%TEMP%\bayan_frame_counters.txt` as `redraws=N presents=M` on each
+increment, replaced with `MoveFileExW` so a reader does not see a torn
+line. Redraws count at `redraw()` entry. Presents count only after
+`gpu.render` returns true (an occluded swapchain does not). The latency
+probe does not set `BAYAN_FRAME_COUNTERS`, so that file replace is not on
+the key->frame path.
+
+The latency and idle-memory ceilings below are **provisional wide
+backstops** so the first hosted runs can print real numbers. They are not
+a measured threshold. Replace them from three `windows-latest` runs before
+treating the gate as tight. Idle redraw's zero is the threshold itself,
+not a measured time.
+
+Scripts: `scripts/measure-tap-latency.ps1`, `scripts/measure-idle.ps1`.
+`scripts/measure-latency.ps1` stays the local SendInput tool.

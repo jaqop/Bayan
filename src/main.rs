@@ -98,6 +98,16 @@ type PaneSnap = (
 const BLINK_MS: u128 = 530;
 const BLINK_STOP: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// `BAYAN_TAP` waits this long after the last PTY read before the first key,
+/// so the prompt's own output is not paired with the sample.
+const TAP_QUIET: std::time::Duration = std::time::Duration::from_millis(500);
+/// Far enough apart that a key is not dropped as part of the previous
+/// sample's burst (`latency::STALE` is 1s; a gap under the echo time
+/// coalesces samples).
+const TAP_GAP: std::time::Duration = std::time::Duration::from_millis(150);
+/// How often the minimized-redraw probe pokes its background tab.
+const BUSY_PUMP: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// The shortcuts editor overlay's state.
 #[derive(Default)]
 struct ShortcutsState {
@@ -179,12 +189,19 @@ const QUAKE_ID: usize = 0xB1AA;
 /// logical character is "ب" — and it also covers the Windows quirk of Ctrl
 /// composing C0 control chars into the logical key (Ctrl+F = '\u{6}').
 fn key_letter(event: &KeyEvent) -> Option<char> {
-    if let winit::keyboard::PhysicalKey::Code(c) = event.physical_key {
+    key_letter_of(event.physical_key, &event.logical_key)
+}
+
+fn key_letter_of(
+    physical: winit::keyboard::PhysicalKey,
+    logical: &winit::keyboard::Key,
+) -> Option<char> {
+    if let winit::keyboard::PhysicalKey::Code(c) = physical {
         if let Some(l) = keys::pc101_unshifted(c).filter(char::is_ascii_lowercase) {
             return Some(l);
         }
     }
-    ctrl_letter(&event.logical_key)
+    ctrl_letter(logical)
 }
 
 /// The preset `dir` steps away from the nearest one at or above `cur`
@@ -535,6 +552,104 @@ mod prof {
             if let Some(summary) = l.summary() {
                 mark(&summary);
             }
+        }
+    }
+
+    /// `redraw()` was entered. The idle probe diffs this against `presents`:
+    /// a requested frame that the differential path or an occluded swapchain
+    /// drops still counts here.
+    pub fn note_redraw() {
+        note_frame(true);
+    }
+
+    /// `gpu.render` returned a real present (not Occluded / lost).
+    pub fn note_present() {
+        note_frame(false);
+    }
+
+    fn frame_counters() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            super::dev_hook("BAYAN_PROFILE").is_some()
+                && super::dev_hook("BAYAN_FRAME_COUNTERS").is_some()
+        })
+    }
+
+    fn note_frame(redraw: bool) {
+        if !frame_counters() {
+            return;
+        }
+        // One writer so the file is never a mix of two snapshots.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        static REDRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static PRESENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let (redraws, presents) = if redraw {
+            (
+                REDRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+                PRESENTS.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        } else {
+            (
+                REDRAWS.load(std::sync::atomic::Ordering::Relaxed),
+                PRESENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+            )
+        };
+        publish_frame_counters(redraws, presents);
+    }
+
+    pub(crate) fn frame_counter_line(redraws: u64, presents: u64) -> String {
+        format!("redraws={redraws} presents={presents}\n")
+    }
+
+    fn publish_frame_counters(redraws: u64, presents: u64) {
+        let dir = std::env::temp_dir();
+        let dest = dir.join("bayan_frame_counters.txt");
+        let tmp = dir.join("bayan_frame_counters.tmp");
+        if std::fs::write(&tmp, frame_counter_line(redraws, presents)).is_err() {
+            return;
+        }
+        replace_frame_counters(&tmp, &dest);
+    }
+
+    /// Replace `dest` with `from` in one directory operation so a reader
+    /// never observes a half-written line.
+    fn replace_frame_counters(from: &std::path::Path, to: &std::path::Path) {
+        use std::os::windows::ffi::OsStrExt;
+        let wide = |path: &std::path::Path| -> Vec<u16> {
+            path.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        };
+        let from_w = wide(from);
+        let to_w = wide(to);
+        // SAFETY: both buffers are NUL-terminated wide paths and live for
+        // the call. A zero return leaves `from` in place; the next publish
+        // overwrites that temp name.
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+                from_w.as_ptr(),
+                to_w.as_ptr(),
+                windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING
+                    | windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok == 0 {
+            let _ = std::fs::remove_file(from);
+        }
+    }
+
+    #[cfg(test)]
+    mod frame_counter_tests {
+        use super::frame_counter_line;
+
+        #[test]
+        fn the_counter_file_is_one_line() {
+            assert_eq!(frame_counter_line(0, 0), "redraws=0 presents=0\n");
+            assert_eq!(frame_counter_line(4, 1), "redraws=4 presents=1\n");
         }
     }
 
@@ -1761,6 +1876,72 @@ fn release_dropped_posh(
     again
 }
 
+/// Keys `BAYAN_TAP` still has to deliver. The first one waits until the
+/// prompt has been quiet; later ones are `TAP_GAP` apart so each echo is
+/// its own latency sample.
+struct TapPlan {
+    left: u32,
+    sent: u32,
+    /// Set once the quiet wait has elapsed. Output after this does not
+    /// push the first key back.
+    armed: bool,
+    next: Option<Instant>,
+}
+
+#[derive(Debug)]
+enum TapStep {
+    Wait(Instant),
+    Send {
+        backspace: bool,
+        wake: Option<Instant>,
+    },
+}
+
+impl TapPlan {
+    fn new(n: u32) -> Self {
+        Self {
+            left: n,
+            sent: 0,
+            armed: false,
+            next: None,
+        }
+    }
+
+    fn poll(&mut self, now: Instant, ready: bool, last_output: Option<Instant>) -> Option<TapStep> {
+        if self.left == 0 {
+            return None;
+        }
+        if !self.armed {
+            if !ready {
+                return None;
+            }
+            let since = last_output?;
+            let quiet_at = since + TAP_QUIET;
+            if now < quiet_at {
+                return Some(TapStep::Wait(quiet_at));
+            }
+            self.armed = true;
+            self.next = Some(now);
+        }
+        let due = self.next?;
+        if now < due {
+            return Some(TapStep::Wait(due));
+        }
+        let backspace = self.sent % 2 == 1;
+        self.sent += 1;
+        self.left -= 1;
+        let wake = if self.left > 0 {
+            let at = now + TAP_GAP;
+            self.next = Some(at);
+            Some(at)
+        } else {
+            self.next = None;
+            None
+        };
+        Some(TapStep::Send { backspace, wake })
+    }
+}
+
 struct App {
     /// the prompt picker, when open
     posh: Option<PoshPicker>,
@@ -1902,6 +2083,14 @@ struct App {
     /// BAYAN_PASTE's text, waiting for the first renderer: a right click
     /// needs cell metrics to land on a pane.
     debug_paste: Option<String>,
+    /// `BAYAN_TAP`: keys still to deliver through `type_key`.
+    tap: Option<TapPlan>,
+    /// Last PTY read on any pane. The tap waits for this to sit still.
+    last_pty: Option<Instant>,
+    /// `BAYAN_IDLE_BUSY`: a background tab is kept busy for the minimized probe.
+    idle_busy: bool,
+    /// When the next busy-tab pump is due.
+    busy_at: Option<Instant>,
     /// `--cwd`'s folder, already gated, until the first tab opens in it.
     /// `#45`: with saved tabs restored, they come back first and this folder
     /// opens as the active extra tab.
@@ -2152,6 +2341,10 @@ impl App {
             normal_geom: None,
             keys_held_away: Vec::new(),
             debug_paste: None,
+            tap: None,
+            last_pty: None,
+            idle_busy: false,
+            busy_at: None,
             start_dir,
             start_profile_command: None,
             start_maximized: false,
@@ -3767,6 +3960,59 @@ impl App {
         self.spawn_tab_command(cwd, &shell, None);
     }
 
+    /// Second tab, then back to the first so the new one is background.
+    /// The command matches `-- argv` when that is how this process started,
+    /// so the probe's `cmd /d /q` is the busy tab too.
+    fn arm_idle_busy(&mut self) {
+        if let Some(argv) = self.start_command.clone() {
+            let command = argv.join(" ");
+            self.spawn_tab_command(None, &command, Some(&argv));
+        } else {
+            self.spawn_tab(None);
+        }
+        if self.tabs.len() >= 2 {
+            self.switch_tab(0);
+        }
+        self.idle_busy = true;
+    }
+
+    /// Keep the background tab inside `Tab::busy`'s 2s window and push a
+    /// BEL plus a command, so wakeup and the bell path both stay live.
+    fn pump_idle_busy(&mut self) {
+        if !self.idle_busy || self.tabs.len() < 2 {
+            return;
+        }
+        let now = Instant::now();
+        if self.busy_at.is_some_and(|at| now < at) {
+            return;
+        }
+        self.busy_at = Some(now + BUSY_PUMP);
+        let Some(ti) = (0..self.tabs.len()).find(|&i| i != self.active) else {
+            return;
+        };
+        let Some(pane) = self.tabs[ti].panes.first_mut() else {
+            return;
+        };
+        pane.last_output = Some(now);
+        pane.session.write(b"\x07echo busy\r");
+    }
+
+    /// `(Some(backspace), wake)` when a key is due. `wake` is the next time
+    /// `about_to_wait` must run, whether or not a key was sent.
+    fn poll_tap(&mut self) -> (Option<bool>, Option<Instant>) {
+        let ready = self.renderer.is_some() && self.first_output;
+        let last = self.last_pty;
+        let now = Instant::now();
+        let Some(plan) = self.tap.as_mut() else {
+            return (None, None);
+        };
+        match plan.poll(now, ready, last) {
+            None => (None, None),
+            Some(TapStep::Wait(at)) => (None, Some(at)),
+            Some(TapStep::Send { backspace, wake }) => (Some(backspace), wake),
+        }
+    }
+
     fn spawn_tab_command(&mut self, cwd: Option<String>, command: &str, raw: Option<&[String]>) {
         self.spawn_tab_named(cwd, command, raw, None);
     }
@@ -4754,6 +5000,24 @@ impl App {
                 self.apply_theme(n);
             }
         }
+        // BAYAN_TAP=<n>: after the prompt is quiet, deliver n keys through
+        // type_key (a, Backspace, a, Backspace, …). This is the CI latency
+        // path. It does not write the PTY behind key_sent the way BAYAN_TYPE does.
+        if let Some(v) = dev_hook("BAYAN_TAP") {
+            match v
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|n| *n > 0)
+            {
+                Some(n) => self.tap = Some(TapPlan::new(n.min(200))),
+                None => eprintln!("bayan: BAYAN_TAP ignored (want a positive count)"),
+            }
+        }
+        // BAYAN_IDLE_BUSY=1: a second tab stays in the background and keeps
+        // producing output, so the minimized-redraw probe has a busy tab.
+        if dev_hook("BAYAN_IDLE_BUSY").is_some() {
+            self.arm_idle_busy();
+        }
         crate::prof::mark("session spawned");
         // the window exists now; if it is already focused and a pane has
         // 1004, say so. has_focus is the same check a later rebase uses.
@@ -4862,7 +5126,10 @@ impl App {
 
     /// `true` when this key's press never reached the PTY.
     fn take_held_away(&mut self, event: &KeyEvent) -> bool {
-        let key = event.physical_key;
+        self.take_held_away_key(event.physical_key)
+    }
+
+    fn take_held_away_key(&mut self, key: winit::keyboard::PhysicalKey) -> bool {
         if let Some(i) = self.keys_held_away.iter().position(|k| *k == key) {
             self.keys_held_away.swap_remove(i);
             true
@@ -4884,28 +5151,43 @@ impl App {
         released: bool,
         mode: TermMode,
     ) -> Option<Vec<u8>> {
-        use winit::keyboard::PhysicalKey;
         use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-        let m = self.modifiers;
         let unmod = event.key_without_modifiers();
-        let physical = match event.physical_key {
+        self.encode_routed(
+            &keyroute::RoutedKey::from_event(event, &unmod),
+            released,
+            mode,
+        )
+    }
+
+    /// `type_key` and `BAYAN_TAP` share this. The tap builds a `RoutedKey`
+    /// because winit 0.30 keeps `KeyEvent`'s platform fields private.
+    fn encode_routed(
+        &self,
+        key: &keyroute::RoutedKey<'_>,
+        released: bool,
+        mode: TermMode,
+    ) -> Option<Vec<u8>> {
+        use winit::keyboard::PhysicalKey;
+        let m = self.modifiers;
+        let physical = match key.physical {
             PhysicalKey::Code(code) => Some(code),
             _ => None,
         };
         keys::encode_input(&keys::EncodeInput {
-            key: &event.logical_key,
-            unmod: &unmod,
+            key: key.logical,
+            unmod: key.unmod,
             physical,
-            location: event.location,
-            text: event.text.as_deref(),
+            location: key.location,
+            text: key.text,
             shift: m.shift_key(),
             alt: m.alt_key(),
             ctrl: m.control_key(),
             super_key: m.super_key(),
-            repeat: event.repeat,
+            repeat: key.repeat,
             released,
             mode: keys::mode_for_keys(mode, self.config.kitty_protocol_on()),
-            physical_letter: key_letter(event),
+            physical_letter: key_letter_of(key.physical, key.logical),
             base_layout_fallback: self.config.kitty_base_layout_fallback_on(),
         })
     }
@@ -6781,6 +7063,7 @@ impl App {
     }
 
     fn redraw(&mut self) {
+        crate::prof::note_redraw();
         // Before a client, this is a flag check. After one, an unchanged
         // stamp does not walk the grid; a flood builds at about 10 Hz.
         self.publish_reader();
@@ -7339,6 +7622,7 @@ impl App {
             return;
         }
         crate::prof::frame_presented();
+        crate::prof::note_present();
         self.last_frame.clear();
         self.last_frame.extend_from_slice(frame_key);
         self.last_frame_size = Some(px);
@@ -7369,7 +7653,9 @@ impl App {
             crate::prof::mark("first pty output");
         }
         if let Some((ti, pi)) = self.find_pane(id) {
-            self.tabs[ti].panes[pi].last_output = Some(Instant::now());
+            let now = Instant::now();
+            self.tabs[ti].panes[pi].last_output = Some(now);
+            self.last_pty = Some(now);
             let (alt, following) = {
                 let t = self.tabs[ti].panes[pi].session.term.lock();
                 (
@@ -7378,7 +7664,6 @@ impl App {
                 )
             };
             let was_alt = self.alt_seen.insert(id, alt).unwrap_or(false);
-            let now = Instant::now();
             scroll::apply_alt_screen(&mut self.smooth, id, was_alt, alt);
             scroll::apply_output(&mut self.smooth, id, following, now);
             let ris = {
@@ -7840,6 +8125,17 @@ impl ApplicationHandler<UserEvent> for App {
         if A11Y_DIRTY.swap(false, std::sync::atomic::Ordering::Relaxed) {
             self.reload_a11y();
         }
+        // The minimized probe's background tab, then the latency tap.
+        // The pump refreshes last_output before the busy-dot check below.
+        self.pump_idle_busy();
+        let (tap_send, tap_wake) = self.poll_tap();
+        if let Some(backspace) = tap_send {
+            self.tap_key(backspace);
+            if self.tap.as_ref().is_some_and(|plan| plan.left == 0) {
+                crate::prof::mark("tap done");
+                self.tap = None;
+            }
+        }
         // busy dots decay after ~2s of quiet: keep repainting on a slow
         // heartbeat only while any background tab is (or just was) active
         let any_busy = self
@@ -7847,9 +8143,15 @@ impl ApplicationHandler<UserEvent> for App {
             .iter()
             .enumerate()
             .any(|(i, t)| t.busy(i == self.active));
-        let mut wake: Option<Instant> = None;
+        let mut wake: Option<Instant> = tap_wake;
+        if self.idle_busy
+            && let Some(at) = self.busy_at
+        {
+            wake = Some(wake.map_or(at, |w| w.min(at)));
+        }
         if any_busy {
-            wake = Some(Instant::now() + std::time::Duration::from_millis(600));
+            let at = Instant::now() + std::time::Duration::from_millis(600);
+            wake = Some(wake.map_or(at, |w| w.min(at)));
             self.request_redraw();
         }
         // cursor blink: wake exactly at the next phase flip (or the 15s
@@ -10876,5 +11178,62 @@ mod scroll_app_tests {
         let off = app.locate(app.cursor_pos).unwrap();
         assert_eq!(off.2, -1);
         assert_eq!(off.3, 0, "explicit BDSM stays on the grid column");
+    }
+}
+
+#[cfg(test)]
+mod tap_plan_tests {
+    use super::*;
+
+    #[test]
+    fn the_tap_waits_out_a_quiet_prompt_then_alternates() {
+        let t0 = Instant::now();
+        let mut plan = TapPlan::new(3);
+        assert!(
+            plan.poll(t0, false, Some(t0)).is_none(),
+            "renderer not ready"
+        );
+        match plan.poll(t0, true, Some(t0)).unwrap() {
+            TapStep::Wait(at) => assert_eq!(at, t0 + TAP_QUIET),
+            other => panic!("expected a quiet wait, got {other:?}"),
+        }
+        // a later chunk of the prompt starts the quiet window over
+        let later = t0 + std::time::Duration::from_millis(400);
+        match plan.poll(later, true, Some(later)).unwrap() {
+            TapStep::Wait(at) => assert_eq!(at, later + TAP_QUIET),
+            other => panic!("expected the quiet window to move, got {other:?}"),
+        }
+        let go = later + TAP_QUIET;
+        match plan.poll(go, true, Some(later)).unwrap() {
+            TapStep::Send { backspace, wake } => {
+                assert!(!backspace, "the first key is a");
+                assert_eq!(wake, Some(go + TAP_GAP));
+            }
+            other => panic!("expected the first key, got {other:?}"),
+        }
+        // inside the gap the next key is not sent yet
+        match plan
+            .poll(go + std::time::Duration::from_millis(10), true, Some(go))
+            .unwrap()
+        {
+            TapStep::Wait(at) => assert_eq!(at, go + TAP_GAP),
+            other => panic!("expected to wait out the gap, got {other:?}"),
+        }
+        match plan.poll(go + TAP_GAP, true, Some(go)).unwrap() {
+            TapStep::Send { backspace, wake } => {
+                assert!(backspace, "the second key is Backspace");
+                assert_eq!(wake, Some(go + TAP_GAP + TAP_GAP));
+            }
+            other => panic!("expected Backspace, got {other:?}"),
+        }
+        let third = go + TAP_GAP + TAP_GAP;
+        match plan.poll(third, true, Some(go)).unwrap() {
+            TapStep::Send { backspace, wake } => {
+                assert!(!backspace);
+                assert!(wake.is_none(), "the last key does not schedule another");
+            }
+            other => panic!("expected the last key, got {other:?}"),
+        }
+        assert!(plan.poll(third + TAP_GAP, true, Some(go)).is_none());
     }
 }
