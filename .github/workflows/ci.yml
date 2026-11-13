@@ -74,6 +74,63 @@ jobs:
             target/debug/ConPTY-LICENSE.txt
             target/debug/build-identity.json
 
+  # A slower reader or a heavier scrollback fails the pull request. The
+  # probes are the ignored `measure_` tests in term.rs, in a release build;
+  # scripts/perf_gate.py compares them with perf/baseline.json. Throughput is
+  # gated as a share of the bare vte parser measured in the same run, so a
+  # slow runner does not fail it. Three runs, best of each.
+  perf:
+    name: perf gate (reader, scrollback)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (v5.1.0)
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: release-probes
+      - name: The gate's own tests
+        run: python -m unittest scripts/test_perf_gate.py
+      - name: Build the probes
+        run: cargo test --locked --release --no-run
+      - name: Measure
+        shell: bash
+        run: |
+          for run in 1 2 3; do
+            cargo test --locked --release -- --ignored measure_reader_throughput --nocapture --test-threads=1 2>&1 | tee -a probe.log
+            cargo test --locked --release -- --ignored measure_scrollback_memory --nocapture --test-threads=1 2>&1 | tee -a probe.log
+          done
+      - name: Gate
+        shell: bash
+        run: |
+          python scripts/perf_gate.py probe.log --print
+          python scripts/perf_gate.py probe.log | tee -a "$GITHUB_STEP_SUMMARY"
+      # Report only, for now: can a hosted runner open the window at all,
+      # and how steady are the startup marks? Five cold starts with
+      # BAYAN_PROFILE, each killed after its first frame has had time to
+      # land. Nothing here fails the job until the spread is known.
+      - name: Startup marks (report only)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          cargo build --locked --release --features dev-hooks
+          $home_dir = Join-Path $env:RUNNER_TEMP 'bayan-home'
+          New-Item -ItemType Directory -Force -Path $home_dir | Out-Null
+          $env:USERPROFILE = $home_dir
+          $env:BAYAN_PROFILE = '1'
+          $env:BAYAN_SHOW_NOW = '1'
+          $log = Join-Path $env:TEMP 'bayan_profile.log'
+          foreach ($run in 1..5) {
+            $p = Start-Process -FilePath target/release/bayan.exe -PassThru
+            Start-Sleep -Seconds 12
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force } else { "run ${run}: exited with $($p.ExitCode)" }
+            "--- startup run $run"
+            if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log | Where-Object { $_ -notmatch ' key ' } } else { 'no profile log' }
+          }
+
   # Enforces the rust-version declared in Cargo.toml. That floor is set by the
   # dependency graph (cosmic-text 0.19 wants 1.89), not by our own source, so
   # without this job the declaration is a comment nobody checks.

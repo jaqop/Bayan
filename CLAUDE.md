@@ -75,6 +75,15 @@ Measure before optimizing, in release builds:
   `BAYAN_PROFILE` latency lines. It covers winit's key event to the PTY echo
   and to the GPU submit; the OS input queue and the display are outside it.
 
+CI gates two of these on every pull request (the `perf` job):
+`process_chunk` as a share of vte per corpus, and private megabytes once
+the scrollback is full. `scripts/perf_gate.py` compares the probes'
+`PROBE` lines with `perf/baseline.json` and fails on anything more than
+10% worse. The baseline is the hosted runner's own figures, not the
+author's machine. When a change makes a figure 10% better the job says
+so: raise the baseline in the same pull request, or the gain can be given
+back unnoticed. Key-to-frame latency is not gated; it needs typed input.
+
 Figures from 2026-11-10 on the author's machine (22bc5d6 + this harness):
 `process_chunk` 83 / 49 / 100 MB/s for plain / SGR / Arabic, which is 57 / 27 /
 48% of vte alone; scrollback +33 MB at 10k lines and +303 MB at 100k, flat after
