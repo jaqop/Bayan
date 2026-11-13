@@ -86,20 +86,20 @@ Measure before optimizing, in release builds:
   The minimized window is report-only until `MINIMIZED_REDRAW_REQUIRED`
   in `scripts/perf_gate.py` is flipped.
 
-CI gates two of these on every pull request (the `perf` job):
-`process_chunk` as a share of vte per corpus, and private megabytes once
-the scrollback is full. `scripts/perf_gate.py` compares the probes'
-`PROBE` lines with `perf/baseline.json` and fails on anything more than
-10% worse. The baseline is the hosted runner's own figures, not the
-author's machine. When a change makes a figure 10% better the job says
-so: raise the baseline in the same pull request, or the gain can be given
-back unnoticed. The job also starts a release build five times with
-`BAYAN_PROFILE`. Hosted runners differ by almost 2x on the same code, so
-milliseconds are only a backstop (twice the slowest job seen); the real
-check is `first frame presented` over `gpu ready` within one start, which
-held at 1.07 to 1.09 everywhere and fails above 1.24 (`perf/README.md`
-has the figures). Key-to-frame latency is not gated; it
-needs typed input.
+CI gates these on every pull request (the `perf` job).
+`scripts/perf_gate.py` compares the probes' `PROBE` lines with
+`perf/baseline.json`. The baseline is the hosted runner's own figures,
+not the author's machine. Reader throughput is a share of vte per corpus,
+and scrollback is private megabytes once full; both fail more than 10%
+worse, and a 10% improvement is reported so the baseline can be raised.
+Startup milliseconds are a backstop at twice the slowest job seen. The
+tighter check is `first frame presented` over `gpu ready` within one
+start, which held at 1.07 to 1.09 and fails above 1.24. Key-to-frame p95
+is gated too, from `BAYAN_TAP` (not SendInput): baseline 155 ms, fail
+above 310 ms, and fewer than 40 samples fails. Idle private memory fails
+above 320.4 MB. A visible idle window must present and redraw zero times.
+The minimized window is measured and report-only until
+`MINIMIZED_REDRAW_REQUIRED` is set. `perf/README.md` has the hosted runs.
 
 Figures from 2026-11-10 on the author's machine (22bc5d6 + this harness):
 `process_chunk` 83 / 49 / 100 MB/s for plain / SGR / Arabic, which is 57 / 27 /

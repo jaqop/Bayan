@@ -116,9 +116,12 @@ Three complete `windows-latest` runs of the same probe code (runs
   Working set was 124.8, 125.1, 124.9 and is not gated.
 - **Visible redraw** was 0 presents and 0 redraws on all three.
 - **Minimized redraw** was 0 presents (the swapchain is occluded) and
-  733, 643, 822 redraws. Report-only until `MINIMIZED_REDRAW_REQUIRED`.
-  The redraws are the 600 ms busy-dot pulse still entering `redraw()`
-  while the window is minimized.
+  733, 643, and 822 redraws. Report-only until `MINIMIZED_REDRAW_REQUIRED`.
+  A 600 ms pulse would be about eight entries in five seconds. The count
+  is ~150/s because `about_to_wait` calls `request_redraw` on every wait
+  while a background tab is busy, and that redraw wakes the loop again,
+  minimized or not. The confirmation run read 846 redraws in the same
+  window.
 
 Scripts: `scripts/measure-tap-latency.ps1`, `scripts/measure-idle.ps1`.
 `scripts/measure-latency.ps1` stays the local SendInput tool.
