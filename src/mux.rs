@@ -2114,6 +2114,173 @@ mod os {
         }
     }
 
+    #[cfg(test)]
+    mod live_tests {
+        use super::*;
+
+        #[test]
+        #[ignore = "live ConPTY child and a standard Windows token; run explicitly with BAYAN_TEST_PYTHON and BAYAN_TEST_OUTPUT"]
+        fn native_mux_survives_detach_and_reattach() {
+            assert!(!is_elevated(), "live mux must run under a standard token");
+            assert!(MuxClient::dial().is_err(), "test pipe must be unused");
+            std::thread::spawn(|| run().expect("live mux server"));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let client = loop {
+                if let Ok(client) = MuxClient::dial() {
+                    break client;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "server did not listen"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            let root = std::path::PathBuf::from(
+                std::env::var_os("BAYAN_TEST_OUTPUT").expect("output directory"),
+            );
+            std::fs::create_dir_all(&root).unwrap();
+            for name in [
+                "counter.json",
+                "counter.tmp",
+                "pty-output.log",
+                "result.json",
+            ] {
+                let path = root.join(name);
+                if path.exists() {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+            let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            let attached = client
+                .spawn(SpawnSpec {
+                    title: "Bayan live mux fixture".into(),
+                    cwd: manifest.display().to_string(),
+                    program: std::env::var("BAYAN_TEST_PYTHON").expect("Python interpreter"),
+                    args: vec![
+                        "-u".into(),
+                        manifest
+                            .join("tests/fixtures/mux_live_counter.py")
+                            .display()
+                            .to_string(),
+                        root.display().to_string(),
+                        manifest
+                            .join("tests/fixtures/mixed-arabic-english.txt")
+                            .display()
+                            .to_string(),
+                    ],
+                    cols: 100,
+                    rows: 30,
+                })
+                .expect("spawn through real mux");
+            let id = attached.id;
+            struct Cleanup(MuxClient, u64);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    self.0.kill_remote(self.1);
+                }
+            }
+            let _cleanup = Cleanup(client.clone(), id);
+            let (output, chunks) = mpsc::channel();
+            let mut reader = attached.reader;
+            let output_log = root.join("pty-output.log");
+            std::thread::spawn(move || {
+                let mut buf = [0; 8192];
+                while let Ok(n) = reader.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&output_log)
+                    {
+                        let _ = file.write_all(&buf[..n]);
+                    }
+                    if output.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            });
+            let mut writer = attached.writer;
+            let mut bytes = Vec::new();
+            // Inbox ConPTY asks the terminal for its initial cursor. A real
+            // Bayan window answers this through its VT parser; this headless
+            // client supplies that same report before the child can start.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut cursor_reported = false;
+            while !root.join("counter.json").exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "ConPTY child did not start"
+                );
+                if let Ok(chunk) = chunks.recv_timeout(std::time::Duration::from_millis(100)) {
+                    bytes.extend(chunk);
+                    if !cursor_reported && bytes.windows(4).any(|p| p == b"\x1b[6n") {
+                        writer.write_all(b"\x1b[1;1R").unwrap();
+                        cursor_reported = true;
+                    }
+                }
+            }
+            writer.write_all(b"MUX-INPUT-ONE\r").unwrap();
+            let read_state = || -> serde_json::Value {
+                serde_json::from_slice(&std::fs::read(root.join("counter.json")).unwrap()).unwrap()
+            };
+            let wait = |label: &str, ready: &dyn Fn() -> bool| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !ready() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "live mux condition timed out: {label}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                }
+            };
+            wait("counter starts", &|| root.join("counter.json").exists());
+            wait("first input reaches child", &|| {
+                read_state()["echo"] == "MUX-INPUT-ONE"
+            });
+            let before = read_state();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !String::from_utf8_lossy(&bytes).contains("انتهى التقرير") {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "mixed corpus never reached client"
+                );
+                bytes.extend(
+                    chunks
+                        .recv_timeout(std::time::Duration::from_millis(500))
+                        .expect("mux output"),
+                );
+            }
+            attached.armed.store(false, Ordering::SeqCst);
+            client.detach(id).unwrap();
+            wait("counter advances detached", &|| {
+                read_state()["tick"].as_u64().unwrap() > before["tick"].as_u64().unwrap() + 2
+            });
+            assert!(client.list().unwrap().iter().any(|s| s.id == id));
+            let second = MuxClient::dial().unwrap();
+            let mut resumed = second.reattach(id).unwrap();
+            (resumed.on_resize)(83, 23);
+            resumed.writer.write_all(b"MUX-INPUT-TWO\r").unwrap();
+            wait("reattach input and resize", &|| {
+                read_state()["echo"] == "MUX-INPUT-TWO" && read_state()["cols"] == 83
+            });
+            let after = read_state();
+            assert_eq!(before["pid"], after["pid"]);
+            assert_eq!(after["rows"], 23);
+            resumed.armed.store(false, Ordering::SeqCst);
+            second.kill_remote(id);
+            let result = serde_json::json!({"before": before, "after": after, "same_process": true,
+                "mixed_corpus_received": true, "detached_listed": true, "resized": true});
+            std::fs::write(
+                root.join("result.json"),
+                serde_json::to_vec_pretty(&result).unwrap(),
+            )
+            .unwrap();
+            println!("{result}");
+        }
+    }
+
     fn production_pipe_name() -> Result<String, String> {
         let sid = current_user_sid()?;
         let mut wide_ptr = std::ptr::null_mut();
@@ -2135,7 +2302,11 @@ mod os {
         if sddl_for_sid(&text).is_err() {
             return Err("token sid did not render as S-1-…".into());
         }
-        Ok(format!(r"\\.\pipe\bayan-mux-{text}"))
+        let name = format!(r"\\.\pipe\bayan-mux-{text}");
+        // Tests must never dial a real user's per-account mux server.
+        #[cfg(test)]
+        let name = format!("{name}-test-{}", std::process::id());
+        Ok(name)
     }
 
     fn create_named_pipe(
