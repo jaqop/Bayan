@@ -360,6 +360,9 @@ pub struct SessionMeta {
     /// File links resolve through `link::cwd_hook` on this field. There is
     /// no second source.
     pub cwd: Option<String>,
+    /// Verified directory used at local spawn, retained for shells that do
+    /// not report OSC cwd. This is not a shell-originated cwd report.
+    pub initial_cwd: Option<String>,
     /// BDSM (implicit/explicit) and SCP paragraph direction for this pane.
     /// An `Arc` so a frame can snapshot it without cloning the stamp list.
     /// The reader thread uses [`Self::bidi_mut`], which copies only when a
@@ -442,8 +445,10 @@ impl SessionMeta {
     /// directory falls through to the launcher directory.
     pub fn spawn_cwd(&self) -> Option<String> {
         self.reported_cwd()
-            .and_then(accept_local_cwd)
-            .filter(|p| usable_spawn_dir(p))
+            .into_iter()
+            .chain(self.initial_cwd.as_deref())
+            .filter_map(accept_local_cwd)
+            .find(|p| usable_spawn_dir(p))
     }
 
     /// Replace this pane's image budget. Used by tests that share one
@@ -3124,7 +3129,7 @@ impl Session {
             .filter(|d| usable_spawn_dir(d))
             .or_else(launcher_dir)
             .or_else(|| std::env::var("USERPROFILE").ok());
-        if let Some(d) = dir {
+        if let Some(d) = &dir {
             cmd.cwd(d);
         }
         // A raw command is the program the user named. The PowerShell,
@@ -3187,7 +3192,7 @@ impl Session {
         let writer = pair.master.take_writer()?;
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
-        Self::from_parts(SessionArgs {
+        let session = Self::from_parts(SessionArgs {
             size,
             proxy,
             id,
@@ -3205,7 +3210,9 @@ impl Session {
                 on_resize: None,
                 on_kill: None,
             },
-        })
+        })?;
+        session.meta.lock_or_recover().initial_cwd = dir;
+        Ok(session)
     }
 
     /// A pane fed by `io` instead of a ConPTY this process opened. Local
@@ -3959,6 +3966,30 @@ pub fn regex_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_directory_falls_back_without_faking_a_shell_report() {
+        let start = std::env::temp_dir()
+            .to_string_lossy()
+            .trim_end_matches('\\')
+            .to_string();
+        let reported = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut meta = SessionMeta {
+            initial_cwd: Some(start.clone()),
+            ..SessionMeta::default()
+        };
+        assert!(meta.reported_cwd().is_none());
+        assert_eq!(meta.spawn_cwd(), Some(start.clone()));
+        meta.cwd = Some(reported.clone());
+        assert_eq!(meta.spawn_cwd(), Some(reported));
+        meta.cwd = Some(r"\\server\share".into());
+        assert_eq!(meta.spawn_cwd(), Some(start));
+        meta.initial_cwd = Some(r"\\server\share".into());
+        assert!(meta.spawn_cwd().is_none());
+    }
 
     #[test]
     fn elevated_environment_removes_startup_code_even_with_nonunicode_values() {

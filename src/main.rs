@@ -298,8 +298,8 @@ fn search_tail(status: SearchStatus) -> String {
         SearchStatus::Counted(c) => {
             let plus = if c.capped { "+" } else { "" };
             match c.at {
-                Some(at) => format!("  {at}/{}{plus}", c.total),
-                None => format!("  {}{plus}", c.total),
+                Some(at) => format!("  \u{2066}{at}/{}{plus}\u{2069}", c.total),
+                None => format!("  \u{2066}{}{plus}\u{2069}", c.total),
             }
         }
     }
@@ -9669,8 +9669,8 @@ mod tests {
         let c = |at, total, capped| SearchStatus::Counted(SearchCount { at, total, capped });
         lang::set(lang::Lang::En); // thread-local under cfg(test)
         assert_eq!(search_tail(SearchStatus::Idle), "");
-        assert_eq!(search_tail(c(Some(2), 17, false)), "  2/17");
-        assert_eq!(search_tail(c(None, 1000, true)), "  1000+");
+        assert_eq!(search_tail(c(Some(2), 17, false)), "  \u{2066}2/17\u{2069}");
+        assert_eq!(search_tail(c(None, 1000, true)), "  \u{2066}1000+\u{2069}");
         assert_eq!(search_tail(c(None, 0, false)), "  no matches");
         assert_eq!(search_tail(SearchStatus::BadPattern), "  invalid pattern");
         lang::set(lang::Lang::Ar);

@@ -11337,6 +11337,33 @@ mod cache_tests {
     /// The top-right bar draws for any text, and widens for a text longer
     /// than its 34-cell floor instead of letting it run out of the box.
     #[test]
+    fn arabic_search_bar_keeps_the_count_plus_after_its_digits() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let tail = crate::search_tail(crate::SearchStatus::Counted(crate::SearchCount {
+            at: None,
+            total: 1000,
+            capped: true,
+        }));
+        let text = format!("بحث: HISTORY-OLD-_{tail}");
+        r.draw_chrome(&mut Vec::new(), 1600, 600, &[], Some(&text), false, None);
+        let run = r
+            .cache_hot
+            .iter()
+            .find(|(key, _)| key.0.iter().any(|seg| seg.text == text))
+            .map(|(_, run)| run)
+            .expect("actual chrome run");
+        let x = |byte| {
+            run.buffer
+                .layout_runs()
+                .flat_map(|line| line.glyphs.iter())
+                .find(|g| g.start <= byte && byte < g.end)
+                .unwrap()
+                .x
+        };
+        assert!(x(text.find("1000").unwrap()) < x(text.rfind('+').unwrap()));
+    }
+
+    #[test]
     fn the_bar_draws_and_holds_its_text() {
         let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
         let by = r.tab_bar_h().round() + 6.0;
