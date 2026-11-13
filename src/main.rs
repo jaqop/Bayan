@@ -104,11 +104,12 @@ const BUSY_PULSE: std::time::Duration = std::time::Duration::from_millis(600);
 
 /// What a paint request is allowed to do.
 ///
-/// `Redraw` calls into winit. `Defer` remembers that a frame is owed and
-/// does not: a minimized, hidden, or occluded window must not enter
-/// `redraw` (that entry is what the idle perf gate counts). `Skip` is a
-/// background tab's grid while the window is up — the bytes are already
-/// applied, and the busy-dot pulse paints the tab bar.
+/// `Redraw` calls into winit. `Defer` does not: a minimized, hidden, or
+/// occluded window must not enter `redraw` (that entry is what the idle
+/// perf gate counts). The restore path asks again when the window becomes
+/// visible; nothing is stored here. `Skip` is a background tab's grid while
+/// the window is up — the bytes are already applied, and the busy-dot pulse
+/// paints the tab bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PaintGate {
     Redraw,
@@ -1944,8 +1945,6 @@ struct App {
     /// The startup window is created hidden and is not this: the first
     /// frame still has to paint.
     hidden: std::cell::Cell<bool>,
-    /// A paint was skipped while the window was not showing.
-    frame_dirty: std::cell::Cell<bool>,
     /// the settings panel (Ctrl+,) with its selected row, when open
     settings: Option<usize>,
     /// window focus (finish notifications only fire when nobody's looking)
@@ -2235,7 +2234,6 @@ impl App {
             occluded: std::cell::Cell::new(false),
             minimized: std::cell::Cell::new(false),
             hidden: std::cell::Cell::new(false),
-            frame_dirty: std::cell::Cell::new(false),
             settings: None,
             focused: false,
             clicks: ClickTracker::new(),
@@ -2297,23 +2295,20 @@ impl App {
         }
     }
 
-    /// Ask winit for one frame, or remember it.
+    /// Ask winit for one frame.
     ///
     /// Every paint goes through here (heal retries included). A window that
     /// is occluded, minimized, or hidden does not get `Window::request_redraw`
-    /// and does not enter `redraw`: the frame is marked dirty and drawn
-    /// once when the window is showing again. PTY reads, bells, and titles
-    /// keep updating; only the paint is held.
+    /// and does not enter `redraw`. The grid, the bell, and the title are
+    /// already updated by the caller. Showing the window again is what
+    /// asks for the frame: `set_occluded(false)`, a non-zero resize, and
+    /// `reveal_window` each call this once they are showing.
     fn request_redraw(&self) {
-        match gate_paint(self.shown(), true) {
-            PaintGate::Redraw => {
-                self.frame_dirty.set(false);
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
-            }
-            PaintGate::Defer => self.frame_dirty.set(true),
-            PaintGate::Skip => {}
+        if !matches!(gate_paint(self.shown(), true), PaintGate::Redraw) {
+            return;
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
         }
     }
 
@@ -7631,10 +7626,10 @@ impl App {
         match gate_paint(self.shown(), on_screen) {
             PaintGate::Redraw => self.request_redraw(),
             PaintGate::Defer => {
-                self.frame_dirty.set(true);
                 // The active tab is what the screen reader speaks. Publish
                 // without entering `redraw`, so a hidden window still
-                // announces and a minimized one does not present.
+                // announces and a minimized one does not present. The
+                // restore path paints when the window is showing again.
                 if on_screen {
                     self.publish_reader();
                 }
@@ -7851,7 +7846,8 @@ impl ApplicationHandler<UserEvent> for App {
                     let background = ti != self.active;
                     if background {
                         self.tabs[ti].attention = true;
-                        // Hidden/minimized/occluded: dirty only, no redraw.
+                        // Hidden/minimized/occluded: no winit redraw. The
+                        // attention flag above is what restore will draw.
                         self.request_redraw();
                     }
                     // sound only when you could have missed it: another tab,
@@ -8216,10 +8212,9 @@ impl ApplicationHandler<UserEvent> for App {
             // idle perf gate counts entries to `redraw`; an OS paint of a
             // minimized window has to miss that function entirely.
             WindowEvent::RedrawRequested => {
+                // Drop the OS paint while hidden. Restore asks again.
                 if self.shown() {
                     self.redraw();
-                } else {
-                    self.frame_dirty.set(true);
                 }
             }
             WindowEvent::ThemeChanged(theme) => {
@@ -8961,7 +8956,7 @@ mod tests {
         assert_eq!(super::gate_paint(true, false), PaintGate::Skip);
 
         // A burst of PTY, bell, and title events while minimized must not
-        // enter redraw. The dirty bit is what the restore paints.
+        // enter redraw. Restore is `became_shown`, not a stored dirty bit.
         let mut redraws = 0u32;
         let mut dirty = false;
         for on_screen in [true, false, true] {
