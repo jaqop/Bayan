@@ -8144,9 +8144,10 @@ impl ApplicationHandler<UserEvent> for App {
             .enumerate()
             .any(|(i, t)| t.busy(i == self.active));
         let mut wake: Option<Instant> = tap_wake;
-        if self.idle_busy
-            && let Some(at) = self.busy_at
-        {
+        // A plain if, not a let-chain: edition 2021, and 1.89 still rejects
+        // `&& let` (rustfmt on later stable only accepts it in edition 2024).
+        let pump_at = if self.idle_busy { self.busy_at } else { None };
+        if let Some(at) = pump_at {
             wake = Some(wake.map_or(at, |w| w.min(at)));
         }
         if any_busy {
