@@ -207,6 +207,21 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn probe_deadline_terminates_a_grandchild_that_keeps_stdout_open() {
+        const FIXTURE_PID: &str = "BAYAN_TEST_PROBE_CHILD_PID";
+        // Re-enter only this test in a fresh process. Its child inherits the
+        // actual stdout pipe; no PowerShell startup competes with the deadline.
+        if let Some(path) = std::env::var_os(FIXTURE_PID) {
+            #[expect(
+                clippy::zombie_processes,
+                reason = "this Windows fixture must exit before its child; the probe job owns cleanup"
+            )]
+            let child = Command::new("cmd.exe")
+                .args(["/c", "ping", "-n", "30", "127.0.0.1"])
+                .spawn()
+                .expect("spawn the fixture child");
+            std::fs::write(path, child.id().to_string()).expect("record the fixture child");
+            return;
+        }
         use windows_sys::Win32::Foundation::{
             CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0,
         };
@@ -220,12 +235,13 @@ mod tests {
             .as_nanos();
         let path =
             std::env::temp_dir().join(format!("bayan-probe-{}-{stamp}.pid", std::process::id()));
-        let script = format!(
-            "$p=Start-Process powershell.exe -NoNewWindow -PassThru -ArgumentList '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 30'; [IO.File]::WriteAllText('{}',[string]$p.Id)",
-            path.to_string_lossy().replace('\'', "''")
-        );
-        let mut cmd = Command::new("powershell.exe");
-        cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+        let mut cmd = Command::new(std::env::current_exe().expect("test executable"));
+        cmd.args([
+            "--exact",
+            "process::tests::probe_deadline_terminates_a_grandchild_that_keeps_stdout_open",
+            "--nocapture",
+        ])
+        .env(FIXTURE_PID, &path);
         let started = std::time::Instant::now();
         let result = run_with_timeout(cmd, Duration::from_secs(3));
         let pid: u32 = std::fs::read_to_string(&path)
