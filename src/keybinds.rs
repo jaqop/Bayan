@@ -38,10 +38,15 @@ pub enum Action {
     PrevGroup,
     CopyMode,
     CopyClean,
+    Fullscreen,
+    ClearScrollback,
+    ResetTerminal,
+    NewWindow,
+    DuplicateTab,
 }
 
 impl Action {
-    pub const ALL: [Action; 25] = [
+    pub const ALL: [Action; 30] = [
         Action::NewTab,
         Action::ClosePane,
         Action::Search,
@@ -67,6 +72,11 @@ impl Action {
         Action::PrevGroup,
         Action::CopyMode,
         Action::CopyClean,
+        Action::Fullscreen,
+        Action::ClearScrollback,
+        Action::ResetTerminal,
+        Action::NewWindow,
+        Action::DuplicateTab,
     ];
 
     /// The config.json key.
@@ -97,6 +107,11 @@ impl Action {
             Action::PrevGroup => "prev-group",
             Action::CopyMode => "copy-mode",
             Action::CopyClean => "copy-clean",
+            Action::Fullscreen => "fullscreen",
+            Action::ClearScrollback => "clear-scrollback",
+            Action::ResetTerminal => "reset-terminal",
+            Action::NewWindow => "new-window",
+            Action::DuplicateTab => "duplicate-tab",
         }
     }
 
@@ -145,6 +160,13 @@ impl Action {
             Action::ExportHistory => {
                 crate::lang::pick(lang, "تصدير سجل اللوحة", "Export pane history")
             }
+            Action::Fullscreen => crate::lang::pick(lang, "ملء الشاشة", "Full screen"),
+            Action::ClearScrollback => crate::lang::pick(lang, "مسح السجل", "Clear scrollback"),
+            Action::ResetTerminal => {
+                crate::lang::pick(lang, "إعادة ضبط أوضاع الطرفية", "Reset terminal modes")
+            }
+            Action::NewWindow => crate::lang::pick(lang, "نافذة جديدة", "New window"),
+            Action::DuplicateTab => crate::lang::pick(lang, "تكرار التبويب", "Duplicate tab"),
         }
     }
 
@@ -196,6 +218,16 @@ impl Action {
             Action::ExportHistory => c(true, true, Letter('s')),
             // Y for yank, cleaned. X is copy mode.
             Action::CopyClean => c(true, true, Letter('y')),
+            // Bare F11, the key every terminal and browser uses. A program
+            // that wants F11 itself needs this rebound.
+            Action::Fullscreen => c(false, false, F(11)),
+            // H for history, J beside it for the mode reset, N for a
+            // window (Windows Terminal's chord), T beside Ctrl+T for the
+            // same tab again.
+            Action::ClearScrollback => c(true, true, Letter('h')),
+            Action::ResetTerminal => c(true, true, Letter('j')),
+            Action::NewWindow => c(true, true, Letter('n')),
+            Action::DuplicateTab => c(true, true, Letter('t')),
         }
     }
 }

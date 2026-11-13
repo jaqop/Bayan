@@ -1228,11 +1228,70 @@ next. An invalid expression clears the highlight. Pasting into either
 search field uses Ctrl+V and never sends the query to the shell. Queries
 are limited to 4096 characters.
 
+After Enter the bar shows where the hit sits among all hits, top of the
+scrollback first: `2/17`, `لا نتائج`, or `تعبير غير صالح` for a regular
+expression that does not compile. The count walks the scrollback under the
+terminal lock, so it stops at 1000 and shows `1000+`. It runs on Enter,
+not on each keystroke, and editing the query clears it. Proven on a real
+`Term`: `a.b` counts 1 as literal and 2 as a regex, the position follows
+the current hit, an unclosed group is reported, and a screen of
+one-character hits stops at the cap.
+
 `Ctrl+Shift+S` exports the focused pane's retained scrollback and screen
 to a new UTF-8 file in `~/.bayan/exports/`. The notice shows its path.
 It preserves logical Arabic and soft-wrapped lines without moving the
 viewport or changing the selection. It contains text, not ANSI sequences
 or images. Export is explicit; this is not automatic disk session logging.
+
+### Full screen, clear, reset, new window, duplicate tab
+
+Five more actions, each with a row in the shortcuts editor, a line in the
+command palette and a `keybinds` key:
+
+| Action | Default | `keybinds` key |
+|---|---|---|
+| Full screen | F11 | `fullscreen` |
+| Clear scrollback | Ctrl+Shift+H | `clear-scrollback` |
+| Reset terminal modes | Ctrl+Shift+J | `reset-terminal` |
+| New window | Ctrl+Shift+N | `new-window` |
+| Duplicate tab | Ctrl+Shift+T | `duplicate-tab` |
+
+- **Full screen** is winit's borderless mode on the monitor the window is
+  on. The saved window rectangle ignores it, the way it ignores maximized,
+  and the resize edges are off. F11 no longer reaches the program; a
+  program that wants it needs the action rebound.
+- **Clear scrollback** feeds `ESC [ 3 J` to the pane's own parser through
+  the reader's counted feed, so the dropped lines count as evicted and
+  OSC 133 marks and images keep their rows. The screen stays. On the
+  alternate screen it does nothing: that screen has no history.
+- **Reset terminal modes** is deliberately not RIS (`ESC c`). ConPTY keeps
+  its own copy of the screen and of the color state and sends only what
+  changed, so a view cleared or recolored behind its back stays wrong
+  until the program repaints. The reset sends what a program should have
+  sent on exit: cursor shown, mouse tracking and focus reports off, cursor
+  keys and keypad normal, bracketed paste off, an open synchronized update
+  closed, and the kitty keyboard stack popped (Ctrl+Shift+K's job, still
+  there on its own). It does not fix colors or a wrong character set;
+  those live in ConPTY.
+- **New window** starts a second Bayan process with `--new-window`, the
+  jump list's launch. An elevated window starts its child with
+  `--elevated` and nothing else. There is still one window per process.
+- **Duplicate tab** opens a tab with the focused pane's own command line
+  (the one a restored session starts it with) in that pane's folder. A
+  pane that lives in the mux server gets an ordinary new tab instead.
+
+With 30 actions the shortcuts editor takes its two columns in a 900px
+window as well as the default one.
+
+Proven by tests: clearing drops the history, keeps the screen text and
+cursor, and a prompt mark made before it still names its row; the mode
+reset turns each leftover mode off and leaves the text, the cursor
+position and the color; the new-window argv parses as a plain or an
+elevated launch with no folder or command. Not run here: any of it on a
+live window. Full screen in particular (the custom chrome and the layered
+window under borderless full screen) has only been type-checked. Tests ran
+as `x86_64-pc-windows-gnu` under wine on Linux, where the same 13 tests
+that need a real Windows fail on `main` too.
 
 Assign persistent colors by exact tab name (Ctrl+Shift+R renames a tab),
 SSH title, or folder title in config.json:
@@ -1564,7 +1623,9 @@ in that folder; a relative one is taken from the current folder. It goes through
 the same gate as every start folder, and a UNC path, a mapped network drive or a
 missing folder stops Bayan with an error instead of opening somewhere else. With
 `restore_tabs` on, the saved tabs come back and the folder opens as the active
-extra tab. `-p <name>` (or `--profile`) starts that tab in a detected shell
+extra tab. `-M` (or `--maximized`) opens the window maximized whatever state
+was saved; the saved rectangle is kept for "restore down". `--elevated` refuses
+it, like every argument other than `-p`. `-p <name>` (or `--profile`) starts that tab in a detected shell
 profile, by its name or its command (`PowerShell`, `PowerShell سريع`,
 `cmd.exe`). `-- <command>...` runs that program in the tab instead.
 `--help` and `--version` print and exit. An unknown argument is an error.

@@ -33,7 +33,7 @@ selection and BiDi paths must do.
 | `localpath.rs` | no-follow walk: is a drive path local in every component, links read but not followed (link probe, new-tab cwd) |
 | `mru.rs` | most-recently-used tab order for Ctrl+Tab, walkable within one group |
 | `shells.rs` | installed-shell detection (ported from EasyTer's `profiles.py`) |
-| `cli.rs` | argv: `#45`'s `-d`/`--cwd`, plus profile, `--` command, `--elevated`, handoff, help, version |
+| `cli.rs` | argv: `#45`'s `-d`/`--cwd`, plus profile, `--` command, `--maximized`, `--elevated`, handoff, help, version |
 | `context_menu.rs` | per-user Explorer "Open Bayan here" (HKCU only, behind `RegistryStore`) |
 | `elevate.rs` | `--elevated` → `ShellExecuteW` verb `runas` only; argv is `--elevated` and optional `-p <name>` |
 | `jumplist.rs` | taskbar Jump List (`ICustomDestinationList`) and the explicit AppUserModelID |
@@ -57,6 +57,7 @@ selection and BiDi paths must do.
 Test counts come from `cargo test -- --list` and the CI test summary, not
 manual totals in this file. Explicit native host probes and measurement
 probes are ignored by the default suite; see their annotations and Measuring.
+
 
 
 
