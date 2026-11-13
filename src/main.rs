@@ -199,15 +199,81 @@ fn ctrl_letter(key: &Key) -> Option<char> {
     None
 }
 
-/// The literal-text search core, GUI-free so a real Term can exercise it in
-/// tests: step past the current hit, search in `dir`, wrap from the far end.
+/// What the search bar hands the matcher: the query as a regular expression
+/// when regex mode is on, otherwise escaped so every character is literal.
+fn search_pattern(query: &str, regex: bool) -> String {
+    if regex {
+        query.to_string()
+    } else {
+        term::regex_escape(query)
+    }
+}
+
+/// Hits are counted up to this many; past it the bar shows `1000+`. The
+/// walk holds the terminal lock, so it must end on a full scrollback of
+/// one-character hits.
+const SEARCH_COUNT_CAP: usize = 1000;
+
+/// Where the current hit sits among all hits, top of the scrollback first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SearchCount {
+    /// 1-based position of the current hit. `None` when there is no current
+    /// hit or it lies past the cap.
+    at: Option<usize>,
+    total: usize,
+    /// The walk stopped at `SEARCH_COUNT_CAP`; `total` is a floor.
+    capped: bool,
+}
+
+/// Count the hits of `pattern` (already a regex) over the whole scrollback.
+/// `None` is a pattern that does not compile.
+fn count_matches<T>(
+    t: &alacritty_terminal::term::Term<T>,
+    pattern: &str,
+    hl: &Option<Match>,
+) -> Option<SearchCount> {
+    use alacritty_terminal::term::search::RegexIter;
+    let mut rs = RegexSearch::new(pattern).ok()?;
+    let start = Point::new(Line(-(t.grid().history_size() as i32)), Column(0));
+    let end = Point::new(
+        Line(t.screen_lines() as i32 - 1),
+        Column(t.columns().saturating_sub(1)),
+    );
+    let mut count = SearchCount {
+        at: None,
+        total: 0,
+        capped: false,
+    };
+    let mut last: Option<Point> = None;
+    for m in RegexIter::new(start, end, Direction::Right, t, &mut rs) {
+        // the iterator steps with wrapping arithmetic: a start that does
+        // not advance means it came back around
+        if last.is_some_and(|p| *m.start() <= p) {
+            break;
+        }
+        if count.total == SEARCH_COUNT_CAP {
+            count.capped = true;
+            break;
+        }
+        last = Some(*m.start());
+        count.total += 1;
+        if hl.as_ref().is_some_and(|h| h.start() == m.start()) {
+            count.at = Some(count.total);
+        }
+    }
+    Some(count)
+}
+
+/// The search core, GUI-free so a real Term can exercise it in tests: step
+/// past the current hit, search in `dir`, wrap from the far end. `pattern`
+/// comes from [`search_pattern`].
 fn find_match<T: alacritty_terminal::event::EventListener>(
     t: &mut alacritty_terminal::term::Term<T>,
-    query: &str,
+    pattern: &str,
     hl: &Option<Match>,
     dir: Direction,
 ) -> Option<Match> {
-    let Ok(mut rs) = RegexSearch::new(&term::regex_escape(query)) else {
+    let Ok(mut rs) = RegexSearch::new(pattern) else {
         return None;
     };
     let cols = t.columns();
@@ -691,11 +757,36 @@ fn tab_label(base: &str, broadcast: bool, hidden: usize) -> String {
 
 /// The top-right bar: the search query while searching (search owns the
 /// keys then, even in copy mode), else the copy-mode hint, else nothing.
-fn bar_text(search: Option<&str>, copy_mode: bool) -> Option<String> {
+fn bar_text(search: Option<&SearchState>, copy_mode: bool) -> Option<String> {
     match search {
-        Some(q) => Some(format!("{}: {q}_", tr("بحث", "Search"))),
+        Some(st) => Some(search_bar_text(&st.query, st.regex, st.status)),
         None => copy_mode.then(|| copymode::hint().to_string()),
     }
+}
+
+/// `بحث: needle_  2/17`. Regex mode is named in the label so the bar says
+/// why `.` matched everything; the count appears after the first Enter.
+fn search_bar_text(query: &str, regex: bool, status: SearchStatus) -> String {
+    let label = if regex {
+        tr("بحث (regex)", "Search (regex)")
+    } else {
+        tr("بحث", "Search")
+    };
+    let tail = match status {
+        SearchStatus::Idle => String::new(),
+        SearchStatus::BadPattern => format!("  {}", tr("تعبير غير صالح", "invalid pattern")),
+        SearchStatus::Counted(c) if c.total == 0 => {
+            format!("  {}", tr("لا نتائج", "no matches"))
+        }
+        SearchStatus::Counted(c) => {
+            let plus = if c.capped { "+" } else { "" };
+            match c.at {
+                Some(at) => format!("  {at}/{}{plus}", c.total),
+                None => format!("  {}{plus}", c.total),
+            }
+        }
+    };
+    format!("{label}: {query}_{tail}")
 }
 
 /// Which panes besides the focused one hear typed input. Broadcast with a
@@ -1002,9 +1093,40 @@ struct SearchState {
     /// A seeded selection searches the exact source cells while the field
     /// shows readable logical Arabic. Editing returns to ordinary search.
     selected_needle: Option<String>,
+    /// Alt+R: the query is a regular expression, not literal text.
+    regex: bool,
+    /// Filled by the last Enter; typing clears it.
+    status: SearchStatus,
+}
+
+/// What the bar shows after the query.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum SearchStatus {
+    /// Nothing searched yet for this query.
+    #[default]
+    Idle,
+    Counted(SearchCount),
+    /// Regex mode and the query does not compile.
+    BadPattern,
 }
 
 impl SearchState {
+    /// The query changed: the old hit and its count no longer describe it.
+    fn edited(&mut self) {
+        self.hl = None;
+        self.selected_needle = None;
+        self.status = SearchStatus::Idle;
+    }
+
+    /// The pattern for the matcher. A seeded selection stays literal even
+    /// in regex mode: it is the exact cells, not something the user typed.
+    fn pattern(&self) -> String {
+        match &self.selected_needle {
+            Some(needle) => search_pattern(needle, false),
+            None => search_pattern(&self.query, self.regex),
+        }
+    }
+
     fn from_selection(text: Option<&str>, claude: bool) -> Self {
         let query = selection_search_query(text, claude);
         let selected_needle = (!query.is_empty()).then(|| text.unwrap_or_default().to_string());
@@ -1012,6 +1134,8 @@ impl SearchState {
             query,
             hl: None,
             selected_needle,
+            regex: false,
+            status: SearchStatus::Idle,
         }
     }
 }
@@ -1786,6 +1910,8 @@ struct App {
     /// Resolved `-p` command line for that same tab. `None` keeps the
     /// configured shell. Ignored when `start_command` is set.
     start_profile_command: Option<String>,
+    /// `--maximized`: the first window opens maximized over any saved size.
+    start_maximized: bool,
     /// argv after `--`. When set, that program is the tab's process.
     start_command: Option<Vec<String>>,
     /// This process token is elevated. Session restore and `config.shell`
@@ -2000,6 +2126,7 @@ impl App {
             debug_paste: None,
             start_dir,
             start_profile_command: None,
+            start_maximized: false,
             start_command: None,
             elevated: false,
             #[cfg(test)]
@@ -6317,19 +6444,17 @@ impl App {
     /// Find the next search hit. Enter walks UP from the bottom (the match
     /// you can see is the one you want), Shift+Enter walks back down.
     fn search_step(&mut self, dir: Direction) {
-        let query = match &self.search {
-            Some(st) if !st.query.is_empty() => {
-                st.selected_needle.as_ref().unwrap_or(&st.query).clone()
-            }
+        let pattern = match &self.search {
+            Some(st) if !st.query.is_empty() => st.pattern(),
             _ => return,
         };
         let Some(session) = self.session() else {
             return;
         };
-        let found = {
+        let (found, status) = {
             let mut t = session.term.lock();
             let hl = self.search.as_ref().and_then(|s| s.hl.clone());
-            let m = find_match(&mut t, &query, &hl, dir);
+            let m = find_match(&mut t, &pattern, &hl, dir);
             if let Some(m) = &m {
                 // bring the hit into view, roughly centered
                 let cur = t.grid().display_offset() as i32;
@@ -6337,20 +6462,42 @@ impl App {
                     .clamp(0, t.grid().history_size() as i32);
                 t.scroll_display(Scroll::Delta(want - cur));
             }
-            m
+            // count against the hit just found, so the bar reads 2/17
+            let status = match count_matches(&t, &pattern, &m.clone().or(hl)) {
+                Some(c) => SearchStatus::Counted(c),
+                None => SearchStatus::BadPattern,
+            };
+            (m, status)
         };
         if let Some(id) = self.focused_pane_id() {
             self.drop_smooth(id);
         }
         self.invalidate_focused_links();
-        if let (Some(st), Some(m)) = (self.search.as_mut(), found) {
-            st.hl = Some(m);
+        if let Some(st) = self.search.as_mut() {
+            st.status = status;
+            if let Some(m) = found {
+                st.hl = Some(m);
+            }
         }
         self.request_redraw();
     }
 
     /// Keyboard handling while the search bar is open.
     fn search_input(&mut self, event: &KeyEvent, shift: bool) {
+        // Alt+R by PHYSICAL key (it types "ق" on the Arabic layout) flips
+        // regex mode. The query stays; its hit and count are stale.
+        if self.modifiers.alt_key()
+            && !self.modifiers.control_key()
+            && event.physical_key
+                == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyR)
+        {
+            if let Some(st) = self.search.as_mut() {
+                st.regex = !st.regex;
+                st.edited();
+            }
+            self.request_redraw();
+            return;
+        }
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => {
                 self.search = None;
@@ -6366,8 +6513,7 @@ impl App {
             Key::Named(NamedKey::Backspace) => {
                 if let Some(st) = self.search.as_mut() {
                     st.query.pop();
-                    st.hl = None;
-                    st.selected_needle = None;
+                    st.edited();
                 }
             }
             _ => {
@@ -6387,8 +6533,7 @@ impl App {
         for ch in t.chars() {
             if !ch.is_control() {
                 st.query.push(ch);
-                st.hl = None;
-                st.selected_needle = None;
+                st.edited();
             }
         }
     }
@@ -6693,8 +6838,7 @@ impl App {
                     px.width as usize,
                     px.height as usize,
                     &tab_infos,
-                    bar_text(self.search.as_ref().map(|s| s.query.as_str()), focused_copy)
-                        .as_deref(),
+                    bar_text(self.search.as_ref(), focused_copy).as_deref(),
                     focused_claude,
                     elevate::title_badge(self.elevated),
                 );
@@ -7034,6 +7178,11 @@ impl ApplicationHandler<UserEvent> for App {
                     ..g
                 });
             }
+        }
+        // `--maximized` wins over the saved state. `normal_geom` above is
+        // untouched, so "restore down" still lands on yesterday's rectangle.
+        if self.start_maximized {
+            attrs = attrs.with_maximized(true);
         }
         let window = match el.create_window(attrs) {
             Ok(window) => Arc::new(window),
@@ -7680,6 +7829,7 @@ struct Startup {
     /// detect a second time.
     shells: Option<Vec<shells::Shell>>,
     elevated: bool,
+    maximized: bool,
 }
 
 fn main() -> std::process::ExitCode {
@@ -7797,6 +7947,7 @@ fn dispatch() -> Result<(), String> {
                 command: if elevated { None } else { launch.command },
                 shells,
                 elevated,
+                maximized: launch.maximized,
             })
         }
     }
@@ -7941,6 +8092,7 @@ fn run(startup: Startup) -> Result<(), String> {
     app.shell_profiles = startup.shells.unwrap_or_default();
     app.shell_profiles_ready = shells_ready;
     app.start_profile_command = startup.profile_command;
+    app.start_maximized = startup.maximized;
     app.start_command = startup.command;
     app.elevated = startup.elevated;
     // App::new starts neutral so a test never reads the machine's High
@@ -9144,22 +9296,115 @@ mod tests {
         }
 
         // Enter: nearest match above the bottom = "needle two" (row 2)
-        let m1 = find_match(&mut t, "needle", &None, Direction::Left).expect("first match");
+        let lit = |q: &str| search_pattern(q, false);
+        let m1 = find_match(&mut t, &lit("needle"), &None, Direction::Left).expect("first match");
         assert_eq!(m1.start().line.0, 2);
         // Enter again: steps up to "needle one" (row 0)
-        let m2 =
-            find_match(&mut t, "needle", &Some(m1.clone()), Direction::Left).expect("second match");
+        let m2 = find_match(&mut t, &lit("needle"), &Some(m1.clone()), Direction::Left)
+            .expect("second match");
         assert_eq!(m2.start().line.0, 0);
         // Enter once more: wraps around back to row 2
-        let m3 = find_match(&mut t, "needle", &Some(m2.clone()), Direction::Left)
+        let m3 = find_match(&mut t, &lit("needle"), &Some(m2.clone()), Direction::Left)
             .expect("wrapped match");
         assert_eq!(m3.start().line.0, 2);
         // Shift+Enter from the first hit walks back down
-        let m4 = find_match(&mut t, "needle", &Some(m2), Direction::Right).expect("forward match");
+        let m4 =
+            find_match(&mut t, &lit("needle"), &Some(m2), Direction::Right).expect("forward match");
         assert_eq!(m4.start().line.0, 2);
         // no hits -> None, and a regex-special query is treated literally
-        assert!(find_match(&mut t, "absent", &None, Direction::Left).is_none());
-        assert!(find_match(&mut t, "needle (", &None, Direction::Left).is_none());
+        assert!(find_match(&mut t, &lit("absent"), &None, Direction::Left).is_none());
+        assert!(find_match(&mut t, &lit("needle ("), &None, Direction::Left).is_none());
+
+        // the bar's count: two hits, and the position follows the hit
+        let count = |hl: &Option<Match>| count_matches(&t, &lit("needle"), hl).unwrap();
+        assert_eq!(count(&None).total, 2);
+        assert_eq!(count(&None).at, None);
+        assert_eq!(count(&Some(m1)).at, Some(2), "the lower hit is 2/2");
+        assert_eq!(count(&Some(m4.clone())).at, Some(2));
+        assert_eq!(count_matches(&t, &lit("absent"), &None).unwrap().total, 0);
+    }
+
+    /// Alt+R: the same query means a pattern, and a broken one is reported
+    /// instead of silently finding nothing.
+    #[test]
+    fn regex_search_matches_patterns_and_reports_a_bad_one() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let size = TermSize { cols: 40, rows: 6 };
+        let mut t = Term::new(Config::default(), &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        for line in ["error 404 here", "ok", "error 500 there", "a.b", "axb"] {
+            p.advance(&mut t, line.as_bytes());
+            p.advance(&mut t, b"\r\n");
+        }
+
+        let re = search_pattern("error [0-9]+", true);
+        let m = find_match(&mut t, &re, &None, Direction::Left).expect("regex hit");
+        assert_eq!(m.start().line.0, 2);
+        assert_eq!((m.start().column.0, m.end().column.0), (0, 8));
+        let c = count_matches(&t, &re, &Some(m)).unwrap();
+        assert_eq!((c.at, c.total, c.capped), (Some(2), 2, false));
+
+        // the same text is one literal hit and two regex hits
+        assert_eq!(
+            count_matches(&t, &search_pattern("a.b", false), &None)
+                .unwrap()
+                .total,
+            1
+        );
+        assert_eq!(
+            count_matches(&t, &search_pattern("a.b", true), &None)
+                .unwrap()
+                .total,
+            2
+        );
+
+        // an unclosed group: no hit, and the count says why
+        let bad = search_pattern("error (", true);
+        assert!(find_match(&mut t, &bad, &None, Direction::Left).is_none());
+        assert!(count_matches(&t, &bad, &None).is_none());
+    }
+
+    /// A screen of one-character hits stops at the cap and says so.
+    #[test]
+    fn the_hit_count_stops_at_the_cap() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let size = TermSize { cols: 80, rows: 30 };
+        let mut t = Term::new(Config::default(), &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        for _ in 0..29 {
+            p.advance(&mut t, "x ".repeat(39).as_bytes());
+            p.advance(&mut t, b"\r\n");
+        }
+        let c = count_matches(&t, "x", &None).unwrap();
+        assert_eq!((c.total, c.capped), (SEARCH_COUNT_CAP, true));
+        let few = count_matches(&t, "x x x x x x x x x x x x x x x x x x x x x x", &None).unwrap();
+        assert!(!few.capped && few.total > 0);
+    }
+
+    #[test]
+    fn the_search_bar_names_the_mode_and_the_count() {
+        let c = |at, total, capped| SearchStatus::Counted(SearchCount { at, total, capped });
+        lang::set(lang::Lang::En); // thread-local under cfg(test)
+        let en = search_bar_text;
+        assert_eq!(en("x", false, SearchStatus::Idle), "Search: x_");
+        assert_eq!(en("x", false, c(Some(2), 17, false)), "Search: x_  2/17");
+        assert_eq!(en("x", false, c(None, 1000, true)), "Search: x_  1000+");
+        assert_eq!(en("x", false, c(None, 0, false)), "Search: x_  no matches");
+        assert_eq!(
+            en("a(", true, SearchStatus::BadPattern),
+            "Search (regex): a(_  invalid pattern"
+        );
+        lang::set(lang::Lang::Ar);
+        assert_eq!(
+            search_bar_text("س", true, c(Some(1), 3, false)),
+            "بحث (regex): س_  1/3"
+        );
     }
 
     /// A background tab's shell exiting must not move focus to a different

@@ -1447,7 +1447,9 @@ in that folder; a relative one is taken from the current folder. It goes through
 the same gate as every start folder, and a UNC path, a mapped network drive or a
 missing folder stops Bayan with an error instead of opening somewhere else. With
 `restore_tabs` on, the saved tabs come back and the folder opens as the active
-extra tab. `-p <name>` (or `--profile`) starts that tab in a detected shell
+extra tab. `-M` (or `--maximized`) opens the window maximized whatever state
+was saved; the saved rectangle is kept for "restore down". `--elevated` refuses
+it, like every argument other than `-p`. `-p <name>` (or `--profile`) starts that tab in a detected shell
 profile, by its name or its command (`PowerShell`, `PowerShell سريع`,
 `cmd.exe`). `-- <command>...` runs that program in the tab instead.
 `--help` and `--version` print and exit. An unknown argument is an error.
@@ -1556,6 +1558,21 @@ Ctrl+Shift+Minus remains available to the running program for undo.
 including Arabic selected inside Claude. Opening it keeps the viewport where
 it is; press Enter to search or Esc to close. Multiline or large selections
 start with an empty search field.
+
+**Alt+R** in the search bar switches the query between literal text and a
+regular expression (alacritty's regex-automata syntax); the label reads
+`بحث (regex)` while it is on. The key is matched by position, so it is the
+same key on the Arabic layout. A seeded selection stays literal in either
+mode. After Enter the bar shows where the hit sits among all hits, top of
+the scrollback first: `2/17`, `لا نتائج`, or `تعبير غير صالح` for a
+pattern that does not compile. The count walks the scrollback under the
+terminal lock, so it stops at 1000 and shows `1000+`. It runs on Enter, not
+on each keystroke. Proven on a real `Term`: literal and regex counts of the
+same text differ (`a.b` is 1 and 2), an unclosed group is reported, and a
+screen of one-character hits stops at the cap. Not run here: the bar on a
+live window — this change was type-checked and tested as
+`x86_64-pc-windows-gnu` under wine on Linux, where the same 13 tests that
+need a real Windows (fonts, child processes, DACLs) fail before and after.
 
 ```
 cargo run --release
