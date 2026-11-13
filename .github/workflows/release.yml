@@ -1,0 +1,59 @@
+name: Release
+
+# A pushed v* tag builds the Windows x64 release zip and attaches it to a
+# DRAFT GitHub release. Nothing is public until someone presses Publish.
+# Windows only for the same reason as ci.yml: the tree does not compile
+# elsewhere yet.
+on:
+  push:
+    tags: ["v*"]
+
+# Default nothing; the one job below asks for what it needs.
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: release zip (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    # contents: write is needed to create the draft release, and only here.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (v5.1.0)
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      # No rust-cache here: a release build should not reuse a cache that
+      # other branches' runs could have written.
+      - name: Check tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ("v$version" -ne $env:GITHUB_REF_NAME) { throw "Tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version" }
+      - name: Build
+        run: cargo build --locked --release
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "bayan-$($env:GITHUB_REF_NAME.TrimStart('v'))-x86_64-pc-windows-msvc"
+          $dir = "dist/$name"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item target/release/bayan.exe, LICENSE, NOTICE, README.md -Destination $dir
+          Copy-Item fonts/OFL.txt, fonts/OFL-KawkabMono.txt -Destination $dir
+          # The pinned, hash- and signature-checked Microsoft console host pair.
+          ./scripts/install-conpty.ps1 -OutputDirectory $dir
+          Compress-Archive -Path $dir -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $name.zip" | Set-Content "dist/$name.zip.sha256" -Encoding ascii -NoNewline
+      - name: Draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --draft --verify-tag --title "Bayan $env:GITHUB_REF_NAME" --generate-notes (Get-ChildItem dist/*.zip, dist/*.sha256).FullName
+          if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
