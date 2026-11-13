@@ -642,17 +642,6 @@ mod prof {
         }
     }
 
-    #[cfg(test)]
-    mod frame_counter_tests {
-        use super::frame_counter_line;
-
-        #[test]
-        fn the_counter_file_is_one_line() {
-            assert_eq!(frame_counter_line(0, 0), "redraws=0 presents=0\n");
-            assert_eq!(frame_counter_line(4, 1), "redraws=4 presents=1\n");
-        }
-    }
-
     pub fn mark(label: &str) {
         if !on() {
             return;
@@ -669,6 +658,17 @@ mod prof {
             .open(std::env::temp_dir().join("bayan_profile.log"))
         {
             let _ = f.write_all(line.as_bytes());
+        }
+    }
+
+    #[cfg(test)]
+    mod frame_counter_tests {
+        use super::frame_counter_line;
+
+        #[test]
+        fn the_counter_file_is_one_line() {
+            assert_eq!(frame_counter_line(0, 0), "redraws=0 presents=0\n");
+            assert_eq!(frame_counter_line(4, 1), "redraws=4 presents=1\n");
         }
     }
 }
