@@ -174,12 +174,16 @@ impl Drop for JobGuard {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::*;
+    #[cfg(windows)]
     use std::process::Command;
+    #[cfg(windows)]
     use std::time::Duration;
 
     /// TYPE writes the file verbatim without a PowerShell/.NET startup
     /// competing with the probe's deadline on a busy CI worker.
+    #[cfg(windows)]
     fn output_fixture(bytes: usize) -> Option<std::process::Output> {
         use std::os::windows::process::CommandExt;
         let stamp = std::time::SystemTime::now()
@@ -198,6 +202,7 @@ mod tests {
         output
     }
 
+    #[cfg(windows)]
     #[test]
     fn probe_preserves_the_output_limit_and_the_child_exit_status() {
         let output = output_fixture(MAX_PROBE_OUTPUT_BYTES).expect("bounded output is allowed");
@@ -206,6 +211,7 @@ mod tests {
         assert_eq!(output.status.code(), Some(7));
     }
 
+    #[cfg(windows)]
     #[test]
     fn probe_rejects_output_larger_than_one_mebibyte() {
         assert!(output_fixture(MAX_PROBE_OUTPUT_BYTES + 1).is_none());

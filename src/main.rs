@@ -6,6 +6,9 @@
 
 // release builds are pure GUI apps: no companion console window
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Off Windows the Win32 call graph is cfg'd out, so the items it was the
+// only caller of look unused. They are live on the Windows build.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 mod a11y;
 mod bidi;
@@ -17,6 +20,22 @@ mod config_watch;
 mod context_menu;
 mod copyclean;
 mod copymode;
+#[cfg(windows)]
+mod dll_search;
+#[cfg(not(windows))]
+mod dll_search {
+    /// Windows selects FXC. There is no other variant on this target.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Dx12ShaderCompiler {
+        Fxc,
+    }
+
+    pub(crate) fn dx12_shader_compiler() -> Dx12ShaderCompiler {
+        Dx12ShaderCompiler::Fxc
+    }
+
+    pub(crate) fn harden_dll_search() {}
+}
 mod elevate;
 mod gpu;
 mod groups;
@@ -54,13 +73,13 @@ mod term;
 mod theme;
 mod toast;
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 #[path = "../vendor/portable-pty/src/win/conpty_bundle.rs"]
 #[allow(dead_code)] // Same production file, compiled here for the security tests.
 mod conpty_bundle;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod conpty_load;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 #[path = "../vendor/portable-pty/src/win/conpty_resolve.rs"]
 // Vendored portable-pty code: its unsafe blocks are upstream's to document.
 #[allow(clippy::undocumented_unsafe_blocks)]
@@ -144,12 +163,15 @@ fn consume_guard_release(pending: &mut bool, state: ElementState, button: MouseB
 /// The system notification sound (bell mode "sound"). Async — never blocks
 /// the UI thread.
 fn beep() {
-    // SAFETY: MessageBeep takes one integer sound type and no pointers,
-    // and is safe to call from any thread.
-    unsafe {
-        // windows-sys files MessageBeep under Diagnostics::Debug (user32's
-        // winuser.h function, but that's where the metadata puts it)
-        windows_sys::Win32::System::Diagnostics::Debug::MessageBeep(0);
+    #[cfg(windows)]
+    {
+        // SAFETY: MessageBeep takes one integer sound type and no pointers,
+        // and is safe to call from any thread.
+        unsafe {
+            // windows-sys files MessageBeep under Diagnostics::Debug (user32's
+            // winuser.h function, but that's where the metadata puts it)
+            windows_sys::Win32::System::Diagnostics::Debug::MessageBeep(0);
+        }
     }
 }
 
@@ -2293,6 +2315,7 @@ impl App {
             // OSC 10/11 answer with what is on screen now
             term::set_query_colors(r.query_colors());
         }
+        #[cfg(windows)]
         self.set_title_bar_dark(colors.title_bar_dark);
         self.request_redraw();
     }
@@ -2321,6 +2344,7 @@ impl App {
             // a program that asks OSC 11 after the switch sees the new side
             term::set_query_colors(r.query_colors());
         }
+        #[cfg(windows)]
         self.set_title_bar_dark(after.colors.title_bar_dark);
         self.request_redraw();
     }
@@ -2441,6 +2465,7 @@ impl App {
     /// included — per-pixel background alpha needs a transparent swapchain,
     /// which DX12 flip-model doesn't offer wgpu today).
     /// The window's Win32 handle (tray icon, toasts, layered alpha).
+    #[cfg(windows)]
     fn hwnd(&self) -> Option<windows_sys::Win32::Foundation::HWND> {
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let w = self.window.as_ref()?;
@@ -2453,6 +2478,7 @@ impl App {
     /// Remove the tray icon, persist the session, leave. Every exit path
     /// funnels here so no ghost icon lingers in the tray.
     fn quit(&mut self, el: &ActiveEventLoop) {
+        #[cfg(windows)]
         if let Some(h) = self.hwnd() {
             toast::remove(h);
         }
@@ -2462,7 +2488,12 @@ impl App {
             // The window is about to close, so its error card cannot be seen.
             // An explicit save failure must be acknowledged before exit.
             if let Some(error) = &self.blocked_link {
+                #[cfg(windows)]
                 show_error_dialog(self.hwnd(), &error.reason, &error.shown);
+                #[cfg(not(windows))]
+                {
+                    let _ = error;
+                }
             }
         }
         // BAYAN-014: end every shell (and, through ConPTY, its console) now,
@@ -2486,6 +2517,7 @@ impl App {
         self.request_redraw();
     }
 
+    #[cfg(windows)]
     fn apply_opacity(&self) {
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let Some(w) = &self.window else { return };
@@ -2516,10 +2548,15 @@ impl App {
         }
     }
 
+    #[cfg(not(windows))]
+    fn apply_opacity(&self) {}
+
     fn apply_window_frame(&self) {
+        #[cfg(windows)]
         self.set_title_bar_dark(render::resolved_colors(&self.config).title_bar_dark);
     }
 
+    #[cfg(windows)]
     fn set_title_bar_dark(&self, title_bar_dark: bool) {
         let Some(hwnd) = self.hwnd() else { return };
         use windows_sys::Win32::Graphics::Dwm::{
@@ -2567,6 +2604,7 @@ impl App {
         self.remember(on, |c, v| c.notifications = Some(v));
         if on {
             // preview the toast you just turned on
+            #[cfg(windows)]
             if let Some(h) = self.hwnd() {
                 toast::show(
                     h,
@@ -4727,6 +4765,7 @@ impl App {
         // BAYAN_TOAST=<title|1>: fire a sample toast at startup (M19
         // verification; a custom value becomes the title, so direction
         // experiments run without rebuilding)
+        #[cfg(windows)]
         if let Some(v) = dev_hook("BAYAN_TOAST") {
             if let Some(h) = self.hwnd() {
                 let t = v.to_str().unwrap_or("1");
@@ -6003,9 +6042,14 @@ impl App {
         if !toast_due(self.last_toast, now, TOAST_MIN_GAP) {
             return;
         }
+        #[cfg(windows)]
         if let Some(h) = self.hwnd() {
             self.last_toast = Some(now);
             toast::show(h, title, body);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (title, body);
         }
     }
 
@@ -7414,13 +7458,16 @@ impl ApplicationHandler<UserEvent> for App {
         // and generated from assets/bayan.ico so the two can't drift apart.
         const ICON_RGBA: &[u8] = include_bytes!("../assets/icon_64.rgba");
         let icon = winit::window::Icon::from_rgba(ICON_RGBA.to_vec(), 64, 64).ok();
-        use winit::platform::windows::WindowAttributesExtWindows;
-        let mut attrs = Window::default_attributes()
-            // M24: no OS title bar. The tab strip IS the title bar, so the
-            // window carries one row of chrome instead of two. We draw the
-            // caption buttons and handle drag/resize ourselves below.
-            .with_decorations(false)
-            .with_undecorated_shadow(true)
+        // M24: no OS title bar. The tab strip IS the title bar, so the
+        // window carries one row of chrome instead of two. We draw the
+        // caption buttons and handle drag/resize ourselves below.
+        let mut attrs = Window::default_attributes().with_decorations(false);
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs = attrs.with_undecorated_shadow(true);
+        }
+        attrs = attrs
             .with_title(elevate::window_title(self.elevated))
             .with_window_icon(icon)
             .with_visible(false)
@@ -7490,6 +7537,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.show_next_lua_card();
         self.apply_opacity(); // the configured window alpha, from frame one
         self.apply_window_frame();
+        #[cfg(windows)]
         if let Some(h) = self.hwnd() {
             // the tray icon: toast anchor + summon target
             if !toast::init(h) {
@@ -7518,6 +7566,7 @@ impl ApplicationHandler<UserEvent> for App {
         // SAFETY: a null hwnd is the documented way to have WM_HOTKEY posted
         // to this thread's queue; the rest are plain integers. A chord another
         // program owns makes it return 0, which is ignored.
+        #[cfg(windows)]
         unsafe {
             use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
                 RegisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, VK_OEM_3,
@@ -7976,79 +8025,10 @@ fn blur_forgets_held_keys(focused: bool, held: &mut Vec<winit::keyboard::Physica
     }
 }
 
-/// Drop the current directory from the DLL search path before anything else
-/// in this process loads a library by name.
-///
-/// `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR)`
-/// (0x800 | 0x200) is available on Windows 8+ and is intentionally not
-/// called. wgpu-hal loads `d3d12.dll` and `dxgi.dll` by bare name
-/// (`libloading` → `LoadLibraryW`). The inbox `d3d12.dll` then maps
-/// `D3D12Core.dll` from `%SystemRoot%\System32\D3D12`, and the GL fallback
-/// loads an ICD from `DriverStore\FileRepository\...`. Those neighbours are
-/// not System32 itself and not the application directory.
-/// `SetDefaultDllDirectories` replaces the process search path permanently
-/// and does not accept `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` (that flag is
-/// per `LoadLibraryEx`). A missed dependency there is a black window, and
-/// neither CI nor this call can create a device to prove it still works.
-/// `SetDllDirectoryW("")` only removes the CWD, which is what Microsoft
-/// documents for this mitigation, and leaves System32, the application
-/// directory, and PATH in place for DirectX and GL.
-///
-/// ConPTY does not depend on this call. `CreatePseudoConsole`,
-/// `ResizePseudoConsole`, and `ClosePseudoConsole` come from `kernel32.dll`
-/// opened with `LoadLibraryExW(L"kernel32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32)`.
-/// `conpty.dll` is never passed to the loader.
-///
-/// NEW-04 (partly): the application directory still precedes System32 for a
-/// bare name, so a `d3d12.dll` planted beside `bayan.exe` (a Downloads
-/// folder, a writable `target\release`) would load. Without touching the
-/// search order above, the graphics DLLs wgpu loads DYNAMICALLY by bare name
-/// are mapped first from System32 only (`LOAD_LIBRARY_SEARCH_SYSTEM32`); a
-/// later `LoadLibraryW("d3d12.dll")` returns the module already in memory.
-/// Their own dependencies (D3D12Core, the DriverStore ICDs) resolve as before.
-///
-/// NOT covered: `dxgi.dll` and `opengl32.dll` are STATIC imports of the exe
-/// (wgpu-hal's `windows` raw-dylib calls), resolved by the loader before
-/// `main` runs, so nothing here can reach them. Closing that needs
-/// `/DEPENDENTLOADFLAG:0x800` at link time, which also restricts every other
-/// static import (the VC runtime among them) to System32 — untested, so not
-/// done. Until then: install Bayan in a folder only you can write
-/// (`%LOCALAPPDATA%\Programs\Bayan`), not run it from Downloads.
-pub(crate) fn harden_dll_search() {
-    use windows_sys::Win32::System::LibraryLoader::{
-        LoadLibraryExW, SetDllDirectoryW, LOAD_LIBRARY_SEARCH_SYSTEM32,
-    };
-    // An empty string removes the CWD. NULL would put it back.
-    let empty = [0u16];
-    // SAFETY: `empty` is a NUL-terminated UTF-16 string that outlives the
-    // call, and SetDllDirectoryW copies it rather than keeping the pointer.
-    unsafe {
-        let _ = SetDllDirectoryW(empty.as_ptr());
-    }
-    for name in GPU_SYSTEM_DLLS {
-        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-        // SAFETY: `wide` is NUL-terminated and outlives the call; the file
-        // handle argument must be null, and the flag restricts the search to
-        // System32. The module stays loaded for the life of the process on
-        // purpose, so the returned handle is not freed.
-        unsafe {
-            let _ = LoadLibraryExW(
-                wide.as_ptr(),
-                std::ptr::null_mut(),
-                LOAD_LIBRARY_SEARCH_SYSTEM32,
-            );
-        }
-    }
-}
+// Graphics DLL search. The decision and the path checks are in `dll_search`.
+pub(crate) use dll_search::harden_dll_search;
 
-/// Graphics DLLs wgpu-hal loads dynamically by bare name on Windows (DX12
-/// path; `gpu.rs` asks for DX12 | GL), pre-mapped from System32 by
-/// `harden_dll_search` (NEW-04). Not listed: `dxgi.dll` / `opengl32.dll`
-/// (static imports, already loaded before `main`), and `dxcompiler.dll` /
-/// `libEGL.dll`, which are not inbox System32 components (pinning an old
-/// inbox copy could break the DXC path).
-const GPU_SYSTEM_DLLS: &[&str] = &["d3d12.dll", "dcomp.dll", "d3dcompiler_47.dll"];
-
+#[cfg(windows)]
 fn show_error_dialog(
     owner: Option<windows_sys::Win32::Foundation::HWND>,
     title: &str,
@@ -8069,6 +8049,7 @@ fn show_error_dialog(
     }
 }
 
+#[cfg(windows)]
 fn show_info_dialog(text: &str) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
 
@@ -8089,7 +8070,12 @@ fn show_info_dialog(text: &str) {
 /// parent (cmd) sees the text; Explorer gets a dialog instead of silence.
 fn present(text: &str) {
     if !cli::write_console(text) {
+        #[cfg(windows)]
         show_info_dialog(text);
+        #[cfg(not(windows))]
+        {
+            let _ = text;
+        }
     }
 }
 
@@ -8106,10 +8092,14 @@ struct Startup {
 }
 
 fn main() -> std::process::ExitCode {
+    // Before dispatch, and before any other LoadLibrary this process does.
+    // Delay-loaded graphics imports have not been resolved yet.
+    harden_dll_search();
     match dispatch() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("bayan: {error}");
+            #[cfg(windows)]
             show_error_dialog(None, tr("تعذّر بدء بيان", "Bayan could not run"), &error);
             std::process::ExitCode::FAILURE
         }
@@ -8237,6 +8227,7 @@ fn cli_start_dir(
 
 /// The subclass and the call-wnd hook both go through this. A message
 /// that is not a settings change leaves the dirty bit alone.
+#[cfg(windows)]
 fn note_a11y_message(message: u32) {
     if a11y::message_triggers_reread(message) {
         A11Y_DIRTY.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -8245,6 +8236,7 @@ fn note_a11y_message(message: u32) {
 
 /// `SetWindowSubclass` procedure. `DefSubclassProc` keeps the message
 /// moving; a null hwnd is the unit test, which has no window to forward to.
+#[cfg(windows)]
 unsafe extern "system" fn a11y_subclass_proc(
     hwnd: windows_sys::Win32::Foundation::HWND,
     msg: u32,
@@ -8277,6 +8269,7 @@ unsafe extern "system" fn a11y_subclass_proc(
     }
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn a11y_call_hook(
     code: i32,
     wparam: windows_sys::Win32::Foundation::WPARAM,
@@ -8309,6 +8302,7 @@ unsafe extern "system" fn a11y_call_hook(
 /// comctl32 v6 is not the active context the export is missing, and the
 /// thread's `WH_CALLWNDPROC` hook is the path that still sees a sent
 /// `WM_SETTINGCHANGE`.
+#[cfg(windows)]
 fn install_a11y_watch(hwnd: windows_sys::Win32::Foundation::HWND) {
     A11Y_HWND.store(hwnd, std::sync::atomic::Ordering::Relaxed);
     if try_set_window_subclass(hwnd) {
@@ -8338,6 +8332,7 @@ fn install_a11y_watch(hwnd: windows_sys::Win32::Foundation::HWND) {
     }
 }
 
+#[cfg(windows)]
 fn unhook_a11y() {
     let hook = A11Y_HOOK.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
     if hook.is_null() {
@@ -8350,36 +8345,42 @@ fn unhook_a11y() {
     }
 }
 
+#[cfg(windows)]
 type SetSubclassFn = unsafe extern "system" fn(
     windows_sys::Win32::Foundation::HWND,
     windows_sys::Win32::UI::Shell::SUBCLASSPROC,
     usize,
     usize,
 ) -> i32;
+#[cfg(windows)]
 type DefSubclassFn = unsafe extern "system" fn(
     windows_sys::Win32::Foundation::HWND,
     u32,
     windows_sys::Win32::Foundation::WPARAM,
     windows_sys::Win32::Foundation::LPARAM,
 ) -> windows_sys::Win32::Foundation::LRESULT;
+#[cfg(windows)]
 type RemoveSubclassFn = unsafe extern "system" fn(
     windows_sys::Win32::Foundation::HWND,
     windows_sys::Win32::UI::Shell::SUBCLASSPROC,
     usize,
 ) -> i32;
 
+#[cfg(windows)]
 struct ComctlFns {
     set: SetSubclassFn,
     def: DefSubclassFn,
     remove: RemoveSubclassFn,
 }
 
+#[cfg(windows)]
 fn comctl_fns() -> Option<&'static ComctlFns> {
     use std::sync::OnceLock;
     static FNS: OnceLock<Option<ComctlFns>> = OnceLock::new();
     FNS.get_or_init(load_comctl).as_ref()
 }
 
+#[cfg(windows)]
 fn load_comctl() -> Option<ComctlFns> {
     use windows_sys::Win32::System::LibraryLoader::{
         GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
@@ -8421,6 +8422,7 @@ fn load_comctl() -> Option<ComctlFns> {
     Some(ComctlFns { set, def, remove })
 }
 
+#[cfg(windows)]
 fn try_set_window_subclass(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
     let Some(api) = comctl_fns() else {
         return false;
@@ -8431,7 +8433,6 @@ fn try_set_window_subclass(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
 }
 
 fn run(startup: Startup) -> Result<(), String> {
-    harden_dll_search();
     if let Ok(exe) = std::env::current_exe() {
         if let Ok(path) = cli::exe_display(&exe) {
             let app_id = jumplist::app_user_model_id(&path);
@@ -8442,9 +8443,11 @@ fn run(startup: Startup) -> Result<(), String> {
     }
     prof::init();
     prof::mark("main start");
-    use winit::platform::windows::EventLoopBuilderExtWindows;
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
-        .with_msg_hook(|msg| {
+    let mut event_loop_builder = EventLoop::<UserEvent>::with_user_event();
+    #[cfg(windows)]
+    {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        event_loop_builder.with_msg_hook(|msg| {
             use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_HOTKEY};
             // SAFETY: winit's msg hook is handed a pointer to the MSG being
             // dispatched, valid for the duration of the callback. It is only read.
@@ -8465,7 +8468,9 @@ fn run(startup: Startup) -> Result<(), String> {
                 return true; // ours either way
             }
             false
-        })
+        });
+    }
+    let event_loop = event_loop_builder
         .build()
         .map_err(|error| format!("Could not create the event loop: {error}"))?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -8586,7 +8591,7 @@ fn run(startup: Startup) -> Result<(), String> {
 /// build its own loop — a second builder in another test module panics
 /// whichever of the two runs second. The loop is leaked so the proxy's
 /// window target stays alive for the rest of the process.
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(crate) fn test_proxy() -> EventLoopProxy<UserEvent> {
     use std::sync::OnceLock;
     use winit::platform::windows::EventLoopBuilderExtWindows;
@@ -8602,6 +8607,11 @@ pub(crate) fn test_proxy() -> EventLoopProxy<UserEvent> {
             proxy
         })
         .clone()
+}
+
+#[cfg(all(test, not(windows)))]
+pub(crate) fn test_proxy() -> EventLoopProxy<UserEvent> {
+    unimplemented!("the test event loop is built with the Windows message hook")
 }
 
 /// OSC 52 writes only from the focused pane of the active tab.
@@ -8627,6 +8637,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[cfg(windows)]
     #[test]
     fn subclass_proc_sets_the_dirty_flag_for_each_live_message() {
         for msg in [

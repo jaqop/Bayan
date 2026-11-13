@@ -6,6 +6,26 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/bayan.ico");
     println!("cargo:rerun-if-changed=build.rs");
 
+    // wgpu-hal imports opengl32.dll and may import dxgi.dll as raw-dylibs,
+    // which the loader resolves before main. Delay-load them so
+    // `dll_search::harden_dll_search` runs first and a copy beside bayan.exe
+    // is not on the search path. The VC runtime is not delay-loaded.
+    // `/DELAYLOAD` is the MSVC linker's flag; the shipped build is MSVC.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if target_os == "windows" && target_env == "msvc" {
+        for dll in [
+            "opengl32.dll",
+            "dxgi.dll",
+            "d3d12.dll",
+            "dcomp.dll",
+            "d3dcompiler_47.dll",
+        ] {
+            println!("cargo:rustc-link-arg=/DELAYLOAD:{dll}");
+        }
+        println!("cargo:rustc-link-lib=delayimp");
+    }
+
     #[cfg(windows)]
     {
         let mut res = winresource::WindowsResource::new();

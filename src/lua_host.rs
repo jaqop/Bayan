@@ -68,9 +68,9 @@
 //! [`load_with`] takes that answer so tests can force either side. The JSON
 //! config is kept and a short Arabic notice is returned; no script is read.
 
+use crate::process::JobGuard;
 #[cfg(windows)]
-use crate::process::resume_process;
-use crate::process::{tie_to_job, JobGuard};
+use crate::process::{resume_process, tie_to_job};
 
 use std::cell::RefCell;
 use std::fs;
@@ -1059,7 +1059,12 @@ fn supervise_child(mut child: std::process::Child, job: Option<JobGuard>) {
     let _ = rx.recv_timeout(Duration::from_secs(2));
     let _ = child.kill();
     let _ = child.wait();
+    #[cfg(windows)]
     drop(job);
+    #[cfg(not(windows))]
+    {
+        let _ = job;
+    }
 }
 
 fn check_send(text: &str) -> Result<(), String> {

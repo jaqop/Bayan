@@ -362,6 +362,13 @@ mod live {
     }
 }
 
+/// No Win32 reparse walk on this target. A path is not treated as local.
+#[cfg(not(windows))]
+pub fn walk_live(path: &str) -> Walk {
+    let _ = path;
+    Walk::NotLocal
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

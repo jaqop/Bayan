@@ -37,6 +37,7 @@
 //! Registry writes are HKCU only, and only the one CLSID key.
 
 use std::path::Path;
+#[cfg(windows)]
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::cli::exe_display;
@@ -45,18 +46,23 @@ use crate::cli::exe_display;
 pub const TERMINAL_CLSID: &str = "{A7C3E1B2-4D58-4F0A-9E6C-1B8D5A2F7043}";
 
 /// `ITerminalHandoff` (deprecated; handles only).
+#[cfg(windows)]
 const IID_TERMINAL_HANDOFF: windows::core::GUID =
     windows::core::GUID::from_u128(0x59D55CCE_FC8A_48B4_ACE8_0A9286C6557F);
 /// `ITerminalHandoff2` (startup info by value).
+#[cfg(windows)]
 const IID_TERMINAL_HANDOFF2: windows::core::GUID =
     windows::core::GUID::from_u128(0xAA6B364F_4A50_4176_9002_0AE755E7B5EF);
 /// `ITerminalHandoff3` (caller-chosen input and output pipes).
+#[cfg(windows)]
 const IID_TERMINAL_HANDOFF3: windows::core::GUID =
     windows::core::GUID::from_u128(0x6F23DA90_15C5_4203_9DB0_64E73F1B1B00);
 
 /// Returned by every `EstablishPtyHandoff`. The session is not started.
+#[cfg(windows)]
 const E_NOTIMPL: windows::core::HRESULT = windows::core::HRESULT(0x8000_4001u32 as i32);
 
+#[cfg(windows)]
 const IID_IUNKNOWN: windows::core::GUID =
     windows::core::GUID::from_u128(0x00000000_0000_0000_C000_000000000046);
 
@@ -101,26 +107,38 @@ pub fn unregister_with(store: &mut impl RegistryStore) -> Result<(), String> {
 }
 
 pub fn set_enabled(enabled: bool) -> Result<(), String> {
-    let exe =
-        std::env::current_exe().map_err(|error| format!("could not find bayan.exe: {error}"))?;
-    let mut registry = LiveRegistry;
-    if enabled {
-        register_with(&mut registry, &exe)
-    } else {
-        unregister_with(&mut registry)
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe()
+            .map_err(|error| format!("could not find bayan.exe: {error}"))?;
+        let mut registry = LiveRegistry;
+        if enabled {
+            register_with(&mut registry, &exe)
+        } else {
+            unregister_with(&mut registry)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = enabled;
+        Err("terminal handoff registers an HKCU class on Windows".into())
     }
 }
 
+#[cfg(windows)]
 fn allowed_value_key(key: &str) -> bool {
     key == clsid_key() || key == local_server_key()
 }
 
+#[cfg(windows)]
 fn allowed_delete_key(key: &str) -> bool {
     key == clsid_key()
 }
 
+#[cfg(windows)]
 struct LiveRegistry;
 
+#[cfg(windows)]
 impl RegistryStore for LiveRegistry {
     fn set_value(&mut self, key: &str, name: &str, value: &str) -> Result<(), String> {
         if !allowed_value_key(key) {
@@ -137,12 +155,15 @@ impl RegistryStore for LiveRegistry {
     }
 }
 
+#[cfg(windows)]
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
 
+#[cfg(windows)]
 struct OpenKey(windows_sys::Win32::System::Registry::HKEY);
 
+#[cfg(windows)]
 impl Drop for OpenKey {
     fn drop(&mut self) {
         if !self.0.is_null() {
@@ -155,6 +176,7 @@ impl Drop for OpenKey {
     }
 }
 
+#[cfg(windows)]
 fn live_set(key: &str, name: &str, value: &str) -> Result<(), String> {
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::System::Registry::{
@@ -215,6 +237,7 @@ fn live_set(key: &str, name: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn live_delete(key: &str) -> Result<(), String> {
     use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
     use windows_sys::Win32::System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER};
@@ -230,9 +253,12 @@ fn live_delete(key: &str) -> Result<(), String> {
     }
 }
 
+#[cfg(windows)]
 static LOCKS: AtomicU32 = AtomicU32::new(0);
+#[cfg(windows)]
 static OBJECTS: AtomicU32 = AtomicU32::new(0);
 
+#[cfg(windows)]
 fn maybe_quit() {
     if LOCKS.load(Ordering::SeqCst) == 0 && OBJECTS.load(Ordering::SeqCst) == 0 {
         // SAFETY: PostQuitMessage posts WM_QUIT to this thread. It takes no pointer.
@@ -242,6 +268,7 @@ fn maybe_quit() {
 
 /// COM local server for `--handoff`. Blocks until the client releases the
 /// class. Does not open a terminal window.
+#[cfg(windows)]
 pub fn serve() -> Result<(), String> {
     use windows::Win32::System::Com::{
         CoInitializeEx, CoRegisterClassObject, CoRevokeClassObject, IClassFactory,
@@ -272,13 +299,16 @@ pub fn serve() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn clsid() -> windows::core::GUID {
     windows::core::GUID::from_u128(0xA7C3E1B2_4D58_4F0A_9E6C_1B8D5A2F7043)
 }
 
+#[cfg(windows)]
 #[windows::core::implement(windows::Win32::System::Com::IClassFactory)]
 struct Factory;
 
+#[cfg(windows)]
 impl windows::Win32::System::Com::IClassFactory_Impl for Factory_Impl {
     fn CreateInstance(
         &self,
@@ -322,6 +352,7 @@ impl windows::Win32::System::Com::IClassFactory_Impl for Factory_Impl {
 
 /// `TERMINAL_STARTUP_INFO` from `ITerminalHandoff.idl`. The fields are not
 /// read: `EstablishPtyHandoff` returns `E_NOTIMPL` without using them.
+#[cfg(windows)]
 #[allow(dead_code)]
 #[repr(C)]
 struct StartupInfo {
@@ -339,6 +370,7 @@ struct StartupInfo {
     show: u16,
 }
 
+#[cfg(windows)]
 #[repr(C)]
 struct Handoff {
     unknown: *const UnknownVtbl,
@@ -348,6 +380,7 @@ struct Handoff {
     refs: AtomicU32,
 }
 
+#[cfg(windows)]
 #[repr(C)]
 struct UnknownVtbl {
     query: unsafe extern "system" fn(
@@ -359,6 +392,7 @@ struct UnknownVtbl {
     release: unsafe extern "system" fn(*mut Handoff) -> u32,
 }
 
+#[cfg(windows)]
 #[repr(C)]
 struct HandoffVtbl {
     query: unsafe extern "system" fn(
@@ -379,6 +413,7 @@ struct HandoffVtbl {
     ) -> windows::core::HRESULT,
 }
 
+#[cfg(windows)]
 #[repr(C)]
 struct Handoff2Vtbl {
     query: unsafe extern "system" fn(
@@ -400,6 +435,7 @@ struct Handoff2Vtbl {
     ) -> windows::core::HRESULT,
 }
 
+#[cfg(windows)]
 #[repr(C)]
 struct Handoff3Vtbl {
     query: unsafe extern "system" fn(
@@ -421,6 +457,7 @@ struct Handoff3Vtbl {
     ) -> windows::core::HRESULT,
 }
 
+#[cfg(windows)]
 impl Handoff {
     fn new() -> Self {
         Self {
@@ -433,12 +470,14 @@ impl Handoff {
     }
 }
 
+#[cfg(windows)]
 static UNKNOWN_VTBL: UnknownVtbl = UnknownVtbl {
     query,
     addref,
     release,
 };
 
+#[cfg(windows)]
 static HANDOFF_VTBL: HandoffVtbl = HandoffVtbl {
     query: query_handoff,
     addref: addref_handoff,
@@ -446,6 +485,7 @@ static HANDOFF_VTBL: HandoffVtbl = HandoffVtbl {
     establish: establish_refused,
 };
 
+#[cfg(windows)]
 static HANDOFF2_VTBL: Handoff2Vtbl = Handoff2Vtbl {
     query: query_handoff2,
     addref: addref_handoff2,
@@ -453,6 +493,7 @@ static HANDOFF2_VTBL: Handoff2Vtbl = Handoff2Vtbl {
     establish: establish2_refused,
 };
 
+#[cfg(windows)]
 static HANDOFF3_VTBL: Handoff3Vtbl = Handoff3Vtbl {
     query: query_handoff3,
     addref: addref_handoff3,
@@ -460,6 +501,7 @@ static HANDOFF3_VTBL: Handoff3Vtbl = Handoff3Vtbl {
     establish: establish3_refused,
 };
 
+#[cfg(windows)]
 unsafe extern "system" fn query(
     this: *mut Handoff,
     iid: *const windows::core::GUID,
@@ -489,11 +531,13 @@ unsafe extern "system" fn query(
     windows::Win32::Foundation::S_OK
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn addref(this: *mut Handoff) -> u32 {
     // SAFETY: `this` is a live Handoff.
     unsafe { (*this).refs.fetch_add(1, Ordering::SeqCst) + 1 }
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn release(this: *mut Handoff) -> u32 {
     // SAFETY: `this` is a live Handoff. The last release frees that allocation.
     unsafe {
@@ -507,10 +551,12 @@ unsafe extern "system" fn release(this: *mut Handoff) -> u32 {
     }
 }
 
+#[cfg(windows)]
 fn object_from_field<T>(field: *mut T, offset: usize) -> *mut Handoff {
     field.cast::<u8>().wrapping_sub(offset).cast()
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn query_handoff(
     this: *mut HandoffVtbl,
     iid: *const windows::core::GUID,
@@ -526,6 +572,7 @@ unsafe extern "system" fn query_handoff(
     }
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn addref_handoff(this: *mut HandoffVtbl) -> u32 {
     // SAFETY: `this` points at `Handoff::handoff` of a live object.
     unsafe {
@@ -536,6 +583,7 @@ unsafe extern "system" fn addref_handoff(this: *mut HandoffVtbl) -> u32 {
     }
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn release_handoff(this: *mut HandoffVtbl) -> u32 {
     // SAFETY: `this` points at `Handoff::handoff` of a live object.
     unsafe {
@@ -546,6 +594,7 @@ unsafe extern "system" fn release_handoff(this: *mut HandoffVtbl) -> u32 {
     }
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn query_handoff2(
     this: *mut Handoff2Vtbl,
     iid: *const windows::core::GUID,
@@ -561,6 +610,7 @@ unsafe extern "system" fn query_handoff2(
     }
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn addref_handoff2(this: *mut Handoff2Vtbl) -> u32 {
     // SAFETY: `this` points at `Handoff::handoff2` of a live object.
     unsafe {
@@ -571,6 +621,7 @@ unsafe extern "system" fn addref_handoff2(this: *mut Handoff2Vtbl) -> u32 {
     }
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn release_handoff2(this: *mut Handoff2Vtbl) -> u32 {
     // SAFETY: `this` points at `Handoff::handoff2` of a live object.
     unsafe {
@@ -581,6 +632,7 @@ unsafe extern "system" fn release_handoff2(this: *mut Handoff2Vtbl) -> u32 {
     }
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn query_handoff3(
     this: *mut Handoff3Vtbl,
     iid: *const windows::core::GUID,
@@ -596,6 +648,7 @@ unsafe extern "system" fn query_handoff3(
     }
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn addref_handoff3(this: *mut Handoff3Vtbl) -> u32 {
     // SAFETY: `this` points at `Handoff::handoff3` of a live object.
     unsafe {
@@ -606,6 +659,7 @@ unsafe extern "system" fn addref_handoff3(this: *mut Handoff3Vtbl) -> u32 {
     }
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn release_handoff3(this: *mut Handoff3Vtbl) -> u32 {
     // SAFETY: `this` points at `Handoff::handoff3` of a live object.
     unsafe {
@@ -617,6 +671,7 @@ unsafe extern "system" fn release_handoff3(this: *mut Handoff3Vtbl) -> u32 {
 }
 
 /// Fail closed. Handles are not closed and not stored: they belong to the caller.
+#[cfg(windows)]
 unsafe extern "system" fn establish_refused(
     _this: *mut HandoffVtbl,
     _input: *mut core::ffi::c_void,
@@ -629,6 +684,7 @@ unsafe extern "system" fn establish_refused(
     E_NOTIMPL
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn establish2_refused(
     _this: *mut Handoff2Vtbl,
     _input: *mut core::ffi::c_void,
@@ -642,6 +698,7 @@ unsafe extern "system" fn establish2_refused(
     E_NOTIMPL
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn establish3_refused(
     _this: *mut Handoff3Vtbl,
     _input: *mut *mut core::ffi::c_void,
@@ -653,6 +710,11 @@ unsafe extern "system" fn establish3_refused(
     _startup: *const StartupInfo,
 ) -> windows::core::HRESULT {
     E_NOTIMPL
+}
+
+#[cfg(not(windows))]
+pub fn serve() -> Result<(), String> {
+    Err("terminal handoff is a Windows COM local server".into())
 }
 
 #[cfg(test)]
@@ -708,6 +770,7 @@ mod tests {
         assert!(store.values.is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_live_store_refuses_delegation_and_hklm() {
         let mut registry = LiveRegistry;
@@ -727,6 +790,7 @@ mod tests {
         assert!(!allowed_delete_key(&local_server_key()));
     }
 
+    #[cfg(windows)]
     #[test]
     fn establish_does_not_report_success() {
         assert_eq!(E_NOTIMPL.0, 0x8000_4001u32 as i32);
