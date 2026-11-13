@@ -2175,7 +2175,7 @@ pub fn known_program_files_x86() -> Option<std::path::PathBuf> {
     known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramFilesX86)
 }
 
-fn known_folder(id: &windows_sys::core::GUID) -> Option<std::path::PathBuf> {
+pub(crate) fn known_folder(id: &windows_sys::core::GUID) -> Option<std::path::PathBuf> {
     use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::UI::Shell::SHGetKnownFolderPath;
     // SAFETY: the folder id is a static GUID. On success `path` is a

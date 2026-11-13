@@ -338,7 +338,8 @@ impl App {
         let (left, right) = self.resize_bands();
         let (x, y) = (pos.x, pos.y);
         let (width, height) = (s.width as f64, s.height as f64);
-        let maximized = w.is_maximized();
+        // a full-screen window has no edge to drag either
+        let maximized = w.is_maximized() || w.fullscreen().is_some();
         if left == EDGE_BAND && right == EDGE_BAND {
             resize_edge(x, y, width, height, maximized)
         } else {

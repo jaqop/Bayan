@@ -36,10 +36,16 @@ pub enum Action {
     PrevGroup,
     CopyMode,
     CopyClean,
+    Fullscreen,
+    ClearScrollback,
+    ResetTerminal,
+    NewWindow,
+    DuplicateTab,
+    SaveOutput,
 }
 
 impl Action {
-    pub const ALL: [Action; 23] = [
+    pub const ALL: [Action; 29] = [
         Action::NewTab,
         Action::ClosePane,
         Action::Search,
@@ -63,6 +69,12 @@ impl Action {
         Action::PrevGroup,
         Action::CopyMode,
         Action::CopyClean,
+        Action::Fullscreen,
+        Action::ClearScrollback,
+        Action::ResetTerminal,
+        Action::NewWindow,
+        Action::DuplicateTab,
+        Action::SaveOutput,
     ];
 
     /// The config.json key.
@@ -91,6 +103,12 @@ impl Action {
             Action::PrevGroup => "prev-group",
             Action::CopyMode => "copy-mode",
             Action::CopyClean => "copy-clean",
+            Action::Fullscreen => "fullscreen",
+            Action::ClearScrollback => "clear-scrollback",
+            Action::ResetTerminal => "reset-terminal",
+            Action::NewWindow => "new-window",
+            Action::DuplicateTab => "duplicate-tab",
+            Action::SaveOutput => "save-output",
         }
     }
 
@@ -133,6 +151,16 @@ impl Action {
             Action::PrevGroup => crate::lang::pick(lang, "المجموعة السابقة", "Previous group"),
             Action::CopyMode => crate::lang::pick(lang, "وضع النسخ", "Copy mode"),
             Action::CopyClean => crate::lang::pick(lang, "نسخ نظيف", "Copy clean"),
+            Action::Fullscreen => crate::lang::pick(lang, "ملء الشاشة", "Full screen"),
+            Action::ClearScrollback => crate::lang::pick(lang, "مسح السجل", "Clear scrollback"),
+            Action::ResetTerminal => {
+                crate::lang::pick(lang, "إعادة ضبط أوضاع الطرفية", "Reset terminal modes")
+            }
+            Action::NewWindow => crate::lang::pick(lang, "نافذة جديدة", "New window"),
+            Action::DuplicateTab => crate::lang::pick(lang, "تكرار التبويب", "Duplicate tab"),
+            Action::SaveOutput => {
+                crate::lang::pick(lang, "حفظ المخرجات في ملف", "Save output to a file")
+            }
         }
     }
 
@@ -182,6 +210,17 @@ impl Action {
             Action::CopyMode => c(true, true, Letter('x')),
             // Y for yank, cleaned. X is copy mode.
             Action::CopyClean => c(true, true, Letter('y')),
+            // Bare F11, the key every terminal and browser uses. A program
+            // that wants F11 itself needs this rebound.
+            Action::Fullscreen => c(false, false, F(11)),
+            // H for history, J beside it for the mode reset, N for a
+            // window (Windows Terminal's chord), T beside Ctrl+T for the
+            // same tab again, S for save.
+            Action::ClearScrollback => c(true, true, Letter('h')),
+            Action::ResetTerminal => c(true, true, Letter('j')),
+            Action::NewWindow => c(true, true, Letter('n')),
+            Action::DuplicateTab => c(true, true, Letter('t')),
+            Action::SaveOutput => c(true, true, Letter('s')),
         }
     }
 }

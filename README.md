@@ -959,6 +959,69 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       with `cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings`
       and `cargo fmt --check`.
 
+## Six basics: full screen, clear, reset, new window, duplicate tab, save output
+
+Six actions every terminal has and Bayan did not. Each is in the registry,
+so it has a row in the shortcuts editor, a line in the command palette, and
+a `keybinds` key in `config.json`.
+
+| Action | Default | `keybinds` key |
+|---|---|---|
+| Full screen | F11 | `fullscreen` |
+| Clear scrollback | Ctrl+Shift+H | `clear-scrollback` |
+| Reset terminal modes | Ctrl+Shift+J | `reset-terminal` |
+| New window | Ctrl+Shift+N | `new-window` |
+| Duplicate tab | Ctrl+Shift+T | `duplicate-tab` |
+| Save output to a file | Ctrl+Shift+S | `save-output` |
+
+- **Full screen** is winit's borderless mode on the monitor the window is
+  on. The saved window rectangle ignores it, the way it ignores maximized,
+  and the resize edges are off. F11 no longer reaches the program; a
+  program that wants it needs the action rebound.
+- **Clear scrollback** feeds `ESC [ 3 J` to the pane's own parser through
+  the reader's counted feed, so the dropped lines count as evicted and
+  OSC 133 marks and images keep their rows. The screen stays. On the
+  alternate screen it does nothing: that screen has no history.
+- **Reset terminal modes** is deliberately not RIS (`ESC c`). ConPTY keeps
+  its own copy of the screen and of the color state and sends only what
+  changed, so a view cleared or recolored behind its back stays wrong
+  until the program repaints. The reset sends what a program should have
+  sent on exit: cursor shown, mouse tracking and focus reports off, cursor
+  keys and keypad normal, bracketed paste off, an open synchronized update
+  closed, and the kitty keyboard stack popped (Ctrl+Shift+K's job, still
+  there on its own). It does not fix colors or a wrong character set;
+  those live in ConPTY.
+- **New window** starts a second Bayan process with `--new-window`, the
+  jump list's launch. An elevated window starts its child with
+  `--elevated` and nothing else. There is still one window per process.
+- **Duplicate tab** opens a tab with the focused pane's own command line
+  (the one a restored session starts it with) in that pane's folder. A
+  pane that lives in the mux server gets an ordinary new tab instead.
+- **Save output** writes the focused pane's scrollback and screen to
+  `Documents\Bayan\bayan-<date>-<time>.txt`, under the Documents folder
+  the shell reports. No dialog. An existing file is never overwritten
+  (`create_new`; a second save in the same second gets `-2`), and a toast
+  names the path. Text only, no colors. With Claude mode on, the text is
+  restored to logical order exactly as a copy of the same rows is, which
+  includes shell lines above an inline Claude session.
+
+The shortcuts editor was one column and 29 rows do not fit a 900px window
+even at the tightest row height (the layout tests caught it). When one
+column does not fit and the window is wide enough for two, the ledger
+splits; the first half sits at the reading edge, the right one in Arabic.
+A tall window keeps one column.
+
+Proven by tests: the registry round-trips the new chords; clearing drops
+the history, keeps the screen text and cursor, and a prompt mark made
+before it still names its row; the mode reset turns each leftover mode off
+and leaves the text, the cursor position and the color; the new-window argv
+parses as a plain or an elevated launch with no folder or command; the
+export name, trimming and no-overwrite write on a temp directory; the
+two-column layout has no overlapping strips. Not run here: any of it on a
+live window. Full screen in particular (the custom chrome and the layered
+window under borderless full screen) has only been type-checked. Tests ran
+as `x86_64-pc-windows-gnu` under wine on Linux.
+
 ## SSH tabs and the session multiplexer
 
 An SSH tab runs the Windows OpenSSH client, `GetSystemDirectoryW()\OpenSSH\ssh.exe`,

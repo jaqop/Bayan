@@ -5594,7 +5594,7 @@ impl Renderer {
     /// Geometry of the shortcuts editor: one full-width clickable strip per
     /// action row (draw + hit-test agree, like the settings panel).
     pub fn shortcuts_layout(&self, fw: usize, fh: usize, n: usize) -> ShortcutsLayout {
-        let w = ((self.ui_cell_w() * 44.0) as i32).clamp(380, fw as i32 - 60);
+        let colw = ((self.ui_cell_w() * 44.0) as i32).clamp(380, fw as i32 - 60);
         let head_h = (self.ui_cell_h() + 30.0) as i32;
         let foot_h = (self.ui_cell_h() + 30.0) as i32;
         let bar = self.tab_bar_h() as i32;
@@ -5606,8 +5606,19 @@ impl Renderer {
         // window. The floor stays tall enough for the keycap chips.
         let tight = (self.ui_cell_h() + 8.0) as i32;
         let room = fh as i32 - bar - 24 - head_h - 6 - foot_h;
-        let rowh = (room / (n as i32).max(1)).clamp(tight, roomy);
-        let h = head_h + 6 + rowh * n as i32 + foot_h;
+        // 29 actions do not fit one column of a 900px window even at the
+        // floor. The ledger then splits in two, when the window is wide
+        // enough for both; the first half sits at the reading edge.
+        let n_i = (n as i32).max(1);
+        let cols = if tight * n_i > room && colw * 2 <= fw as i32 - 60 {
+            2
+        } else {
+            1
+        };
+        let per_col = (n_i + cols - 1) / cols;
+        let w = colw * cols;
+        let rowh = (room / per_col).clamp(tight, roomy);
+        let h = head_h + 6 + rowh * per_col + foot_h;
         let x = (fw as i32 - w) / 2;
         // a third of the spare height above, but never past the bottom.
         // A registry that fills the window sits against the tab bar instead
@@ -5624,7 +5635,21 @@ impl Renderer {
         };
         let rows_top = y + head_h + 6;
         let rows = (0..n as i32)
-            .map(|i| (x + 8, rows_top + rowh * i, w - 16, rowh))
+            .map(|i| {
+                let col = i / per_col;
+                // column 0 is where reading starts: the right half in Arabic
+                let slot = if crate::lang::rtl() {
+                    cols - 1 - col
+                } else {
+                    col
+                };
+                (
+                    x + colw * slot + 8,
+                    rows_top + rowh * (i % per_col),
+                    colw - 16,
+                    rowh,
+                )
+            })
             .collect();
         ShortcutsLayout {
             card: (x, y, w, h),
@@ -5695,6 +5720,8 @@ impl Renderer {
 
         for (i, row) in rows.iter().enumerate() {
             let (rx, ry, rw, rh) = lay.rows[i];
+            // the row's column: the whole card when there is one column
+            let (x, w) = (rx - 8, rw + 16);
             let selected = i == sel;
             if selected {
                 // the accent bar hugs the reading edge: right in Arabic
@@ -10794,12 +10821,29 @@ mod cache_tests {
         assert_eq!(lay.rows.len(), n);
         let (cx, cy, cw, ch) = lay.card;
         assert!(cx > 0 && cy > 0 && cx + cw <= 1400 && cy + ch <= 900);
-        let mut last_bottom = 0;
-        for &(rx, ry, rw, rh) in &lay.rows {
+        for (i, &(rx, ry, rw, rh)) in lay.rows.iter().enumerate() {
             assert!(rx >= cx && rx + rw <= cx + cw && ry >= cy && ry + rh <= cy + ch);
-            assert!(ry >= last_bottom, "rows must stack without overlap");
-            last_bottom = ry + rh;
+            for &(ox, oy, ow, oh) in &lay.rows[..i] {
+                let apart = rx >= ox + ow || ox >= rx + rw || ry >= oy + oh || oy >= ry + rh;
+                assert!(apart, "strips must not overlap");
+            }
         }
+        // a registry too long for one column splits in two, and the first
+        // action sits at the reading edge: the right half in Arabic
+        if lay.rows.iter().any(|r| r.0 != lay.rows[0].0) {
+            let other = lay.rows.iter().find(|r| r.0 != lay.rows[0].0).unwrap();
+            assert!(
+                lay.rows[0].0 > other.0,
+                "Arabic reads the right column first"
+            );
+            assert_eq!(lay.rows[0].1, other.1, "both columns start on one line");
+        }
+        // a window tall enough keeps the single column
+        let tall = r.shortcuts_layout(1400, 2000, n);
+        assert!(tall.rows.iter().all(|r| r.0 == tall.rows[0].0));
+        // a window too narrow for two columns keeps one, as before
+        let narrow = r.shortcuts_layout(600, 900, n);
+        assert!(narrow.rows.iter().all(|r| r.0 == narrow.rows[0].0));
         // the settings panel's header button exists and sits inside ITS card
         let slay = r.settings_layout(1400, 900);
         let (bx, by, bw, bh) = slay.shortcuts_btn;

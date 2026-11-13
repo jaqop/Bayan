@@ -18,6 +18,7 @@ mod context_menu;
 mod copyclean;
 mod copymode;
 mod elevate;
+mod export;
 mod gpu;
 mod groups;
 mod handoff;
@@ -197,6 +198,24 @@ fn ctrl_letter(key: &Key) -> Option<char> {
         }
     }
     None
+}
+
+/// Argv for the process Ctrl+Shift+N starts. An elevated window keeps the
+/// elevation rule: its child is told `--elevated` and nothing else, and
+/// being elevated already it starts without a second UAC prompt.
+fn new_window_args(elevated: bool) -> [&'static str; 1] {
+    if elevated {
+        ["--elevated"]
+    } else {
+        ["--new-window"]
+    }
+}
+
+/// The command a duplicated tab starts: the focused pane's own. `None`
+/// (a pane that lives in the mux server, or one with no recorded command)
+/// falls back to the shell a new tab would get.
+fn duplicate_command(pane_command: &str, in_mux: bool) -> Option<String> {
+    (!in_mux && !pane_command.trim().is_empty()).then(|| pane_command.to_string())
 }
 
 /// What the search bar hands the matcher: the query as a regular expression
@@ -3008,6 +3027,126 @@ impl App {
             CopyClean => {
                 self.copy_selection_clean();
             }
+            Fullscreen => self.toggle_fullscreen(),
+            ClearScrollback => self.clear_scrollback(),
+            ResetTerminal => {
+                if let Some(s) = self.session_mut() {
+                    s.reset_modes();
+                }
+                // a drag the program was tracking has no program side now
+                self.abandon_mouse();
+                self.request_redraw();
+            }
+            NewWindow => self.open_new_window(),
+            DuplicateTab => {
+                let Some((cwd, command)) = self.tabs.get(self.active).and_then(|tab| {
+                    let pane = tab.panes.get(tab.focused)?;
+                    let cwd = pane.session.meta.lock_or_recover().spawn_cwd();
+                    Some((cwd, duplicate_command(&pane.command, pane.mux.is_some())))
+                }) else {
+                    return;
+                };
+                // the pane's own command line, the one a restored session
+                // starts it with; a mux pane lives in the server, so its
+                // copy is an ordinary new tab
+                let command = command.unwrap_or_else(|| self.spawn_shell());
+                self.spawn_tab_command(cwd, &command, None);
+                self.request_redraw();
+            }
+            SaveOutput => self.save_output(),
+        }
+    }
+
+    /// F11. Borderless on the monitor the window is on; the same key
+    /// returns to the rectangle it had.
+    fn toggle_fullscreen(&mut self) {
+        if let Some(w) = &self.window {
+            let on = w.fullscreen().is_some();
+            w.set_fullscreen((!on).then_some(winit::window::Fullscreen::Borderless(None)));
+        }
+        // a divider or selection drag was measured against the old size
+        self.abandon_mouse();
+        self.drag_divider = None;
+        self.request_redraw();
+    }
+
+    fn clear_scrollback(&mut self) {
+        if let Some(id) = self.focused_pane_id() {
+            self.drop_smooth(id);
+        }
+        if let Some(s) = self.session_mut() {
+            s.clear_scrollback();
+        }
+        // a hit in the cleared lines is gone, and so is its count
+        if let Some(st) = self.search.as_mut() {
+            st.hl = None;
+            st.status = SearchStatus::Idle;
+        }
+        self.invalidate_focused_links();
+        self.request_redraw();
+    }
+
+    /// Ctrl+Shift+N: a second Bayan process. It is the jump list's
+    /// "New window" launch; an elevated window opens an elevated one.
+    fn open_new_window(&mut self) {
+        let started = std::env::current_exe().and_then(|exe| {
+            std::process::Command::new(exe)
+                .args(new_window_args(self.elevated))
+                .spawn()
+        });
+        if let Err(error) = started {
+            self.report_error(
+                tr("تعذر فتح نافذة جديدة", "Could not open a new window"),
+                &error.to_string(),
+            );
+        }
+    }
+
+    /// Write the focused pane's scrollback and screen to a new text file
+    /// in `Documents\Bayan` and say where it went.
+    fn save_output(&mut self) {
+        let Some(session) = self.session() else {
+            return;
+        };
+        let raw = {
+            let t = session.term.lock();
+            let top = Line(-(t.grid().history_size() as i32));
+            let bottom = Line(t.screen_lines() as i32 - 1);
+            t.bounds_to_string(
+                Point::new(top, Column(0)),
+                Point::new(bottom, Column(t.columns().saturating_sub(1))),
+            )
+        };
+        // Claude rows hold visual-order Arabic. The file gets the same
+        // logical text a copy of those rows puts on the clipboard.
+        let claude = self.claude_active();
+        let logical = copyclean::clipboard_text(&raw, &[], false, claude);
+        let failed = tr("تعذر حفظ المخرجات", "Could not save the output");
+        let Some(text) = export::file_text(&logical) else {
+            self.report_error(failed, tr("اللوحة فارغة", "The pane is empty"));
+            return;
+        };
+        let Some(dir) = export::output_dir() else {
+            self.report_error(
+                failed,
+                tr(
+                    "مجلد المستندات غير معروف",
+                    "The Documents folder is unknown",
+                ),
+            );
+            return;
+        };
+        match export::write_new(&dir, export::now(), &text) {
+            Ok(path) => {
+                if let Some(h) = self.hwnd() {
+                    toast::show(
+                        h,
+                        tr("حُفظت المخرجات", "Output saved"),
+                        &path.display().to_string(),
+                    );
+                }
+            }
+            Err(error) => self.report_error(failed, &error.to_string()),
         }
     }
 
@@ -4491,7 +4630,8 @@ impl App {
     /// (moved or resized by the user, not maximized).
     fn track_geometry(&mut self) {
         let Some(w) = &self.window else { return };
-        if w.is_maximized() || w.is_minimized().unwrap_or(false) {
+        // full screen is not a rectangle to come back to either
+        if w.is_maximized() || w.is_minimized().unwrap_or(false) || w.fullscreen().is_some() {
             return;
         }
         let (Ok(pos), size) = (w.outer_position(), w.inner_size()) else {
@@ -9365,6 +9505,28 @@ mod tests {
         let bad = search_pattern("error (", true);
         assert!(find_match(&mut t, &bad, &None, Direction::Left).is_none());
         assert!(count_matches(&t, &bad, &None).is_none());
+    }
+
+    #[test]
+    fn a_new_window_keeps_the_elevation_rule_and_a_copy_keeps_its_shell() {
+        assert_eq!(new_window_args(false), ["--new-window"]);
+        assert_eq!(new_window_args(true), ["--elevated"]);
+        // both are launches the parser accepts, and neither carries a
+        // folder, a profile or a command
+        for elevated in [false, true] {
+            let cli::CliAction::Launch(launch) = cli::parse(new_window_args(elevated)).unwrap()
+            else {
+                panic!("not a launch");
+            };
+            assert_eq!(launch.elevated, elevated);
+            assert!(launch.directory.is_none() && launch.command.is_none());
+        }
+        assert_eq!(
+            duplicate_command("cmd.exe", false).as_deref(),
+            Some("cmd.exe")
+        );
+        assert_eq!(duplicate_command("cmd.exe", true), None, "a mux pane");
+        assert_eq!(duplicate_command("  ", false), None);
     }
 
     /// A screen of one-character hits stops at the cap and says so.
