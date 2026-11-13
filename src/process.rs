@@ -178,15 +178,29 @@ mod tests {
     use std::process::Command;
     use std::time::Duration;
 
+    /// TYPE writes the file verbatim without a PowerShell/.NET startup
+    /// competing with the probe's deadline on a busy CI worker.
+    fn output_fixture(bytes: usize) -> Option<std::process::Output> {
+        use std::os::windows::process::CommandExt;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("bayan-output-{}-{stamp}.bin", std::process::id()));
+        std::fs::write(&path, vec![0; bytes]).expect("write output fixture");
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/d", "/s", "/c"])
+            .raw_arg("type \"%BAYAN_PROBE_FIXTURE%\" & exit /b 7")
+            .env("BAYAN_PROBE_FIXTURE", &path);
+        let output = run_with_timeout(cmd, Duration::from_secs(5));
+        std::fs::remove_file(path).expect("remove output fixture");
+        output
+    }
+
     #[test]
     fn probe_preserves_the_output_limit_and_the_child_exit_status() {
-        let mut cmd = Command::new("powershell.exe");
-        cmd.args([
-            "-NoProfile", "-NonInteractive", "-Command",
-            "$b=[byte[]]::new(1048576); [Console]::OpenStandardOutput().Write($b,0,$b.Length); exit 7",
-        ]);
-        let output =
-            run_with_timeout(cmd, Duration::from_secs(5)).expect("bounded output is allowed");
+        let output = output_fixture(MAX_PROBE_OUTPUT_BYTES).expect("bounded output is allowed");
         assert_eq!(output.stdout.len(), MAX_PROBE_OUTPUT_BYTES);
         assert!(output.stdout.iter().all(|&byte| byte == 0));
         assert_eq!(output.status.code(), Some(7));
@@ -194,14 +208,7 @@ mod tests {
 
     #[test]
     fn probe_rejects_output_larger_than_one_mebibyte() {
-        let mut cmd = Command::new("powershell.exe");
-        cmd.args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "$b=[byte[]]::new(1048577); [Console]::OpenStandardOutput().Write($b,0,$b.Length)",
-        ]);
-        assert!(run_with_timeout(cmd, Duration::from_secs(5)).is_none());
+        assert!(output_fixture(MAX_PROBE_OUTPUT_BYTES + 1).is_none());
     }
 
     #[cfg(windows)]

@@ -16,6 +16,8 @@ pub enum Action {
     NewTab,
     ClosePane,
     Search,
+    SearchRegex,
+    ExportHistory,
     Settings,
     Copy,
     Paste,
@@ -39,10 +41,12 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 23] = [
+    pub const ALL: [Action; 25] = [
         Action::NewTab,
         Action::ClosePane,
         Action::Search,
+        Action::SearchRegex,
+        Action::ExportHistory,
         Action::Settings,
         Action::Copy,
         Action::Paste,
@@ -71,6 +75,8 @@ impl Action {
             Action::NewTab => "new-tab",
             Action::ClosePane => "close-pane",
             Action::Search => "search",
+            Action::SearchRegex => "search-regex",
+            Action::ExportHistory => "export-history",
             Action::Settings => "settings",
             Action::Copy => "copy",
             Action::Paste => "paste",
@@ -132,7 +138,13 @@ impl Action {
             Action::NextGroup => crate::lang::pick(lang, "المجموعة التالية", "Next group"),
             Action::PrevGroup => crate::lang::pick(lang, "المجموعة السابقة", "Previous group"),
             Action::CopyMode => crate::lang::pick(lang, "وضع النسخ", "Copy mode"),
+            Action::SearchRegex => {
+                crate::lang::pick(lang, "بحث بتعبير نمطي", "Search regular expression")
+            }
             Action::CopyClean => crate::lang::pick(lang, "نسخ نظيف", "Copy clean"),
+            Action::ExportHistory => {
+                crate::lang::pick(lang, "تصدير سجل اللوحة", "Export pane history")
+            }
         }
     }
 
@@ -180,6 +192,8 @@ impl Action {
             Action::PrevGroup => c(true, true, PageUp),
             // X: WezTerm's ActivateCopyMode chord
             Action::CopyMode => c(true, true, Letter('x')),
+            Action::SearchRegex => c(true, true, Letter('f')),
+            Action::ExportHistory => c(true, true, Letter('s')),
             // Y for yank, cleaned. X is copy mode.
             Action::CopyClean => c(true, true, Letter('y')),
         }

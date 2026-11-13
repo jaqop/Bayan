@@ -207,7 +207,22 @@ fn find_match<T: alacritty_terminal::event::EventListener>(
     hl: &Option<Match>,
     dir: Direction,
 ) -> Option<Match> {
-    let Ok(mut rs) = RegexSearch::new(&term::regex_escape(query)) else {
+    find_match_mode(t, query, hl, dir, false)
+}
+
+fn find_match_mode<T: alacritty_terminal::event::EventListener>(
+    t: &mut alacritty_terminal::term::Term<T>,
+    query: &str,
+    hl: &Option<Match>,
+    dir: Direction,
+    regex: bool,
+) -> Option<Match> {
+    let pattern = if regex {
+        query.to_string()
+    } else {
+        term::regex_escape(query)
+    };
+    let Ok(mut rs) = RegexSearch::new(&pattern) else {
         return None;
     };
     let cols = t.columns();
@@ -998,6 +1013,7 @@ impl ClickTracker {
 #[derive(Default)]
 struct SearchState {
     query: String,
+    regex: bool,
     hl: Option<Match>,
     /// A seeded selection searches the exact source cells while the field
     /// shows readable logical Arabic. Editing returns to ordinary search.
@@ -1005,6 +1021,13 @@ struct SearchState {
 }
 
 impl SearchState {
+    fn push(&mut self, text: &str) {
+        let room = 4096usize.saturating_sub(self.query.chars().count());
+        self.query
+            .extend(text.chars().filter(|c| !c.is_control()).take(room));
+        self.hl = None;
+        self.selected_needle = None;
+    }
     fn from_selection(text: Option<&str>, claude: bool) -> Self {
         let query = selection_search_query(text, claude);
         let selected_needle = (!query.is_empty()).then(|| text.unwrap_or_default().to_string());
@@ -1012,6 +1035,7 @@ impl SearchState {
             query,
             hl: None,
             selected_needle,
+            regex: false,
         }
     }
 }
@@ -2827,7 +2851,7 @@ impl App {
                 }
                 self.remove_pane(ti, pi, el);
             }
-            Search => {
+            Search | SearchRegex => {
                 let selected = self
                     .session()
                     .and_then(|s| s.term.lock().selection_to_string());
@@ -2835,12 +2859,19 @@ impl App {
                     selected.as_deref(),
                     self.claude_active(),
                 ));
+                if action == SearchRegex {
+                    if let Some(st) = self.search.as_mut() {
+                        st.regex = true;
+                        st.selected_needle = None;
+                    }
+                }
                 self.request_redraw();
             }
             Settings => {
                 self.settings = Some(0);
                 self.request_redraw();
             }
+            ExportHistory => self.export_scrollback(),
             Copy => {
                 self.copy_selection(false);
             }
@@ -5974,6 +6005,44 @@ impl App {
         self.request_redraw();
     }
 
+    fn export_scrollback(&mut self) {
+        use std::io::Write;
+        let claude = self.claude_active();
+        let Some(session) = self.session() else {
+            return;
+        };
+        let text = copyclean::history_text(&session.term.lock(), claude);
+        let result = (|| -> std::io::Result<std::path::PathBuf> {
+            let dir = config::bayan_dir().join("exports");
+            std::fs::create_dir_all(&dir)?;
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = dir.join(format!("bayan-{stamp}-{}.txt", std::process::id()));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            file.write_all(text.as_bytes())?;
+            file.flush()?;
+            Ok(path)
+        })();
+        match result {
+            Ok(path) => {
+                self.config_notice = Some(ConfigNotice {
+                    text: format!("{}: {}", tr("حُفظ السجل", "History saved"), path.display()),
+                    until: Some(Instant::now() + std::time::Duration::from_secs(15)),
+                })
+            }
+            Err(err) => self.report_error(
+                tr("تعذر تصدير السجل", "Could not export history"),
+                &err.to_string(),
+            ),
+        }
+        self.request_redraw();
+    }
+
     fn paste(&mut self) {
         let Some(txt) = self.clipboard().and_then(|c| c.get_text().ok()) else {
             return;
@@ -6329,7 +6398,12 @@ impl App {
         let found = {
             let mut t = session.term.lock();
             let hl = self.search.as_ref().and_then(|s| s.hl.clone());
-            let m = find_match(&mut t, &query, &hl, dir);
+            let regex = self.search.as_ref().is_some_and(|s| s.regex);
+            let m = if regex {
+                find_match_mode(&mut t, &query, &hl, dir, true)
+            } else {
+                find_match(&mut t, &query, &hl, dir)
+            };
             if let Some(m) = &m {
                 // bring the hit into view, roughly centered
                 let cur = t.grid().display_offset() as i32;
@@ -6343,14 +6417,24 @@ impl App {
             self.drop_smooth(id);
         }
         self.invalidate_focused_links();
-        if let (Some(st), Some(m)) = (self.search.as_mut(), found) {
-            st.hl = Some(m);
+        if let Some(st) = self.search.as_mut() {
+            st.hl = found;
         }
         self.request_redraw();
     }
 
     /// Keyboard handling while the search bar is open.
     fn search_input(&mut self, event: &KeyEvent, shift: bool) {
+        if self.modifiers.control_key()
+            && !self.modifiers.alt_key()
+            && key_letter(event) == Some('v')
+        {
+            if let Some(text) = self.clipboard().and_then(|c| c.get_text().ok()) {
+                self.search_push(&text);
+            }
+            self.request_redraw();
+            return;
+        }
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => {
                 self.search = None;
@@ -6384,13 +6468,7 @@ impl App {
         let Some(st) = self.search.as_mut() else {
             return;
         };
-        for ch in t.chars() {
-            if !ch.is_control() {
-                st.query.push(ch);
-                st.hl = None;
-                st.selected_needle = None;
-            }
-        }
+        st.push(t);
     }
 
     fn redraw(&mut self) {
@@ -6485,6 +6563,9 @@ impl App {
                 attention: t.attention,
                 active: i == self.active,
                 progress: t.progress(),
+                color: self
+                    .config
+                    .session_color(t.name.as_deref().unwrap_or(&t.title)),
             })
             .collect();
         let config_notice = self.config_notice.clone();
@@ -6694,6 +6775,13 @@ impl App {
                     px.height as usize,
                     &tab_infos,
                     bar_text(self.search.as_ref().map(|s| s.query.as_str()), focused_copy)
+                        .map(|text| {
+                            if self.search.as_ref().is_some_and(|s| s.regex) {
+                                format!("[.*] {text}")
+                            } else {
+                                text
+                            }
+                        })
                         .as_deref(),
                     focused_claude,
                     elevate::title_badge(self.elevated),
@@ -9160,6 +9248,70 @@ mod tests {
         // no hits -> None, and a regex-special query is treated literally
         assert!(find_match(&mut t, "absent", &None, Direction::Left).is_none());
         assert!(find_match(&mut t, "needle (", &None, Direction::Left).is_none());
+    }
+
+    #[test]
+    fn regex_search_is_explicit_handles_errors_and_matches_real_history() {
+        use alacritty_terminal::{
+            event::VoidListener,
+            term::{Config, Term},
+            vte::ansi::Processor,
+        };
+        let mut t = Term::new(
+            Config::default(),
+            &TermSize { cols: 40, rows: 2 },
+            VoidListener,
+        );
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut t, "host 123\r\nمرحبا 456\r\ntail\r\n".as_bytes());
+        assert!(find_match(&mut t, r"host \d+", &None, Direction::Left).is_none());
+        let found = find_match_mode(&mut t, r"host \d+", &None, Direction::Left, true).unwrap();
+        assert!(found.start().line.0 < 0, "must search scrollback too");
+        assert!(find_match_mode(&mut t, r"مرحبا \d+", &None, Direction::Left, true).is_some());
+        assert!(find_match_mode(&mut t, "[", &None, Direction::Left, true).is_none());
+        let seed = SearchState::from_selection(Some("a.b"), false);
+        assert!(!seed.regex, "selected text remains literal");
+    }
+
+    #[test]
+    fn search_pasted_or_committed_text_is_bounded_and_never_submits_a_command() {
+        let mut st = SearchState::from_selection(Some("old"), false);
+        st.push("مرحبا\r\n\x03");
+        assert_eq!(st.query, "oldمرحبا");
+        assert!(st.selected_needle.is_none());
+        st.push(&"س".repeat(5000));
+        assert_eq!(st.query.chars().count(), 4096);
+        st.push("extra");
+        assert_eq!(st.query.chars().count(), 4096);
+    }
+
+    #[test]
+    fn exported_history_keeps_logical_arabic_wraps_and_the_selection() {
+        use alacritty_terminal::{
+            event::VoidListener,
+            term::{Config, Term},
+            vte::ansi::Processor,
+        };
+        let mut t = Term::new(
+            Config::default(),
+            &TermSize { cols: 12, rows: 2 },
+            VoidListener,
+        );
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut t, "مرحبا\r\nabcdefghijklmnop\r\nlast".as_bytes());
+        t.selection = Some(Selection::new(
+            SelectionType::Lines,
+            Point::new(Line(0), Column(0)),
+            Side::Left,
+        ));
+        let before = t.selection_to_string();
+        let text = copyclean::history_text(&t, false);
+        assert!(
+            text.starts_with("مرحبا\nabcdefghijklmnop\nlast"),
+            "{text:?}"
+        );
+        assert_eq!(t.selection_to_string(), before);
+        assert!(!text.contains('\x1b'));
     }
 
     /// A background tab's shell exiting must not move focus to a different

@@ -861,6 +861,15 @@ pub fn allow_osc52_write(
     copy_enabled && window_focused && from_focused_pane
 }
 
+/// Use a widely installed terminfo entry rather than a Bayan-only name
+/// that a remote machine would need to install before it can draw a TUI.
+fn terminal_environment(cmd: &mut CommandBuilder) {
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("TERM_PROGRAM", "Bayan");
+    cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    cmd.env("COLORTERM", "truecolor");
+}
+
 /// Longest cwd we will store or start a process in. Real Windows paths fit;
 /// a multi-kilobyte string in `session.json` is not a directory.
 const MAX_CWD_CHARS: usize = 4096;
@@ -2983,9 +2992,7 @@ impl Session {
         }
         // what programs key their terminal features on: Claude Code, ripgrep,
         // delta and the rest read these before deciding what to emit
-        cmd.env("TERM_PROGRAM", "Bayan");
-        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
-        cmd.env("COLORTERM", "truecolor");
+        terminal_environment(&mut cmd);
         // requested dir (a restored tab, or "new tab inherits the cwd"),
         // else the launcher's directory, else home.
         // accept_local_cwd runs BEFORE any probe: a UNC path must not be
@@ -6158,6 +6165,25 @@ mod tests {
         let (writes, loads) = host_feed(1, cfg, b"\x1b]52;c;?\x07");
         assert!(writes.is_empty(), "{writes:?}");
         assert_eq!(loads, vec![ClipboardType::Clipboard]);
+    }
+
+    #[test]
+    fn new_pty_advertises_a_standard_terminfo_entry_and_truecolor() {
+        let mut cmd = CommandBuilder::new("ssh.exe");
+        cmd.env("TERM", "unknown-parent-terminal");
+        terminal_environment(&mut cmd);
+        assert_eq!(
+            cmd.get_env("TERM"),
+            Some(std::ffi::OsStr::new("xterm-256color"))
+        );
+        assert_eq!(
+            cmd.get_env("COLORTERM"),
+            Some(std::ffi::OsStr::new("truecolor"))
+        );
+        assert_eq!(
+            cmd.get_env("TERM_PROGRAM"),
+            Some(std::ffi::OsStr::new("Bayan"))
+        );
     }
 
     struct KittyFixture {

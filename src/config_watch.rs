@@ -168,6 +168,12 @@ pub fn merge_reload(base: &UserConfig, live: &UserConfig, file: &UserConfig) -> 
         bg: merge_field(&base.bg, &live.bg, &file.bg, &mut overrode),
         fg: merge_field(&base.fg, &live.fg, &file.fg, &mut overrode),
         palette: merge_field(&base.palette, &live.palette, &file.palette, &mut overrode),
+        session_colors: merge_field(
+            &base.session_colors,
+            &live.session_colors,
+            &file.session_colors,
+            &mut overrode,
+        ),
         ligatures: merge_field(
             &base.ligatures,
             &live.ligatures,
