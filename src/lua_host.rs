@@ -61,6 +61,10 @@
 //! [`load_with`] takes that answer so tests can force either side. The JSON
 //! config is kept and a short Arabic notice is returned; no script is read.
 
+#[cfg(windows)]
+use crate::process::resume_process;
+use crate::process::{tie_to_job, JobGuard};
+
 use std::cell::RefCell;
 use std::fs;
 use std::io::Read;
@@ -1057,85 +1061,6 @@ fn supervise_child(mut child: std::process::Child, job: Option<JobGuard>) {
     let _ = child.kill();
     let _ = child.wait();
     drop(job);
-}
-
-/// A job that kills the process and anything it spawned when the handle
-/// closes. Absent off Windows, and best-effort if the job cannot be made.
-/// Called while the process is still suspended, so the job owns it before
-/// the first instruction runs.
-fn tie_to_job(_child: &std::process::Child) -> Option<JobGuard> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        };
-        // SAFETY: CreateJobObjectW returns a handle this function either
-        // closes or wraps in OwnedHandle. AssignProcessToJobObject borrows
-        // the process handle owned by `Child`. The information pointer is a
-        // local struct that outlives SetInformationJobObject.
-        unsafe {
-            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if job.is_null() {
-                return None;
-            }
-            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            if SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                &info as *const _ as *const _,
-                std::mem::size_of_val(&info) as u32,
-            ) == 0
-            {
-                let _ = CloseHandle(job);
-                return None;
-            }
-            if AssignProcessToJobObject(job, _child.as_raw_handle()) == 0 {
-                let _ = CloseHandle(job);
-                return None;
-            }
-            Some(JobGuard(OwnedHandle::from_raw_handle(job)))
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = _child;
-        None
-    }
-}
-
-/// Std closes the primary thread when CREATE_SUSPENDED is set and does not
-/// resume it. Resume the whole process after the job assignment.
-#[cfg(windows)]
-fn resume_process(child: &std::process::Child) {
-    use std::os::windows::io::AsRawHandle;
-    #[link(name = "ntdll")]
-    unsafe extern "system" {
-        fn NtResumeProcess(process: windows_sys::Win32::Foundation::HANDLE) -> i32;
-    }
-    // SAFETY: the handle is the live process from Command::spawn.
-    unsafe {
-        let _ = NtResumeProcess(child.as_raw_handle());
-    }
-}
-
-#[cfg(windows)]
-struct JobGuard(std::os::windows::io::OwnedHandle);
-#[cfg(not(windows))]
-struct JobGuard;
-
-#[cfg(windows)]
-impl Drop for JobGuard {
-    fn drop(&mut self) {
-        use std::os::windows::io::AsRawHandle;
-        // The field is the owned job handle. Dropping it after this function
-        // closes the handle, and that close kills the process tree.
-        let _ = self.0.as_raw_handle();
-    }
 }
 
 fn check_send(text: &str) -> Result<(), String> {

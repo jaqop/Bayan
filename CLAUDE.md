@@ -54,7 +54,7 @@ selection and BiDi paths must do.
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-831 tests across the tree. `render.rs` (100), `term.rs` (99) and `link.rs`
+838 tests across the tree. `render.rs` (103), `term.rs` (99) and `link.rs`
 (66) carry the most; `lua_host.rs` has 46, `shellint.rs` 24, `images.rs` and
 `localpath.rs` 21 each, `mux.rs` 15, `config_watch.rs` 14, `screen_reader.rs`
 11 and `ssh.rs` 7. Three more in `term.rs` are `#[ignore]`d probes, run by
@@ -332,6 +332,7 @@ key identity or typed text:
 | `BAYAN_POSH=1` | open the oh-my-posh prompt picker at startup |
 | `BAYAN_TOAST=<title\|1>` | fire a sample toast at startup (M19 A/B loops without rebuilding) |
 | `BAYAN_ATLAS_STRESS=1` | shape a large spread of unique glyphs to force page-1 atlas growth |
+| `BAYAN_ATLAS_RESET=1` | fill the real allocator to its eight-page cap once per renderer, before frame geometry; verify the white texel, backgrounds, cursor and text survive the reset |
 | `BAYAN_PROFILE=1` | startup timeline marks to `%TEMP%\bayan_profile.log` (EasyTer's `EASYTER_PROFILE` pattern), zero cost when unset. Key presses log modifiers only, never the key. Also key-to-frame latency samples and a summary every 25 (see Measuring) |
 
 Start with `Start-Process -PassThru`, sleep ~6s for GPU init, capture the
