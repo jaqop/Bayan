@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'scripts/package-release.ps1'
+      - 'scripts/install-conpty.ps1'
+      - 'resources/conpty.json'
+      - 'resources/ConPTY-LICENSE.txt'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'LICENSE'
+      - 'NOTICE'
+      - 'fonts/OFL*.txt'
+  workflow_dispatch:
+
+permissions: {}
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: release zip (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - name: Check version and tag
+        id: version
+        shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
+          $version = ($metadata | ConvertFrom-Json).packages[0].version
+          if ($env:REF_TYPE -eq 'tag' -and "v$version" -ne $env:REF_NAME) {
+            throw 'Tag does not match Cargo.toml version'
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+      # Deliberately no branch-written Rust cache for release packaging.
+      - name: Build
+        run: cargo build --locked --release
+      - name: Package and verify archive contents
+        shell: pwsh
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/package-release.ps1 -Version $env:PACKAGE_VERSION
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bayan-release-windows
+          if-no-files-found: error
+          path: |
+            dist/*.zip
+            dist/*.sha256
+
+  draft:
+    name: draft release (tags only)
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bayan-release-windows
+          path: dist
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" --draft --verify-tag --title "Bayan $RELEASE_TAG" --generate-notes dist/*.zip dist/*.sha256
