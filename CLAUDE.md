@@ -328,6 +328,18 @@ so a still terminal stops rendering. Anything that churns state every frame
 silently destroys both. The atlas grows a new texture-array *page* when one
 fills — it does not wipe.
 
+**A minimized, hidden, or occluded window does not enter `redraw`.**
+`request_redraw` is the only call to `Window::request_redraw`. When the
+window is not showing it sets a dirty flag and returns: no winit redraw, so
+`RedrawRequested` does not call `redraw` (the idle perf gate counts entries
+there, and presents inside it, and both must stay zero while minimized with
+a busy background tab). PTY reads, bells, toasts, and attention still run.
+The ~600ms busy-dot pulse is scheduled only while the window is showing; a
+background tab's grid is not a reason to paint. Restoring, unoccluding, or
+summoning requests one frame, and cursor blink is armed again from the next
+wait. Do not add another direct `redraw()` or `request_redraw()` on the
+window for a hidden state.
+
 ## Build, test, verify
 
 ```

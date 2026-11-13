@@ -1615,6 +1615,14 @@ processes. `BAYAN_ATLAS_RESET=1` in a debug build (or a release built with
 The checked window retained Arabic, colored backgrounds, selection/copy,
 font/theme switching and config hot reload after these resets.
 
+A minimized, quake-hidden, or occluded window does not paint. PTY output is
+still read, and bells, toasts, and the tab attention dot are still recorded;
+the frame is drawn once when the window is shown again, and cursor blink
+resumes from that frame. While the window is up, a busy background tab keeps
+the 600ms tab-bar dot and does not repaint its own grid on every read. The
+decision is `gate_paint` / `plan_idle` / `minimized_now` (eight unit tests).
+Nothing visible means `ControlFlow::Wait`, not a timer.
+
 Bayan now starts with one fresh tab. To opt into reopening saved tabs and panes,
 set `"restore_tabs": true` in config. Window position and size still persist.
 

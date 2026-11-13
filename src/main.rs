@@ -97,6 +97,106 @@ type PaneSnap = (
 /// The Windows caret rhythm; kitty's idea on top: stop after 15s idle.
 const BLINK_MS: u128 = 530;
 const BLINK_STOP: std::time::Duration = std::time::Duration::from_secs(15);
+/// Busy-dot heartbeat. Only while the window is showing: a background tab's
+/// green dot fades ~2s after its last output, and the tab bar is the only
+/// thing this tick paints.
+const BUSY_PULSE: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// What a paint request is allowed to do.
+///
+/// `Redraw` calls into winit. `Defer` remembers that a frame is owed and
+/// does not: a minimized, hidden, or occluded window must not enter
+/// `redraw` (that entry is what the idle perf gate counts). `Skip` is a
+/// background tab's grid while the window is up — the bytes are already
+/// applied, and the busy-dot pulse paints the tab bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaintGate {
+    Redraw,
+    Defer,
+    Skip,
+}
+
+/// `on_screen` is the active tab's grid, or chrome (title, bell, cwd,
+/// progress, the busy-dot pulse). A background tab's own grid is not.
+fn gate_paint(window_shown: bool, on_screen: bool) -> PaintGate {
+    if !window_shown {
+        PaintGate::Defer
+    } else if on_screen {
+        PaintGate::Redraw
+    } else {
+        PaintGate::Skip
+    }
+}
+
+/// The window can be drawn. Occluded, minimized, and quake-hidden are each
+/// enough to stop every paint.
+fn window_paints(occluded: bool, minimized: bool, hidden: bool) -> bool {
+    !occluded && !minimized && !hidden
+}
+
+/// Windows reports a minimized window as a 0×0 client size, and
+/// `Window::is_minimized` is the iconic bit. Either one means minimized.
+/// `None` (the query failed) does not.
+fn minimized_now(size_empty: bool, is_minimized: Option<bool>) -> bool {
+    size_empty || is_minimized.unwrap_or(false)
+}
+
+/// Drop the minimized flag only when the OS shows a real client size and
+/// says the window is not iconic. An unknown query keeps the flag, so a
+/// failed `is_minimized` cannot resume painting on its own.
+fn minimized_cleared(size_empty: bool, is_minimized: Option<bool>) -> bool {
+    !size_empty && is_minimized == Some(false)
+}
+
+/// One paint when the window goes from not showing to showing. A later
+/// event in the same restore must not ask again just because it also
+/// noticed.
+fn became_shown(was_shown: bool, now_shown: bool) -> bool {
+    !was_shown && now_shown
+}
+
+/// Visual deadlines the loop may arm, before visibility is applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WakeInputs {
+    shown: bool,
+    /// A background tab produced output inside the busy-dot window.
+    background_busy: bool,
+    blink: Option<Instant>,
+    scroll: Option<Instant>,
+    scrollbar: Option<Instant>,
+    notice: Option<Instant>,
+    /// Screen reader. Not a paint, so it still wakes a hidden window.
+    reader: Option<Instant>,
+}
+
+/// The next `ControlFlow` deadline, and whether the busy-dot pulse paints
+/// on this turn. `wake == None` is `ControlFlow::Wait`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WakePlan {
+    pulse_redraw: bool,
+    wake: Option<Instant>,
+}
+
+fn plan_idle(now: Instant, pulse: std::time::Duration, src: WakeInputs) -> WakePlan {
+    let mut wake: Option<Instant> = None;
+    let mut push = |at: Option<Instant>| {
+        if let Some(at) = at {
+            wake = Some(wake.map_or(at, |earliest| earliest.min(at)));
+        }
+    };
+    let pulse_redraw = src.shown && src.background_busy;
+    if src.shown {
+        if src.background_busy {
+            push(Some(now + pulse));
+        }
+        push(src.blink);
+        push(src.scroll);
+        push(src.scrollbar);
+        push(src.notice);
+    }
+    push(src.reader);
+    WakePlan { pulse_redraw, wake }
+}
 
 /// The shortcuts editor overlay's state.
 #[derive(Default)]
@@ -1835,6 +1935,17 @@ struct App {
     last_input: Instant,
     /// the blink phase the last frame actually drew (change → redraw)
     blink_drawn_on: bool,
+    /// `WindowEvent::Occluded(true)`. Windows does not emit this today;
+    /// minimized and hidden cover the cases it does not.
+    occluded: std::cell::Cell<bool>,
+    /// Client size is 0×0, or `Window::is_minimized`.
+    minimized: std::cell::Cell<bool>,
+    /// Quake hide, or `is_visible() == Some(false)` after the first frame.
+    /// The startup window is created hidden and is not this: the first
+    /// frame still has to paint.
+    hidden: std::cell::Cell<bool>,
+    /// A paint was skipped while the window was not showing.
+    frame_dirty: std::cell::Cell<bool>,
     /// the settings panel (Ctrl+,) with its selected row, when open
     settings: Option<usize>,
     /// window focus (finish notifications only fire when nobody's looking)
@@ -2121,6 +2232,10 @@ impl App {
             link_cache: link::SpanCache::default(),
             last_input: Instant::now(),
             blink_drawn_on: true,
+            occluded: std::cell::Cell::new(false),
+            minimized: std::cell::Cell::new(false),
+            hidden: std::cell::Cell::new(false),
+            frame_dirty: std::cell::Cell::new(false),
             settings: None,
             focused: false,
             clicks: ClickTracker::new(),
@@ -2182,10 +2297,109 @@ impl App {
         }
     }
 
+    /// Ask winit for one frame, or remember it.
+    ///
+    /// Every paint goes through here (heal retries included). A window that
+    /// is occluded, minimized, or hidden does not get `Window::request_redraw`
+    /// and does not enter `redraw`: the frame is marked dirty and drawn
+    /// once when the window is showing again. PTY reads, bells, and titles
+    /// keep updating; only the paint is held.
     fn request_redraw(&self) {
-        if let Some(w) = &self.window {
-            w.request_redraw();
+        match gate_paint(self.shown(), true) {
+            PaintGate::Redraw => {
+                self.frame_dirty.set(false);
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            PaintGate::Defer => self.frame_dirty.set(true),
+            PaintGate::Skip => {}
         }
+    }
+
+    /// The window is on screen. Before the first present the real window is
+    /// still hidden on purpose, and this stays true so that frame can land.
+    /// After it, a 0×0 size, the iconic bit, or `is_visible() == false`
+    /// latches minimized or hidden. Those latches are cleared by the
+    /// restore path, not here — a minimize that has not reached
+    /// `IsIconic` yet must not be undone by a stale query.
+    fn shown(&self) -> bool {
+        if self.occluded.get() {
+            return false;
+        }
+        self.observe_window();
+        window_paints(false, self.minimized.get(), self.hidden.get())
+    }
+
+    fn observe_window(&self) {
+        if !self.first_frame {
+            return;
+        }
+        let Some(w) = &self.window else {
+            return;
+        };
+        let size = w.inner_size();
+        let empty = size.width == 0 || size.height == 0;
+        if minimized_now(empty, w.is_minimized()) {
+            self.minimized.set(true);
+        }
+        if w.is_visible() == Some(false) {
+            self.hidden.set(true);
+        }
+    }
+
+    /// The OS reports a restored window (real size, not iconic) after we
+    /// had latched minimized. One paint, and only when nothing else is
+    /// still hiding the window.
+    fn release_minimized_if_restored(&self) {
+        if !self.first_frame || !self.minimized.get() {
+            return;
+        }
+        let Some(w) = &self.window else {
+            return;
+        };
+        let size = w.inner_size();
+        let empty = size.width == 0 || size.height == 0;
+        if !minimized_cleared(empty, w.is_minimized()) {
+            return;
+        }
+        // The flag was set, so the window was not showing. Clearing it
+        // paints only when occlusion and quake-hide are clear too.
+        self.minimized.set(false);
+        if window_paints(self.occluded.get(), false, self.hidden.get()) {
+            self.request_redraw();
+        }
+    }
+
+    /// Quake summon and the toast click: the window is being put on screen.
+    fn reveal_window(&self) {
+        self.hidden.set(false);
+        self.minimized.set(false);
+        self.occluded.set(false);
+        if let Some(w) = &self.window {
+            w.set_visible(true);
+            w.set_minimized(false);
+            w.focus_window();
+        }
+        self.apply_opacity();
+        self.request_redraw();
+    }
+
+    fn set_occluded(&self, occluded: bool) {
+        let was_shown = self.flags_shown();
+        self.occluded.set(occluded);
+        if became_shown(was_shown, self.flags_shown()) {
+            self.request_redraw();
+        }
+    }
+
+    fn flags_shown(&self) -> bool {
+        window_paints(self.occluded.get(), self.minimized.get(), self.hidden.get())
+    }
+
+    /// A pane of the tab that is on screen. Background tabs are not.
+    fn pane_on_active_tab(&self, id: u64) -> bool {
+        self.find_pane(id).is_some_and(|(ti, _)| ti == self.active)
     }
 
     /// Re-read High Contrast and the text-size slider. A real change
@@ -6780,6 +6994,13 @@ impl App {
         st.push(t);
     }
 
+    /// Paint one frame.
+    ///
+    /// Callers enter this only while the window is showing. The minimized
+    /// idle gate counts entries here and presents inside it, and requires
+    /// both to stay at zero while a minimized window has a busy background
+    /// tab. `RedrawRequested` checks first; do not add an early return in
+    /// front of that count.
     fn redraw(&mut self) {
         // Before a client, this is a flag check. After one, an unchanged
         // stamp does not walk the grid; a flood builds at about 10 Hz.
@@ -6878,7 +7099,9 @@ impl App {
             })
             .collect();
         let config_notice = self.config_notice.clone();
-        let Some(window) = self.window.as_ref() else {
+        // Owned Arc so a later `request_redraw` can borrow `self` while
+        // this handle is still used for the present and the first show.
+        let Some(window) = self.window.clone() else {
             return;
         };
         let px = window.inner_size();
@@ -7332,9 +7555,11 @@ impl App {
             .collect();
         if !gpu.render(&verts, &quads, bg) {
             // Retry once after reconfiguring, without spinning on occlusion.
+            // `request_redraw` no-ops while the window is not showing, so a
+            // surface that comes back occluded does not schedule another entry.
             self.last_frame_size = None;
             if surface_resized || heal {
-                window.request_redraw();
+                self.request_redraw();
             }
             return;
         }
@@ -7343,11 +7568,14 @@ impl App {
         self.last_frame.extend_from_slice(frame_key);
         self.last_frame_size = Some(px);
         if heal {
-            window.request_redraw();
+            self.request_redraw();
         }
         if !self.first_frame {
             self.first_frame = true;
             window.set_visible(true);
+            // ShowWindow can deliver a paint before it returns. That paint
+            // must not latch "hidden" from the pre-show visibility bit.
+            self.hidden.set(false);
             // winit reapplies ITS OWN style flags on visibility changes,
             // wiping the layered bit — restore the configured alpha after
             self.apply_opacity();
@@ -7394,7 +7622,25 @@ impl App {
         // the chunk may have enabled focus reporting; tell the
         // program whether the window is looking at it
         self.sync_focus(None);
-        self.request_redraw();
+        // The grid is already updated. Paint only the tab that is on
+        // screen, and not at all while the window itself is hidden:
+        // a deferred frame is drawn once on restore. A background tab
+        // while the window is up leaves the busy-dot pulse to repaint
+        // the tab bar; this chunk does not.
+        let on_screen = self.pane_on_active_tab(id);
+        match gate_paint(self.shown(), on_screen) {
+            PaintGate::Redraw => self.request_redraw(),
+            PaintGate::Defer => {
+                self.frame_dirty.set(true);
+                // The active tab is what the screen reader speaks. Publish
+                // without entering `redraw`, so a hidden window still
+                // announces and a minimized one does not present.
+                if on_screen {
+                    self.publish_reader();
+                }
+            }
+            PaintGate::Skip => {}
+        }
     }
 }
 
@@ -7605,6 +7851,7 @@ impl ApplicationHandler<UserEvent> for App {
                     let background = ti != self.active;
                     if background {
                         self.tabs[ti].attention = true;
+                        // Hidden/minimized/occluded: dirty only, no redraw.
                         self.request_redraw();
                     }
                     // sound only when you could have missed it: another tab,
@@ -7661,7 +7908,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some((ti, pi)) = self.find_pane(id) {
                     if self.tabs[ti].panes[pi].progress != p {
                         self.tabs[ti].panes[pi].progress = p;
-                        self.request_redraw(); // the tab bar and cockpit draw it
+                        // The tab bar draws it. A hidden window defers the paint.
+                        self.request_redraw();
                     }
                 }
             }
@@ -7683,6 +7931,8 @@ impl ApplicationHandler<UserEvent> for App {
                             let body = self.tabs[ti].label();
                             self.toast_from_pty(title, &body);
                         }
+                        // Attention and the toast are already recorded. The
+                        // paint waits if the window is not showing.
                         self.request_redraw();
                     }
                 }
@@ -7703,7 +7953,7 @@ impl ApplicationHandler<UserEvent> for App {
                         self.tabs[ti].title = base;
                     }
                 }
-                self.request_redraw(); // tab titles live in the frame
+                self.request_redraw(); // tab title; deferred while the window is hidden
             }
             UserEvent::RendererReady(r) => {
                 crate::prof::mark("renderer ready");
@@ -7813,76 +8063,83 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        // quake toggle: summon Bayan from anywhere / tuck it away again
+        // quake toggle: summon Bayan from anywhere / tuck it away again.
+        // Hiding latches before the paint schedule below, so this turn
+        // does not arm a blink or a busy-dot wake.
         if QUAKE_HIT.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            if let Some(w) = &self.window {
-                if self.focused && w.is_visible().unwrap_or(true) {
+            let visible = self
+                .window
+                .as_ref()
+                .is_some_and(|w| w.is_visible().unwrap_or(true));
+            if self.focused && visible {
+                self.hidden.set(true);
+                if let Some(w) = &self.window {
                     w.set_visible(false);
-                } else {
-                    w.set_visible(true);
-                    w.set_minimized(false);
-                    w.focus_window();
-                    self.apply_opacity(); // set_visible wipes the layered bit
                 }
+            } else {
+                self.reveal_window();
             }
         }
         // a toast/tray click summons (never hides — that's the quake key)
         if SUMMON_HIT.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            if let Some(w) = &self.window {
-                w.set_visible(true);
-                w.set_minimized(false);
-                w.focus_window();
-                self.apply_opacity(); // set_visible wipes the layered bit
-            }
+            self.reveal_window();
         }
         // High Contrast or the text-size slider changed. Re-read now; a
         // rebuild applies it on the next frame, without restarting.
         if A11Y_DIRTY.swap(false, std::sync::atomic::Ordering::Relaxed) {
             self.reload_a11y();
         }
-        // busy dots decay after ~2s of quiet: keep repainting on a slow
-        // heartbeat only while any background tab is (or just was) active
-        let any_busy = self
+        self.observe_window();
+        self.release_minimized_if_restored();
+        // Busy dots, blink, smooth scroll, and the scrollbar are paints.
+        // None of them are scheduled while the window is not showing, so
+        // the loop can Wait. The screen reader is not a paint and still
+        // wakes. A background tab's grid is not painted here either; the
+        // pulse only refreshes the tab-bar dot, and only while visible.
+        let shown = self.shown();
+        let background_busy = self
             .tabs
             .iter()
             .enumerate()
             .any(|(i, t)| t.busy(i == self.active));
-        let mut wake: Option<Instant> = None;
-        if any_busy {
-            wake = Some(Instant::now() + std::time::Duration::from_millis(600));
-            self.request_redraw();
-        }
-        // cursor blink: wake exactly at the next phase flip (or the 15s
-        // park); an idle window schedules nothing and truly sleeps
-        let (blink_on, blink_wake) = self.cursor_blink_state();
-        if blink_on != self.blink_drawn_on {
-            self.request_redraw();
-        }
-        if let Some(b) = blink_wake {
-            wake = Some(wake.map_or(b, |w| w.min(b)));
-        }
-        if let Some(t) = self.tick_smooth_scroll() {
-            wake = Some(wake.map_or(t, |w| w.min(t)));
-        }
-        // a scrollbar that auto-hides wakes once, then the next frame drops
-        // it and the window goes back to sleeping
-        let tick = self
-            .bars
-            .tick(self.config.scrollbar.autohide_on(), Instant::now());
-        if tick.redraw {
-            self.request_redraw();
-        }
-        if let Some(t) = tick.wake {
-            wake = Some(wake.map_or(t, |w| w.min(t)));
-        }
-        if let Some(until) = self.config_notice.as_ref().and_then(|notice| notice.until) {
-            if Instant::now() >= until {
-                self.config_notice = None;
+        let blink = if shown {
+            let (blink_on, blink_wake) = self.cursor_blink_state();
+            if blink_on != self.blink_drawn_on {
                 self.request_redraw();
-            } else {
-                wake = Some(wake.map_or(until, |w| w.min(until)));
             }
-        }
+            blink_wake
+        } else {
+            None
+        };
+        let scroll = if shown {
+            self.tick_smooth_scroll()
+        } else {
+            None
+        };
+        let scrollbar = if shown {
+            let tick = self
+                .bars
+                .tick(self.config.scrollbar.autohide_on(), Instant::now());
+            if tick.redraw {
+                self.request_redraw();
+            }
+            tick.wake
+        } else {
+            None
+        };
+        let notice = if shown {
+            let until = self.config_notice.as_ref().and_then(|notice| notice.until);
+            match until {
+                Some(until) if Instant::now() >= until => {
+                    self.config_notice = None;
+                    self.request_redraw();
+                    None
+                }
+                until => until,
+            }
+        } else {
+            None
+        };
         // The burst is spoken once the hold elapses, and a stamp that
         // arrived inside the 10 Hz window is published when that window ends.
         let now = Instant::now();
@@ -7891,14 +8148,27 @@ impl ApplicationHandler<UserEvent> for App {
         {
             self.publish_reader();
         }
-        let soon = match (self.reader_deadline, self.reader_tree_at) {
+        let reader = match (self.reader_deadline, self.reader_tree_at) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        if let Some(at) = soon {
-            wake = Some(wake.map_or(at, |w| w.min(at)));
+        let plan = plan_idle(
+            now,
+            BUSY_PULSE,
+            WakeInputs {
+                shown,
+                background_busy,
+                blink,
+                scroll,
+                scrollbar,
+                notice,
+                reader,
+            },
+        );
+        if plan.pulse_redraw {
+            self.request_redraw();
         }
-        match wake {
+        match plan.wake {
             Some(t) => el.set_control_flow(ControlFlow::WaitUntil(t)),
             None => el.set_control_flow(ControlFlow::Wait),
         }
@@ -7938,7 +8208,20 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseWheel { delta, .. } => self.mouse_wheel(delta),
             WindowEvent::KeyboardInput { event, .. } => self.key_input(&event, el),
             WindowEvent::Ime(ime) => self.ime_input(ime),
-            WindowEvent::RedrawRequested => self.redraw(),
+            // winit does not emit this on Windows today. Handle it anyway:
+            // a build that starts sending it, and every other backend,
+            // must stop painting while the window is covered.
+            WindowEvent::Occluded(occluded) => self.set_occluded(occluded),
+            // Do not enter `redraw` while the window is not showing. The
+            // idle perf gate counts entries to `redraw`; an OS paint of a
+            // minimized window has to miss that function entirely.
+            WindowEvent::RedrawRequested => {
+                if self.shown() {
+                    self.redraw();
+                } else {
+                    self.frame_dirty.set(true);
+                }
+            }
             WindowEvent::ThemeChanged(theme) => {
                 // winit emits this from WM_SETTINGCHANGE only while the
                 // window's preferred theme is unset. Do not call set_theme.
@@ -8622,6 +8905,155 @@ mod tests {
         assert!(!super::frame_unchanged(true, b"quads", b"quads", true));
         assert!(!super::frame_unchanged(false, b"quads", b"quads", false));
         assert!(!super::frame_unchanged(true, b"old", b"new", false));
+    }
+
+    #[test]
+    fn occluded_minimized_or_hidden_is_not_paintable() {
+        assert!(super::window_paints(false, false, false));
+        assert!(!super::window_paints(true, false, false), "occluded");
+        assert!(!super::window_paints(false, true, false), "minimized");
+        assert!(!super::window_paints(false, false, true), "hidden");
+        assert!(!super::window_paints(true, true, true));
+    }
+
+    #[test]
+    fn minimized_is_a_zero_size_or_the_iconic_bit() {
+        assert!(super::minimized_now(true, Some(false)), "0×0 is minimized");
+        assert!(super::minimized_now(true, None));
+        assert!(
+            super::minimized_now(false, Some(true)),
+            "iconic wins over a stale size"
+        );
+        assert!(!super::minimized_now(false, Some(false)));
+        assert!(
+            !super::minimized_now(false, None),
+            "a failed query is not minimized"
+        );
+        assert!(super::minimized_cleared(false, Some(false)));
+        assert!(!super::minimized_cleared(true, Some(false)), "still 0×0");
+        assert!(!super::minimized_cleared(false, Some(true)));
+        assert!(
+            !super::minimized_cleared(false, None),
+            "unknown iconic state keeps the latch"
+        );
+    }
+
+    #[test]
+    fn restore_paints_once_when_the_window_becomes_visible() {
+        assert!(super::became_shown(false, true));
+        assert!(
+            !super::became_shown(true, true),
+            "a resize is not a restore"
+        );
+        assert!(!super::became_shown(true, false));
+        assert!(!super::became_shown(false, false));
+    }
+
+    /// Bell, cwd, title, and the active tab's PTY all ask for a frame.
+    /// While the window is hidden that ask is deferred. A background tab's
+    /// grid never paints on its own chunk.
+    #[test]
+    fn paint_gate_defers_when_hidden_and_skips_a_background_grid() {
+        use super::PaintGate;
+        assert_eq!(super::gate_paint(false, true), PaintGate::Defer);
+        assert_eq!(super::gate_paint(false, false), PaintGate::Defer);
+        assert_eq!(super::gate_paint(true, true), PaintGate::Redraw);
+        assert_eq!(super::gate_paint(true, false), PaintGate::Skip);
+
+        // A burst of PTY, bell, and title events while minimized must not
+        // enter redraw. The dirty bit is what the restore paints.
+        let mut redraws = 0u32;
+        let mut dirty = false;
+        for on_screen in [true, false, true] {
+            match super::gate_paint(false, on_screen) {
+                PaintGate::Redraw => redraws += 1,
+                PaintGate::Defer => dirty = true,
+                PaintGate::Skip => {}
+            }
+        }
+        assert_eq!(redraws, 0);
+        assert!(dirty);
+    }
+
+    #[test]
+    fn minimized_busy_tab_arms_no_timer_and_does_not_pulse() {
+        let now = Instant::now();
+        let plan = super::plan_idle(
+            now,
+            super::BUSY_PULSE,
+            super::WakeInputs {
+                shown: false,
+                background_busy: true,
+                blink: Some(now + Duration::from_millis(530)),
+                scroll: Some(now + Duration::from_millis(8)),
+                scrollbar: Some(now + Duration::from_millis(100)),
+                notice: Some(now + Duration::from_secs(8)),
+                reader: None,
+            },
+        );
+        assert!(!plan.pulse_redraw);
+        assert_eq!(plan.wake, None, "ControlFlow::Wait, no visual timer");
+    }
+
+    #[test]
+    fn visible_busy_background_tab_keeps_the_dot_pulse() {
+        let now = Instant::now();
+        let soon = now + Duration::from_millis(50);
+        let plan = super::plan_idle(
+            now,
+            super::BUSY_PULSE,
+            super::WakeInputs {
+                shown: true,
+                background_busy: true,
+                blink: Some(soon),
+                scroll: None,
+                scrollbar: None,
+                notice: None,
+                reader: None,
+            },
+        );
+        assert!(plan.pulse_redraw);
+        assert_eq!(plan.wake, Some(soon), "the earlier blink wins over 600ms");
+    }
+
+    #[test]
+    fn a_reader_deadline_still_wakes_a_hidden_window() {
+        let now = Instant::now();
+        let at = now + Duration::from_millis(100);
+        let plan = super::plan_idle(
+            now,
+            super::BUSY_PULSE,
+            super::WakeInputs {
+                shown: false,
+                background_busy: true,
+                blink: Some(now + Duration::from_millis(10)),
+                scroll: None,
+                scrollbar: None,
+                notice: None,
+                reader: Some(at),
+            },
+        );
+        assert!(!plan.pulse_redraw);
+        assert_eq!(plan.wake, Some(at));
+    }
+
+    #[test]
+    fn an_idle_visible_window_waits_without_a_timer() {
+        let plan = super::plan_idle(
+            Instant::now(),
+            super::BUSY_PULSE,
+            super::WakeInputs {
+                shown: true,
+                background_busy: false,
+                blink: None,
+                scroll: None,
+                scrollbar: None,
+                notice: None,
+                reader: None,
+            },
+        );
+        assert!(!plan.pulse_redraw);
+        assert_eq!(plan.wake, None);
     }
 
     use super::*;
