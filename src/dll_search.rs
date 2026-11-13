@@ -532,6 +532,41 @@ mod tests {
         Path::new(r"C:\Windows\System32")
     }
 
+    /// Line comments removed, so a note that names a refused API is not a use of it.
+    fn rust_code(src: &str) -> String {
+        let mut out = String::new();
+        let mut chars = src.chars().peekable();
+        let mut in_string = false;
+        let mut escape = false;
+        while let Some(c) = chars.next() {
+            if in_string {
+                out.push(c);
+                if escape {
+                    escape = false;
+                } else if c == '\\' {
+                    escape = true;
+                } else if c == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            if c == '"' {
+                in_string = true;
+                out.push(c);
+                continue;
+            }
+            if c == '/' && chars.peek() == Some(&'/') {
+                chars.next();
+                while chars.peek().is_some_and(|next| *next != '\n') {
+                    chars.next();
+                }
+                continue;
+            }
+            out.push(c);
+        }
+        out
+    }
+
     #[test]
     fn system32_graphics_dll_accepts_only_the_allowlist() {
         let got = system32_graphics_dll(system(), "D3D12.DLL").unwrap();
@@ -629,7 +664,8 @@ mod tests {
     #[test]
     fn shaders_use_fxc_even_when_a_dxc_dll_is_sitting_there() {
         assert_eq!(dx12_shader_compiler(), Dx12ShaderCompiler::Fxc);
-        let gpu = include_str!("gpu.rs");
+        // Comments may name the default we refused. Only the code is checked.
+        let gpu = rust_code(include_str!("gpu.rs"));
         assert!(
             gpu.contains("Dx12Compiler::Fxc"),
             "the instance must ask for FXC"
