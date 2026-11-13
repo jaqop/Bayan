@@ -2368,6 +2368,8 @@ pub struct Renderer {
     pub hover_caption: Option<usize>,
     /// pointer over the settings gear
     pub hover_gear: bool,
+    /// End of the tabs in the last painted bar, shared with menu hit testing.
+    shell_menu_end: i32,
     /// IME composition text, drawn at the focused cursor. winit keeps the
     /// IME's own composition window hidden, so this is the only place
     /// the text being composed shows.
@@ -2598,6 +2600,7 @@ impl Renderer {
             mapping_context: None,
             hover_caption: None,
             hover_gear: false,
+            shell_menu_end: 0,
             preedit: None,
             ime_spot: None,
             font_system,
@@ -7405,6 +7408,8 @@ impl Renderer {
             .tab_rects(width, &titles, active)
             .last()
             .map_or(0, |r| r.1 + r.2);
+        self.shell_menu_end = end;
+        let end = self.tab_controls(width)[3].0 + self.tab_controls(width)[3].2;
         if claude {
             let label = [Seg::plain(
                 "● Claude",
@@ -7441,9 +7446,32 @@ impl Renderer {
             }
         }
 
-        for (rect, glyph) in self.tab_controls(width).iter().zip(["‹", "›", "+", "⌄"]) {
+        for (i, (rect, glyph)) in self
+            .tab_controls(width)
+            .iter()
+            .zip(["‹", "›", "+", ""])
+            .enumerate()
+        {
             let (bx, by, bw, bh) = *rect;
             push_rect(out, whole, bx, by, bw, bh, c4(bar_bg, 255));
+            if i == 3 {
+                // A compact chevron independent of the terminal font's glyph metrics.
+                let scale = self.dpi_scale.max(1.0).round() as i32;
+                let cx = bx + bw / 2;
+                let cy = by + bh / 2;
+                for dx in -4i32..=4 {
+                    push_rect(
+                        out,
+                        whole,
+                        cx + dx * scale,
+                        cy + (2 - dx.abs()) * scale,
+                        scale,
+                        2 * scale,
+                        c4(self.chrome_fg(), 255),
+                    );
+                }
+                continue;
+            }
             let seg = [Seg::plain(glyph, self.chrome_fg())];
             let gw = self.measure(&seg, false);
             self.draw_run(
@@ -7551,7 +7579,10 @@ impl Renderer {
     pub fn tab_controls(&self, width: usize) -> [Rect; 4] {
         let (gear_x, _, bw, _) = self.settings_button_rect(width);
         let h = self.tab_bar_h().round() as i32;
-        std::array::from_fn(|i| (gear_x - (4 - i as i32) * bw, 0, bw, h))
+        let mut controls = std::array::from_fn(|i| (gear_x - (4 - i as i32) * bw, 0, bw, h));
+        controls[3].0 =
+            (self.shell_menu_end.max(self.tabs_x0()) + 4).min((controls[0].0 - bw).max(0));
+        controls
     }
 
     pub fn tab_control_hit(&self, width: usize, px: f64, py: f64) -> Option<usize> {
@@ -7705,7 +7736,8 @@ impl Renderer {
         active: usize,
     ) -> Vec<(usize, i32, i32)> {
         let x0 = self.tabs_x0();
-        let available = (self.tab_controls(width)[0].0 - x0).max(0);
+        let available =
+            (self.tab_controls(width)[0].0 - self.settings_button_rect(width).2 - 8 - x0).max(0);
         if titles.is_empty() || available == 0 {
             return Vec::new();
         }
@@ -8772,6 +8804,40 @@ mod tests {
     }
 
     #[test]
+    fn shell_menu_follows_the_drawn_tabs() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        for width in [800, 1400] {
+            let tabs = [TabInfo {
+                title: "بيان".into(),
+                color: None,
+                busy: false,
+                attention: false,
+                active: true,
+                progress: None,
+            }];
+            r.draw_chrome(&mut Vec::new(), width, 700, &tabs, None, false, None);
+            let end = r
+                .tab_rects(width, &["بيان"], 0)
+                .last()
+                .map(|t| t.1 + t.2)
+                .unwrap();
+            let menu = r.tab_controls(width)[3];
+            assert!(
+                (menu.0 - end).abs() <= 8,
+                "menu must follow the tab, not the window edge"
+            );
+            assert_eq!(
+                r.tab_control_hit(
+                    width,
+                    (menu.0 + menu.2 / 2) as f64,
+                    (menu.1 + menu.3 / 2) as f64
+                ),
+                Some(3)
+            );
+        }
+    }
+
+    #[test]
     fn tab_controls_hit_the_drawn_buttons_and_hide_with_the_bar() {
         let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
         for (i, (x, y, w, h)) in r.tab_controls(800).into_iter().enumerate() {
@@ -8780,7 +8846,7 @@ mod tests {
                 Some(i)
             );
         }
-        assert_eq!(r.tab_control_hit(800, 10.0, 10.0), None);
+        assert_eq!(r.tab_control_hit(800, 400.0, 10.0), None);
         let (x, y, w, h) = r.tab_controls(800)[2];
         r.set_bar_hidden(true);
         assert_eq!(
