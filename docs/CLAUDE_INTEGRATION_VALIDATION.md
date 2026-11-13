@@ -107,3 +107,10 @@ positioned TUIs, alternate-screen output, explicit application
 direction controls, and visual-order Claude output on their existing path.
 UIA still exposes physical grid rows; this check does not certify NVDA's
 reading across soft wraps.
+
+The scroll-edge follow-up passed 888 ordinary tests (seven explicit probes
+excluded), and an additional native ConPTY corpus probe was run manually
+with the real Python child, 1200 history lines, and the signed host. It
+checks actual painted runs for `تقريبًا`, `الإنجليزية`, `نعيد` and `كتابته.`.
+Live scrolling was verified on source `5158b02` (binary SHA-256
+`e776706611f2d60a5ccf98bee555aad83a54bcb85f0dcdeecb6788b36fb53258`).

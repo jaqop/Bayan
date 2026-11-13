@@ -138,7 +138,7 @@ impl Caption {
 }
 
 /// What a tab-bar control does: 0 is the previous tab, 1 the next, 2 a
-/// new tab. An arrow at the end of the row does nothing.
+/// new tab, 3 the shell menu. Navigation stops at either end of the tabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TabControl {
     Switch(usize),

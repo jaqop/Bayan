@@ -12287,6 +12287,90 @@ mod paragraph_align {
         assert!(checked > 0);
     }
 
+    #[test]
+    #[ignore = "real Windows ConPTY and Python; run explicitly with BAYAN_TEST_PYTHON"]
+    fn native_conpty_mixed_corpus_word_wrapping() {
+        use alacritty_terminal::{event::VoidListener, term::Config, vte::ansi::Processor};
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use std::io::{Read, Write};
+        const COLS: u16 = 102;
+        let mut command = CommandBuilder::new(
+            std::env::var_os("BAYAN_TEST_PYTHON").expect("Python fixture interpreter"),
+        );
+        command.arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/native_corpus_console.py"),
+        );
+        command.arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/mixed-arabic-english.txt"),
+        );
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 60,
+                cols: COLS,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut child = pty.slave.spawn_command(command).unwrap();
+        drop(pty.slave);
+        let mut reader = pty.master.try_clone_reader().unwrap();
+        let mut writer = pty.master.take_writer().unwrap();
+        let (send, recv) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut all = Vec::new();
+            let mut bytes = [0; 4096];
+            let mut answered = false;
+            while let Ok(n) = reader.read(&mut bytes) {
+                if n == 0 {
+                    break;
+                }
+                all.extend_from_slice(&bytes[..n]);
+                if !answered && all.windows(4).any(|w| w == b"\x1b[6n") {
+                    let _ = writer.write_all(b"\x1b[1;1R");
+                    let _ = writer.flush();
+                    answered = true;
+                }
+                if all.windows(17).any(|w| w == b"BAYAN-CORPUS-DONE") || all.len() > 65536 {
+                    break;
+                }
+            }
+            let _ = send.send(all);
+        });
+        let received = recv.recv_timeout(std::time::Duration::from_secs(15));
+        let _ = child.kill();
+        let _ = child.wait();
+        let bytes = received.expect("native corpus output deadline");
+        let mut term = Term::new(
+            Config::default(),
+            &crate::term::TermSize {
+                cols: COLS as usize,
+                rows: 60,
+            },
+            VoidListener,
+        );
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, &bytes);
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        r.draw_pane(&mut Vec::new(), &pane_view((0, 0, 1100, 1800), true), &term);
+        let painted: Vec<String> = r
+            .row_shape
+            .values()
+            .map(|row| row.key.0.iter().map(|s| s.text.as_str()).collect())
+            .collect();
+        eprintln!(
+            "native mixed corpus: {} PTY bytes, {COLS} columns",
+            bytes.len()
+        );
+        for word in ["تقريبًا", "الإنجليزية", "نعيد", "كتابته."] {
+            assert!(
+                painted.iter().any(|row| row.contains(word)),
+                "native word split {word}: {painted:?}"
+            );
+        }
+    }
+
     /// A soft-wrapped RTL paragraph keeps one direction. The tail is flush
     /// right too, not re-detected as its own paragraph.
 
