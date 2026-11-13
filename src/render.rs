@@ -31,6 +31,9 @@ use cosmic_text::{
 use crate::bidi_ctl::{base_direction_mark, ParagraphDir};
 use crate::gpu::Vertex;
 
+#[path = "render_technical.rs"]
+mod technical;
+
 // Bayan's first look is Jonathan Blow's scheme, SAMPLED from two captures of
 // his editor rather than recalled. Five colours are measured medians, not
 // guesses: background #062626, foreground tan #c2b796, and — the pair that
@@ -2072,6 +2075,7 @@ fn bidi_plan(
     } else {
         byte_cols_of(&full, &char_cols)
     };
+    technical::isolate(&mut segs, &mut byte_cols, &mut cur_bytes);
     // SCP base direction. Only a non-default direction prepends a mark,
     // so an ordinary Arabic row keeps the cache key it had before SCP.
     // The mark is not a cell; it maps to the first real column so a

@@ -51,3 +51,24 @@ host round-trip probe: invoke it explicitly under a standard Windows token
 with the pinned pair next to the test executable and `BAYAN_TEST_PYTHON`
 set. CI explicitly runs the signed-file/pin/write-lock verifier, and saves
 the debug app with its console pair and a source/hash identity file.
+
+## Mixed-language corpus (stronger follow-up)
+
+A one-line Arabic greeting was insufficient evidence. The follow-up uses
+`tests/fixtures/mixed-arabic-english.txt`: 279 words across Arabic and
+English paragraphs, Arabic diacritics, Latin/Arabic digits, dates, times,
+signed values, currencies, operators, URLs, and Windows/POSIX paths with
+Arabic components. The unmodified CI build `798f088` copied the full corpus
+back exactly, including soft-wrapped lines. A real Bash/readline edit also
+matched the intended text after inserting `!` inside an Arabic word and
+`[X=9]` before final punctuation in a mixed input line.
+
+That larger test exposed reversed path-component order in RTL prose and
+misplaced date/numeric prefixes. The renderer now adds LTR isolates only
+in its shaped view around recognized paths and punctuation-bearing ASCII
+numeric tokens. Application-supplied direction controls take precedence.
+Grid storage, clipboard/export text, colors, styles, and real-character
+cursor/hit-test maps remain unchanged. Tests check actual glyph positions
+for the observed cases, and character/cursor mappings across the complete
+corpus. This is a targeted correction, not a claim that every ambiguous
+plain-text expression or every shell editor has identical BiDi semantics.
