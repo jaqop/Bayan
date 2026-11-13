@@ -3,9 +3,9 @@
 use super::{is_arabic, tui_row, CellInfo};
 
 /// Keep the same number of screen rows, moving only their soft break points.
-/// Fully visible paragraphs only: an unseen head/tail must not change the
-/// positions of the visible rows as the viewport scrolls. TUIs and explicit
-/// newlines retain their exact grid layout.
+/// The visible portion is sufficient: an unseen head/tail must not restore
+/// word splits inside the viewport. A word clipped by the viewport itself
+/// remains clipped. TUIs and explicit newlines retain their grid layout.
 pub(super) fn reflow(lines: &mut [Vec<CellInfo>], continued: &[bool], cols: usize) -> Vec<usize> {
     let mut changed = Vec::new();
     let mut start = 0;
@@ -14,7 +14,6 @@ pub(super) fn reflow(lines: &mut [Vec<CellInfo>], continued: &[bool], cols: usiz
         while end < lines.len() && continued[end] {
             end += 1;
         }
-        let complete = !continued[start] && !continued[end];
         let split_arabic = (start + 1..end).any(|row| {
             lines[row - 1]
                 .last()
@@ -28,13 +27,16 @@ pub(super) fn reflow(lines: &mut [Vec<CellInfo>], continued: &[bool], cols: usiz
                 .chain(cell.zw.iter().flatten().copied())
                 .any(|c| matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
         });
-        if complete
-            && split_arabic
+        if split_arabic
             && !application_direction
             && !lines[start..end].iter().enumerate().any(|(offset, row)| {
                 // A continuation beginning with `>=` is still prose, not a
                 // fresh shell prompt. Grid gaps/boxes remain TUI indicators.
-                tui_row(row.len(), |i| (row[i].col, row[i].w, row[i].c), offset == 0)
+                tui_row(
+                    row.len(),
+                    |i| (row[i].col, row[i].w, row[i].c),
+                    offset == 0 && !continued[start],
+                )
             })
         {
             // Count word-end boundaries in the original grid. Never create
@@ -115,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_paragraphs_explicit_lines_tuis_and_app_direction_keep_the_grid() {
+    fn explicit_lines_tuis_and_app_direction_keep_the_grid() {
         for text in [
             "هذه الإنجليزية ثم العربية",
             "│هذه الإنجليزية ثم العربية",
@@ -125,8 +127,6 @@ mod tests {
             let mut lines = rows(text, 8);
             let mut continued = vec![true; lines.len() + 1];
             continued[0] = false;
-            // A paragraph clipped at the bottom is not reflowed.
-            assert!(reflow(&mut lines, &continued, 8).is_empty());
             continued.fill(false);
             assert!(
                 reflow(&mut lines, &continued, 8).is_empty(),
@@ -139,6 +139,33 @@ mod tests {
                 assert!(reflow(&mut lines, &continued, 8).is_empty());
             } else {
                 assert!(!reflow(&mut lines, &continued, 8).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn scroll_edges_do_not_restore_internal_arabic_word_splits() {
+        for clipped_top in [false, true] {
+            for clipped_bottom in [false, true] {
+                let mut lines = rows("هذه الإنجليزية ثم العربية وبعدها نعيد الاختبار", 8);
+                let mut continued = vec![true; lines.len() + 1];
+                continued[0] = clipped_top;
+                *continued.last_mut().unwrap() = clipped_bottom;
+                assert!(
+                    !reflow(&mut lines, &continued, 8).is_empty(),
+                    "clipped_top={clipped_top}, clipped_bottom={clipped_bottom}"
+                );
+                let painted: Vec<String> = lines
+                    .iter()
+                    .map(|row| row.iter().map(|c| c.c).collect())
+                    .collect();
+                for word in ["الإنجليزية", "العربية", "نعيد", "الاختبار"]
+                {
+                    assert!(
+                        painted.iter().any(|row| row.contains(word)),
+                        "split {word}: {painted:?}"
+                    );
+                }
             }
         }
     }

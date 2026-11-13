@@ -77,7 +77,7 @@ The earlier copy check proved data integrity, not word-boundary quality.
 Live inspection reproduced `الإنجل` / `يزية`, `ن` / `عيد`, and `فح` / `ص`
 on adjacent screen rows. The PTY wraps at grid columns and the renderer
 shaped each physical row independently. The view now moves soft breaks to
-word boundaries in fully visible Arabic prose paragraphs, keeping the same
+word boundaries in visible Arabic prose, keeping the same
 number of rows. Original grid coordinates are retained for selection,
 search, links, cursor and IME. Grid contents and copied text are unchanged.
 
@@ -100,8 +100,17 @@ distribution is present on this machine.
 
 886 ordinary tests passed; fmt, clippy with warnings denied, build and Rust
 1.89 all-target checking passed. Original native probe results above remain
-separate from these renderer checks. The reflow deliberately leaves clipped
-paragraphs, positioned TUIs, alternate-screen output, explicit application
+separate from these renderer checks. A follow-up regression covers paragraphs
+clipped at either viewport edge: internal word boundaries are preserved too,
+while text outside the viewport stays clipped. Reflow deliberately leaves
+positioned TUIs, alternate-screen output, explicit application
 direction controls, and visual-order Claude output on their existing path.
 UIA still exposes physical grid rows; this check does not certify NVDA's
 reading across soft wraps.
+
+The scroll-edge follow-up passed 888 ordinary tests (seven explicit probes
+excluded), and an additional native ConPTY corpus probe was run manually
+with the real Python child, 1200 history lines, and the signed host. It
+checks actual painted runs for `تقريبًا`, `الإنجليزية`, `نعيد` and `كتابته.`.
+Live scrolling was verified on source `5158b02` (binary SHA-256
+`e776706611f2d60a5ccf98bee555aad83a54bcb85f0dcdeecb6788b36fb53258`).
