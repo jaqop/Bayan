@@ -845,6 +845,9 @@ fn pane_nodes(tab: usize, pane: &PaneItem) -> Vec<(NodeId, Node)> {
             node.set_character_lengths(run.lengths.clone());
             node.set_word_starts(run.words.clone());
             node.set_text_direction(dir);
+            if let Some(language) = run.language {
+                node.set_language(language);
+            }
             if let Some(next) = built.get(i + 1) {
                 node.set_next_on_line(next.id);
             }
@@ -884,17 +887,61 @@ struct BuiltRun {
     value: String,
     lengths: Vec<u8>,
     words: Vec<u8>,
+    language: Option<&'static str>,
+}
+
+struct RunSpan {
+    start: usize,
+    end: usize,
+    language: Option<&'static str>,
+}
+
+/// Script tags let the reader select its own installed voices. Neutral
+/// characters stay with their surrounding run; other scripts stay untagged.
+fn run_spans(chars: &[char]) -> Vec<RunSpan> {
+    let mut spans = Vec::new();
+    let mut start = 0;
+    let mut language = None;
+    let mut has_letters = false;
+    for (i, &ch) in chars.iter().enumerate() {
+        let next = if ch.is_ascii_alphabetic() {
+            Some("en-US")
+        } else if ch.is_alphabetic() {
+            if bidi::is_arabic_letter(ch) {
+                Some("ar-SA")
+            } else {
+                None
+            }
+        } else {
+            language
+        };
+        if i - start >= RUN_CHARS || (next != language && has_letters) {
+            spans.push(RunSpan {
+                start,
+                end: i,
+                language,
+            });
+            start = i;
+            has_letters = false;
+        }
+        language = next;
+        has_letters |= ch.is_alphabetic();
+    }
+    spans.push(RunSpan {
+        start,
+        end: chars.len(),
+        language,
+    });
+    spans
 }
 
 fn split_runs(tab: usize, pane: usize, line: usize, src: &LogicalLine) -> Vec<BuiltRun> {
     let chars: Vec<char> = src.text.chars().collect();
-    let parts = chars.len().div_ceil(RUN_CHARS).max(1);
-    let mut runs = Vec::with_capacity(parts);
-    for part in 0..parts {
-        let start = part * RUN_CHARS;
-        let end = (start + RUN_CHARS).min(chars.len());
-        let mut value: String = chars[start..end].iter().collect();
-        let last = part + 1 == parts;
+    let spans = run_spans(&chars);
+    let mut runs = Vec::with_capacity(spans.len());
+    for (part, span) in spans.iter().enumerate() {
+        let mut value: String = chars[span.start..span.end].iter().collect();
+        let last = part + 1 == spans.len();
         if last {
             value.push('\n');
         }
@@ -905,6 +952,7 @@ fn split_runs(tab: usize, pane: usize, line: usize, src: &LogicalLine) -> Vec<Bu
             value,
             lengths,
             words,
+            language: span.language,
         });
     }
     runs
@@ -974,10 +1022,13 @@ fn position_at(
             index += 1;
         }
     }
-    let part = index / RUN_CHARS;
-    let parts = line.text.chars().count().div_ceil(RUN_CHARS).max(1);
-    let part = part.min(parts - 1);
-    let local = index - part * RUN_CHARS;
+    let chars: Vec<_> = line.text.chars().collect();
+    let spans = run_spans(&chars);
+    let part = spans
+        .iter()
+        .position(|span| index < span.end)
+        .unwrap_or(spans.len() - 1);
+    let local = index - spans[part].start;
     TextPosition {
         node: run_node(tab, pane, line_index, part),
         character_index: local,
@@ -1204,11 +1255,31 @@ mod tests {
         view.panes[0].text = pane_text(raw, false);
         let tree = build_tree(&view);
         let selection = find(&tree, pane_node(0, 0)).text_selection().unwrap();
-        let value = find(&tree, selection.anchor.node).value().unwrap();
-        let chosen: String = value
-            .chars()
-            .skip(selection.anchor.character_index)
-            .take(selection.focus.character_index - selection.anchor.character_index)
+        let children = find(&tree, pane_node(0, 0)).children();
+        let first = children
+            .iter()
+            .position(|id| *id == selection.anchor.node)
+            .unwrap();
+        let last = children
+            .iter()
+            .position(|id| *id == selection.focus.node)
+            .unwrap();
+        let chosen: String = children[first..=last]
+            .iter()
+            .flat_map(|&id| {
+                let value: Vec<_> = find(&tree, id).value().unwrap().chars().collect();
+                let start = if id == selection.anchor.node {
+                    selection.anchor.character_index
+                } else {
+                    0
+                };
+                let end = if id == selection.focus.node {
+                    selection.focus.character_index
+                } else {
+                    value.len()
+                };
+                value[start..end].to_vec()
+            })
             .collect();
         assert_eq!(chosen, "حبا abcdefghij");
         view.panes[0].text.selection = None;
@@ -1310,6 +1381,52 @@ mod tests {
     }
 
     #[test]
+    fn mixed_text_marks_each_script_for_native_voice_switching() {
+        let view = one_pane("بيان server-02 مُرَاجَعَةٌ CPU 12.5ms", (0, 0), None);
+        let tree = build_tree(&view);
+        let doc = find(&tree, pane_node(0, 0));
+        let runs: Vec<_> = doc.children().iter().map(|&id| find(&tree, id)).collect();
+        assert!(runs
+            .iter()
+            .any(|r| r.language() == Some("en-US") && r.value().unwrap().contains("server-02")));
+        assert!(runs
+            .iter()
+            .any(|r| r.language() == Some("ar-SA") && r.value().unwrap().contains("مُرَاجَعَةٌ")));
+        let text: String = runs.iter().map(|r| r.value().unwrap()).collect();
+        assert_eq!(text, "بيان server-02 مُرَاجَعَةٌ CPU 12.5ms\n");
+    }
+
+    #[test]
+    fn voice_run_boundaries_preserve_every_caret_and_combining_mark() {
+        let text = "مُرَاجَعَةٌ English 12.5ms ".repeat(20);
+        let line = line_of(&text);
+        let runs = split_runs(0, 0, 0, &line);
+        let expected: Vec<_> = line.text.chars().collect();
+        for (col, &ch) in expected.iter().enumerate() {
+            let pos = position_at(0, 0, 0, &line, col, false);
+            let run = runs.iter().find(|run| run.id == pos.node).unwrap();
+            assert_eq!(
+                run.value.chars().nth(pos.character_index),
+                Some(ch),
+                "column {col}"
+            );
+        }
+        assert!(runs
+            .iter()
+            .all(|run| run.value.chars().count() <= RUN_CHARS + 1));
+        let text: String = runs.iter().map(|run| run.value.as_str()).collect();
+        assert_eq!(text, format!("{}\n", line.text));
+        let other = build_tree(&one_pane("עברית 中文", (0, 0), None));
+        for &id in find(&other, pane_node(0, 0)).children() {
+            assert_eq!(
+                find(&other, id).language(),
+                None,
+                "other scripts are not guessed as Arabic or English"
+            );
+        }
+    }
+
+    #[test]
     fn caret_is_the_character_under_the_cursor_column() {
         let _lang = with_lang(Lang::Ar);
         let view = one_pane("hello مرحبا", (0, 6), None);
@@ -1317,10 +1434,15 @@ mod tests {
         let doc = find(&tree, pane_node(0, 0));
         let sel = doc.text_selection().expect("caret");
         assert_eq!(sel.anchor, sel.focus, "a caret is a degenerate selection");
-        assert_eq!(sel.focus.character_index, 6);
+        assert_eq!(sel.focus.character_index, 0);
         let run = find(&tree, sel.focus.node);
         assert_eq!(run.role(), Role::TextRun);
-        let ch = run.value().unwrap().chars().nth(6).unwrap();
+        let ch = run
+            .value()
+            .unwrap()
+            .chars()
+            .nth(sel.focus.character_index)
+            .unwrap();
         assert_eq!(ch, 'م');
 
         // A wide glyph covers two columns. The caret on the spacer column
@@ -1360,9 +1482,9 @@ mod tests {
         let view = one_pane("hello مرحبا", (0, 10), Some(((0, 6), (0, 10))));
         let tree = build_tree(&view);
         let sel = find(&tree, pane_node(0, 0)).text_selection().unwrap();
-        assert_eq!(sel.anchor.character_index, 6);
+        assert_eq!(sel.anchor.character_index, 0);
         assert_eq!(
-            sel.focus.character_index, 11,
+            sel.focus.character_index, 5,
             "UIA range ends after the last selected cell"
         );
         assert_eq!(sel.anchor.node, sel.focus.node);

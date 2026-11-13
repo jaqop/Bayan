@@ -74,3 +74,22 @@ native caret/selection ownership, long-paragraph node identity, and bounded
 live announcements. The reader still exposes the visible viewport, rather
 than inventing text outside it. Existing rendering, shell security, OSC 52,
 session and shell-menu behavior are retained.
+
+## Mixed-language pronunciation
+
+Arabic-script and ASCII English spans now carry `ar-SA` and `en-US`
+accessibility language metadata. This lets NVDA select installed voices for
+both languages instead of asking an Arabic voice to pronounce English.
+Other scripts remain untagged; script tags are not general language detection.
+Run boundaries and caret/selection positions use the same span calculation.
+Text, real newlines and Unicode combining marks are preserved.
+
+For listening, Windows OneCore can use Microsoft Zira as the English base
+voice and installed Microsoft Naayf for Arabic language spans. A rate of 45
+with rate boost disabled is the requested modest increase from 40. Voice
+preferences belong to the screen reader and are not written to Bayan settings.
+The earlier eSpeak comparison proves word preservation, not voice quality.
+
+The updated full local suite passed 897 tests, with seven explicit probes
+ignored. Added coverage checks language tags, all caret positions across many
+script switches, combining marks and selections that cross language spans.
