@@ -885,6 +885,86 @@ fn terminal_environment(cmd: &mut CommandBuilder) {
     cmd.env("COLORTERM", "truecolor");
 }
 
+/// Filter the actual builder (including HKCU-imported entries), before
+/// adding this pane's generated integration environment. Ordinary windows
+/// keep their exact environment. This is not a PATH/completion policy.
+pub(crate) fn sanitize_elevated_environment(cmd: &mut CommandBuilder, elevated: bool) {
+    if !elevated {
+        return;
+    }
+    let remove: Vec<_> = cmd
+        .env_keys()
+        .filter(|name| {
+            let name = name.to_string_lossy().to_ascii_uppercase();
+            matches!(
+                name.as_str(),
+                "BASH_ENV"
+                    | "ENV"
+                    | "PROMPT_COMMAND"
+                    | "PS0"
+                    | "PS1"
+                    | "PS2"
+                    | "PS3"
+                    | "PS4"
+                    | "SHELLOPTS"
+                    | "BASHOPTS"
+                    | "CDPATH"
+                    | "GLOBIGNORE"
+                    | "IFS"
+                    | "INPUTRC"
+                    | "HISTFILE"
+                    | "POSIXLY_CORRECT"
+                    | "BASH_XTRACEFD"
+                    | "CYGWIN"
+                    | "MSYS"
+                    | "MSYSTEM"
+                    | "MSYSTEM_CARCH"
+                    | "MSYSTEM_CHOST"
+                    | "MSYSTEM_PREFIX"
+                    | "MINGW_PREFIX"
+                    | "DOTNET_STARTUP_HOOKS"
+                    | "DOTNET_ADDITIONAL_DEPS"
+                    | "DOTNET_SHARED_STORE"
+                    | "CORECLR_ENABLE_PROFILING"
+                    | "CORECLR_PROFILER"
+                    | "CORECLR_PROFILER_PATH"
+                    | "COR_ENABLE_PROFILING"
+                    | "COR_PROFILER"
+                    | "COR_PROFILER_PATH"
+            ) || ["BASH_FUNC_", "BAYAN_", "__BAYAN_", "LD_", "DYLD_", "MSYS2_"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        })
+        .map(std::ffi::OsStr::to_os_string)
+        .collect();
+    for name in remove {
+        cmd.env_remove(name);
+    }
+    cmd.env("INPUTRC", "/dev/null");
+    cmd.env("HISTFILE", "/dev/null");
+}
+
+fn prepare_elevated_shell(
+    cmd: &mut CommandBuilder,
+    program: &str,
+    args: &[String],
+    elevated: bool,
+    marks: bool,
+    nonce: &str,
+) -> Result<Option<crate::shellint::Plan>, String> {
+    sanitize_elevated_environment(cmd, elevated);
+    if !elevated {
+        return Ok(None);
+    }
+    let protected = crate::shellint::elevated_bash_startup(program, args, marks, nonce)?;
+    if crate::shellint::is_bash_program(program) && protected.is_none() {
+        // Explicit commands keep their arguments, but not startup-file or
+        // environment-function execution before those commands.
+        cmd.args(["--noprofile", "--norc", "-p"]);
+    }
+    Ok(protected)
+}
+
 /// Longest cwd we will store or start a process in. Real Windows paths fit;
 /// a multi-kilobyte string in `session.json` is not a directory.
 const MAX_CWD_CHARS: usize = 4096;
@@ -2985,7 +3065,16 @@ impl Session {
         } else {
             prog
         };
-        let mut cmd = CommandBuilder::new(prog);
+        let mut cmd = CommandBuilder::new(&prog);
+        let protected_bash = prepare_elevated_shell(
+            &mut cmd,
+            &prog,
+            &args,
+            elevated,
+            shell_integration,
+            &prompt_nonce,
+        )?;
+        let protection_required = protected_bash.is_some();
         for a in &args {
             cmd.arg(a);
         }
@@ -3031,30 +3120,28 @@ impl Session {
             let theme = if elevated { None } else { detect_posh_theme() };
             let setup = powershell_setup(elevated, theme.as_deref(), integrate);
             cmd.arg(setup);
-        } else if wrap {
-            if let Some(plan) =
+        } else if wrap || protection_required {
+            if let Some(plan) = protected_bash.or_else(|| {
                 crate::shellint::plan(shell, shell_integration, elevated, &prompt_nonce)
-            {
-                match crate::shellint::materialize(&plan) {
-                    Ok(done) => {
-                        let argv = cmd.get_argv_mut();
-                        let prog = argv.first().cloned();
-                        argv.clear();
-                        if let Some(prog) = prog {
-                            argv.push(prog);
-                        }
-                        for arg in done.args {
-                            argv.push(arg.into());
-                        }
-                        for (key, value) in done.env {
-                            cmd.env(key, value);
-                        }
-                        integration_scripts = crate::shellint::IntegrationDir(done.dir);
-                        applied = true;
+            }) {
+                if let Some(done) = crate::shellint::startup_materialization(
+                    crate::shellint::materialize(&plan),
+                    protection_required,
+                )? {
+                    let argv = cmd.get_argv_mut();
+                    let prog = argv.first().cloned();
+                    argv.clear();
+                    if let Some(prog) = prog {
+                        argv.push(prog);
                     }
-                    Err(err) => {
-                        eprintln!("bayan: shell integration skipped: {err}");
+                    for arg in done.args {
+                        argv.push(arg.into());
                     }
+                    for (key, value) in done.env {
+                        cmd.env(key, value);
+                    }
+                    integration_scripts = crate::shellint::IntegrationDir(done.dir);
+                    applied = true;
                 }
             }
         }
@@ -3819,6 +3906,106 @@ pub fn regex_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elevated_environment_removes_startup_code_even_with_nonunicode_values() {
+        use std::os::windows::ffi::OsStringExt;
+        let mut cmd = CommandBuilder::new("bash.exe");
+        cmd.env_clear();
+        for name in [
+            "PROMPT_COMMAND",
+            "BASH_ENV",
+            "ENV",
+            "PS0",
+            "PS1",
+            "PS4",
+            "SHELLOPTS",
+            "BASHOPTS",
+            "CDPATH",
+            "GLOBIGNORE",
+            "CYGWIN",
+            "LD_PRELOAD",
+            "__BAYAN_SI",
+        ] {
+            cmd.env(name, "untrusted");
+        }
+        cmd.env(
+            "BASH_FUNC_dirname%%",
+            std::ffi::OsString::from_wide(&[0xd800]),
+        );
+        cmd.env("BAYAN_PROMPT_NONCE", "inherited");
+        cmd.env("SYSTEMROOT", r"C:\Windows");
+        sanitize_elevated_environment(&mut cmd, true);
+        for name in [
+            "PROMPT_COMMAND",
+            "BASH_ENV",
+            "ENV",
+            "PS0",
+            "PS1",
+            "PS4",
+            "SHELLOPTS",
+            "BASHOPTS",
+            "CDPATH",
+            "GLOBIGNORE",
+            "CYGWIN",
+            "LD_PRELOAD",
+            "__BAYAN_SI",
+            "BASH_FUNC_dirname%%",
+            "BAYAN_PROMPT_NONCE",
+        ] {
+            assert!(cmd.get_env(name).is_none(), "{name} survived");
+        }
+        assert_eq!(
+            cmd.get_env("SYSTEMROOT"),
+            Some(std::ffi::OsStr::new(r"C:\Windows"))
+        );
+        assert_eq!(
+            cmd.get_env("INPUTRC"),
+            Some(std::ffi::OsStr::new("/dev/null"))
+        );
+        assert_eq!(
+            cmd.get_env("HISTFILE"),
+            Some(std::ffi::OsStr::new("/dev/null"))
+        );
+    }
+
+    #[test]
+    fn normal_environment_keeps_user_prompt_and_functions_unchanged() {
+        let mut cmd = CommandBuilder::new("bash.exe");
+        cmd.env_clear();
+        cmd.env("PROMPT_COMMAND", "user prompt");
+        cmd.env("BASH_FUNC_fixture%%", "() { :; }");
+        let before = cmd.clone();
+        sanitize_elevated_environment(&mut cmd, false);
+        assert_eq!(cmd, before);
+    }
+
+    #[test]
+    fn elevated_explicit_bash_keeps_command_bytes_but_suppresses_startup() {
+        let args = vec![
+            "-c".into(),
+            "printf '%s' \"$1\"".into(),
+            "--".into(),
+            "عربي & literal".into(),
+        ];
+        let mut cmd = CommandBuilder::new("bash.exe");
+        cmd.env_clear();
+        cmd.env("BASH_ENV", "untrusted-file");
+        let protected =
+            prepare_elevated_shell(&mut cmd, "bash.exe", &args, true, false, NONCE_OFF).unwrap();
+        assert!(
+            protected.is_none(),
+            "an explicit command does not get a prompt wrapper"
+        );
+        cmd.args(&args);
+        let expected: Vec<std::ffi::OsString> = ["bash.exe", "--noprofile", "--norc", "-p"]
+            .into_iter()
+            .map(Into::into)
+            .chain(args.into_iter().map(Into::into))
+            .collect();
+        assert_eq!(cmd.get_argv(), &expected);
+        assert!(cmd.get_env("BASH_ENV").is_none());
+    }
 
     #[test]
     fn an_elevated_powershell_setup_does_not_inject_oh_my_posh() {

@@ -5610,6 +5610,10 @@ impl App {
     /// Explorer `/select` for a reveal-only card. This does not call
     /// `settle`: an allowlisted extension would become an association open.
     fn spawn_reveal_only(&mut self, path: &str) {
+        if self.elevated {
+            self.refuse_link(link::RefuseReason::PrivilegedOpen, path);
+            return;
+        }
         let path = path.to_string();
         let proxy = self.proxy.clone();
         let owned = path.clone();
@@ -6163,11 +6167,9 @@ impl App {
     fn request_clipboard_read(&mut self, id: u64, kind: alacritty_terminal::term::ClipboardType) {
         if kind != alacritty_terminal::term::ClipboardType::Clipboard
             || !self.clipboard_read_allowed(id)
-            || self.pending_paste.is_some()
-            || self.blocked_link.is_some()
-            || self.pending_close.is_some()
-            || self.settings.is_some()
-            || self.palette.is_some()
+            || self.overlay_blocks_mouse()
+            || self.search.is_some()
+            || self.term_mode().contains(TermMode::VI)
         {
             return;
         }

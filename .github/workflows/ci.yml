@@ -37,12 +37,42 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Build
-        run: cargo build --all-targets
-      # The tests are pure unit tests — no GPU, no window, no PTY spawn —
-      # so they run headless. They never read or write ~/.bayan, so a local
-      # run with a live config.json behaves the same as this one.
+        run: cargo build --locked --all-targets
+      # Headless tests include isolated shell/PTY probes; no GUI or GPU.
+      # Native signed-host round trips are explicitly run on a standard-token
+      # Windows desktop: elevated runners deliberately reject that host.
       - name: Test
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
+      - name: Install and verify pinned Microsoft console host
+        shell: pwsh
+        run: |
+          ./scripts/install-conpty.ps1 -OutputDirectory target/debug
+          $env:BAYAN_SIGNED_HOST_DIR = (Resolve-Path target/debug).Path
+          $artifacts = cargo test --locked --no-run --message-format=json | ForEach-Object { $_ | ConvertFrom-Json }
+          if ($LASTEXITCODE -ne 0) { throw 'Test harness build failed' }
+          $harness = @($artifacts | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.target.name -eq 'bayan' -and $_.executable })
+          if ($harness.Count -ne 1) { throw 'Expected one Bayan test harness' }
+          & $harness[0].executable --exact conpty_load::installed_microsoft_pair_is_verified_and_locked --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned host verification failed' }
+      - name: Record build identity
+        shell: pwsh
+        env:
+          BUILD_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $files = @('bayan.exe', 'conpty.dll', 'OpenConsole.exe') | ForEach-Object {
+            @{ name = $_; sha256 = (Get-FileHash -LiteralPath "target/debug/$_" -Algorithm SHA256).Hash.ToLowerInvariant() }
+          }
+          @{ source_sha = $env:BUILD_SOURCE_SHA; checkout_sha = (git rev-parse HEAD); configuration = 'debug'; files = $files } | ConvertTo-Json -Depth 4 | Set-Content target/debug/build-identity.json -Encoding utf8
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (v4.6.2)
+        with:
+          name: bayan-windows-tested
+          if-no-files-found: error
+          path: |
+            target/debug/bayan.exe
+            target/debug/conpty.dll
+            target/debug/OpenConsole.exe
+            target/debug/ConPTY-LICENSE.txt
+            target/debug/build-identity.json
 
   # Enforces the rust-version declared in Cargo.toml. That floor is set by the
   # dependency graph (cosmic-text 0.19 wants 1.89), not by our own source, so
@@ -59,7 +89,7 @@ jobs:
           toolchain: "1.89"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Check against the declared minimum
-        run: cargo check --all-targets
+        run: cargo check --locked --all-targets
 
   # The tree is rustfmt-clean and clippy-clean with -D warnings, and these
   # two steps keep it that way. A lint the project disagrees with gets a
@@ -81,7 +111,7 @@ jobs:
       - name: Format
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
   # RustSec advisories against Cargo.lock. Fails on a known vulnerability;
   # unmaintained or yanked crates print as warnings and do not fail it. It

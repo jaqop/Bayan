@@ -35,7 +35,11 @@ pub(crate) enum ShellKind {
 /// Program name of `command`, which may be a full command line.
 pub(crate) fn shell_kind(command: &str) -> ShellKind {
     let (prog, _) = split_command(command);
-    let base = prog.rsplit(['\\', '/']).next().unwrap_or(&prog);
+    program_kind(&prog)
+}
+
+fn program_kind(prog: &str) -> ShellKind {
+    let base = prog.rsplit(['\\', '/']).next().unwrap_or(prog);
     let name = base.to_ascii_lowercase();
     let name = name.strip_suffix(".exe").unwrap_or(&name);
     match name {
@@ -56,6 +60,52 @@ pub(crate) fn shell_kind(command: &str) -> ShellKind {
 /// nothing: a missing nonce would make every `133` mark trusted.
 pub(crate) fn injection_allowed(enabled: bool, nonce: &str) -> bool {
     enabled && !nonce.is_empty() && nonce != NONCE_OFF
+}
+
+pub(crate) fn elevated_bash_startup(
+    program: &str,
+    args: &[String],
+    enabled: bool,
+    nonce: &str,
+) -> Result<Option<Plan>, String> {
+    if !is_bash_program(program) || !bash_is_interactive(args) {
+        return Ok(None);
+    }
+    if !injection_allowed(true, nonce) {
+        return Err("refusing elevated Bash without a protected startup nonce".into());
+    }
+    let mut plan = bash_plan(args, true, vec![(NONCE_ENV.into(), nonce.into())])
+        .ok_or_else(|| "refusing elevated Bash without a protected startup plan".to_string())?;
+    if !enabled {
+        // Prompt marks are optional; avoiding the user's startup files is not.
+        let (_, body) = plan
+            .files
+            .iter_mut()
+            .find(|(name, _)| name == "bash.sh")
+            .ok_or_else(|| "protected Bash startup file is missing".to_string())?;
+        *body = format!("{BASH_PRELUDE}{BASH_ELEVATED_ENV}");
+    }
+    Ok(Some(plan))
+}
+
+pub(crate) fn is_bash_program(program: &str) -> bool {
+    program_kind(program) == ShellKind::Bash
+}
+
+pub(crate) fn startup_materialization(
+    result: Result<Materialized, String>,
+    required: bool,
+) -> Result<Option<Materialized>, String> {
+    match result {
+        Ok(done) => Ok(Some(done)),
+        Err(error) if required => Err(format!(
+            "refusing elevated Bash: protected startup failed: {error}"
+        )),
+        Err(error) => {
+            eprintln!("bayan: shell integration skipped: {error}");
+            Ok(None)
+        }
+    }
 }
 
 /// One pane's injection, before any file is written. Paths in `args` are
@@ -115,11 +165,12 @@ fn bash_plan(args: &[String], elevated: bool, mut env: Vec<(String, String)>) ->
         push_safe_readline(&mut env);
     }
     let mut bash_argv = bash_args(args, "@file:bash.sh");
-    if elevated && !bash_argv.iter().any(|a| a == "--noprofile") {
-        // `--login` is already gone. `--noprofile` also stops a bash that
-        // still treats itself as a login shell from reading /etc/profile
-        // before the rcfile.
-        bash_argv.push("--noprofile".to_string());
+    if elevated {
+        // Long options must precede -i. --norc would disable the protected
+        // rcfile too, so only the explicitly generated startup is allowed.
+        bash_argv.retain(|arg| arg != "--noprofile" && arg != "--norc");
+        bash_argv.insert(0, "--noprofile".into());
+        bash_argv.push("-p".into());
     }
     let mut files = vec![("bash.sh".into(), bash_rc(login, user, elevated))];
     let mut path_env = Vec::new();
@@ -369,7 +420,7 @@ fn cmd_setup() -> String {
 /// with `HOME` pointed at the rcfile directory for that read.
 fn bash_rc(login: bool, user: bool, windows_elevated: bool) -> String {
     let mut s = String::from(BASH_PRELUDE);
-    if login && !user && windows_elevated {
+    if !user && windows_elevated {
         s.push_str(BASH_ELEVATED_ENV);
     } else if login {
         if user {
@@ -1700,6 +1751,54 @@ fn find_real_bash() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn elevated_bash_protection_is_required_even_with_prompt_marks_disabled() {
+        let args = vec!["--login".into(), "-i".into()];
+        let got =
+            elevated_bash_startup(r"C:\Program Files\Git\bin\bash.exe", &args, false, "nonce")
+                .expect("valid protected startup")
+                .expect("protection cannot be disabled");
+        assert!(got.elevated);
+        let rc = file(&got, "bash.sh");
+        assert!(
+            !rc.contains("PROMPT_COMMAND=__bayan_prompt_command"),
+            "marks remain off"
+        );
+        assert!(
+            rc.contains("__bayan_home="),
+            "protected HOME must still be restored"
+        );
+        assert_eq!(got.args.first().map(String::as_str), Some("--noprofile"));
+        assert!(got.args.iter().any(|arg| arg == "-p"));
+    }
+
+    #[test]
+    fn elevated_bash_refuses_missing_nonce_and_required_script_failure() {
+        let args = vec!["-i".into()];
+        assert!(elevated_bash_startup("bash.exe", &args, false, NONCE_OFF).is_err());
+        assert!(elevated_bash_startup("bash.exe", &args, true, "").is_err());
+        assert!(
+            startup_materialization(Err("protected directory unavailable".into()), true).is_err()
+        );
+        assert!(
+            startup_materialization(Err("ordinary optional integration".into()), false)
+                .unwrap()
+                .is_none()
+        );
+        let good = Materialized {
+            args: vec!["protected".into()],
+            env: Vec::new(),
+            dir: None,
+        };
+        assert_eq!(
+            startup_materialization(Ok(good), true)
+                .unwrap()
+                .unwrap()
+                .args,
+            ["protected"]
+        );
+    }
+
     const NONCE: &str = "abc123deadbeef";
 
     fn bash_git() -> &'static str {
@@ -2377,12 +2476,40 @@ mod tests {
         )
         .unwrap();
         let rc_path = safe.join("bash.sh");
-        std::fs::write(&rc_path, bash_rc(true, false, true)).unwrap();
+        let protected = elevated_bash_startup(
+            &bash.to_string_lossy(),
+            &["--login".into(), "-i".into()],
+            true,
+            "n0nce",
+        )
+        .unwrap()
+        .unwrap();
+        std::fs::write(&rc_path, &protected.files[0].1).unwrap();
+        // Exercise the production environment filter without elevating this
+        // test process. These payloads must never reach Bash startup.
+        let mut environment = portable_pty::CommandBuilder::new(&bash);
+        // Isolate this startup-variable test from HKCU PATH merging and
+        // the separate PATH/completion trust policy.
+        environment.env("PATH", std::env::var_os("PATH").unwrap_or_default());
+        environment.env("PROMPT_COMMAND", format!("echo prompt > '{marker_bash}'"));
+        let bash_env = home.join("startup.sh");
+        std::fs::write(&bash_env, format!("echo bashenv > '{marker_bash}'\n")).unwrap();
+        environment.env("BASH_ENV", &bash_env);
+        environment.env(
+            "BASH_FUNC_dirname%%",
+            format!("() {{ echo function > '{marker_bash}'; }}"),
+        );
+        crate::term::sanitize_elevated_environment(&mut environment, true);
         let mut child = std::process::Command::new(&bash)
-            .arg("--noprofile")
-            .arg("--rcfile")
-            .arg(&rc_path)
-            .arg("-i")
+            .args(protected.args.iter().map(|arg| {
+                if arg == "@file:bash.sh" {
+                    rc_path.to_string_lossy().into_owned()
+                } else {
+                    arg.clone()
+                }
+            }))
+            .env_clear()
+            .envs(environment.iter_full_env_as_str())
             .env("HOME", &empty_home)
             .env(REAL_HOME_ENV, &home)
             .env("USERPROFILE", &home)

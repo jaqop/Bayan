@@ -1,0 +1,53 @@
+# OSC 52 and SSH/tmux live validation
+
+On Windows, source `1e162e2a2df7a0dab11edc7ec6b99b279f66e707`
+(debug executable SHA-256
+`4736dfceacecb70953b0a3f22b6653854692c822729db8f367e29f361093de37`)
+was exercised against an isolated Alpine 3.22.2 VM using QEMU software
+emulation, OpenSSH and tmux 3.5a. No host directories were shared and no
+host elevation or virtualization settings were changed. The VM used a
+temporary public-key-only SSH identity with a pinned host key.
+
+## Clipboard
+
+The real Linux process sent OSC 52 over SSH into a visible Bayan window.
+The Microsoft console host was verified loaded from the pinned bundle.
+Only synthetic clipboard text was used.
+
+- Reads disabled: no clipboard reply.
+- Reads enabled: a real query raised the permission dialog. Enter returned
+  exactly the synthetic clipboard text to the requesting process.
+- A second request required a new confirmation. Esc returned no reply.
+- Ten thousand queries produced one responsive permission dialog; refusing
+  returned no clipboard data.
+- Remote writes while copy was off did not change the Windows clipboard.
+  With copy enabled, the expected synthetic remote value was copied.
+- The native console regression separately verified that a query travels
+  out through ConPTY and the exact reply reaches the requesting console.
+
+## Real transport loss and recovery
+
+A localhost TCP proxy forwarded SSH into the VM. Its cut operation set
+SO_LINGER to zero and closed both sockets, producing a real TCP reset.
+Two cuts were recorded with one live connection each. Bayan showed the
+closed SSH transport; the remote tmux session remained detached and alive.
+
+The same tmux server (PID 1964), session `$0`, and workload process (PID
+1965) survived. The workload counter advanced from 6 before the first cut,
+to 85 detached, to 138 after reconnecting, and 455 after the second cut.
+Reattaching did not restart the workload. Window resizing reached tmux:
+102×25 to 240×54 client cells (240×53 workload pane).
+
+The disposable Alpine client initially used the C locale; reconnecting
+with `LANG=C.UTF-8 tmux -u attach-session` restored correct Arabic. The
+UTF-8 run displayed `العربية تعمل` with the same workload PID.
+
+## Scope
+
+These are Windows live tests of OSC 52, SSH transport and tmux recovery,
+not a Linux Bayan port. They do not establish NVDA, Win+H, all IME, image
+layout, or elevated WSL safety. The default suite does not run the native
+host round-trip probe: invoke it explicitly under a standard Windows token
+with the pinned pair next to the test executable and `BAYAN_TEST_PYTHON`
+set. CI explicitly runs the signed-file/pin/write-lock verifier, and saves
+the debug app with its console pair and a source/hash identity file.

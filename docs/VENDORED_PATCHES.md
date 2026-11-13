@@ -34,3 +34,13 @@ package and verifies both file hashes and Microsoft signatures before
 copying the pair. `src/conpty_load.rs` compiles the production verifier
 into the Bayan test harness. The explicitly invoked native probes cover
 signature/pin acceptance, write locks, and a real console OSC 52 round trip.
+
+- `cmdbuilder.rs`: `env_keys()` exposes raw `OsStr` environment names so
+  elevated-spawn sanitation also covers inherited registry values and names
+  whose values are not Unicode. The normal command builder remains unchanged.
+
+Elevated Git Bash uses a mandatory protected startup plan independently of
+OSC prompt integration. Startup/environment hooks are removed from the final
+command builder, including its HKCU environment base. This does not certify
+all of PR #71: completion helper/path ownership and WSL-root isolation need
+separate validation. Do not treat WSL elevation as a security boundary.

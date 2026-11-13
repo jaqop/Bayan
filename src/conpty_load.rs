@@ -61,7 +61,7 @@ fn installed_microsoft_pair_is_verified_and_locked() {
 }
 
 #[test]
-#[ignore = "requires pinned ConPTY next to the test executable and Python; CI runs explicitly"]
+#[ignore = "requires pinned ConPTY next to the test executable, Python, and a standard token"]
 fn native_conpty_preserves_osc52_query_and_reply() {
     use std::io::Write;
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

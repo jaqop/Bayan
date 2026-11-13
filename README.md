@@ -1155,8 +1155,23 @@ keyboard protocol in new panes. When one of those changes, the notice
 names it. `osc52` is config-file
 only (there is no settings-panel row). Leave it out or set `"off"`.
 `"copy"` lets a focused window accept OSC 52 clipboard writes from the
-focused pane; no value enables a clipboard read. The decode backstop is
-64 KiB, and one scan sees about 48–51 KiB.
+focused pane. Reads are separately disabled by default: `"osc52_read": true`
+allows a focused pane to request a one-time Arabic/English confirmation.
+Enter approves that request; Esc refuses without returning clipboard data.
+Each new request needs consent, and requests during other overlays or copy
+mode are ignored. The clipboard is read only after approval, with a 64 KiB
+limit and no broadcast to other panes. Copy decoding has a 64 KiB backstop;
+one scan sees about 48–51 KiB.
+
+Reliable query/reply transport needs the pinned Microsoft console host:
+run `powershell -File scripts/install-conpty.ps1 -OutputDirectory <Bayan-folder>`.
+It installs the verified `conpty.dll` / `OpenConsole.exe` pair and license.
+Bayan checks both hashes, Microsoft's publisher, and cached revocation state,
+and keeps the verified files locked. Rejection falls back to Windows' inbox
+ConPTY, which can strip OSC 52 queries/replies. Elevated Bayan never loads
+the optional bundle. This is not a signed Bayan installer or an automatic
+update service. External links in elevated windows are refused; open them
+from a normal window instead.
 
 ### Search, export, and session identity
 
