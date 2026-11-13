@@ -33,7 +33,7 @@ selection and BiDi paths must do.
 | `localpath.rs` | no-follow walk: is a drive path local in every component, links read but not followed (link probe, new-tab cwd) |
 | `mru.rs` | most-recently-used tab order for Ctrl+Tab, walkable within one group |
 | `shells.rs` | installed-shell detection (ported from EasyTer's `profiles.py`) |
-| `cli.rs` | argv: `#45`'s `-d`/`--cwd`, plus profile, `--` command, `--elevated`, handoff, help, version |
+| `cli.rs` | argv: `#45`'s `-d`/`--cwd`, plus profile, `--` command, `--maximized`, `--elevated`, handoff, help, version |
 | `context_menu.rs` | per-user Explorer "Open Bayan here" (HKCU only, behind `RegistryStore`) |
 | `elevate.rs` | `--elevated` → `ShellExecuteW` verb `runas` only; argv is `--elevated` and optional `-p <name>` |
 | `jumplist.rs` | taskbar Jump List (`ICustomDestinationList`) and the explicit AppUserModelID |
@@ -232,10 +232,28 @@ give cmd the nonce in any form. `git-bash.exe`, `bash -c`, and
 `BAYAN_PROMPT_NONCE` and is unset before a child inherits it. Do not write
 the user's rc files. An elevated token must not source `~/.bashrc`,
 `~/.bash_profile`, `~/.inputrc`, or the zsh home files: set `INPUTRC` and
-`HISTFILE` to `/dev/null`. Elevated Git Bash is `--noprofile` and must
-not source `/etc/profile` (its `git-prompt.sh` runs user files); set
-`PATH` and `MSYSTEM` from the bash install. Elevated WSL bash still reads the
-distro profile with `HOME` pointed at the rcfile directory. A failed
+`HISTFILE` to `/dev/null`. Git Bash protection is mandatory even when
+prompt marks are disabled; startup-file creation failures refuse the spawn.
+Elevated Git Bash passes `--noprofile` and `-p`, with long options before
+`-i` and must not source `/etc/profile` (its `git-prompt.sh` runs user
+files). Login or not, the rcfile restores `HOME` from `BAYAN_SI_HOME`
+with `/usr/bin/cygpath` and then unsets that variable. `PATH` and
+`MSYSTEM` come from `/ucrt64` before `/mingw64`. Do not
+replace `PS1`: the system prompt (cwd, branch, window title) stays, and
+the OSC mark is appended. Elevated WSL bash still reads the distro
+profile with `HOME` pointed at the rcfile directory, after clearing
+inherited `XDG_DATA_DIRS`, `XDG_CONFIG_HOME`, `BASH_COMPLETION_USER_FILE`
+and `BASH_COMPLETION_COMPAT_DIR`. Once `HOME` is real again,
+`BASH_COMPLETION_USER_DIR` is the integration directory for both Git Bash
+and WSL. The WSL loaders `_comp_load` and `__load_completion` compute a
+safe `PATH` before `local`, and never leave it empty (the fallback is
+`/usr/sbin:/usr/bin:/sbin:/bin`). Entries that are not absolute, are under
+`/mnt`, or are not a root-owned directory (the entry and its parent,
+following links) with no group or world write are dropped, using
+`/usr/bin/stat`. The command name is passed without its directory, so
+`/mnt/c/.../bin/zzcmd` and `./zzcmd` do not load a completion from that
+folder. System completions such as ssh still load from the remaining
+`PATH`. A failed
 elevation query is treated as elevated. `shellint` takes the `elevated` flag `Session::spawn` is given, which is
 `elevate::process_is_elevated`, the one token query in the tree.
 The script directory comes from `SHGetKnownFolderPath(FOLDERID_ProgramData)`
@@ -243,6 +261,26 @@ when elevated, never from the `PROGRAMDATA` environment variable. It is a
 random name with a DACL that is not world-writable, and zsh's `ZDOTDIR` is
 restored to the user's value before the first prompt. Only a directory
 whose name we minted is deleted.
+
+**No Lua value may carry `__close` or `__gc`.** When the instruction hook
+ends a call, mlua clears the Lua stack from inside the hook, which closes
+every to-be-closed slot of the running function with hooks off. A
+`__close` handler that loops there never returns, and `__gc` always runs
+unhooked. So the sandbox's `setmetatable` installs a private snapshot of
+the table it is given and refuses those two fields, and `getmetatable("")`
+returns `false`. Do not hand a script a live metatable, a userdata, or the
+original `setmetatable`. Rejecting `<close>` in the bytecode was the first
+fix and missed the closing value of a generic `for`, which needs no
+`<close>`.
+
+**The mux pipe is overlapped at both ends.** The window and the server
+each park one thread in a read and write from another. On a synchronous
+handle Windows serializes the two, so the write waits for the read and
+nothing is ever sent. `mux::os::PipeEnd` does every read, write and
+connect with its own `OVERLAPPED` and event. Do not swap it for
+`std::fs::File`. The server never writes to a pipe from its event loop:
+frames go to a bounded queue per window, and a window that fills it is
+disconnected with its sessions left detached.
 
 **Start-directory precedence, in order:** a restored session's saved cwd, then
 the launcher's directory (a shortcut's "Start in"), then `USERPROFILE`. The

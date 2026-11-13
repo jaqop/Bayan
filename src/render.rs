@@ -34,6 +34,9 @@ use crate::gpu::Vertex;
 #[path = "render_technical.rs"]
 mod technical;
 
+#[path = "render_flow.rs"]
+mod flow;
+
 // Bayan's first look is Jonathan Blow's scheme, SAMPLED from two captures of
 // his editor rather than recalled. Five colours are measured medians, not
 // guesses: background #062626, foreground tan #c2b796, and — the pair that
@@ -1501,16 +1504,24 @@ fn line_wrapped_into<T: alacritty_terminal::event::EventListener>(
 }
 
 fn is_tui_row(cells: &[CellInfo]) -> bool {
-    tui_row(cells.len(), |i| (cells[i].col, cells[i].w, cells[i].c))
+    tui_row(
+        cells.len(),
+        |i| (cells[i].col, cells[i].w, cells[i].c),
+        true,
+    )
 }
 
 /// The same test for a mouse snapshot. A click has to follow the path
 /// `draw_pane` took, or a right-aligned row and a TUI field disagree.
 pub(crate) fn snap_is_tui(cells: &[SnapCell]) -> bool {
-    tui_row(cells.len(), |i| (cells[i].col, cells[i].w, cells[i].c))
+    tui_row(
+        cells.len(),
+        |i| (cells[i].col, cells[i].w, cells[i].c),
+        true,
+    )
 }
 
-fn tui_row(n: usize, at: impl Fn(usize) -> (usize, usize, char)) -> bool {
+fn tui_row(n: usize, at: impl Fn(usize) -> (usize, usize, char), prompt_start: bool) -> bool {
     let mut end = n;
     while end > 0 && at(end - 1).2 == ' ' {
         end -= 1;
@@ -1546,7 +1557,7 @@ fn tui_row(n: usize, at: impl Fn(usize) -> (usize, usize, char)) -> bool {
         }
         prev = Some((col, w));
     }
-    boxy || gap || matches!(first_text, Some('>' | '❯' | '›'))
+    boxy || gap || (prompt_start && matches!(first_text, Some('>' | '❯' | '›')))
 }
 
 /// Horizontal shift that puts an RTL paragraph's rightmost glyph on the
@@ -2338,6 +2349,10 @@ type RowHit = (i32, i32, usize, bool); // x, width, column, logical RTL
 const CACHE_CAP: usize = 4096;
 
 pub struct Renderer {
+    /// Presentation-only word wrapping. Packed columns identify the original
+    /// viewport cell; the PTY grid and copied text are never rewritten.
+    flow_rows: std::collections::HashMap<(Rect, usize), usize>,
+    flow_cells: std::collections::HashMap<(Rect, usize, usize), (usize, usize)>,
     cell_geometry: std::collections::HashMap<(Rect, usize, usize), CellGeometry>,
     row_hits: std::collections::HashMap<(Rect, usize), Vec<RowHit>>,
     /// Ink union for clicks and the cursor block. Never copied into
@@ -2573,6 +2588,8 @@ impl Renderer {
             fg = grid.fg;
         }
         Self {
+            flow_rows: std::collections::HashMap::new(),
+            flow_cells: std::collections::HashMap::new(),
             cell_geometry: std::collections::HashMap::new(),
             row_hits: std::collections::HashMap::new(),
             click_boxes: std::collections::HashMap::new(),
@@ -2664,6 +2681,8 @@ impl Renderer {
     }
 
     pub fn begin_frame(&mut self) {
+        self.flow_rows.clear();
+        self.flow_cells.clear();
         self.cell_geometry.clear();
         self.row_hits.clear();
         self.click_boxes.clear();
@@ -2904,10 +2923,40 @@ impl Renderer {
     /// Whether the last frame laid cell `col` of viewport `row` right to
     /// left. False for a grid row, or a cell the frame did not draw.
     pub fn cell_rtl(&self, pane: Rect, row: usize, col: usize) -> bool {
+        let (row, col) = self
+            .flow_cells
+            .get(&(pane, row, col))
+            .copied()
+            .unwrap_or((row, col));
         self.cell_geometry
             .get(&(pane, row, col))
             .and_then(|spans| spans.first())
             .is_some_and(|&(_, _, rtl)| rtl)
+    }
+
+    /// A reflowed row can contain cells from adjacent grid rows. Return the
+    /// original source point for selection, links, and mouse reports.
+    pub fn flow_hit(
+        &self,
+        pane: Rect,
+        row: usize,
+        x: f64,
+    ) -> Option<(usize, usize, alacritty_terminal::index::Side)> {
+        use alacritty_terminal::index::Side;
+        let cols = *self.flow_rows.get(&(pane, row))?;
+        let (col, side) = self.hit_cell(pane, row, x).or_else(|| {
+            let spans = self.row_hits.get(&(pane, row))?;
+            let &(left, width, col, rtl) = spans.iter().min_by_key(|s| {
+                if x < s.0 as f64 {
+                    (s.0 as f64 - x) as i64
+                } else {
+                    (x - (s.0 + s.1) as f64).max(0.0) as i64
+                }
+            })?;
+            let right = x >= left as f64 + width as f64 / 2.0;
+            Some((col, if right ^ rtl { Side::Right } else { Side::Left }))
+        })?;
+        Some((col / cols, col % cols, side))
     }
 
     /// The primary family actually in use (post-fallback) — what the
@@ -4197,9 +4246,19 @@ impl Renderer {
         } else {
             vis as usize
         };
-        let hover = view
-            .link_hover
-            .and_then(|(row, a, b)| (row == hover_key).then_some((a, b)));
+        let hover = if let Some(&cols) = self.flow_rows.get(&(view.rect, key)) {
+            view.link_hover.and_then(|(row, a, b)| {
+                let mut matching = cells
+                    .iter()
+                    .filter(|c| c.col / cols == row && a <= c.col % cols && c.col % cols < b)
+                    .map(|c| c.col);
+                let first = matching.next()?;
+                Some((first, matching.next_back().unwrap_or(first) + 1))
+            })
+        } else {
+            view.link_hover
+                .and_then(|(row, a, b)| (row == hover_key).then_some((a, b)))
+        };
         // Explicit BDSM: the application sent visual order (and, per the
         // recommendation, presentation forms). The grid path does not
         // run UAX#9 and does not reshape. Implicit mode keeps the
@@ -4208,7 +4267,8 @@ impl Renderer {
         let row_claude = view.claude && view.claude_from.is_none_or(|start| vis as i64 >= start);
         // A wrapped tail of an RTL paragraph (`follow_rtl`) stays on the
         // bidi path even when this row itself has no Arabic letter.
-        if (arabic || follow_rtl) && view.reorder {
+        if (arabic || follow_rtl || self.flow_rows.contains_key(&(view.rect, key))) && view.reorder
+        {
             let on_row = cursor_vrow == vis;
             let col = if on_row { Some(ccol) } else { None };
             // Alternate-screen rows stay in their grid columns: a TUI
@@ -4236,6 +4296,8 @@ impl Renderer {
     ) {
         self.cell_geometry
             .retain(|(pane, _, _), _| *pane != view.rect);
+        self.flow_rows.retain(|(pane, _), _| *pane != view.rect);
+        self.flow_cells.retain(|(pane, _, _), _| *pane != view.rect);
         let (px, py, pw, ph) = view.rect;
         let clip = view.rect;
         let rows = term.screen_lines();
@@ -4316,15 +4378,41 @@ impl Renderer {
             });
         }
 
-        let cursor_vrow = cursor.point.line.0 + off;
-        let ccol = cursor.point.column.0;
+        let native_cursor_row = cursor.point.line.0 + off;
+        let native_ccol = cursor.point.column.0;
+        let continued: Vec<_> = (0..=rows)
+            .map(|row| line_wrapped_into(term, row, off))
+            .collect();
+        // Positioned TUIs and visual-order application output retain their
+        // grid. Prose reflow is view-only and keeps the same row budget.
+        if view.reorder
+            && !alt
+            && !view.claude
+            && view.line_dir.iter().all(|d| *d == ParagraphDir::Default)
+        {
+            for row in flow::reflow(&mut lines, &continued, term.columns()) {
+                let cols = term.columns();
+                self.flow_rows.insert((view.rect, row), cols);
+                for cell in &lines[row] {
+                    self.flow_cells.insert(
+                        (view.rect, cell.col / cols, cell.col % cols),
+                        (row, cell.col),
+                    );
+                }
+            }
+        }
+        let (cursor_vrow, ccol) = self
+            .flow_cells
+            .get(&(view.rect, native_cursor_row as usize, native_ccol))
+            .map(|&(row, col)| (row as i32, col))
+            .unwrap_or((native_cursor_row, native_ccol));
         let mut cursor_rect: Option<(i32, i32)> = None; // (x, w) via shaped layout
         let mut walk = ParagraphWalk::default();
         for (li, cells) in lines.iter().enumerate() {
             // The row's direction: SCP stamp, then the wrapped paragraph's
             // direction, then its own first strong letter.
             let explicit = view.line_dir.get(li).copied().unwrap_or_default();
-            let continued = line_wrapped_into(term, li, off);
+            let continued = continued[li];
             let auto = auto_paragraph_dir(
                 cells
                     .iter()
@@ -4419,7 +4507,12 @@ impl Renderer {
             let Some(((r, g, b), a)) = paint else {
                 continue;
             };
-            for &(li, col, w) in cells.iter() {
+            for &(source_li, source_col, w) in cells.iter() {
+                let (li, col) = self
+                    .flow_cells
+                    .get(&(view.rect, source_li, source_col))
+                    .copied()
+                    .unwrap_or((source_li, source_col));
                 let vis = if li == crate::scroll::PEEK_ROW {
                     -1
                 } else {
@@ -4438,6 +4531,10 @@ impl Renderer {
                             c4((r, g, b), a as u8),
                         );
                     }
+                    continue;
+                }
+                // Trimmed presentation whitespace has no painted box.
+                if self.flow_rows.contains_key(&(view.rect, li)) {
                     continue;
                 }
                 let x0 = px + (col as f32 * self.cell_w).round() as i32;
@@ -7344,7 +7441,7 @@ impl Renderer {
             }
         }
 
-        for (rect, glyph) in self.tab_controls(width).iter().zip(["‹", "›", "+"]) {
+        for (rect, glyph) in self.tab_controls(width).iter().zip(["‹", "›", "+", "⌄"]) {
             let (bx, by, bw, bh) = *rect;
             push_rect(out, whole, bx, by, bw, bh, c4(bar_bg, 255));
             let seg = [Seg::plain(glyph, self.chrome_fg())];
@@ -7450,11 +7547,11 @@ impl Renderer {
         (self.ui_cell_w() * 3.2).max(46.0 * self.dpi_scale) as i32
     }
 
-    /// Previous tab, next tab, and new tab; reserve this area before layout.
-    pub fn tab_controls(&self, width: usize) -> [Rect; 3] {
+    /// Previous tab, next tab, new tab, and shell menu; reserve before layout.
+    pub fn tab_controls(&self, width: usize) -> [Rect; 4] {
         let (gear_x, _, bw, _) = self.settings_button_rect(width);
         let h = self.tab_bar_h().round() as i32;
-        std::array::from_fn(|i| (gear_x - (3 - i as i32) * bw, 0, bw, h))
+        std::array::from_fn(|i| (gear_x - (4 - i as i32) * bw, 0, bw, h))
     }
 
     pub fn tab_control_hit(&self, width: usize, px: f64, py: f64) -> Option<usize> {
@@ -10857,12 +10954,18 @@ mod cache_tests {
         assert_eq!(lay.rows.len(), n);
         let (cx, cy, cw, ch) = lay.card;
         assert!(cx > 0 && cy > 0 && cx + cw <= 1400 && cy + ch <= 900);
-        let mut last_bottom = 0;
-        for &(rx, ry, rw, rh) in &lay.rows {
+        // 30 actions take two columns at this height, so "no overlap" is
+        // checked between every pair, not as one stack
+        for (i, &(rx, ry, rw, rh)) in lay.rows.iter().enumerate() {
             assert!(rx >= cx && rx + rw <= cx + cw && ry >= cy && ry + rh <= cy + ch);
-            assert!(ry >= last_bottom, "rows must stack without overlap");
-            last_bottom = ry + rh;
+            for &(ox, oy, ow, oh) in &lay.rows[..i] {
+                let apart = rx >= ox + ow || ox >= rx + rw || ry >= oy + oh || oy >= ry + rh;
+                assert!(apart, "strips must not overlap");
+            }
         }
+        // a window tall enough keeps one column, stacked in order
+        let tall = r.shortcuts_layout(1400, 2000, n);
+        assert!(tall.rows.windows(2).all(|p| p[1].1 >= p[0].1 + p[0].3));
         // the settings panel's header button exists and sits inside ITS card
         let slay = r.settings_layout(1400, 900);
         let (bx, by, bw, bh) = slay.shortcuts_btn;
@@ -11330,6 +11433,94 @@ mod cache_tests {
 
     /// The top-right bar draws for any text, and widens for a text longer
     /// than its 34-cell floor instead of letting it run out of the box.
+    #[test]
+    fn changing_only_arabic_letter_colors_preserves_connected_glyph_forms() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let mut cells: Vec<_> = "بببب"
+            .chars()
+            .enumerate()
+            .map(|(col, c)| CellInfo {
+                col,
+                c,
+                w: 1,
+                zw: None,
+                fg: FG,
+                bg: BG,
+                style: 0,
+                ul: FG,
+            })
+            .collect();
+        let shape = |r: &mut Renderer, cells: &[CellInfo]| {
+            r.cache_hot.clear();
+            r.cache_cold.clear();
+            r.draw_line_bidi(
+                &mut Vec::new(),
+                (0, 0, 1000, 100),
+                0,
+                0,
+                1000,
+                cells,
+                false,
+                None,
+                ParagraphDir::Default,
+                None,
+                true,
+            );
+            r.cache_hot
+                .values()
+                .flat_map(|cached| cached.buffer.layout_runs())
+                .flat_map(|line| line.glyphs.iter())
+                .map(|g| (g.start, g.end, g.font_id, g.glyph_id))
+                .collect::<Vec<_>>()
+        };
+        let mono = shape(&mut r, &cells);
+        assert!(
+            mono.iter()
+                .map(|g| g.3)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                >= 3,
+            "a connected beh word must use initial/medial/final forms: {mono:?}"
+        );
+        for cell in &mut cells {
+            if cell.col % 2 == 0 {
+                cell.fg = (255, 80, 80);
+            }
+        }
+        let colored = shape(&mut r, &cells);
+        assert_eq!(
+            colored, mono,
+            "syntax colors must not disconnect Arabic letters"
+        );
+    }
+
+    #[test]
+    fn arabic_search_bar_keeps_the_count_plus_after_its_digits() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let tail = crate::search_tail(crate::SearchStatus::Counted(crate::SearchCount {
+            at: None,
+            total: 1000,
+            capped: true,
+        }));
+        let text = format!("بحث: HISTORY-OLD-_{tail}");
+        r.draw_chrome(&mut Vec::new(), 1600, 600, &[], Some(&text), false, None);
+        let run = r
+            .cache_hot
+            .iter()
+            .find(|(key, _)| key.0.iter().any(|seg| seg.text == text))
+            .map(|(_, run)| run)
+            .expect("actual chrome run");
+        let x = |byte| {
+            run.buffer
+                .layout_runs()
+                .flat_map(|line| line.glyphs.iter())
+                .find(|g| g.start <= byte && byte < g.end)
+                .unwrap()
+                .x
+        };
+        assert!(x(text.find("1000").unwrap()) < x(text.rfind('+').unwrap()));
+    }
+
     #[test]
     fn the_bar_draws_and_holds_its_text() {
         let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
@@ -11914,8 +12105,275 @@ mod paragraph_align {
         }
     }
 
+    /// Exercise the production painter rather than a parallel wrapping model.
+    #[test]
+    fn soft_wrapping_does_not_split_arabic_words_in_the_painted_runs() {
+        use alacritty_terminal::{event::VoidListener, term::Config, vte::ansi::Processor};
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let mut term = Term::new(
+            Config::default(),
+            &crate::term::TermSize { cols: 18, rows: 8 },
+            VoidListener,
+        );
+        let mut processor: Processor = Processor::new();
+        let text = "هذه تجربة الإنجليزية مع العربية ثم نعيد الاختبار 123 ready";
+        processor.advance(&mut term, text.as_bytes());
+        let pane = (0, 0, 500, 300);
+        r.draw_pane(&mut Vec::new(), &pane_view(pane, true), &term);
+        let painted: Vec<String> = r
+            .row_shape
+            .values()
+            .map(|row| row.key.0.iter().map(|s| s.text.as_str()).collect())
+            .collect();
+        for word in ["الإنجليزية", "العربية", "نعيد", "الاختبار"] {
+            assert!(
+                painted.iter().any(|row| row.contains(word)),
+                "{word} was split in actual draw_pane: {painted:?}"
+            );
+        }
+        // A letter moved across a display break still resolves to the cell
+        // the PTY owns, including the RTL selection side.
+        let moved: Vec<_> = r
+            .flow_cells
+            .iter()
+            .filter(|((_, source, _), (paint, _))| source != paint)
+            .map(|(&(p, source, col), &(paint, packed))| (p, source, col, paint, packed))
+            .collect();
+        assert!(!moved.is_empty());
+        let mut checked = 0;
+        for &(p, source, col, paint, packed) in &moved {
+            let Some(spans) = r.cell_geometry.get(&(p, paint, packed)) else {
+                continue;
+            };
+            let (x, width, _) = spans[0];
+            if width < 3 {
+                continue;
+            }
+            let hit = r.flow_hit(p, paint, x as f64 + width as f64 / 2.0).unwrap();
+            assert_eq!((hit.0, hit.1), (source, col));
+            checked += 1;
+        }
+        assert!(checked > 0);
+        // Drawing cannot add newlines, spaces or join controls to the grid.
+        let mut stored = String::new();
+        for row in 0..term.screen_lines() {
+            for col in 0..term.columns() {
+                stored.push(
+                    term.grid()[alacritty_terminal::index::Line(row as i32)]
+                        [alacritty_terminal::index::Column(col)]
+                    .c,
+                );
+            }
+        }
+        assert_eq!(stored.trim_end(), text);
+        // The application moves its native cursor onto a letter that the
+        // view put on another row. IME/caret must follow the painted row.
+        let &(_, source, col, paint, _) = moved
+            .iter()
+            .find(|&&(p, _, _, row, packed)| r.cell_geometry.contains_key(&(p, row, packed)))
+            .unwrap();
+        processor.advance(
+            &mut term,
+            format!("\x1b[{};{}H", source + 1, col + 1).as_bytes(),
+        );
+        let mut view = pane_view(pane, true);
+        view.focused = true;
+        view.cursor_on = true;
+        r.begin_frame();
+        r.draw_pane(&mut Vec::new(), &view, &term);
+        let (_, y, _, _) = r.ime_spot.expect("cursor stays visible after reflow");
+        assert_eq!(y, crate::scroll::content_y(0, paint as i32, r.cell_h, 0));
+    }
+
+    #[test]
+    fn mixed_corpus_keeps_arabic_words_whole_at_multiple_widths() {
+        use alacritty_terminal::{event::VoidListener, term::Config, vte::ansi::Processor};
+        let corpus = include_str!("../tests/fixtures/mixed-arabic-english.txt");
+        assert!(corpus.split_whitespace().count() > 100);
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        for cols in [32, 70, 100] {
+            let mut term = Term::new(
+                Config::default(),
+                &crate::term::TermSize { cols, rows: 100 },
+                VoidListener,
+            );
+            let mut processor: Processor = Processor::new();
+            processor.advance(
+                &mut term,
+                corpus
+                    .replace("\r\n", "\n")
+                    .replace('\n', "\r\n")
+                    .as_bytes(),
+            );
+            r.begin_frame();
+            r.draw_pane(
+                &mut Vec::new(),
+                &pane_view((0, 0, cols as i32 * 15, 4000), true),
+                &term,
+            );
+            let painted: Vec<String> = r
+                .row_shape
+                .values()
+                .map(|row| row.key.0.iter().map(|s| s.text.as_str()).collect())
+                .collect();
+            for word in corpus.split_whitespace().filter(|word| {
+                word.chars().any(is_arabic)
+                    && word
+                        .chars()
+                        .all(|c| is_arabic(c) || c.is_ascii_punctuation())
+            }) {
+                assert!(
+                    painted.iter().any(|line| line.contains(word)),
+                    "word {word:?} split at {cols} columns: {painted:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scrolling_inside_a_paragraph_keeps_visible_words_whole() {
+        use alacritty_terminal::{
+            event::VoidListener, grid::Scroll, term::Config, vte::ansi::Processor,
+        };
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let mut term = Term::new(
+            Config::default(),
+            &crate::term::TermSize { cols: 30, rows: 4 },
+            VoidListener,
+        );
+        let mut processor: Processor = Processor::new();
+        let corpus =
+            include_str!("../tests/fixtures/mixed-arabic-english.txt").replace("\r\n", "\n");
+        let text = corpus.split("\n\n").nth(1).unwrap();
+        processor.advance(&mut term, text.as_bytes());
+        term.scroll_display(Scroll::Delta(3));
+        let off = term.grid().display_offset() as i32;
+        assert!(off > 0);
+        assert!(line_wrapped_into(&term, 0, off));
+        assert!(line_wrapped_into(&term, 4, off));
+        let mut visible = String::new();
+        for row in 0..4 {
+            for cell in r.cells_of_line(&term, alacritty_terminal::index::Line(row - off)) {
+                cell.push_text(&mut visible);
+            }
+        }
+        let pane = (0, 0, 600, 160);
+        r.draw_pane(&mut Vec::new(), &pane_view(pane, true), &term);
+        assert!(
+            !r.flow_rows.is_empty(),
+            "viewport edges must not disable prose reflow"
+        );
+        let painted: Vec<String> = r
+            .row_shape
+            .values()
+            .map(|row| row.key.0.iter().map(|s| s.text.as_str()).collect())
+            .collect();
+        let words: Vec<_> = visible.split_whitespace().collect();
+        let mut checked = 0;
+        // The first/last token can be clipped by the viewport, not a break
+        // introduced inside it. Every complete Arabic word stays whole.
+        for word in &words[1..words.len() - 1] {
+            if word
+                .chars()
+                .all(|c| is_arabic(c) || c.is_ascii_punctuation())
+            {
+                assert!(
+                    painted.iter().any(|row| row.contains(word)),
+                    "split visible {word}: {painted:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
+    }
+
+    #[test]
+    #[ignore = "real Windows ConPTY and Python; run explicitly with BAYAN_TEST_PYTHON"]
+    fn native_conpty_mixed_corpus_word_wrapping() {
+        use alacritty_terminal::{event::VoidListener, term::Config, vte::ansi::Processor};
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use std::io::{Read, Write};
+        const COLS: u16 = 102;
+        let mut command = CommandBuilder::new(
+            std::env::var_os("BAYAN_TEST_PYTHON").expect("Python fixture interpreter"),
+        );
+        command.arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/native_corpus_console.py"),
+        );
+        command.arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/mixed-arabic-english.txt"),
+        );
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 60,
+                cols: COLS,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut child = pty.slave.spawn_command(command).unwrap();
+        drop(pty.slave);
+        let mut reader = pty.master.try_clone_reader().unwrap();
+        let mut writer = pty.master.take_writer().unwrap();
+        let (send, recv) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut all = Vec::new();
+            let mut bytes = [0; 4096];
+            let mut answered = false;
+            while let Ok(n) = reader.read(&mut bytes) {
+                if n == 0 {
+                    break;
+                }
+                all.extend_from_slice(&bytes[..n]);
+                if !answered && all.windows(4).any(|w| w == b"\x1b[6n") {
+                    let _ = writer.write_all(b"\x1b[1;1R");
+                    let _ = writer.flush();
+                    answered = true;
+                }
+                if all.windows(17).any(|w| w == b"BAYAN-CORPUS-DONE") || all.len() > 65536 {
+                    break;
+                }
+            }
+            let _ = send.send(all);
+        });
+        let received = recv.recv_timeout(std::time::Duration::from_secs(15));
+        let _ = child.kill();
+        let _ = child.wait();
+        let bytes = received.expect("native corpus output deadline");
+        let mut term = Term::new(
+            Config::default(),
+            &crate::term::TermSize {
+                cols: COLS as usize,
+                rows: 60,
+            },
+            VoidListener,
+        );
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, &bytes);
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        r.draw_pane(&mut Vec::new(), &pane_view((0, 0, 1100, 1800), true), &term);
+        let painted: Vec<String> = r
+            .row_shape
+            .values()
+            .map(|row| row.key.0.iter().map(|s| s.text.as_str()).collect())
+            .collect();
+        eprintln!(
+            "native mixed corpus: {} PTY bytes, {COLS} columns",
+            bytes.len()
+        );
+        for word in ["تقريبًا", "الإنجليزية", "نعيد", "كتابته."] {
+            assert!(
+                painted.iter().any(|row| row.contains(word)),
+                "native word split {word}: {painted:?}"
+            );
+        }
+    }
+
     /// A soft-wrapped RTL paragraph keeps one direction. The tail is flush
     /// right too, not re-detected as its own paragraph.
+
     #[test]
     fn wrapped_rtl_line_keeps_paragraph_alignment() {
         use alacritty_terminal::event::VoidListener;

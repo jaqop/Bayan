@@ -184,7 +184,9 @@ pub fn forward_args(launch: &Launch) -> Result<Vec<String>, String> {
     if !launch.elevated {
         return Err(refused());
     }
-    if launch.command.is_some() || launch.directory.is_some() {
+    // `--maximized` is refused, not dropped: the elevated argv is
+    // `--elevated` and `-p <name>` and nothing else
+    if launch.command.is_some() || launch.directory.is_some() || launch.maximized {
         return Err(refused());
     }
     let mut args = vec!["--elevated".to_string()];
@@ -309,7 +311,16 @@ mod tests {
             profile: profile.map(str::to_string),
             command: command.map(|argv| argv.iter().map(|s| (*s).to_string()).collect()),
             elevated: true,
+            maximized: false,
         }
+    }
+
+    #[test]
+    fn a_window_mode_is_not_forwarded_to_the_elevated_process() {
+        let mut asked = launch(None, None, None);
+        assert!(forward_args(&asked).is_ok());
+        asked.maximized = true;
+        assert!(forward_args(&asked).is_err());
     }
 
     #[test]

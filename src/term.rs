@@ -360,6 +360,9 @@ pub struct SessionMeta {
     /// File links resolve through `link::cwd_hook` on this field. There is
     /// no second source.
     pub cwd: Option<String>,
+    /// Verified directory used at local spawn, retained for shells that do
+    /// not report OSC cwd. This is not a shell-originated cwd report.
+    pub initial_cwd: Option<String>,
     /// BDSM (implicit/explicit) and SCP paragraph direction for this pane.
     /// An `Arc` so a frame can snapshot it without cloning the stamp list.
     /// The reader thread uses [`Self::bidi_mut`], which copies only when a
@@ -442,8 +445,10 @@ impl SessionMeta {
     /// directory falls through to the launcher directory.
     pub fn spawn_cwd(&self) -> Option<String> {
         self.reported_cwd()
-            .and_then(accept_local_cwd)
-            .filter(|p| usable_spawn_dir(p))
+            .into_iter()
+            .chain(self.initial_cwd.as_deref())
+            .filter_map(accept_local_cwd)
+            .find(|p| usable_spawn_dir(p))
     }
 
     /// Replace this pane's image budget. Used by tests that share one
@@ -1406,6 +1411,39 @@ fn feed_counted<T: EventListener>(
     if evict > 0 {
         meta.evicted += evict as u64;
     }
+}
+
+/// What "Reset terminal modes" turns off, as the bytes a well-behaved
+/// program would have sent on exit: cursor shown, mouse tracking and focus
+/// reports off, cursor keys and keypad back to normal, bracketed paste off,
+/// an open synchronized update closed.
+///
+/// It is not RIS, and it does not touch colors, the character set or the
+/// screen. ConPTY keeps its own copy of the screen and its own attribute
+/// state and only sends what changed. A view cleared or recolored behind
+/// its back stays wrong until the program happens to repaint.
+pub(crate) const MODE_RESET: &[u8] = b"\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\
+\x1b[?1004l\x1b[?1l\x1b>\x1b[?2004l\x1b[?2026l";
+
+/// ED 3: drop the saved lines, keep the screen.
+pub(crate) const CLEAR_SCROLLBACK: &[u8] = b"\x1b[3J";
+
+/// Bytes from the window rather than the program, through the reader's own
+/// counted feed. The lines ED 3 drops count as evicted, so OSC 133 marks
+/// and images keep their global rows.
+///
+/// The parser is the reader's. If a read ended inside an escape sequence,
+/// these bytes cut it short; [`reset_keyboard_modes`] has the same property.
+pub(crate) fn feed_local<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    meta: &mut SessionMeta,
+    bytes: &[u8],
+) {
+    // none of the sequences above asks a question
+    let mut replies = Vec::new();
+    feed_counted(parser, t, meta, bytes, &mut replies);
+    meta.images.evict(meta.evicted);
 }
 
 fn merge_chunk(dst: &mut ChunkEvents, src: ChunkEvents) {
@@ -3091,7 +3129,7 @@ impl Session {
             .filter(|d| usable_spawn_dir(d))
             .or_else(launcher_dir)
             .or_else(|| std::env::var("USERPROFILE").ok());
-        if let Some(d) = dir {
+        if let Some(d) = &dir {
             cmd.cwd(d);
         }
         // A raw command is the program the user named. The PowerShell,
@@ -3154,7 +3192,7 @@ impl Session {
         let writer = pair.master.take_writer()?;
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
-        Self::from_parts(SessionArgs {
+        let session = Self::from_parts(SessionArgs {
             size,
             proxy,
             id,
@@ -3172,7 +3210,9 @@ impl Session {
                 on_resize: None,
                 on_kill: None,
             },
-        })
+        })?;
+        session.meta.lock_or_recover().initial_cwd = dir;
+        Ok(session)
     }
 
     /// A pane fed by `io` instead of a ConPTY this process opened. Local
@@ -3473,6 +3513,26 @@ impl Session {
         let mut m = self.meta.lock_or_recover();
         let mut parser = self.parser.lock_or_recover();
         reset_keyboard_modes(&mut parser, &mut t, &mut m);
+    }
+
+    fn feed_local(&mut self, bytes: &[u8]) {
+        let mut t = self.term.lock();
+        let mut m = self.meta.lock_or_recover();
+        let mut parser = self.parser.lock_or_recover();
+        feed_local(&mut parser, &mut t, &mut m, bytes);
+    }
+
+    /// Drop this pane's saved lines. The screen stays. On the alternate
+    /// screen there is no history to drop and the primary one is untouched.
+    pub fn clear_scrollback(&mut self) {
+        self.feed_local(CLEAR_SCROLLBACK);
+    }
+
+    /// Undo the modes a crashed program left on: [`MODE_RESET`] and the
+    /// kitty keyboard stack.
+    pub fn reset_modes(&mut self) {
+        self.reset_keyboard();
+        self.feed_local(MODE_RESET);
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
@@ -3906,6 +3966,30 @@ pub fn regex_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_directory_falls_back_without_faking_a_shell_report() {
+        let start = std::env::temp_dir()
+            .to_string_lossy()
+            .trim_end_matches('\\')
+            .to_string();
+        let reported = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut meta = SessionMeta {
+            initial_cwd: Some(start.clone()),
+            ..SessionMeta::default()
+        };
+        assert!(meta.reported_cwd().is_none());
+        assert_eq!(meta.spawn_cwd(), Some(start.clone()));
+        meta.cwd = Some(reported.clone());
+        assert_eq!(meta.spawn_cwd(), Some(reported));
+        meta.cwd = Some(r"\\server\share".into());
+        assert_eq!(meta.spawn_cwd(), Some(start));
+        meta.initial_cwd = Some(r"\\server\share".into());
+        assert!(meta.spawn_cwd().is_none());
+    }
 
     #[test]
     fn elevated_environment_removes_startup_code_even_with_nonunicode_values() {
@@ -5386,6 +5470,106 @@ mod tests {
         assert_eq!(grid_line, t.grid().cursor.point.line.0 as i64);
         // the display offset was left untouched by the parking trick
         assert_eq!(t.grid().display_offset(), 0);
+    }
+
+    /// "Clear scrollback" from the window: the saved lines go, the screen
+    /// stays, and a mark made before the clear still names its own row.
+    #[test]
+    fn clearing_the_scrollback_keeps_the_screen_and_the_marks() {
+        use alacritty_terminal::index::{Line, Point};
+        let size = TermSize { cols: 20, rows: 4 };
+        let mut t = Term::new(Config::default(), &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        let mut meta = SessionMeta {
+            prompt_nonce: "n0nce".into(),
+            ..SessionMeta::default()
+        };
+        let mut carry = Vec::new();
+        for i in 0..10 {
+            let line = format!("L{i}\r\n");
+            process_chunk(&mut p, &mut t, &mut meta, &mut carry, line.as_bytes());
+        }
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;A;n0nce\x07prompt",
+        );
+        let history = t.grid().history_size();
+        assert!(history > 0, "the test needs saved lines");
+        let screen = |t: &Term<VoidListener>| {
+            t.bounds_to_string(
+                Point::new(Line(0), Column(0)),
+                Point::new(Line(3), Column(19)),
+            )
+        };
+        let before = screen(&t);
+        let cursor = t.grid().cursor.point;
+        t.scroll_display(Scroll::Delta(3));
+
+        feed_local(&mut p, &mut t, &mut meta, CLEAR_SCROLLBACK);
+
+        assert_eq!(t.grid().history_size(), 0);
+        assert_eq!(
+            t.grid().display_offset(),
+            0,
+            "nothing left to be scrolled into"
+        );
+        assert_eq!(screen(&t), before, "the screen is untouched");
+        assert_eq!(t.grid().cursor.point, cursor);
+        assert_eq!(
+            meta.evicted, history as u64,
+            "the cleared lines count as evicted"
+        );
+        let m = meta.marks.last().unwrap();
+        let grid_line = (m.abs - meta.evicted) as i64 - t.grid().history_size() as i64;
+        assert_eq!(
+            grid_line, cursor.line.0 as i64,
+            "the prompt mark kept its row"
+        );
+    }
+
+    /// "Reset terminal modes": what a crashed TUI leaves on goes off, and
+    /// nothing ConPTY keeps its own copy of (text, colors, cursor) moves.
+    #[test]
+    fn the_mode_reset_turns_leftover_modes_off_and_leaves_the_screen() {
+        use alacritty_terminal::index::{Line, Point};
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[31mred text\x1b[?25l\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?1h\x1b=\x1b[?2004h",
+        );
+        let left_on = TermMode::MOUSE_MOTION
+            | TermMode::SGR_MOUSE
+            | TermMode::FOCUS_IN_OUT
+            | TermMode::APP_CURSOR
+            | TermMode::APP_KEYPAD
+            | TermMode::BRACKETED_PASTE;
+        assert!(t.mode().contains(left_on));
+        assert!(!t.mode().contains(TermMode::SHOW_CURSOR));
+        let cursor = t.grid().cursor.point;
+        let fg = t.grid().cursor.template.fg;
+
+        feed_local(&mut p, &mut t, &mut meta, MODE_RESET);
+
+        assert!(!t.mode().intersects(left_on | TermMode::MOUSE_MODE));
+        assert!(t.mode().contains(TermMode::SHOW_CURSOR));
+        assert_eq!(t.grid().cursor.point, cursor, "the cursor did not move");
+        assert_eq!(
+            t.grid().cursor.template.fg,
+            fg,
+            "the color is ConPTY's to reset"
+        );
+        let row = t.bounds_to_string(
+            Point::new(Line(0), Column(0)),
+            Point::new(Line(0), Column(7)),
+        );
+        assert_eq!(row, "red text");
+        assert!(!t.mode().contains(TermMode::ALT_SCREEN));
     }
 
     #[test]

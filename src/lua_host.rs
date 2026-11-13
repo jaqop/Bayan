@@ -50,9 +50,15 @@
 //! Each call into a plugin — loading it, a key binding, one event dispatch —
 //! gets its own instruction budget and its own deadline. Handlers of one
 //! dispatch share that deadline, and one event holds at most 32 of them.
-//! A loop is cut off. The next call starts clean. `__gc` is rejected, and
-//! so is `<close>`: its `OP_TBC` instruction is refused in every loaded
-//! chunk, including one hidden inside `load`.
+//! A loop is cut off. The next call starts clean.
+//!
+//! `setmetatable` gives the object a snapshot of the metatable, taken at
+//! that call. A field added to the table afterwards is not a metamethod
+//! until `setmetatable` is called again; methods reached through `__index`
+//! stay live. A metatable with `__gc` or `__close` is refused, and
+//! `getmetatable("")` returns `false`. No value can therefore carry
+//! `__close`, so neither `<close>` nor the closing value of a generic `for`
+//! has a handler to run.
 //!
 //! Strings crossing the boundary are UTF-8. Arabic round-trips unchanged.
 //!
@@ -1144,39 +1150,19 @@ fn harden(lua: &Lua, fuel: &Arc<Fuel>) -> Result<(), String> {
             .map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
-    // Lua 5.4 runs __gc with hooks disabled, so a finalizer loop never
-    // trips the instruction budget. Finalization is decided at setmetatable
-    // time, from a raw __gc lookup. Adding __gc later does not arm it, but
-    // rawset of that key is refused too.
-    let orig_setmt: mlua::Function = g.get("setmetatable").map_err(|e| e.to_string())?;
     g.set(
         "setmetatable",
-        lua.create_function(move |_, (obj, mt): (Value, Value)| {
-            if let Value::Table(ref table) = mt {
-                let gc: Value = table.raw_get("__gc").map_err(mlua::Error::external)?;
-                if !matches!(gc, Value::Nil) {
-                    return Err(mlua::Error::runtime("__gc is disabled"));
-                }
-            }
-            orig_setmt.call::<Value>((obj, mt))
-        })
-        .map_err(|e| e.to_string())?,
+        lua.create_function(guarded_setmetatable)
+            .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    let orig_rawset: mlua::Function = g.get("rawset").map_err(|e| e.to_string())?;
-    g.set(
-        "rawset",
-        lua.create_function(move |_, (table, key, value): (Value, Value, Value)| {
-            if let Value::String(s) = &key {
-                if s.to_str().ok().as_deref() == Some("__gc") && !matches!(value, Value::Nil) {
-                    return Err(mlua::Error::runtime("__gc is disabled"));
-                }
-            }
-            orig_rawset.call::<Value>((table, key, value))
-        })
-        .map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
+    // Every string shares one metatable. `getmetatable("")` must not hand
+    // it out, or a script could give strings a `__close`.
+    let getmetatable: mlua::Function = g.get("getmetatable").map_err(|e| e.to_string())?;
+    let string_meta: mlua::Table = getmetatable.call("").map_err(|e| e.to_string())?;
+    string_meta
+        .raw_set("__metatable", false)
+        .map_err(|e| e.to_string())?;
     // The string metatable's __index is this same table, so `s:find(...)`
     // reaches these wrappers too.
     cap_pattern_functions(lua, &string, fuel)?;
@@ -1452,227 +1438,73 @@ fn text_only_load(lua: &Lua, args: MultiValue) -> mlua::Result<mlua::Function> {
     if let Some(Value::Table(env)) = args.get(3) {
         loader = loader.set_environment(env.clone());
     }
-    let func = loader.into_function()?;
-    // `<close>` is compiled into this function, including its nested
-    // prototypes. Reject it before the caller can run it.
-    if let Err(msg) = reject_to_be_closed(&func) {
-        return Err(mlua::Error::runtime(msg));
-    }
-    Ok(func)
+    loader.into_function()
 }
 
 fn compile_text(lua: &Lua, source: &str, name: &str) -> Result<mlua::Function, String> {
-    let func = lua
-        .load(source)
+    lua.load(source)
         .set_mode(ChunkMode::Text)
         .set_name(name)
         .into_function()
-        .map_err(|e| e.to_string())?;
-    reject_to_be_closed(&func)?;
-    Ok(func)
+        .map_err(|e| e.to_string())
 }
 
-fn reject_to_be_closed(func: &mlua::Function) -> Result<(), String> {
-    let bytes = func.dump(true);
-    if bytes.is_empty() {
-        return Err("lua chunk could not be checked".into());
+/// Metamethods Lua 5.4 can run with the instruction hook off. `__gc` runs
+/// that way always. `__close` runs that way when the hook itself ends the
+/// call: mlua clears the Lua stack from inside the hook, and that closes
+/// every to-be-closed slot of the running function.
+const UNHOOKED_METAMETHODS: [&str; 2] = ["__gc", "__close"];
+
+/// Set in a snapshot whose source carried its own `__metatable` field. A
+/// source that uses this key itself only gets a metatable it cannot change.
+const PROTECTED_KEY: &str = "__bayan_protected";
+
+/// `setmetatable` for the sandbox. The object gets a private snapshot of
+/// `mt`, so no table a script can reach is ever a live metatable, and a
+/// metamethod cannot be added once the snapshot is taken. That is what
+/// keeps `__close` out: `<close>` and the closing value of a generic `for`
+/// both need a value whose metatable has it.
+fn guarded_setmetatable(
+    lua: &Lua,
+    (object, mt): (mlua::Table, Value),
+) -> mlua::Result<mlua::Table> {
+    if let Some(current) = object.metatable() {
+        if current.raw_get::<bool>(PROTECTED_KEY)? {
+            return Err(mlua::Error::runtime("cannot change a protected metatable"));
+        }
     }
-    match bytecode_arms_close(&bytes) {
-        Ok(false) => Ok(()),
-        Ok(true) => Err("<close> is disabled".into()),
-        Err(()) => Err("lua chunk could not be checked".into()),
-    }
+    let snapshot = match mt {
+        Value::Nil => None,
+        Value::Table(source) => Some(metatable_snapshot(lua, &source)?),
+        _ => return Err(mlua::Error::runtime("setmetatable expects a table or nil")),
+    };
+    object.set_metatable(snapshot)?;
+    Ok(object)
 }
 
-/// `OP_TBC` in Lua 5.4. It is the only instruction that marks a local
-/// to-be-closed. `__close` then runs while unwinding, with hooks off, so
-/// the instruction budget cannot stop a loop inside that handler. The
-/// field may be written after `setmetatable`; the opcode is what arms it.
-const OP_TBC: u32 = 55;
-const LUA_VNIL: u8 = 0;
-const LUA_VFALSE: u8 = 1;
-const LUA_VTRUE: u8 = 17;
-const LUA_VNUMINT: u8 = 3;
-const LUA_VNUMFLT: u8 = 19;
-const LUA_VSHRSTR: u8 = 4;
-const LUA_VLNGSTR: u8 = 20;
-
-/// Whether this official Lua 5.4 dump contains `OP_TBC` in any prototype.
-/// `Err` means the bytes are not a dump we can read. Callers reject both.
-fn bytecode_arms_close(bytes: &[u8]) -> Result<bool, ()> {
-    let mut r = Dump::new(bytes);
-    r.header()?;
-    let _upvalues = r.byte()?;
-    let found = r.function()?;
-    if r.i != r.b.len() {
-        return Err(());
-    }
-    Ok(found)
-}
-
-struct Dump<'a> {
-    b: &'a [u8],
-    i: usize,
-}
-
-impl<'a> Dump<'a> {
-    fn new(b: &'a [u8]) -> Self {
-        Self { b, i: 0 }
-    }
-
-    fn byte(&mut self) -> Result<u8, ()> {
-        let b = *self.b.get(self.i).ok_or(())?;
-        self.i += 1;
-        Ok(b)
-    }
-
-    fn bytes(&mut self, n: usize) -> Result<&'a [u8], ()> {
-        let end = self.i.checked_add(n).ok_or(())?;
-        let s = self.b.get(self.i..end).ok_or(())?;
-        self.i = end;
-        Ok(s)
-    }
-
-    fn skip(&mut self, n: usize) -> Result<(), ()> {
-        let _ = self.bytes(n)?;
-        Ok(())
-    }
-
-    /// Lua's `dumpSize`: 7-bit groups, most significant first, high bit set
-    /// on the last byte.
-    fn size(&mut self) -> Result<usize, ()> {
-        let mut x: u64 = 0;
-        for _ in 0..10 {
-            let b = self.byte()?;
-            if x > (u64::MAX >> 7) {
-                return Err(());
-            }
-            x = (x << 7) | u64::from(b & 0x7f);
-            if b & 0x80 != 0 {
-                return usize::try_from(x).map_err(|_| ());
+/// A raw copy of `source`. `getmetatable` returns `source` itself through
+/// the copy's `__metatable`, unless `source` already set that field.
+fn metatable_snapshot(lua: &Lua, source: &mlua::Table) -> mlua::Result<mlua::Table> {
+    let snapshot = lua.create_table()?;
+    for pair in source.pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        if let Value::String(name) = &key {
+            let name = name.as_bytes();
+            if let Some(found) = UNHOOKED_METAMETHODS
+                .iter()
+                .find(|m| m.as_bytes() == &name[..])
+            {
+                return Err(mlua::Error::runtime(format!("{found} is disabled")));
             }
         }
-        Err(())
+        snapshot.raw_set(key, value)?;
     }
-
-    fn header(&mut self) -> Result<(), ()> {
-        if self.bytes(4)? != b"\x1bLua" {
-            return Err(());
-        }
-        if self.byte()? != 0x54 || self.byte()? != 0 {
-            return Err(());
-        }
-        if self.bytes(6)? != b"\x19\x93\r\n\x1a\n" {
-            return Err(());
-        }
-        // Instruction, lua_Integer, lua_Number. Then the endianness checks.
-        if self.byte()? != 4 || self.byte()? != 8 || self.byte()? != 8 {
-            return Err(());
-        }
-        if self.bytes(8)? != 0x5678u64.to_le_bytes() {
-            return Err(());
-        }
-        let num = f64::from_le_bytes(self.bytes(8)?.try_into().map_err(|_| ())?);
-        if num.to_bits() != 370.5f64.to_bits() {
-            return Err(());
-        }
-        Ok(())
+    if snapshot.raw_get::<Value>("__metatable")?.is_nil() {
+        snapshot.raw_set("__metatable", source)?;
+    } else {
+        snapshot.raw_set(PROTECTED_KEY, true)?;
     }
-
-    fn lua_string(&mut self) -> Result<(), ()> {
-        let n = self.size()?;
-        if n == 0 {
-            return Ok(());
-        }
-        self.skip(n - 1)
-    }
-
-    fn function(&mut self) -> Result<bool, ()> {
-        self.lua_string()?;
-        let _ = self.size()?;
-        let _ = self.size()?;
-        let _ = self.byte()?;
-        let _ = self.byte()?;
-        let _ = self.byte()?;
-        let mut found = self.code()?;
-        self.constants()?;
-        self.upvalues()?;
-        if self.protos()? {
-            found = true;
-        }
-        self.debug()?;
-        Ok(found)
-    }
-
-    fn code(&mut self) -> Result<bool, ()> {
-        let n = self.bounded()?;
-        let mut found = false;
-        for _ in 0..n {
-            let word = u32::from_le_bytes(self.bytes(4)?.try_into().map_err(|_| ())?);
-            if (word & 0x7f) == OP_TBC {
-                found = true;
-            }
-        }
-        Ok(found)
-    }
-
-    fn constants(&mut self) -> Result<(), ()> {
-        let n = self.bounded()?;
-        for _ in 0..n {
-            match self.byte()? {
-                LUA_VNIL | LUA_VFALSE | LUA_VTRUE => {}
-                LUA_VNUMINT | LUA_VNUMFLT => self.skip(8)?,
-                LUA_VSHRSTR | LUA_VLNGSTR => self.lua_string()?,
-                _ => return Err(()),
-            }
-        }
-        Ok(())
-    }
-
-    fn upvalues(&mut self) -> Result<(), ()> {
-        let n = self.bounded()?;
-        self.skip(n.checked_mul(3).ok_or(())?)
-    }
-
-    fn protos(&mut self) -> Result<bool, ()> {
-        let n = self.bounded()?;
-        let mut found = false;
-        for _ in 0..n {
-            if self.function()? {
-                found = true;
-            }
-        }
-        Ok(found)
-    }
-
-    fn debug(&mut self) -> Result<(), ()> {
-        let lines = self.bounded()?;
-        self.skip(lines)?;
-        let abs = self.bounded()?;
-        for _ in 0..abs {
-            let _ = self.size()?;
-            let _ = self.size()?;
-        }
-        let locals = self.bounded()?;
-        for _ in 0..locals {
-            self.lua_string()?;
-            let _ = self.size()?;
-            let _ = self.size()?;
-        }
-        let names = self.bounded()?;
-        for _ in 0..names {
-            self.lua_string()?;
-        }
-        Ok(())
-    }
-
-    fn bounded(&mut self) -> Result<usize, ()> {
-        let n = self.size()?;
-        if n > 1_000_000 {
-            return Err(());
-        }
-        Ok(n)
-    }
+    Ok(snapshot)
 }
 
 fn read_source(path: &Path) -> Result<Vec<u8>, String> {
@@ -2703,8 +2535,10 @@ mod tests {
             let raw = r#"
             local t, mt = {}, {}
             setmetatable(t, mt)
-            local ok = pcall(function() rawset(mt, "__gc", function() while true do end end) end)
-            if ok then error("rawset allowed __gc") end
+            rawset(mt, "__gc", function() while true do end end)
+            if pcall(setmetatable, {}, mt) then error("setmetatable accepted __gc") end
+            t = nil
+            collectgarbage()
             config.font_size = 7
         "#;
             fs::write(dir.join("config.lua"), raw).unwrap();
@@ -2911,125 +2745,184 @@ mod tests {
         }
     }
 
-    #[test]
-    fn bytecode_scanner_sees_close_in_nested_functions_not_in_strings() {
-        let (lua, _) = open_sandbox(Limits::production()).unwrap();
-        let nested = compile_text(
-            &lua,
-            "local function f()\n  local x <close> = nil\nend\nreturn 1\n",
-            "nested",
-        );
-        assert!(
-            nested.is_err(),
-            "a nested <close> must be refused before it runs"
-        );
-        let plain = lua
-            .load("return 'local x <close> = 1\\55'")
-            .set_mode(ChunkMode::Text)
-            .into_function()
-            .unwrap();
-        assert_eq!(bytecode_arms_close(&plain.dump(true)), Ok(false));
-        let with_upvalue = lua
-            .load("local a = 'hello'\nlocal function f()\n  return a .. 'local x <close>'\nend\nreturn 1\n")
-            .set_mode(ChunkMode::Text)
-            .into_function()
-            .unwrap();
-        assert_eq!(bytecode_arms_close(&with_upvalue.dump(true)), Ok(false));
-        let inner = lua
-            .load("local function f()\n  local x <close> = nil\nend\n")
-            .set_mode(ChunkMode::Text)
-            .into_function()
-            .unwrap();
-        assert_eq!(bytecode_arms_close(&inner.dump(true)), Ok(true));
+    /// Load `src` as an approved `config.lua` that ends by setting
+    /// `font_size` to 4, and return the errors. The size must not change.
+    fn refused_config_lua(label: &str, src: &str) -> Vec<String> {
+        let dir = scratch(label);
+        fs::write(dir.join("config.lua"), src).unwrap();
+        let mut cfg = json_cfg(r#"{"font_size":12.0}"#);
+        approve(&mut cfg, src.as_bytes());
+        let out = load_with(&cfg, &dir, false);
+        assert_ne!(out.config.font_size, Some(4.0), "{src}");
+        let _ = fs::remove_dir_all(&dir);
+        out.errors
+    }
+
+    /// Load `body` as the approved plugin `hello` and press F12. Nothing
+    /// may be sent: the binding has to fail before its `bayan.send`.
+    fn f12_sends_nothing(label: &str, body: &str) {
+        let dir = scratch(label);
+        let plugins = dir.join("plugins");
+        fs::create_dir_all(&plugins).unwrap();
+        fs::write(plugins.join("hello.lua"), body).unwrap();
+        let mut cfg = plugin_cfg(&plugins, "hello", false);
+        approve(&mut cfg, body.as_bytes());
+        let mut out = load_with(&cfg, &dir, false);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert!(out.plugins.fire("f12").is_empty(), "{body}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_close_variable_cannot_run_a_loop_after_the_budget() {
         finish_within(Duration::from_secs(5), || {
-            let dir = scratch("close");
-            let src = "local x <close> = setmetatable({}, {__close=function() while true do end end})\nwhile true do end\nconfig.font_size = 4\n";
-            fs::write(dir.join("config.lua"), src).unwrap();
-            let mut cfg = json_cfg(r#"{"font_size":12.0}"#);
-            approve(&mut cfg, src.as_bytes());
-            let out = load_with(&cfg, &dir, false);
-            assert!(
-                out.errors.iter().any(|e| e.contains("<close>")),
-                "{:?}",
-                out.errors
+            let errors = refused_config_lua(
+                "close",
+                "local x <close> = setmetatable({}, {__close=function() while true do end end})\nwhile true do end\nconfig.font_size = 4\n",
             );
-            assert_ne!(out.config.font_size, Some(4.0));
+            assert!(errors.iter().any(|e| e.contains("__close")), "{errors:?}");
 
-            let plugins = dir.join("plugins");
-            fs::create_dir_all(&plugins).unwrap();
-            let plug = r#"
+            f12_sends_nothing(
+                "close-plugin",
+                r#"
                 bayan.bind("f12", function()
                   local x <close> = setmetatable({}, {__close=function() while true do end end})
                   while true do end
                   bayan.send("ran")
                 end)
-            "#;
-            fs::write(plugins.join("hello.lua"), plug).unwrap();
-            let mut pcfg = plugin_cfg(&plugins, "hello", false);
-            approve(&mut pcfg, plug.as_bytes());
-            let mut out = load_with(&pcfg, &dir, false);
-            assert!(
-                out.errors.iter().any(|e| e.contains("<close>")),
-                "{:?}",
-                out.errors
+                "#,
             );
-            assert!(out.plugins.fire("f12").is_empty());
-            let _ = fs::remove_dir_all(&dir);
         });
     }
 
     #[test]
-    fn a_close_handler_assigned_after_setmetatable_is_rejected() {
+    fn a_close_handler_assigned_after_setmetatable_never_arms() {
         finish_within(Duration::from_secs(5), || {
-            let dir = scratch("late-close");
-            let src = r#"
+            let errors = refused_config_lua(
+                "late-close",
+                r#"
                 local mt = {}
                 local o = setmetatable({}, mt)
                 mt.__close = function() while true do end end
                 local x <close> = o
                 while true do end
                 config.font_size = 4
-            "#;
-            fs::write(dir.join("config.lua"), src).unwrap();
-            let mut cfg = json_cfg(r#"{"font_size":12.0}"#);
-            approve(&mut cfg, src.as_bytes());
-            let out = load_with(&cfg, &dir, false);
-            assert!(
-                out.errors.iter().any(|e| e.contains("<close>")),
-                "{:?}",
-                out.errors
+                "#,
             );
-            assert_ne!(out.config.font_size, Some(4.0));
+            assert!(
+                errors.iter().any(|e| e.contains("non-closable")),
+                "{errors:?}"
+            );
 
-            let plugins = dir.join("plugins");
-            fs::create_dir_all(&plugins).unwrap();
-            let plug = r#"
-                local function arm()
+            f12_sends_nothing(
+                "late-close-plugin",
+                r#"
+                bayan.bind("f12", function()
+                  local mt = {}
+                  local o = setmetatable({}, mt)
+                  rawset(mt, "__close", function() while true do end end)
+                  local f = load("local x <close> = ...\nwhile true do end\n")
+                  f(o)
+                  bayan.send("ran")
+                end)
+                "#,
+            );
+        });
+    }
+
+    /// The closing value of a generic `for` is to-be-closed without any
+    /// `<close>` in the source. This one hung the window: the budget ended
+    /// the loop body and `__close` then spun with the hook off.
+    #[test]
+    fn a_for_loop_closing_value_cannot_run_a_loop_after_the_budget() {
+        finish_within(Duration::from_secs(5), || {
+            let errors = refused_config_lua(
+                "for-close",
+                r#"
+                local mt = {}
+                local o = setmetatable({}, mt)
+                mt.__close = function() while true do end end
+                for _ in function() return 1 end, nil, nil, o do
+                  while true do end
+                end
+                config.font_size = 4
+                "#,
+            );
+            assert!(
+                errors.iter().any(|e| e.contains("non-closable")),
+                "{errors:?}"
+            );
+
+            // Strings share one metatable, and it is not handed out.
+            let errors = refused_config_lua(
+                "for-close-string",
+                r#"
+                getmetatable("").__close = function() while true do end end
+                for _ in function() return 1 end, nil, nil, "s" do
+                  while true do end
+                end
+                config.font_size = 4
+                "#,
+            );
+            assert!(!errors.is_empty());
+
+            f12_sends_nothing(
+                "for-close-plugin",
+                r#"
+                bayan.bind("f12", function()
                   local mt = {}
                   local o = setmetatable({}, mt)
                   mt.__close = function() while true do end end
-                  local ok, f = pcall(load, "local x <close> = ...\nwhile true do end\n")
-                  if ok and f then f(o) end
-                end
-                bayan.bind("f12", function()
-                  arm()
+                  for _ in function() return 1 end, nil, nil, o do
+                    while true do end
+                  end
                   bayan.send("ran")
                 end)
-            "#;
-            fs::write(plugins.join("hello.lua"), plug).unwrap();
-            let mut pcfg = plugin_cfg(&plugins, "hello", false);
-            approve(&mut pcfg, plug.as_bytes());
-            let mut out = load_with(&pcfg, &dir, false);
-            assert!(out.errors.is_empty(), "{:?}", out.errors);
-            let sent = out.plugins.fire("f12");
-            assert_eq!(sent.len(), 1, "load of <close> must fail before the loop");
-            assert_eq!(sent[0].text, "ran");
-            let _ = fs::remove_dir_all(&dir);
+                "#,
+            );
         });
+    }
+
+    #[test]
+    fn close_without_a_handler_still_compiles_and_runs() {
+        assert_eq!(probe("local x <close> = nil\nreturn 'ok'").unwrap(), "ok");
+    }
+
+    #[test]
+    fn a_metatable_is_a_snapshot_and_getmetatable_returns_the_table() {
+        let out = probe(
+            r#"
+            local out = {}
+            local function add(v) out[#out + 1] = tostring(v) end
+
+            local Class = {}
+            Class.__index = Class
+            local object = setmetatable({}, Class)
+            function Class:hello() return "hello" end
+            add(object:hello())
+            add(getmetatable(object) == Class)
+
+            local Derived = setmetatable({}, { __index = Class })
+            Derived.__index = Derived
+            add(setmetatable({}, Derived):hello())
+
+            local mt = { __tostring = function() return "early" end }
+            local value = setmetatable({}, mt)
+            mt.__tostring = function() return "late" end
+            add(value)
+            setmetatable(value, mt)
+            add(value)
+            add(getmetatable(setmetatable(value, nil)))
+
+            local locked = setmetatable({}, { __metatable = "locked" })
+            add(getmetatable(locked))
+            add(pcall(setmetatable, locked, {}))
+            add(getmetatable(""))
+            return table.concat(out, " ")
+            "#,
+        )
+        .unwrap();
+        assert_eq!(out, "hello true hello early late nil locked false false");
     }
 
     fn feed_terminal(bytes: &[u8]) {

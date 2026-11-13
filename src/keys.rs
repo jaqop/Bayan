@@ -217,6 +217,20 @@ pub fn encode_input(input: &EncodeInput<'_>) -> Option<Vec<u8>> {
     if input.ctrl && input.alt && matches!(input.key, Key::Character(_)) {
         return encode(input.key, input.text, input.shift, false, true);
     }
+    if input.mode.contains(TermMode::APP_CURSOR) && !(input.shift || input.alt || input.ctrl) {
+        let code = match input.key {
+            Key::Named(NamedKey::ArrowUp) => Some('A'),
+            Key::Named(NamedKey::ArrowDown) => Some('B'),
+            Key::Named(NamedKey::ArrowRight) => Some('C'),
+            Key::Named(NamedKey::ArrowLeft) => Some('D'),
+            Key::Named(NamedKey::Home) => Some('H'),
+            Key::Named(NamedKey::End) => Some('F'),
+            _ => None,
+        };
+        if let Some(code) = code {
+            return Some(format!("\x1bO{code}").into_bytes());
+        }
+    }
     encode(input.key, input.text, input.shift, input.alt, input.ctrl)
 }
 
@@ -967,6 +981,37 @@ mod tests {
         altgr.physical = Some(KeyCode::KeyE);
         altgr.mode = TermMode::DISAMBIGUATE_ESC_CODES;
         assert_eq!(encode_input(&altgr).unwrap(), "€".as_bytes());
+    }
+
+    #[test]
+    fn application_cursor_mode_changes_plain_arrows_and_reset_restores_csi() {
+        for (key, code) in [
+            (NamedKey::ArrowUp, 'A'),
+            (NamedKey::ArrowDown, 'B'),
+            (NamedKey::ArrowRight, 'C'),
+            (NamedKey::ArrowLeft, 'D'),
+            (NamedKey::Home, 'H'),
+            (NamedKey::End, 'F'),
+        ] {
+            let key = Key::Named(key);
+            let mut input = ev(&key, &key);
+            input.mode = TermMode::APP_CURSOR;
+            assert_eq!(
+                encode_input(&input).unwrap(),
+                format!("\x1bO{code}").as_bytes()
+            );
+            input.shift = true;
+            assert_eq!(
+                encode_input(&input).unwrap(),
+                format!("\x1b[1;2{code}").as_bytes()
+            );
+            input.shift = false;
+            input.mode = TermMode::empty();
+            assert_eq!(
+                encode_input(&input).unwrap(),
+                format!("\x1b[{code}").as_bytes()
+            );
+        }
     }
 
     fn is_csi_u(bytes: &[u8]) -> bool {
