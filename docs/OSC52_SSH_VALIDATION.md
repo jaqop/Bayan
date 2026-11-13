@@ -72,3 +72,11 @@ cursor/hit-test maps remain unchanged. Tests check actual glyph positions
 for the observed cases, and character/cursor mappings across the complete
 corpus. This is a targeted correction, not a claim that every ambiguous
 plain-text expression or every shell editor has identical BiDi semantics.
+
+The live follow-up on `606a621` verified the actual draw path at narrow and
+maximized widths. Paths, dates and numeric prefixes displayed in their
+intended order. The 279-word copy again matched the original exactly after
+resizing, without injected direction controls. A second real Bash/readline
+edit inserted `!` after the third Arabic letter and preserved the rest of
+the mixed input exactly. The glyph regression calls `draw_line_bidi` and
+reads its cached run, so a hit-test-only change cannot satisfy it.
