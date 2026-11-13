@@ -820,8 +820,7 @@ fn last_osc_payload<'a>(data: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
 ///
 /// Write-only. A query (`?`) returns `None` here. The parser may still
 /// emit `ClipboardLoad`; [`EventProxy`] forwards that and
-/// [`clipboard_load_reply`] writes nothing unless the read flag is on —
-/// and even then this build does not read the clipboard. The caller still
+/// the UI requires consent before reading. The reader never replies. The caller still
 /// has to pass [`allow_osc52_write`] for a copy: this function only parses.
 fn scan_osc52(data: &[u8]) -> Option<String> {
     let payload = last_osc_payload(data, b"\x1b]52;")?;
@@ -861,6 +860,22 @@ pub fn allow_osc52_write(
     copy_enabled && window_focused && from_focused_pane
 }
 
+pub fn allow_osc52_read(enabled: bool, window_focused: bool, pane_focused: bool) -> bool {
+    enabled && window_focused && pane_focused
+}
+
+/// Called only after a fresh, explicit approval. Never type clipboard text
+/// as shell input: it is an encoded OSC reply to this pane alone.
+pub fn approved_clipboard_reply(text: &str) -> Option<String> {
+    use base64::Engine;
+    (text.len() <= OSC52_MAX_BYTES).then(|| {
+        format!(
+            "\x1b]52;c;{}\x07",
+            base64::engine::general_purpose::STANDARD.encode(text)
+        )
+    })
+}
+
 /// Use a widely installed terminfo entry rather than a Bayan-only name
 /// that a remote machine would need to install before it can draw a TUI.
 fn terminal_environment(cmd: &mut CommandBuilder) {
@@ -868,6 +883,86 @@ fn terminal_environment(cmd: &mut CommandBuilder) {
     cmd.env("TERM_PROGRAM", "Bayan");
     cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
     cmd.env("COLORTERM", "truecolor");
+}
+
+/// Filter the actual builder (including HKCU-imported entries), before
+/// adding this pane's generated integration environment. Ordinary windows
+/// keep their exact environment. This is not a PATH/completion policy.
+pub(crate) fn sanitize_elevated_environment(cmd: &mut CommandBuilder, elevated: bool) {
+    if !elevated {
+        return;
+    }
+    let remove: Vec<_> = cmd
+        .env_keys()
+        .filter(|name| {
+            let name = name.to_string_lossy().to_ascii_uppercase();
+            matches!(
+                name.as_str(),
+                "BASH_ENV"
+                    | "ENV"
+                    | "PROMPT_COMMAND"
+                    | "PS0"
+                    | "PS1"
+                    | "PS2"
+                    | "PS3"
+                    | "PS4"
+                    | "SHELLOPTS"
+                    | "BASHOPTS"
+                    | "CDPATH"
+                    | "GLOBIGNORE"
+                    | "IFS"
+                    | "INPUTRC"
+                    | "HISTFILE"
+                    | "POSIXLY_CORRECT"
+                    | "BASH_XTRACEFD"
+                    | "CYGWIN"
+                    | "MSYS"
+                    | "MSYSTEM"
+                    | "MSYSTEM_CARCH"
+                    | "MSYSTEM_CHOST"
+                    | "MSYSTEM_PREFIX"
+                    | "MINGW_PREFIX"
+                    | "DOTNET_STARTUP_HOOKS"
+                    | "DOTNET_ADDITIONAL_DEPS"
+                    | "DOTNET_SHARED_STORE"
+                    | "CORECLR_ENABLE_PROFILING"
+                    | "CORECLR_PROFILER"
+                    | "CORECLR_PROFILER_PATH"
+                    | "COR_ENABLE_PROFILING"
+                    | "COR_PROFILER"
+                    | "COR_PROFILER_PATH"
+            ) || ["BASH_FUNC_", "BAYAN_", "__BAYAN_", "LD_", "DYLD_", "MSYS2_"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        })
+        .map(std::ffi::OsStr::to_os_string)
+        .collect();
+    for name in remove {
+        cmd.env_remove(name);
+    }
+    cmd.env("INPUTRC", "/dev/null");
+    cmd.env("HISTFILE", "/dev/null");
+}
+
+fn prepare_elevated_shell(
+    cmd: &mut CommandBuilder,
+    program: &str,
+    args: &[String],
+    elevated: bool,
+    marks: bool,
+    nonce: &str,
+) -> Result<Option<crate::shellint::Plan>, String> {
+    sanitize_elevated_environment(cmd, elevated);
+    if !elevated {
+        return Ok(None);
+    }
+    let protected = crate::shellint::elevated_bash_startup(program, args, marks, nonce)?;
+    if crate::shellint::is_bash_program(program) && protected.is_none() {
+        // Explicit commands keep their arguments, but not startup-file or
+        // environment-function execution before those commands.
+        cmd.args(["--noprofile", "--norc", "-p"]);
+    }
+    Ok(protected)
 }
 
 /// Longest cwd we will store or start a process in. Real Windows paths fit;
@@ -2452,6 +2547,7 @@ pub(crate) struct ChunkOutput {
 pub struct EventBatch {
     active: bool,
     out: ChunkOutput,
+    clipboard_read_after: Option<Instant>,
 }
 
 impl EventBatch {
@@ -2462,6 +2558,13 @@ impl EventBatch {
 
     /// `Some(event)` when the event should be posted now.
     pub(crate) fn absorb(&mut self, event: Event) -> Option<Event> {
+        if matches!(event, Event::ClipboardLoad(..)) {
+            let now = Instant::now();
+            if self.clipboard_read_after.is_some_and(|after| now < after) {
+                return None;
+            }
+            self.clipboard_read_after = Some(now + std::time::Duration::from_secs(2));
+        }
         if !self.active {
             return Some(event);
         }
@@ -2627,15 +2730,6 @@ static TEXT_AREA: std::sync::LazyLock<RwLock<TextArea>> = std::sync::LazyLock::n
     })
 });
 
-/// OSC 52 read. Off unless the user set `osc52_read`. A reply is still
-/// refused while the read itself is unimplemented.
-static OSC52_READ: AtomicBool = AtomicBool::new(false);
-
-/// Publish the read flag. Default off. Called once at startup.
-pub fn set_osc52_read(enabled: bool) {
-    OSC52_READ.store(enabled, Ordering::Release);
-}
-
 /// The renderer's cell, in pixels. A non-finite or sub-pixel value counts
 /// as unknown.
 pub fn set_text_area_cell(cell_w: f32, cell_h: f32) {
@@ -2706,18 +2800,6 @@ fn text_area_reply(
     area.map(format)
 }
 
-/// Bytes to write for an OSC 52 read, or nothing.
-///
-/// Off is the default. This function never returns text: not the clipboard,
-/// and not an empty OSC 52. Reading the clipboard is a later change; until
-/// then an enabled flag still writes nothing.
-pub(crate) fn clipboard_load_reply(read_enabled: bool) -> Option<String> {
-    if !read_enabled {
-        return None;
-    }
-    None
-}
-
 /// Colour, text-area, and clipboard queries, before the batch. A `PtyWrite`
 /// joins the read's 16 KiB cap. `ClipboardLoad` stays a notice: the
 /// formatter is not called, so no clipboard bytes (and no empty OSC 52)
@@ -2729,10 +2811,7 @@ fn prepare_event(pane: u64, event: Event) -> Option<Event> {
         }
         Event::ClipboardLoad(kind, format) => {
             // `format(text)` is the OSC 52 reply. It is not called.
-            match clipboard_load_reply(OSC52_READ.load(Ordering::Acquire)) {
-                Some(text) => Some(Event::PtyWrite(text)),
-                None => Some(Event::ClipboardLoad(kind, format)),
-            }
+            Some(Event::ClipboardLoad(kind, format))
         }
         other => {
             let colors = QUERY_COLORS
@@ -2986,7 +3065,16 @@ impl Session {
         } else {
             prog
         };
-        let mut cmd = CommandBuilder::new(prog);
+        let mut cmd = CommandBuilder::new(&prog);
+        let protected_bash = prepare_elevated_shell(
+            &mut cmd,
+            &prog,
+            &args,
+            elevated,
+            shell_integration,
+            &prompt_nonce,
+        )?;
+        let protection_required = protected_bash.is_some();
         for a in &args {
             cmd.arg(a);
         }
@@ -3032,30 +3120,28 @@ impl Session {
             let theme = if elevated { None } else { detect_posh_theme() };
             let setup = powershell_setup(elevated, theme.as_deref(), integrate);
             cmd.arg(setup);
-        } else if wrap {
-            if let Some(plan) =
+        } else if wrap || protection_required {
+            if let Some(plan) = protected_bash.or_else(|| {
                 crate::shellint::plan(shell, shell_integration, elevated, &prompt_nonce)
-            {
-                match crate::shellint::materialize(&plan) {
-                    Ok(done) => {
-                        let argv = cmd.get_argv_mut();
-                        let prog = argv.first().cloned();
-                        argv.clear();
-                        if let Some(prog) = prog {
-                            argv.push(prog);
-                        }
-                        for arg in done.args {
-                            argv.push(arg.into());
-                        }
-                        for (key, value) in done.env {
-                            cmd.env(key, value);
-                        }
-                        integration_scripts = crate::shellint::IntegrationDir(done.dir);
-                        applied = true;
+            }) {
+                if let Some(done) = crate::shellint::startup_materialization(
+                    crate::shellint::materialize(&plan),
+                    protection_required,
+                )? {
+                    let argv = cmd.get_argv_mut();
+                    let prog = argv.first().cloned();
+                    argv.clear();
+                    if let Some(prog) = prog {
+                        argv.push(prog);
                     }
-                    Err(err) => {
-                        eprintln!("bayan: shell integration skipped: {err}");
+                    for arg in done.args {
+                        argv.push(arg.into());
                     }
+                    for (key, value) in done.env {
+                        cmd.env(key, value);
+                    }
+                    integration_scripts = crate::shellint::IntegrationDir(done.dir);
+                    applied = true;
                 }
             }
         }
@@ -3820,6 +3906,106 @@ pub fn regex_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elevated_environment_removes_startup_code_even_with_nonunicode_values() {
+        use std::os::windows::ffi::OsStringExt;
+        let mut cmd = CommandBuilder::new("bash.exe");
+        cmd.env_clear();
+        for name in [
+            "PROMPT_COMMAND",
+            "BASH_ENV",
+            "ENV",
+            "PS0",
+            "PS1",
+            "PS4",
+            "SHELLOPTS",
+            "BASHOPTS",
+            "CDPATH",
+            "GLOBIGNORE",
+            "CYGWIN",
+            "LD_PRELOAD",
+            "__BAYAN_SI",
+        ] {
+            cmd.env(name, "untrusted");
+        }
+        cmd.env(
+            "BASH_FUNC_dirname%%",
+            std::ffi::OsString::from_wide(&[0xd800]),
+        );
+        cmd.env("BAYAN_PROMPT_NONCE", "inherited");
+        cmd.env("SYSTEMROOT", r"C:\Windows");
+        sanitize_elevated_environment(&mut cmd, true);
+        for name in [
+            "PROMPT_COMMAND",
+            "BASH_ENV",
+            "ENV",
+            "PS0",
+            "PS1",
+            "PS4",
+            "SHELLOPTS",
+            "BASHOPTS",
+            "CDPATH",
+            "GLOBIGNORE",
+            "CYGWIN",
+            "LD_PRELOAD",
+            "__BAYAN_SI",
+            "BASH_FUNC_dirname%%",
+            "BAYAN_PROMPT_NONCE",
+        ] {
+            assert!(cmd.get_env(name).is_none(), "{name} survived");
+        }
+        assert_eq!(
+            cmd.get_env("SYSTEMROOT"),
+            Some(std::ffi::OsStr::new(r"C:\Windows"))
+        );
+        assert_eq!(
+            cmd.get_env("INPUTRC"),
+            Some(std::ffi::OsStr::new("/dev/null"))
+        );
+        assert_eq!(
+            cmd.get_env("HISTFILE"),
+            Some(std::ffi::OsStr::new("/dev/null"))
+        );
+    }
+
+    #[test]
+    fn normal_environment_keeps_user_prompt_and_functions_unchanged() {
+        let mut cmd = CommandBuilder::new("bash.exe");
+        cmd.env_clear();
+        cmd.env("PROMPT_COMMAND", "user prompt");
+        cmd.env("BASH_FUNC_fixture%%", "() { :; }");
+        let before = cmd.clone();
+        sanitize_elevated_environment(&mut cmd, false);
+        assert_eq!(cmd, before);
+    }
+
+    #[test]
+    fn elevated_explicit_bash_keeps_command_bytes_but_suppresses_startup() {
+        let args = vec![
+            "-c".into(),
+            "printf '%s' \"$1\"".into(),
+            "--".into(),
+            "عربي & literal".into(),
+        ];
+        let mut cmd = CommandBuilder::new("bash.exe");
+        cmd.env_clear();
+        cmd.env("BASH_ENV", "untrusted-file");
+        let protected =
+            prepare_elevated_shell(&mut cmd, "bash.exe", &args, true, false, NONCE_OFF).unwrap();
+        assert!(
+            protected.is_none(),
+            "an explicit command does not get a prompt wrapper"
+        );
+        cmd.args(&args);
+        let expected: Vec<std::ffi::OsString> = ["bash.exe", "--noprofile", "--norc", "-p"]
+            .into_iter()
+            .map(Into::into)
+            .chain(args.into_iter().map(Into::into))
+            .collect();
+        assert_eq!(cmd.get_argv(), &expected);
+        assert!(cmd.get_env("BASH_ENV").is_none());
+    }
 
     #[test]
     fn an_elevated_powershell_setup_does_not_inject_oh_my_posh() {
@@ -6145,9 +6331,6 @@ mod tests {
     fn osc52_query_writes_nothing_and_the_load_is_forwarded() {
         use alacritty_terminal::term::ClipboardType;
         assert!(!crate::config::UserConfig::default().osc52_read_enabled());
-        assert!(!OSC52_READ.load(Ordering::Acquire));
-        assert!(clipboard_load_reply(false).is_none());
-        assert!(clipboard_load_reply(true).is_none());
 
         let (writes, loads) = host_feed(1, Config::default(), b"\x1b]52;c;?\x07");
         assert!(
@@ -6184,6 +6367,48 @@ mod tests {
             cmd.get_env("TERM_PROGRAM"),
             Some(std::ffi::OsStr::new("Bayan"))
         );
+    }
+
+    #[test]
+    fn clipboard_read_needs_focused_explicit_permission_and_is_size_bounded() {
+        for enabled in [false, true] {
+            for window in [false, true] {
+                for pane in [false, true] {
+                    assert_eq!(
+                        allow_osc52_read(enabled, window, pane),
+                        enabled && window && pane
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            approved_clipboard_reply("مرحبا"),
+            Some("\x1b]52;c;2YXYsdit2KjYpw==\x07".into())
+        );
+        assert!(approved_clipboard_reply(&"x".repeat(OSC52_MAX_BYTES + 1)).is_none());
+        assert!(approved_clipboard_reply(&"x".repeat(OSC52_MAX_BYTES)).is_some());
+        assert_eq!(approved_clipboard_reply(""), Some("\x1b]52;c;\x07".into()));
+    }
+
+    #[test]
+    fn clipboard_query_flood_is_rate_limited_even_across_batches() {
+        use alacritty_terminal::term::ClipboardType;
+        let query = || {
+            Event::ClipboardLoad(
+                ClipboardType::Clipboard,
+                std::sync::Arc::new(|s| s.to_string()),
+            )
+        };
+        let mut batch = EventBatch::default();
+        assert!(batch.absorb(query()).is_some());
+        batch.begin();
+        for _ in 0..1000 {
+            assert!(batch.absorb(query()).is_none());
+        }
+        batch.finish(false, vec![]);
+        assert!(batch.absorb(query()).is_none());
+        batch.clipboard_read_after = Some(Instant::now());
+        assert!(batch.absorb(query()).is_some());
     }
 
     struct KittyFixture {

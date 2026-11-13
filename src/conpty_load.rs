@@ -20,6 +20,111 @@ const BAIT: &[u8] = include_bytes!("../tests/fixtures/fake_conpty.dll");
 /// does not look like a successful load.
 const PROBE_TEST: &str = "conpty_load::probe_loads_fake_conpty_dll";
 
+#[test]
+fn bundled_host_requires_both_a_valid_signature_and_the_exact_microsoft_digest() {
+    use crate::conpty_bundle::{digest_matches, trust_pair};
+    assert!(
+        !trust_pair(true, false),
+        "another trusted publisher is insufficient"
+    );
+    assert!(
+        !trust_pair(false, true),
+        "a pin does not bypass signature verification"
+    );
+    assert!(trust_pair(true, true));
+    assert!(!digest_matches(BAIT, ""));
+    assert!(!digest_matches(BAIT, &"0".repeat(64)));
+    assert!(digest_matches(
+        b"abc",
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    ));
+}
+
+#[test]
+fn elevation_never_loads_a_user_supplied_bundled_host() {
+    assert!(crate::conpty_bundle::verify_pair(Path::new(r"C:\bayan\bayan.exe"), true).is_none());
+}
+
+#[test]
+#[ignore = "needs the pinned Microsoft pair; CI installs it and runs this test explicitly"]
+fn installed_microsoft_pair_is_verified_and_locked() {
+    let dir = std::env::var_os("BAYAN_SIGNED_HOST_DIR").expect("signed host fixture directory");
+    let exe = Path::new(&dir).join("bayan.exe");
+    let pair =
+        crate::conpty_bundle::verify_pair(&exe, false).expect("pinned Microsoft host accepted");
+    for path in &pair.paths {
+        assert!(
+            std::fs::OpenOptions::new().write(true).open(path).is_err(),
+            "verified image must stay write-locked"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires pinned ConPTY next to the test executable, Python, and a standard token"]
+fn native_conpty_preserves_osc52_query_and_reply() {
+    use std::io::Write;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let result = std::env::temp_dir().join(format!("bayan-osc52-{}.json", std::process::id()));
+    let python =
+        std::env::var_os("BAYAN_TEST_PYTHON").expect("absolute Python fixture interpreter");
+    let mut cmd = CommandBuilder::new(python);
+    cmd.arg(root.join("tests/fixtures/osc52_console.py"));
+    cmd.arg(&result);
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut child = pty.slave.spawn_command(cmd).unwrap();
+    drop(pty.slave);
+    let mut reader = pty.master.try_clone_reader().unwrap();
+    let mut writer = pty.master.take_writer().unwrap();
+    let (send, recv) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut all = Vec::new();
+        let mut bytes = [0; 4096];
+        while let Ok(n) = reader.read(&mut bytes) {
+            if n == 0 {
+                break;
+            }
+            all.extend_from_slice(&bytes[..n]);
+            if all.windows(9).any(|s| s == b"\x1b]52;c;?\x07") {
+                let _ = send.send(());
+                break;
+            }
+            if all.len() > 65536 {
+                break;
+            }
+        }
+    });
+    if recv
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .is_err()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("real console query was not forwarded");
+    }
+    writer.write_all(b"\x1b]52;c;VEVTVA==\x07").unwrap();
+    writer.flush().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !result.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let text = std::fs::read_to_string(&result).expect("console received the reply");
+    std::fs::remove_file(&result).unwrap();
+    assert_eq!(
+        serde_json::from_str::<String>(&text).unwrap(),
+        "\x1b]52;c;VEVTVA==\x07"
+    );
+}
+
 struct RecordingLoader {
     loads: RefCell<Vec<(String, u32)>>,
     procs: RefCell<Vec<String>>,

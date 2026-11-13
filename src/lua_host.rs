@@ -2756,25 +2756,25 @@ mod tests {
 
     #[test]
     fn a_backtracking_pattern_is_rejected() {
-        let dir = scratch("pattern");
-        let src = r#"
-            local ok = pcall(string.find, string.rep("a", 24), ".-.-.-.-.-.-.-.-b")
-            if ok then error("pattern ran") end
-            config.font_size = 15
-        "#;
-        fs::write(dir.join("config.lua"), src).unwrap();
-        let mut cfg = json_cfg(r#"{"font_size":12.0}"#);
-        approve(&mut cfg, src.as_bytes());
-        let start = Instant::now();
-        let out = load_with(&cfg, &dir, false);
-        assert!(
-            start.elapsed() < Duration::from_millis(400),
-            "the pattern ran for {:?}",
-            start.elapsed()
-        );
-        assert!(out.errors.is_empty(), "{:?}", out.errors);
-        assert_eq!(out.config.font_size, Some(15.0));
-        let _ = fs::remove_dir_all(&dir);
+        finish_within(Duration::from_secs(5), || {
+            // Check the actual pattern wrapper and its reason, independently
+            // of a hosted runner pausing this thread past the 100 ms runtime
+            // deadline. Production limits are unchanged; the outer timeout
+            // still catches a missing wrapper entering an unbounded C match.
+            let result = probe_with(
+                r#"
+                    local ok, err = pcall(string.find, string.rep("a", 24), ".-.-.-.-.-.-.-.-b")
+                    assert(not ok, "pattern ran")
+                    assert(string.find(tostring(err), "pattern is too costly", 1, true), tostring(err))
+                    return 15
+                "#,
+                Limits {
+                    deadline: Duration::from_secs(30),
+                    ..Limits::production()
+                },
+            );
+            assert_eq!(result.unwrap(), "15");
+        });
     }
 
     /// config.lua errors here; it must not take the process down.
