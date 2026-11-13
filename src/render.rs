@@ -2075,7 +2075,14 @@ fn bidi_plan(
     } else {
         byte_cols_of(&full, &char_cols)
     };
-    technical::isolate(&mut segs, &mut byte_cols, &mut cur_bytes);
+    if let Some(map) = technical::isolate(&mut segs) {
+        for (start, end, _) in &mut byte_cols {
+            map.range(start, end);
+        }
+        if let Some((start, end)) = &mut cur_bytes {
+            map.range(start, end);
+        }
+    }
     // SCP base direction. Only a non-default direction prepends a mark,
     // so an ordinary Arabic row keeps the cache key it had before SCP.
     // The mark is not a cell; it maps to the first real column so a
@@ -3419,6 +3426,18 @@ impl Renderer {
                 }
                 cur_bytes = None;
             }
+        }
+        if let Some(map) = technical::isolate(&mut segs) {
+            for (_, start, finish) in &mut cell_bytes {
+                map.range(start, finish);
+            }
+            for (start, finish, _, _, _) in &mut decos {
+                map.range(start, finish);
+            }
+            if let Some((start, finish)) = &mut cur_bytes {
+                map.range(start, finish);
+            }
+            nbytes = segs.iter().map(|seg| seg.text.len()).sum();
         }
         if let Some(mark) = base_direction_mark(dir) {
             let n = mark.len_utf8();

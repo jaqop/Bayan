@@ -5,18 +5,14 @@ use std::collections::BTreeSet;
 
 /// Add controls only to the shaped view, never to the terminal grid. This
 /// preserves copy/export bytes and keeps every real character's cell map.
-pub(super) fn isolate(
-    segs: &mut Vec<Seg>,
-    byte_cols: &mut [(usize, usize, usize)],
-    cursor: &mut Option<(usize, usize)>,
-) {
+pub(super) fn isolate(segs: &mut Vec<Seg>) -> Option<ByteMap> {
     let text: String = segs.iter().map(|s| s.text.as_str()).collect();
     // Applications supplying explicit direction controls own their policy.
     if text
         .chars()
         .any(|c| matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
     {
-        return;
+        return None;
     }
     let mut starts = BTreeSet::new();
     let mut ends = BTreeSet::new();
@@ -55,7 +51,7 @@ pub(super) fn isolate(
         offset += token.len();
     }
     if starts.is_empty() {
-        return;
+        return None;
     }
     fn push(out: &mut Vec<Seg>, template: &Seg, c: char) {
         if let Some(last) = out
@@ -95,19 +91,23 @@ pub(super) fn isolate(
             push(&mut out, seg, '\u{2069}');
         }
     }
-    for (start, end, _) in byte_cols {
-        let i = mapped
-            .binary_search_by_key(start, |&(old, _, _)| old)
-            .expect("real character start");
-        (*start, *end) = (mapped[i].1, mapped[i].2);
-    }
-    if let Some((start, end)) = cursor {
-        let i = mapped
-            .binary_search_by_key(start, |&(old, _, _)| old)
-            .expect("cursor character start");
-        (*start, *end) = (mapped[i].1, mapped[i].2);
-    }
     *segs = out;
+    Some(ByteMap(mapped))
+}
+
+/// Original character boundaries -> shaped boundaries, including multi-scalar
+/// terminal cells and decoration ranges spanning more than one character.
+pub(super) struct ByteMap(Vec<(usize, usize, usize)>);
+
+impl ByteMap {
+    pub(super) fn range(&self, start: &mut usize, end: &mut usize) {
+        let first = self
+            .0
+            .binary_search_by_key(start, |&(old, _, _)| old)
+            .expect("original range begins at a character");
+        let last = self.0.partition_point(|&(old, _, _)| old < *end) - 1;
+        (*start, *end) = (self.0[first].1, self.0[last].2);
+    }
 }
 
 #[cfg(test)]
@@ -134,8 +134,28 @@ mod tests {
         let source_byte = text.find(needle).unwrap();
         let col = text[..source_byte].chars().count();
         let plan = bidi_plan(&cells(text), false, FG, Some(col), ParagraphDir::Rtl).unwrap();
-        let key = r.ensure_shaped(&plan.segs, true);
-        let run = r.cache_hot.get(&key).unwrap();
+        let pane = (0, 0, 4000, 100);
+        r.draw_line_bidi(
+            &mut Vec::new(),
+            pane,
+            0,
+            0,
+            pane.2,
+            &cells(text),
+            false,
+            Some(col),
+            ParagraphDir::Rtl,
+            None,
+            true,
+        );
+        // Use only the run that the real drawing function cached. Calling
+        // ensure_shaped here would hide a missing live-path integration.
+        let run = r
+            .cache_hot
+            .iter()
+            .find(|(key, _)| key.0 == plan.segs)
+            .map(|(_, run)| run)
+            .expect("drawing must use the same mapped text as hit-testing");
         let byte = plan
             .byte_cols
             .iter()
