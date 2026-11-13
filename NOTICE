@@ -5,6 +5,18 @@ This product includes third-party material distributed under its own terms.
 Bayan itself is MIT licensed; see LICENSE.
 
 --------------------------------------------------------------------------
+Optional pinned Microsoft ConPTY host — MIT
+--------------------------------------------------------------------------
+
+scripts/install-conpty.ps1 obtains conpty.dll and OpenConsole.exe from the
+Microsoft.Windows.Console.ConPTY NuGet package. These files are built from
+https://github.com/microsoft/terminal, Copyright (c) Microsoft Corporation,
+under the MIT license. Keep the Windows Terminal MIT license and this notice
+with a distribution containing the pair. Their exact pinned version and
+SHA-256 values are recorded in resources/conpty.json. Runtime verification
+does not accept arbitrary signed replacements.
+
+--------------------------------------------------------------------------
 Bundled fonts — SIL Open Font License 1.1
 --------------------------------------------------------------------------
 

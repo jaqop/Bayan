@@ -100,9 +100,9 @@ pub struct UserConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub osc52: Option<String>,
     /// OSC 52 clipboard reads (`OSC 52 ; c ; ?`). Off unless this is exactly
-    /// `true`. Even then Bayan does not read the clipboard or write a reply
-    /// (not an empty one either); a later change does the read. A missing
-    /// key and `false` stay off.
+    /// `true`. Then each request needs explicit approval in the focused pane.
+    /// No clipboard contents are read before approval. A missing key and
+    /// `false` stay off; a background pane cannot request the read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub osc52_read: Option<bool>,
     /// BEL behavior: "attention" (amber tab dot, default), "sound"

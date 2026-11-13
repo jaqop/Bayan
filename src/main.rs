@@ -55,6 +55,10 @@ mod theme;
 mod toast;
 
 #[cfg(test)]
+#[path = "../vendor/portable-pty/src/win/conpty_bundle.rs"]
+#[allow(dead_code)] // Same production file, compiled here for the security tests.
+mod conpty_bundle;
+#[cfg(test)]
 mod conpty_load;
 #[cfg(test)]
 #[path = "../vendor/portable-pty/src/win/conpty_resolve.rs"]
@@ -467,9 +471,7 @@ pub enum UserEvent {
     /// `allow_osc52_write` says so — the default is to drop it, and a write
     /// from any pane but the focused one of the active tab is dropped too.
     ClipboardSet(u64, String),
-    /// Pane `id` asked to read the clipboard (OSC 52). Forwarded so a later
-    /// change can answer it. This build writes no reply. The read flag
-    /// defaults off; see [`config::UserConfig::osc52_read_enabled`].
+    /// Read request: opt-in, active-pane focus, and explicit approval required.
     ClipboardLoad(u64, alacritty_terminal::term::ClipboardType),
     /// Pane `id`'s shell reported its working directory (OSC 7 or OSC 9;9).
     Cwd(u64, String),
@@ -561,6 +563,8 @@ enum PendingKind {
     /// config.lua or an executable plugin, approved by content hash.
     /// Enter does not type the source into the shell.
     ApproveLua,
+    /// One explicit clipboard read, never pasted or broadcast.
+    ReadClipboard,
 }
 
 /// Text held for the confirm card: the bytes to send, and why the card is up.
@@ -1409,7 +1413,7 @@ fn lua_card_window(rows: &[String], scroll: usize) -> (Vec<String>, usize, bool)
     )
 }
 
-fn lua_enter_ready(not_before: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+fn approval_ready(not_before: Option<std::time::Instant>, now: std::time::Instant) -> bool {
     not_before.is_none_or(|t| now >= t)
 }
 
@@ -1747,8 +1751,8 @@ struct App {
     lua_errors: Vec<String>,
     /// Set when the token is elevated and scripts were left unloaded.
     lua_notice: Option<String>,
-    /// Enter on a revealed Lua card is ignored until this instant.
-    lua_approve_not_before: Option<std::time::Instant>,
+    /// Ignore Enter briefly when a Lua or clipboard consent card first appears.
+    approve_not_before: Option<std::time::Instant>,
     /// every rebindable action's effective chord (defaults + config)
     keymap: Vec<(keybinds::Action, keybinds::Chord)>,
     /// the shortcuts editor overlay, when open
@@ -2010,7 +2014,7 @@ impl App {
             lua_send_queue: std::collections::VecDeque::new(),
             lua_errors: Vec::new(),
             lua_notice: None,
-            lua_approve_not_before: None,
+            approve_not_before: None,
             config,
             config_load_error,
             startup_error: None,
@@ -3218,8 +3222,6 @@ impl App {
         // the bar's side and width decide the gutter, so the grid moves
         let bar_moved = runtime.scrollbar != self.config.scrollbar;
         self.config = runtime;
-        // published once at startup; a reload has to publish it again
-        term::set_osc52_read(self.config.osc52_read_enabled());
         if language {
             lang::set(self.config.lang());
         }
@@ -5048,7 +5050,11 @@ impl App {
         let preview = card_preview(paste.kind, &paste.text);
         let shown = preview.first().map(String::as_str).unwrap_or("");
         Some(screen_reader::DialogItem {
-            name: screen_reader::paste_dialog_name().to_string(),
+            name: if paste.kind == PendingKind::ReadClipboard {
+                tr("السماح بقراءة الحافظة؟", "Allow clipboard read?").into()
+            } else {
+                screen_reader::paste_dialog_name().to_string()
+            },
             body: format!("{}\n{shown}", paste.reason),
         })
     }
@@ -6078,7 +6084,7 @@ impl App {
             match kind {
                 PendingKind::Paste => self.send_paste(&txt),
                 PendingKind::Drop | PendingKind::Command => self.send_focused(kind, &txt),
-                PendingKind::ApproveLua => {}
+                PendingKind::ApproveLua | PendingKind::ReadClipboard => {}
             }
             return;
         };
@@ -6108,6 +6114,15 @@ impl App {
         let Some(p) = self.pending_paste.take() else {
             return;
         };
+        if p.kind == PendingKind::ReadClipboard
+            && !approval_ready(self.approve_not_before, Instant::now())
+        {
+            self.pending_paste = Some(p);
+            return;
+        }
+        if p.kind == PendingKind::ReadClipboard {
+            self.approve_not_before = None;
+        }
         if p.kind == PendingKind::ApproveLua {
             self.approve_lua(p);
             self.after_confirm_card();
@@ -6122,6 +6137,7 @@ impl App {
             PendingKind::Paste => self.send_paste(&p.text),
             PendingKind::Drop | PendingKind::Command => self.send_focused(p.kind, &p.text),
             PendingKind::ApproveLua => {}
+            PendingKind::ReadClipboard => self.approve_clipboard_read(p.pane),
         }
         self.after_confirm_card();
         self.request_redraw();
@@ -6139,9 +6155,78 @@ impl App {
             self.lua_skipped.push(hash);
         }
         self.pending_paste = None;
-        self.lua_approve_not_before = None;
+        self.approve_not_before = None;
         self.after_confirm_card();
         self.request_redraw();
+    }
+
+    fn request_clipboard_read(&mut self, id: u64, kind: alacritty_terminal::term::ClipboardType) {
+        if kind != alacritty_terminal::term::ClipboardType::Clipboard
+            || !self.clipboard_read_allowed(id)
+            || self.pending_paste.is_some()
+            || self.blocked_link.is_some()
+            || self.pending_close.is_some()
+            || self.settings.is_some()
+            || self.palette.is_some()
+        {
+            return;
+        }
+        let label = self
+            .tabs
+            .get(self.active)
+            .map(|t| t.label())
+            .unwrap_or_default();
+        self.approve_not_before = Some(Instant::now() + LUA_APPROVE_DELAY);
+        self.pending_paste = Some(PendingPaste {
+            kind: PendingKind::ReadClipboard,
+            pane: Some(id),
+            text: format!("{}: {}", tr("الجلسة", "Session"), label),
+            lines: 1,
+            chars: 0,
+            reason: tr(
+                "سيتم إرسال نص الحافظة إلى هذه اللوحة مرة واحدة؛ قد يصل إلى جهاز بعيد.",
+                "Send clipboard text to this pane once; it may reach a remote host.",
+            )
+            .into(),
+            lua: None,
+            scroll: 0,
+            saw_end: true,
+        });
+        self.request_redraw();
+    }
+
+    fn clipboard_read_allowed(&self, id: u64) -> bool {
+        term::allow_osc52_read(
+            self.config.osc52_read_enabled(),
+            self.window.as_ref().is_some_and(|w| w.has_focus()),
+            self.osc52_pane_is_focused(id),
+        )
+    }
+
+    fn approve_clipboard_read(&mut self, pane: Option<u64>) {
+        let Some(id) = pane.filter(|&id| self.clipboard_read_allowed(id)) else {
+            return;
+        };
+        // Read only here, after approval, and recheck the target. Never cache
+        // clipboard contents on a PTY request or send to broadcast panes.
+        let Some(text) = self.clipboard().and_then(|c| c.get_text().ok()) else {
+            return;
+        };
+        let Some(reply) = term::approved_clipboard_reply(&text) else {
+            self.report_error(
+                tr("الحافظة كبيرة جدًا", "Clipboard too large"),
+                tr(
+                    "الحد الأقصى 64 كيبيبايت؛ لم يُرسل شيء.",
+                    "Limit is 64 KiB; nothing was sent.",
+                ),
+            );
+            return;
+        };
+        if self.focused_pane_id() == Some(id) {
+            if let Some(session) = self.session_mut() {
+                session.write(reply.as_bytes());
+            }
+        }
     }
 
     fn after_confirm_card(&mut self) {
@@ -6246,18 +6331,17 @@ impl App {
             return;
         };
         if !script.shows_everything() {
-            self.lua_approve_not_before = Some(std::time::Instant::now() + LUA_APPROVE_DELAY);
+            self.approve_not_before = Some(std::time::Instant::now() + LUA_APPROVE_DELAY);
             self.raise_lua_card(script.reveal());
             self.request_redraw();
             return;
         }
-        if !lua_enter_ready(self.lua_approve_not_before, std::time::Instant::now()) || !card.saw_end
-        {
+        if !approval_ready(self.approve_not_before, std::time::Instant::now()) || !card.saw_end {
             self.pending_paste = Some(card);
             self.request_redraw();
             return;
         }
-        self.lua_approve_not_before = None;
+        self.approve_not_before = None;
         match lua_host::unchanged(&script) {
             Ok(()) => {
                 lua_host::grant(&mut self.json_config, &script.hash);
@@ -6831,8 +6915,15 @@ impl App {
                     } else {
                         all
                     };
-                    let heading = (p.kind == PendingKind::ApproveLua)
-                        .then(|| tr("تشغيل سكربت لوا؟", "Run this Lua script?"));
+                    let heading = match p.kind {
+                        PendingKind::ApproveLua => {
+                            Some(tr("تشغيل سكربت لوا؟", "Run this Lua script?"))
+                        }
+                        PendingKind::ReadClipboard => {
+                            Some(tr("السماح بقراءة الحافظة؟", "Allow clipboard read?"))
+                        }
+                        _ => None,
+                    };
                     renderer.draw_paste_guard(
                         &mut verts,
                         px.width as usize,
@@ -7245,11 +7336,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.report_error(tr("تعذر إرسال الإدخال", "Could not send input"), &error);
                 }
             }
-            UserEvent::ClipboardLoad(_id, _kind) => {
-                // No PTY reply. The read flag defaults off, and even when
-                // it is on this build does not read the clipboard or write
-                // an empty OSC 52. Item 31 is the read.
-            }
+            UserEvent::ClipboardLoad(id, kind) => self.request_clipboard_read(id, kind),
             UserEvent::ClipboardSet(id, text) => {
                 // has_focus, not the startup value of self.focused: that flag
                 // begins false and only tracks Focused events, which can lag
@@ -8011,7 +8098,6 @@ fn run(startup: Startup) -> Result<(), String> {
     if let Some(v) = dev_hook("BAYAN_LANG") {
         lang::set(lang::Lang::from_config(v.to_str()));
     }
-    term::set_osc52_read(cfg.osc52_read_enabled());
     let config_path = config::config_path();
     let baseline_bytes = std::fs::read(&config_path).ok();
     let reload_proxy = proxy.clone();
@@ -8475,9 +8561,9 @@ mod tests {
         assert!(lua_card_window(&short, 0).2);
 
         let now = std::time::Instant::now();
-        assert!(lua_enter_ready(None, now));
-        assert!(!lua_enter_ready(Some(now + LUA_APPROVE_DELAY), now));
-        assert!(lua_enter_ready(
+        assert!(approval_ready(None, now));
+        assert!(!approval_ready(Some(now + LUA_APPROVE_DELAY), now));
+        assert!(approval_ready(
             Some(now - std::time::Duration::from_millis(1)),
             now
         ));

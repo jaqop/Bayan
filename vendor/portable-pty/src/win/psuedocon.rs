@@ -1,4 +1,5 @@
-use super::conpty_resolve::{self, SystemLoader};
+use super::conpty_resolve::{self, ConptyLoader, SystemLoader};
+use super::conpty_bundle;
 use super::WinChild;
 use crate::cmdbuilder::CommandBuilder;
 use crate::win::procthreadattr::ProcThreadAttributeList;
@@ -40,6 +41,7 @@ struct ConPtyFuncs {
     ResizePseudoConsole: unsafe extern "system" fn(HPCON, COORD) -> HRESULT,
     ClosePseudoConsole: unsafe extern "system" fn(HPCON),
     _module: usize,
+    _verified_pair: Option<conpty_bundle::VerifiedPair>,
 }
 
 fn load_conpty() -> ConPtyFuncs {
@@ -58,16 +60,43 @@ fn load_conpty() -> ConPtyFuncs {
             ResizePseudoConsole: mem::transmute(resolved.resize_pseudo_console),
             ClosePseudoConsole: mem::transmute(resolved.close_pseudo_console),
             _module: resolved.module as usize,
+            _verified_pair: None,
         }
     }
 }
 
+fn load_bundled() -> Option<ConPtyFuncs> {
+    let pair = conpty_bundle::verify_pair(&std::env::current_exe().ok()?, conpty_bundle::running_elevated())?;
+    let module = SystemLoader.load_library_ex(pair.paths[0].to_str()?, 0x0000_0900).ok()?;
+    let create = SystemLoader.get_proc_address(module, "CreatePseudoConsole");
+    let resize = SystemLoader.get_proc_address(module, "ResizePseudoConsole");
+    let close = SystemLoader.get_proc_address(module, "ClosePseudoConsole");
+    let (Ok(create), Ok(resize), Ok(close)) = (create, resize, close) else {
+        // SAFETY: no export was called; release the module we just opened.
+        unsafe { FreeLibrary(module as _) };
+        return None;
+    };
+    // SAFETY: these exports have the same documented ABI as kernel32's.
+    Some(unsafe { ConPtyFuncs {
+        CreatePseudoConsole: mem::transmute(create),
+        ResizePseudoConsole: mem::transmute(resize),
+        ClosePseudoConsole: mem::transmute(close),
+        _module: module as usize,
+        _verified_pair: Some(pair),
+    } })
+}
+
+#[link(name = "kernel32")]
+extern "system" { fn FreeLibrary(module: *mut std::ffi::c_void) -> i32; }
+
 lazy_static! {
     static ref CONPTY: ConPtyFuncs = load_conpty();
+    static ref BUNDLED_CONPTY: Option<ConPtyFuncs> = load_bundled();
 }
 
 pub struct PsuedoCon {
     con: HPCON,
+    api: &'static ConPtyFuncs,
 }
 
 unsafe impl Send for PsuedoCon {}
@@ -75,34 +104,34 @@ unsafe impl Sync for PsuedoCon {}
 
 impl Drop for PsuedoCon {
     fn drop(&mut self) {
-        unsafe { (CONPTY.ClosePseudoConsole)(self.con) };
+        unsafe { (self.api.ClosePseudoConsole)(self.con) };
     }
 }
 
 impl PsuedoCon {
     pub fn new(size: COORD, input: FileDescriptor, output: FileDescriptor) -> Result<Self, Error> {
+        // Microsoft's 1.22+ rewrite passes VT through by default. Bit 0x8
+        // now means grapheme width, not the historical passthrough option.
+        if let Some(api) = BUNDLED_CONPTY.as_ref() {
+            if let Ok(con) = Self::open(api, size, &input, &output, PSUEDOCONSOLE_INHERIT_CURSOR) {
+                log::info!("conpty: pinned Microsoft host active");
+                return Ok(con);
+            }
+        }
+        Self::open(&CONPTY, size, &input, &output,
+            PSUEDOCONSOLE_INHERIT_CURSOR | PSEUDOCONSOLE_RESIZE_QUIRK | PSEUDOCONSOLE_WIN32_INPUT_MODE)
+    }
+
+    fn open(api: &'static ConPtyFuncs, size: COORD, input: &FileDescriptor, output: &FileDescriptor, flags: DWORD) -> Result<Self, Error> {
         let mut con: HPCON = INVALID_HANDLE_VALUE;
-        let result = unsafe {
-            (CONPTY.CreatePseudoConsole)(
-                size,
-                input.as_raw_handle() as _,
-                output.as_raw_handle() as _,
-                PSUEDOCONSOLE_INHERIT_CURSOR
-                    | PSEUDOCONSOLE_RESIZE_QUIRK
-                    | PSEUDOCONSOLE_WIN32_INPUT_MODE,
-                &mut con,
-            )
-        };
-        ensure!(
-            result == S_OK,
-            "failed to create psuedo console: HRESULT {}",
-            result
-        );
-        Ok(Self { con })
+        // SAFETY: live pipe handles and output pointer, matched ConPTY ABI.
+        let result = unsafe { (api.CreatePseudoConsole)(size, input.as_raw_handle() as _, output.as_raw_handle() as _, flags, &mut con) };
+        ensure!(result == S_OK, "failed to create pseudo console: HRESULT {}", result);
+        Ok(Self { con, api })
     }
 
     pub fn resize(&self, size: COORD) -> Result<(), Error> {
-        let result = unsafe { (CONPTY.ResizePseudoConsole)(self.con, size) };
+        let result = unsafe { (self.api.ResizePseudoConsole)(self.con, size) };
         ensure!(
             result == S_OK,
             "failed to resize console to {}x{}: HRESULT: {}",

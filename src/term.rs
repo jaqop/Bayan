@@ -820,8 +820,7 @@ fn last_osc_payload<'a>(data: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
 ///
 /// Write-only. A query (`?`) returns `None` here. The parser may still
 /// emit `ClipboardLoad`; [`EventProxy`] forwards that and
-/// [`clipboard_load_reply`] writes nothing unless the read flag is on —
-/// and even then this build does not read the clipboard. The caller still
+/// the UI requires consent before reading. The reader never replies. The caller still
 /// has to pass [`allow_osc52_write`] for a copy: this function only parses.
 fn scan_osc52(data: &[u8]) -> Option<String> {
     let payload = last_osc_payload(data, b"\x1b]52;")?;
@@ -859,6 +858,22 @@ pub fn allow_osc52_write(
     from_focused_pane: bool,
 ) -> bool {
     copy_enabled && window_focused && from_focused_pane
+}
+
+pub fn allow_osc52_read(enabled: bool, window_focused: bool, pane_focused: bool) -> bool {
+    enabled && window_focused && pane_focused
+}
+
+/// Called only after a fresh, explicit approval. Never type clipboard text
+/// as shell input: it is an encoded OSC reply to this pane alone.
+pub fn approved_clipboard_reply(text: &str) -> Option<String> {
+    use base64::Engine;
+    (text.len() <= OSC52_MAX_BYTES).then(|| {
+        format!(
+            "\x1b]52;c;{}\x07",
+            base64::engine::general_purpose::STANDARD.encode(text)
+        )
+    })
 }
 
 /// Use a widely installed terminfo entry rather than a Bayan-only name
@@ -2452,6 +2467,7 @@ pub(crate) struct ChunkOutput {
 pub struct EventBatch {
     active: bool,
     out: ChunkOutput,
+    clipboard_read_after: Option<Instant>,
 }
 
 impl EventBatch {
@@ -2462,6 +2478,13 @@ impl EventBatch {
 
     /// `Some(event)` when the event should be posted now.
     pub(crate) fn absorb(&mut self, event: Event) -> Option<Event> {
+        if matches!(event, Event::ClipboardLoad(..)) {
+            let now = Instant::now();
+            if self.clipboard_read_after.is_some_and(|after| now < after) {
+                return None;
+            }
+            self.clipboard_read_after = Some(now + std::time::Duration::from_secs(2));
+        }
         if !self.active {
             return Some(event);
         }
@@ -2627,15 +2650,6 @@ static TEXT_AREA: std::sync::LazyLock<RwLock<TextArea>> = std::sync::LazyLock::n
     })
 });
 
-/// OSC 52 read. Off unless the user set `osc52_read`. A reply is still
-/// refused while the read itself is unimplemented.
-static OSC52_READ: AtomicBool = AtomicBool::new(false);
-
-/// Publish the read flag. Default off. Called once at startup.
-pub fn set_osc52_read(enabled: bool) {
-    OSC52_READ.store(enabled, Ordering::Release);
-}
-
 /// The renderer's cell, in pixels. A non-finite or sub-pixel value counts
 /// as unknown.
 pub fn set_text_area_cell(cell_w: f32, cell_h: f32) {
@@ -2706,18 +2720,6 @@ fn text_area_reply(
     area.map(format)
 }
 
-/// Bytes to write for an OSC 52 read, or nothing.
-///
-/// Off is the default. This function never returns text: not the clipboard,
-/// and not an empty OSC 52. Reading the clipboard is a later change; until
-/// then an enabled flag still writes nothing.
-pub(crate) fn clipboard_load_reply(read_enabled: bool) -> Option<String> {
-    if !read_enabled {
-        return None;
-    }
-    None
-}
-
 /// Colour, text-area, and clipboard queries, before the batch. A `PtyWrite`
 /// joins the read's 16 KiB cap. `ClipboardLoad` stays a notice: the
 /// formatter is not called, so no clipboard bytes (and no empty OSC 52)
@@ -2729,10 +2731,7 @@ fn prepare_event(pane: u64, event: Event) -> Option<Event> {
         }
         Event::ClipboardLoad(kind, format) => {
             // `format(text)` is the OSC 52 reply. It is not called.
-            match clipboard_load_reply(OSC52_READ.load(Ordering::Acquire)) {
-                Some(text) => Some(Event::PtyWrite(text)),
-                None => Some(Event::ClipboardLoad(kind, format)),
-            }
+            Some(Event::ClipboardLoad(kind, format))
         }
         other => {
             let colors = QUERY_COLORS
@@ -6145,9 +6144,6 @@ mod tests {
     fn osc52_query_writes_nothing_and_the_load_is_forwarded() {
         use alacritty_terminal::term::ClipboardType;
         assert!(!crate::config::UserConfig::default().osc52_read_enabled());
-        assert!(!OSC52_READ.load(Ordering::Acquire));
-        assert!(clipboard_load_reply(false).is_none());
-        assert!(clipboard_load_reply(true).is_none());
 
         let (writes, loads) = host_feed(1, Config::default(), b"\x1b]52;c;?\x07");
         assert!(
@@ -6184,6 +6180,48 @@ mod tests {
             cmd.get_env("TERM_PROGRAM"),
             Some(std::ffi::OsStr::new("Bayan"))
         );
+    }
+
+    #[test]
+    fn clipboard_read_needs_focused_explicit_permission_and_is_size_bounded() {
+        for enabled in [false, true] {
+            for window in [false, true] {
+                for pane in [false, true] {
+                    assert_eq!(
+                        allow_osc52_read(enabled, window, pane),
+                        enabled && window && pane
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            approved_clipboard_reply("مرحبا"),
+            Some("\x1b]52;c;2YXYsdit2KjYpw==\x07".into())
+        );
+        assert!(approved_clipboard_reply(&"x".repeat(OSC52_MAX_BYTES + 1)).is_none());
+        assert!(approved_clipboard_reply(&"x".repeat(OSC52_MAX_BYTES)).is_some());
+        assert_eq!(approved_clipboard_reply(""), Some("\x1b]52;c;\x07".into()));
+    }
+
+    #[test]
+    fn clipboard_query_flood_is_rate_limited_even_across_batches() {
+        use alacritty_terminal::term::ClipboardType;
+        let query = || {
+            Event::ClipboardLoad(
+                ClipboardType::Clipboard,
+                std::sync::Arc::new(|s| s.to_string()),
+            )
+        };
+        let mut batch = EventBatch::default();
+        assert!(batch.absorb(query()).is_some());
+        batch.begin();
+        for _ in 0..1000 {
+            assert!(batch.absorb(query()).is_none());
+        }
+        batch.finish(false, vec![]);
+        assert!(batch.absorb(query()).is_none());
+        batch.clipboard_read_after = Some(Instant::now());
+        assert!(batch.absorb(query()).is_some());
     }
 
     struct KittyFixture {

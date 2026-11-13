@@ -13,6 +13,7 @@ use winapi::um::winbase::INFINITE;
 
 pub mod conpty;
 mod conpty_resolve;
+mod conpty_bundle;
 mod procthreadattr;
 mod psuedocon;
 
