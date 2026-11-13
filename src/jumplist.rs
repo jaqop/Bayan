@@ -147,10 +147,17 @@ pub fn refresh(profiles: &[Shell], persist_stamp: bool) -> Result<(), String> {
         Vec::new()
     };
     let app_id = app_user_model_id(&exe);
-    let mut live = LiveDestinations { exe };
-    if apply(&mut live, &previous, &next, &app_id)? && persist_stamp {
-        let bytes = serde_json::to_vec(&next).map_err(|error| error.to_string())?;
-        crate::persist::write(&path, &bytes).map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    {
+        let mut live = LiveDestinations { exe };
+        if apply(&mut live, &previous, &next, &app_id)? && persist_stamp {
+            let bytes = serde_json::to_vec(&next).map_err(|error| error.to_string())?;
+            crate::persist::write(&path, &bytes).map_err(|error| error.to_string())?;
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (exe, app_id, previous, next, path, persist_stamp);
     }
     Ok(())
 }
@@ -166,6 +173,7 @@ fn read_stamp(path: &Path) -> Vec<JumpTask> {
 }
 
 /// Set the process AppUserModelID before any window exists.
+#[cfg(windows)]
 pub fn set_process_app_id(app_id: &str) -> Result<(), String> {
     let wide = wide(app_id);
     // SAFETY: `wide` is NUL-terminated and lives for the call.
@@ -177,6 +185,13 @@ pub fn set_process_app_id(app_id: &str) -> Result<(), String> {
     .map_err(|error| error.to_string())
 }
 
+#[cfg(not(windows))]
+pub fn set_process_app_id(app_id: &str) -> Result<(), String> {
+    let _ = app_id;
+    Err("AppUserModelID is a Windows shell property".into())
+}
+
+#[cfg(windows)]
 pub fn set_window_app_id(
     hwnd: windows_sys::Win32::Foundation::HWND,
     app_id: &str,
@@ -202,16 +217,19 @@ pub fn set_window_app_id(
     Ok(())
 }
 
+#[cfg(windows)]
 struct LiveDestinations {
     exe: String,
 }
 
+#[cfg(windows)]
 impl JumpListStore for LiveDestinations {
     fn commit(&mut self, app_id: &str, tasks: &[JumpTask]) -> Result<(), String> {
         commit_destinations(&self.exe, app_id, tasks)
     }
 }
 
+#[cfg(windows)]
 fn commit_destinations(exe: &str, app_id: &str, tasks: &[JumpTask]) -> Result<(), String> {
     use windows::core::{Interface, PCWSTR};
     use windows::Win32::Storage::EnhancedStorage::{PKEY_AppUserModel_ID, PKEY_Title};
@@ -289,6 +307,7 @@ fn commit_destinations(exe: &str, app_id: &str, tasks: &[JumpTask]) -> Result<()
 }
 
 /// `VT_LPWSTR` allocated with `CoTaskMemAlloc`, so `PropVariantClear` can free it.
+#[cfg(windows)]
 fn lpwstr_variant(
     text: &str,
 ) -> Result<windows::Win32::System::Com::StructuredStorage::PROPVARIANT, String> {
@@ -315,6 +334,7 @@ fn lpwstr_variant(
     }
 }
 
+#[cfg(windows)]
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }

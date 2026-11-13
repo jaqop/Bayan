@@ -5,19 +5,25 @@
 //! quake hotkey and window alpha. The tray icon doubles as a summon
 //! target: clicking it (or a toast) raises the window.
 
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::HWND;
+#[cfg(windows)]
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO,
     NIIF_RESPECT_QUIET_TIME, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW,
     NOTIFYICON_VERSION_4,
 };
+#[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{LoadIconW, IDI_APPLICATION};
 
 /// The tray callback message (WM_APP+2); the msg hook watches it so a
 /// toast/tray click can summon the window.
+#[cfg(windows)]
 pub const TRAY_MSG: u32 = 0x8000 + 2;
 /// Callback events that mean "the user clicked us".
+#[cfg(windows)]
 pub const NIN_BALLOONUSERCLICK: u32 = 0x0405;
+#[cfg(windows)]
 pub const WM_LBUTTONUP: u32 = 0x0202;
 const TRAY_UID: u32 = 1;
 
@@ -69,6 +75,7 @@ pub fn pty_toast(tab_label: &str, prog_title: &str, prog_body: &str) -> (String,
 }
 
 /// &str -> fixed UTF-16 buffer, truncated with a NUL guaranteed.
+#[cfg(windows)]
 fn wstr<const N: usize>(s: &str) -> [u16; N] {
     let mut out = [0u16; N];
     for (slot, ch) in out.iter_mut().zip(s.encode_utf16().take(N - 1)) {
@@ -77,6 +84,7 @@ fn wstr<const N: usize>(s: &str) -> [u16; N] {
     out
 }
 
+#[cfg(windows)]
 fn base(hwnd: HWND) -> NOTIFYICONDATAW {
     // SAFETY: NOTIFYICONDATAW is plain C data (integers, handles, fixed u16
     // arrays), for which all-zero is a valid value.
@@ -90,6 +98,7 @@ fn base(hwnd: HWND) -> NOTIFYICONDATAW {
 /// Add the tray icon once at startup (idempotent enough: a second NIM_ADD
 /// for the same (hwnd, uid) just fails quietly). True when the shell
 /// accepted the icon.
+#[cfg(windows)]
 pub fn init(hwnd: HWND) -> bool {
     let mut d = base(hwnd);
     d.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
@@ -111,6 +120,7 @@ pub fn init(hwnd: HWND) -> bool {
 /// notification that interrupts a presentation is worse than none. True
 /// when the shell accepted it (do-not-disturb can still hold the banner
 /// and file it in the notification center instead).
+#[cfg(windows)]
 pub fn show(hwnd: HWND, title: &str, body: &str) -> bool {
     let mut d = base(hwnd);
     d.uFlags = NIF_INFO;
@@ -124,6 +134,7 @@ pub fn show(hwnd: HWND, title: &str, body: &str) -> bool {
 
 /// Remove the tray icon before exit — orphaned icons ghost in the tray
 /// until the next hover sweeps them.
+#[cfg(windows)]
 pub fn remove(hwnd: HWND) {
     let d = base(hwnd);
     // SAFETY: `d` comes from `base` with `cbSize` set.
@@ -164,6 +175,7 @@ mod tests {
         assert_eq!(visual_order(&t), "my\u{00A0}api · بيان");
     }
 
+    #[cfg(windows)]
     #[test]
     fn wstr_truncates_and_terminates() {
         let w: [u16; 8] = wstr("hello");

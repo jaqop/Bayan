@@ -42,6 +42,32 @@ serde_json = "1"
 mlua = { version = "0.12.2", default-features = false, features = ["lua54", "vendored"] }
 # Approval is the SHA-256 of the file bytes. A changed file is a new hash.
 sha2 = "0.10"
+# Hot-reload of ~/.bayan/config.json. On Windows the recommended backend
+# is ReadDirectoryChangesW (a target dependency, not a crate feature).
+# config_watch watches the parent directory so an editor that saves by
+# renaming a temp file over config.json is seen, then debounces itself.
+# notify 8.2.2 accepts notify-types ^2. 2.3.0 needs rustc 1.91, above
+# this crate's 1.89 floor, so the lock stays on 2.2.0 (rustc 1.88).
+notify = { version = "8.2.2", default-features = false }
+notify-types = "=2.2.0"
+
+# Screen readers (NVDA, JAWS, Narrator) via UI Automation. accesskit_winit's
+# Windows backend is accesskit_windows; default features stay off so the
+# Windows build does not pull the AT-SPI/unix adapter. The tree is built
+# only after a client connects (`Adapter::update_if_active`).
+accesskit = "0.25.2"
+accesskit_winit = { version = "0.34.2", default-features = false, features = ["rwh_06"] }
+
+[features]
+# BAYAN_* environment debug hooks (BAYAN_TYPE, BAYAN_PASTE, BAYAN_PROFILE, …)
+# are always on in debug builds and compiled out of release builds unless
+# this feature is enabled: `cargo build --release --features dev-hooks`.
+dev-hooks = []
+
+# Win32, COM jump lists, and the handoff class factory. These crates do not
+# build off Windows (`windows-future` and the rest of the windows bindings).
+# The Windows target still links the same features as before.
+[target."cfg(windows)".dependencies]
 # global quake hotkey (RegisterHotKey + WM_HOTKEY via the msg hook);
 # Diagnostics_Debug carries MessageBeep (the bell's "sound" mode)
 windows-sys = { version = "0.61", features = [
@@ -69,14 +95,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_Graphics_Gdi", # GetSysColor: High Contrast system colors
     "Win32_UI_Accessibility", # HIGHCONTRASTW / HCF_HIGHCONTRASTON
 ] }
-# Hot-reload of ~/.bayan/config.json. On Windows the recommended backend
-# is ReadDirectoryChangesW (a target dependency, not a crate feature).
-# config_watch watches the parent directory so an editor that saves by
-# renaming a temp file over config.json is seen, then debounces itself.
-# notify 8.2.2 accepts notify-types ^2. 2.3.0 needs rustc 1.91, above
-# this crate's 1.89 floor, so the lock stays on 2.2.0 (rustc 1.88).
-notify = { version = "8.2.2", default-features = false }
-notify-types = "=2.2.0"
 
 # Jump List (ICustomDestinationList) and the terminal-handoff class
 # factory. windows-sys stays for the rest of the Win32 surface.
@@ -95,28 +113,12 @@ windows = { version = "0.61", features = [
 # The `implement` macro emits `windows_core::` paths, so the crate has to
 # be a direct dependency even though `windows` re-exports it.
 windows-core = "0.61"
-# Screen readers (NVDA, JAWS, Narrator) via UI Automation. accesskit_winit's
-# Windows backend is accesskit_windows; default features stay off so the
-# Windows build does not pull the AT-SPI/unix adapter. The tree is built
-# only after a client connects (`Adapter::update_if_active`).
-accesskit = "0.25.2"
-accesskit_winit = { version = "0.34.2", default-features = false, features = ["rwh_06"] }
 
-[features]
-# BAYAN_* environment debug hooks (BAYAN_TYPE, BAYAN_PASTE, BAYAN_PROFILE, …)
-# are always on in debug builds and compiled out of release builds unless
-# this feature is enabled: `cargo build --release --features dev-hooks`.
-dev-hooks = []
-
-[target."cfg(windows)".build-dependencies]
-winresource = "0.1"
-
-# One table per target, not an extra feature on the shared dependency.
+# Same table as the Win32 crates above. A second
+# `[target."cfg(windows)".dependencies]` header is a duplicate TOML key.
 # Windows: DX12 and GL only, so vulkan-1.dll is not linked. GL is the
 # fallback when DX12 cannot make a device; dll_search pins both to System32.
-# Other targets also enable Vulkan so a later Linux port can select it.
 # default-features stays off: the defaults include Metal and webgpu.
-[target.'cfg(windows)'.dependencies]
 wgpu = { version = "30", default-features = false, features = [
     "std",
     "parking_lot",
@@ -125,7 +127,11 @@ wgpu = { version = "30", default-features = false, features = [
     "wgsl",
 ] }
 
-[target.'cfg(not(windows))'.dependencies]
+[target."cfg(windows)".build-dependencies]
+winresource = "0.1"
+
+# Other targets also enable Vulkan so a later Linux port can select it.
+[target."cfg(not(windows))".dependencies]
 wgpu = { version = "30", default-features = false, features = [
     "std",
     "parking_lot",

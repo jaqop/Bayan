@@ -5,6 +5,10 @@ param(
 $ErrorActionPreference = 'Stop'
 $exe = (Resolve-Path -LiteralPath $BinaryPath).Path
 $source = (Resolve-Path -LiteralPath $PlantSource).Path
+# tests/fixtures/marker_dxcompiler.dll, built from marker_dxcompiler.c.
+$expected = '4327247952c12c9809fd034fc38610709b84e2da74b40517edd9d2174aae8a2e'
+$actual = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "marker DLL hash mismatch: $actual" }
 $dir = [IO.Path]::GetDirectoryName($exe)
 if ([string]::IsNullOrWhiteSpace($dir)) { throw 'The executable has no directory' }
 # These two names only. Never remove $dir itself.
