@@ -601,8 +601,8 @@ struct GlyphEntry {
 /// reset-loses-all became a visible flash with big fonts + emoji + Arabic).
 pub struct Atlas {
     pub pages: Vec<Vec<u8>>,
-    /// pixels changed since the last GPU sync (per-page dirty flag)
-    pub dirty: bool,
+    /// One bit per CPU page, cleared only after the GPU sync.
+    dirty_pages: Vec<bool>,
     /// bumps on the wholesale reset at MAX_PAGES — one healing redraw
     pub generation: u32,
     map: std::collections::HashMap<cosmic_text::CacheKey, Option<GlyphEntry>>,
@@ -613,10 +613,21 @@ pub struct Atlas {
 }
 
 impl Atlas {
+    /// Pages to sync. Recreating the GPU texture also needs the clean pages.
+    pub fn uploads(&self, recreated: bool) -> impl Iterator<Item = (u32, &[u8])> {
+        self.pages.iter().enumerate().filter_map(move |(i, page)| {
+            (recreated || self.dirty_pages[i]).then_some((i as u32, page.as_slice()))
+        })
+    }
+
+    pub fn uploaded(&mut self) {
+        self.dirty_pages.fill(false);
+    }
+
     fn new() -> Self {
         let mut a = Atlas {
             pages: vec![vec![0; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize]],
-            dirty: true,
+            dirty_pages: vec![true],
             generation: 0,
             map: std::collections::HashMap::new(),
             cur: 0,
@@ -645,33 +656,45 @@ impl Atlas {
         if w + pad > ATLAS_SIZE || h + pad > ATLAS_SIZE {
             return None; // a single glyph larger than a whole page
         }
-        if self.shelf_x + w + pad > ATLAS_SIZE {
-            self.shelf_y += self.shelf_h + pad;
-            self.shelf_x = 0;
-            self.shelf_h = 0;
-        }
-        if self.shelf_y + h + pad > ATLAS_SIZE {
+        loop {
+            if self.shelf_x + w + pad > ATLAS_SIZE {
+                self.shelf_y += self.shelf_h + pad;
+                self.shelf_x = 0;
+                self.shelf_h = 0;
+            }
+            if self.shelf_y + h + pad <= ATLAS_SIZE {
+                break;
+            }
             // this page is full: grow a new one (no loss), or reset at the cap
-            if (self.pages.len() as u32) < MAX_PAGES {
+            if self.cur + 1 < self.pages.len() as u32 {
+                // After a reset all existing pages are empty and reusable.
+                self.cur += 1;
+            } else if (self.pages.len() as u32) < MAX_PAGES {
                 self.pages
                     .push(vec![0; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize]);
+                self.dirty_pages.push(true);
                 self.cur = self.pages.len() as u32 - 1;
             } else {
                 self.map.clear();
                 for p in &mut self.pages {
                     p.fill(0);
                 }
+                self.dirty_pages.fill(true);
                 self.cur = 0;
                 self.write_white_texel();
                 self.generation = self.generation.wrapping_add(1);
             }
-            self.shelf_x = 0;
+            // Page 0 always reserves the solid-quad sample, including after
+            // a reset. Recheck the slot: a near-page-sized glyph may only fit
+            // on the next page once this reserved shelf has been skipped.
+            self.shelf_x = if self.cur == 0 { 4 } else { 0 };
             self.shelf_y = 0;
-            self.shelf_h = 0;
+            self.shelf_h = if self.cur == 0 { 4 } else { 0 };
         }
         let pos = (self.cur, self.shelf_x, self.shelf_y);
         self.shelf_x += w + pad;
         self.shelf_h = self.shelf_h.max(h);
+        self.dirty_pages[self.cur as usize] = true;
         Some(pos)
     }
 
@@ -718,7 +741,6 @@ impl Atlas {
                     page[dst..dst + 4].copy_from_slice(&px);
                 }
             }
-            self.dirty = true;
             let s = ATLAS_SIZE as f32;
             Some(GlyphEntry {
                 layer,
@@ -4746,6 +4768,22 @@ impl Renderer {
             ];
             self.draw_run(&segs, true, out, whole, (x + 32) as f32, ry + 6, 1.0);
         }
+    }
+
+    /// Debug (BAYAN_ATLAS_RESET): force the real allocation path through its
+    /// page cap once per renderer, before drawing any quads for this frame.
+    pub fn stress_reset_atlas(&mut self) {
+        if self.atlas.generation != 0 {
+            return;
+        }
+        while self.atlas.generation == 0 {
+            let _ = self.atlas.alloc(ATLAS_SIZE - 1, ATLAS_SIZE - 1);
+        }
+        eprintln!(
+            "Bayan atlas reset probe: {} pages, generation {}",
+            self.atlas.pages.len(),
+            self.atlas.generation
+        );
     }
 
     /// Debug (BAYAN_ATLAS_STRESS): draw a big grid of large distinct glyphs
@@ -10521,6 +10559,69 @@ mod cache_tests {
         // the picked family is the first installed MONO candidate (or a
         // Consolas fallback) — never a Code-leading pick
         assert!(FAMILY_MONO.contains(&r.family.as_str()) || r.family == "Consolas");
+    }
+
+    #[test]
+    fn atlas_uploads_only_the_changed_page_but_restores_all_after_gpu_growth() {
+        let mut atlas = Atlas::new();
+        atlas.shelf_y = ATLAS_SIZE;
+        atlas.alloc(8, 8).unwrap();
+        assert_eq!(atlas.pages.len(), 2);
+        atlas.uploaded();
+        assert_eq!(atlas.uploads(false).count(), 0);
+        atlas.alloc(8, 8).unwrap();
+        let dirty: Vec<_> = atlas.uploads(false).map(|(page, _)| page).collect();
+        assert_eq!(dirty, vec![1], "a glyph on page 1 must not upload page 0");
+        let all: Vec<_> = atlas.uploads(true).map(|(page, _)| page).collect();
+        assert_eq!(all, vec![0, 1], "a new GPU texture needs every page");
+    }
+
+    #[test]
+    fn atlas_reset_keeps_the_solid_rect_texel_out_of_glyph_slots() {
+        let mut atlas = Atlas::new();
+        atlas.pages.resize_with(MAX_PAGES as usize, Vec::new);
+        atlas.dirty_pages.resize(MAX_PAGES as usize, false);
+        atlas.cur = MAX_PAGES - 1;
+        atlas.shelf_y = ATLAS_SIZE;
+        let (layer, x, y) = atlas.alloc(8, 8).unwrap();
+        assert_eq!(atlas.generation, 1, "the full atlas must actually reset");
+        for row in y..y + 8 {
+            for col in x..x + 8 {
+                let offset = ((row * ATLAS_SIZE + col) * 4) as usize;
+                atlas.pages[layer as usize][offset..offset + 4].fill(0);
+            }
+        }
+        for row in 0..3 {
+            for col in 0..3 {
+                let offset = ((row * ATLAS_SIZE + col) * 4) as usize;
+                assert_eq!(&atlas.pages[0][offset..offset + 4], &[255; 4]);
+            }
+        }
+    }
+
+    #[test]
+    fn atlas_reuses_every_page_after_a_reset_and_rechecks_large_slots() {
+        let mut atlas = Atlas::new();
+        atlas.pages.resize_with(MAX_PAGES as usize, Vec::new);
+        atlas.dirty_pages.resize(MAX_PAGES as usize, false);
+        atlas.cur = MAX_PAGES - 1;
+        atlas.shelf_y = ATLAS_SIZE;
+        let slot = atlas.alloc(ATLAS_SIZE - 1, ATLAS_SIZE - 1).unwrap();
+        assert_eq!(
+            slot,
+            (1, 0, 0),
+            "a full-page glyph cannot cover the white texel"
+        );
+        assert_eq!(atlas.generation, 1);
+        assert_eq!(atlas.uploads(false).count(), MAX_PAGES as usize);
+        for page in 2..MAX_PAGES {
+            let slot = atlas.alloc(ATLAS_SIZE - 1, ATLAS_SIZE - 1).unwrap();
+            assert_eq!(slot, (page, 0, 0));
+            assert_eq!(
+                atlas.generation, 1,
+                "reuse the cleared pages before resetting"
+            );
+        }
     }
 
     /// The atlas grows a new page when one fills, keeping earlier glyphs —

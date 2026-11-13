@@ -67,6 +67,16 @@ fn hex((r, g, b): (u8, u8, u8)) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
 }
 
+/// Geometry alone cannot identify a frame when its sampled textures changed.
+fn frame_unchanged(
+    same_size: bool,
+    previous: &[u8],
+    current: &[u8],
+    resources_changed: bool,
+) -> bool {
+    same_size && !resources_changed && previous == current
+}
+
 /// Meta copied off a pane before the term lock: command marks in grid
 /// space, the running command, the BiDi snapshot, and evicted lines.
 /// The `Arc` is the snapshot. Cloning it does not copy the stamp list.
@@ -6489,6 +6499,9 @@ impl App {
         let mut sprites: Vec<render::ImageSprite> = Vec::new();
         match (self.renderer.as_mut(), self.tabs.get(self.active)) {
             (Some(renderer), Some(tab)) if !rects.is_empty() => {
+                if dev_hook("BAYAN_ATLAS_RESET").is_some() {
+                    renderer.stress_reset_atlas();
+                }
                 renderer.begin_frame();
                 self.bars.begin_frame();
                 let bordered = tab.panes.len() > 1 && !tab.zoomed;
@@ -6853,11 +6866,9 @@ impl App {
         }
         // new glyphs were rasterized this frame: sync the atlas texture
         let mut heal = false;
+        let mut atlas_changed = false;
         if let Some(renderer) = self.renderer.as_mut() {
-            if renderer.atlas.dirty {
-                gpu.upload_atlas(&renderer.atlas.pages);
-                renderer.atlas.dirty = false;
-            }
+            atlas_changed |= gpu.upload_atlas(&mut renderer.atlas);
             // an atlas reset mid-frame leaves earlier quads with stale uvs:
             // one more redraw re-emits everything from the fresh atlas
             heal = renderer.atlas.generation != self.atlas_generation;
@@ -6871,10 +6882,7 @@ impl App {
                 // persistent overlay (re-emitted every frame) so the second
                 // atlas page's glyphs stay on screen for verification
                 r.stress_atlas(&mut verts, px.width as usize, px.height as usize);
-                if r.atlas.dirty {
-                    gpu.upload_atlas(&r.atlas.pages);
-                    r.atlas.dirty = false;
-                }
+                atlas_changed |= gpu.upload_atlas(&mut r.atlas);
             }
         }
         // differential redraw: an identical quad set + unchanged atlas means
@@ -6892,8 +6900,12 @@ impl App {
             }
             &extended
         };
-        let unchanged =
-            self.last_frame_size == Some(px) && !heal && frame_key == self.last_frame.as_slice();
+        let unchanged = frame_unchanged(
+            self.last_frame_size == Some(px),
+            &self.last_frame,
+            frame_key,
+            atlas_changed || heal,
+        );
         if unchanged {
             return;
         }
@@ -7985,6 +7997,14 @@ fn osc52_pane_is_focused(tabs: &[(usize, &[u64])], active: usize, source: u64) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn identical_vertices_still_redraw_after_an_atlas_upload() {
+        assert!(super::frame_unchanged(true, b"quads", b"quads", false));
+        assert!(!super::frame_unchanged(true, b"quads", b"quads", true));
+        assert!(!super::frame_unchanged(false, b"quads", b"quads", false));
+        assert!(!super::frame_unchanged(true, b"old", b"new", false));
+    }
+
     use super::*;
     use std::time::Duration;
 
