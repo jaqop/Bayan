@@ -7994,10 +7994,17 @@ fn blur_forgets_held_keys(focused: bool, held: &mut Vec<winit::keyboard::Physica
 /// documents for this mitigation, and leaves System32, the application
 /// directory, and PATH in place for DirectX and GL.
 ///
-/// ConPTY does not depend on this call. `CreatePseudoConsole`,
-/// `ResizePseudoConsole`, and `ClosePseudoConsole` come from `kernel32.dll`
-/// opened with `LoadLibraryExW(L"kernel32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32)`.
-/// `conpty.dll` is never passed to the loader.
+/// Neither ConPTY load depends on this call. The inbox fallback binds
+/// `CreatePseudoConsole`, `ResizePseudoConsole`, and `ClosePseudoConsole`
+/// from `kernel32.dll` opened with `LoadLibraryExW(L"kernel32.dll", NULL,
+/// LOAD_LIBRARY_SEARCH_SYSTEM32)`. When the pinned Microsoft pair beside
+/// the executable verifies, `psuedocon::load_bundled` passes that
+/// `conpty.dll` full path to `LoadLibraryExW` with
+/// `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32`
+/// (`0x900`), and `PsuedoCon::new` uses those exports. A bare-name
+/// `conpty.dll` is still never requested. An elevated process, or a failed
+/// elevation query, skips the pinned pair and stays on kernel32; a failed
+/// open of the pinned host does the same.
 ///
 /// NEW-04 (partly): the application directory still precedes System32 for a
 /// bare name, so a `d3d12.dll` planted beside `bayan.exe` (a Downloads

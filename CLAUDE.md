@@ -54,9 +54,12 @@ selection and BiDi paths must do.
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-Test counts come from `cargo test -- --list` and the CI test summary, not
-manual totals in this file. Explicit native host probes and measurement
-probes are ignored by the default suite; see their annotations and Measuring.
+915 tests, of which 7 are ignored by the default suite (908 run). That is
+`cargo test --locked --all-targets` on Windows (`running 915 tests`,
+`908 passed; 7 ignored`) and the same lines the CI summary counts with
+`--list`. Explicit native host probes and measurement probes are the
+ignored ones; see their annotations and Measuring. Milestone write-ups
+below record what that change proved, not this total.
 
 ## Measuring
 
