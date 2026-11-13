@@ -447,24 +447,37 @@ unset __bayan_completion_dir
 # bash-completion >= 2.12 also loads share/bash-completion/completions
 # beside every PATH entry that ends in /bin. WSL appends /mnt/c/...
 # directories the user can write. Run the loaders with those removed.
+# One directory. It passes when it is absolute, and, after every symlink
+# and a trailing slash are resolved, it is not under a /mnt, and it and
+# its parent are owned by root and not writable by group or other. The
+# resolved path is printed: a root-owned link to /mnt/c is judged by where
+# it points, and `/x/bin/` has the parent `/x`, not itself.
+__bayan_safe_dir() {
+  local _d=$1 _q _uid _mode
+  case "$_d" in /*) ;; *) return 1 ;; esac
+  _d=$(CDPATH= cd -P -- "$_d" 2>/dev/null && pwd -P) || return 1
+  case "$_d" in
+    /mnt|/mnt/*|*/mnt/*) return 1 ;;
+    /*) ;;
+    *) return 1 ;;
+  esac
+  for _q in "$_d" "${_d%/*}"; do
+    [ -n "$_q" ] || _q=/
+    _uid=$(/usr/bin/stat -c %u -- "$_q" 2>/dev/null) || return 1
+    _mode=$(/usr/bin/stat -c %a -- "$_q" 2>/dev/null) || return 1
+    [ "$_uid" = 0 ] || return 1
+    case "$_mode" in *[2367]?|*[2367]) return 1 ;; esac
+  done
+  printf '%s\n' "$_d"
+}
 __bayan_safe_path() {
-  local _p _q _out= _uid _mode
-  local IFS=:
-  for _p in $PATH; do
-    case "$_p" in
-      /mnt|/mnt/*|*/mnt/*) continue ;;
-      /*) ;;
-      *) continue ;;
-    esac
-    [ -d "$_p" ] || continue
-    for _q in "$_p" "${_p%/*}"; do
-      [ -n "$_q" ] || _q=/
-      _uid=$(/usr/bin/stat -L -c %u -- "$_q" 2>/dev/null) || continue 2
-      _mode=$(/usr/bin/stat -L -c %a -- "$_q" 2>/dev/null) || continue 2
-      [ "$_uid" = 0 ] || continue 2
-      case "$_mode" in *[2367]?|*[2367]) continue 2 ;; esac
-    done
-    _out="${_out:+$_out:}$_p"
+  local _p _r _out=
+  local -a _parts
+  # read, not an unquoted $PATH: an entry such as /usr/* must not glob
+  IFS=: read -r -a _parts <<< "$PATH"
+  for _p in "${_parts[@]}"; do
+    _r=$(__bayan_safe_dir "$_p") || continue
+    _out="${_out:+$_out:}$_r"
   done
   printf '%s\n' "$_out"
 }
@@ -474,17 +487,50 @@ __bayan_wrap_loader() {
   _orig=__bayan_orig_${_name}
   _def=$(declare -f "$_name") || return 0
   eval "${_def/$_name/$_orig}"
+  # The command is the first argument after the options, as the loaders
+  # read it (`_comp_load [-D] [--] cmd [args...]`), not the last one: a
+  # caller may pass more after it. Only that argument loses its directory.
   eval "$_name() {
     local __bayan_sp
     __bayan_sp=\$(__bayan_safe_path)
     local PATH=\${__bayan_sp:-/usr/sbin:/usr/bin:/sbin:/bin}
     local -a __bayan_a=(\"\$@\")
-    (( \${#__bayan_a[@]} )) && __bayan_a[-1]=\${__bayan_a[-1]##*/}
+    local __bayan_i=0 __bayan_n=\${#__bayan_a[@]}
+    while [ \"\$__bayan_i\" -lt \"\$__bayan_n\" ]; do
+      case \${__bayan_a[__bayan_i]} in
+        --) __bayan_i=\$((__bayan_i + 1)); break ;;
+        -*) __bayan_i=\$((__bayan_i + 1)) ;;
+        *) break ;;
+      esac
+    done
+    [ \"\$__bayan_i\" -lt \"\$__bayan_n\" ] && __bayan_a[__bayan_i]=\${__bayan_a[__bayan_i]##*/}
     $_orig \"\${__bayan_a[@]}\"
   }"
 }
 __bayan_wrap_loader _comp_load
 __bayan_wrap_loader __load_completion
+# bash-completion >= 2.12 also looks beside the command's REAL path
+# (_comp_realcommand follows links). A root-owned /usr/bin/x that links
+# to /mnt/c/... would bring the user's completions back, and the function
+# is called outside the loaders too. Its answer goes through the same
+# directory test; a refused one is "no real path".
+__bayan_wrap_realcommand() {
+  local _def
+  declare -F _comp_realcommand >/dev/null 2>&1 || return 0
+  _def=$(declare -f _comp_realcommand) || return 0
+  eval "${_def/_comp_realcommand/__bayan_orig__comp_realcommand}"
+  _comp_realcommand() {
+    __bayan_orig__comp_realcommand "$@" || return
+    case "$REPLY" in
+      /*/*) __bayan_safe_dir "${REPLY%/*}" >/dev/null && return 0 ;;
+      /*) __bayan_safe_dir / >/dev/null && return 0 ;;
+    esac
+    REPLY=
+    return 1
+  }
+}
+__bayan_wrap_realcommand
+unset -f __bayan_wrap_realcommand
 "#;
 
 const BASH_ELEVATED_ENV: &str = r#"
@@ -2466,10 +2512,18 @@ mod tests {
         assert!(wsl.contains(r"__bayan_sp=\$(__bayan_safe_path)"));
         assert!(wsl.contains(r"local PATH=\${__bayan_sp:-/usr/sbin:/usr/bin:/sbin:/bin}"));
         assert!(wsl.contains("/mnt|/mnt/*|*/mnt/*"));
-        assert!(wsl.contains("/usr/bin/stat -L"));
+        // no -L: the path handed to stat has no link left in it
+        assert!(wsl.contains("/usr/bin/stat -c %u -- \"$_q\""));
+        assert!(!wsl.contains("/usr/bin/stat -L"));
         assert!(wsl.contains(r#"[ "$_uid" = 0 ]"#));
+        // the directory is resolved before it is judged, and the real
+        // path of a command goes through the same test
+        assert!(wsl.contains("cd -P -- \"$_d\""));
+        assert!(wsl.contains("__bayan_wrap_realcommand"));
         assert!(wsl.contains("*[2367]?|*[2367]"));
-        assert!(wsl.contains(r"__bayan_a[-1]=\${__bayan_a[-1]##*/}"));
+        // the command is found by position, not taken to be the last word
+        assert!(wsl.contains(r"__bayan_a[__bayan_i]=\${__bayan_a[__bayan_i]##*/}"));
+        assert!(!wsl.contains("__bayan_a[-1]"));
     }
 
     #[test]
@@ -2791,4 +2845,123 @@ printf 'DONE\n'
             "command paths were not reduced to a basename:\n{text}"
         );
     }
+
+    /// Every branch of the completion filter, one case each, in a real
+    /// bash. `/usr/bin/stat` is a stand-in function, so "owned by root"
+    /// does not depend on the machine: under Git Bash nothing is uid 0 and
+    /// the planted test above passes through the empty-PATH fallback alone.
+    /// Removing the `/mnt` case, the uid test, the mode test or the
+    /// fallback each changes a line asserted here.
+    #[test]
+    fn the_completion_filter_refuses_each_planted_shape() {
+        let Some(bash) = find_real_bash() else {
+            if std::env::var_os("GITHUB_ACTIONS").is_some() {
+                panic!("Git Bash is required on the Windows CI runner");
+            }
+            return;
+        };
+        let hex = random_hex().expect("random");
+        let root = std::env::temp_dir().join(format!("bayan-filter-{hex}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let wsl = plan(r"C:\Windows\System32\wsl.exe -d Ubuntu", true, true, NONCE).unwrap();
+        let guard = file(&wsl, "bash.sh");
+        let start = guard.find("__bayan_safe_dir()").expect("filter");
+        std::fs::write(root.join("guard.sh"), &guard[start..]).unwrap();
+        std::fs::write(root.join("case.sh"), FILTER_CASES).unwrap();
+        let output = std::process::Command::new(&bash)
+            .arg("--noprofile")
+            .arg("--norc")
+            .arg("case.sh")
+            .current_dir(&root)
+            .output()
+            .expect("bash");
+        let text = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+        let err = String::from_utf8_lossy(&output.stderr);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(text.contains("\nDONE"), "did not finish: {text}\n{err}");
+        let r = text
+            .lines()
+            .find_map(|l| l.strip_prefix("ROOT="))
+            .expect("the script prints its root");
+        let has = |line: String| {
+            assert!(
+                text.lines().any(|l| l == line),
+                "missing {line:?} in:\n{text}\n{err}"
+            );
+        };
+        // a root-owned directory passes, with or without a trailing slash
+        has(format!("OK=[{r}/ok/bin]"));
+        has(format!("SLASH_OK=[{r}/ok/bin]"));
+        // root-owned, but under a /mnt
+        has("MNT=[]".into());
+        // no `mnt` in the name, owned by the user
+        has("OWNER=[]".into());
+        // the parent is the user's; `/par/bin/` used to check itself twice
+        has("PARENT=[]".into());
+        has("PARENT_SLASH=[]".into());
+        has("WRITABLE=[]".into());
+        has("RELATIVE=[]".into());
+        has("GLOB=[]".into());
+        has(format!("MIXED=[{r}/ok/bin]"));
+        // every entry refused: the loader sees the default, not an empty PATH
+        has("PATHSEEN=/usr/sbin:/usr/bin:/sbin:/bin".into());
+        // the command is the first argument after the options; the
+        // arguments after it arrive untouched
+        has("LOAD=-D|--|zzcmd|e1|e2".into());
+        has("LOAD=zzcmd|e1".into());
+        has("OLDLOAD=zzcmd".into());
+        // a real path under /mnt or in a user's directory is no real path
+        has("REAL_MNT=1[]".into());
+        has("REAL_OWNER=1[]".into());
+        has("REAL_OK=0[/ok/bin/zzcmd]".into());
+    }
+
+    const FILTER_CASES: &str = r##"# Ownership comes from this stand-in, so every branch of the filter is
+# reachable on any machine: under Git Bash no directory is owned by uid 0.
+/usr/bin/stat() {
+  local fmt=$2 p=$4 uid=0 mode=755
+  case $p in
+    */own/bin|*/par) uid=1000 ;;
+    */ww/bin) mode=777 ;;
+  esac
+  case $fmt in
+    %u) printf '%s\n' "$uid" ;;
+    %a) printf '%s\n' "$mode" ;;
+  esac
+}
+_comp_load() {
+  local IFS='|'
+  printf 'LOAD=%s\n' "$*"
+  printf 'PATHSEEN=%s\n' "$PATH"
+}
+__load_completion() {
+  local IFS='|'
+  printf 'OLDLOAD=%s\n' "$*"
+}
+_comp_realcommand() {
+  REPLY=$FAKE_REAL
+}
+ROOT=$(pwd -P)
+mkdir -p ok/bin own/bin mnt/c/bin par/bin ww/bin
+. ./guard.sh
+one() { PATH=$2 ; printf '%s=[%s]\n' "$1" "$(__bayan_safe_path)"; }
+( one OK "$ROOT/ok/bin" )
+( one SLASH_OK "$ROOT/ok/bin/" )
+( one MNT "$ROOT/mnt/c/bin" )
+( one OWNER "$ROOT/own/bin" )
+( one PARENT "$ROOT/par/bin" )
+( one PARENT_SLASH "$ROOT/par/bin/" )
+( one WRITABLE "$ROOT/ww/bin" )
+( one RELATIVE "ok/bin" )
+( one GLOB "$ROOT/o*/bin" )
+( one MIXED "$ROOT/own/bin:$ROOT/ok/bin:$ROOT/mnt/c/bin" )
+( PATH="$ROOT/own/bin:$ROOT/mnt/c/bin"; _comp_load -D -- "$ROOT/mnt/c/bin/zzcmd" e1 e2 )
+( PATH="$ROOT/ok/bin"; _comp_load "$ROOT/mnt/c/bin/zzcmd" e1 )
+( PATH="$ROOT/ok/bin"; __load_completion ./zzcmd )
+FAKE_REAL=$ROOT/mnt/c/bin/zzcmd; _comp_realcommand zzcmd; printf 'REAL_MNT=%s[%s]\n' "$?" "$REPLY"
+FAKE_REAL=$ROOT/own/bin/zzcmd; _comp_realcommand zzcmd; printf 'REAL_OWNER=%s[%s]\n' "$?" "$REPLY"
+FAKE_REAL=$ROOT/ok/bin/zzcmd; _comp_realcommand zzcmd; printf 'REAL_OK=%s[%s]\n' "$?" "${REPLY#"$ROOT"}"
+printf 'ROOT=%s\nDONE\n' "$ROOT"
+"##;
 }
