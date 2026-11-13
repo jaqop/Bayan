@@ -414,6 +414,23 @@ fn dim((r, g, b): (u8, u8, u8)) -> (u8, u8, u8) {
     (f(r), f(g), f(b))
 }
 
+/// Keep a control inside the window after the ledger is scaled down.
+fn clamp_rect_bottom(r: Rect, limit: i32) -> Rect {
+    if r.1 + r.3 > limit {
+        (r.0, r.1, r.2, (limit - r.1).max(1))
+    } else {
+        r
+    }
+}
+
+/// A preferred width between `min_w` and `max_w`. `i32::clamp` panics when
+/// the floor is above the ceiling, which a 150% text size does to a 700px
+/// window (`430 * 1.5` against `fw - 60`). The ceiling wins.
+fn span_in(preferred: i32, min_w: i32, max_w: i32) -> i32 {
+    let max_w = max_w.max(0);
+    preferred.max(min_w).min(max_w)
+}
+
 /// Straight-alpha color for the quad batch.
 fn c4((r, g, b): (u8, u8, u8), a: u8) -> [f32; 4] {
     [
@@ -1040,6 +1057,43 @@ pub struct ShortcutsLayout {
     pub rowh: i32,
     /// full-width hit strip per action row
     pub rows: Vec<Rect>,
+    /// 1 when the card fits. Below 1 every row was scaled into the window.
+    pub fit: f32,
+}
+
+impl ShortcutsLayout {
+    fn fit_into(&mut self, top: i32, frame_h: i32) {
+        let (_, y, _, h) = self.card;
+        let span = y.saturating_sub(top) + h;
+        let room = frame_h.saturating_sub(top).saturating_sub(8);
+        if room <= 0 || span <= room {
+            self.fit = 1.0;
+            return;
+        }
+        let fit = room as f32 / span as f32;
+        self.fit = fit;
+        let sy = |v: i32| top + ((v - top) as f32 * fit).round() as i32;
+        let sh = |v: i32| ((v as f32) * fit).round().max(1.0) as i32;
+        let (x, _, w, _) = self.card;
+        let ny = sy(y);
+        let nh = sh(h).min((frame_h - 8 - ny).max(1));
+        self.card = (x, ny, w, nh);
+        self.rowh = sh(self.rowh);
+        let limit = frame_h - 8;
+        self.rows = self
+            .rows
+            .iter()
+            .copied()
+            .map(|r| {
+                let y = sy(r.1);
+                let mut h = sh(r.3);
+                if y + h > limit {
+                    h = (limit - y).max(1);
+                }
+                (r.0, y, r.2, h)
+            })
+            .collect();
+    }
 }
 
 pub struct CloseGuardLayout {
@@ -1113,6 +1167,9 @@ pub struct SettingsLayout {
     pub appearance_label_y: i32,
     /// segmented control, left→right: النظام، داكن، فاتح
     pub appearance_btns: [Rect; 3],
+    /// 1 when the card fits. Below 1 the whole ledger was scaled so the
+    /// last row stays inside the window. Drawing uses the same factor.
+    pub fit: f32,
 }
 
 /// Move a group of rects to the mirror-image position across the card
@@ -1162,6 +1219,74 @@ impl SettingsLayout {
         ] {
             mirror_group(std::slice::from_mut(t), x, w);
         }
+    }
+
+    /// Shrink the ledger from `top` when it would run past `frame_h`.
+    /// A card that already fits is left byte-for-byte alone.
+    fn fit_into(&mut self, top: i32, frame_h: i32) {
+        let (_, y, _, h) = self.card;
+        let span = y.saturating_sub(top) + h;
+        let room = frame_h.saturating_sub(top).saturating_sub(8);
+        if room <= 0 || span <= room {
+            self.fit = 1.0;
+            return;
+        }
+        let fit = room as f32 / span as f32;
+        self.fit = fit;
+        let sy = |v: i32| top + ((v - top) as f32 * fit).round() as i32;
+        let sh = |v: i32| ((v as f32) * fit).round().max(1.0) as i32;
+        let sr = |r: Rect| (r.0, sy(r.1), r.2, sh(r.3));
+        self.card = sr(self.card);
+        self.head_h = sh(self.head_h);
+        self.rowh = sh(self.rowh);
+        self.shortcuts_btn = sr(self.shortcuts_btn);
+        self.lang_btn = sr(self.lang_btn);
+        self.theme_tiles = self.theme_tiles.iter().copied().map(sr).collect();
+        self.font_label_y = sy(self.font_label_y);
+        self.font_prev = sr(self.font_prev);
+        self.font_next = sr(self.font_next);
+        self.size_label_y = sy(self.size_label_y);
+        self.size_minus = sr(self.size_minus);
+        self.size_plus = sr(self.size_plus);
+        self.arabic_label_y = sy(self.arabic_label_y);
+        self.arabic_prev = sr(self.arabic_prev);
+        self.arabic_next = sr(self.arabic_next);
+        self.cursor_label_y = sy(self.cursor_label_y);
+        self.cursor_btns = self.cursor_btns.map(sr);
+        self.blink_label_y = sy(self.blink_label_y);
+        self.blink_toggle = sr(self.blink_toggle);
+        self.scroll_label_y = sy(self.scroll_label_y);
+        self.scroll_minus = sr(self.scroll_minus);
+        self.scroll_plus = sr(self.scroll_plus);
+        self.copy_label_y = sy(self.copy_label_y);
+        self.copy_toggle = sr(self.copy_toggle);
+        self.liga_label_y = sy(self.liga_label_y);
+        self.liga_toggle = sr(self.liga_toggle);
+        self.bell_label_y = sy(self.bell_label_y);
+        self.bell_btns = self.bell_btns.map(sr);
+        self.notif_label_y = sy(self.notif_label_y);
+        self.notif_toggle = sr(self.notif_toggle);
+        self.pad_label_y = sy(self.pad_label_y);
+        self.pad_minus = sr(self.pad_minus);
+        self.pad_plus = sr(self.pad_plus);
+        self.opacity_label_y = sy(self.opacity_label_y);
+        self.opacity_minus = sr(self.opacity_minus);
+        self.opacity_plus = sr(self.opacity_plus);
+        self.shell_label_y = sy(self.shell_label_y);
+        self.shell_prev = sr(self.shell_prev);
+        self.shell_next = sr(self.shell_next);
+        self.bar_label_y = sy(self.bar_label_y);
+        self.bar_toggle = sr(self.bar_toggle);
+        self.close_label_y = sy(self.close_label_y);
+        self.close_toggle = sr(self.close_toggle);
+        self.appearance_label_y = sy(self.appearance_label_y);
+        self.appearance_btns = self.appearance_btns.map(sr);
+        let limit = frame_h - 8;
+        if self.card.1 + self.card.3 > limit {
+            self.card.3 = (limit - self.card.1).max(1);
+        }
+        self.close_toggle = clamp_rect_bottom(self.close_toggle, limit);
+        self.appearance_btns = self.appearance_btns.map(|r| clamp_rect_bottom(r, limit));
     }
 }
 
@@ -2340,6 +2465,8 @@ struct RowShape {
 
 /// Cache key: the exact rich-text content (text + color + style) + alignment.
 type RunKey = (Vec<Seg>, bool, bool, u32, bool);
+type ContrastCache = std::collections::HashMap<((u8, u8, u8), (u8, u8, u8)), (u8, u8, u8)>;
+const CONTRAST_CACHE_CAP: usize = 4096;
 type CellGeometry = Vec<(i32, i32, bool)>; // visual x, width, logical RTL
 type RowHit = (i32, i32, usize, bool); // x, width, column, logical RTL
 
@@ -2391,6 +2518,9 @@ pub struct Renderer {
     /// High Contrast is on and the grid follows it (fg/bg/selection/cursor).
     grid_follows_hc: bool,
     chrome: crate::a11y::ChromeColors,
+    /// `(fg, bg) -> adjusted fg` for High Contrast cell text. Cleared with
+    /// the renderer, so a theme change cannot serve a stale pair.
+    contrast_cache: ContrastCache,
     cache_hot: std::collections::HashMap<RunKey, ShapedRun>,
     cache_cold: std::collections::HashMap<RunKey, ShapedRun>,
     pub atlas: Atlas,
@@ -2613,6 +2743,7 @@ impl Renderer {
             high_contrast: a11y.high_contrast,
             grid_follows_hc,
             chrome,
+            contrast_cache: std::collections::HashMap::new(),
             cache_hot: std::collections::HashMap::new(),
             cache_cold: std::collections::HashMap::new(),
             atlas: Atlas::new(),
@@ -2781,6 +2912,16 @@ impl Renderer {
         }
     }
 
+    /// A mark on the tab bar. Starts from the theme accent (the system
+    /// accent under High Contrast) and moves until it clears `minimum`
+    /// against the bar this frame paints. Caption text wants 4.5; a
+    /// non-text mark wants 3. The light amber `#9a5f00` is only 3.06:1
+    /// on that bar.
+    fn ink_on_bar(&self, theme: (u8, u8, u8), minimum: f32) -> (u8, u8, u8) {
+        let bar = self.window_fill(chrome_bar_bg(self.bg));
+        crate::a11y::ensure_contrast(self.accent_color(theme), bar, minimum)
+    }
+
     fn muted_color(&self, theme: (u8, u8, u8)) -> (u8, u8, u8) {
         if self.high_contrast {
             self.chrome.muted
@@ -2828,6 +2969,40 @@ impl Renderer {
         } else {
             (self.fg, false)
         }
+    }
+
+    /// Shrink the chrome face to `fit` for one card, and hand back the
+    /// metrics to restore. `fit` of 1 leaves the current face alone.
+    fn apply_panel_fit(&mut self, fit: f32) -> (Metrics, f32, f32) {
+        let saved = (self.metrics, self.cell_w, self.cell_h);
+        if fit < 0.999 {
+            let px = (self.ui_font_px() * fit).max(1.0);
+            let lh = (self.ui_cell_h() * fit).max(1.0);
+            self.metrics = Metrics::new(px, lh);
+            self.cell_w = (self.ui_cell_w() * fit).max(1.0);
+            self.cell_h = lh;
+        }
+        saved
+    }
+
+    fn restore_panel(&mut self, saved: (Metrics, f32, f32)) {
+        self.metrics = saved.0;
+        self.cell_w = saved.1;
+        self.cell_h = saved.2;
+    }
+
+    /// High Contrast cell ink. The first pair pays for `ensure_contrast`;
+    /// every later cell with the same pair reads the map.
+    fn cached_cell_contrast(&mut self, fg: (u8, u8, u8), bg: (u8, u8, u8)) -> (u8, u8, u8) {
+        if let Some(hit) = self.contrast_cache.get(&(fg, bg)).copied() {
+            return hit;
+        }
+        if self.contrast_cache.len() > CONTRAST_CACHE_CAP {
+            self.contrast_cache.clear();
+        }
+        let adjusted = crate::a11y::ensure_contrast(fg, bg, crate::a11y::MIN_CELL_CONTRAST);
+        self.contrast_cache.insert((fg, bg), adjusted);
+        adjusted
     }
 
     pub fn use_ui_metrics(&mut self, active: bool) {
@@ -4361,6 +4536,9 @@ impl Renderer {
                     bg = self.chrome.selection;
                 }
             }
+            if self.grid_follows_hc {
+                fg = self.cached_cell_contrast(fg, bg);
+            }
             if view
                 .search_match
                 .is_some_and(|m| *m.start() <= cell.point && cell.point <= *m.end())
@@ -4947,8 +5125,11 @@ impl Renderer {
         // The ledger grammar: every row is [control]···dotted leader···[label],
         // controls left, labels right (RTL), one shared control height.
         let pad = 24;
-        let w = ((self.ui_cell_w() * 52.0) as i32)
-            .clamp((430.0 * self.system_text_scale) as i32, fw as i32 - 60);
+        let w = span_in(
+            (self.ui_cell_w() * 52.0) as i32,
+            (430.0 * self.system_text_scale) as i32,
+            fw as i32 - 60,
+        );
         let head_h = (self.ui_cell_h() + 18.0 * self.dpi_scale) as i32;
         let foot_h = (self.ui_cell_h() + 18.0 * self.dpi_scale) as i32;
         // 16 rows since the system-theme row: at the roomy height the card
@@ -5127,10 +5308,12 @@ impl Renderer {
             close_toggle,
             appearance_label_y: appearance_y,
             appearance_btns,
+            fit: 1.0,
         };
         if !crate::lang::rtl() {
             lay.mirror(x, w);
         }
+        lay.fit_into(bar, fh as i32);
         lay
     }
 
@@ -5161,6 +5344,7 @@ impl Renderer {
 
         let whole: Rect = (0, 0, fw as i32, fh as i32);
         let lay = self.settings_layout(fw, fh);
+        let saved_panel = self.apply_panel_fit(lay.fit);
         let (x, y, w, h) = lay.card;
         let pad = 24;
         // label baseline offset: text vertically centered in its row
@@ -5713,12 +5897,13 @@ impl Renderer {
             y + h - (self.cell_h as i32 + 14),
             1.0,
         );
+        self.restore_panel(saved_panel);
     }
 
     /// Geometry of the shortcuts editor: clickable rows in one column, or
     /// two when a wide, short window needs them. Draw and hit-test agree.
     pub fn shortcuts_layout(&self, fw: usize, fh: usize, n: usize) -> ShortcutsLayout {
-        let mut w = ((self.ui_cell_w() * 44.0) as i32).clamp(380, fw as i32 - 60);
+        let mut w = span_in((self.ui_cell_w() * 44.0) as i32, 380, fw as i32 - 60);
         let head_h = (self.ui_cell_h() + 30.0) as i32;
         let foot_h = (self.ui_cell_h() + 30.0) as i32;
         let bar = self.tab_bar_h() as i32;
@@ -5773,11 +5958,14 @@ impl Renderer {
                 )
             })
             .collect();
-        ShortcutsLayout {
+        let mut lay = ShortcutsLayout {
             card: (x, y, w, h),
             rowh,
             rows,
-        }
+            fit: 1.0,
+        };
+        lay.fit_into(bar, fh as i32);
+        lay
     }
 
     /// The shortcuts editor: the settings ledger grammar again — keycap
@@ -5806,6 +5994,7 @@ impl Renderer {
 
         let whole: Rect = (0, 0, fw as i32, fh as i32);
         let lay = self.shortcuts_layout(fw, fh, rows.len());
+        let saved_panel = self.apply_panel_fit(lay.fit);
         let (x, y, w, h) = lay.card;
         let pad = 24;
         let tc = (lay.rowh as f32 - self.cell_h) as i32 / 2;
@@ -5846,7 +6035,15 @@ impl Renderer {
             let selected = i == sel;
             if selected {
                 // the accent bar hugs the reading edge: right in Arabic
-                push_rect(out, whole, rx, ry, rw, rh, c4((0x1b, 0x21, 0x29), 255));
+                push_rect(
+                    out,
+                    whole,
+                    rx,
+                    ry,
+                    rw,
+                    rh,
+                    c4(self.palette_sel_fill((0x1b, 0x21, 0x29)), 255),
+                );
                 let bar_x = if crate::lang::rtl() { rx + rw - 3 } else { rx };
                 push_rect(out, whole, bar_x, ry + 2, 3, rh - 4, c4(focus_c, 255));
             }
@@ -5857,7 +6054,11 @@ impl Renderer {
                 .map(|t| self.measure(&[Seg::plain(t, fg_c)], false) as i32 + 14)
                 .collect();
             let chips_width = widths.iter().sum::<i32>() + 6 * (widths.len() as i32 - 1).max(0);
-            let label_color = if selected { fg_c } else { muted_c };
+            let label_color = if selected {
+                self.palette_sel_text(fg_c)
+            } else {
+                muted_c
+            };
             let label = self.fit_title(
                 &row.label,
                 label_color,
@@ -5958,6 +6159,7 @@ impl Renderer {
             y + h - (self.cell_h as i32 + 14),
             1.0,
         );
+        self.restore_panel(saved_panel);
     }
 
     /// Shared geometry for painting and pointer input, independent of terminal zoom.
@@ -6929,7 +7131,10 @@ impl Renderer {
             1.0,
         );
         let keys_at = if let Some(rest) = rest_line {
-            let path = [Seg::plain(rest.to_string(), (0xc5, 0xcd, 0xd6))];
+            let path = [Seg::plain(
+                rest.to_string(),
+                self.chrome_fg_or((0xc5, 0xcd, 0xd6)),
+            )];
             self.draw_run(
                 &path,
                 false,
@@ -6944,7 +7149,10 @@ impl Renderer {
             2.0
         };
         let (ar, en) = crate::link::card_key_lines(may_open);
-        let keys_ar = [Seg::plain(ar.to_string(), (0x9a, 0xa4, 0xb2))];
+        let keys_ar = [Seg::plain(
+            ar.to_string(),
+            self.chrome_fg_or((0x9a, 0xa4, 0xb2)),
+        )];
         self.draw_run(
             &keys_ar,
             true,
@@ -7087,7 +7295,10 @@ impl Renderer {
             1.0,
         );
         for (i, line) in card.preview.iter().enumerate() {
-            let shown = [Seg::plain(line.clone(), (0xc5, 0xcd, 0xd6))];
+            let shown = [Seg::plain(
+                line.clone(),
+                self.chrome_fg_or((0xc5, 0xcd, 0xd6)),
+            )];
             self.draw_run(
                 &shown,
                 true,
@@ -7103,7 +7314,7 @@ impl Renderer {
                 "Enter تأكيد   ·   Esc إلغاء",
                 "Enter confirm   ·   Esc cancel",
             ),
-            (0x9a, 0xa4, 0xb2),
+            self.chrome_fg_or((0x9a, 0xa4, 0xb2)),
         )];
         self.draw_run(
             &keys,
@@ -7379,7 +7590,14 @@ impl Renderer {
             // its fill at the reported percent (full-width dim = indeterminate)
             if let Some(p) = tab.progress.filter(|_| tw >= 28) {
                 let (bx, bw, by, bh) = (tx + 6, tabw - 12, oy - 3, 3);
-                let c = progress_color(p);
+                let c = if p.state == crate::term::ProgressState::Paused {
+                    self.ink_on_bar(
+                        crate::theme::bar_accent(crate::theme::BarAccent::Amber, page_dark),
+                        3.0,
+                    )
+                } else {
+                    progress_color(p)
+                };
                 push_rect(out, whole, bx, by, bw, bh, c4(c, 70));
                 let fill = match p.state {
                     crate::term::ProgressState::Indeterminate => bw,
@@ -7398,9 +7616,15 @@ impl Renderer {
             self.draw_title_tip(out, whole, width, tx, &full);
         }
 
+        // 4.6, not 4.5: the search stops on the threshold, and the light
+        // bar otherwise lands on 4.501.
+        let elevated_color = self.ink_on_bar(
+            crate::theme::bar_accent(crate::theme::BarAccent::Amber, page_dark),
+            4.6,
+        );
         let elevated_w = elevated_label
             .map(|text| {
-                let segs = [Seg::plain(text, (0xf2, 0xcc, 0x60))];
+                let segs = [Seg::plain(text, elevated_color)];
                 self.measure(&segs, false).ceil() as i32 + 16
             })
             .unwrap_or(0);
@@ -7413,7 +7637,10 @@ impl Renderer {
         if claude {
             let label = [Seg::plain(
                 "● Claude",
-                crate::theme::bar_accent(crate::theme::BarAccent::Green, page_dark),
+                self.accent_color(crate::theme::bar_accent(
+                    crate::theme::BarAccent::Green,
+                    page_dark,
+                )),
             )];
             let tw = self.measure(&label, false);
             let x = self.tab_controls(width)[0].0 - tw.ceil() as i32 - 18 - elevated_w;
@@ -7430,7 +7657,7 @@ impl Renderer {
             }
         }
         if let Some(text) = elevated_label {
-            let label = [Seg::plain(text, (0xf2, 0xcc, 0x60))];
+            let label = [Seg::plain(text, elevated_color)];
             let tw = self.measure(&label, false);
             let x = self.tab_controls(width)[0].0 - tw.ceil() as i32 - 12;
             if x >= end + 12 {
@@ -10359,6 +10586,374 @@ mod cache_tests {
             .layout_runs()
             .flat_map(|run| run.glyphs.iter().map(|g| g.glyph_id).collect::<Vec<_>>())
             .collect()
+    }
+
+    fn quad_has(out: &[crate::gpu::Vertex], rgb: (u8, u8, u8)) -> bool {
+        let want = c4(rgb, 255);
+        out.chunks(6).any(|q| {
+            q.iter().all(|v| {
+                (v.color[0] - want[0]).abs() < 0.01
+                    && (v.color[1] - want[1]).abs() < 0.01
+                    && (v.color[2] - want[2]).abs() < 0.01
+            })
+        })
+    }
+
+    #[test]
+    fn settings_card_survives_a_narrow_window_and_stays_on_screen() {
+        let cases = [
+            (1.0_f32, 1.0_f32, 480usize, 700usize),
+            (1.5, 1.0, 700, 800),
+            (2.25, 1.0, 1000, 800),
+            (1.25, 1.5, 1920, 1030),
+            (2.25, 1.0, 1920, 1080),
+        ];
+        for (ts, dpi, fw, fh) in cases {
+            let snap = crate::a11y::A11ySnapshot {
+                text_scale: ts,
+                ..crate::a11y::A11ySnapshot::neutral()
+            };
+            let r = Renderer::with_a11y(dpi, &crate::config::UserConfig::default(), 0.0, snap);
+            let lay = r.settings_layout(fw, fh);
+            let (x, y, w, h) = lay.card;
+            assert!(x >= 0 && y >= 0, "origin {ts} {dpi} {fw}x{fh}");
+            assert!(x + w <= fw as i32, "width {x}+{w} > {fw}");
+            assert!(y + h <= fh as i32, "settings bottom {} > {fh}", y + h);
+            let last = lay.close_toggle;
+            assert!(
+                last.1 >= 0 && last.1 + last.3 <= fh as i32,
+                "last settings row {}..{} leaves {fh}",
+                last.1,
+                last.1 + last.3
+            );
+            let keys = r.shortcuts_layout(fw, fh, 24);
+            let (sx, sy, sw, sh) = keys.card;
+            assert!(sx >= 0 && sy >= 0 && sx + sw <= fw as i32);
+            assert!(sy + sh <= fh as i32, "shortcuts bottom {} > {fh}", sy + sh);
+            let row = keys.rows.last().copied().unwrap();
+            assert!(
+                row.1 + row.3 <= fh as i32,
+                "last shortcut row leaves the window"
+            );
+        }
+    }
+
+    #[test]
+    fn high_contrast_draw_path_paints_system_colors() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+        let sys = crate::a11y::SystemColors {
+            window: (255, 255, 255),
+            window_text: (0, 0, 0),
+            highlight: (0, 0, 180),
+            highlight_text: (255, 255, 255),
+            hotlight: (0, 0, 128),
+            gray_text: (90, 90, 90),
+            btn_face: (255, 255, 255),
+        };
+        let mut r = Renderer::with_a11y(
+            1.0,
+            &crate::config::UserConfig::default(),
+            0.0,
+            crate::a11y::A11ySnapshot {
+                high_contrast: true,
+                colors: sys,
+                text_scale: 1.0,
+            },
+        );
+        let mut out = Vec::new();
+        r.use_ui_metrics(true);
+        r.draw_chrome(
+            &mut out,
+            1400,
+            800,
+            &[TabInfo {
+                title: "بيان".into(),
+                color: None,
+                busy: false,
+                attention: false,
+                active: true,
+                progress: None,
+            }],
+            None,
+            true,
+            None,
+        );
+        assert!(
+            quad_has(&out, sys.window),
+            "the tab bar was not painted with COLOR_WINDOW"
+        );
+        assert!(
+            quad_has(&out, sys.hotlight)
+                || out.iter().any(|v| {
+                    let c = (
+                        (v.color[0] * 255.0).round() as u8,
+                        (v.color[1] * 255.0).round() as u8,
+                        (v.color[2] * 255.0).round() as u8,
+                    );
+                    c == sys.hotlight
+                }),
+            "the Claude badge was not COLOR_HOTLIGHT"
+        );
+        out.clear();
+        let rows = [ShortcutRow {
+            label: "تبويب جديد".into(),
+            chord: "Ctrl+T".into(),
+            custom: false,
+        }];
+        r.draw_shortcuts(&mut out, 1400, 800, &rows, 0, false, None);
+        assert!(
+            quad_has(&out, sys.highlight),
+            "the selected shortcut row was not COLOR_HIGHLIGHT"
+        );
+
+        let size = crate::term::TermSize { cols: 20, rows: 2 };
+        let mut t = Term::new(Config::default(), &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        p.advance(&mut t, b"\x1b[38;2;255;255;255mX");
+        let mut glyphs = Vec::new();
+        let view = PaneView {
+            rect: (0, 0, 400, 80),
+            focused: false,
+            cursor: crate::config::CursorStyle::Block,
+            cursor_on: false,
+            bordered: false,
+            claude: false,
+            claude_from: None,
+            reorder: true,
+            line_dir: &[],
+            bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+            search_match: None,
+            marks: &[],
+            link_hover: None,
+            link_tip: None,
+            scroll_px: 0,
+            peek_dir: ParagraphDir::Default,
+        };
+        r.draw_pane(&mut glyphs, &view, &t);
+        let painted = glyphs.iter().any(|v| {
+            let c = (
+                (v.color[0] * 255.0).round() as u8,
+                (v.color[1] * 255.0).round() as u8,
+                (v.color[2] * 255.0).round() as u8,
+            );
+            c != sys.window
+                && crate::a11y::contrast_ratio(c, sys.window) >= crate::a11y::MIN_CELL_CONTRAST
+        });
+        assert!(painted, "white-on-white cell text was left unreadable");
+    }
+
+    fn cached_text_colors(r: &Renderer, needle: &str) -> Vec<(u8, u8, u8)> {
+        let mut colors = Vec::new();
+        for (segs, _, _, _, _) in r.cache_hot.keys() {
+            for seg in segs {
+                if seg.text.contains(needle) {
+                    colors.push(seg.fg);
+                }
+            }
+        }
+        colors
+    }
+
+    /// Light page, dark page, and High Contrast on a light window whose
+    /// hot accent does not yet clear the bar.
+    fn bar_cases() -> [(&'static str, bool, (u8, u8, u8)); 3] {
+        [
+            ("light", false, (0, 0, 128)),
+            ("dark", false, (0, 0, 128)),
+            ("light", true, (255, 220, 80)),
+        ]
+    }
+
+    fn renderer_for_bar(theme: &str, high_contrast: bool, hotlight: (u8, u8, u8)) -> Renderer {
+        let cfg = crate::config::UserConfig {
+            theme: Some(theme.into()),
+            ..crate::config::UserConfig::default()
+        };
+        let colors = crate::a11y::SystemColors {
+            window: (255, 255, 255),
+            window_text: (0, 0, 0),
+            hotlight,
+            ..crate::a11y::A11ySnapshot::neutral().colors
+        };
+        Renderer::with_a11y(
+            1.0,
+            &cfg,
+            0.0,
+            crate::a11y::A11ySnapshot {
+                high_contrast,
+                colors,
+                text_scale: 1.0,
+            },
+        )
+    }
+
+    #[test]
+    fn elevated_badge_keeps_contrast_on_light_dark_and_high_contrast() {
+        let label = "مسؤول";
+        for (theme, high_contrast, hotlight) in bar_cases() {
+            let mut r = renderer_for_bar(theme, high_contrast, hotlight);
+            let page_dark = crate::theme::title_bar_dark_for(r.bg);
+            let bar = r.window_fill(chrome_bar_bg(r.bg));
+            let raw = r.accent_color(crate::theme::bar_accent(
+                crate::theme::BarAccent::Amber,
+                page_dark,
+            ));
+            let expected = crate::a11y::ensure_contrast(raw, bar, 4.6);
+            if !high_contrast && !page_dark {
+                assert_ne!(bar, (255, 255, 255), "light contrast is against the bar");
+            }
+            if !page_dark {
+                assert!(
+                    crate::a11y::contrast_ratio(raw, bar) < crate::a11y::MIN_CELL_CONTRAST,
+                    "unadjusted {raw:?} already clears the bar {bar:?}; the test is aimed at the wrong surface"
+                );
+            }
+            let mut out = Vec::new();
+            r.use_ui_metrics(true);
+            r.draw_chrome(
+                &mut out,
+                1600,
+                800,
+                &[TabInfo {
+                    title: "بيان".into(),
+                    color: None,
+                    busy: false,
+                    attention: false,
+                    active: true,
+                    progress: None,
+                }],
+                None,
+                false,
+                Some(label),
+            );
+            let found = cached_text_colors(&r, label);
+            assert!(
+                !found.is_empty(),
+                "the badge was neither measured nor drawn"
+            );
+            assert!(
+                found.iter().all(|c| *c == expected),
+                "measure and draw diverged: {found:?} expected {expected:?}"
+            );
+            for c in &found {
+                let ratio = crate::a11y::contrast_ratio(*c, bar);
+                assert!(ratio >= 4.6, "{c:?} on the bar {bar:?} is {ratio}");
+            }
+            if !page_dark || high_contrast {
+                assert_ne!(
+                    found[0],
+                    (0xf2, 0xcc, 0x60),
+                    "light or HC kept the hard-coded amber"
+                );
+            }
+            let _ = out;
+        }
+    }
+
+    #[test]
+    fn contrast_cache_returns_the_same_adjusted_color() {
+        let mut r = Renderer::with_a11y(
+            1.0,
+            &crate::config::UserConfig::default(),
+            0.0,
+            crate::a11y::A11ySnapshot {
+                high_contrast: true,
+                colors: crate::a11y::A11ySnapshot::neutral().colors,
+                text_scale: 1.0,
+            },
+        );
+        let white = (255, 255, 255);
+        let first = r.cached_cell_contrast(white, white);
+        let second = r.cached_cell_contrast(white, white);
+        assert_eq!(first, second);
+        assert_eq!(r.contrast_cache.len(), 1);
+        let other = r.cached_cell_contrast((255, 0, 0), white);
+        assert_eq!(r.contrast_cache.len(), 2);
+        assert_eq!(r.cached_cell_contrast((255, 0, 0), white), other);
+        assert!(crate::a11y::contrast_ratio(first, white) >= crate::a11y::MIN_CELL_CONTRAST);
+    }
+
+    #[test]
+    fn contrast_cache_drops_entries_past_4096_pairs() {
+        let mut r = Renderer::with_a11y(
+            1.0,
+            &crate::config::UserConfig::default(),
+            0.0,
+            crate::a11y::A11ySnapshot::neutral(),
+        );
+        let bg = (255, 255, 255);
+        for i in 0..=CONTRAST_CACHE_CAP {
+            let fg = (i as u8, (i >> 8) as u8, 1);
+            r.cached_cell_contrast(fg, bg);
+        }
+        assert_eq!(r.contrast_cache.len(), CONTRAST_CACHE_CAP + 1);
+        let extra = (0, 0, 2);
+        let drawn = r.cached_cell_contrast(extra, bg);
+        assert_eq!(r.contrast_cache.len(), 1);
+        assert_eq!(
+            drawn,
+            crate::a11y::ensure_contrast(extra, bg, crate::a11y::MIN_CELL_CONTRAST)
+        );
+        assert_eq!(r.cached_cell_contrast(extra, bg), drawn);
+    }
+
+    #[test]
+    fn paused_progress_bar_clears_three_to_one_on_the_bar() {
+        for (theme, high_contrast, hotlight) in bar_cases() {
+            let mut r = renderer_for_bar(theme, high_contrast, hotlight);
+            let page_dark = crate::theme::title_bar_dark_for(r.bg);
+            let bar = r.window_fill(chrome_bar_bg(r.bg));
+            let raw = r.accent_color(crate::theme::bar_accent(
+                crate::theme::BarAccent::Amber,
+                page_dark,
+            ));
+            let expected = crate::a11y::ensure_contrast(raw, bar, 3.0);
+            if !high_contrast && !page_dark {
+                assert_ne!(bar, (255, 255, 255), "progress contrast is against the bar");
+                assert!(
+                    crate::a11y::contrast_ratio((0xf2, 0xcc, 0x60), bar) < 3.0,
+                    "the old amber already clears the bar; the test is aimed at the wrong surface"
+                );
+            }
+            if high_contrast {
+                assert!(
+                    crate::a11y::contrast_ratio(raw, bar) < 3.0,
+                    "HC accent {raw:?} already clears the bar {bar:?}"
+                );
+            }
+            let ratio = crate::a11y::contrast_ratio(expected, bar);
+            assert!(
+                ratio >= 3.0,
+                "paused progress {expected:?} on the bar {bar:?} is {ratio}"
+            );
+            let mut out = Vec::new();
+            r.use_ui_metrics(true);
+            r.draw_chrome(
+                &mut out,
+                1200,
+                600,
+                &[TabInfo {
+                    title: "عمل".into(),
+                    color: None,
+                    busy: false,
+                    attention: false,
+                    active: true,
+                    progress: Some(crate::term::Progress {
+                        state: crate::term::ProgressState::Paused,
+                        percent: 40,
+                    }),
+                }],
+                None,
+                false,
+                None,
+            );
+            assert!(
+                quad_has(&out, expected),
+                "paused progress painted something other than {expected:?} on {bar:?}"
+            );
+        }
     }
 
     /// M20: cosmic-text 0.19 shapes through harfrust with default OpenType

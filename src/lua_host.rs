@@ -63,7 +63,8 @@
 //! Strings crossing the boundary are UTF-8. Arabic round-trips unchanged.
 //!
 //! An elevated process token — `--elevated` after UAC, or Explorer's Run as
-//! administrator — loads none of this. [`is_elevated`] reads the token.
+//! administrator — loads none of this. [`crate::elevate::process_is_elevated`]
+//! reads the token.
 //! [`load_with`] takes that answer so tests can force either side. The JSON
 //! config is kept and a short Arabic notice is returned; no script is read.
 
@@ -494,26 +495,18 @@ pub struct Outcome {
 }
 
 /// User Lua and every plugin (executable or declarative) load only when
-/// `elevated` is false. Tests pass the flag; the process asks [`is_elevated`].
+/// `elevated` is false. Tests pass the flag; the process asks
+/// [`crate::elevate::process_is_elevated`].
 pub fn scripts_enabled(elevated: bool) -> bool {
     !elevated
 }
 
-/// Whether this process token is elevated. The query lives in [`crate::elevate`]
-/// so a later merge with the `--elevated` relaunch uses one check. A failed
-/// query is elevated (scripts stay off). Tests pass the boolean into
-/// [`load_with`] instead of calling this.
-pub fn is_elevated() -> bool {
-    // `process_is_elevated` is the name #56 uses. Same function.
-    crate::elevate::process_is_elevated()
-}
-
 /// Load Lua beside `dir`'s config.json. Unapproved and changed files are
-/// returned in `pending` and are not executed. This asks [`is_elevated`]
-/// itself, so a config watcher has no other entry and cannot run a file
-/// while the token is elevated.
+/// returned in `pending` and are not executed. This asks
+/// [`crate::elevate::process_is_elevated`] itself, so a config watcher has
+/// no other entry and cannot run a file while the token is elevated.
 pub fn load_at(cfg: &UserConfig, dir: &Path) -> Outcome {
-    load_with(cfg, dir, is_elevated())
+    load_with(cfg, dir, crate::elevate::process_is_elevated())
 }
 
 /// [`load_at`] with the elevation answer supplied by the caller. `true`
@@ -2287,8 +2280,8 @@ mod tests {
     #[test]
     fn elevated_startup_runs_no_lua_and_loads_no_plugins() {
         // Files are present and already approved. The injected flag is what
-        // `is_elevated` returns for a UAC token or Explorer's Run as
-        // administrator. `load_at` and `reload` pass that function through.
+        // `elevate::process_is_elevated` is true for a UAC token or
+        // Explorer's Run as administrator. `load_at` passes that through.
         let dir = scratch("elevated");
         let plugins = dir.join("plugins");
         fs::create_dir_all(&plugins).unwrap();
@@ -2337,7 +2330,7 @@ mod tests {
         let loaded = crate::plugins::load_from(&plugins, &[]);
         assert_eq!(loaded.loaded, vec!["theme".to_string()]);
         // The live token, whatever this process is. Scripts follow it.
-        let live = is_elevated();
+        let live = crate::elevate::process_is_elevated();
         assert_eq!(scripts_enabled(live), !live);
         let _ = fs::remove_dir_all(&dir);
     }

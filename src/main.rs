@@ -158,9 +158,19 @@ fn beep() {
 static QUAKE_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// A toast/tray click wants the window raised (summon, never hide).
 static SUMMON_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// `WM_SETTINGCHANGE` / `WM_SYSCOLORCHANGE` arrived. `about_to_wait` re-reads
-/// High Contrast and the text-size slider; the hook only sets the bit.
+/// `WM_SETTINGCHANGE` / `WM_SYSCOLORCHANGE` / `WM_THEMECHANGED` arrived.
+/// Those are sent straight to WindowProc, so winit's queue hook never sees
+/// them. The subclass (or the thread's call-wnd hook) sets this bit, and
+/// `about_to_wait` re-reads.
 static A11Y_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// One subclass id, and the call-wnd hook if the subclass export is missing.
+const A11Y_SUBCLASS_ID: usize = 0xB1A5;
+static A11Y_HOOK: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+/// The top-level window that hook belongs to. `WH_CALLWNDPROC` sees every
+/// window on the thread, so only this hwnd's `WM_NCDESTROY` may remove it.
+static A11Y_HWND: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 const QUAKE_ID: usize = 0xB1AA;
 
 /// The letter a Ctrl+<letter> event represents, resolved the way real
@@ -3814,7 +3824,7 @@ impl App {
     /// before any pipe probe or `bayan --mux-server` spawn, the same branch
     /// `connect_if_enabled` tests.
     fn ensure_mux(&mut self) -> bool {
-        if !mux::mux_may_run(self.config.mux_enabled(), mux::is_elevated()) {
+        if !mux::mux_may_run(self.config.mux_enabled(), elevate::process_is_elevated()) {
             return false;
         }
         if self.mux_client.as_ref().is_some_and(|c| c.is_alive()) {
@@ -7479,6 +7489,7 @@ impl ApplicationHandler<UserEvent> for App {
             if !toast::init(h) {
                 eprintln!("bayan: tray icon registration failed — no toasts");
             }
+            install_a11y_watch(h);
             if let Ok(exe) = std::env::current_exe() {
                 if let Ok(path) = cli::exe_display(&exe) {
                     let app_id = jumplist::app_user_model_id(&path);
@@ -8208,6 +8219,201 @@ fn cli_start_dir(
     cli::start_directory(args)
 }
 
+/// The subclass and the call-wnd hook both go through this. A message
+/// that is not a settings change leaves the dirty bit alone.
+fn note_a11y_message(message: u32) {
+    if a11y::message_triggers_reread(message) {
+        A11Y_DIRTY.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `SetWindowSubclass` procedure. `DefSubclassProc` keeps the message
+/// moving; a null hwnd is the unit test, which has no window to forward to.
+unsafe extern "system" fn a11y_subclass_proc(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+    _id: usize,
+    _data: usize,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_NCDESTROY;
+    note_a11y_message(msg);
+    if msg == WM_NCDESTROY && !hwnd.is_null() {
+        if let Some(api) = comctl_fns() {
+            // SAFETY: this hwnd was subclassed with this procedure and id.
+            // Removing it on WM_NCDESTROY is the documented order, before
+            // the default subclass procedure runs.
+            unsafe { (api.remove)(hwnd, Some(a11y_subclass_proc), A11Y_SUBCLASS_ID) };
+        }
+        unhook_a11y();
+    }
+    if hwnd.is_null() {
+        return 0;
+    }
+    if let Some(api) = comctl_fns() {
+        // SAFETY: DefSubclassProc was loaded from the same System32
+        // comctl32 that installed this subclass. The pointers belong to
+        // this call.
+        unsafe { (api.def)(hwnd, msg, wparam, lparam) }
+    } else {
+        0
+    }
+}
+
+unsafe extern "system" fn a11y_call_hook(
+    code: i32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    if code >= 0 {
+        // SAFETY: for WH_CALLWNDPROC, lParam is a pointer to a CWPSTRUCT
+        // that lives for this call.
+        let cwp = &*(lparam as *const windows_sys::Win32::UI::WindowsAndMessaging::CWPSTRUCT);
+        note_a11y_message(cwp.message);
+        let ours = A11Y_HWND.load(std::sync::atomic::Ordering::Relaxed);
+        if cwp.message == windows_sys::Win32::UI::WindowsAndMessaging::WM_NCDESTROY
+            && cwp.hwnd == ours
+            && !ours.is_null()
+        {
+            unhook_a11y();
+        }
+    }
+    // SAFETY: a null hook handle asks CallNextHookEx to walk the chain
+    // without naming ours. Documented.
+    windows_sys::Win32::UI::WindowsAndMessaging::CallNextHookEx(
+        std::ptr::null_mut(),
+        code,
+        wparam,
+        lparam,
+    )
+}
+
+/// Prefer `SetWindowSubclass` (it sees messages sent to this hwnd). When
+/// comctl32 v6 is not the active context the export is missing, and the
+/// thread's `WH_CALLWNDPROC` hook is the path that still sees a sent
+/// `WM_SETTINGCHANGE`.
+fn install_a11y_watch(hwnd: windows_sys::Win32::Foundation::HWND) {
+    A11Y_HWND.store(hwnd, std::sync::atomic::Ordering::Relaxed);
+    if try_set_window_subclass(hwnd) {
+        return;
+    }
+    if !A11Y_HOOK
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .is_null()
+    {
+        return;
+    }
+    // SAFETY: the hook procedure is 'static. A null module with the
+    // current thread id installs a thread hook, which is what a sent
+    // message to this window needs. GetCurrentThreadId takes no pointers.
+    let installed = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SetWindowsHookExW(
+            windows_sys::Win32::UI::WindowsAndMessaging::WH_CALLWNDPROC,
+            Some(a11y_call_hook),
+            std::ptr::null_mut(),
+            windows_sys::Win32::System::Threading::GetCurrentThreadId(),
+        )
+    };
+    if installed.is_null() {
+        eprintln!("bayan: could not watch High Contrast changes");
+    } else {
+        A11Y_HOOK.store(installed, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn unhook_a11y() {
+    let hook = A11Y_HOOK.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
+    if hook.is_null() {
+        return;
+    }
+    // SAFETY: `hook` is the HHOOK returned by SetWindowsHookExW for this
+    // thread, or it was already taken. UnhookWindowsHookEx releases it.
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx(hook);
+    }
+}
+
+type SetSubclassFn = unsafe extern "system" fn(
+    windows_sys::Win32::Foundation::HWND,
+    windows_sys::Win32::UI::Shell::SUBCLASSPROC,
+    usize,
+    usize,
+) -> i32;
+type DefSubclassFn = unsafe extern "system" fn(
+    windows_sys::Win32::Foundation::HWND,
+    u32,
+    windows_sys::Win32::Foundation::WPARAM,
+    windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::LRESULT;
+type RemoveSubclassFn = unsafe extern "system" fn(
+    windows_sys::Win32::Foundation::HWND,
+    windows_sys::Win32::UI::Shell::SUBCLASSPROC,
+    usize,
+) -> i32;
+
+struct ComctlFns {
+    set: SetSubclassFn,
+    def: DefSubclassFn,
+    remove: RemoveSubclassFn,
+}
+
+fn comctl_fns() -> Option<&'static ComctlFns> {
+    use std::sync::OnceLock;
+    static FNS: OnceLock<Option<ComctlFns>> = OnceLock::new();
+    FNS.get_or_init(load_comctl).as_ref()
+}
+
+fn load_comctl() -> Option<ComctlFns> {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
+    let wide: Vec<u16> = "comctl32.dll"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: the path is a null-terminated UTF-16 string. SEARCH_SYSTEM32
+    // refuses a comctl32 planted next to the executable. The module stays
+    // loaded: the subclass pointers need it for the process lifetime.
+    let lib = unsafe {
+        LoadLibraryExW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    };
+    if lib.is_null() {
+        return None;
+    }
+    let proc_of = |name: &[u8]| {
+        // SAFETY: `name` is a null-terminated ANSI export. The pointer is
+        // null or that export in the System32 module.
+        unsafe { GetProcAddress(lib, name.as_ptr()) }
+    };
+    let set = proc_of(b"SetWindowSubclass\0")?;
+    let def = proc_of(b"DefSubclassProc\0")?;
+    let remove = proc_of(b"RemoveWindowSubclass\0")?;
+    // SAFETY: each name is the export of that exact ABI. A function
+    // pointer is the same size as every other function pointer.
+    let (set, def, remove) = unsafe {
+        (
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, SetSubclassFn>(set),
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, DefSubclassFn>(def),
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, RemoveSubclassFn>(remove),
+        )
+    };
+    Some(ComctlFns { set, def, remove })
+}
+
+fn try_set_window_subclass(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
+    let Some(api) = comctl_fns() else {
+        return false;
+    };
+    // SAFETY: hwnd is this window's live handle. The procedure and id are
+    // the pair RemoveWindowSubclass uses on WM_NCDESTROY.
+    unsafe { (api.set)(hwnd, Some(a11y_subclass_proc), A11Y_SUBCLASS_ID, 0) != 0 }
+}
+
 fn run(startup: Startup) -> Result<(), String> {
     harden_dll_search();
     if let Ok(exe) = std::env::current_exe() {
@@ -8227,9 +8433,9 @@ fn run(startup: Startup) -> Result<(), String> {
             // SAFETY: winit's msg hook is handed a pointer to the MSG being
             // dispatched, valid for the duration of the callback. It is only read.
             let m = unsafe { &*(msg as *const MSG) };
-            if a11y::message_triggers_reread(m.message) {
-                A11Y_DIRTY.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+            // WM_SETTINGCHANGE, WM_SYSCOLORCHANGE and WM_THEMECHANGED are
+            // sent, not posted, so this hook never observes them. The
+            // window subclass does.
             if m.message == WM_HOTKEY && m.wParam == QUAKE_ID {
                 QUAKE_HIT.store(true, std::sync::atomic::Ordering::Relaxed);
                 return true; // consumed
@@ -8404,6 +8610,44 @@ mod tests {
 
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn subclass_proc_sets_the_dirty_flag_for_each_live_message() {
+        for msg in [
+            a11y::WM_SETTINGCHANGE,
+            a11y::WM_SYSCOLORCHANGE,
+            a11y::WM_THEMECHANGED,
+        ] {
+            A11Y_DIRTY.store(false, std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: a null hwnd is the test's stand-in. The procedure
+            // records the message and returns without calling DefSubclassProc.
+            unsafe {
+                a11y_subclass_proc(std::ptr::null_mut(), msg, 0, 0, 0, 0);
+            }
+            assert!(
+                A11Y_DIRTY.swap(false, std::sync::atomic::Ordering::Relaxed),
+                "{msg:#x} did not ask for a re-read"
+            );
+        }
+        A11Y_DIRTY.store(false, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: a null hwnd returns before DefSubclassProc. WM_PAINT is
+        // not a settings message, so the dirty bit stays clear.
+        unsafe {
+            a11y_subclass_proc(std::ptr::null_mut(), 0x000F, 0, 0, 0, 0);
+        }
+        assert!(!A11Y_DIRTY.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn the_window_installs_the_accessibility_watch() {
+        let src = include_str!("main.rs");
+        let head = src.split_once("mod tests").expect("test module").0;
+        let needle = concat!("install_a11y", "_watch(h);");
+        assert!(
+            head.contains(needle),
+            "the window never installs the accessibility watch"
+        );
+    }
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
