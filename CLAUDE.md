@@ -33,7 +33,7 @@ selection and BiDi paths must do.
 | `localpath.rs` | no-follow walk: is a drive path local in every component, links read but not followed (link probe, new-tab cwd) |
 | `mru.rs` | most-recently-used tab order for Ctrl+Tab, walkable within one group |
 | `shells.rs` | installed-shell detection (ported from EasyTer's `profiles.py`) |
-| `cli.rs` | argv: `#45`'s `-d`/`--cwd`, plus profile, `--` command, `--elevated`, handoff, help, version |
+| `cli.rs` | argv: `#45`'s `-d`/`--cwd`, plus profile, `--` command, `--maximized`, `--elevated`, handoff, help, version |
 | `context_menu.rs` | per-user Explorer "Open Bayan here" (HKCU only, behind `RegistryStore`) |
 | `elevate.rs` | `--elevated` → `ShellExecuteW` verb `runas` only; argv is `--elevated` and optional `-p <name>` |
 | `jumplist.rs` | taskbar Jump List (`ICustomDestinationList`) and the explicit AppUserModelID |
@@ -54,7 +54,7 @@ selection and BiDi paths must do.
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-845 tests across the tree. `render.rs` (105), `term.rs` (100) and `link.rs`
+852 tests across the tree. `render.rs` (105), `term.rs` (102) and `link.rs`
 (66) carry the most; `lua_host.rs` has 46, `shellint.rs` 24, `images.rs` and
 `localpath.rs` 21 each, `mux.rs` 15, `config_watch.rs` 14, `screen_reader.rs`
 11 and `ssh.rs` 7. Three more in `term.rs` are `#[ignore]`d probes, run by

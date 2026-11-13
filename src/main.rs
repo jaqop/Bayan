@@ -210,6 +210,115 @@ fn find_match<T: alacritty_terminal::event::EventListener>(
     find_match_mode(t, query, hl, dir, false)
 }
 
+/// Hits are counted up to this many; past it the bar shows `1000+`. The
+/// walk holds the terminal lock, so it must end on a full scrollback of
+/// one-character hits.
+const SEARCH_COUNT_CAP: usize = 1000;
+
+/// Where the current hit sits among all hits, top of the scrollback first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SearchCount {
+    /// 1-based position of the current hit. `None` when there is no current
+    /// hit or it lies past the cap.
+    at: Option<usize>,
+    total: usize,
+    /// The walk stopped at `SEARCH_COUNT_CAP`; `total` is a floor.
+    capped: bool,
+}
+
+/// What the bar shows after the query. Filled by Enter; typing clears it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum SearchStatus {
+    /// Nothing searched yet for this query.
+    #[default]
+    Idle,
+    Counted(SearchCount),
+    /// Regex mode and the query does not compile.
+    BadPattern,
+}
+
+/// Count the hits of `query` over the whole scrollback, literal or regex
+/// as [`find_match_mode`] reads it. `None` is a pattern that does not compile.
+fn count_matches<T>(
+    t: &alacritty_terminal::term::Term<T>,
+    query: &str,
+    hl: &Option<Match>,
+    regex: bool,
+) -> Option<SearchCount> {
+    use alacritty_terminal::term::search::RegexIter;
+    let pattern = if regex {
+        query.to_string()
+    } else {
+        term::regex_escape(query)
+    };
+    let mut rs = RegexSearch::new(&pattern).ok()?;
+    let start = Point::new(Line(-(t.grid().history_size() as i32)), Column(0));
+    let end = Point::new(
+        Line(t.screen_lines() as i32 - 1),
+        Column(t.columns().saturating_sub(1)),
+    );
+    let mut count = SearchCount {
+        at: None,
+        total: 0,
+        capped: false,
+    };
+    let mut last: Option<Point> = None;
+    for m in RegexIter::new(start, end, Direction::Right, t, &mut rs) {
+        // the iterator steps with wrapping arithmetic: a start that does
+        // not advance means it came back around
+        if last.is_some_and(|p| *m.start() <= p) {
+            break;
+        }
+        if count.total == SEARCH_COUNT_CAP {
+            count.capped = true;
+            break;
+        }
+        last = Some(*m.start());
+        count.total += 1;
+        if hl.as_ref().is_some_and(|h| h.start() == m.start()) {
+            count.at = Some(count.total);
+        }
+    }
+    Some(count)
+}
+
+/// The count as it follows the query in the bar: `  2/17`, `  1000+`,
+/// no matches, or an invalid pattern. Empty before the first Enter.
+fn search_tail(status: SearchStatus) -> String {
+    match status {
+        SearchStatus::Idle => String::new(),
+        SearchStatus::BadPattern => format!("  {}", tr("تعبير غير صالح", "invalid pattern")),
+        SearchStatus::Counted(c) if c.total == 0 => {
+            format!("  {}", tr("لا نتائج", "no matches"))
+        }
+        SearchStatus::Counted(c) => {
+            let plus = if c.capped { "+" } else { "" };
+            match c.at {
+                Some(at) => format!("  {at}/{}{plus}", c.total),
+                None => format!("  {}{plus}", c.total),
+            }
+        }
+    }
+}
+
+/// Argv for the process Ctrl+Shift+N starts. An elevated window keeps the
+/// elevation rule: its child is told `--elevated` and nothing else, and
+/// being elevated already it starts without a second UAC prompt.
+fn new_window_args(elevated: bool) -> [&'static str; 1] {
+    if elevated {
+        ["--elevated"]
+    } else {
+        ["--new-window"]
+    }
+}
+
+/// The command a duplicated tab starts: the focused pane's own. `None`
+/// (a pane that lives in the mux server, or one with no recorded command)
+/// falls back to the shell a new tab would get.
+fn duplicate_command(pane_command: &str, in_mux: bool) -> Option<String> {
+    (!in_mux && !pane_command.trim().is_empty()).then(|| pane_command.to_string())
+}
+
 fn find_match_mode<T: alacritty_terminal::event::EventListener>(
     t: &mut alacritty_terminal::term::Term<T>,
     query: &str,
@@ -1018,10 +1127,12 @@ struct SearchState {
     /// A seeded selection searches the exact source cells while the field
     /// shows readable logical Arabic. Editing returns to ordinary search.
     selected_needle: Option<String>,
+    status: SearchStatus,
 }
 
 impl SearchState {
     fn push(&mut self, text: &str) {
+        self.status = SearchStatus::Idle;
         let room = 4096usize.saturating_sub(self.query.chars().count());
         self.query
             .extend(text.chars().filter(|c| !c.is_control()).take(room));
@@ -1036,6 +1147,7 @@ impl SearchState {
             hl: None,
             selected_needle,
             regex: false,
+            status: SearchStatus::Idle,
         }
     }
 }
@@ -1810,6 +1922,8 @@ struct App {
     /// Resolved `-p` command line for that same tab. `None` keeps the
     /// configured shell. Ignored when `start_command` is set.
     start_profile_command: Option<String>,
+    /// `--maximized`: the first window opens maximized over any saved size.
+    start_maximized: bool,
     /// argv after `--`. When set, that program is the tab's process.
     start_command: Option<Vec<String>>,
     /// This process token is elevated. Session restore and `config.shell`
@@ -2024,6 +2138,7 @@ impl App {
             debug_paste: None,
             start_dir,
             start_profile_command: None,
+            start_maximized: false,
             start_command: None,
             elevated: false,
             #[cfg(test)]
@@ -2912,6 +3027,77 @@ impl App {
             CopyClean => {
                 self.copy_selection_clean();
             }
+            Fullscreen => self.toggle_fullscreen(),
+            ClearScrollback => self.clear_scrollback(),
+            ResetTerminal => {
+                if let Some(s) = self.session_mut() {
+                    s.reset_modes();
+                }
+                // a drag the program was tracking has no program side now
+                self.abandon_mouse();
+                self.request_redraw();
+            }
+            NewWindow => self.open_new_window(),
+            DuplicateTab => {
+                let Some((cwd, command)) = self.tabs.get(self.active).and_then(|tab| {
+                    let pane = tab.panes.get(tab.focused)?;
+                    let cwd = pane.session.meta.lock_or_recover().spawn_cwd();
+                    Some((cwd, duplicate_command(&pane.command, pane.mux.is_some())))
+                }) else {
+                    return;
+                };
+                // the pane's own command line, the one a restored session
+                // starts it with; a mux pane lives in the server, so its
+                // copy is an ordinary new tab
+                let command = command.unwrap_or_else(|| self.spawn_shell());
+                self.spawn_tab_command(cwd, &command, None);
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// F11. Borderless on the monitor the window is on; the same key
+    /// returns to the rectangle it had.
+    fn toggle_fullscreen(&mut self) {
+        if let Some(w) = &self.window {
+            let on = w.fullscreen().is_some();
+            w.set_fullscreen((!on).then_some(winit::window::Fullscreen::Borderless(None)));
+        }
+        // a divider or selection drag was measured against the old size
+        self.abandon_mouse();
+        self.drag_divider = None;
+        self.request_redraw();
+    }
+
+    fn clear_scrollback(&mut self) {
+        if let Some(id) = self.focused_pane_id() {
+            self.drop_smooth(id);
+        }
+        if let Some(s) = self.session_mut() {
+            s.clear_scrollback();
+        }
+        // a hit in the cleared lines is gone, and so is its count
+        if let Some(st) = self.search.as_mut() {
+            st.hl = None;
+            st.status = SearchStatus::Idle;
+        }
+        self.invalidate_focused_links();
+        self.request_redraw();
+    }
+
+    /// Ctrl+Shift+N: a second Bayan process. It is the jump list's
+    /// "New window" launch; an elevated window opens an elevated one.
+    fn open_new_window(&mut self) {
+        let started = std::env::current_exe().and_then(|exe| {
+            std::process::Command::new(exe)
+                .args(new_window_args(self.elevated))
+                .spawn()
+        });
+        if let Err(error) = started {
+            self.report_error(
+                tr("تعذر فتح نافذة جديدة", "Could not open a new window"),
+                &error.to_string(),
+            );
         }
     }
 
@@ -4395,7 +4581,8 @@ impl App {
     /// (moved or resized by the user, not maximized).
     fn track_geometry(&mut self) {
         let Some(w) = &self.window else { return };
-        if w.is_maximized() || w.is_minimized().unwrap_or(false) {
+        // full screen is not a rectangle to come back to either
+        if w.is_maximized() || w.is_minimized().unwrap_or(false) || w.fullscreen().is_some() {
             return;
         }
         let (Ok(pos), size) = (w.outer_position(), w.inner_size()) else {
@@ -6395,7 +6582,7 @@ impl App {
         let Some(session) = self.session() else {
             return;
         };
-        let found = {
+        let (found, status) = {
             let mut t = session.term.lock();
             let hl = self.search.as_ref().and_then(|s| s.hl.clone());
             let regex = self.search.as_ref().is_some_and(|s| s.regex);
@@ -6411,7 +6598,12 @@ impl App {
                     .clamp(0, t.grid().history_size() as i32);
                 t.scroll_display(Scroll::Delta(want - cur));
             }
-            m
+            // count against the hit just found, so the bar reads 2/17
+            let status = match count_matches(&t, &query, &m, regex) {
+                Some(c) => SearchStatus::Counted(c),
+                None => SearchStatus::BadPattern,
+            };
+            (m, status)
         };
         if let Some(id) = self.focused_pane_id() {
             self.drop_smooth(id);
@@ -6419,6 +6611,7 @@ impl App {
         self.invalidate_focused_links();
         if let Some(st) = self.search.as_mut() {
             st.hl = found;
+            st.status = status;
         }
         self.request_redraw();
     }
@@ -6452,6 +6645,7 @@ impl App {
                     st.query.pop();
                     st.hl = None;
                     st.selected_needle = None;
+                    st.status = SearchStatus::Idle;
                 }
             }
             _ => {
@@ -6776,10 +6970,16 @@ impl App {
                     &tab_infos,
                     bar_text(self.search.as_ref().map(|s| s.query.as_str()), focused_copy)
                         .map(|text| {
+                            // the count follows the query: `بحث: x_  2/17`
+                            let tail = self
+                                .search
+                                .as_ref()
+                                .map(|s| search_tail(s.status))
+                                .unwrap_or_default();
                             if self.search.as_ref().is_some_and(|s| s.regex) {
-                                format!("[.*] {text}")
+                                format!("[.*] {text}{tail}")
                             } else {
-                                text
+                                format!("{text}{tail}")
                             }
                         })
                         .as_deref(),
@@ -7122,6 +7322,11 @@ impl ApplicationHandler<UserEvent> for App {
                     ..g
                 });
             }
+        }
+        // `--maximized` wins over the saved state. `normal_geom` above is
+        // untouched, so "restore down" still lands on yesterday's rectangle.
+        if self.start_maximized {
+            attrs = attrs.with_maximized(true);
         }
         let window = match el.create_window(attrs) {
             Ok(window) => Arc::new(window),
@@ -7768,6 +7973,7 @@ struct Startup {
     /// detect a second time.
     shells: Option<Vec<shells::Shell>>,
     elevated: bool,
+    maximized: bool,
 }
 
 fn main() -> std::process::ExitCode {
@@ -7885,6 +8091,7 @@ fn dispatch() -> Result<(), String> {
                 command: if elevated { None } else { launch.command },
                 shells,
                 elevated,
+                maximized: launch.maximized,
             })
         }
     }
@@ -8029,6 +8236,7 @@ fn run(startup: Startup) -> Result<(), String> {
     app.shell_profiles = startup.shells.unwrap_or_default();
     app.shell_profiles_ready = shells_ready;
     app.start_profile_command = startup.profile_command;
+    app.start_maximized = startup.maximized;
     app.start_command = startup.command;
     app.elevated = startup.elevated;
     // App::new starts neutral so a test never reads the machine's High
@@ -9312,6 +9520,95 @@ mod tests {
         );
         assert_eq!(t.selection_to_string(), before);
         assert!(!text.contains('\x1b'));
+    }
+
+    /// The bar's count on a real Term: literal and regex, the position of
+    /// the current hit, and a pattern that does not compile.
+    #[test]
+    fn the_hit_count_follows_the_mode_and_the_current_hit() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let size = TermSize { cols: 40, rows: 6 };
+        let mut t = Term::new(Config::default(), &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        for line in ["error 404 here", "ok", "error 500 there", "a.b", "axb"] {
+            p.advance(&mut t, line.as_bytes());
+            p.advance(&mut t, b"\r\n");
+        }
+
+        let m = find_match_mode(&mut t, "error [0-9]+", &None, Direction::Left, true)
+            .expect("regex hit");
+        assert_eq!(m.start().line.0, 2, "Enter finds the lower hit first");
+        let c = count_matches(&t, "error [0-9]+", &Some(m), true).unwrap();
+        assert_eq!((c.at, c.total, c.capped), (Some(2), 2, false));
+        let none = count_matches(&t, "error [0-9]+", &None, true).unwrap();
+        assert_eq!((none.at, none.total), (None, 2));
+
+        // the same text is one literal hit and two regex hits
+        assert_eq!(count_matches(&t, "a.b", &None, false).unwrap().total, 1);
+        assert_eq!(count_matches(&t, "a.b", &None, true).unwrap().total, 2);
+        assert_eq!(count_matches(&t, "absent", &None, false).unwrap().total, 0);
+
+        // an unclosed group is a literal hit count of zero and a bad regex
+        assert_eq!(count_matches(&t, "error (", &None, false).unwrap().total, 0);
+        assert!(count_matches(&t, "error (", &None, true).is_none());
+    }
+
+    /// A screen of one-character hits stops at the cap and says so.
+    #[test]
+    fn the_hit_count_stops_at_the_cap() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let size = TermSize { cols: 80, rows: 30 };
+        let mut t = Term::new(Config::default(), &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        for _ in 0..29 {
+            p.advance(&mut t, "x ".repeat(39).as_bytes());
+            p.advance(&mut t, b"\r\n");
+        }
+        let c = count_matches(&t, "x", &None, false).unwrap();
+        assert_eq!((c.total, c.capped), (SEARCH_COUNT_CAP, true));
+        let few = count_matches(&t, &"x ".repeat(20), &None, false).unwrap();
+        assert!(!few.capped && few.total > 0);
+    }
+
+    #[test]
+    fn the_search_bar_tail_names_the_count() {
+        let c = |at, total, capped| SearchStatus::Counted(SearchCount { at, total, capped });
+        lang::set(lang::Lang::En); // thread-local under cfg(test)
+        assert_eq!(search_tail(SearchStatus::Idle), "");
+        assert_eq!(search_tail(c(Some(2), 17, false)), "  2/17");
+        assert_eq!(search_tail(c(None, 1000, true)), "  1000+");
+        assert_eq!(search_tail(c(None, 0, false)), "  no matches");
+        assert_eq!(search_tail(SearchStatus::BadPattern), "  invalid pattern");
+        lang::set(lang::Lang::Ar);
+        assert_eq!(search_tail(c(None, 0, false)), "  لا نتائج");
+    }
+
+    #[test]
+    fn a_new_window_keeps_the_elevation_rule_and_a_copy_keeps_its_shell() {
+        assert_eq!(new_window_args(false), ["--new-window"]);
+        assert_eq!(new_window_args(true), ["--elevated"]);
+        // both are launches the parser accepts, and neither carries a
+        // folder, a profile or a command
+        for elevated in [false, true] {
+            let cli::CliAction::Launch(launch) = cli::parse(new_window_args(elevated)).unwrap()
+            else {
+                panic!("not a launch");
+            };
+            assert_eq!(launch.elevated, elevated);
+            assert!(launch.directory.is_none() && launch.command.is_none());
+        }
+        assert_eq!(
+            duplicate_command("cmd.exe", false).as_deref(),
+            Some("cmd.exe")
+        );
+        assert_eq!(duplicate_command("cmd.exe", true), None, "a mux pane");
+        assert_eq!(duplicate_command("  ", false), None);
     }
 
     /// A background tab's shell exiting must not move focus to a different

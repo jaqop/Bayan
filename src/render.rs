@@ -10834,12 +10834,18 @@ mod cache_tests {
         assert_eq!(lay.rows.len(), n);
         let (cx, cy, cw, ch) = lay.card;
         assert!(cx > 0 && cy > 0 && cx + cw <= 1400 && cy + ch <= 900);
-        let mut last_bottom = 0;
-        for &(rx, ry, rw, rh) in &lay.rows {
+        // 30 actions take two columns at this height, so "no overlap" is
+        // checked between every pair, not as one stack
+        for (i, &(rx, ry, rw, rh)) in lay.rows.iter().enumerate() {
             assert!(rx >= cx && rx + rw <= cx + cw && ry >= cy && ry + rh <= cy + ch);
-            assert!(ry >= last_bottom, "rows must stack without overlap");
-            last_bottom = ry + rh;
+            for &(ox, oy, ow, oh) in &lay.rows[..i] {
+                let apart = rx >= ox + ow || ox >= rx + rw || ry >= oy + oh || oy >= ry + rh;
+                assert!(apart, "strips must not overlap");
+            }
         }
+        // a window tall enough keeps one column, stacked in order
+        let tall = r.shortcuts_layout(1400, 2000, n);
+        assert!(tall.rows.windows(2).all(|p| p[1].1 >= p[0].1 + p[0].3));
         // the settings panel's header button exists and sits inside ITS card
         let slay = r.settings_layout(1400, 900);
         let (bx, by, bw, bh) = slay.shortcuts_btn;
