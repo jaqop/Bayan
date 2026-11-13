@@ -1293,7 +1293,7 @@ fn shell_menu_rows(profiles: &[shells::Shell], default: &str) -> Vec<(PaletteRow
             .map(|s| (s.label(), s.command.clone()))
             .collect()
     };
-    listed
+    let mut rows: Vec<_> = listed
         .into_iter()
         .map(|(name, command)| {
             let label = if command == default {
@@ -1303,7 +1303,9 @@ fn shell_menu_rows(profiles: &[shells::Shell], default: &str) -> Vec<(PaletteRow
             };
             (PaletteRow::Shell(command), label)
         })
-        .collect()
+        .collect();
+    rows.push((PaletteRow::OpenSsh, ssh::label_open().to_string()));
+    rows
 }
 
 /// The Arabic-font cycler's step: the ring is Auto (`None`), then each of
@@ -5261,6 +5263,9 @@ impl App {
         } else {
             row as usize
         };
+        if let Some((source_row, col, side)) = r.flow_hit(rect, geom_row, pos.x) {
+            return Some((hit.pane, source_row as i32, col, side));
+        }
         if let Some((col, side)) = r.hit_cell(rect, geom_row, pos.x) {
             return Some((hit.pane, row, col, side));
         }
@@ -5396,6 +5401,14 @@ impl App {
         } else {
             row as usize
         };
+        if let Some(rect) = rects.get(hit.pane) {
+            if let Some(r) = self.renderer.as_mut() {
+                r.warm_row_ink(*rect, geom_row);
+                if let Some((source_row, col, _)) = r.flow_hit(*rect, geom_row, pos.x) {
+                    return Some((pane_id, source_row as i32, col));
+                }
+            }
+        }
         if row < 0 {
             let (cols, alt, history, off, cells) = {
                 let t = self.tabs[self.active].panes[hit.pane].session.term.lock();
@@ -10206,13 +10219,14 @@ mod m38_tests {
             },
         ];
         let rows = shell_menu_rows(&detected, "cmd.exe");
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.len(), 5);
         assert!(rows[2].0 == PaletteRow::Shell(detected[2].command.clone()));
         assert_eq!(rows[1].1, "Command Prompt · الافتراضية");
         assert_eq!(rows[3].1, "WSL · Ubuntu");
         // detection has not reported yet: PowerShell and cmd stand in
         let early = shell_menu_rows(&[], "powershell.exe");
-        assert_eq!(early.len(), 2);
+        assert_eq!(early.len(), 3);
+        assert!(early[2].0 == PaletteRow::OpenSsh);
         assert!(early[1].0 == PaletteRow::Shell("cmd.exe".into()));
         assert_eq!(early[0].1, "PowerShell · الافتراضية");
     }

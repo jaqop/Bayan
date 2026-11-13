@@ -928,6 +928,7 @@ impl App {
                         }
                     }
                     Some(TabControl::NewTab) => self.perform_action(keybinds::Action::NewTab, el),
+                    Some(TabControl::ShellMenu) => self.open_shell_menu(),
                     None => {}
                 }
                 self.request_redraw();

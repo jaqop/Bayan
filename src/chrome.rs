@@ -143,6 +143,7 @@ impl Caption {
 pub(crate) enum TabControl {
     Switch(usize),
     NewTab,
+    ShellMenu,
 }
 
 pub(crate) fn tab_control(control: usize, active: usize, tabs: usize) -> Option<TabControl> {
@@ -150,6 +151,7 @@ pub(crate) fn tab_control(control: usize, active: usize, tabs: usize) -> Option<
         0 if active > 0 => Some(TabControl::Switch(active - 1)),
         1 if active + 1 < tabs => Some(TabControl::Switch(active + 1)),
         2 => Some(TabControl::NewTab),
+        3 => Some(TabControl::ShellMenu),
         _ => None,
     }
 }
@@ -770,7 +772,8 @@ mod tests {
         assert_eq!(tab_control(1, 2, 3), None);
         assert_eq!(tab_control(1, 0, 3), Some(TabControl::Switch(1)));
         assert_eq!(tab_control(2, 0, 1), Some(TabControl::NewTab));
-        assert_eq!(tab_control(3, 0, 1), None);
+        assert_eq!(tab_control(3, 0, 1), Some(TabControl::ShellMenu));
+        assert_eq!(tab_control(4, 0, 1), None);
     }
 
     #[test]
