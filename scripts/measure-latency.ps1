@@ -1,6 +1,10 @@
 <#
 Key-to-frame latency through the real key path.
 
+Local only: SendInput needs the foreground, which a hosted runner does not
+keep. CI uses scripts/measure-tap-latency.ps1 (`BAYAN_TAP`), which calls
+keyroute::type_key inside the process.
+
 Needs a build with dev hooks, so BAYAN_PROFILE is honoured:
     cargo build --release --features dev-hooks
 

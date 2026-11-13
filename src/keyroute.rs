@@ -13,7 +13,8 @@ use alacritty_terminal::term::TermMode;
 use std::time::Instant;
 use winit::event::{ElementState, Ime, KeyEvent};
 use winit::event_loop::ActiveEventLoop;
-use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, KeyLocation, NamedKey, PhysicalKey};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 
 use crate::input::zoomed;
 use crate::{copymode, key_letter, keybinds, keyboard_zoom, link, App};
@@ -229,6 +230,32 @@ pub(crate) fn is_plain_ctrl_c(letter: Option<char>, shift: bool, alt: bool) -> b
     !shift && !alt && letter == Some('c')
 }
 
+/// A press reduced to what the encoder and `type_key` actually read.
+/// winit 0.30's `KeyEvent` cannot be built outside that crate (its
+/// platform fields are private), so `BAYAN_TAP` builds one of these and
+/// the real key path converts into the same shape.
+pub(crate) struct RoutedKey<'a> {
+    pub logical: &'a Key,
+    pub unmod: &'a Key,
+    pub physical: PhysicalKey,
+    pub location: KeyLocation,
+    pub text: Option<&'a str>,
+    pub repeat: bool,
+}
+
+impl<'a> RoutedKey<'a> {
+    pub(crate) fn from_event(event: &'a KeyEvent, unmod: &'a Key) -> Self {
+        Self {
+            logical: &event.logical_key,
+            unmod,
+            physical: event.physical_key,
+            location: event.location,
+            text: event.text.as_deref(),
+            repeat: event.repeat,
+        }
+    }
+}
+
 /// Shift+PageUp pages back through the scrollback, Shift+PageDown forward.
 pub(crate) fn page_direction(key: &Key) -> Option<i32> {
     match key {
@@ -391,7 +418,8 @@ impl App {
                 return;
             }
         }
-        self.type_key(event, arrived);
+        let unmod = event.key_without_modifiers();
+        self.type_key(RoutedKey::from_event(event, &unmod), arrived);
     }
 
     fn overlay_key(
@@ -663,8 +691,10 @@ impl App {
     /// logical char is "ؤ"). A child that pushed kitty flags gets CSI u
     /// instead, from the same call.
     /// `arrived`: when winit delivered the key, for `BAYAN_PROFILE` latency.
-    fn type_key(&mut self, event: &KeyEvent, arrived: Instant) {
-        let Some(bytes) = self.encode_key_event(event, false) else {
+    /// `BAYAN_TAP` calls this with the same `arrived` a winit press uses
+    /// (`Instant::now()` at the call), not a PTY write that skips `key_sent`.
+    pub(crate) fn type_key(&mut self, event: RoutedKey<'_>, arrived: Instant) {
+        let Some(bytes) = self.encode_routed(&event, false, self.term_mode()) else {
             return;
         };
         // typing snaps to the bottom and clears any selection; it also
@@ -672,12 +702,12 @@ impl App {
         self.last_input = Instant::now();
         // The press reached the encoder. Drop it from the swallowed set
         // before borrowing the session.
-        self.take_held_away(event);
+        self.take_held_away_key(event.physical);
         // Broadcast: every other pane of the tab gets the key too, encoded
         // for its own modes, and snaps to its bottom like the focused one.
         for pi in self.broadcast_targets() {
             let mode = *self.tabs[self.active].panes[pi].session.term.lock().mode();
-            let Some(other) = self.encode_key_event_for(event, false, mode) else {
+            let Some(other) = self.encode_routed(&event, false, mode) else {
                 continue;
             };
             let id = self.tabs[self.active].panes[pi].id;
@@ -703,6 +733,39 @@ impl App {
             crate::prof::key_sent(arrived);
         }
         self.invalidate_focused_links();
+    }
+
+    /// `BAYAN_TAP` entry. `a` then Backspace, through [`Self::type_key`],
+    /// timed from this call the way a winit press is timed from `key_pressed`.
+    pub(crate) fn tap_key(&mut self, backspace: bool) {
+        let arrived = Instant::now();
+        if backspace {
+            let logical = Key::Named(NamedKey::Backspace);
+            self.type_key(
+                RoutedKey {
+                    logical: &logical,
+                    unmod: &logical,
+                    physical: PhysicalKey::Code(KeyCode::Backspace),
+                    location: KeyLocation::Standard,
+                    text: None,
+                    repeat: false,
+                },
+                arrived,
+            );
+        } else {
+            let logical = Key::Character("a".into());
+            self.type_key(
+                RoutedKey {
+                    logical: &logical,
+                    unmod: &logical,
+                    physical: PhysicalKey::Code(KeyCode::KeyA),
+                    location: KeyLocation::Standard,
+                    text: Some("a"),
+                    repeat: false,
+                },
+                arrived,
+            );
+        }
     }
 
     /// Key-up is invisible until the child asks for event types. Presses
