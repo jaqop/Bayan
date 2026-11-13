@@ -26,6 +26,7 @@ STARTUP = """
      40.0 ms  latency key->pty-output 0.5 ms, key->frame 1.4 ms
 --- startup run 2
 2026-11-13T13:50:01.1Z       0.3 ms  main start
+2026-11-13T13:50:01.2Z      99.7 ms  gpu ready
 2026-11-13T13:50:01.2Z     107.1 ms  first frame presented
 2026-11-13T13:50:01.3Z     138.4 ms  renderer ready
 """
@@ -77,8 +78,9 @@ class Gate(unittest.TestCase):
 
     def test_the_ratio_is_taken_within_one_start(self):
         got = perf_gate.parse(STARTUP)["startup_ratio"]
-        # run 1 has both marks (617.0 / 601.7); run 2 has no gpu mark
-        self.assertEqual(got, {"first frame / gpu ready": 1.025})
+        # the warm start (107.1 / 99.7), not the cold one (617.0 / 601.7 =
+        # 1.025), whose slow GPU bring-up would hide work added after it
+        self.assertEqual(got, {"first frame / gpu ready": 1.074})
         base = {"tolerances": {"startup_ratio": 0.15}, "startup_ratio": {"first frame / gpu ready": 1.08}}
         self.assertEqual(perf_gate.compare(base, {"startup_ratio": {"first frame / gpu ready": 1.2}}, 0.1)[0], [])
         late = perf_gate.compare(base, {"startup_ratio": {"first frame / gpu ready": 1.3}}, 0.1)[0]

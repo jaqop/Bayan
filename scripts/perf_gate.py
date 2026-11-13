@@ -16,8 +16,8 @@ concatenated) and compares them with perf/baseline.json:
       times slower). Hosted runners differ by almost a factor of two from
       one job to the next, so this group is a backstop with a wide
       tolerance: it catches hundreds of milliseconds, not tens.
-  startup_ratio: `first frame presented` over `gpu ready` within one start,
-      lowest of the runs. Both scale with the machine, so the ratio holds
+  startup_ratio: `first frame presented` over `gpu ready` within the fastest
+      start. Both scale with the machine, so the ratio holds
       from runner to runner; it rises when work lands between the GPU being
       ready and the first frame.
 
@@ -52,13 +52,16 @@ def parse(text):
         scrollback[lines] = min(float(mb), scrollback.get(lines, float("inf")))
     for ms, mark in STARTUP.findall(text):
         startup[mark] = min(float(ms), startup.get(mark, float("inf")))
-    # one start at a time: the ratio is between two marks of the same start
+    # The ratio is between two marks of the same start, and it is read from
+    # the fastest start. A cold start spends longer bringing the GPU up, so
+    # its ratio is lower and would hide work added after that point.
+    fastest = float("inf")
     for block in text.split("--- startup run")[1:]:
         marks = {mark: float(ms) for ms, mark in STARTUP.findall(block)}
         gpu, frame = marks.get("gpu ready"), marks.get("first frame presented")
-        if gpu and frame:
-            name = "first frame / gpu ready"
-            ratio[name] = min(round(frame / gpu, 3), ratio.get(name, float("inf")))
+        if gpu and frame and frame < fastest:
+            fastest = frame
+            ratio["first frame / gpu ready"] = round(frame / gpu, 3)
     return {
         "throughput": throughput,
         "scrollback": scrollback,
