@@ -1158,6 +1158,49 @@ only (there is no settings-panel row). Leave it out or set `"off"`.
 focused pane; no value enables a clipboard read. The decode backstop is
 64 KiB, and one scan sees about 48–51 KiB.
 
+### Search, export, and session identity
+
+`Ctrl+F` searches literal text. `Ctrl+Shift+F` opens regular-expression
+search, marked `[.*]`; Enter finds the previous match and Shift+Enter the
+next. An invalid expression clears the highlight. Pasting into either
+search field uses Ctrl+V and never sends the query to the shell. Queries
+are limited to 4096 characters.
+
+`Ctrl+Shift+S` exports the focused pane's retained scrollback and screen
+to a new UTF-8 file in `~/.bayan/exports/`. The notice shows its path.
+It preserves logical Arabic and soft-wrapped lines without moving the
+viewport or changing the selection. It contains text, not ANSI sequences
+or images. Export is explicit; this is not automatic disk session logging.
+
+Assign persistent colors by exact tab name (Ctrl+Shift+R renames a tab),
+SSH title, or folder title in config.json:
+
+```json
+{
+  "session_colors": { "production": "#fb1153", "staging": "#22aa44" },
+  "osc52_read": false
+}
+```
+
+The colored strip is separate from busy/progress indicators and never
+changes program output. Changes reload live. Windows High Contrast takes
+precedence. Pin a descriptive tab name when distinguishing hosts: a color
+is a visual reminder, not verification of the connected machine.
+
+Clipboard reads remain blocked, including when `osc52_read` is enabled.
+An experimental per-request consent path is preserved separately: the live
+inbox-ConPTY test did not carry the query or its reply to the program, so
+that experiment is not part of the adopted feature set.
+
+New panes advertise `TERM=xterm-256color` and `COLORTERM=truecolor`, using
+a common remote terminfo entry. SSH does not install files on a server.
+Use a remote tmux session for work that must survive an SSH/VPN disconnect;
+local splits alone do not provide that persistence.
+
+Bayan sends no usage telemetry. Local session state, explicit exports,
+and opt-in diagnostic measurements stay on this computer. SSH and programs
+the user runs retain their own network behavior.
+
 ## Inline images
 
 Sixel (`DCS q`), Kitty graphics (`APC _G`) and iTerm2 (`OSC 1337 ; File=`

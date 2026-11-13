@@ -812,6 +812,7 @@ fn push_shaped(
 /// One tab as the bar renders it.
 pub struct TabInfo {
     pub title: String,
+    pub color: Option<(u8, u8, u8)>,
     pub busy: bool,
     /// a pane in this background tab rang the bell (Claude asking for an
     /// approval): amber beats the green busy dot
@@ -5591,10 +5592,10 @@ impl Renderer {
         );
     }
 
-    /// Geometry of the shortcuts editor: one full-width clickable strip per
-    /// action row (draw + hit-test agree, like the settings panel).
+    /// Geometry of the shortcuts editor: clickable rows in one column, or
+    /// two when a wide, short window needs them. Draw and hit-test agree.
     pub fn shortcuts_layout(&self, fw: usize, fh: usize, n: usize) -> ShortcutsLayout {
-        let w = ((self.ui_cell_w() * 44.0) as i32).clamp(380, fw as i32 - 60);
+        let mut w = ((self.ui_cell_w() * 44.0) as i32).clamp(380, fw as i32 - 60);
         let head_h = (self.ui_cell_h() + 30.0) as i32;
         let foot_h = (self.ui_cell_h() + 30.0) as i32;
         let bar = self.tab_bar_h() as i32;
@@ -5602,12 +5603,21 @@ impl Renderer {
         // roomy row height (20 actions with tab groups), so rows tighten
         // to fit the window, down to a floor that still holds the keycaps.
         let roomy = (self.ui_cell_h() + 18.0) as i32;
-        // 22 actions (BiDi toggle included) still have to fit a 900px
-        // window. The floor stays tall enough for the keycap chips.
-        let tight = (self.ui_cell_h() + 8.0) as i32;
+        // Keep 25 actions on a 900px window without shrinking the text.
+        // Keycaps use the row's available height below.
+        let tight = (self.ui_cell_h() + 4.0) as i32;
         let room = fh as i32 - bar - 24 - head_h - 6 - foot_h;
-        let rowh = (room / (n as i32).max(1)).clamp(tight, roomy);
-        let h = head_h + 6 + rowh * n as i32 + foot_h;
+        let columns = if n as i32 * tight > room && fw >= 1000 {
+            2
+        } else {
+            1
+        };
+        if columns == 2 {
+            w = fw as i32 - 60;
+        }
+        let per_column = n.div_ceil(columns).max(1) as i32;
+        let rowh = (room / per_column).clamp(tight, roomy);
+        let h = head_h + 6 + rowh * per_column + foot_h;
         let x = (fw as i32 - w) / 2;
         // a third of the spare height above, but never past the bottom.
         // A registry that fills the window sits against the tab bar instead
@@ -5623,8 +5633,22 @@ impl Renderer {
             }
         };
         let rows_top = y + head_h + 6;
+        let column_w = w / columns as i32;
         let rows = (0..n as i32)
-            .map(|i| (x + 8, rows_top + rowh * i, w - 16, rowh))
+            .map(|i| {
+                let column = i / per_column;
+                let column = if crate::lang::rtl() {
+                    columns as i32 - 1 - column
+                } else {
+                    column
+                };
+                (
+                    x + column * column_w + 8,
+                    rows_top + rowh * (i % per_column),
+                    column_w - 16,
+                    rowh,
+                )
+            })
             .collect();
         ShortcutsLayout {
             card: (x, y, w, h),
@@ -5695,6 +5719,7 @@ impl Renderer {
 
         for (i, row) in rows.iter().enumerate() {
             let (rx, ry, rw, rh) = lay.rows[i];
+            let (x, w) = (rx - 8, rw + 16);
             let selected = i == sel;
             if selected {
                 // the accent bar hugs the reading edge: right in Arabic
@@ -5703,10 +5728,19 @@ impl Renderer {
                 push_rect(out, whole, bar_x, ry + 2, 3, rh - 4, c4(focus_c, 255));
             }
             // label at the reading edge
-            let lseg = [Seg::plain(
-                row.label.clone(),
-                if selected { fg_c } else { muted_c },
-            )];
+            let widths: Vec<i32> = row
+                .chord
+                .split('+')
+                .map(|t| self.measure(&[Seg::plain(t, fg_c)], false) as i32 + 14)
+                .collect();
+            let chips_width = widths.iter().sum::<i32>() + 6 * (widths.len() as i32 - 1).max(0);
+            let label_color = if selected { fg_c } else { muted_c };
+            let label = self.fit_title(
+                &row.label,
+                label_color,
+                (w - pad * 2 - chips_width - 24).max(0) as f32,
+            );
+            let lseg = [Seg::plain(label, label_color)];
             let lw = self.measure(&lseg, true);
             let label_x = crate::lang::lead_x(x, w, pad, lw.ceil() as i32) as f32;
             self.draw_run(&lseg, true, out, whole, label_x, ry + tc, 1.0);
@@ -5727,14 +5761,8 @@ impl Renderer {
                 // keycap chips, one per token: Ctrl / Shift / T. Measured
                 // first, so in English the row of chips can end at the
                 // right edge.
-                let ch = lay.rowh - 12;
-                let widths: Vec<i32> = row
-                    .chord
-                    .split('+')
-                    .map(|t| self.measure(&[Seg::plain(t, fg_c)], false) as i32 + 14)
-                    .collect();
-                let total = widths.iter().sum::<i32>() + 6 * (widths.len() as i32 - 1).max(0);
-                let start = crate::lang::trail_x(x, w, pad, total);
+                let ch = lay.rowh - 4;
+                let start = crate::lang::trail_x(x, w, pad, chips_width);
                 let mut cx = start;
                 let cy = ry + (lay.rowh - ch) / 2;
                 for token in row.chord.split('+') {
@@ -7126,6 +7154,17 @@ impl Renderer {
             let tx = x0 + gap / 2;
             let tabw = tw - gap;
             push_rect_top_rounded(out, whole, tx, TAB_TOP, tabw, oy - TAB_TOP - 4, c4(bg, 255));
+            if let Some(color) = tab.color.filter(|_| !self.high_contrast) {
+                push_rect(
+                    out,
+                    whole,
+                    tx + 4,
+                    oy - 8,
+                    (tabw - 8).max(0),
+                    3,
+                    c4(color, 255),
+                );
+            }
             if tab.active && tabw >= 12 {
                 // a hairline that hugs the curve — enough to mark focus without
                 // shouting; the background match already does most of the work
@@ -10448,6 +10487,7 @@ mod cache_tests {
         r.use_ui_metrics(true);
         let tabs = vec![TabInfo {
             title: "hi".into(),
+            color: None,
             busy: true,
             attention: true,
             active: true,
@@ -10805,6 +10845,48 @@ mod cache_tests {
         let (bx, by, bw, bh) = slay.shortcuts_btn;
         let (scx, scy, scw, sch) = slay.card;
         assert!(bx >= scx && bx + bw <= scx + scw && by >= scy && by + bh <= scy + sch);
+    }
+
+    #[test]
+    fn shortcuts_fit_the_default_window_with_all_workflow_actions() {
+        let r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let lay = r.shortcuts_layout(1100, 730, crate::keybinds::Action::ALL.len());
+        assert_eq!(lay.rows.len(), crate::keybinds::Action::ALL.len());
+        assert!(lay.card.1 + lay.card.3 <= 730);
+        for (i, &(x, y, w, h)) in lay.rows.iter().enumerate() {
+            assert!(x >= 0 && y >= 0 && x + w <= 1100 && y + h <= 730);
+            for &(a, b, c, d) in &lay.rows[..i] {
+                assert!(x + w <= a || a + c <= x || y + h <= b || b + d <= y);
+            }
+        }
+    }
+
+    #[test]
+    fn session_color_is_drawn_by_chrome_and_yields_to_high_contrast() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let tab = TabInfo {
+            title: "prod".into(),
+            color: Some((251, 17, 83)),
+            busy: false,
+            attention: false,
+            active: true,
+            progress: None,
+        };
+        let mut out = Vec::new();
+        r.draw_chrome(
+            &mut out,
+            1400,
+            900,
+            std::slice::from_ref(&tab),
+            None,
+            false,
+            None,
+        );
+        assert!(out.iter().any(|v| vertex_rgb(v.color) == (251, 17, 83)));
+        r.high_contrast = true;
+        out.clear();
+        r.draw_chrome(&mut out, 1400, 900, &[tab], None, false, None);
+        assert!(!out.iter().any(|v| vertex_rgb(v.color) == (251, 17, 83)));
     }
 
     /// The settings gear button hit-test: a click on it registers, a click
@@ -11250,6 +11332,7 @@ mod cache_tests {
         let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
         let tab = |p: Option<Progress>| TabInfo {
             title: "claude".into(),
+            color: None,
             busy: false,
             attention: false,
             active: true,
