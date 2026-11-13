@@ -59,6 +59,7 @@ manual totals in this file. Explicit native host probes and measurement
 probes are ignored by the default suite; see their annotations and Measuring.
 
 
+
 ## Measuring
 
 Measure before optimizing, in release builds:
@@ -218,10 +219,26 @@ give cmd the nonce in any form. `git-bash.exe`, `bash -c`, and
 `BAYAN_PROMPT_NONCE` and is unset before a child inherits it. Do not write
 the user's rc files. An elevated token must not source `~/.bashrc`,
 `~/.bash_profile`, `~/.inputrc`, or the zsh home files: set `INPUTRC` and
-`HISTFILE` to `/dev/null`. Elevated Git Bash is `--noprofile` and must
-not source `/etc/profile` (its `git-prompt.sh` runs user files); set
-`PATH` and `MSYSTEM` from the bash install. Elevated WSL bash still reads the
-distro profile with `HOME` pointed at the rcfile directory. A failed
+`HISTFILE` to `/dev/null`. Elevated Git Bash passes `--noprofile` before
+`-i` and must not source `/etc/profile` (its `git-prompt.sh` runs user
+files). Login or not, the rcfile restores `HOME` from `BAYAN_SI_HOME`
+with `/usr/bin/cygpath` and then unsets that variable. `PATH` and
+`MSYSTEM` come from `/ucrt64` before `/mingw64`. Do not
+replace `PS1`: the system prompt (cwd, branch, window title) stays, and
+the OSC mark is appended. Elevated WSL bash still reads the distro
+profile with `HOME` pointed at the rcfile directory, after clearing
+inherited `XDG_DATA_DIRS`, `XDG_CONFIG_HOME`, `BASH_COMPLETION_USER_FILE`
+and `BASH_COMPLETION_COMPAT_DIR`. Once `HOME` is real again,
+`BASH_COMPLETION_USER_DIR` is the integration directory for both Git Bash
+and WSL. The WSL loaders `_comp_load` and `__load_completion` compute a
+safe `PATH` before `local`, and never leave it empty (the fallback is
+`/usr/sbin:/usr/bin:/sbin:/bin`). Entries that are not absolute, are under
+`/mnt`, or are not a root-owned directory (the entry and its parent,
+following links) with no group or world write are dropped, using
+`/usr/bin/stat`. The command name is passed without its directory, so
+`/mnt/c/.../bin/zzcmd` and `./zzcmd` do not load a completion from that
+folder. System completions such as ssh still load from the remaining
+`PATH`. A failed
 elevation query is treated as elevated. `shellint` takes the `elevated` flag `Session::spawn` is given, which is
 `elevate::process_is_elevated`, the one token query in the tree.
 The script directory comes from `SHGetKnownFolderPath(FOLDERID_ProgramData)`

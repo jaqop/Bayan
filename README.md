@@ -1108,12 +1108,49 @@ receives it: it would have to live in `PROMPT`, which every child
 inherits, so cmd's marks carry no nonce and are not trusted. An
 elevated token (Run as administrator) does not source user rc files, sets
 `INPUTRC` and `HISTFILE` to `/dev/null` so `~/.inputrc` cannot run a
-macro. Elevated Git Bash is started with `--noprofile` and does not read
-`/etc/profile`: that file runs `git-prompt.sh`, which executes
-`~/.config/git/git-prompt.sh` and `~/bash_completion.d/*.bash` as
-administrator. `PATH` and `MSYSTEM` are set from the Git install instead. Elevated WSL bash still reads the
-distro's `/etc/profile`, with `HOME` pointed at the rcfile directory for
-that read and restored afterwards. Elevated zsh ends `.zlogin` with
+macro. Elevated Git Bash is started with `--noprofile` before `-i` and
+does not read `/etc/profile`: that file runs `git-prompt.sh`, which
+executes `~/.config/git/git-prompt.sh` and `~/bash_completion.d/*.bash` as
+administrator. `HOME` is an empty directory in the integration folder
+until the rcfile restores it, including a non-login `bash.exe -i`.
+`PATH` and `MSYSTEM` come from the Git
+install, preferring `/ucrt64` (Git for Windows 2.56) over `/mingw64`.
+Git's own prompt is kept. Elevated WSL bash still reads the distro's
+`/etc/profile`, with `HOME` pointed at the rcfile directory for that
+read. Inherited `XDG_DATA_DIRS`, `XDG_CONFIG_HOME`,
+`BASH_COMPLETION_USER_FILE` and `BASH_COMPLETION_COMPAT_DIR` are cleared
+first. After `HOME` returns, `BASH_COMPLETION_USER_DIR` stays on the
+integration directory. Tab completion then runs with a `PATH` that was
+filtered before it was made local, and is never empty: `/mnt` entries,
+relative entries, and directories that are not root-owned or that are
+group- or world-writable are removed, and a command path is reduced to
+its name so a completion beside `/mnt/c/.../bin` or `./zzcmd` is not
+sourced. ssh and the other system completions still load. Each `PATH`
+entry is resolved through its symlinks and its trailing slash before it is
+judged, so a root-owned link to `/mnt/c` is refused for where it points,
+and `/x/bin/` is checked against its parent `/x` (it used to be checked
+against itself, twice). The command the loader is given is found by
+position, the first argument after the options, because
+`_comp_load [-D] [--] cmd [args...]` may carry more after it; taking the
+last word left a `/mnt/c/.../cmd` path whole whenever one argument
+followed. `_comp_realcommand` (bash-completion 2.12 and later) is wrapped
+too: it follows a command's links to its real path and the loader looks
+for completions beside that, so a real path whose directory fails the
+same test is reported as no real path. `PATH` is split with `read`, not
+by an unquoted expansion, so an entry such as `/usr/*` is not globbed
+into a list of directories. Reproduced before the fix against a stand-in
+for the 2.12 loader on Linux bash 5.2, with planted completions: a
+symlinked command, a trailing-slash entry under a user-owned parent, and
+a command followed by one argument each sourced the planted file; after
+it none does and a legitimate completion still loads. The stand-in was
+written for the test; bash-completion's own file was read, not run.
+`the_completion_filter_refuses_each_planted_shape` runs every branch in a
+real bash with `/usr/bin/stat` replaced by a function, because under Git
+Bash no directory is owned by uid 0 and the older planted test passed
+through the empty-`PATH` fallback alone. Removing the `/mnt` case, the
+uid test, the mode test or the fallback each changes a line it asserts
+(checked by hand on Linux). Not run here: a WSL distro, an elevated
+token, or the real bash-completion package. Elevated zsh ends `.zlogin` with
 `unsetopt rcs`, so exit does not read `~/.zlogout`. oh-my-posh is not inited from the user
 profile. A failed elevation query is treated as elevated. Elevated scripts
 are created under the real ProgramData folder
