@@ -1423,6 +1423,22 @@ end
 
 ## Build
 
+Atlas and probe fixes (2026-11-13): resetting a full glyph atlas reserves
+page 0's white texel again and reuses every cleared page. GPU sync copies
+only changed pages, except when texture growth requires restoring them all;
+an atlas upload forces a present even when the quad geometry is identical.
+Shell/theme probes accept at most 1 MiB of stdout and share one deadline
+for process exit and pipe drain. On Windows they enter a kill-on-close job
+before running, so a descendant holding stdout cannot survive a timed-out
+probe. Lua-spawn supervision keeps its existing behavior and shares that
+same low-level job implementation.
+
+Seven regression tests cover these cases, including real Windows child
+processes. `BAYAN_ATLAS_RESET=1` in a debug build (or a release built with
+`dev-hooks`) forces the allocator through its page cap for a live GUI check.
+The checked window retained Arabic, colored backgrounds, selection/copy,
+font/theme switching and config hot reload after these resets.
+
 Bayan now starts with one fresh tab. To opt into reopening saved tabs and panes,
 set `"restore_tabs": true` in config. Window position and size still persist.
 
