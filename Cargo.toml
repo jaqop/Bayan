@@ -18,7 +18,16 @@ alacritty_terminal = "0.26.1-dev"
 portable-pty = "0.9"
 # windowing + GPU present + text shaping (HarfBuzz-class, BiDi, fallback)
 winit = "0.30"
-wgpu = "30"
+# Vulkan is off so vulkan-1.dll is never loaded. Metal and webgpu are not
+# this target. DX12 and GL stay: GL is the fallback when DX12 cannot make
+# a device, and both are pinned to System32 by dll_search.
+wgpu = { version = "30", default-features = false, features = [
+    "std",
+    "parking_lot",
+    "dx12",
+    "gles",
+    "wgsl",
+] }
 pollster = "1"
 bytemuck = { version = "1", features = ["derive"] }
 cosmic-text = "0.19"
@@ -51,7 +60,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Shell", # Shell_NotifyIcon balloons = native toasts, no WinRT
     "Win32_Storage_FileSystem", # GetShortPathNameW: ConPTY chokes on spaces in paths
     "Win32_System_Com", # CoInitializeEx on the link-open thread, before ShellExecuteW
-    "Win32_System_LibraryLoader", # SetDllDirectoryW; ConPTY comes from kernel32, not conpty.dll
+    "Win32_System_LibraryLoader", # SetDefaultDllDirectories, AddDllDirectory; ConPTY comes from kernel32
     "Win32_System_ProcessStatus", # EnumProcessModules in the planted-conpty.dll test
     "Win32_System_Threading", # GetCurrentProcess for that module walk
     "Win32_Security", # TokenElevation: an elevated token does not run Lua

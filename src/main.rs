@@ -17,6 +17,7 @@ mod config_watch;
 mod context_menu;
 mod copyclean;
 mod copymode;
+mod dll_search;
 mod elevate;
 mod gpu;
 mod groups;
@@ -7976,78 +7977,8 @@ fn blur_forgets_held_keys(focused: bool, held: &mut Vec<winit::keyboard::Physica
     }
 }
 
-/// Drop the current directory from the DLL search path before anything else
-/// in this process loads a library by name.
-///
-/// `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR)`
-/// (0x800 | 0x200) is available on Windows 8+ and is intentionally not
-/// called. wgpu-hal loads `d3d12.dll` and `dxgi.dll` by bare name
-/// (`libloading` → `LoadLibraryW`). The inbox `d3d12.dll` then maps
-/// `D3D12Core.dll` from `%SystemRoot%\System32\D3D12`, and the GL fallback
-/// loads an ICD from `DriverStore\FileRepository\...`. Those neighbours are
-/// not System32 itself and not the application directory.
-/// `SetDefaultDllDirectories` replaces the process search path permanently
-/// and does not accept `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` (that flag is
-/// per `LoadLibraryEx`). A missed dependency there is a black window, and
-/// neither CI nor this call can create a device to prove it still works.
-/// `SetDllDirectoryW("")` only removes the CWD, which is what Microsoft
-/// documents for this mitigation, and leaves System32, the application
-/// directory, and PATH in place for DirectX and GL.
-///
-/// ConPTY does not depend on this call. `CreatePseudoConsole`,
-/// `ResizePseudoConsole`, and `ClosePseudoConsole` come from `kernel32.dll`
-/// opened with `LoadLibraryExW(L"kernel32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32)`.
-/// `conpty.dll` is never passed to the loader.
-///
-/// NEW-04 (partly): the application directory still precedes System32 for a
-/// bare name, so a `d3d12.dll` planted beside `bayan.exe` (a Downloads
-/// folder, a writable `target\release`) would load. Without touching the
-/// search order above, the graphics DLLs wgpu loads DYNAMICALLY by bare name
-/// are mapped first from System32 only (`LOAD_LIBRARY_SEARCH_SYSTEM32`); a
-/// later `LoadLibraryW("d3d12.dll")` returns the module already in memory.
-/// Their own dependencies (D3D12Core, the DriverStore ICDs) resolve as before.
-///
-/// NOT covered: `dxgi.dll` and `opengl32.dll` are STATIC imports of the exe
-/// (wgpu-hal's `windows` raw-dylib calls), resolved by the loader before
-/// `main` runs, so nothing here can reach them. Closing that needs
-/// `/DEPENDENTLOADFLAG:0x800` at link time, which also restricts every other
-/// static import (the VC runtime among them) to System32 — untested, so not
-/// done. Until then: install Bayan in a folder only you can write
-/// (`%LOCALAPPDATA%\Programs\Bayan`), not run it from Downloads.
-pub(crate) fn harden_dll_search() {
-    use windows_sys::Win32::System::LibraryLoader::{
-        LoadLibraryExW, SetDllDirectoryW, LOAD_LIBRARY_SEARCH_SYSTEM32,
-    };
-    // An empty string removes the CWD. NULL would put it back.
-    let empty = [0u16];
-    // SAFETY: `empty` is a NUL-terminated UTF-16 string that outlives the
-    // call, and SetDllDirectoryW copies it rather than keeping the pointer.
-    unsafe {
-        let _ = SetDllDirectoryW(empty.as_ptr());
-    }
-    for name in GPU_SYSTEM_DLLS {
-        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-        // SAFETY: `wide` is NUL-terminated and outlives the call; the file
-        // handle argument must be null, and the flag restricts the search to
-        // System32. The module stays loaded for the life of the process on
-        // purpose, so the returned handle is not freed.
-        unsafe {
-            let _ = LoadLibraryExW(
-                wide.as_ptr(),
-                std::ptr::null_mut(),
-                LOAD_LIBRARY_SEARCH_SYSTEM32,
-            );
-        }
-    }
-}
-
-/// Graphics DLLs wgpu-hal loads dynamically by bare name on Windows (DX12
-/// path; `gpu.rs` asks for DX12 | GL), pre-mapped from System32 by
-/// `harden_dll_search` (NEW-04). Not listed: `dxgi.dll` / `opengl32.dll`
-/// (static imports, already loaded before `main`), and `dxcompiler.dll` /
-/// `libEGL.dll`, which are not inbox System32 components (pinning an old
-/// inbox copy could break the DXC path).
-const GPU_SYSTEM_DLLS: &[&str] = &["d3d12.dll", "dcomp.dll", "d3dcompiler_47.dll"];
+// Graphics DLL search. The decision and the path checks are in `dll_search`.
+pub(crate) use dll_search::harden_dll_search;
 
 fn show_error_dialog(
     owner: Option<windows_sys::Win32::Foundation::HWND>,
@@ -8106,6 +8037,9 @@ struct Startup {
 }
 
 fn main() -> std::process::ExitCode {
+    // Before dispatch, and before any other LoadLibrary this process does.
+    // Delay-loaded graphics imports have not been resolved yet.
+    harden_dll_search();
     match dispatch() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
@@ -8431,7 +8365,6 @@ fn try_set_window_subclass(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
 }
 
 fn run(startup: Startup) -> Result<(), String> {
-    harden_dll_search();
     if let Ok(exe) = std::env::current_exe() {
         if let Ok(path) = cli::exe_display(&exe) {
             let app_id = jumplist::app_user_model_id(&path);

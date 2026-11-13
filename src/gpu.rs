@@ -102,11 +102,28 @@ pub struct ImageQuad<'a> {
 impl Gpu {
     pub fn new(window: Arc<Window>, width: u32, height: u32) -> Result<Self, String> {
         // DX12 first (native on Windows, fastest to initialize), GL as the
-        // universal fallback — enumerating every backend cost ~800ms
+        // fallback when DX12 cannot make a device. Vulkan is not a backend:
+        // that feature is off, so vulkan-1.dll is never opened.
         // wgpu 30 dropped Default for InstanceDescriptor (a display handle is
-        // now an explicit choice); DX12/Vulkan ignore it, so "without" is ours.
+        // now an explicit choice); DX12/GL ignore it, so "without" is ours.
+        //
+        // `Dx12Compiler::Auto` (the descriptor default) loads the bare name
+        // `dxcompiler.dll`, and the application directory is searched first.
+        // FXC uses `d3dcompiler_47.dll`, which `dll_search::harden_dll_search`
+        // has already mapped from System32. A missing dxcompiler.dll is the
+        // normal case and still renders. `WGPU_DX12_COMPILER` is not applied:
+        // `dxc` would put the bare name back.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::DX12 | wgpu::Backends::GL,
+            backend_options: wgpu::BackendOptions {
+                dx12: wgpu::Dx12BackendOptions {
+                    shader_compiler: match crate::dll_search::dx12_shader_compiler() {
+                        crate::dll_search::Dx12ShaderCompiler::Fxc => wgpu::Dx12Compiler::Fxc,
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let surface = instance
