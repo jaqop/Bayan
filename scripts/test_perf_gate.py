@@ -75,6 +75,15 @@ class Gate(unittest.TestCase):
         self.assertEqual(got["renderer ready"], 138.4)
         self.assertNotIn("latency key", " ".join(got))
 
+    def test_the_ratio_is_taken_within_one_start(self):
+        got = perf_gate.parse(STARTUP)["startup_ratio"]
+        # run 1 has both marks (617.0 / 601.7); run 2 has no gpu mark
+        self.assertEqual(got, {"first frame / gpu ready": 1.025})
+        base = {"tolerances": {"startup_ratio": 0.15}, "startup_ratio": {"first frame / gpu ready": 1.08}}
+        self.assertEqual(perf_gate.compare(base, {"startup_ratio": {"first frame / gpu ready": 1.2}}, 0.1)[0], [])
+        late = perf_gate.compare(base, {"startup_ratio": {"first frame / gpu ready": 1.3}}, 0.1)[0]
+        self.assertEqual(len(late), 1)
+
     def test_startup_has_its_own_tolerance_and_reports_no_gain(self):
         base = {
             "tolerances": {"startup": 0.5},

@@ -21,21 +21,35 @@ job prints a note when that happens.
 
 ## Startup
 
-| Mark | Baseline | Fastest of five starts, two jobs on `main` (6e3742c + the gate) |
-|---|---|---|
-| first frame presented | 100 ms | 80.0, 100.2 |
-| renderer ready | 135 ms | 100.7, 132.4 |
+Fastest of five starts, three jobs on `main` (6e3742c + the gate), same code:
 
-The two jobs differ by a quarter with the same code, so this group's limit
-is 50%, not 10% (`tolerances.startup`): above 150 ms to the first frame or
-about 200 ms to a ready renderer fails. That catches work that moves in
-front of the first frame, which is what the hidden-until-first-frame
-startup is built around; it does not catch a regression of a few
-milliseconds. Within one job the four warm starts agree to about 5%.
+| Job | vte alone, plain | gpu ready | first frame | renderer ready | first frame / gpu ready |
+|---|---|---|---|---|---|
+| 1 | 141 MB/s | 73.3 ms | 80.0 ms | 100.7 ms | 1.09 |
+| 2 | 85 MB/s | 92.1 ms | 100.2 ms | 132.4 ms | 1.09 |
+| 3 | 77 MB/s | 131.2 ms | 140.7 ms | 200.7 ms | 1.07 |
 
-The first start of each job is cold and is not what the gate reads: 182
-and 617 ms to the first frame, 3.0 and 3.9 s to a ready renderer. A hosted
-runner has no GPU; the window opens on WARP.
+Hosted runners are not one machine: the same code took 80 ms on one and
+141 ms on another. A first version of this gate allowed 50% over job 2's
+figures and job 3 came within 7% of failing it with no change at all. So:
 
-The SGR throughput share read 35 to 41% across four jobs, the widest of
+- **`startup`** (milliseconds) is a backstop. The baseline is the slowest
+  job seen and the limit is 100% over it: above 280 ms to the first frame
+  or 400 ms to a ready renderer fails. It catches hundreds of
+  milliseconds, such as the font scan moving in front of the first frame.
+- **`startup_ratio`** is `first frame presented` over `gpu ready` within
+  one start, at 15%. Most of the time to the first frame is WARP coming
+  up, which scales with the machine, so the ratio held at 1.07 to 1.09 on
+  all three. Above 1.24 fails: roughly 10 to 20 ms of new work between the
+  GPU being ready and the first frame.
+
+Not caught: new work before `gpu ready` that is smaller than the backstop,
+and anything after the first frame short of 400 ms. `renderer ready` minus
+`first frame` read 21, 32 and 60 ms on the three jobs, too loose to gate.
+
+The first start of each job is cold and is not what the gate reads: up to
+617 ms to the first frame and 3.9 s to a ready renderer. A hosted runner
+has no GPU; the window opens on WARP.
+
+The SGR throughput share read 35 to 41% across five jobs, the widest of
 the three corpora. Its floor is 32.4%.

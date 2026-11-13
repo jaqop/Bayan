@@ -1,7 +1,8 @@
 {
   "tolerance": 0.1,
   "tolerances": {
-    "startup": 0.5
+    "startup": 1.0,
+    "startup_ratio": 0.15
   },
   "throughput": {
     "ascii": 78,
@@ -13,7 +14,10 @@
     "100000": 302.0
   },
   "startup": {
-    "first frame presented": 100,
-    "renderer ready": 135
+    "first frame presented": 140,
+    "renderer ready": 200
+  },
+  "startup_ratio": {
+    "first frame / gpu ready": 1.08
   }
 }

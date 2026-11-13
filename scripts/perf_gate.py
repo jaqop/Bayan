@@ -13,9 +13,13 @@ concatenated) and compares them with perf/baseline.json:
 
   startup: milliseconds from process start to a `BAYAN_PROFILE` mark, per
       mark, lowest of the runs (the first start of a job is cold and several
-      times slower). Hosted runners differ by a quarter from one job to the
-      next, so this group has its own, wide tolerance: it catches work that
-      lands in front of the first frame, not a few milliseconds.
+      times slower). Hosted runners differ by almost a factor of two from
+      one job to the next, so this group is a backstop with a wide
+      tolerance: it catches hundreds of milliseconds, not tens.
+  startup_ratio: `first frame presented` over `gpu ready` within one start,
+      lowest of the runs. Both scale with the machine, so the ratio holds
+      from runner to runner; it rises when work lands between the GPU being
+      ready and the first frame.
 
 A value more than `tolerance` (10%) worse than the baseline fails. A value
 that much better is reported, so the baseline can be raised and the gain
@@ -40,15 +44,27 @@ STARTUP = re.compile(r"(\d+(?:\.\d+)?) ms  ([a-z][a-z ]*[a-z])\s*$", re.MULTILIN
 
 def parse(text):
     """{'throughput': {kind: best %}, 'scrollback': {lines: lowest MB},
-    'startup': {mark: lowest ms}}"""
-    throughput, scrollback, startup = {}, {}, {}
+    'startup': {mark: lowest ms}, 'startup_ratio': {name: lowest ratio}}"""
+    throughput, scrollback, startup, ratio = {}, {}, {}, {}
     for kind, pct in THROUGHPUT.findall(text):
         throughput[kind] = max(float(pct), throughput.get(kind, 0.0))
     for lines, mb in SCROLLBACK.findall(text):
         scrollback[lines] = min(float(mb), scrollback.get(lines, float("inf")))
     for ms, mark in STARTUP.findall(text):
         startup[mark] = min(float(ms), startup.get(mark, float("inf")))
-    return {"throughput": throughput, "scrollback": scrollback, "startup": startup}
+    # one start at a time: the ratio is between two marks of the same start
+    for block in text.split("--- startup run")[1:]:
+        marks = {mark: float(ms) for ms, mark in STARTUP.findall(block)}
+        gpu, frame = marks.get("gpu ready"), marks.get("first frame presented")
+        if gpu and frame:
+            name = "first frame / gpu ready"
+            ratio[name] = min(round(frame / gpu, 3), ratio.get(name, float("inf")))
+    return {
+        "throughput": throughput,
+        "scrollback": scrollback,
+        "startup": startup,
+        "startup_ratio": ratio,
+    }
 
 
 def compare(baseline, measured, tolerance):
@@ -60,6 +76,7 @@ def compare(baseline, measured, tolerance):
         ("throughput", "% of vte", True, True),
         ("scrollback", "MB", False, True),
         ("startup", "ms", False, False),
+        ("startup_ratio", "x", False, False),
     )
     for group, unit, higher_is_better, report_gains in checks:
         group_tolerance = float(baseline.get("tolerances", {}).get(group, tolerance))
