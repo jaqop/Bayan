@@ -17,7 +17,8 @@ def read_input():
         if not data: break
         with (root/f'input-{pid}.bin').open('ab') as f: f.write(data)
 threading.Thread(target=read_input, daemon=True).start()
-for i in range(1200): print(f'HISTORY-OLD-{i:04d}', flush=False)
+history_lines = int(sys.argv[3]) if len(sys.argv) > 3 else 1200
+for i in range(history_lines): print(f'HISTORY-OLD-{i:04d}', flush=False)
 print(corpus, flush=True)
 print(f'LIVE-READY pid={pid}', flush=True)
 seen = ''

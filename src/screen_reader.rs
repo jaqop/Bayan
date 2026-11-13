@@ -67,11 +67,14 @@ pub fn pane_node(tab: usize, pane: usize) -> NodeId {
 }
 
 fn run_node(tab: usize, pane: usize, line: usize, part: usize) -> NodeId {
+    // Paragraphs can span many physical rows. Four part bits were only
+    // enough for 3200 characters and aliased the next paragraph after that.
+    // Separate 16-bit tab/line, 4-bit pane, and 24-bit part namespaces.
     NodeId(
-        0x1_0000_0000
-            | ((tab as u64) << 24)
-            | ((pane as u64) << 18)
-            | ((line as u64) << 4)
+        0x1000_0000_0000_0000
+            | ((tab as u64) << 44)
+            | ((pane as u64) << 40)
+            | ((line as u64) << 24)
             | part as u64,
     )
 }
@@ -193,7 +196,12 @@ pub struct LogicalLine {
 /// Storage order, trimmed of the blank cells a row is padded with.
 /// `claude` runs the visual-to-logical map; every other program is already
 /// logical and must be left alone.
-pub fn logical_line(cells: &[GridCell], claude: bool) -> LogicalLine {
+#[cfg(test)]
+fn logical_line(cells: &[GridCell], claude: bool) -> LogicalLine {
+    logical_row(cells, claude, true)
+}
+
+fn logical_row(cells: &[GridCell], claude: bool, trim_padding: bool) -> LogicalLine {
     let mut ordered = cells.to_vec();
     ordered.sort_by_key(|c| c.col);
     let mut text = String::new();
@@ -235,7 +243,7 @@ pub fn logical_line(cells: &[GridCell], claude: bool) -> LogicalLine {
         (text, cols, widths)
     };
     let mut line = LogicalLine { text, cols, widths };
-    while line.text.ends_with(' ') {
+    while trim_padding && line.text.ends_with(' ') {
         line.text.pop();
         line.cols.pop();
         line.widths.pop();
@@ -247,11 +255,17 @@ pub fn logical_line(cells: &[GridCell], claude: bool) -> LogicalLine {
 #[derive(Clone, Debug)]
 pub struct RawPane {
     pub rows: Vec<Vec<GridCell>>,
+    /// A full grid row can continue without a newline. Preserve the source
+    /// column span for caret/selection mapping after joining those rows.
+    pub columns: usize,
+    pub wrapped: Vec<bool>,
     pub cursor: Option<(usize, usize)>,
     pub selection: Option<((usize, usize), (usize, usize))>,
 }
 
-/// What one pane shows the reader: viewport rows, caret, selection.
+/// Logical paragraphs in the visible pane, caret and inclusive selection.
+/// A joined row's columns are offset by its original grid-row width, so
+/// positions still identify the source cells rather than visual glyphs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaneText {
     pub lines: Vec<LogicalLine>,
@@ -265,9 +279,21 @@ pub fn copy_pane<T: EventListener>(term: &Term<T>) -> RawPane {
     let content = term.renderable_content();
     let off = content.display_offset as i32;
     let rows = term.screen_lines();
+    let columns = term.columns();
+    let wrapped = (0..rows)
+        .map(|row| {
+            term.grid()[alacritty_terminal::index::Line(row as i32 - off)]
+                [alacritty_terminal::index::Column(columns.saturating_sub(1))]
+            .flags
+            .contains(Flags::WRAPLINE)
+        })
+        .collect();
     let mut cells = vec![Vec::new(); rows];
     for cell in content.display_iter {
-        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
             continue;
         }
         let vrow = cell.point.line.0 + off;
@@ -297,6 +323,8 @@ pub fn copy_pane<T: EventListener>(term: &Term<T>) -> RawPane {
     }
     RawPane {
         rows: cells,
+        columns,
+        wrapped,
         cursor: viewport_cursor(content.cursor.point, off, rows),
         selection: content
             .selection
@@ -304,17 +332,47 @@ pub fn copy_pane<T: EventListener>(term: &Term<T>) -> RawPane {
     }
 }
 
-/// Logical lines from a [`copy_pane`] snapshot. `claude` restores visual
-/// order; every other grid is already logical.
+/// Logical paragraphs from a [`copy_pane`] snapshot. Only soft wraps join;
+/// explicit newlines and their blank lines remain. `claude` retains its
+/// existing per-row visual-order restoration.
 pub fn pane_text(raw: RawPane, claude: bool) -> PaneText {
+    let mut lines: Vec<LogicalLine> = Vec::new();
+    let mut source_rows = Vec::with_capacity(raw.rows.len());
+    let mut offset = 0;
+    for (row, cells) in raw.rows.iter().enumerate() {
+        // Visual-order application output keeps its existing per-row
+        // restoration. Normal terminal output is already logical Unicode.
+        let continued = !claude && row > 0 && raw.wrapped[row - 1];
+        if continued {
+            offset += raw.columns;
+        } else {
+            offset = 0;
+            lines.push(LogicalLine {
+                text: String::new(),
+                cols: Vec::new(),
+                widths: Vec::new(),
+            });
+        }
+        let logical = logical_row(cells, claude, claude || !raw.wrapped[row]);
+        let paragraph = lines.len() - 1;
+        let line = &mut lines[paragraph];
+        line.text.push_str(&logical.text);
+        line.cols
+            .extend(logical.cols.iter().map(|col| offset + col));
+        line.widths.extend(logical.widths);
+        source_rows.push((paragraph, offset));
+    }
+    let map_point = |(row, col): (usize, usize)| {
+        source_rows
+            .get(row)
+            .map(|&(paragraph, offset)| (paragraph, offset.saturating_add(col)))
+    };
     PaneText {
-        lines: raw
-            .rows
-            .iter()
-            .map(|row| logical_line(row, claude))
-            .collect(),
-        cursor: raw.cursor,
-        selection: raw.selection,
+        lines,
+        cursor: raw.cursor.and_then(map_point),
+        selection: raw
+            .selection
+            .and_then(|(start, end)| Some((map_point(start)?, map_point(end)?))),
     }
 }
 
@@ -366,9 +424,21 @@ pub fn appended_lines(prev: &[String], next: &[String]) -> Vec<String> {
     if next.len() >= prev.len() && next[..prev.len()] == prev[..] {
         return next[prev.len()..].to_vec();
     }
+    // The last paragraph may have grown across soft wraps before its real
+    // newline arrives. Announce the completed paragraph, not each edit.
+    let last = prev.len() - 1;
+    if next.len() > prev.len()
+        && next[..last] == prev[..last]
+        && next[last].starts_with(&prev[last])
+    {
+        return next[last..].to_vec();
+    }
     let max_k = prev.len().min(next.len());
     for k in 1..=max_k {
         let tail = &prev[k..];
+        if tail.is_empty() {
+            break;
+        }
         if next.len() >= tail.len() && next[..tail.len()] == tail[..] {
             return next[tail.len()..].to_vec();
         }
@@ -464,7 +534,29 @@ fn coalesce_tail(lines: &[String], skipped: usize) -> String {
         chosen.remove(0);
     }
     let omitted = skipped + lines.len() - chosen.len();
-    let body = chosen.join("\n");
+    let mut body = chosen.join("\n");
+    if let Some((start, _)) = body
+        .char_indices()
+        .rev()
+        .nth(TAIL_CHARS - 1)
+        .filter(|(i, _)| *i > 0)
+    {
+        let boundary = if body[..start].ends_with(char::is_whitespace) {
+            Some(start)
+        } else {
+            body[start..].find(char::is_whitespace).map(|i| start + i)
+        };
+        let tail = boundary.map(|i| body[i..].trim_start()).unwrap_or("");
+        body = if tail.is_empty() {
+            tr(
+                "مخرجات طويلة؛ راجع المستند لقراءتها",
+                "Long output; review the document to read it",
+            )
+            .into()
+        } else {
+            format!("… {tail}")
+        };
+    }
     if omitted == 0 {
         body
     } else if lang::rtl() {
@@ -873,8 +965,15 @@ fn position_at(
     line_index: usize,
     line: &LogicalLine,
     col: usize,
+    after_cell: bool,
 ) -> TextPosition {
-    let index = char_index_at(line, col);
+    let mut index = char_index_at(line, col);
+    if after_cell && index < line.cols.len() {
+        let owner = line.cols[index];
+        while index < line.cols.len() && line.cols[index] == owner {
+            index += 1;
+        }
+    }
     let part = index / RUN_CHARS;
     let parts = line.text.chars().count().div_ceil(RUN_CHARS).max(1);
     let part = part.min(parts - 1);
@@ -891,13 +990,13 @@ fn text_selection(tab: usize, pane: &PaneItem) -> Option<(TextPosition, TextPosi
         return None;
     }
     if let Some((anchor, focus)) = pane.text.selection {
-        let anchor = point_on(tab, pane.index, lines, anchor);
-        let focus = point_on(tab, pane.index, lines, focus);
+        let anchor = point_on(tab, pane.index, lines, anchor, false);
+        let focus = point_on(tab, pane.index, lines, focus, true);
         return Some((anchor, focus));
     }
     let (row, col) = pane.text.cursor?;
     let row = row.min(lines.len() - 1);
-    let at = position_at(tab, pane.index, row, &lines[row], col);
+    let at = position_at(tab, pane.index, row, &lines[row], col, false);
     Some((at, at))
 }
 
@@ -906,9 +1005,10 @@ fn point_on(
     pane: usize,
     lines: &[LogicalLine],
     (row, col): (usize, usize),
+    after_cell: bool,
 ) -> TextPosition {
     let row = row.min(lines.len() - 1);
-    position_at(tab, pane, row, &lines[row], col)
+    position_at(tab, pane, row, &lines[row], col, after_cell)
 }
 
 fn palette_nodes(palette: &PaletteItem) -> Vec<(NodeId, Node)> {
@@ -1038,6 +1138,154 @@ mod tests {
     }
 
     #[test]
+    fn soft_wraps_are_one_readable_paragraph_in_the_actual_accessibility_tree() {
+        let corpus =
+            include_str!("../tests/fixtures/mixed-arabic-english.txt").replace("\r\n", "\n");
+        assert!(corpus.split_whitespace().count() > 100);
+        for cols in [18, 70, 102] {
+            let mut term = Term::new(
+                Config::default(),
+                &crate::term::TermSize { cols, rows: 160 },
+                VoidListener,
+            );
+            let mut parser = Processor::<StdSyncHandler>::new();
+            parser.advance(
+                &mut term,
+                corpus.trim_end().replace('\n', "\r\n").as_bytes(),
+            );
+            let mut view = one_pane("", (0, 0), None);
+            view.panes[0].text = read_pane(&term, false);
+            let tree = build_tree(&view);
+            let document = find(&tree, pane_node(0, 0));
+            let spoken: String = document
+                .children()
+                .iter()
+                .map(|&id| find(&tree, id).value().unwrap_or(""))
+                .collect();
+            assert_eq!(
+                spoken.trim_end(),
+                corpus.trim_end(),
+                "physical wraps leaked into UIA at {cols} columns"
+            );
+        }
+    }
+
+    #[test]
+    fn long_paragraph_runs_do_not_alias_the_next_paragraph_node_ids() {
+        let mut view = one_pane("", (0, 0), None);
+        view.panes[0].text.lines = vec![
+            line_of(&"عربية English 123 ".repeat(300)),
+            line_of("next paragraph"),
+        ];
+        let tree = build_tree(&view);
+        let ids: std::collections::HashSet<_> = tree.nodes.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids.len(),
+            tree.nodes.len(),
+            "long wrapped paragraphs must not alias another text node"
+        );
+    }
+
+    #[test]
+    fn wrapped_caret_and_inclusive_selection_keep_native_cell_ownership() {
+        let mut term = Term::new(
+            Config::default(),
+            &crate::term::TermSize { cols: 10, rows: 6 },
+            VoidListener,
+        );
+        let mut parser = Processor::<StdSyncHandler>::new();
+        parser.advance(&mut term, "مَرحبا abcdefghijklmnop عربي".as_bytes());
+        parser.advance(&mut term, b"\x1b[2;3H");
+        let mut view = one_pane("", (0, 0), None);
+        let mut raw = copy_pane(&term);
+        raw.selection = Some(((0, 2), (1, 5)));
+        let caret = pane_text(raw.clone(), false).cursor.unwrap();
+        assert_eq!(caret, (0, 12));
+        view.panes[0].text = pane_text(raw, false);
+        let tree = build_tree(&view);
+        let selection = find(&tree, pane_node(0, 0)).text_selection().unwrap();
+        let value = find(&tree, selection.anchor.node).value().unwrap();
+        let chosen: String = value
+            .chars()
+            .skip(selection.anchor.character_index)
+            .take(selection.focus.character_index - selection.anchor.character_index)
+            .collect();
+        assert_eq!(chosen, "حبا abcdefghij");
+        view.panes[0].text.selection = None;
+        let tree = build_tree(&view);
+        let caret = find(&tree, pane_node(0, 0)).text_selection().unwrap().focus;
+        assert_eq!(
+            find(&tree, caret.node)
+                .value()
+                .unwrap()
+                .chars()
+                .nth(caret.character_index),
+            Some('g')
+        );
+    }
+
+    #[test]
+    fn wrap_spaces_wide_characters_and_explicit_newlines_remain_distinct() {
+        let mut term = Term::new(
+            Config::default(),
+            &crate::term::TermSize { cols: 10, rows: 8 },
+            VoidListener,
+        );
+        let mut parser = Processor::<StdSyncHandler>::new();
+        parser.advance(
+            &mut term,
+            "123456789 text عربي 😀\r\nسطر آخر\r\nEnglish".as_bytes(),
+        );
+        let pane = read_pane(&term, false);
+        assert_eq!(pane.lines[0].text, "123456789 text عربي 😀");
+        assert_eq!(pane.lines[1].text, "سطر آخر");
+        assert_eq!(pane.lines[2].text, "English");
+        let mut term = Term::new(
+            Config::default(),
+            &crate::term::TermSize { cols: 10, rows: 3 },
+            VoidListener,
+        );
+        let mut parser = Processor::<StdSyncHandler>::new();
+        parser.advance(&mut term, "123456789😀x".as_bytes());
+        assert_eq!(
+            read_pane(&term, false).lines[0].text,
+            "123456789😀x",
+            "wide-character wrap padding is not text"
+        );
+    }
+
+    #[test]
+    fn completed_growing_paragraph_is_announced_but_typing_is_not() {
+        let before = vec!["ready".into(), "نقارن زمن".into()];
+        let typing = vec!["ready".into(), "نقارن زمن الاستجابة".into()];
+        assert!(appended_lines(&before, &typing).is_empty());
+        let completed = vec!["ready".into(), "نقارن زمن الاستجابة".into(), String::new()];
+        assert_eq!(appended_lines(&before, &completed), completed[1..]);
+    }
+
+    #[test]
+    fn long_logical_paragraph_live_tail_is_bounded_at_whole_words() {
+        let text = "English مراجعة 123 ".repeat(500);
+        let tail = coalesce_tail(&[text], 0);
+        assert!(
+            tail.chars().count() <= TAIL_CHARS + 2,
+            "unbounded live announcement"
+        );
+        assert!(tail.starts_with("… "));
+        assert!(tail.ends_with("123 "));
+        assert!(tail
+            .trim_start_matches("… ")
+            .split_whitespace()
+            .all(|word| ["English", "مراجعة", "123"].contains(&word)));
+        let unbroken = coalesce_tail(&["x".repeat(1000)], 0);
+        assert!(unbroken.chars().count() < TAIL_CHARS);
+        assert!(
+            !unbroken.contains("xxx"),
+            "an overlong token is omitted, not pronounced as a fragment"
+        );
+    }
+
+    #[test]
     fn mixed_arabic_latin_line_stays_in_logical_order() {
         // Storage order is what the program wrote. Visual BiDi would put
         // the Arabic on the right and a column walk of the shaped line
@@ -1113,10 +1361,17 @@ mod tests {
         let tree = build_tree(&view);
         let sel = find(&tree, pane_node(0, 0)).text_selection().unwrap();
         assert_eq!(sel.anchor.character_index, 6);
-        assert_eq!(sel.focus.character_index, 10);
+        assert_eq!(
+            sel.focus.character_index, 11,
+            "UIA range ends after the last selected cell"
+        );
         assert_eq!(sel.anchor.node, sel.focus.node);
         let value = find(&tree, sel.anchor.node).value().unwrap();
-        let chosen: String = value.chars().skip(6).take(5).collect();
+        let chosen: String = value
+            .chars()
+            .skip(sel.anchor.character_index)
+            .take(sel.focus.character_index - sel.anchor.character_index)
+            .collect();
         assert_eq!(chosen, "مرحبا");
     }
 

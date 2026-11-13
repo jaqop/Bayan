@@ -105,8 +105,9 @@ clipped at either viewport edge: internal word boundaries are preserved too,
 while text outside the viewport stays clipped. Reflow deliberately leaves
 positioned TUIs, alternate-screen output, explicit application
 direction controls, and visual-order Claude output on their existing path.
-UIA still exposes physical grid rows; this check does not certify NVDA's
-reading across soft wraps.
+At that stage UIA still exposed physical grid rows and NVDA soft-wrap reading
+was not certified. The later correction and live NVDA comparison are recorded
+in [NVDA_WRAP_VALIDATION.md](NVDA_WRAP_VALIDATION.md).
 
 The scroll-edge follow-up passed 888 ordinary tests (seven explicit probes
 excluded), and an additional native ConPTY corpus probe was run manually
