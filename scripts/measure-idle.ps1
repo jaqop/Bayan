@@ -105,12 +105,12 @@ $failed = $false
 
 function Invoke-QuietWindow {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('bayan-idle-' + [Guid]::NewGuid().ToString('N'))
-    $home = Join-Path $root 'home'
+    $runHome = Join-Path $root 'home'
     $temp = Join-Path $root 'temp'
-    New-Item -ItemType Directory -Path $home, (Join-Path $home '.bayan'), $temp -Force | Out-Null
-    [IO.File]::WriteAllText((Join-Path $home '.bayan\config.json'), '{"cursor_blink":false}')
-    $env:USERPROFILE = $home
-    $env:HOME = $home
+    New-Item -ItemType Directory -Path $runHome, (Join-Path $runHome '.bayan'), $temp -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $runHome '.bayan\config.json'), '{"cursor_blink":false}')
+    $env:USERPROFILE = $runHome
+    $env:HOME = $runHome
     $env:TEMP = $temp
     $env:TMP = $temp
     $env:BAYAN_PROFILE = '1'
@@ -151,12 +151,12 @@ function Invoke-QuietWindow {
 
 function Invoke-MinimizedWindow {
     $root = Join-Path ([IO.Path]::GetTempPath()) ('bayan-idle-min-' + [Guid]::NewGuid().ToString('N'))
-    $home = Join-Path $root 'home'
+    $runHome = Join-Path $root 'home'
     $temp = Join-Path $root 'temp'
-    New-Item -ItemType Directory -Path $home, (Join-Path $home '.bayan'), $temp -Force | Out-Null
-    [IO.File]::WriteAllText((Join-Path $home '.bayan\config.json'), '{"cursor_blink":false}')
-    $env:USERPROFILE = $home
-    $env:HOME = $home
+    New-Item -ItemType Directory -Path $runHome, (Join-Path $runHome '.bayan'), $temp -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $runHome '.bayan\config.json'), '{"cursor_blink":false}')
+    $env:USERPROFILE = $runHome
+    $env:HOME = $runHome
     $env:TEMP = $temp
     $env:TMP = $temp
     $env:BAYAN_PROFILE = '1'
