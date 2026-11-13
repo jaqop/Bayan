@@ -93,11 +93,32 @@ line. Redraws count at `redraw()` entry. Presents count only after
 probe does not set `BAYAN_FRAME_COUNTERS`, so that file replace is not on
 the key->frame path.
 
-The latency and idle-memory ceilings below are **provisional wide
-backstops** so the first hosted runs can print real numbers. They are not
-a measured threshold. Replace them from three `windows-latest` runs before
-treating the gate as tight. Idle redraw's zero is the threshold itself,
-not a measured time.
+Three complete `windows-latest` runs of the same probe code (runs
+43519776309, 43520662670, 43520674052), 2026-11-13:
+
+| Run | key->frame p50 | p95 | n | render p50 | render p95 | private MB | working set MB | visible p/r | minimized p/r |
+|---|---|---|---|---|---|---|---|---|---|
+| 43519776309 | 126.4 | 149.3 | 46 | 111.2 | 132.4 | 291.1 | 124.8 | 0/0 | 0/733 |
+| 43520662670 | 128.5 | 154.7 | 46 | 111.2 | 141.9 | 291.4 | 125.1 | 0/0 | 0/643 |
+| 43520674052 | 102.0 | 127.0 | 46 | 88.2 | 107.4 | 291.3 | 124.9 | 0/0 | 0/822 |
+
+- **Latency.** Slowest p95 is 154.7 ms. The baseline is 155 ms and the
+  tolerance is 100%, so the job fails above 310 ms. The same binary, on
+  three earlier runs whose idle step did not start, read p95 134.5, 140.6
+  and 179.1. 179 is inside the 310 ms band. A tighter band would fail a
+  quiet runner change.
+- **Render gap** (key->frame minus key->pty-output), p95: 132.4, 141.9,
+  107.4 on the three runs, and 120.8, 129.8, 151.7 on the earlier ones.
+  That is the same kind of spread as key->frame, not a stable remainder,
+  so it is printed and not gated.
+- **Idle memory.** Private MB 291.1, 291.4, 291.3. Median 291.3. The
+  spread is 0.3 MB, so the tolerance stays 10% (fail above 320.4 MB).
+  Working set was 124.8, 125.1, 124.9 and is not gated.
+- **Visible redraw** was 0 presents and 0 redraws on all three.
+- **Minimized redraw** was 0 presents (the swapchain is occluded) and
+  733, 643, 822 redraws. Report-only until `MINIMIZED_REDRAW_REQUIRED`.
+  The redraws are the 600 ms busy-dot pulse still entering `redraw()`
+  while the window is minimized.
 
 Scripts: `scripts/measure-tap-latency.ps1`, `scripts/measure-idle.ps1`.
 `scripts/measure-latency.ps1` stays the local SendInput tool.

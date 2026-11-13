@@ -23,9 +23,9 @@ PROBE scrollback  10000 lines x 120 cols: +  35.5 MB once full, +  35.5 MB after
 """
 
 PROBES = """
-PROBE latency key->frame p50=10.0 p95=1000.0 n=50
-PROBE latency render p50=2.0 p95=4.0 n=50
-PROBE idle_memory private=10000.0 MB working_set=12000.0 MB
+PROBE latency key->frame p50=120.0 p95=155.0 n=50
+PROBE latency render p50=100.0 p95=130.0 n=50
+PROBE idle_memory private=291.3 MB working_set=125.0 MB
 PROBE idle_redraw visible presents=0 redraws=0 window_s=5
 PROBE idle_redraw minimized presents=0 redraws=0 window_s=5
 """
@@ -113,9 +113,9 @@ class Gate(unittest.TestCase):
 
     def test_new_probes_parse(self):
         got = perf_gate.parse(PROBES)
-        self.assertEqual(got["latency"], {"key->frame p95": 1000.0})
-        self.assertEqual(got["latency_render"], {"p50": 2.0, "p95": 4.0})
-        self.assertEqual(got["idle_memory"], {"private": 10000.0})
+        self.assertEqual(got["latency"], {"key->frame p95": 155.0})
+        self.assertEqual(got["latency_render"], {"p50": 100.0, "p95": 130.0})
+        self.assertEqual(got["idle_memory"], {"private": 291.3})
         self.assertEqual(got["idle_redraw"]["visible presents"], 0.0)
         self.assertEqual(got["idle_redraw"]["minimized redraws"], 0.0)
 

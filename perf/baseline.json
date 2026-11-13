@@ -24,10 +24,10 @@
     "first frame / gpu ready": 1.08
   },
   "latency": {
-    "key->frame p95": 1000
+    "key->frame p95": 155
   },
   "idle_memory": {
-    "private": 10000
+    "private": 291.3
   },
   "idle_redraw": {
     "visible presents": 0,
