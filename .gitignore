@@ -5,3 +5,7 @@
 .claude/skills/
 # Machine-local: absolute paths, approved commands, stale pids.
 .claude/settings.local.json
+
+# Generated Python bytecode is never a source artifact.
+__pycache__/
+*.py[cod]
