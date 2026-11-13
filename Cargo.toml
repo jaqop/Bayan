@@ -54,6 +54,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem", # GetShortPathNameW: ConPTY chokes on spaces in paths
     "Win32_System_Com", # CoInitializeEx on the link-open thread, before ShellExecuteW
     "Win32_System_LibraryLoader", # SetDefaultDllDirectories, AddDllDirectory; ConPTY comes from kernel32
+    "Win32_System_Environment", # ExpandEnvironmentStringsW for an OpenGL ICD REG_EXPAND_SZ
     "Win32_System_ProcessStatus", # EnumProcessModules in the planted-conpty.dll test
     "Win32_System_Threading", # GetCurrentProcess for that module walk
     "Win32_Security", # TokenElevation: an elevated token does not run Lua

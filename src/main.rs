@@ -17,7 +17,22 @@ mod config_watch;
 mod context_menu;
 mod copyclean;
 mod copymode;
+#[cfg(windows)]
 mod dll_search;
+#[cfg(not(windows))]
+mod dll_search {
+    /// Windows selects FXC. There is no other variant on this target.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Dx12ShaderCompiler {
+        Fxc,
+    }
+
+    pub(crate) fn dx12_shader_compiler() -> Dx12ShaderCompiler {
+        Dx12ShaderCompiler::Fxc
+    }
+
+    pub(crate) fn harden_dll_search() {}
+}
 mod elevate;
 mod gpu;
 mod groups;

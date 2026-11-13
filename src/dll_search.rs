@@ -19,6 +19,8 @@
 //!   `vulkan-1.dll` is not linked. Non-Windows targets enable that feature
 //!   for a later Linux port; this process still does not request Vulkan.
 //!   OpenGL stays compiled, as the fallback when DX12 cannot make a device.
+//!   An ICD path that cannot be read or expanded is skipped. DirectX 12
+//!   does not need it, so a bad registry value is not a black window.
 //! - `SetDllDirectoryW("")` drops the current directory.
 //!   `SetDefaultDllDirectories` is called with
 //!   `LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_USER_DIRS`, not
@@ -320,9 +322,7 @@ fn khronos_icd_names(out: &mut Vec<PathBuf>) {
 }
 
 fn display_icd_names(out: &mut Vec<PathBuf>) {
-    use windows_sys::Win32::System::Registry::{
-        RegEnumKeyExW, RegQueryValueExW, HKEY_LOCAL_MACHINE, REG_SZ,
-    };
+    use windows_sys::Win32::System::Registry::{RegEnumKeyExW, HKEY_LOCAL_MACHINE};
     let Some(class) = open_key(
         HKEY_LOCAL_MACHINE,
         r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}",
@@ -362,30 +362,87 @@ fn display_icd_names(out: &mut Vec<PathBuf>) {
         let Some(adapter) = open_key(class.0, &sub_name) else {
             continue;
         };
-        let value = wide("OpenGLDriverName");
-        let mut data = [0u16; 1024];
-        let mut bytes = (data.len() * 2) as u32;
-        let mut kind = 0u32;
-        // SAFETY: `adapter` is open, `value` is NUL-terminated, and `data`
-        // is the buffer `bytes` describes. The call does not retain them.
-        let queried = unsafe {
-            RegQueryValueExW(
-                adapter.0,
-                value.as_ptr(),
-                std::ptr::null(),
-                &mut kind,
-                data.as_mut_ptr().cast(),
-                &mut bytes,
-            )
-        };
-        if queried != 0 || kind != REG_SZ || bytes < 2 || bytes as usize > data.len() * 2 {
+        let Some((kind_raw, units)) = registry_string(&adapter, "OpenGLDriverName") else {
             continue;
-        }
-        let chars = (bytes as usize) / 2;
-        if let Some(path) = path_from_wide(&data[..chars]) {
+        };
+        // A missing value, an unknown type, or an expansion that fails is
+        // skipped. DirectX 12 still starts; this read must not abort it.
+        let Some(kind) = icd_kind(kind_raw) else {
+            continue;
+        };
+        if let Some(path) = icd_path_from_registry(kind, &units, expand_environment_string) {
             out.push(path);
         }
     }
+}
+
+fn icd_kind(raw: u32) -> Option<IcdRegKind> {
+    use windows_sys::Win32::System::Registry::{REG_EXPAND_SZ, REG_MULTI_SZ, REG_SZ};
+    match raw {
+        REG_SZ => Some(IcdRegKind::Sz),
+        REG_EXPAND_SZ => Some(IcdRegKind::ExpandSz),
+        REG_MULTI_SZ => Some(IcdRegKind::MultiSz),
+        _ => None,
+    }
+}
+
+fn registry_string(key: &RegKey, name: &str) -> Option<(u32, Vec<u16>)> {
+    use windows_sys::Win32::System::Registry::RegQueryValueExW;
+    let name = wide(name);
+    let mut bytes = 8192u32;
+    for _ in 0..4 {
+        let mut data = vec![0u8; bytes as usize];
+        let mut kind = 0u32;
+        let mut size = bytes;
+        // SAFETY: `key` is open, `name` is NUL-terminated, and `data` is
+        // the buffer `size` describes. The call does not retain them.
+        // ERROR_MORE_DATA (234) reports the size to retry with.
+        let queried = unsafe {
+            RegQueryValueExW(
+                key.0,
+                name.as_ptr(),
+                std::ptr::null(),
+                &mut kind,
+                data.as_mut_ptr(),
+                &mut size,
+            )
+        };
+        if queried == 234 && size > bytes && size <= 1_048_576 {
+            bytes = size;
+            continue;
+        }
+        if queried != 0 || size == 0 || size as usize > data.len() || !size.is_multiple_of(2) {
+            return None;
+        }
+        let (pairs, _) = data[..size as usize].as_chunks::<2>();
+        let units = pairs.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
+        return Some((kind, units));
+    }
+    None
+}
+
+/// `ExpandEnvironmentStringsW`. `None` if the API fails, so the caller
+/// skips this ICD instead of failing startup.
+fn expand_environment_string(value: &str) -> Option<String> {
+    use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
+    let src = wide(value);
+    let mut cap = 1024u32;
+    for _ in 0..4 {
+        let mut buf = vec![0u16; cap as usize];
+        // SAFETY: `src` is NUL-terminated and outlives the call. `buf` has
+        // `cap` code units. A return of 0 is failure. A return above `cap`
+        // is the required size, including the NUL, and the buffer is not read.
+        let written = unsafe { ExpandEnvironmentStringsW(src.as_ptr(), buf.as_mut_ptr(), cap) };
+        if written == 0 {
+            return None;
+        }
+        if written <= cap {
+            let end = (written as usize).saturating_sub(1);
+            return String::from_utf16(&buf[..end.min(buf.len())]).ok();
+        }
+        cap = written;
+    }
+    None
 }
 
 struct RegKey(windows_sys::Win32::System::Registry::HKEY);
@@ -421,6 +478,95 @@ fn open_key(parent: windows_sys::Win32::System::Registry::HKEY, subkey: &str) ->
         None
     } else {
         Some(RegKey(key))
+    }
+}
+
+/// Registry string kinds that can name an OpenGL ICD.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IcdRegKind {
+    /// REG_SZ. One string, used as written.
+    Sz,
+    /// REG_EXPAND_SZ. One string. The caller expands it after the read.
+    ExpandSz,
+    /// REG_MULTI_SZ. The first non-empty string. Later strings are ignored.
+    MultiSz,
+}
+
+/// The ICD string selected from a registry value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IcdRegString {
+    path: String,
+    /// Set only for [`IcdRegKind::ExpandSz`].
+    expand: bool,
+}
+
+/// Select the ICD string from registry bytes. No Win32 calls: environment
+/// expansion is the `expand` argument, applied only for REG_EXPAND_SZ and
+/// only after the string has been read. `None` (unknown shape, empty, or
+/// an expander that fails) means "skip this value".
+fn icd_path_from_registry(
+    kind: IcdRegKind,
+    units: &[u16],
+    expand: impl FnOnce(&str) -> Option<String>,
+) -> Option<PathBuf> {
+    let parsed = parse_icd_registry(kind, units)?;
+    let text = if parsed.expand {
+        let expanded = expand(parsed.path.as_str())?;
+        clean_icd_text(&expanded)?
+    } else {
+        parsed.path
+    };
+    Some(PathBuf::from(text))
+}
+
+fn parse_icd_registry(kind: IcdRegKind, units: &[u16]) -> Option<IcdRegString> {
+    let path = match kind {
+        IcdRegKind::Sz | IcdRegKind::ExpandSz => one_reg_string(units)?,
+        IcdRegKind::MultiSz => first_nonempty_multi(units)?,
+    };
+    Some(IcdRegString {
+        expand: matches!(kind, IcdRegKind::ExpandSz),
+        path,
+    })
+}
+
+fn one_reg_string(units: &[u16]) -> Option<String> {
+    let end = units
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(units.len());
+    clean_icd_text(&String::from_utf16(&units[..end]).ok()?)
+}
+
+/// NUL-separated strings. An empty entry, including a leading NUL, is not
+/// a path. The list ends at the extra trailing NUL or at the buffer.
+fn first_nonempty_multi(units: &[u16]) -> Option<String> {
+    let mut start = 0usize;
+    while start < units.len() {
+        let end = start
+            + units[start..]
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(units.len() - start);
+        if let Ok(text) = String::from_utf16(&units[start..end]) {
+            if let Some(clean) = clean_icd_text(&text) {
+                return Some(clean);
+            }
+        }
+        if end >= units.len() {
+            break;
+        }
+        start = end + 1;
+    }
+    None
+}
+
+fn clean_icd_text(text: &str) -> Option<String> {
+    let text = text.trim().trim_matches('"');
+    if text.is_empty() || text.len() > 1024 {
+        None
+    } else {
+        Some(text.to_string())
     }
 }
 
@@ -660,6 +806,78 @@ mod tests {
         assert!(search_directories(system(), [beside], None)
             .iter()
             .all(|dir| dir.ends_with("D3D12")));
+    }
+
+    fn utf16_z(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(Some(0)).collect()
+    }
+
+    #[test]
+    fn reg_sz_is_the_string_itself() {
+        let units = utf16_z(r"C:\Windows\System32\DriverStore\FileRepository\pkg\nvoglv64.dll");
+        let got =
+            icd_path_from_registry(IcdRegKind::Sz, &units, |_| panic!("REG_SZ is not expanded"))
+                .unwrap();
+        assert_eq!(
+            got,
+            PathBuf::from(r"C:\Windows\System32\DriverStore\FileRepository\pkg\nvoglv64.dll")
+        );
+    }
+
+    #[test]
+    fn reg_multi_sz_uses_the_first_non_empty_string() {
+        let mut units = utf16_z(r"C:\Windows\System32\DriverStore\FileRepository\a\nvoglv64.dll");
+        units.extend(utf16_z(
+            r"C:\Windows\System32\DriverStore\FileRepository\b\nvoglv64.dll",
+        ));
+        units.push(0);
+        let got = icd_path_from_registry(IcdRegKind::MultiSz, &units, |_| {
+            panic!("REG_MULTI_SZ is not expanded")
+        })
+        .unwrap();
+        assert_eq!(
+            got,
+            PathBuf::from(r"C:\Windows\System32\DriverStore\FileRepository\a\nvoglv64.dll")
+        );
+    }
+
+    #[test]
+    fn reg_multi_sz_skips_an_empty_first_string() {
+        let mut units = vec![0u16];
+        units.extend(utf16_z(
+            r"C:\Windows\System32\DriverStore\FileRepository\nv\nvoglv64.dll",
+        ));
+        units.push(0);
+        let got = icd_path_from_registry(IcdRegKind::MultiSz, &units, |_| {
+            panic!("REG_MULTI_SZ is not expanded")
+        })
+        .unwrap();
+        assert_eq!(
+            got,
+            PathBuf::from(r"C:\Windows\System32\DriverStore\FileRepository\nv\nvoglv64.dll")
+        );
+    }
+
+    #[test]
+    fn reg_expand_sz_is_expanded_after_the_string_is_read() {
+        let units = utf16_z(r"%SystemRoot%\System32\DriverStore\FileRepository\pkg\nvoglv64.dll");
+        let got = icd_path_from_registry(IcdRegKind::ExpandSz, &units, |raw| {
+            assert!(
+                raw.starts_with("%SystemRoot%"),
+                "expansion runs on the string that was read"
+            );
+            Some(raw.replace("%SystemRoot%", r"C:\Windows"))
+        })
+        .unwrap();
+        assert_eq!(
+            got,
+            PathBuf::from(r"C:\Windows\System32\DriverStore\FileRepository\pkg\nvoglv64.dll")
+        );
+        let units = utf16_z(r"%SystemRoot%\System32\foo.dll");
+        assert!(
+            icd_path_from_registry(IcdRegKind::ExpandSz, &units, |_| None).is_none(),
+            "a failed expansion skips the value"
+        );
     }
 
     #[test]

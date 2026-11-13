@@ -38,6 +38,12 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Build
         run: cargo build --locked --all-targets
+      # The real debug binary, before `cargo test` replaces the harness.
+      # A dxcompiler.dll beside it must not be mapped by the time the
+      # renderer is ready. The file is removed before the test step.
+      - name: Planted dxcompiler.dll is not loaded
+        shell: pwsh
+        run: ./scripts/assert-no-planted-dxc.ps1 -BinaryPath target/debug/bayan.exe -PlantSource tests/fixtures/marker_dxcompiler.dll
       # Headless tests include isolated shell/PTY probes; no GUI or GPU.
       # Native signed-host round trips are explicitly run on a standard-token
       # Windows desktop: elevated runners deliberately reject that host.
