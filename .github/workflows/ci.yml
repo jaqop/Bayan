@@ -43,6 +43,52 @@ jobs:
       # run with a live config.json behaves the same as this one.
       - name: Test
         run: cargo test --all-targets
+      # The count used to be a sentence in CLAUDE.md that every pull request
+      # edited by hand, so every pair of them conflicted on it and each
+      # carried a different number. It is counted here instead.
+      - name: Count the tests
+        shell: bash
+        run: |
+          list=$(cargo test --all-targets -- --list --ignored 2>/dev/null | grep -c ': test$' || true)
+          all=$(cargo test --all-targets -- --list 2>/dev/null | grep -c ': test$' || true)
+          echo "tests: $all, of which $list are ignored probes"
+          echo "**$all tests**, of which $list are \`#[ignore]\`d probes." >> "$GITHUB_STEP_SUMMARY"
+
+  # A slower reader or a heavier scrollback fails the pull request. The
+  # probes are the ignored `measure_` tests in term.rs, in a release build;
+  # scripts/perf_gate.py compares them with perf/baseline.json. Throughput is
+  # gated as a share of the bare vte parser measured in the same run, so a
+  # slow runner does not fail it. Three runs, best of each. Startup time and
+  # key-to-frame latency are not gated: they need a window.
+  perf:
+    name: perf gate (reader, scrollback)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (v5.1.0)
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: release-probes
+      - name: The gate's own tests
+        run: python -m unittest scripts/test_perf_gate.py
+      - name: Build the probes
+        run: cargo test --release --no-run
+      - name: Measure
+        shell: bash
+        run: |
+          for run in 1 2 3; do
+            cargo test --release -- --ignored measure_reader_throughput --nocapture --test-threads=1 2>&1 | tee -a probe.log
+            cargo test --release -- --ignored measure_scrollback_memory --nocapture --test-threads=1 2>&1 | tee -a probe.log
+          done
+      - name: Gate
+        shell: bash
+        run: |
+          python scripts/perf_gate.py probe.log --print
+          python scripts/perf_gate.py probe.log | tee -a "$GITHUB_STEP_SUMMARY"
 
   # Enforces the rust-version declared in Cargo.toml. That floor is set by the
   # dependency graph (cosmic-text 0.19 wants 1.89), not by our own source, so

@@ -54,11 +54,12 @@ selection and BiDi paths must do.
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-831 tests across the tree. `render.rs` (100), `term.rs` (99) and `link.rs`
-(66) carry the most; `lua_host.rs` has 46, `shellint.rs` 24, `images.rs` and
-`localpath.rs` 21 each, `mux.rs` 15, `config_watch.rs` 14, `screen_reader.rs`
-11 and `ssh.rs` 7. Three more in `term.rs` are `#[ignore]`d probes, run by
-hand (see Measuring).
+The test count is not written here. CI counts it on every run and puts it
+in the job summary (`cargo test --all-targets -- --list` says the same
+locally). A number in this file was edited by every pull request, so they
+all conflicted on this paragraph and each carried a different figure. Do
+not add one back. `render.rs`, `term.rs` and `link.rs` carry the most
+tests. Three in `term.rs` are `#[ignore]`d probes (see Measuring).
 
 ## Measuring
 
@@ -76,6 +77,16 @@ Measure before optimizing, in release builds:
   SendInput (only while Bayan has the foreground) and summarises the
   `BAYAN_PROFILE` latency lines. It covers winit's key event to the PTY echo
   and to the GPU submit; the OS input queue and the display are outside it.
+
+CI gates two of these on every pull request (the `perf` job):
+`process_chunk` as a share of vte per corpus, and private megabytes once
+the scrollback is full. `scripts/perf_gate.py` compares the probes'
+`PROBE` lines with `perf/baseline.json` and fails on anything more than
+10% worse. The baseline is the hosted runner's own figures, not the
+author's machine. When a change makes a figure 10% better the job says
+so: raise the baseline in the same pull request, or the gain can be given
+back unnoticed. Startup time and key-to-frame latency are not gated; they
+need a window.
 
 Figures from 2026-11-10 on the author's machine (22bc5d6 + this harness):
 `process_chunk` 83 / 49 / 100 MB/s for plain / SGR / Arabic, which is 57 / 27 /
