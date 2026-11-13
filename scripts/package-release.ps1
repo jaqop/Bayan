@@ -43,7 +43,8 @@ $archive = [IO.Compression.ZipFile]::OpenRead($zip)
 try {
     $required = @('bayan.exe','conpty.dll','OpenConsole.exe','ConPTY-LICENSE.txt',
         'LICENSE','NOTICE','README.md','OFL.txt','OFL-KawkabMono.txt','build-identity.json')
-    $present = @($archive.Entries | Where-Object { $_.Name } | ForEach-Object { $_.Name })
+    $required = @($required | ForEach-Object { "$name/$_" })
+    $present = @($archive.Entries | Where-Object { $_.Name } | ForEach-Object { $_.FullName.Replace('\','/') })
     if ($present.Count -ne $required.Count -or @($required | Where-Object { $_ -notin $present }).Count) {
         throw 'Release archive is incomplete or contains unexpected files'
     }
