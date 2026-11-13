@@ -882,8 +882,8 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       key means the same) tracks light and dark. `"dark"` and `"light"`
       lock the pair in `theme.rs`; a named scheme, or any hand-set
       `bg`/`fg`/`palette`, is not replaced when Windows changes. The
-      signal is winit's `ThemeChanged` and `WM_SETTINGCHANGE` whose
-      lParam is `ImmersiveColorSet`; both read
+      signal is winit's `ThemeChanged` (emitted while the window's
+      preferred theme is unset). It reads
       `HKCU\...\Personalize\AppsUseLightTheme` (DWORD 1 is light, anything
       else including a missing value is dark). The terminal palette, the
       tab bar (it already derives from the page colour), and
