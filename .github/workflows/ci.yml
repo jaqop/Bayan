@@ -124,11 +124,20 @@ jobs:
           $env:BAYAN_SHOW_NOW = '1'
           $log = Join-Path $env:TEMP 'bayan_profile.log'
           foreach ($run in 1..5) {
-            $p = Start-Process -FilePath target/release/bayan.exe -PassThru
+            if (Test-Path -LiteralPath $log) { Remove-Item -LiteralPath $log }
+            $p = Start-Process -FilePath target/release/bayan.exe -PassThru -RedirectStandardError (Join-Path $env:RUNNER_TEMP "bayan-stderr-$run.txt")
             Start-Sleep -Seconds 12
+            "bayan processes alive: $(@(Get-Process -Name bayan -ErrorAction SilentlyContinue).Count)"
             if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force } else { "run ${run}: exited with $($p.ExitCode)" }
+            Get-Process -Name bayan -ErrorAction SilentlyContinue | Stop-Process -Force
+            Get-Content -LiteralPath (Join-Path $env:RUNNER_TEMP "bayan-stderr-$run.txt") -ErrorAction SilentlyContinue | Select-Object -First 20
             "--- startup run $run"
-            if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log | Where-Object { $_ -notmatch ' key ' } } else { 'no profile log' }
+            if (Test-Path -LiteralPath $log) {
+              "profile log: $((Get-Item -LiteralPath $log).Length) bytes at $log"
+              Get-Content -LiteralPath $log | Where-Object { $_ -notmatch ' key ' }
+            } else {
+              "no profile log at $log"
+            }
           }
 
   # Enforces the rust-version declared in Cargo.toml. That floor is set by the
