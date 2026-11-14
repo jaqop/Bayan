@@ -2179,14 +2179,29 @@ pub fn trusted_vscode_dirs(
 /// `FOLDERID_ProgramFiles` via `SHGetKnownFolderPath`. Not the
 /// `ProgramFiles` environment variable.
 pub fn known_program_files() -> Option<std::path::PathBuf> {
-    known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles)
+    #[cfg(windows)]
+    {
+        known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 /// `FOLDERID_ProgramFilesX86` via `SHGetKnownFolderPath`.
 pub fn known_program_files_x86() -> Option<std::path::PathBuf> {
-    known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramFilesX86)
+    #[cfg(windows)]
+    {
+        known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramFilesX86)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
+#[cfg(windows)]
 fn known_folder(id: &windows_sys::core::GUID) -> Option<std::path::PathBuf> {
     use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::UI::Shell::SHGetKnownFolderPath;

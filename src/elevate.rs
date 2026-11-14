@@ -228,6 +228,7 @@ pub fn elevated_from_query(opened: bool, query_ok: bool, bit: bool) -> bool {
 /// True when this process token is elevated (UAC's high integrity token),
 /// not merely when the user is a member of Administrators. A failed query
 /// is treated as elevated.
+#[cfg(windows)]
 pub fn process_is_elevated() -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::Security::{
@@ -258,6 +259,12 @@ pub fn process_is_elevated() -> bool {
     }
 }
 
+#[cfg(not(windows))]
+pub fn process_is_elevated() -> bool {
+    // No token to query. A failed query is treated as elevated.
+    true
+}
+
 /// Start `exe` elevated with `args` and return. The caller exits. This does
 /// not wait, does not set a directory, and does not pass an environment
 /// block — `ShellExecuteW` has no parameter for one.
@@ -267,6 +274,7 @@ pub fn relaunch(exe: &Path, args: &[String]) -> Result<(), String> {
     shell_execute_runas(&exe, &parameters)
 }
 
+#[cfg(windows)]
 fn shell_execute_runas(exe: &str, parameters: &str) -> Result<(), String> {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -295,6 +303,12 @@ fn shell_execute_runas(exe: &str, parameters: &str) -> Result<(), String> {
             rc as isize
         ))
     }
+}
+
+#[cfg(not(windows))]
+fn shell_execute_runas(exe: &str, parameters: &str) -> Result<(), String> {
+    let _ = (exe, parameters);
+    Err("elevation uses ShellExecuteW on Windows".into())
 }
 
 fn wide(s: &str) -> Vec<u16> {
