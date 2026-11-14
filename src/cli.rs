@@ -431,6 +431,19 @@ fn join_command(argv: &[String]) -> String {
 /// Write `text` to the parent console when there is one (a `cmd` launch of
 /// the window-subsystem binary). `false` means the caller should show a dialog.
 pub fn write_console(text: &str) -> bool {
+    #[cfg(windows)]
+    {
+        write_console_win(text)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = text;
+        false
+    }
+}
+
+#[cfg(windows)]
+fn write_console_win(text: &str) -> bool {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Console::{
         AttachConsole, GetConsoleMode, GetStdHandle, WriteConsoleW, ATTACH_PARENT_PROCESS,
@@ -482,8 +495,6 @@ pub fn exe_display(exe: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::windows::ffi::OsStringExt;
-
     use super::*;
 
     fn launch(args: &[&str]) -> Launch {
@@ -615,8 +626,12 @@ mod tests {
             assert!(parse(args.iter().copied()).is_err(), "{args:?}");
         }
         // an unpaired surrogate is not Unicode; parsing reports it
-        let bad = OsString::from_wide(&[0xD800]);
-        assert!(parse([bad]).is_err());
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let bad = std::ffi::OsString::from_wide(&[0xD800]);
+            assert!(parse([bad]).is_err());
+        }
     }
 
     #[test]

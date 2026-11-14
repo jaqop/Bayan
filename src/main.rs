@@ -6,6 +6,9 @@
 
 // release builds are pure GUI apps: no companion console window
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Off Windows the Win32 call graph is cfg'd out, so the items it was the
+// only caller of look unused. They are live on the Windows build.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 mod a11y;
 mod bidi;
@@ -17,6 +20,22 @@ mod config_watch;
 mod context_menu;
 mod copyclean;
 mod copymode;
+#[cfg(windows)]
+mod dll_search;
+#[cfg(not(windows))]
+mod dll_search {
+    /// Windows selects FXC. There is no other variant on this target.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Dx12ShaderCompiler {
+        Fxc,
+    }
+
+    pub(crate) fn dx12_shader_compiler() -> Dx12ShaderCompiler {
+        Dx12ShaderCompiler::Fxc
+    }
+
+    pub(crate) fn harden_dll_search() {}
+}
 mod elevate;
 mod gpu;
 mod groups;
@@ -54,13 +73,13 @@ mod term;
 mod theme;
 mod toast;
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 #[path = "../vendor/portable-pty/src/win/conpty_bundle.rs"]
 #[allow(dead_code)] // Same production file, compiled here for the security tests.
 mod conpty_bundle;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod conpty_load;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 #[path = "../vendor/portable-pty/src/win/conpty_resolve.rs"]
 // Vendored portable-pty code: its unsafe blocks are upstream's to document.
 #[allow(clippy::undocumented_unsafe_blocks)]
@@ -97,6 +116,107 @@ type PaneSnap = (
 /// The Windows caret rhythm; kitty's idea on top: stop after 15s idle.
 const BLINK_MS: u128 = 530;
 const BLINK_STOP: std::time::Duration = std::time::Duration::from_secs(15);
+/// Busy-dot heartbeat. Only while the window is showing: a background tab's
+/// green dot fades ~2s after its last output, and the tab bar is the only
+/// thing this tick paints.
+const BUSY_PULSE: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// What a paint request is allowed to do.
+///
+/// `Redraw` calls into winit. `Defer` does not: a minimized, hidden, or
+/// occluded window must not enter `redraw` (that entry is what the idle
+/// perf gate counts). The restore path asks again when the window becomes
+/// visible; nothing is stored here. `Skip` is a background tab's grid while
+/// the window is up — the bytes are already applied, and the busy-dot pulse
+/// paints the tab bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaintGate {
+    Redraw,
+    Defer,
+    Skip,
+}
+
+/// `on_screen` is the active tab's grid, or chrome (title, bell, cwd,
+/// progress, the busy-dot pulse). A background tab's own grid is not.
+fn gate_paint(window_shown: bool, on_screen: bool) -> PaintGate {
+    if !window_shown {
+        PaintGate::Defer
+    } else if on_screen {
+        PaintGate::Redraw
+    } else {
+        PaintGate::Skip
+    }
+}
+
+/// The window can be drawn. Occluded, minimized, and quake-hidden are each
+/// enough to stop every paint.
+fn window_paints(occluded: bool, minimized: bool, hidden: bool) -> bool {
+    !occluded && !minimized && !hidden
+}
+
+/// Windows reports a minimized window as a 0×0 client size, and
+/// `Window::is_minimized` is the iconic bit. Either one means minimized.
+/// `None` (the query failed) does not.
+fn minimized_now(size_empty: bool, is_minimized: Option<bool>) -> bool {
+    size_empty || is_minimized.unwrap_or(false)
+}
+
+/// Drop the minimized flag only when the OS shows a real client size and
+/// says the window is not iconic. An unknown query keeps the flag, so a
+/// failed `is_minimized` cannot resume painting on its own.
+fn minimized_cleared(size_empty: bool, is_minimized: Option<bool>) -> bool {
+    !size_empty && is_minimized == Some(false)
+}
+
+/// One paint when the window goes from not showing to showing. A later
+/// event in the same restore must not ask again just because it also
+/// noticed.
+fn became_shown(was_shown: bool, now_shown: bool) -> bool {
+    !was_shown && now_shown
+}
+
+/// Visual deadlines the loop may arm, before visibility is applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WakeInputs {
+    shown: bool,
+    /// A background tab produced output inside the busy-dot window.
+    background_busy: bool,
+    blink: Option<Instant>,
+    scroll: Option<Instant>,
+    scrollbar: Option<Instant>,
+    notice: Option<Instant>,
+    /// Screen reader. Not a paint, so it still wakes a hidden window.
+    reader: Option<Instant>,
+}
+
+/// The next `ControlFlow` deadline, and whether the busy-dot pulse paints
+/// on this turn. `wake == None` is `ControlFlow::Wait`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WakePlan {
+    pulse_redraw: bool,
+    wake: Option<Instant>,
+}
+
+fn plan_idle(now: Instant, pulse: std::time::Duration, src: WakeInputs) -> WakePlan {
+    let mut wake: Option<Instant> = None;
+    let mut push = |at: Option<Instant>| {
+        if let Some(at) = at {
+            wake = Some(wake.map_or(at, |earliest| earliest.min(at)));
+        }
+    };
+    let pulse_redraw = src.shown && src.background_busy;
+    if src.shown {
+        if src.background_busy {
+            push(Some(now + pulse));
+        }
+        push(src.blink);
+        push(src.scroll);
+        push(src.scrollbar);
+        push(src.notice);
+    }
+    push(src.reader);
+    WakePlan { pulse_redraw, wake }
+}
 
 /// `BAYAN_TAP` waits this long after the last PTY read before the first key,
 /// so the prompt's own output is not paired with the sample.
@@ -154,12 +274,15 @@ fn consume_guard_release(pending: &mut bool, state: ElementState, button: MouseB
 /// The system notification sound (bell mode "sound"). Async — never blocks
 /// the UI thread.
 fn beep() {
-    // SAFETY: MessageBeep takes one integer sound type and no pointers,
-    // and is safe to call from any thread.
-    unsafe {
-        // windows-sys files MessageBeep under Diagnostics::Debug (user32's
-        // winuser.h function, but that's where the metadata puts it)
-        windows_sys::Win32::System::Diagnostics::Debug::MessageBeep(0);
+    #[cfg(windows)]
+    {
+        // SAFETY: MessageBeep takes one integer sound type and no pointers,
+        // and is safe to call from any thread.
+        unsafe {
+            // windows-sys files MessageBeep under Diagnostics::Debug (user32's
+            // winuser.h function, but that's where the metadata puts it)
+            windows_sys::Win32::System::Diagnostics::Debug::MessageBeep(0);
+        }
     }
 }
 
@@ -2016,6 +2139,15 @@ struct App {
     last_input: Instant,
     /// the blink phase the last frame actually drew (change → redraw)
     blink_drawn_on: bool,
+    /// `WindowEvent::Occluded(true)`. Windows does not emit this today;
+    /// minimized and hidden cover the cases it does not.
+    occluded: std::cell::Cell<bool>,
+    /// Client size is 0×0, or `Window::is_minimized`.
+    minimized: std::cell::Cell<bool>,
+    /// Quake hide, or `is_visible() == Some(false)` after the first frame.
+    /// The startup window is created hidden and is not this: the first
+    /// frame still has to paint.
+    hidden: std::cell::Cell<bool>,
     /// the settings panel (Ctrl+,) with its selected row, when open
     settings: Option<usize>,
     /// window focus (finish notifications only fire when nobody's looking)
@@ -2310,6 +2442,9 @@ impl App {
             link_cache: link::SpanCache::default(),
             last_input: Instant::now(),
             blink_drawn_on: true,
+            occluded: std::cell::Cell::new(false),
+            minimized: std::cell::Cell::new(false),
+            hidden: std::cell::Cell::new(false),
             settings: None,
             focused: false,
             clicks: ClickTracker::new(),
@@ -2375,10 +2510,106 @@ impl App {
         }
     }
 
+    /// Ask winit for one frame.
+    ///
+    /// Every paint goes through here (heal retries included). A window that
+    /// is occluded, minimized, or hidden does not get `Window::request_redraw`
+    /// and does not enter `redraw`. The grid, the bell, and the title are
+    /// already updated by the caller. Showing the window again is what
+    /// asks for the frame: `set_occluded(false)`, a non-zero resize, and
+    /// `reveal_window` each call this once they are showing.
     fn request_redraw(&self) {
+        if !matches!(gate_paint(self.shown(), true), PaintGate::Redraw) {
+            return;
+        }
         if let Some(w) = &self.window {
             w.request_redraw();
         }
+    }
+
+    /// The window is on screen. Before the first present the real window is
+    /// still hidden on purpose, and this stays true so that frame can land.
+    /// After it, a 0×0 size, the iconic bit, or `is_visible() == false`
+    /// latches minimized or hidden. Those latches are cleared by the
+    /// restore path, not here — a minimize that has not reached
+    /// `IsIconic` yet must not be undone by a stale query.
+    fn shown(&self) -> bool {
+        if self.occluded.get() {
+            return false;
+        }
+        self.observe_window();
+        window_paints(false, self.minimized.get(), self.hidden.get())
+    }
+
+    fn observe_window(&self) {
+        if !self.first_frame {
+            return;
+        }
+        let Some(w) = &self.window else {
+            return;
+        };
+        let size = w.inner_size();
+        let empty = size.width == 0 || size.height == 0;
+        if minimized_now(empty, w.is_minimized()) {
+            self.minimized.set(true);
+        }
+        if w.is_visible() == Some(false) {
+            self.hidden.set(true);
+        }
+    }
+
+    /// The OS reports a restored window (real size, not iconic) after we
+    /// had latched minimized. One paint, and only when nothing else is
+    /// still hiding the window.
+    fn release_minimized_if_restored(&self) {
+        if !self.first_frame || !self.minimized.get() {
+            return;
+        }
+        let Some(w) = &self.window else {
+            return;
+        };
+        let size = w.inner_size();
+        let empty = size.width == 0 || size.height == 0;
+        if !minimized_cleared(empty, w.is_minimized()) {
+            return;
+        }
+        // The flag was set, so the window was not showing. Clearing it
+        // paints only when occlusion and quake-hide are clear too.
+        self.minimized.set(false);
+        if window_paints(self.occluded.get(), false, self.hidden.get()) {
+            self.request_redraw();
+        }
+    }
+
+    /// Quake summon and the toast click: the window is being put on screen.
+    fn reveal_window(&self) {
+        self.hidden.set(false);
+        self.minimized.set(false);
+        self.occluded.set(false);
+        if let Some(w) = &self.window {
+            w.set_visible(true);
+            w.set_minimized(false);
+            w.focus_window();
+        }
+        self.apply_opacity();
+        self.request_redraw();
+    }
+
+    fn set_occluded(&self, occluded: bool) {
+        let was_shown = self.flags_shown();
+        self.occluded.set(occluded);
+        if became_shown(was_shown, self.flags_shown()) {
+            self.request_redraw();
+        }
+    }
+
+    fn flags_shown(&self) -> bool {
+        window_paints(self.occluded.get(), self.minimized.get(), self.hidden.get())
+    }
+
+    /// A pane of the tab that is on screen. Background tabs are not.
+    fn pane_on_active_tab(&self, id: u64) -> bool {
+        self.find_pane(id).is_some_and(|(ti, _)| ti == self.active)
     }
 
     /// Re-read High Contrast and the text-size slider. A real change
@@ -2486,6 +2717,7 @@ impl App {
             // OSC 10/11 answer with what is on screen now
             term::set_query_colors(r.query_colors());
         }
+        #[cfg(windows)]
         self.set_title_bar_dark(colors.title_bar_dark);
         self.request_redraw();
     }
@@ -2514,6 +2746,7 @@ impl App {
             // a program that asks OSC 11 after the switch sees the new side
             term::set_query_colors(r.query_colors());
         }
+        #[cfg(windows)]
         self.set_title_bar_dark(after.colors.title_bar_dark);
         self.request_redraw();
     }
@@ -2634,6 +2867,7 @@ impl App {
     /// included — per-pixel background alpha needs a transparent swapchain,
     /// which DX12 flip-model doesn't offer wgpu today).
     /// The window's Win32 handle (tray icon, toasts, layered alpha).
+    #[cfg(windows)]
     fn hwnd(&self) -> Option<windows_sys::Win32::Foundation::HWND> {
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let w = self.window.as_ref()?;
@@ -2646,6 +2880,7 @@ impl App {
     /// Remove the tray icon, persist the session, leave. Every exit path
     /// funnels here so no ghost icon lingers in the tray.
     fn quit(&mut self, el: &ActiveEventLoop) {
+        #[cfg(windows)]
         if let Some(h) = self.hwnd() {
             toast::remove(h);
         }
@@ -2655,7 +2890,12 @@ impl App {
             // The window is about to close, so its error card cannot be seen.
             // An explicit save failure must be acknowledged before exit.
             if let Some(error) = &self.blocked_link {
+                #[cfg(windows)]
                 show_error_dialog(self.hwnd(), &error.reason, &error.shown);
+                #[cfg(not(windows))]
+                {
+                    let _ = error;
+                }
             }
         }
         // BAYAN-014: end every shell (and, through ConPTY, its console) now,
@@ -2679,6 +2919,7 @@ impl App {
         self.request_redraw();
     }
 
+    #[cfg(windows)]
     fn apply_opacity(&self) {
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let Some(w) = &self.window else { return };
@@ -2709,10 +2950,15 @@ impl App {
         }
     }
 
+    #[cfg(not(windows))]
+    fn apply_opacity(&self) {}
+
     fn apply_window_frame(&self) {
+        #[cfg(windows)]
         self.set_title_bar_dark(render::resolved_colors(&self.config).title_bar_dark);
     }
 
+    #[cfg(windows)]
     fn set_title_bar_dark(&self, title_bar_dark: bool) {
         let Some(hwnd) = self.hwnd() else { return };
         use windows_sys::Win32::Graphics::Dwm::{
@@ -2760,6 +3006,7 @@ impl App {
         self.remember(on, |c, v| c.notifications = Some(v));
         if on {
             // preview the toast you just turned on
+            #[cfg(windows)]
             if let Some(h) = self.hwnd() {
                 toast::show(
                     h,
@@ -4973,6 +5220,7 @@ impl App {
         // BAYAN_TOAST=<title|1>: fire a sample toast at startup (M19
         // verification; a custom value becomes the title, so direction
         // experiments run without rebuilding)
+        #[cfg(windows)]
         if let Some(v) = dev_hook("BAYAN_TOAST") {
             if let Some(h) = self.hwnd() {
                 let t = v.to_str().unwrap_or("1");
@@ -6285,9 +6533,14 @@ impl App {
         if !toast_due(self.last_toast, now, TOAST_MIN_GAP) {
             return;
         }
+        #[cfg(windows)]
         if let Some(h) = self.hwnd() {
             self.last_toast = Some(now);
             toast::show(h, title, body);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (title, body);
         }
     }
 
@@ -7062,6 +7315,13 @@ impl App {
         st.push(t);
     }
 
+    /// Paint one frame.
+    ///
+    /// Callers enter this only while the window is showing. The minimized
+    /// idle gate counts entries here and presents inside it, and requires
+    /// both to stay at zero while a minimized window has a busy background
+    /// tab. `RedrawRequested` checks first; do not add an early return in
+    /// front of that count.
     fn redraw(&mut self) {
         crate::prof::note_redraw();
         // Before a client, this is a flag check. After one, an unchanged
@@ -7161,7 +7421,9 @@ impl App {
             })
             .collect();
         let config_notice = self.config_notice.clone();
-        let Some(window) = self.window.as_ref() else {
+        // Owned Arc so a later `request_redraw` can borrow `self` while
+        // this handle is still used for the present and the first show.
+        let Some(window) = self.window.clone() else {
             return;
         };
         let px = window.inner_size();
@@ -7615,9 +7877,11 @@ impl App {
             .collect();
         if !gpu.render(&verts, &quads, bg) {
             // Retry once after reconfiguring, without spinning on occlusion.
+            // `request_redraw` no-ops while the window is not showing, so a
+            // surface that comes back occluded does not schedule another entry.
             self.last_frame_size = None;
             if surface_resized || heal {
-                window.request_redraw();
+                self.request_redraw();
             }
             return;
         }
@@ -7627,11 +7891,14 @@ impl App {
         self.last_frame.extend_from_slice(frame_key);
         self.last_frame_size = Some(px);
         if heal {
-            window.request_redraw();
+            self.request_redraw();
         }
         if !self.first_frame {
             self.first_frame = true;
             window.set_visible(true);
+            // ShowWindow can deliver a paint before it returns. That paint
+            // must not latch "hidden" from the pre-show visibility bit.
+            self.hidden.set(false);
             // winit reapplies ITS OWN style flags on visibility changes,
             // wiping the layered bit — restore the configured alpha after
             self.apply_opacity();
@@ -7679,7 +7946,25 @@ impl App {
         // the chunk may have enabled focus reporting; tell the
         // program whether the window is looking at it
         self.sync_focus(None);
-        self.request_redraw();
+        // The grid is already updated. Paint only the tab that is on
+        // screen, and not at all while the window itself is hidden:
+        // a deferred frame is drawn once on restore. A background tab
+        // while the window is up leaves the busy-dot pulse to repaint
+        // the tab bar; this chunk does not.
+        let on_screen = self.pane_on_active_tab(id);
+        match gate_paint(self.shown(), on_screen) {
+            PaintGate::Redraw => self.request_redraw(),
+            PaintGate::Defer => {
+                // The active tab is what the screen reader speaks. Publish
+                // without entering `redraw`, so a hidden window still
+                // announces and a minimized one does not present. The
+                // restore path paints when the window is showing again.
+                if on_screen {
+                    self.publish_reader();
+                }
+            }
+            PaintGate::Skip => {}
+        }
     }
 }
 
@@ -7699,13 +7984,16 @@ impl ApplicationHandler<UserEvent> for App {
         // and generated from assets/bayan.ico so the two can't drift apart.
         const ICON_RGBA: &[u8] = include_bytes!("../assets/icon_64.rgba");
         let icon = winit::window::Icon::from_rgba(ICON_RGBA.to_vec(), 64, 64).ok();
-        use winit::platform::windows::WindowAttributesExtWindows;
-        let mut attrs = Window::default_attributes()
-            // M24: no OS title bar. The tab strip IS the title bar, so the
-            // window carries one row of chrome instead of two. We draw the
-            // caption buttons and handle drag/resize ourselves below.
-            .with_decorations(false)
-            .with_undecorated_shadow(true)
+        // M24: no OS title bar. The tab strip IS the title bar, so the
+        // window carries one row of chrome instead of two. We draw the
+        // caption buttons and handle drag/resize ourselves below.
+        let mut attrs = Window::default_attributes().with_decorations(false);
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs = attrs.with_undecorated_shadow(true);
+        }
+        attrs = attrs
             .with_title(elevate::window_title(self.elevated))
             .with_window_icon(icon)
             .with_visible(false)
@@ -7775,6 +8063,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.show_next_lua_card();
         self.apply_opacity(); // the configured window alpha, from frame one
         self.apply_window_frame();
+        #[cfg(windows)]
         if let Some(h) = self.hwnd() {
             // the tray icon: toast anchor + summon target
             if !toast::init(h) {
@@ -7803,6 +8092,7 @@ impl ApplicationHandler<UserEvent> for App {
         // SAFETY: a null hwnd is the documented way to have WM_HOTKEY posted
         // to this thread's queue; the rest are plain integers. A chord another
         // program owns makes it return 0, which is ignored.
+        #[cfg(windows)]
         unsafe {
             use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
                 RegisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, VK_OEM_3,
@@ -7890,6 +8180,8 @@ impl ApplicationHandler<UserEvent> for App {
                     let background = ti != self.active;
                     if background {
                         self.tabs[ti].attention = true;
+                        // Hidden/minimized/occluded: no winit redraw. The
+                        // attention flag above is what restore will draw.
                         self.request_redraw();
                     }
                     // sound only when you could have missed it: another tab,
@@ -7946,7 +8238,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some((ti, pi)) = self.find_pane(id) {
                     if self.tabs[ti].panes[pi].progress != p {
                         self.tabs[ti].panes[pi].progress = p;
-                        self.request_redraw(); // the tab bar and cockpit draw it
+                        // The tab bar draws it. A hidden window defers the paint.
+                        self.request_redraw();
                     }
                 }
             }
@@ -7968,6 +8261,8 @@ impl ApplicationHandler<UserEvent> for App {
                             let body = self.tabs[ti].label();
                             self.toast_from_pty(title, &body);
                         }
+                        // Attention and the toast are already recorded. The
+                        // paint waits if the window is not showing.
                         self.request_redraw();
                     }
                 }
@@ -7988,7 +8283,7 @@ impl ApplicationHandler<UserEvent> for App {
                         self.tabs[ti].title = base;
                     }
                 }
-                self.request_redraw(); // tab titles live in the frame
+                self.request_redraw(); // tab title; deferred while the window is hidden
             }
             UserEvent::RendererReady(r) => {
                 crate::prof::mark("renderer ready");
@@ -8098,27 +8393,26 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        // quake toggle: summon Bayan from anywhere / tuck it away again
+        // quake toggle: summon Bayan from anywhere / tuck it away again.
+        // Hiding latches before the paint schedule below, so this turn
+        // does not arm a blink or a busy-dot wake.
         if QUAKE_HIT.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            if let Some(w) = &self.window {
-                if self.focused && w.is_visible().unwrap_or(true) {
+            let visible = self
+                .window
+                .as_ref()
+                .is_some_and(|w| w.is_visible().unwrap_or(true));
+            if self.focused && visible {
+                self.hidden.set(true);
+                if let Some(w) = &self.window {
                     w.set_visible(false);
-                } else {
-                    w.set_visible(true);
-                    w.set_minimized(false);
-                    w.focus_window();
-                    self.apply_opacity(); // set_visible wipes the layered bit
                 }
+            } else {
+                self.reveal_window();
             }
         }
         // a toast/tray click summons (never hides — that's the quake key)
         if SUMMON_HIT.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            if let Some(w) = &self.window {
-                w.set_visible(true);
-                w.set_minimized(false);
-                w.focus_window();
-                self.apply_opacity(); // set_visible wipes the layered bit
-            }
+            self.reveal_window();
         }
         // High Contrast or the text-size slider changed. Re-read now; a
         // rebuild applies it on the next frame, without restarting.
@@ -8136,56 +8430,57 @@ impl ApplicationHandler<UserEvent> for App {
                 self.tap = None;
             }
         }
-        // busy dots decay after ~2s of quiet: keep repainting on a slow
-        // heartbeat only while any background tab is (or just was) active
-        let any_busy = self
+        self.observe_window();
+        self.release_minimized_if_restored();
+        // Busy dots, blink, smooth scroll, and the scrollbar are paints.
+        // None of them are scheduled while the window is not showing, so
+        // the loop can Wait. The screen reader is not a paint and still
+        // wakes. A background tab's grid is not painted here either; the
+        // pulse only refreshes the tab-bar dot, and only while visible.
+        let shown = self.shown();
+        let background_busy = self
             .tabs
             .iter()
             .enumerate()
             .any(|(i, t)| t.busy(i == self.active));
-        let mut wake: Option<Instant> = tap_wake;
-        // A plain if, not a let-chain: edition 2021, and 1.89 still rejects
-        // `&& let` (rustfmt on later stable only accepts it in edition 2024).
-        let pump_at = if self.idle_busy { self.busy_at } else { None };
-        if let Some(at) = pump_at {
-            wake = Some(wake.map_or(at, |w| w.min(at)));
-        }
-        if any_busy {
-            let at = Instant::now() + std::time::Duration::from_millis(600);
-            wake = Some(wake.map_or(at, |w| w.min(at)));
-            self.request_redraw();
-        }
-        // cursor blink: wake exactly at the next phase flip (or the 15s
-        // park); an idle window schedules nothing and truly sleeps
-        let (blink_on, blink_wake) = self.cursor_blink_state();
-        if blink_on != self.blink_drawn_on {
-            self.request_redraw();
-        }
-        if let Some(b) = blink_wake {
-            wake = Some(wake.map_or(b, |w| w.min(b)));
-        }
-        if let Some(t) = self.tick_smooth_scroll() {
-            wake = Some(wake.map_or(t, |w| w.min(t)));
-        }
-        // a scrollbar that auto-hides wakes once, then the next frame drops
-        // it and the window goes back to sleeping
-        let tick = self
-            .bars
-            .tick(self.config.scrollbar.autohide_on(), Instant::now());
-        if tick.redraw {
-            self.request_redraw();
-        }
-        if let Some(t) = tick.wake {
-            wake = Some(wake.map_or(t, |w| w.min(t)));
-        }
-        if let Some(until) = self.config_notice.as_ref().and_then(|notice| notice.until) {
-            if Instant::now() >= until {
-                self.config_notice = None;
+        let blink = if shown {
+            let (blink_on, blink_wake) = self.cursor_blink_state();
+            if blink_on != self.blink_drawn_on {
                 self.request_redraw();
-            } else {
-                wake = Some(wake.map_or(until, |w| w.min(until)));
             }
-        }
+            blink_wake
+        } else {
+            None
+        };
+        let scroll = if shown {
+            self.tick_smooth_scroll()
+        } else {
+            None
+        };
+        let scrollbar = if shown {
+            let tick = self
+                .bars
+                .tick(self.config.scrollbar.autohide_on(), Instant::now());
+            if tick.redraw {
+                self.request_redraw();
+            }
+            tick.wake
+        } else {
+            None
+        };
+        let notice = if shown {
+            let until = self.config_notice.as_ref().and_then(|notice| notice.until);
+            match until {
+                Some(until) if Instant::now() >= until => {
+                    self.config_notice = None;
+                    self.request_redraw();
+                    None
+                }
+                until => until,
+            }
+        } else {
+            None
+        };
         // The burst is spoken once the hold elapses, and a stamp that
         // arrived inside the 10 Hz window is published when that window ends.
         let now = Instant::now();
@@ -8194,13 +8489,30 @@ impl ApplicationHandler<UserEvent> for App {
         {
             self.publish_reader();
         }
-        let soon = match (self.reader_deadline, self.reader_tree_at) {
+        let reader = match (self.reader_deadline, self.reader_tree_at) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        if let Some(at) = soon {
-            wake = Some(wake.map_or(at, |w| w.min(at)));
+        let plan = plan_idle(
+            now,
+            BUSY_PULSE,
+            WakeInputs {
+                shown,
+                background_busy,
+                blink,
+                scroll,
+                scrollbar,
+                notice,
+                reader,
+            },
+        );
+        if plan.pulse_redraw {
+            self.request_redraw();
         }
+        // The idle pump and the latency tap are not paints: they wake even
+        // while the window is hidden, which is what the minimized probe needs.
+        let pump_at = if self.idle_busy { self.busy_at } else { None };
+        let wake = [plan.wake, tap_wake, pump_at].into_iter().flatten().min();
         match wake {
             Some(t) => el.set_control_flow(ControlFlow::WaitUntil(t)),
             None => el.set_control_flow(ControlFlow::Wait),
@@ -8241,7 +8553,19 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseWheel { delta, .. } => self.mouse_wheel(delta),
             WindowEvent::KeyboardInput { event, .. } => self.key_input(&event, el),
             WindowEvent::Ime(ime) => self.ime_input(ime),
-            WindowEvent::RedrawRequested => self.redraw(),
+            // winit does not emit this on Windows today. Handle it anyway:
+            // a build that starts sending it, and every other backend,
+            // must stop painting while the window is covered.
+            WindowEvent::Occluded(occluded) => self.set_occluded(occluded),
+            // Do not enter `redraw` while the window is not showing. The
+            // idle perf gate counts entries to `redraw`; an OS paint of a
+            // minimized window has to miss that function entirely.
+            WindowEvent::RedrawRequested => {
+                // Drop the OS paint while hidden. Restore asks again.
+                if self.shown() {
+                    self.redraw();
+                }
+            }
             WindowEvent::ThemeChanged(theme) => {
                 // winit emits this from WM_SETTINGCHANGE only while the
                 // window's preferred theme is unset. Do not call set_theme.
@@ -8279,79 +8603,10 @@ fn blur_forgets_held_keys(focused: bool, held: &mut Vec<winit::keyboard::Physica
     }
 }
 
-/// Drop the current directory from the DLL search path before anything else
-/// in this process loads a library by name.
-///
-/// `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR)`
-/// (0x800 | 0x200) is available on Windows 8+ and is intentionally not
-/// called. wgpu-hal loads `d3d12.dll` and `dxgi.dll` by bare name
-/// (`libloading` → `LoadLibraryW`). The inbox `d3d12.dll` then maps
-/// `D3D12Core.dll` from `%SystemRoot%\System32\D3D12`, and the GL fallback
-/// loads an ICD from `DriverStore\FileRepository\...`. Those neighbours are
-/// not System32 itself and not the application directory.
-/// `SetDefaultDllDirectories` replaces the process search path permanently
-/// and does not accept `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` (that flag is
-/// per `LoadLibraryEx`). A missed dependency there is a black window, and
-/// neither CI nor this call can create a device to prove it still works.
-/// `SetDllDirectoryW("")` only removes the CWD, which is what Microsoft
-/// documents for this mitigation, and leaves System32, the application
-/// directory, and PATH in place for DirectX and GL.
-///
-/// ConPTY does not depend on this call. `CreatePseudoConsole`,
-/// `ResizePseudoConsole`, and `ClosePseudoConsole` come from `kernel32.dll`
-/// opened with `LoadLibraryExW(L"kernel32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32)`.
-/// `conpty.dll` is never passed to the loader.
-///
-/// NEW-04 (partly): the application directory still precedes System32 for a
-/// bare name, so a `d3d12.dll` planted beside `bayan.exe` (a Downloads
-/// folder, a writable `target\release`) would load. Without touching the
-/// search order above, the graphics DLLs wgpu loads DYNAMICALLY by bare name
-/// are mapped first from System32 only (`LOAD_LIBRARY_SEARCH_SYSTEM32`); a
-/// later `LoadLibraryW("d3d12.dll")` returns the module already in memory.
-/// Their own dependencies (D3D12Core, the DriverStore ICDs) resolve as before.
-///
-/// NOT covered: `dxgi.dll` and `opengl32.dll` are STATIC imports of the exe
-/// (wgpu-hal's `windows` raw-dylib calls), resolved by the loader before
-/// `main` runs, so nothing here can reach them. Closing that needs
-/// `/DEPENDENTLOADFLAG:0x800` at link time, which also restricts every other
-/// static import (the VC runtime among them) to System32 — untested, so not
-/// done. Until then: install Bayan in a folder only you can write
-/// (`%LOCALAPPDATA%\Programs\Bayan`), not run it from Downloads.
-pub(crate) fn harden_dll_search() {
-    use windows_sys::Win32::System::LibraryLoader::{
-        LoadLibraryExW, SetDllDirectoryW, LOAD_LIBRARY_SEARCH_SYSTEM32,
-    };
-    // An empty string removes the CWD. NULL would put it back.
-    let empty = [0u16];
-    // SAFETY: `empty` is a NUL-terminated UTF-16 string that outlives the
-    // call, and SetDllDirectoryW copies it rather than keeping the pointer.
-    unsafe {
-        let _ = SetDllDirectoryW(empty.as_ptr());
-    }
-    for name in GPU_SYSTEM_DLLS {
-        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-        // SAFETY: `wide` is NUL-terminated and outlives the call; the file
-        // handle argument must be null, and the flag restricts the search to
-        // System32. The module stays loaded for the life of the process on
-        // purpose, so the returned handle is not freed.
-        unsafe {
-            let _ = LoadLibraryExW(
-                wide.as_ptr(),
-                std::ptr::null_mut(),
-                LOAD_LIBRARY_SEARCH_SYSTEM32,
-            );
-        }
-    }
-}
+// Graphics DLL search. The decision and the path checks are in `dll_search`.
+pub(crate) use dll_search::harden_dll_search;
 
-/// Graphics DLLs wgpu-hal loads dynamically by bare name on Windows (DX12
-/// path; `gpu.rs` asks for DX12 | GL), pre-mapped from System32 by
-/// `harden_dll_search` (NEW-04). Not listed: `dxgi.dll` / `opengl32.dll`
-/// (static imports, already loaded before `main`), and `dxcompiler.dll` /
-/// `libEGL.dll`, which are not inbox System32 components (pinning an old
-/// inbox copy could break the DXC path).
-const GPU_SYSTEM_DLLS: &[&str] = &["d3d12.dll", "dcomp.dll", "d3dcompiler_47.dll"];
-
+#[cfg(windows)]
 fn show_error_dialog(
     owner: Option<windows_sys::Win32::Foundation::HWND>,
     title: &str,
@@ -8372,6 +8627,7 @@ fn show_error_dialog(
     }
 }
 
+#[cfg(windows)]
 fn show_info_dialog(text: &str) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
 
@@ -8392,7 +8648,12 @@ fn show_info_dialog(text: &str) {
 /// parent (cmd) sees the text; Explorer gets a dialog instead of silence.
 fn present(text: &str) {
     if !cli::write_console(text) {
+        #[cfg(windows)]
         show_info_dialog(text);
+        #[cfg(not(windows))]
+        {
+            let _ = text;
+        }
     }
 }
 
@@ -8409,10 +8670,14 @@ struct Startup {
 }
 
 fn main() -> std::process::ExitCode {
+    // Before dispatch, and before any other LoadLibrary this process does.
+    // Delay-loaded graphics imports have not been resolved yet.
+    harden_dll_search();
     match dispatch() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("bayan: {error}");
+            #[cfg(windows)]
             show_error_dialog(None, tr("تعذّر بدء بيان", "Bayan could not run"), &error);
             std::process::ExitCode::FAILURE
         }
@@ -8540,6 +8805,7 @@ fn cli_start_dir(
 
 /// The subclass and the call-wnd hook both go through this. A message
 /// that is not a settings change leaves the dirty bit alone.
+#[cfg(windows)]
 fn note_a11y_message(message: u32) {
     if a11y::message_triggers_reread(message) {
         A11Y_DIRTY.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -8548,6 +8814,7 @@ fn note_a11y_message(message: u32) {
 
 /// `SetWindowSubclass` procedure. `DefSubclassProc` keeps the message
 /// moving; a null hwnd is the unit test, which has no window to forward to.
+#[cfg(windows)]
 unsafe extern "system" fn a11y_subclass_proc(
     hwnd: windows_sys::Win32::Foundation::HWND,
     msg: u32,
@@ -8580,6 +8847,7 @@ unsafe extern "system" fn a11y_subclass_proc(
     }
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn a11y_call_hook(
     code: i32,
     wparam: windows_sys::Win32::Foundation::WPARAM,
@@ -8612,6 +8880,7 @@ unsafe extern "system" fn a11y_call_hook(
 /// comctl32 v6 is not the active context the export is missing, and the
 /// thread's `WH_CALLWNDPROC` hook is the path that still sees a sent
 /// `WM_SETTINGCHANGE`.
+#[cfg(windows)]
 fn install_a11y_watch(hwnd: windows_sys::Win32::Foundation::HWND) {
     A11Y_HWND.store(hwnd, std::sync::atomic::Ordering::Relaxed);
     if try_set_window_subclass(hwnd) {
@@ -8641,6 +8910,7 @@ fn install_a11y_watch(hwnd: windows_sys::Win32::Foundation::HWND) {
     }
 }
 
+#[cfg(windows)]
 fn unhook_a11y() {
     let hook = A11Y_HOOK.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
     if hook.is_null() {
@@ -8653,36 +8923,42 @@ fn unhook_a11y() {
     }
 }
 
+#[cfg(windows)]
 type SetSubclassFn = unsafe extern "system" fn(
     windows_sys::Win32::Foundation::HWND,
     windows_sys::Win32::UI::Shell::SUBCLASSPROC,
     usize,
     usize,
 ) -> i32;
+#[cfg(windows)]
 type DefSubclassFn = unsafe extern "system" fn(
     windows_sys::Win32::Foundation::HWND,
     u32,
     windows_sys::Win32::Foundation::WPARAM,
     windows_sys::Win32::Foundation::LPARAM,
 ) -> windows_sys::Win32::Foundation::LRESULT;
+#[cfg(windows)]
 type RemoveSubclassFn = unsafe extern "system" fn(
     windows_sys::Win32::Foundation::HWND,
     windows_sys::Win32::UI::Shell::SUBCLASSPROC,
     usize,
 ) -> i32;
 
+#[cfg(windows)]
 struct ComctlFns {
     set: SetSubclassFn,
     def: DefSubclassFn,
     remove: RemoveSubclassFn,
 }
 
+#[cfg(windows)]
 fn comctl_fns() -> Option<&'static ComctlFns> {
     use std::sync::OnceLock;
     static FNS: OnceLock<Option<ComctlFns>> = OnceLock::new();
     FNS.get_or_init(load_comctl).as_ref()
 }
 
+#[cfg(windows)]
 fn load_comctl() -> Option<ComctlFns> {
     use windows_sys::Win32::System::LibraryLoader::{
         GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
@@ -8724,6 +9000,7 @@ fn load_comctl() -> Option<ComctlFns> {
     Some(ComctlFns { set, def, remove })
 }
 
+#[cfg(windows)]
 fn try_set_window_subclass(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
     let Some(api) = comctl_fns() else {
         return false;
@@ -8734,7 +9011,6 @@ fn try_set_window_subclass(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
 }
 
 fn run(startup: Startup) -> Result<(), String> {
-    harden_dll_search();
     if let Ok(exe) = std::env::current_exe() {
         if let Ok(path) = cli::exe_display(&exe) {
             let app_id = jumplist::app_user_model_id(&path);
@@ -8745,9 +9021,11 @@ fn run(startup: Startup) -> Result<(), String> {
     }
     prof::init();
     prof::mark("main start");
-    use winit::platform::windows::EventLoopBuilderExtWindows;
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
-        .with_msg_hook(|msg| {
+    let mut event_loop_builder = EventLoop::<UserEvent>::with_user_event();
+    #[cfg(windows)]
+    {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        event_loop_builder.with_msg_hook(|msg| {
             use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_HOTKEY};
             // SAFETY: winit's msg hook is handed a pointer to the MSG being
             // dispatched, valid for the duration of the callback. It is only read.
@@ -8768,7 +9046,9 @@ fn run(startup: Startup) -> Result<(), String> {
                 return true; // ours either way
             }
             false
-        })
+        });
+    }
+    let event_loop = event_loop_builder
         .build()
         .map_err(|error| format!("Could not create the event loop: {error}"))?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -8889,7 +9169,7 @@ fn run(startup: Startup) -> Result<(), String> {
 /// build its own loop — a second builder in another test module panics
 /// whichever of the two runs second. The loop is leaked so the proxy's
 /// window target stays alive for the rest of the process.
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(crate) fn test_proxy() -> EventLoopProxy<UserEvent> {
     use std::sync::OnceLock;
     use winit::platform::windows::EventLoopBuilderExtWindows;
@@ -8905,6 +9185,11 @@ pub(crate) fn test_proxy() -> EventLoopProxy<UserEvent> {
             proxy
         })
         .clone()
+}
+
+#[cfg(all(test, not(windows)))]
+pub(crate) fn test_proxy() -> EventLoopProxy<UserEvent> {
+    unimplemented!("the test event loop is built with the Windows message hook")
 }
 
 /// OSC 52 writes only from the focused pane of the active tab.
@@ -8927,9 +9212,159 @@ mod tests {
         assert!(!super::frame_unchanged(true, b"old", b"new", false));
     }
 
+    #[test]
+    fn occluded_minimized_or_hidden_is_not_paintable() {
+        assert!(super::window_paints(false, false, false));
+        assert!(!super::window_paints(true, false, false), "occluded");
+        assert!(!super::window_paints(false, true, false), "minimized");
+        assert!(!super::window_paints(false, false, true), "hidden");
+        assert!(!super::window_paints(true, true, true));
+    }
+
+    #[test]
+    fn minimized_is_a_zero_size_or_the_iconic_bit() {
+        assert!(super::minimized_now(true, Some(false)), "0×0 is minimized");
+        assert!(super::minimized_now(true, None));
+        assert!(
+            super::minimized_now(false, Some(true)),
+            "iconic wins over a stale size"
+        );
+        assert!(!super::minimized_now(false, Some(false)));
+        assert!(
+            !super::minimized_now(false, None),
+            "a failed query is not minimized"
+        );
+        assert!(super::minimized_cleared(false, Some(false)));
+        assert!(!super::minimized_cleared(true, Some(false)), "still 0×0");
+        assert!(!super::minimized_cleared(false, Some(true)));
+        assert!(
+            !super::minimized_cleared(false, None),
+            "unknown iconic state keeps the latch"
+        );
+    }
+
+    #[test]
+    fn restore_paints_once_when_the_window_becomes_visible() {
+        assert!(super::became_shown(false, true));
+        assert!(
+            !super::became_shown(true, true),
+            "a resize is not a restore"
+        );
+        assert!(!super::became_shown(true, false));
+        assert!(!super::became_shown(false, false));
+    }
+
+    /// Bell, cwd, title, and the active tab's PTY all ask for a frame.
+    /// While the window is hidden that ask is deferred. A background tab's
+    /// grid never paints on its own chunk.
+    #[test]
+    fn paint_gate_defers_when_hidden_and_skips_a_background_grid() {
+        use super::PaintGate;
+        assert_eq!(super::gate_paint(false, true), PaintGate::Defer);
+        assert_eq!(super::gate_paint(false, false), PaintGate::Defer);
+        assert_eq!(super::gate_paint(true, true), PaintGate::Redraw);
+        assert_eq!(super::gate_paint(true, false), PaintGate::Skip);
+
+        // A burst of PTY, bell, and title events while minimized must not
+        // enter redraw. Restore is `became_shown`, not a stored dirty bit.
+        let mut redraws = 0u32;
+        let mut dirty = false;
+        for on_screen in [true, false, true] {
+            match super::gate_paint(false, on_screen) {
+                PaintGate::Redraw => redraws += 1,
+                PaintGate::Defer => dirty = true,
+                PaintGate::Skip => {}
+            }
+        }
+        assert_eq!(redraws, 0);
+        assert!(dirty);
+    }
+
+    #[test]
+    fn minimized_busy_tab_arms_no_timer_and_does_not_pulse() {
+        let now = Instant::now();
+        let plan = super::plan_idle(
+            now,
+            super::BUSY_PULSE,
+            super::WakeInputs {
+                shown: false,
+                background_busy: true,
+                blink: Some(now + Duration::from_millis(530)),
+                scroll: Some(now + Duration::from_millis(8)),
+                scrollbar: Some(now + Duration::from_millis(100)),
+                notice: Some(now + Duration::from_secs(8)),
+                reader: None,
+            },
+        );
+        assert!(!plan.pulse_redraw);
+        assert_eq!(plan.wake, None, "ControlFlow::Wait, no visual timer");
+    }
+
+    #[test]
+    fn visible_busy_background_tab_keeps_the_dot_pulse() {
+        let now = Instant::now();
+        let soon = now + Duration::from_millis(50);
+        let plan = super::plan_idle(
+            now,
+            super::BUSY_PULSE,
+            super::WakeInputs {
+                shown: true,
+                background_busy: true,
+                blink: Some(soon),
+                scroll: None,
+                scrollbar: None,
+                notice: None,
+                reader: None,
+            },
+        );
+        assert!(plan.pulse_redraw);
+        assert_eq!(plan.wake, Some(soon), "the earlier blink wins over 600ms");
+    }
+
+    #[test]
+    fn a_reader_deadline_still_wakes_a_hidden_window() {
+        let now = Instant::now();
+        let at = now + Duration::from_millis(100);
+        let plan = super::plan_idle(
+            now,
+            super::BUSY_PULSE,
+            super::WakeInputs {
+                shown: false,
+                background_busy: true,
+                blink: Some(now + Duration::from_millis(10)),
+                scroll: None,
+                scrollbar: None,
+                notice: None,
+                reader: Some(at),
+            },
+        );
+        assert!(!plan.pulse_redraw);
+        assert_eq!(plan.wake, Some(at));
+    }
+
+    #[test]
+    fn an_idle_visible_window_waits_without_a_timer() {
+        let plan = super::plan_idle(
+            Instant::now(),
+            super::BUSY_PULSE,
+            super::WakeInputs {
+                shown: true,
+                background_busy: false,
+                blink: None,
+                scroll: None,
+                scrollbar: None,
+                notice: None,
+                reader: None,
+            },
+        );
+        assert!(!plan.pulse_redraw);
+        assert_eq!(plan.wake, None);
+    }
+
     use super::*;
     use std::time::Duration;
 
+    #[cfg(windows)]
     #[test]
     fn subclass_proc_sets_the_dirty_flag_for_each_live_message() {
         for msg in [

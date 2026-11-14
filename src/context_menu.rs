@@ -147,26 +147,43 @@ pub fn sync_with(
 /// Installer and the explicit CLI flags call this. `enabled` writes the two
 /// HKCU verbs; `false` deletes them. The command points at this process's exe.
 pub fn set_enabled(enabled: bool) -> Result<(), String> {
-    let exe =
-        std::env::current_exe().map_err(|error| format!("could not find bayan.exe: {error}"))?;
-    let mut registry = LiveRegistry;
-    if enabled {
-        register_with(&mut registry, &exe)
-    } else {
-        unregister_with(&mut registry)
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe()
+            .map_err(|error| format!("could not find bayan.exe: {error}"))?;
+        let mut registry = LiveRegistry;
+        if enabled {
+            register_with(&mut registry, &exe)
+        } else {
+            unregister_with(&mut registry)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = enabled;
+        Err("the Explorer context menu is an HKCU registration on Windows".into())
     }
 }
 
 /// What startup does with `explorer_context_menu`. Skips the write when the
 /// verbs already say what this exe would write, or are already absent.
 pub fn sync_enabled(enabled: bool) -> Result<(), String> {
-    let exe =
-        std::env::current_exe().map_err(|error| format!("could not find bayan.exe: {error}"))?;
-    let mut registry = LiveRegistry;
-    sync_with(&mut registry, &exe, enabled).map(|_| ())
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe()
+            .map_err(|error| format!("could not find bayan.exe: {error}"))?;
+        let mut registry = LiveRegistry;
+        sync_with(&mut registry, &exe, enabled).map(|_| ())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = enabled;
+        Err("the Explorer context menu is an HKCU registration on Windows".into())
+    }
 }
 
 /// A value key we are willing to write: a verb, or that verb's `command` subkey.
+#[cfg(windows)]
 fn allowed_value_key(key: &str) -> bool {
     VERBS.iter().any(|verb| {
         key == *verb
@@ -177,12 +194,15 @@ fn allowed_value_key(key: &str) -> bool {
 }
 
 /// A key we are willing to delete: the verb itself, which takes `command` with it.
+#[cfg(windows)]
 fn allowed_delete_key(key: &str) -> bool {
     VERBS.contains(&key)
 }
 
+#[cfg(windows)]
 struct LiveRegistry;
 
+#[cfg(windows)]
 impl RegistryStore for LiveRegistry {
     fn set_value(&mut self, key: &str, name: &str, value: &str) -> Result<(), String> {
         if !allowed_value_key(key) {
@@ -206,12 +226,15 @@ impl RegistryStore for LiveRegistry {
     }
 }
 
+#[cfg(windows)]
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
 
+#[cfg(windows)]
 struct OpenKey(windows_sys::Win32::System::Registry::HKEY);
 
+#[cfg(windows)]
 impl Drop for OpenKey {
     fn drop(&mut self) {
         if !self.0.is_null() {
@@ -224,6 +247,7 @@ impl Drop for OpenKey {
     }
 }
 
+#[cfg(windows)]
 fn live_set(key: &str, name: &str, value: &str) -> Result<(), String> {
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::System::Registry::{
@@ -276,6 +300,7 @@ fn live_set(key: &str, name: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn live_get(key: &str, name: &str) -> Result<Option<String>, String> {
     use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS};
     use windows_sys::Win32::System::Registry::{
@@ -350,6 +375,7 @@ fn live_get(key: &str, name: &str) -> Result<Option<String>, String> {
     reg_sz_decode(&buf[..n]).map(Some)
 }
 
+#[cfg(windows)]
 fn live_delete(key: &str) -> Result<(), String> {
     use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
     use windows_sys::Win32::System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER};
@@ -491,6 +517,7 @@ mod tests {
         unregister_with(&mut store).unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_live_store_refuses_anything_outside_the_two_verbs() {
         let mut registry = LiveRegistry;
