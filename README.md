@@ -1599,6 +1599,11 @@ end
 
 ## Build
 
+The Windows suite is 915 tests, 7 ignored by the default run (908
+executed). CI on `e63bb89` printed `running 915 tests` and
+`test result: ok. 908 passed; 0 failed; 7 ignored`. Counts inside a
+milestone are what that change proved, not this total.
+
 Atlas and probe fixes (2026-11-13): resetting a full glyph atlas reserves
 page 0's white texel again and reuses every cleared page. GPU sync copies
 only changed pages, except when texture growth requires restoring them all;
