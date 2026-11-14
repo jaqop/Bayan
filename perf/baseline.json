@@ -2,7 +2,10 @@
   "tolerance": 0.1,
   "tolerances": {
     "startup": 1.0,
-    "startup_ratio": 0.15
+    "startup_ratio": 0.15,
+    "latency": 1.0,
+    "idle_memory": 0.1,
+    "idle_redraw": 0.0
   },
   "throughput": {
     "ascii": 78,
@@ -19,5 +22,17 @@
   },
   "startup_ratio": {
     "first frame / gpu ready": 1.08
+  },
+  "latency": {
+    "key->frame p95": 155
+  },
+  "idle_memory": {
+    "private": 291.3
+  },
+  "idle_redraw": {
+    "visible presents": 0,
+    "visible redraws": 0,
+    "minimized presents": 0,
+    "minimized redraws": 0
   }
 }

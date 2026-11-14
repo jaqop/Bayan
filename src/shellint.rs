@@ -1286,6 +1286,7 @@ fn should_sweep(path: &Path, cutoff: std::time::SystemTime, sid: &str) -> bool {
     owner_sid(path).as_deref() == Some(sid)
 }
 
+#[cfg(windows)]
 fn owner_sid(path: &Path) -> Option<String> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{
@@ -1332,6 +1333,12 @@ fn owner_sid(path: &Path) -> Option<String> {
     }
 }
 
+#[cfg(not(windows))]
+fn owner_sid(path: &Path) -> Option<String> {
+    let _ = path;
+    None
+}
+
 /// Holds the directory until [`IntegrationDir::disarm`]. Dropping it early
 /// (spawn failed) deletes the scripts.
 pub(crate) struct IntegrationDir(pub Option<PathBuf>);
@@ -1363,6 +1370,7 @@ fn programdata_from_known_folder() -> PathBuf {
     known_folder_programdata().unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
 }
 
+#[cfg(windows)]
 fn known_folder_programdata() -> Option<PathBuf> {
     use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath};
@@ -1388,6 +1396,11 @@ fn known_folder_programdata() -> Option<PathBuf> {
             Some(PathBuf::from(text))
         }
     }
+}
+
+#[cfg(not(windows))]
+fn known_folder_programdata() -> Option<PathBuf> {
+    None
 }
 
 /// Where a new integration directory is created. Elevated files go in
@@ -1420,6 +1433,7 @@ pub(crate) fn security_sddl(elevated: bool) -> std::io::Result<String> {
 
 /// `S-1-…` form of the process token's user. That is the only SDDL trustee
 /// that means "this account and nobody else".
+#[cfg(windows)]
 fn current_user_sid() -> std::io::Result<String> {
     use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
@@ -1473,8 +1487,17 @@ fn current_user_sid() -> std::io::Result<String> {
     }
 }
 
+#[cfg(not(windows))]
+fn current_user_sid() -> std::io::Result<String> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "the process token SID is a Windows query",
+    ))
+}
+
 /// SID that owns objects this process creates. Elevated, that is usually
 /// BUILTIN\Administrators rather than the user account.
+#[cfg(windows)]
 fn token_owner_sid() -> std::io::Result<String> {
     use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
@@ -1525,6 +1548,14 @@ fn token_owner_sid() -> std::io::Result<String> {
     }
 }
 
+#[cfg(not(windows))]
+fn token_owner_sid() -> std::io::Result<String> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "the token owner SID is a Windows query",
+    ))
+}
+
 /// Enables `SeSecurityPrivilege` for this function's lifetime, then puts it
 /// back. Drop runs on every return, including a failed create.
 struct PrivilegeGuard(bool);
@@ -1543,6 +1574,7 @@ impl Drop for PrivilegeGuard {
     }
 }
 
+#[cfg(windows)]
 fn set_privilege(name: &str, enable: bool) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_SUCCESS};
     use windows_sys::Win32::Security::{
@@ -1596,6 +1628,12 @@ fn set_privilege(name: &str, enable: bool) -> bool {
     }
 }
 
+#[cfg(not(windows))]
+fn set_privilege(name: &str, enable: bool) -> bool {
+    let _ = (name, enable);
+    false
+}
+
 fn random_hex() -> Option<String> {
     let mut bytes = [0u8; 16];
     if !fill_random(&mut bytes) {
@@ -1626,6 +1664,7 @@ fn create_integration_dir(elevated: bool) -> std::io::Result<PathBuf> {
     Err(last)
 }
 
+#[cfg(windows)]
 fn create_dir_secure(path: &Path, elevated: bool) -> std::io::Result<()> {
     with_security(elevated, |sa| {
         let wide = wide_path(path);
@@ -1642,6 +1681,16 @@ fn create_dir_secure(path: &Path, elevated: bool) -> std::io::Result<()> {
     })
 }
 
+#[cfg(not(windows))]
+fn create_dir_secure(path: &Path, elevated: bool) -> std::io::Result<()> {
+    let _ = (path, elevated);
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "integration directories are created with a Win32 DACL",
+    ))
+}
+
+#[cfg(windows)]
 fn write_secure(path: &Path, body: &[u8], elevated: bool) -> std::io::Result<()> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -1681,6 +1730,16 @@ fn write_secure(path: &Path, body: &[u8], elevated: bool) -> std::io::Result<()>
     })
 }
 
+#[cfg(not(windows))]
+fn write_secure(path: &Path, body: &[u8], elevated: bool) -> std::io::Result<()> {
+    let _ = (path, body, elevated);
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "integration files are created with a Win32 DACL",
+    ))
+}
+
+#[cfg(windows)]
 fn write_all(
     handle: windows_sys::Win32::Foundation::HANDLE,
     mut body: &[u8],
@@ -1711,6 +1770,7 @@ fn write_all(
     Ok(())
 }
 
+#[cfg(windows)]
 fn with_security<T>(
     elevated: bool,
     f: impl FnOnce(*const windows_sys::Win32::Security::SECURITY_ATTRIBUTES) -> std::io::Result<T>,
@@ -1747,17 +1807,20 @@ fn with_security<T>(
     result
 }
 
+#[cfg(windows)]
 fn wide_path(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 
+#[cfg(windows)]
 fn wide_str(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
 
 /// DACL of `path` as an SDDL string. Label and owner are not requested, so
 /// this does not need the security privilege.
+#[cfg(windows)]
 #[cfg(test)]
 pub(crate) fn dacl_sddl(path: &Path) -> std::io::Result<String> {
     use windows_sys::Win32::Foundation::LocalFree;
@@ -2297,6 +2360,7 @@ mod tests {
     }
 
     /// The directory really is created with that DACL, not only described.
+    #[cfg(windows)]
     #[test]
     fn a_secure_directory_is_unique_and_not_world_writable() {
         let dir = create_integration_dir(false).expect("create");

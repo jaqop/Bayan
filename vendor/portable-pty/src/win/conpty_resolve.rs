@@ -4,9 +4,21 @@
 //! `conpty.dll` (via the `shared_library` crate) and preferred that image
 //! over kernel32. The search order for a bare name includes the directory
 //! containing the executable, the current directory, and `PATH`, so a
-//! planted `conpty.dll` runs as the user. Bayan does not ship a ConPTY
-//! redistributable. The three exports have lived in kernel32 since Windows
-//! 10 1809.
+//! planted `conpty.dll` runs as the user. `resolve_conpty` does not repeat
+//! that search: its only open is `kernel32.dll` with
+//! `LOAD_LIBRARY_SEARCH_SYSTEM32`, then `CreatePseudoConsole`,
+//! `ResizePseudoConsole`, and `ClosePseudoConsole`. Those three exports
+//! have lived in kernel32 since Windows 10 1809.
+//!
+//! The release archive does ship a ConPTY redistributable: Microsoft's
+//! pinned `conpty.dll` and `OpenConsole.exe`, installed by
+//! `scripts/install-conpty.ps1`. That pair is not loaded here.
+//! `psuedocon::load_bundled` passes the verified full path to
+//! `LoadLibraryExW` and `PsuedoCon::new` prefers those exports. The
+//! kernel32 bindings are the fallback when the pair is missing, the
+//! signature or hash check fails, the process is elevated (a failed
+//! elevation query counts as elevated), or `CreatePseudoConsole` on the
+//! pinned host fails.
 //!
 //! This file is compiled into the vendored crate (the production call) and,
 //! under `cfg(test)`, into the bayan harness so the unit test observes the
