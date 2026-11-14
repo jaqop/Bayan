@@ -12,8 +12,8 @@ Get-Process PrivateMemorySize64 (PrivateUsage). Working set is reported
 and not gated. Child cmd/ConPTY processes are not included.
 
 The minimized window sets BAYAN_IDLE_BUSY=1, waits until frame counters
-are moving, then ShowWindow(SW_MINIMIZE). Its counts are report-only in
-the gate until minimized redraws are stopped.
+are moving, then ShowWindow(SW_MINIMIZE). The gate requires both counts
+to be 0 for that window.
 
 Both windows publish `%TEMP%\bayan_frame_counters.txt` because
 BAYAN_FRAME_COUNTERS is set. The latency probe does not set it.
@@ -94,6 +94,12 @@ function Stop-Owned($proc) {
     }
 }
 
+function Add-AdapterLine([string]$stderr, [string]$output) {
+    if ([string]::IsNullOrEmpty($stderr) -or -not (Test-Path -LiteralPath $stderr)) { return }
+    $lines = @(Get-Content -LiteralPath $stderr | Where-Object { $_ -match '^bayan: wgpu adapter ' })
+    if ($lines.Count -gt 0) { $lines | Tee-Object -FilePath $output -Append }
+}
+
 $names = @(
     'USERPROFILE', 'HOME', 'TEMP', 'TMP',
     'BAYAN_PROFILE', 'BAYAN_SHOW_NOW', 'BAYAN_FRAME_COUNTERS',
@@ -146,6 +152,7 @@ function Invoke-QuietWindow {
         ) | Tee-Object -FilePath $output -Append
     } finally {
         Stop-Owned $proc
+        Add-AdapterLine $stderr $output
     }
 }
 
@@ -206,6 +213,7 @@ function Invoke-MinimizedWindow {
         "PROBE idle_redraw minimized presents=$presents redraws=$redraws window_s=$WindowSeconds" | Tee-Object -FilePath $output -Append
     } finally {
         Stop-Owned $proc
+        Add-AdapterLine $stderr $output
     }
 }
 

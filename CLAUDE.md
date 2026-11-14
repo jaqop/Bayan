@@ -54,11 +54,18 @@ selection and BiDi paths must do.
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-Test counts come from `cargo test -- --list` and the CI test summary, not
-manual totals in this file. Explicit native host probes and measurement
-probes are ignored by the default suite; see their annotations and Measuring.
-`scripts/test_perf_gate.py` is the perf job's unittest and is not part of
-that cargo count.
+915 tests, of which 7 are ignored by the default suite (908 run). That is
+`cargo test --locked --all-targets` on Windows (`running 915 tests`,
+`908 passed; 7 ignored`) and the same lines the CI summary counts with
+`--list`, measured on bayan-plus before the latency gate's
+`the_counter_file_is_one_line` and
+`the_tap_waits_out_a_quiet_prompt_then_alternates`, and before
+`gpu::tests::the_adapter_line_names_the_backend_and_device_type`.
+Explicit native host
+probes and measurement probes are the ignored ones; see their annotations
+and Measuring. Milestone write-ups below record what that change proved,
+not this total. `scripts/test_perf_gate.py` is the perf job's unittest
+and is not part of that cargo count.
 
 ## Measuring
 
@@ -83,8 +90,8 @@ Measure before optimizing, in release builds:
 - **Idle memory and idle redraws**, CI: `scripts\measure-idle.ps1` on that
   same binary. Private bytes after a quiet tab, then two 5 s windows
   (`BAYAN_FRAME_COUNTERS` writes `%TEMP%\bayan_frame_counters.txt`).
-  The minimized window is report-only until `MINIMIZED_REDRAW_REQUIRED`
-  in `scripts/perf_gate.py` is flipped.
+  The minimized window, with `BAYAN_IDLE_BUSY=1`, must present and redraw
+  zero times. `MINIMIZED_REDRAW_REQUIRED` in `scripts/perf_gate.py` is true.
 
 CI gates these on every pull request (the `perf` job).
 `scripts/perf_gate.py` compares the probes' `PROBE` lines with
@@ -95,11 +102,11 @@ worse, and a 10% improvement is reported so the baseline can be raised.
 Startup milliseconds are a backstop at twice the slowest job seen. The
 tighter check is `first frame presented` over `gpu ready` within one
 start, which held at 1.07 to 1.09 and fails above 1.24. Key-to-frame p95
-is gated too, from `BAYAN_TAP` (not SendInput): baseline 155 ms, fail
-above 310 ms, and fewer than 40 samples fails. Idle private memory fails
-above 320.4 MB. A visible idle window must present and redraw zero times.
-The minimized window is measured and report-only until
-`MINIMIZED_REDRAW_REQUIRED` is set. `perf/README.md` has the hosted runs.
+is gated, from `BAYAN_TAP` (not SendInput): baseline 155 ms, tolerance
+30%, fail above 201.5 ms, and fewer than 40 samples fails. Idle private
+memory fails above 320.4 MB. A visible idle window, and a minimized one
+with a busy background tab, must each present and redraw zero times.
+`perf/README.md` has the hosted runs.
 
 Figures from 2026-11-10 on the author's machine (22bc5d6 + this harness):
 `process_chunk` 83 / 49 / 100 MB/s for plain / SGR / Arabic, which is 57 / 27 /
@@ -338,6 +345,19 @@ the GPU submit entirely when the quad set is byte-identical to the last frame,
 so a still terminal stops rendering. Anything that churns state every frame
 silently destroys both. The atlas grows a new texture-array *page* when one
 fills — it does not wipe.
+
+**A minimized, hidden, or occluded window does not enter `redraw`.**
+`request_redraw` is the only call to `Window::request_redraw`. When the
+window is not showing it returns without asking winit, so `RedrawRequested`
+does not call `redraw` (the idle perf gate counts entries there, and presents
+inside it, and both must stay zero while minimized with a busy background
+tab). PTY reads, bells, toasts, and attention still run. The ~600ms busy-dot
+pulse is scheduled only while the window is showing; a background tab's grid
+is not a reason to paint. Restoring, unoccluding, or summoning calls
+`request_redraw` once the window is showing again, and cursor blink is armed
+from the next wait. There is no dirty flag: those paths ask explicitly. Do
+not add another direct `redraw()` or `Window::request_redraw` for a hidden
+state.
 
 ## Build, test, verify
 

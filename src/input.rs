@@ -791,12 +791,23 @@ impl App {
     }
 
     pub(crate) fn resized(&mut self, px: PhysicalSize<u32>) {
-        if px.width == 0 || px.height == 0 {
+        // A minimized window reports 0×0, and `is_minimized` covers the
+        // case where the size has not caught up yet. Do not relayout to
+        // nothing: the PTY would see a 0-column resize. The restore below
+        // is the one paint; a busy background tab does not paint until then.
+        let iconic = self.window.as_ref().and_then(|w| w.is_minimized());
+        let empty = px.width == 0 || px.height == 0;
+        if crate::minimized_now(empty, iconic) {
+            self.minimized.set(true);
             return;
         }
+        let was_shown = self.flags_shown();
+        self.minimized.set(false);
         self.track_geometry();
         self.relayout_active();
-        self.request_redraw();
+        if crate::became_shown(was_shown, self.flags_shown()) || was_shown {
+            self.request_redraw();
+        }
     }
 
     /// `WindowEvent::MouseInput`, after the guard and the modals.
@@ -907,7 +918,12 @@ impl App {
             LeftPress::Caption(caption) => {
                 if let Some(w) = self.window.clone() {
                     match caption {
-                        Caption::Minimize => w.set_minimized(true),
+                        Caption::Minimize => {
+                            // Latch before ShowWindow returns, so a paint
+                            // queued in this same turn cannot enter `redraw`.
+                            self.minimized.set(true);
+                            w.set_minimized(true);
+                        }
                         Caption::Maximize => w.set_maximized(!w.is_maximized()),
                         // identical to CloseRequested: the running-command
                         // guard must not be bypassed just because the

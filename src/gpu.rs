@@ -90,6 +90,15 @@ struct CachedImage {
     bind: wgpu::BindGroup,
 }
 
+/// One line for the process log. `Debug` quotes the name and names the
+/// `Backend` and `DeviceType` variants (`Dx12`, `Cpu`).
+pub(crate) fn adapter_log_line(info: &wgpu::AdapterInfo) -> String {
+    format!(
+        "bayan: wgpu adapter name={:?} backend={:?} device_type={:?}",
+        info.name, info.backend, info.device_type
+    )
+}
+
 /// One image draw. The vertices are already clipped to the pane.
 pub struct ImageQuad<'a> {
     pub cookie: u64,
@@ -121,6 +130,9 @@ impl Gpu {
             apply_limit_buckets: false,
         }))
         .map_err(|e| format!("no graphics adapter: {e}"))?;
+        // Once, so a perf-job log can show WARP (software) on a hosted runner:
+        // name, backend, and device_type from AdapterInfo.
+        eprintln!("{}", adapter_log_line(&adapter.get_info()));
         // wgpu 30 dropped the trace-path argument
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("bayan"),
@@ -558,4 +570,19 @@ fn pad_rows(rgba: &[u8], width: u32, height: u32, bpr: u32) -> Vec<u8> {
         buf[dst..dst + tight].copy_from_slice(&rgba[src..src + tight]);
     }
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::adapter_log_line;
+
+    #[test]
+    fn the_adapter_line_names_the_backend_and_device_type() {
+        let mut info = wgpu::AdapterInfo::new(wgpu::DeviceType::Cpu, wgpu::Backend::Dx12);
+        info.name = "Microsoft Basic Render Driver".into();
+        assert_eq!(
+            adapter_log_line(&info),
+            "bayan: wgpu adapter name=\"Microsoft Basic Render Driver\" backend=Dx12 device_type=Cpu"
+        );
+    }
 }
