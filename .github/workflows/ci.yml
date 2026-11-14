@@ -22,8 +22,8 @@ env:
 jobs:
   # Windows only, deliberately. Bayan is bound to the platform: ConPTY via
   # portable-pty, Shell_NotifyIcon toasts, RegisterHotKey, DX12-first wgpu,
-  # and a windows-sys dependency. A Linux job would not compile, so there
-  # isn't one — rather than a matrix full of exclusions.
+  # and a windows-sys dependency. linux-check typechecks; it does not run
+  # these tests — rather than a matrix full of exclusions.
   test:
     name: build + test (stable, windows)
     runs-on: windows-latest
@@ -178,10 +178,49 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+  # Typecheck off Windows. The Windows jobs only compile the cfg(windows)
+  # dependency table, so a break that lives entirely behind that cfg — the
+  # windows-only dll_search module, a Win32 import left unguarded — stays
+  # green there. This job is the one that sees it. winit 0.30 dlopens
+  # Wayland and X11, and wgpu dlopens Vulkan; the -dev packages are what
+  # those build scripts probe through pkg-config, and what a linked build
+  # needs. Clippy is the same -D warnings bar as the Windows lint job.
+  linux-check:
+    name: check + clippy (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (v5.1.0)
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxrandr-dev \
+            libx11-xcb-dev \
+            libvulkan-dev \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Check
+        run: cargo check --all-targets --locked
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
   # RustSec advisories against Cargo.lock. Fails on a known vulnerability;
   # unmaintained or yanked crates print as warnings and do not fail it. It
-  # reads the lockfile and compiles nothing, so it is the one job that does
-  # not need Windows. At the time of writing it reports one warning:
+  # reads the lockfile and compiles nothing, so it does not need Windows.
+  # At the time of writing it reports one warning:
   # ttf-parser (via cosmic-text -> fontdb) is unmaintained upstream.
   audit:
     name: cargo audit
