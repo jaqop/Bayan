@@ -16,6 +16,8 @@ pub enum Action {
     NewTab,
     ClosePane,
     Search,
+    SearchRegex,
+    ExportHistory,
     Settings,
     Copy,
     Paste,
@@ -36,13 +38,20 @@ pub enum Action {
     PrevGroup,
     CopyMode,
     CopyClean,
+    Fullscreen,
+    ClearScrollback,
+    ResetTerminal,
+    NewWindow,
+    DuplicateTab,
 }
 
 impl Action {
-    pub const ALL: [Action; 23] = [
+    pub const ALL: [Action; 30] = [
         Action::NewTab,
         Action::ClosePane,
         Action::Search,
+        Action::SearchRegex,
+        Action::ExportHistory,
         Action::Settings,
         Action::Copy,
         Action::Paste,
@@ -63,6 +72,11 @@ impl Action {
         Action::PrevGroup,
         Action::CopyMode,
         Action::CopyClean,
+        Action::Fullscreen,
+        Action::ClearScrollback,
+        Action::ResetTerminal,
+        Action::NewWindow,
+        Action::DuplicateTab,
     ];
 
     /// The config.json key.
@@ -71,6 +85,8 @@ impl Action {
             Action::NewTab => "new-tab",
             Action::ClosePane => "close-pane",
             Action::Search => "search",
+            Action::SearchRegex => "search-regex",
+            Action::ExportHistory => "export-history",
             Action::Settings => "settings",
             Action::Copy => "copy",
             Action::Paste => "paste",
@@ -91,6 +107,11 @@ impl Action {
             Action::PrevGroup => "prev-group",
             Action::CopyMode => "copy-mode",
             Action::CopyClean => "copy-clean",
+            Action::Fullscreen => "fullscreen",
+            Action::ClearScrollback => "clear-scrollback",
+            Action::ResetTerminal => "reset-terminal",
+            Action::NewWindow => "new-window",
+            Action::DuplicateTab => "duplicate-tab",
         }
     }
 
@@ -132,7 +153,20 @@ impl Action {
             Action::NextGroup => crate::lang::pick(lang, "المجموعة التالية", "Next group"),
             Action::PrevGroup => crate::lang::pick(lang, "المجموعة السابقة", "Previous group"),
             Action::CopyMode => crate::lang::pick(lang, "وضع النسخ", "Copy mode"),
+            Action::SearchRegex => {
+                crate::lang::pick(lang, "بحث بتعبير نمطي", "Search regular expression")
+            }
             Action::CopyClean => crate::lang::pick(lang, "نسخ نظيف", "Copy clean"),
+            Action::ExportHistory => {
+                crate::lang::pick(lang, "تصدير سجل اللوحة", "Export pane history")
+            }
+            Action::Fullscreen => crate::lang::pick(lang, "ملء الشاشة", "Full screen"),
+            Action::ClearScrollback => crate::lang::pick(lang, "مسح السجل", "Clear scrollback"),
+            Action::ResetTerminal => {
+                crate::lang::pick(lang, "إعادة ضبط أوضاع الطرفية", "Reset terminal modes")
+            }
+            Action::NewWindow => crate::lang::pick(lang, "نافذة جديدة", "New window"),
+            Action::DuplicateTab => crate::lang::pick(lang, "تكرار التبويب", "Duplicate tab"),
         }
     }
 
@@ -180,8 +214,20 @@ impl Action {
             Action::PrevGroup => c(true, true, PageUp),
             // X: WezTerm's ActivateCopyMode chord
             Action::CopyMode => c(true, true, Letter('x')),
+            Action::SearchRegex => c(true, true, Letter('f')),
+            Action::ExportHistory => c(true, true, Letter('s')),
             // Y for yank, cleaned. X is copy mode.
             Action::CopyClean => c(true, true, Letter('y')),
+            // Bare F11, the key every terminal and browser uses. A program
+            // that wants F11 itself needs this rebound.
+            Action::Fullscreen => c(false, false, F(11)),
+            // H for history, J beside it for the mode reset, N for a
+            // window (Windows Terminal's chord), T beside Ctrl+T for the
+            // same tab again.
+            Action::ClearScrollback => c(true, true, Letter('h')),
+            Action::ResetTerminal => c(true, true, Letter('j')),
+            Action::NewWindow => c(true, true, Letter('n')),
+            Action::DuplicateTab => c(true, true, Letter('t')),
         }
     }
 }

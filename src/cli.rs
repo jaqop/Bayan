@@ -18,7 +18,7 @@ pub const HELP: &str = concat!(
     "\n\n",
     "\
 الاستخدام:
-  bayan [-d | --cwd <مجلد>] [-p | --profile <اسم>] [-- <أمر>...]
+  bayan [-d | --cwd <مجلد>] [-p | --profile <اسم>] [-M | --maximized] [-- <أمر>...]
   bayan --new-window
   bayan --elevated [-p <اسم>]
   bayan --register-context-menu
@@ -28,6 +28,7 @@ pub const HELP: &str = concat!(
 
   -d, --cwd <مجلد>       مجلد التبويب الذي يفتحه هذا الأمر
   -p, --profile <اسم>    صدفة ذلك التبويب (اسمها أو أمرها)
+  -M, --maximized        فتح النافذة مكبَّرة، أيًّا كان حجمها المحفوظ
   -- <أمر>...            تشغيل هذا البرنامج بدل الصدفة
   --new-window           نافذة جديدة (قائمة شريط المهام)
   --elevated             إعادة التشغيل كمسؤول. يُبقى -p <اسم> فقط
@@ -47,7 +48,7 @@ Bayan ",
     "\n\n",
     "\
 usage:
-  bayan [-d | --cwd <folder>] [-p | --profile <name>] [-- <command>...]
+  bayan [-d | --cwd <folder>] [-p | --profile <name>] [-M | --maximized] [-- <command>...]
   bayan --new-window
   bayan --elevated [-p | --profile <name>]
   bayan --register-context-menu
@@ -59,6 +60,7 @@ usage:
       --cwd=<folder>       The same, as one argument
   -p, --profile <name>     Shell profile for that tab (its name or its command)
       --profile=<name>     The same, as one argument
+  -M, --maximized          Open the window maximized, whatever size was saved
       -- <command>...      Run this program in that tab instead of the shell
       --new-window         Open a window (the taskbar jump list's \"New window\")
       --elevated           Relaunch through UAC as administrator. Only an
@@ -105,7 +107,7 @@ have to provide.
 );
 
 const USAGE: &str = "\
-usage: bayan [-d | --cwd <folder>] [-p | --profile <name>] [-- <command>...]
+usage: bayan [-d | --cwd <folder>] [-p | --profile <name>] [-M | --maximized] [-- <command>...]
        bayan --new-window | --elevated [-p <name>]
        bayan --register-context-menu | --unregister-context-menu
        bayan --register-terminal-handoff | --unregister-terminal-handoff
@@ -136,6 +138,9 @@ pub struct Launch {
     /// `--elevated`: relaunch through UAC. The elevated process keeps only
     /// this flag and an optional profile name; see `elevate`.
     pub elevated: bool,
+    /// `-M` / `--maximized`: this window opens maximized. It does not
+    /// change the saved rectangle a later "restore down" returns to.
+    pub maximized: bool,
 }
 
 /// The process the launch tab starts. A `--` command is already split, so
@@ -161,6 +166,7 @@ where
     let mut profile = None;
     let mut command = None;
     let mut elevated = false;
+    let mut maximized = false;
     let mut new_window = false;
     let mut handoff = false;
     // `Some(true)` registers, `Some(false)` removes. Both at once is an error.
@@ -217,6 +223,7 @@ where
             }
             "--handoff" | "-Embedding" => handoff = true,
             "--elevated" => elevated = true,
+            "-M" | "--maximized" => maximized = true,
             // The jump list needs a non-empty argument list (AddUserTasks
             // rejects a shell link with no arguments). The flag is a launch.
             "--new-window" => new_window = true,
@@ -256,7 +263,8 @@ where
     if exclusive > 1 {
         return Err(format!("those commands cannot be combined\n{USAGE}"));
     }
-    let launch_bits = directory.is_some() || profile.is_some() || command.is_some() || elevated;
+    let launch_bits =
+        directory.is_some() || profile.is_some() || command.is_some() || elevated || maximized;
     if exclusive > 0 && (launch_bits || (new_window && (menu.is_some() || handoff_reg.is_some()))) {
         return Err(format!(
             "that command cannot be combined with other arguments\n{USAGE}"
@@ -292,6 +300,7 @@ where
         profile,
         command,
         elevated,
+        maximized,
     }))
 }
 
@@ -548,6 +557,15 @@ mod tests {
         assert_eq!(elevated.profile.as_deref(), Some("PowerShell سريع"));
         assert!(elevated.command.is_none());
         assert!(elevated.directory.is_none());
+        // `-M` is a launch flag: it rides with a folder, after `--` it is
+        // the command's own argument, and a registration refuses it
+        assert!(launch(&["--maximized"]).maximized);
+        assert!(launch(&["-M", "-d", folder]).maximized);
+        assert!(!launch(&["-d", folder]).maximized);
+        let after = launch(&["--", "vim", "-M"]);
+        assert!(!after.maximized);
+        assert_eq!(after.command.as_deref().map(<[String]>::len), Some(2));
+        assert!(parse(["--maximized", "--register-context-menu"]).is_err());
         let window = launch(&["--new-window"]);
         assert!(!window.elevated);
         assert!(window.profile.is_none());

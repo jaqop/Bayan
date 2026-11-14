@@ -4,7 +4,7 @@
 //! Draw order in the vertex buffer is the painter's order the CPU renderer
 //! already used, so translucent overlays blend identically.
 
-use crate::render::ATLAS_SIZE;
+use crate::render::{Atlas, ATLAS_SIZE};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -318,13 +318,14 @@ impl Gpu {
         true
     }
 
-    /// Sync the CPU atlas pages to the GPU (only on frames that rasterized a
-    /// new glyph). When the page count grew, the texture array is recreated
-    /// with more layers and the bind group rebound — rare, a few times a
-    /// session at most. 2048² RGBA has a bytes_per_row already 256-aligned.
-    pub fn upload_atlas(&mut self, pages: &[Vec<u8>]) {
-        let n = pages.len() as u32;
-        if n != self.layers {
+    /// Sync changed CPU atlas pages; a clean page is copied only when growth
+    /// recreated the texture array. Return whether sampled pixels changed,
+    /// so identical quad geometry cannot hide an atlas update. 2048² RGBA
+    /// has a bytes_per_row already 256-aligned.
+    pub fn upload_atlas(&mut self, atlas: &mut Atlas) -> bool {
+        let n = atlas.pages.len() as u32;
+        let recreated = n != self.layers;
+        if recreated {
             self.atlas_tex = Self::make_atlas(&self.device, n);
             self.layers = n;
             self.bind_group = Self::bind_group(
@@ -335,7 +336,9 @@ impl Gpu {
                 &self.sampler,
             );
         }
-        for (layer, page) in pages.iter().enumerate() {
+        let mut changed = false;
+        for (layer, page) in atlas.uploads(recreated) {
+            changed = true;
             self.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.atlas_tex,
@@ -343,7 +346,7 @@ impl Gpu {
                     origin: wgpu::Origin3d {
                         x: 0,
                         y: 0,
-                        z: layer as u32,
+                        z: layer,
                     },
                     aspect: wgpu::TextureAspect::All,
                 },
@@ -360,6 +363,8 @@ impl Gpu {
                 },
             );
         }
+        atlas.uploaded();
+        changed
     }
 
     /// Upload any image the cache does not have yet, and drop the rest.

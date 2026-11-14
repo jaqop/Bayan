@@ -360,6 +360,9 @@ pub struct SessionMeta {
     /// File links resolve through `link::cwd_hook` on this field. There is
     /// no second source.
     pub cwd: Option<String>,
+    /// Verified directory used at local spawn, retained for shells that do
+    /// not report OSC cwd. This is not a shell-originated cwd report.
+    pub initial_cwd: Option<String>,
     /// BDSM (implicit/explicit) and SCP paragraph direction for this pane.
     /// An `Arc` so a frame can snapshot it without cloning the stamp list.
     /// The reader thread uses [`Self::bidi_mut`], which copies only when a
@@ -442,8 +445,10 @@ impl SessionMeta {
     /// directory falls through to the launcher directory.
     pub fn spawn_cwd(&self) -> Option<String> {
         self.reported_cwd()
-            .and_then(accept_local_cwd)
-            .filter(|p| usable_spawn_dir(p))
+            .into_iter()
+            .chain(self.initial_cwd.as_deref())
+            .filter_map(accept_local_cwd)
+            .find(|p| usable_spawn_dir(p))
     }
 
     /// Replace this pane's image budget. Used by tests that share one
@@ -828,8 +833,7 @@ fn last_osc_payload<'a>(data: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
 ///
 /// Write-only. A query (`?`) returns `None` here. The parser may still
 /// emit `ClipboardLoad`; [`EventProxy`] forwards that and
-/// [`clipboard_load_reply`] writes nothing unless the read flag is on —
-/// and even then this build does not read the clipboard. The caller still
+/// the UI requires consent before reading. The reader never replies. The caller still
 /// has to pass [`allow_osc52_write`] for a copy: this function only parses.
 fn scan_osc52(data: &[u8]) -> Option<String> {
     let payload = last_osc_payload(data, b"\x1b]52;")?;
@@ -867,6 +871,111 @@ pub fn allow_osc52_write(
     from_focused_pane: bool,
 ) -> bool {
     copy_enabled && window_focused && from_focused_pane
+}
+
+pub fn allow_osc52_read(enabled: bool, window_focused: bool, pane_focused: bool) -> bool {
+    enabled && window_focused && pane_focused
+}
+
+/// Called only after a fresh, explicit approval. Never type clipboard text
+/// as shell input: it is an encoded OSC reply to this pane alone.
+pub fn approved_clipboard_reply(text: &str) -> Option<String> {
+    use base64::Engine;
+    (text.len() <= OSC52_MAX_BYTES).then(|| {
+        format!(
+            "\x1b]52;c;{}\x07",
+            base64::engine::general_purpose::STANDARD.encode(text)
+        )
+    })
+}
+
+/// Use a widely installed terminfo entry rather than a Bayan-only name
+/// that a remote machine would need to install before it can draw a TUI.
+fn terminal_environment(cmd: &mut CommandBuilder) {
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("TERM_PROGRAM", "Bayan");
+    cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    cmd.env("COLORTERM", "truecolor");
+}
+
+/// Filter the actual builder (including HKCU-imported entries), before
+/// adding this pane's generated integration environment. Ordinary windows
+/// keep their exact environment. This is not a PATH/completion policy.
+pub(crate) fn sanitize_elevated_environment(cmd: &mut CommandBuilder, elevated: bool) {
+    if !elevated {
+        return;
+    }
+    let remove: Vec<_> = cmd
+        .env_keys()
+        .filter(|name| {
+            let name = name.to_string_lossy().to_ascii_uppercase();
+            matches!(
+                name.as_str(),
+                "BASH_ENV"
+                    | "ENV"
+                    | "PROMPT_COMMAND"
+                    | "PS0"
+                    | "PS1"
+                    | "PS2"
+                    | "PS3"
+                    | "PS4"
+                    | "SHELLOPTS"
+                    | "BASHOPTS"
+                    | "CDPATH"
+                    | "GLOBIGNORE"
+                    | "IFS"
+                    | "INPUTRC"
+                    | "HISTFILE"
+                    | "POSIXLY_CORRECT"
+                    | "BASH_XTRACEFD"
+                    | "CYGWIN"
+                    | "MSYS"
+                    | "MSYSTEM"
+                    | "MSYSTEM_CARCH"
+                    | "MSYSTEM_CHOST"
+                    | "MSYSTEM_PREFIX"
+                    | "MINGW_PREFIX"
+                    | "DOTNET_STARTUP_HOOKS"
+                    | "DOTNET_ADDITIONAL_DEPS"
+                    | "DOTNET_SHARED_STORE"
+                    | "CORECLR_ENABLE_PROFILING"
+                    | "CORECLR_PROFILER"
+                    | "CORECLR_PROFILER_PATH"
+                    | "COR_ENABLE_PROFILING"
+                    | "COR_PROFILER"
+                    | "COR_PROFILER_PATH"
+            ) || ["BASH_FUNC_", "BAYAN_", "__BAYAN_", "LD_", "DYLD_", "MSYS2_"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        })
+        .map(std::ffi::OsStr::to_os_string)
+        .collect();
+    for name in remove {
+        cmd.env_remove(name);
+    }
+    cmd.env("INPUTRC", "/dev/null");
+    cmd.env("HISTFILE", "/dev/null");
+}
+
+fn prepare_elevated_shell(
+    cmd: &mut CommandBuilder,
+    program: &str,
+    args: &[String],
+    elevated: bool,
+    marks: bool,
+    nonce: &str,
+) -> Result<Option<crate::shellint::Plan>, String> {
+    sanitize_elevated_environment(cmd, elevated);
+    if !elevated {
+        return Ok(None);
+    }
+    let protected = crate::shellint::elevated_bash_startup(program, args, marks, nonce)?;
+    if crate::shellint::is_bash_program(program) && protected.is_none() {
+        // Explicit commands keep their arguments, but not startup-file or
+        // environment-function execution before those commands.
+        cmd.args(["--noprofile", "--norc", "-p"]);
+    }
+    Ok(protected)
 }
 
 /// Longest cwd we will store or start a process in. Real Windows paths fit;
@@ -1310,6 +1419,39 @@ fn feed_counted<T: EventListener>(
     if evict > 0 {
         meta.evicted += evict as u64;
     }
+}
+
+/// What "Reset terminal modes" turns off, as the bytes a well-behaved
+/// program would have sent on exit: cursor shown, mouse tracking and focus
+/// reports off, cursor keys and keypad back to normal, bracketed paste off,
+/// an open synchronized update closed.
+///
+/// It is not RIS, and it does not touch colors, the character set or the
+/// screen. ConPTY keeps its own copy of the screen and its own attribute
+/// state and only sends what changed. A view cleared or recolored behind
+/// its back stays wrong until the program happens to repaint.
+pub(crate) const MODE_RESET: &[u8] = b"\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\
+\x1b[?1004l\x1b[?1l\x1b>\x1b[?2004l\x1b[?2026l";
+
+/// ED 3: drop the saved lines, keep the screen.
+pub(crate) const CLEAR_SCROLLBACK: &[u8] = b"\x1b[3J";
+
+/// Bytes from the window rather than the program, through the reader's own
+/// counted feed. The lines ED 3 drops count as evicted, so OSC 133 marks
+/// and images keep their global rows.
+///
+/// The parser is the reader's. If a read ended inside an escape sequence,
+/// these bytes cut it short; [`reset_keyboard_modes`] has the same property.
+pub(crate) fn feed_local<T: EventListener>(
+    parser: &mut Processor,
+    t: &mut Term<T>,
+    meta: &mut SessionMeta,
+    bytes: &[u8],
+) {
+    // none of the sequences above asks a question
+    let mut replies = Vec::new();
+    feed_counted(parser, t, meta, bytes, &mut replies);
+    meta.images.evict(meta.evicted);
 }
 
 fn merge_chunk(dst: &mut ChunkEvents, src: ChunkEvents) {
@@ -2452,6 +2594,7 @@ pub(crate) struct ChunkOutput {
 pub struct EventBatch {
     active: bool,
     out: ChunkOutput,
+    clipboard_read_after: Option<Instant>,
 }
 
 impl EventBatch {
@@ -2462,6 +2605,13 @@ impl EventBatch {
 
     /// `Some(event)` when the event should be posted now.
     pub(crate) fn absorb(&mut self, event: Event) -> Option<Event> {
+        if matches!(event, Event::ClipboardLoad(..)) {
+            let now = Instant::now();
+            if self.clipboard_read_after.is_some_and(|after| now < after) {
+                return None;
+            }
+            self.clipboard_read_after = Some(now + std::time::Duration::from_secs(2));
+        }
         if !self.active {
             return Some(event);
         }
@@ -2669,15 +2819,6 @@ static TEXT_AREA: std::sync::LazyLock<RwLock<TextArea>> = std::sync::LazyLock::n
     })
 });
 
-/// OSC 52 read. Off unless the user set `osc52_read`. A reply is still
-/// refused while the read itself is unimplemented.
-static OSC52_READ: AtomicBool = AtomicBool::new(false);
-
-/// Publish the read flag. Default off. Called once at startup.
-pub fn set_osc52_read(enabled: bool) {
-    OSC52_READ.store(enabled, Ordering::Release);
-}
-
 /// The renderer's cell, in pixels. A non-finite or sub-pixel value counts
 /// as unknown.
 pub fn set_text_area_cell(cell_w: f32, cell_h: f32) {
@@ -2748,18 +2889,6 @@ fn text_area_reply(
     area.map(format)
 }
 
-/// Bytes to write for an OSC 52 read, or nothing.
-///
-/// Off is the default. This function never returns text: not the clipboard,
-/// and not an empty OSC 52. Reading the clipboard is a later change; until
-/// then an enabled flag still writes nothing.
-pub(crate) fn clipboard_load_reply(read_enabled: bool) -> Option<String> {
-    if !read_enabled {
-        return None;
-    }
-    None
-}
-
 /// Colour, text-area, and clipboard queries, before the batch. A `PtyWrite`
 /// joins the read's 16 KiB cap. `ClipboardLoad` stays a notice: the
 /// formatter is not called, so no clipboard bytes (and no empty OSC 52)
@@ -2771,10 +2900,7 @@ fn prepare_event(pane: u64, event: Event) -> Option<Event> {
         }
         Event::ClipboardLoad(kind, format) => {
             // `format(text)` is the OSC 52 reply. It is not called.
-            match clipboard_load_reply(OSC52_READ.load(Ordering::Acquire)) {
-                Some(text) => Some(Event::PtyWrite(text)),
-                None => Some(Event::ClipboardLoad(kind, format)),
-            }
+            Some(Event::ClipboardLoad(kind, format))
         }
         other => {
             let colors = QUERY_COLORS
@@ -3035,15 +3161,22 @@ impl Session {
         } else {
             prog
         };
-        let mut cmd = CommandBuilder::new(prog);
+        let mut cmd = CommandBuilder::new(&prog);
+        let protected_bash = prepare_elevated_shell(
+            &mut cmd,
+            &prog,
+            &args,
+            elevated,
+            shell_integration,
+            &prompt_nonce,
+        )?;
+        let protection_required = protected_bash.is_some();
         for a in &args {
             cmd.arg(a);
         }
         // what programs key their terminal features on: Claude Code, ripgrep,
         // delta and the rest read these before deciding what to emit
-        cmd.env("TERM_PROGRAM", "Bayan");
-        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
-        cmd.env("COLORTERM", "truecolor");
+        terminal_environment(&mut cmd);
         // requested dir (a restored tab, or "new tab inherits the cwd"),
         // else the launcher's directory, else home.
         // accept_local_cwd runs BEFORE any probe: a UNC path must not be
@@ -3054,7 +3187,7 @@ impl Session {
             .filter(|d| usable_spawn_dir(d))
             .or_else(launcher_dir)
             .or_else(|| std::env::var("USERPROFILE").ok());
-        if let Some(d) = dir {
+        if let Some(d) = &dir {
             cmd.cwd(d);
         }
         // A raw command is the program the user named. The PowerShell,
@@ -3083,30 +3216,28 @@ impl Session {
             let theme = if elevated { None } else { detect_posh_theme() };
             let setup = powershell_setup(elevated, theme.as_deref(), integrate);
             cmd.arg(setup);
-        } else if wrap {
-            if let Some(plan) =
+        } else if wrap || protection_required {
+            if let Some(plan) = protected_bash.or_else(|| {
                 crate::shellint::plan(shell, shell_integration, elevated, &prompt_nonce)
-            {
-                match crate::shellint::materialize(&plan) {
-                    Ok(done) => {
-                        let argv = cmd.get_argv_mut();
-                        let prog = argv.first().cloned();
-                        argv.clear();
-                        if let Some(prog) = prog {
-                            argv.push(prog);
-                        }
-                        for arg in done.args {
-                            argv.push(arg.into());
-                        }
-                        for (key, value) in done.env {
-                            cmd.env(key, value);
-                        }
-                        integration_scripts = crate::shellint::IntegrationDir(done.dir);
-                        applied = true;
+            }) {
+                if let Some(done) = crate::shellint::startup_materialization(
+                    crate::shellint::materialize(&plan),
+                    protection_required,
+                )? {
+                    let argv = cmd.get_argv_mut();
+                    let prog = argv.first().cloned();
+                    argv.clear();
+                    if let Some(prog) = prog {
+                        argv.push(prog);
                     }
-                    Err(err) => {
-                        eprintln!("bayan: shell integration skipped: {err}");
+                    for arg in done.args {
+                        argv.push(arg.into());
                     }
+                    for (key, value) in done.env {
+                        cmd.env(key, value);
+                    }
+                    integration_scripts = crate::shellint::IntegrationDir(done.dir);
+                    applied = true;
                 }
             }
         }
@@ -3119,7 +3250,7 @@ impl Session {
         let writer = pair.master.take_writer()?;
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
-        Self::from_parts(SessionArgs {
+        let session = Self::from_parts(SessionArgs {
             size,
             proxy,
             id,
@@ -3137,7 +3268,9 @@ impl Session {
                 on_resize: None,
                 on_kill: None,
             },
-        })
+        })?;
+        session.meta.lock_or_recover().initial_cwd = dir;
+        Ok(session)
     }
 
     /// A pane fed by `io` instead of a ConPTY this process opened. Local
@@ -3438,6 +3571,26 @@ impl Session {
         let mut m = self.meta.lock_or_recover();
         let mut parser = self.parser.lock_or_recover();
         reset_keyboard_modes(&mut parser, &mut t, &mut m);
+    }
+
+    fn feed_local(&mut self, bytes: &[u8]) {
+        let mut t = self.term.lock();
+        let mut m = self.meta.lock_or_recover();
+        let mut parser = self.parser.lock_or_recover();
+        feed_local(&mut parser, &mut t, &mut m, bytes);
+    }
+
+    /// Drop this pane's saved lines. The screen stays. On the alternate
+    /// screen there is no history to drop and the primary one is untouched.
+    pub fn clear_scrollback(&mut self) {
+        self.feed_local(CLEAR_SCROLLBACK);
+    }
+
+    /// Undo the modes a crashed program left on: [`MODE_RESET`] and the
+    /// kitty keyboard stack.
+    pub fn reset_modes(&mut self) {
+        self.reset_keyboard();
+        self.feed_local(MODE_RESET);
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
@@ -3871,6 +4024,130 @@ pub fn regex_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_directory_falls_back_without_faking_a_shell_report() {
+        let start = std::env::temp_dir()
+            .to_string_lossy()
+            .trim_end_matches('\\')
+            .to_string();
+        let reported = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut meta = SessionMeta {
+            initial_cwd: Some(start.clone()),
+            ..SessionMeta::default()
+        };
+        assert!(meta.reported_cwd().is_none());
+        assert_eq!(meta.spawn_cwd(), Some(start.clone()));
+        meta.cwd = Some(reported.clone());
+        assert_eq!(meta.spawn_cwd(), Some(reported));
+        meta.cwd = Some(r"\\server\share".into());
+        assert_eq!(meta.spawn_cwd(), Some(start));
+        meta.initial_cwd = Some(r"\\server\share".into());
+        assert!(meta.spawn_cwd().is_none());
+    }
+
+    #[test]
+    fn elevated_environment_removes_startup_code_even_with_nonunicode_values() {
+        use std::os::windows::ffi::OsStringExt;
+        let mut cmd = CommandBuilder::new("bash.exe");
+        cmd.env_clear();
+        for name in [
+            "PROMPT_COMMAND",
+            "BASH_ENV",
+            "ENV",
+            "PS0",
+            "PS1",
+            "PS4",
+            "SHELLOPTS",
+            "BASHOPTS",
+            "CDPATH",
+            "GLOBIGNORE",
+            "CYGWIN",
+            "LD_PRELOAD",
+            "__BAYAN_SI",
+        ] {
+            cmd.env(name, "untrusted");
+        }
+        cmd.env(
+            "BASH_FUNC_dirname%%",
+            std::ffi::OsString::from_wide(&[0xd800]),
+        );
+        cmd.env("BAYAN_PROMPT_NONCE", "inherited");
+        cmd.env("SYSTEMROOT", r"C:\Windows");
+        sanitize_elevated_environment(&mut cmd, true);
+        for name in [
+            "PROMPT_COMMAND",
+            "BASH_ENV",
+            "ENV",
+            "PS0",
+            "PS1",
+            "PS4",
+            "SHELLOPTS",
+            "BASHOPTS",
+            "CDPATH",
+            "GLOBIGNORE",
+            "CYGWIN",
+            "LD_PRELOAD",
+            "__BAYAN_SI",
+            "BASH_FUNC_dirname%%",
+            "BAYAN_PROMPT_NONCE",
+        ] {
+            assert!(cmd.get_env(name).is_none(), "{name} survived");
+        }
+        assert_eq!(
+            cmd.get_env("SYSTEMROOT"),
+            Some(std::ffi::OsStr::new(r"C:\Windows"))
+        );
+        assert_eq!(
+            cmd.get_env("INPUTRC"),
+            Some(std::ffi::OsStr::new("/dev/null"))
+        );
+        assert_eq!(
+            cmd.get_env("HISTFILE"),
+            Some(std::ffi::OsStr::new("/dev/null"))
+        );
+    }
+
+    #[test]
+    fn normal_environment_keeps_user_prompt_and_functions_unchanged() {
+        let mut cmd = CommandBuilder::new("bash.exe");
+        cmd.env_clear();
+        cmd.env("PROMPT_COMMAND", "user prompt");
+        cmd.env("BASH_FUNC_fixture%%", "() { :; }");
+        let before = cmd.clone();
+        sanitize_elevated_environment(&mut cmd, false);
+        assert_eq!(cmd, before);
+    }
+
+    #[test]
+    fn elevated_explicit_bash_keeps_command_bytes_but_suppresses_startup() {
+        let args = vec![
+            "-c".into(),
+            "printf '%s' \"$1\"".into(),
+            "--".into(),
+            "عربي & literal".into(),
+        ];
+        let mut cmd = CommandBuilder::new("bash.exe");
+        cmd.env_clear();
+        cmd.env("BASH_ENV", "untrusted-file");
+        let protected =
+            prepare_elevated_shell(&mut cmd, "bash.exe", &args, true, false, NONCE_OFF).unwrap();
+        assert!(
+            protected.is_none(),
+            "an explicit command does not get a prompt wrapper"
+        );
+        cmd.args(&args);
+        let expected: Vec<std::ffi::OsString> = ["bash.exe", "--noprofile", "--norc", "-p"]
+            .into_iter()
+            .map(Into::into)
+            .chain(args.into_iter().map(Into::into))
+            .collect();
+        assert_eq!(cmd.get_argv(), &expected);
+        assert!(cmd.get_env("BASH_ENV").is_none());
+    }
 
     #[test]
     fn an_elevated_powershell_setup_does_not_inject_oh_my_posh() {
@@ -5253,6 +5530,106 @@ mod tests {
         assert_eq!(t.grid().display_offset(), 0);
     }
 
+    /// "Clear scrollback" from the window: the saved lines go, the screen
+    /// stays, and a mark made before the clear still names its own row.
+    #[test]
+    fn clearing_the_scrollback_keeps_the_screen_and_the_marks() {
+        use alacritty_terminal::index::{Line, Point};
+        let size = TermSize { cols: 20, rows: 4 };
+        let mut t = Term::new(Config::default(), &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        let mut meta = SessionMeta {
+            prompt_nonce: "n0nce".into(),
+            ..SessionMeta::default()
+        };
+        let mut carry = Vec::new();
+        for i in 0..10 {
+            let line = format!("L{i}\r\n");
+            process_chunk(&mut p, &mut t, &mut meta, &mut carry, line.as_bytes());
+        }
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b]133;A;n0nce\x07prompt",
+        );
+        let history = t.grid().history_size();
+        assert!(history > 0, "the test needs saved lines");
+        let screen = |t: &Term<VoidListener>| {
+            t.bounds_to_string(
+                Point::new(Line(0), Column(0)),
+                Point::new(Line(3), Column(19)),
+            )
+        };
+        let before = screen(&t);
+        let cursor = t.grid().cursor.point;
+        t.scroll_display(Scroll::Delta(3));
+
+        feed_local(&mut p, &mut t, &mut meta, CLEAR_SCROLLBACK);
+
+        assert_eq!(t.grid().history_size(), 0);
+        assert_eq!(
+            t.grid().display_offset(),
+            0,
+            "nothing left to be scrolled into"
+        );
+        assert_eq!(screen(&t), before, "the screen is untouched");
+        assert_eq!(t.grid().cursor.point, cursor);
+        assert_eq!(
+            meta.evicted, history as u64,
+            "the cleared lines count as evicted"
+        );
+        let m = meta.marks.last().unwrap();
+        let grid_line = (m.abs - meta.evicted) as i64 - t.grid().history_size() as i64;
+        assert_eq!(
+            grid_line, cursor.line.0 as i64,
+            "the prompt mark kept its row"
+        );
+    }
+
+    /// "Reset terminal modes": what a crashed TUI leaves on goes off, and
+    /// nothing ConPTY keeps its own copy of (text, colors, cursor) moves.
+    #[test]
+    fn the_mode_reset_turns_leftover_modes_off_and_leaves_the_screen() {
+        use alacritty_terminal::index::{Line, Point};
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"\x1b[31mred text\x1b[?25l\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?1h\x1b=\x1b[?2004h",
+        );
+        let left_on = TermMode::MOUSE_MOTION
+            | TermMode::SGR_MOUSE
+            | TermMode::FOCUS_IN_OUT
+            | TermMode::APP_CURSOR
+            | TermMode::APP_KEYPAD
+            | TermMode::BRACKETED_PASTE;
+        assert!(t.mode().contains(left_on));
+        assert!(!t.mode().contains(TermMode::SHOW_CURSOR));
+        let cursor = t.grid().cursor.point;
+        let fg = t.grid().cursor.template.fg;
+
+        feed_local(&mut p, &mut t, &mut meta, MODE_RESET);
+
+        assert!(!t.mode().intersects(left_on | TermMode::MOUSE_MODE));
+        assert!(t.mode().contains(TermMode::SHOW_CURSOR));
+        assert_eq!(t.grid().cursor.point, cursor, "the cursor did not move");
+        assert_eq!(
+            t.grid().cursor.template.fg,
+            fg,
+            "the color is ConPTY's to reset"
+        );
+        let row = t.bounds_to_string(
+            Point::new(Line(0), Column(0)),
+            Point::new(Line(0), Column(7)),
+        );
+        assert_eq!(row, "red text");
+        assert!(!t.mode().contains(TermMode::ALT_SCREEN));
+    }
+
     #[test]
     fn osc52_and_cwd_scan_with_split_payloads() {
         let (mut t, mut p, mut meta, mut carry) = test_term();
@@ -6220,9 +6597,6 @@ mod tests {
     fn osc52_query_writes_nothing_and_the_load_is_forwarded() {
         use alacritty_terminal::term::ClipboardType;
         assert!(!crate::config::UserConfig::default().osc52_read_enabled());
-        assert!(!OSC52_READ.load(Ordering::Acquire));
-        assert!(clipboard_load_reply(false).is_none());
-        assert!(clipboard_load_reply(true).is_none());
 
         let (writes, loads) = host_feed(1, Config::default(), b"\x1b]52;c;?\x07");
         assert!(
@@ -6240,6 +6614,67 @@ mod tests {
         let (writes, loads) = host_feed(1, cfg, b"\x1b]52;c;?\x07");
         assert!(writes.is_empty(), "{writes:?}");
         assert_eq!(loads, vec![ClipboardType::Clipboard]);
+    }
+
+    #[test]
+    fn new_pty_advertises_a_standard_terminfo_entry_and_truecolor() {
+        let mut cmd = CommandBuilder::new("ssh.exe");
+        cmd.env("TERM", "unknown-parent-terminal");
+        terminal_environment(&mut cmd);
+        assert_eq!(
+            cmd.get_env("TERM"),
+            Some(std::ffi::OsStr::new("xterm-256color"))
+        );
+        assert_eq!(
+            cmd.get_env("COLORTERM"),
+            Some(std::ffi::OsStr::new("truecolor"))
+        );
+        assert_eq!(
+            cmd.get_env("TERM_PROGRAM"),
+            Some(std::ffi::OsStr::new("Bayan"))
+        );
+    }
+
+    #[test]
+    fn clipboard_read_needs_focused_explicit_permission_and_is_size_bounded() {
+        for enabled in [false, true] {
+            for window in [false, true] {
+                for pane in [false, true] {
+                    assert_eq!(
+                        allow_osc52_read(enabled, window, pane),
+                        enabled && window && pane
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            approved_clipboard_reply("مرحبا"),
+            Some("\x1b]52;c;2YXYsdit2KjYpw==\x07".into())
+        );
+        assert!(approved_clipboard_reply(&"x".repeat(OSC52_MAX_BYTES + 1)).is_none());
+        assert!(approved_clipboard_reply(&"x".repeat(OSC52_MAX_BYTES)).is_some());
+        assert_eq!(approved_clipboard_reply(""), Some("\x1b]52;c;\x07".into()));
+    }
+
+    #[test]
+    fn clipboard_query_flood_is_rate_limited_even_across_batches() {
+        use alacritty_terminal::term::ClipboardType;
+        let query = || {
+            Event::ClipboardLoad(
+                ClipboardType::Clipboard,
+                std::sync::Arc::new(|s| s.to_string()),
+            )
+        };
+        let mut batch = EventBatch::default();
+        assert!(batch.absorb(query()).is_some());
+        batch.begin();
+        for _ in 0..1000 {
+            assert!(batch.absorb(query()).is_none());
+        }
+        batch.finish(false, vec![]);
+        assert!(batch.absorb(query()).is_none());
+        batch.clipboard_read_after = Some(Instant::now());
+        assert!(batch.absorb(query()).is_some());
     }
 
     struct KittyFixture {

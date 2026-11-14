@@ -91,6 +91,8 @@ pub fn click_owner(
 /// a sanitized copy of the target — never a button that opens it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefuseReason {
+    /// High-token association opens can execute per-user registered handlers.
+    PrivilegedOpen,
     Scheme,
     ControlOrBidi,
     TooLong,
@@ -107,6 +109,10 @@ pub enum RefuseReason {
 impl RefuseReason {
     pub fn label(self) -> &'static str {
         match self {
+            RefuseReason::PrivilegedOpen => crate::lang::tr(
+                "افتح الروابط والملفات من نافذة غير مرفوعة الصلاحيات",
+                "Open links and files from a non-administrator window",
+            ),
             RefuseReason::Scheme => crate::lang::tr("المخطط غير مسموح", "Scheme not allowed"),
             RefuseReason::ControlOrBidi => {
                 crate::lang::tr("يحتوي على أحرف تحكم", "Contains control characters")
@@ -1774,13 +1780,19 @@ where
 
 pub fn settle_live(action: Action, elevated: bool) -> Action {
     if elevated {
-        settle_choosing(
-            action,
-            local_file_probe,
-            win_long_path,
-            || code_exe(true).map(|p| p.to_string_lossy().into_owned()),
-            true,
-        )
+        // A Program Files executable can still load per-user extensions or
+        // associations. Until an unelevated broker is verified, fail closed
+        // before probing/launching any external target. Normal windows keep
+        // the complete link/editor behavior below.
+        match action {
+            Action::Browse(uri)
+            | Action::OpenPath(uri)
+            | Action::Reveal(uri)
+            | Action::Edit { path: uri, .. }
+            | Action::EditDefault { path: uri, .. }
+            | Action::Confirm { uri, .. } => refuse(RefuseReason::PrivilegedOpen, &uri),
+            refusal @ Action::Refuse { .. } => refusal,
+        }
     } else {
         settle(action, local_file_probe, win_long_path, || {
             code_exe(false).map(|p| p.to_string_lossy().into_owned())
@@ -2859,6 +2871,34 @@ impl SpanCache {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn elevated_links_cannot_start_user_associations_or_editor_profiles() {
+        let actions = [
+            Action::Browse("https://example.com".into()),
+            Action::OpenPath(r"C:\file.txt".into()),
+            Action::Reveal(r"C:\file.txt".into()),
+            Action::Edit {
+                argv: vec!["code.exe".into()],
+                path: r"C:\file.txt".into(),
+            },
+            Action::EditDefault {
+                path: r"C:\file.txt".into(),
+                line: 1,
+                col: None,
+            },
+            Action::Confirm {
+                uri: "https://example.com".into(),
+                host: "example.com".into(),
+            },
+        ];
+        for action in actions {
+            assert!(matches!(settle_live(action, true), Action::Refuse { .. }));
+        }
+        assert_eq!(
+            settle_live(Action::Browse("https://example.com".into()), false),
+            Action::Browse("https://example.com".into())
+        );
+    }
     use super::*;
 
     fn row(s: &str) -> Vec<RowCell> {

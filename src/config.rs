@@ -63,6 +63,10 @@ pub struct UserConfig {
     /// The 16 ANSI colors as "#rrggbb", normal 0-7 then bright 8-15.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub palette: Option<Vec<String>>,
+    /// Exact tab name (or folder/SSH title when unnamed) to #rrggbb.
+    /// Only chrome is colored; program text and ANSI colors stay intact.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub session_colors: std::collections::BTreeMap<String, String>,
     /// Programming ligatures (-> => != >= ...). Default on; needs a
     /// ligature-capable font (Cascadia Code, JetBrains Mono, Fira Code).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,9 +100,9 @@ pub struct UserConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub osc52: Option<String>,
     /// OSC 52 clipboard reads (`OSC 52 ; c ; ?`). Off unless this is exactly
-    /// `true`. Even then Bayan does not read the clipboard or write a reply
-    /// (not an empty one either); a later change does the read. A missing
-    /// key and `false` stay off.
+    /// `true`. Then each request needs explicit approval in the focused pane.
+    /// No clipboard contents are read before approval. A missing key and
+    /// `false` stay off; a background pane cannot request the read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub osc52_read: Option<bool>,
     /// BEL behavior: "attention" (amber tab dot, default), "sound"
@@ -511,6 +515,9 @@ pub const OPACITY_STEPS: [u32; 6] = [50, 60, 70, 80, 90, 100]; // percent
 pub const PADDING_STEPS: [u32; 6] = [0, 4, 8, 12, 16, 24]; // px
 
 impl UserConfig {
+    pub fn session_color(&self, title: &str) -> Option<(u8, u8, u8)> {
+        self.session_colors.get(title).and_then(|s| parse_hex(s))
+    }
     pub fn cursor(&self) -> CursorStyle {
         self.cursor_style
             .as_deref()
@@ -1066,6 +1073,19 @@ mod tests {
         assert_eq!(parse_hex("#fff"), None);
         assert_eq!(parse_hex("#zzzzzz"), None);
         assert_eq!(parse_hex(""), None);
+    }
+
+    #[test]
+    fn session_colors_match_explicit_names_and_reject_invalid_colors() {
+        let cfg: UserConfig = serde_json::from_str(
+            r##"{"session_colors":{"prod":"#ff3322","test":"#22aa44","bad":"red"}}"##,
+        )
+        .unwrap();
+        assert_eq!(cfg.session_color("prod"), Some((255, 51, 34)));
+        assert_eq!(cfg.session_color("test"), Some((34, 170, 68)));
+        assert_eq!(cfg.session_color("bad"), None);
+        assert_eq!(cfg.session_color("unknown"), None);
+        assert_eq!(UserConfig::default().session_color("prod"), None);
     }
 
     /// BAYAN-001: OSC 52 writes default off, and no value enables a read.

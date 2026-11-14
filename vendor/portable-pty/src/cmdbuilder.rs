@@ -325,6 +325,14 @@ impl CommandBuilder {
         self.envs.clear();
     }
 
+    /// All configured keys, including registry/base entries and entries
+    /// whose values are not Unicode. Security filtering must not skip them.
+    pub fn env_keys(&self) -> impl Iterator<Item = &OsStr> {
+        self.envs
+            .values()
+            .map(|entry| entry.preferred_key.as_os_str())
+    }
+
     pub fn get_env<K>(&self, key: K) -> Option<&OsStr>
     where
         K: AsRef<OsStr>,

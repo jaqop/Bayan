@@ -55,6 +55,10 @@ mod theme;
 mod toast;
 
 #[cfg(test)]
+#[path = "../vendor/portable-pty/src/win/conpty_bundle.rs"]
+#[allow(dead_code)] // Same production file, compiled here for the security tests.
+mod conpty_bundle;
+#[cfg(test)]
 mod conpty_load;
 #[cfg(test)]
 #[path = "../vendor/portable-pty/src/win/conpty_resolve.rs"]
@@ -65,6 +69,16 @@ mod conpty_resolve;
 /// rgb -> "#rrggbb" for the config file.
 fn hex((r, g, b): (u8, u8, u8)) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+/// Geometry alone cannot identify a frame when its sampled textures changed.
+fn frame_unchanged(
+    same_size: bool,
+    previous: &[u8],
+    current: &[u8],
+    resources_changed: bool,
+) -> bool {
+    same_size && !resources_changed && previous == current
 }
 
 /// Meta copied off a pane before the term lock: command marks in grid
@@ -83,6 +97,107 @@ type PaneSnap = (
 /// The Windows caret rhythm; kitty's idea on top: stop after 15s idle.
 const BLINK_MS: u128 = 530;
 const BLINK_STOP: std::time::Duration = std::time::Duration::from_secs(15);
+/// Busy-dot heartbeat. Only while the window is showing: a background tab's
+/// green dot fades ~2s after its last output, and the tab bar is the only
+/// thing this tick paints.
+const BUSY_PULSE: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// What a paint request is allowed to do.
+///
+/// `Redraw` calls into winit. `Defer` does not: a minimized, hidden, or
+/// occluded window must not enter `redraw` (that entry is what the idle
+/// perf gate counts). The restore path asks again when the window becomes
+/// visible; nothing is stored here. `Skip` is a background tab's grid while
+/// the window is up — the bytes are already applied, and the busy-dot pulse
+/// paints the tab bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaintGate {
+    Redraw,
+    Defer,
+    Skip,
+}
+
+/// `on_screen` is the active tab's grid, or chrome (title, bell, cwd,
+/// progress, the busy-dot pulse). A background tab's own grid is not.
+fn gate_paint(window_shown: bool, on_screen: bool) -> PaintGate {
+    if !window_shown {
+        PaintGate::Defer
+    } else if on_screen {
+        PaintGate::Redraw
+    } else {
+        PaintGate::Skip
+    }
+}
+
+/// The window can be drawn. Occluded, minimized, and quake-hidden are each
+/// enough to stop every paint.
+fn window_paints(occluded: bool, minimized: bool, hidden: bool) -> bool {
+    !occluded && !minimized && !hidden
+}
+
+/// Windows reports a minimized window as a 0×0 client size, and
+/// `Window::is_minimized` is the iconic bit. Either one means minimized.
+/// `None` (the query failed) does not.
+fn minimized_now(size_empty: bool, is_minimized: Option<bool>) -> bool {
+    size_empty || is_minimized.unwrap_or(false)
+}
+
+/// Drop the minimized flag only when the OS shows a real client size and
+/// says the window is not iconic. An unknown query keeps the flag, so a
+/// failed `is_minimized` cannot resume painting on its own.
+fn minimized_cleared(size_empty: bool, is_minimized: Option<bool>) -> bool {
+    !size_empty && is_minimized == Some(false)
+}
+
+/// One paint when the window goes from not showing to showing. A later
+/// event in the same restore must not ask again just because it also
+/// noticed.
+fn became_shown(was_shown: bool, now_shown: bool) -> bool {
+    !was_shown && now_shown
+}
+
+/// Visual deadlines the loop may arm, before visibility is applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WakeInputs {
+    shown: bool,
+    /// A background tab produced output inside the busy-dot window.
+    background_busy: bool,
+    blink: Option<Instant>,
+    scroll: Option<Instant>,
+    scrollbar: Option<Instant>,
+    notice: Option<Instant>,
+    /// Screen reader. Not a paint, so it still wakes a hidden window.
+    reader: Option<Instant>,
+}
+
+/// The next `ControlFlow` deadline, and whether the busy-dot pulse paints
+/// on this turn. `wake == None` is `ControlFlow::Wait`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WakePlan {
+    pulse_redraw: bool,
+    wake: Option<Instant>,
+}
+
+fn plan_idle(now: Instant, pulse: std::time::Duration, src: WakeInputs) -> WakePlan {
+    let mut wake: Option<Instant> = None;
+    let mut push = |at: Option<Instant>| {
+        if let Some(at) = at {
+            wake = Some(wake.map_or(at, |earliest| earliest.min(at)));
+        }
+    };
+    let pulse_redraw = src.shown && src.background_busy;
+    if src.shown {
+        if src.background_busy {
+            push(Some(now + pulse));
+        }
+        push(src.blink);
+        push(src.scroll);
+        push(src.scrollbar);
+        push(src.notice);
+    }
+    push(src.reader);
+    WakePlan { pulse_redraw, wake }
+}
 
 /// The shortcuts editor overlay's state.
 #[derive(Default)]
@@ -144,9 +259,19 @@ fn beep() {
 static QUAKE_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// A toast/tray click wants the window raised (summon, never hide).
 static SUMMON_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// `WM_SETTINGCHANGE` / `WM_SYSCOLORCHANGE` arrived. `about_to_wait` re-reads
-/// High Contrast and the text-size slider; the hook only sets the bit.
+/// `WM_SETTINGCHANGE` / `WM_SYSCOLORCHANGE` / `WM_THEMECHANGED` arrived.
+/// Those are sent straight to WindowProc, so winit's queue hook never sees
+/// them. The subclass (or the thread's call-wnd hook) sets this bit, and
+/// `about_to_wait` re-reads.
 static A11Y_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// One subclass id, and the call-wnd hook if the subclass export is missing.
+const A11Y_SUBCLASS_ID: usize = 0xB1A5;
+static A11Y_HOOK: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+/// The top-level window that hook belongs to. `WH_CALLWNDPROC` sees every
+/// window on the thread, so only this hwnd's `WM_NCDESTROY` may remove it.
+static A11Y_HWND: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 const QUAKE_ID: usize = 0xB1AA;
 
 /// The letter a Ctrl+<letter> event represents, resolved the way real
@@ -197,7 +322,131 @@ fn find_match<T: alacritty_terminal::event::EventListener>(
     hl: &Option<Match>,
     dir: Direction,
 ) -> Option<Match> {
-    let Ok(mut rs) = RegexSearch::new(&term::regex_escape(query)) else {
+    find_match_mode(t, query, hl, dir, false)
+}
+
+/// Hits are counted up to this many; past it the bar shows `1000+`. The
+/// walk holds the terminal lock, so it must end on a full scrollback of
+/// one-character hits.
+const SEARCH_COUNT_CAP: usize = 1000;
+
+/// Where the current hit sits among all hits, top of the scrollback first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SearchCount {
+    /// 1-based position of the current hit. `None` when there is no current
+    /// hit or it lies past the cap.
+    at: Option<usize>,
+    total: usize,
+    /// The walk stopped at `SEARCH_COUNT_CAP`; `total` is a floor.
+    capped: bool,
+}
+
+/// What the bar shows after the query. Filled by Enter; typing clears it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum SearchStatus {
+    /// Nothing searched yet for this query.
+    #[default]
+    Idle,
+    Counted(SearchCount),
+    /// Regex mode and the query does not compile.
+    BadPattern,
+}
+
+/// Count the hits of `query` over the whole scrollback, literal or regex
+/// as [`find_match_mode`] reads it. `None` is a pattern that does not compile.
+fn count_matches<T>(
+    t: &alacritty_terminal::term::Term<T>,
+    query: &str,
+    hl: &Option<Match>,
+    regex: bool,
+) -> Option<SearchCount> {
+    use alacritty_terminal::term::search::RegexIter;
+    let pattern = if regex {
+        query.to_string()
+    } else {
+        term::regex_escape(query)
+    };
+    let mut rs = RegexSearch::new(&pattern).ok()?;
+    let start = Point::new(Line(-(t.grid().history_size() as i32)), Column(0));
+    let end = Point::new(
+        Line(t.screen_lines() as i32 - 1),
+        Column(t.columns().saturating_sub(1)),
+    );
+    let mut count = SearchCount {
+        at: None,
+        total: 0,
+        capped: false,
+    };
+    let mut last: Option<Point> = None;
+    for m in RegexIter::new(start, end, Direction::Right, t, &mut rs) {
+        // the iterator steps with wrapping arithmetic: a start that does
+        // not advance means it came back around
+        if last.is_some_and(|p| *m.start() <= p) {
+            break;
+        }
+        if count.total == SEARCH_COUNT_CAP {
+            count.capped = true;
+            break;
+        }
+        last = Some(*m.start());
+        count.total += 1;
+        if hl.as_ref().is_some_and(|h| h.start() == m.start()) {
+            count.at = Some(count.total);
+        }
+    }
+    Some(count)
+}
+
+/// The count as it follows the query in the bar: `  2/17`, `  1000+`,
+/// no matches, or an invalid pattern. Empty before the first Enter.
+fn search_tail(status: SearchStatus) -> String {
+    match status {
+        SearchStatus::Idle => String::new(),
+        SearchStatus::BadPattern => format!("  {}", tr("تعبير غير صالح", "invalid pattern")),
+        SearchStatus::Counted(c) if c.total == 0 => {
+            format!("  {}", tr("لا نتائج", "no matches"))
+        }
+        SearchStatus::Counted(c) => {
+            let plus = if c.capped { "+" } else { "" };
+            match c.at {
+                Some(at) => format!("  \u{2066}{at}/{}{plus}\u{2069}", c.total),
+                None => format!("  \u{2066}{}{plus}\u{2069}", c.total),
+            }
+        }
+    }
+}
+
+/// Argv for the process Ctrl+Shift+N starts. An elevated window keeps the
+/// elevation rule: its child is told `--elevated` and nothing else, and
+/// being elevated already it starts without a second UAC prompt.
+fn new_window_args(elevated: bool) -> [&'static str; 1] {
+    if elevated {
+        ["--elevated"]
+    } else {
+        ["--new-window"]
+    }
+}
+
+/// The command a duplicated tab starts: the focused pane's own. `None`
+/// (a pane that lives in the mux server, or one with no recorded command)
+/// falls back to the shell a new tab would get.
+fn duplicate_command(pane_command: &str, in_mux: bool) -> Option<String> {
+    (!in_mux && !pane_command.trim().is_empty()).then(|| pane_command.to_string())
+}
+
+fn find_match_mode<T: alacritty_terminal::event::EventListener>(
+    t: &mut alacritty_terminal::term::Term<T>,
+    query: &str,
+    hl: &Option<Match>,
+    dir: Direction,
+    regex: bool,
+) -> Option<Match> {
+    let pattern = if regex {
+        query.to_string()
+    } else {
+        term::regex_escape(query)
+    };
+    let Ok(mut rs) = RegexSearch::new(&pattern) else {
         return None;
     };
     let cols = t.columns();
@@ -442,9 +691,7 @@ pub enum UserEvent {
     /// `allow_osc52_write` says so — the default is to drop it, and a write
     /// from any pane but the focused one of the active tab is dropped too.
     ClipboardSet(u64, String),
-    /// Pane `id` asked to read the clipboard (OSC 52). Forwarded so a later
-    /// change can answer it. This build writes no reply. The read flag
-    /// defaults off; see [`config::UserConfig::osc52_read_enabled`].
+    /// Read request: opt-in, active-pane focus, and explicit approval required.
     ClipboardLoad(u64, alacritty_terminal::term::ClipboardType),
     /// Pane `id`'s shell reported its working directory (OSC 7 or OSC 9;9).
     Cwd(u64, String),
@@ -536,6 +783,8 @@ enum PendingKind {
     /// config.lua or an executable plugin, approved by content hash.
     /// Enter does not type the source into the shell.
     ApproveLua,
+    /// One explicit clipboard read, never pasted or broadcast.
+    ReadClipboard,
 }
 
 /// Text held for the confirm card: the bytes to send, and why the card is up.
@@ -988,13 +1237,23 @@ impl ClickTracker {
 #[derive(Default)]
 struct SearchState {
     query: String,
+    regex: bool,
     hl: Option<Match>,
     /// A seeded selection searches the exact source cells while the field
     /// shows readable logical Arabic. Editing returns to ordinary search.
     selected_needle: Option<String>,
+    status: SearchStatus,
 }
 
 impl SearchState {
+    fn push(&mut self, text: &str) {
+        self.status = SearchStatus::Idle;
+        let room = 4096usize.saturating_sub(self.query.chars().count());
+        self.query
+            .extend(text.chars().filter(|c| !c.is_control()).take(room));
+        self.hl = None;
+        self.selected_needle = None;
+    }
     fn from_selection(text: Option<&str>, claude: bool) -> Self {
         let query = selection_search_query(text, claude);
         let selected_needle = (!query.is_empty()).then(|| text.unwrap_or_default().to_string());
@@ -1002,6 +1261,8 @@ impl SearchState {
             query,
             hl: None,
             selected_needle,
+            regex: false,
+            status: SearchStatus::Idle,
         }
     }
 }
@@ -1143,7 +1404,7 @@ fn shell_menu_rows(profiles: &[shells::Shell], default: &str) -> Vec<(PaletteRow
             .map(|s| (s.label(), s.command.clone()))
             .collect()
     };
-    listed
+    let mut rows: Vec<_> = listed
         .into_iter()
         .map(|(name, command)| {
             let label = if command == default {
@@ -1153,7 +1414,9 @@ fn shell_menu_rows(profiles: &[shells::Shell], default: &str) -> Vec<(PaletteRow
             };
             (PaletteRow::Shell(command), label)
         })
-        .collect()
+        .collect();
+    rows.push((PaletteRow::OpenSsh, ssh::label_open().to_string()));
+    rows
 }
 
 /// The Arabic-font cycler's step: the ring is Auto (`None`), then each of
@@ -1375,7 +1638,7 @@ fn lua_card_window(rows: &[String], scroll: usize) -> (Vec<String>, usize, bool)
     )
 }
 
-fn lua_enter_ready(not_before: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+fn approval_ready(not_before: Option<std::time::Instant>, now: std::time::Instant) -> bool {
     not_before.is_none_or(|t| now >= t)
 }
 
@@ -1673,6 +1936,15 @@ struct App {
     last_input: Instant,
     /// the blink phase the last frame actually drew (change → redraw)
     blink_drawn_on: bool,
+    /// `WindowEvent::Occluded(true)`. Windows does not emit this today;
+    /// minimized and hidden cover the cases it does not.
+    occluded: std::cell::Cell<bool>,
+    /// Client size is 0×0, or `Window::is_minimized`.
+    minimized: std::cell::Cell<bool>,
+    /// Quake hide, or `is_visible() == Some(false)` after the first frame.
+    /// The startup window is created hidden and is not this: the first
+    /// frame still has to paint.
+    hidden: std::cell::Cell<bool>,
     /// the settings panel (Ctrl+,) with its selected row, when open
     settings: Option<usize>,
     /// window focus (finish notifications only fire when nobody's looking)
@@ -1713,8 +1985,8 @@ struct App {
     lua_errors: Vec<String>,
     /// Set when the token is elevated and scripts were left unloaded.
     lua_notice: Option<String>,
-    /// Enter on a revealed Lua card is ignored until this instant.
-    lua_approve_not_before: Option<std::time::Instant>,
+    /// Ignore Enter briefly when a Lua or clipboard consent card first appears.
+    approve_not_before: Option<std::time::Instant>,
     /// every rebindable action's effective chord (defaults + config)
     keymap: Vec<(keybinds::Action, keybinds::Chord)>,
     /// the shortcuts editor overlay, when open
@@ -1776,6 +2048,8 @@ struct App {
     /// Resolved `-p` command line for that same tab. `None` keeps the
     /// configured shell. Ignored when `start_command` is set.
     start_profile_command: Option<String>,
+    /// `--maximized`: the first window opens maximized over any saved size.
+    start_maximized: bool,
     /// argv after `--`. When set, that program is the tab's process.
     start_command: Option<Vec<String>>,
     /// This process token is elevated. Session restore and `config.shell`
@@ -1957,6 +2231,9 @@ impl App {
             link_cache: link::SpanCache::default(),
             last_input: Instant::now(),
             blink_drawn_on: true,
+            occluded: std::cell::Cell::new(false),
+            minimized: std::cell::Cell::new(false),
+            hidden: std::cell::Cell::new(false),
             settings: None,
             focused: false,
             clicks: ClickTracker::new(),
@@ -1976,7 +2253,7 @@ impl App {
             lua_send_queue: std::collections::VecDeque::new(),
             lua_errors: Vec::new(),
             lua_notice: None,
-            lua_approve_not_before: None,
+            approve_not_before: None,
             config,
             config_load_error,
             startup_error: None,
@@ -1990,6 +2267,7 @@ impl App {
             debug_paste: None,
             start_dir,
             start_profile_command: None,
+            start_maximized: false,
             start_command: None,
             elevated: false,
             #[cfg(test)]
@@ -2017,10 +2295,106 @@ impl App {
         }
     }
 
+    /// Ask winit for one frame.
+    ///
+    /// Every paint goes through here (heal retries included). A window that
+    /// is occluded, minimized, or hidden does not get `Window::request_redraw`
+    /// and does not enter `redraw`. The grid, the bell, and the title are
+    /// already updated by the caller. Showing the window again is what
+    /// asks for the frame: `set_occluded(false)`, a non-zero resize, and
+    /// `reveal_window` each call this once they are showing.
     fn request_redraw(&self) {
+        if !matches!(gate_paint(self.shown(), true), PaintGate::Redraw) {
+            return;
+        }
         if let Some(w) = &self.window {
             w.request_redraw();
         }
+    }
+
+    /// The window is on screen. Before the first present the real window is
+    /// still hidden on purpose, and this stays true so that frame can land.
+    /// After it, a 0×0 size, the iconic bit, or `is_visible() == false`
+    /// latches minimized or hidden. Those latches are cleared by the
+    /// restore path, not here — a minimize that has not reached
+    /// `IsIconic` yet must not be undone by a stale query.
+    fn shown(&self) -> bool {
+        if self.occluded.get() {
+            return false;
+        }
+        self.observe_window();
+        window_paints(false, self.minimized.get(), self.hidden.get())
+    }
+
+    fn observe_window(&self) {
+        if !self.first_frame {
+            return;
+        }
+        let Some(w) = &self.window else {
+            return;
+        };
+        let size = w.inner_size();
+        let empty = size.width == 0 || size.height == 0;
+        if minimized_now(empty, w.is_minimized()) {
+            self.minimized.set(true);
+        }
+        if w.is_visible() == Some(false) {
+            self.hidden.set(true);
+        }
+    }
+
+    /// The OS reports a restored window (real size, not iconic) after we
+    /// had latched minimized. One paint, and only when nothing else is
+    /// still hiding the window.
+    fn release_minimized_if_restored(&self) {
+        if !self.first_frame || !self.minimized.get() {
+            return;
+        }
+        let Some(w) = &self.window else {
+            return;
+        };
+        let size = w.inner_size();
+        let empty = size.width == 0 || size.height == 0;
+        if !minimized_cleared(empty, w.is_minimized()) {
+            return;
+        }
+        // The flag was set, so the window was not showing. Clearing it
+        // paints only when occlusion and quake-hide are clear too.
+        self.minimized.set(false);
+        if window_paints(self.occluded.get(), false, self.hidden.get()) {
+            self.request_redraw();
+        }
+    }
+
+    /// Quake summon and the toast click: the window is being put on screen.
+    fn reveal_window(&self) {
+        self.hidden.set(false);
+        self.minimized.set(false);
+        self.occluded.set(false);
+        if let Some(w) = &self.window {
+            w.set_visible(true);
+            w.set_minimized(false);
+            w.focus_window();
+        }
+        self.apply_opacity();
+        self.request_redraw();
+    }
+
+    fn set_occluded(&self, occluded: bool) {
+        let was_shown = self.flags_shown();
+        self.occluded.set(occluded);
+        if became_shown(was_shown, self.flags_shown()) {
+            self.request_redraw();
+        }
+    }
+
+    fn flags_shown(&self) -> bool {
+        window_paints(self.occluded.get(), self.minimized.get(), self.hidden.get())
+    }
+
+    /// A pane of the tab that is on screen. Background tabs are not.
+    fn pane_on_active_tab(&self, id: u64) -> bool {
+        self.find_pane(id).is_some_and(|(ti, _)| ti == self.active)
     }
 
     /// Re-read High Contrast and the text-size slider. A real change
@@ -2137,6 +2511,12 @@ impl App {
             colors: render::resolved_colors(&self.config),
             follows_system: render::follows_system_theme(&self.config),
         }
+    }
+
+    /// `ThemeChanged` while the preferred theme is unset. The registry
+    /// DWORD wins; winit's light/dark is the fallback when the read fails.
+    fn on_theme_changed(&mut self, winit_light: bool, registry: Option<u32>) {
+        self.on_system_theme(theme_event_from(winit_light, registry));
     }
 
     /// A Windows theme signal. The tested `apply_event` decides the palette
@@ -2817,7 +3197,7 @@ impl App {
                 }
                 self.remove_pane(ti, pi, el);
             }
-            Search => {
+            Search | SearchRegex => {
                 let selected = self
                     .session()
                     .and_then(|s| s.term.lock().selection_to_string());
@@ -2825,12 +3205,19 @@ impl App {
                     selected.as_deref(),
                     self.claude_active(),
                 ));
+                if action == SearchRegex {
+                    if let Some(st) = self.search.as_mut() {
+                        st.regex = true;
+                        st.selected_needle = None;
+                    }
+                }
                 self.request_redraw();
             }
             Settings => {
                 self.settings = Some(0);
                 self.request_redraw();
             }
+            ExportHistory => self.export_scrollback(),
             Copy => {
                 self.copy_selection(false);
             }
@@ -2871,6 +3258,77 @@ impl App {
             CopyClean => {
                 self.copy_selection_clean();
             }
+            Fullscreen => self.toggle_fullscreen(),
+            ClearScrollback => self.clear_scrollback(),
+            ResetTerminal => {
+                if let Some(s) = self.session_mut() {
+                    s.reset_modes();
+                }
+                // a drag the program was tracking has no program side now
+                self.abandon_mouse();
+                self.request_redraw();
+            }
+            NewWindow => self.open_new_window(),
+            DuplicateTab => {
+                let Some((cwd, command)) = self.tabs.get(self.active).and_then(|tab| {
+                    let pane = tab.panes.get(tab.focused)?;
+                    let cwd = pane.session.meta.lock_or_recover().spawn_cwd();
+                    Some((cwd, duplicate_command(&pane.command, pane.mux.is_some())))
+                }) else {
+                    return;
+                };
+                // the pane's own command line, the one a restored session
+                // starts it with; a mux pane lives in the server, so its
+                // copy is an ordinary new tab
+                let command = command.unwrap_or_else(|| self.spawn_shell());
+                self.spawn_tab_command(cwd, &command, None);
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// F11. Borderless on the monitor the window is on; the same key
+    /// returns to the rectangle it had.
+    fn toggle_fullscreen(&mut self) {
+        if let Some(w) = &self.window {
+            let on = w.fullscreen().is_some();
+            w.set_fullscreen((!on).then_some(winit::window::Fullscreen::Borderless(None)));
+        }
+        // a divider or selection drag was measured against the old size
+        self.abandon_mouse();
+        self.drag_divider = None;
+        self.request_redraw();
+    }
+
+    fn clear_scrollback(&mut self) {
+        if let Some(id) = self.focused_pane_id() {
+            self.drop_smooth(id);
+        }
+        if let Some(s) = self.session_mut() {
+            s.clear_scrollback();
+        }
+        // a hit in the cleared lines is gone, and so is its count
+        if let Some(st) = self.search.as_mut() {
+            st.hl = None;
+            st.status = SearchStatus::Idle;
+        }
+        self.invalidate_focused_links();
+        self.request_redraw();
+    }
+
+    /// Ctrl+Shift+N: a second Bayan process. It is the jump list's
+    /// "New window" launch; an elevated window opens an elevated one.
+    fn open_new_window(&mut self) {
+        let started = std::env::current_exe().and_then(|exe| {
+            std::process::Command::new(exe)
+                .args(new_window_args(self.elevated))
+                .spawn()
+        });
+        if let Err(error) = started {
+            self.report_error(
+                tr("تعذر فتح نافذة جديدة", "Could not open a new window"),
+                &error.to_string(),
+            );
         }
     }
 
@@ -3177,8 +3635,6 @@ impl App {
         // the bar's side and width decide the gutter, so the grid moves
         let bar_moved = runtime.scrollbar != self.config.scrollbar;
         self.config = runtime;
-        // published once at startup; a reload has to publish it again
-        term::set_osc52_read(self.config.osc52_read_enabled());
         self.reapply_image_limits();
         if language {
             lang::set(self.config.lang());
@@ -3601,7 +4057,7 @@ impl App {
     /// before any pipe probe or `bayan --mux-server` spawn, the same branch
     /// `connect_if_enabled` tests.
     fn ensure_mux(&mut self) -> bool {
-        if !mux::mux_may_run(self.config.mux_enabled(), mux::is_elevated()) {
+        if !mux::mux_may_run(self.config.mux_enabled(), elevate::process_is_elevated()) {
             return false;
         }
         if self.mux_client.as_ref().is_some_and(|c| c.is_alive()) {
@@ -4372,7 +4828,8 @@ impl App {
     /// (moved or resized by the user, not maximized).
     fn track_geometry(&mut self) {
         let Some(w) = &self.window else { return };
-        if w.is_maximized() || w.is_minimized().unwrap_or(false) {
+        // full screen is not a rectangle to come back to either
+        if w.is_maximized() || w.is_minimized().unwrap_or(false) || w.fullscreen().is_some() {
             return;
         }
         let (Ok(pos), size) = (w.outer_position(), w.inner_size()) else {
@@ -5025,7 +5482,11 @@ impl App {
         let preview = card_preview(paste.kind, &paste.text);
         let shown = preview.first().map(String::as_str).unwrap_or("");
         Some(screen_reader::DialogItem {
-            name: screen_reader::paste_dialog_name().to_string(),
+            name: if paste.kind == PendingKind::ReadClipboard {
+                tr("السماح بقراءة الحافظة؟", "Allow clipboard read?").into()
+            } else {
+                screen_reader::paste_dialog_name().to_string()
+            },
             body: format!("{}\n{shown}", paste.reason),
         })
     }
@@ -5045,6 +5506,9 @@ impl App {
         } else {
             row as usize
         };
+        if let Some((source_row, col, side)) = r.flow_hit(rect, geom_row, pos.x) {
+            return Some((hit.pane, source_row as i32, col, side));
+        }
         if let Some((col, side)) = r.hit_cell(rect, geom_row, pos.x) {
             return Some((hit.pane, row, col, side));
         }
@@ -5180,6 +5644,14 @@ impl App {
         } else {
             row as usize
         };
+        if let Some(rect) = rects.get(hit.pane) {
+            if let Some(r) = self.renderer.as_mut() {
+                r.warm_row_ink(*rect, geom_row);
+                if let Some((source_row, col, _)) = r.flow_hit(*rect, geom_row, pos.x) {
+                    return Some((pane_id, source_row as i32, col));
+                }
+            }
+        }
         if row < 0 {
             let (cols, alt, history, off, cells) = {
                 let t = self.tabs[self.active].panes[hit.pane].session.term.lock();
@@ -5581,6 +6053,10 @@ impl App {
     /// Explorer `/select` for a reveal-only card. This does not call
     /// `settle`: an allowlisted extension would become an association open.
     fn spawn_reveal_only(&mut self, path: &str) {
+        if self.elevated {
+            self.refuse_link(link::RefuseReason::PrivilegedOpen, path);
+            return;
+        }
         let path = path.to_string();
         let proxy = self.proxy.clone();
         let owned = path.clone();
@@ -5982,6 +6458,44 @@ impl App {
         self.request_redraw();
     }
 
+    fn export_scrollback(&mut self) {
+        use std::io::Write;
+        let claude = self.claude_active();
+        let Some(session) = self.session() else {
+            return;
+        };
+        let text = copyclean::history_text(&session.term.lock(), claude);
+        let result = (|| -> std::io::Result<std::path::PathBuf> {
+            let dir = config::bayan_dir().join("exports");
+            std::fs::create_dir_all(&dir)?;
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = dir.join(format!("bayan-{stamp}-{}.txt", std::process::id()));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            file.write_all(text.as_bytes())?;
+            file.flush()?;
+            Ok(path)
+        })();
+        match result {
+            Ok(path) => {
+                self.config_notice = Some(ConfigNotice {
+                    text: format!("{}: {}", tr("حُفظ السجل", "History saved"), path.display()),
+                    until: Some(Instant::now() + std::time::Duration::from_secs(15)),
+                })
+            }
+            Err(err) => self.report_error(
+                tr("تعذر تصدير السجل", "Could not export history"),
+                &err.to_string(),
+            ),
+        }
+        self.request_redraw();
+    }
+
     fn paste(&mut self) {
         let Some(txt) = self.clipboard().and_then(|c| c.get_text().ok()) else {
             return;
@@ -6017,7 +6531,7 @@ impl App {
             match kind {
                 PendingKind::Paste => self.send_paste(&txt),
                 PendingKind::Drop | PendingKind::Command => self.send_focused(kind, &txt),
-                PendingKind::ApproveLua => {}
+                PendingKind::ApproveLua | PendingKind::ReadClipboard => {}
             }
             return;
         };
@@ -6047,6 +6561,15 @@ impl App {
         let Some(p) = self.pending_paste.take() else {
             return;
         };
+        if p.kind == PendingKind::ReadClipboard
+            && !approval_ready(self.approve_not_before, Instant::now())
+        {
+            self.pending_paste = Some(p);
+            return;
+        }
+        if p.kind == PendingKind::ReadClipboard {
+            self.approve_not_before = None;
+        }
         if p.kind == PendingKind::ApproveLua {
             self.approve_lua(p);
             self.after_confirm_card();
@@ -6061,6 +6584,7 @@ impl App {
             PendingKind::Paste => self.send_paste(&p.text),
             PendingKind::Drop | PendingKind::Command => self.send_focused(p.kind, &p.text),
             PendingKind::ApproveLua => {}
+            PendingKind::ReadClipboard => self.approve_clipboard_read(p.pane),
         }
         self.after_confirm_card();
         self.request_redraw();
@@ -6078,9 +6602,76 @@ impl App {
             self.lua_skipped.push(hash);
         }
         self.pending_paste = None;
-        self.lua_approve_not_before = None;
+        self.approve_not_before = None;
         self.after_confirm_card();
         self.request_redraw();
+    }
+
+    fn request_clipboard_read(&mut self, id: u64, kind: alacritty_terminal::term::ClipboardType) {
+        if kind != alacritty_terminal::term::ClipboardType::Clipboard
+            || !self.clipboard_read_allowed(id)
+            || self.overlay_blocks_mouse()
+            || self.search.is_some()
+            || self.term_mode().contains(TermMode::VI)
+        {
+            return;
+        }
+        let label = self
+            .tabs
+            .get(self.active)
+            .map(|t| t.label())
+            .unwrap_or_default();
+        self.approve_not_before = Some(Instant::now() + LUA_APPROVE_DELAY);
+        self.pending_paste = Some(PendingPaste {
+            kind: PendingKind::ReadClipboard,
+            pane: Some(id),
+            text: format!("{}: {}", tr("الجلسة", "Session"), label),
+            lines: 1,
+            chars: 0,
+            reason: tr(
+                "سيتم إرسال نص الحافظة إلى هذه اللوحة مرة واحدة؛ قد يصل إلى جهاز بعيد.",
+                "Send clipboard text to this pane once; it may reach a remote host.",
+            )
+            .into(),
+            lua: None,
+            scroll: 0,
+            saw_end: true,
+        });
+        self.request_redraw();
+    }
+
+    fn clipboard_read_allowed(&self, id: u64) -> bool {
+        term::allow_osc52_read(
+            self.config.osc52_read_enabled(),
+            self.window.as_ref().is_some_and(|w| w.has_focus()),
+            self.osc52_pane_is_focused(id),
+        )
+    }
+
+    fn approve_clipboard_read(&mut self, pane: Option<u64>) {
+        let Some(id) = pane.filter(|&id| self.clipboard_read_allowed(id)) else {
+            return;
+        };
+        // Read only here, after approval, and recheck the target. Never cache
+        // clipboard contents on a PTY request or send to broadcast panes.
+        let Some(text) = self.clipboard().and_then(|c| c.get_text().ok()) else {
+            return;
+        };
+        let Some(reply) = term::approved_clipboard_reply(&text) else {
+            self.report_error(
+                tr("الحافظة كبيرة جدًا", "Clipboard too large"),
+                tr(
+                    "الحد الأقصى 64 كيبيبايت؛ لم يُرسل شيء.",
+                    "Limit is 64 KiB; nothing was sent.",
+                ),
+            );
+            return;
+        };
+        if self.focused_pane_id() == Some(id) {
+            if let Some(session) = self.session_mut() {
+                session.write(reply.as_bytes());
+            }
+        }
     }
 
     fn after_confirm_card(&mut self) {
@@ -6185,18 +6776,17 @@ impl App {
             return;
         };
         if !script.shows_everything() {
-            self.lua_approve_not_before = Some(std::time::Instant::now() + LUA_APPROVE_DELAY);
+            self.approve_not_before = Some(std::time::Instant::now() + LUA_APPROVE_DELAY);
             self.raise_lua_card(script.reveal());
             self.request_redraw();
             return;
         }
-        if !lua_enter_ready(self.lua_approve_not_before, std::time::Instant::now()) || !card.saw_end
-        {
+        if !approval_ready(self.approve_not_before, std::time::Instant::now()) || !card.saw_end {
             self.pending_paste = Some(card);
             self.request_redraw();
             return;
         }
-        self.lua_approve_not_before = None;
+        self.approve_not_before = None;
         match lua_host::unchanged(&script) {
             Ok(()) => {
                 lua_host::grant(&mut self.json_config, &script.hash);
@@ -6334,10 +6924,15 @@ impl App {
         let Some(session) = self.session() else {
             return;
         };
-        let found = {
+        let (found, status) = {
             let mut t = session.term.lock();
             let hl = self.search.as_ref().and_then(|s| s.hl.clone());
-            let m = find_match(&mut t, &query, &hl, dir);
+            let regex = self.search.as_ref().is_some_and(|s| s.regex);
+            let m = if regex {
+                find_match_mode(&mut t, &query, &hl, dir, true)
+            } else {
+                find_match(&mut t, &query, &hl, dir)
+            };
             if let Some(m) = &m {
                 // bring the hit into view, roughly centered
                 let cur = t.grid().display_offset() as i32;
@@ -6345,20 +6940,36 @@ impl App {
                     .clamp(0, t.grid().history_size() as i32);
                 t.scroll_display(Scroll::Delta(want - cur));
             }
-            m
+            // count against the hit just found, so the bar reads 2/17
+            let status = match count_matches(&t, &query, &m, regex) {
+                Some(c) => SearchStatus::Counted(c),
+                None => SearchStatus::BadPattern,
+            };
+            (m, status)
         };
         if let Some(id) = self.focused_pane_id() {
             self.drop_smooth(id);
         }
         self.invalidate_focused_links();
-        if let (Some(st), Some(m)) = (self.search.as_mut(), found) {
-            st.hl = Some(m);
+        if let Some(st) = self.search.as_mut() {
+            st.hl = found;
+            st.status = status;
         }
         self.request_redraw();
     }
 
     /// Keyboard handling while the search bar is open.
     fn search_input(&mut self, event: &KeyEvent, shift: bool) {
+        if self.modifiers.control_key()
+            && !self.modifiers.alt_key()
+            && key_letter(event) == Some('v')
+        {
+            if let Some(text) = self.clipboard().and_then(|c| c.get_text().ok()) {
+                self.search_push(&text);
+            }
+            self.request_redraw();
+            return;
+        }
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => {
                 self.search = None;
@@ -6376,6 +6987,7 @@ impl App {
                     st.query.pop();
                     st.hl = None;
                     st.selected_needle = None;
+                    st.status = SearchStatus::Idle;
                 }
             }
             _ => {
@@ -6392,15 +7004,16 @@ impl App {
         let Some(st) = self.search.as_mut() else {
             return;
         };
-        for ch in t.chars() {
-            if !ch.is_control() {
-                st.query.push(ch);
-                st.hl = None;
-                st.selected_needle = None;
-            }
-        }
+        st.push(t);
     }
 
+    /// Paint one frame.
+    ///
+    /// Callers enter this only while the window is showing. The minimized
+    /// idle gate counts entries here and presents inside it, and requires
+    /// both to stay at zero while a minimized window has a busy background
+    /// tab. `RedrawRequested` checks first; do not add an early return in
+    /// front of that count.
     fn redraw(&mut self) {
         // Before a client, this is a flag check. After one, an unchanged
         // stamp does not walk the grid; a flood builds at about 10 Hz.
@@ -6493,10 +7106,15 @@ impl App {
                 attention: t.attention,
                 active: i == self.active,
                 progress: t.progress(),
+                color: self
+                    .config
+                    .session_color(t.name.as_deref().unwrap_or(&t.title)),
             })
             .collect();
         let config_notice = self.config_notice.clone();
-        let Some(window) = self.window.as_ref() else {
+        // Owned Arc so a later `request_redraw` can borrow `self` while
+        // this handle is still used for the present and the first show.
+        let Some(window) = self.window.clone() else {
             return;
         };
         let px = window.inner_size();
@@ -6507,6 +7125,9 @@ impl App {
         let mut sprites: Vec<render::ImageSprite> = Vec::new();
         match (self.renderer.as_mut(), self.tabs.get(self.active)) {
             (Some(renderer), Some(tab)) if !rects.is_empty() => {
+                if dev_hook("BAYAN_ATLAS_RESET").is_some() {
+                    renderer.stress_reset_atlas();
+                }
                 renderer.begin_frame();
                 self.bars.begin_frame();
                 let bordered = tab.panes.len() > 1 && !tab.zoomed;
@@ -6699,6 +7320,19 @@ impl App {
                     px.height as usize,
                     &tab_infos,
                     bar_text(self.search.as_ref().map(|s| s.query.as_str()), focused_copy)
+                        .map(|text| {
+                            // the count follows the query: `بحث: x_  2/17`
+                            let tail = self
+                                .search
+                                .as_ref()
+                                .map(|s| search_tail(s.status))
+                                .unwrap_or_default();
+                            if self.search.as_ref().is_some_and(|s| s.regex) {
+                                format!("[.*] {text}{tail}")
+                            } else {
+                                format!("{text}{tail}")
+                            }
+                        })
                         .as_deref(),
                     focused_claude,
                     elevate::title_badge(self.elevated),
@@ -6748,8 +7382,15 @@ impl App {
                     } else {
                         all
                     };
-                    let heading = (p.kind == PendingKind::ApproveLua)
-                        .then(|| tr("تشغيل سكربت لوا؟", "Run this Lua script?"));
+                    let heading = match p.kind {
+                        PendingKind::ApproveLua => {
+                            Some(tr("تشغيل سكربت لوا؟", "Run this Lua script?"))
+                        }
+                        PendingKind::ReadClipboard => {
+                            Some(tr("السماح بقراءة الحافظة؟", "Allow clipboard read?"))
+                        }
+                        _ => None,
+                    };
                     renderer.draw_paste_guard(
                         &mut verts,
                         px.width as usize,
@@ -6871,11 +7512,9 @@ impl App {
         }
         // new glyphs were rasterized this frame: sync the atlas texture
         let mut heal = false;
+        let mut atlas_changed = false;
         if let Some(renderer) = self.renderer.as_mut() {
-            if renderer.atlas.dirty {
-                gpu.upload_atlas(&renderer.atlas.pages);
-                renderer.atlas.dirty = false;
-            }
+            atlas_changed |= gpu.upload_atlas(&mut renderer.atlas);
             // an atlas reset mid-frame leaves earlier quads with stale uvs:
             // one more redraw re-emits everything from the fresh atlas
             heal = renderer.atlas.generation != self.atlas_generation;
@@ -6889,10 +7528,7 @@ impl App {
                 // persistent overlay (re-emitted every frame) so the second
                 // atlas page's glyphs stay on screen for verification
                 r.stress_atlas(&mut verts, px.width as usize, px.height as usize);
-                if r.atlas.dirty {
-                    gpu.upload_atlas(&r.atlas.pages);
-                    r.atlas.dirty = false;
-                }
+                atlas_changed |= gpu.upload_atlas(&mut r.atlas);
             }
         }
         // differential redraw: an identical quad set + unchanged atlas means
@@ -6910,8 +7546,12 @@ impl App {
             }
             &extended
         };
-        let unchanged =
-            self.last_frame_size == Some(px) && !heal && frame_key == self.last_frame.as_slice();
+        let unchanged = frame_unchanged(
+            self.last_frame_size == Some(px),
+            &self.last_frame,
+            frame_key,
+            atlas_changed || heal,
+        );
         if unchanged {
             return;
         }
@@ -6928,9 +7568,11 @@ impl App {
             .collect();
         if !gpu.render(&verts, &quads, bg) {
             // Retry once after reconfiguring, without spinning on occlusion.
+            // `request_redraw` no-ops while the window is not showing, so a
+            // surface that comes back occluded does not schedule another entry.
             self.last_frame_size = None;
             if surface_resized || heal {
-                window.request_redraw();
+                self.request_redraw();
             }
             return;
         }
@@ -6939,11 +7581,14 @@ impl App {
         self.last_frame.extend_from_slice(frame_key);
         self.last_frame_size = Some(px);
         if heal {
-            window.request_redraw();
+            self.request_redraw();
         }
         if !self.first_frame {
             self.first_frame = true;
             window.set_visible(true);
+            // ShowWindow can deliver a paint before it returns. That paint
+            // must not latch "hidden" from the pre-show visibility bit.
+            self.hidden.set(false);
             // winit reapplies ITS OWN style flags on visibility changes,
             // wiping the layered bit — restore the configured alpha after
             self.apply_opacity();
@@ -6990,7 +7635,25 @@ impl App {
         // the chunk may have enabled focus reporting; tell the
         // program whether the window is looking at it
         self.sync_focus(None);
-        self.request_redraw();
+        // The grid is already updated. Paint only the tab that is on
+        // screen, and not at all while the window itself is hidden:
+        // a deferred frame is drawn once on restore. A background tab
+        // while the window is up leaves the busy-dot pulse to repaint
+        // the tab bar; this chunk does not.
+        let on_screen = self.pane_on_active_tab(id);
+        match gate_paint(self.shown(), on_screen) {
+            PaintGate::Redraw => self.request_redraw(),
+            PaintGate::Defer => {
+                // The active tab is what the screen reader speaks. Publish
+                // without entering `redraw`, so a hidden window still
+                // announces and a minimized one does not present. The
+                // restore path paints when the window is showing again.
+                if on_screen {
+                    self.publish_reader();
+                }
+            }
+            PaintGate::Skip => {}
+        }
     }
 }
 
@@ -7041,6 +7704,11 @@ impl ApplicationHandler<UserEvent> for App {
                 });
             }
         }
+        // `--maximized` wins over the saved state. `normal_geom` above is
+        // untouched, so "restore down" still lands on yesterday's rectangle.
+        if self.start_maximized {
+            attrs = attrs.with_maximized(true);
+        }
         let window = match el.create_window(attrs) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -7086,6 +7754,7 @@ impl ApplicationHandler<UserEvent> for App {
             if !toast::init(h) {
                 eprintln!("bayan: tray icon registration failed — no toasts");
             }
+            install_a11y_watch(h);
             if let Ok(exe) = std::env::current_exe() {
                 if let Ok(path) = cli::exe_display(&exe) {
                     let app_id = jumplist::app_user_model_id(&path);
@@ -7163,11 +7832,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.report_error(tr("تعذر إرسال الإدخال", "Could not send input"), &error);
                 }
             }
-            UserEvent::ClipboardLoad(_id, _kind) => {
-                // No PTY reply. The read flag defaults off, and even when
-                // it is on this build does not read the clipboard or write
-                // an empty OSC 52. Item 31 is the read.
-            }
+            UserEvent::ClipboardLoad(id, kind) => self.request_clipboard_read(id, kind),
             UserEvent::ClipboardSet(id, text) => {
                 // has_focus, not the startup value of self.focused: that flag
                 // begins false and only tracks Focused events, which can lag
@@ -7199,6 +7864,8 @@ impl ApplicationHandler<UserEvent> for App {
                     let background = ti != self.active;
                     if background {
                         self.tabs[ti].attention = true;
+                        // Hidden/minimized/occluded: no winit redraw. The
+                        // attention flag above is what restore will draw.
                         self.request_redraw();
                     }
                     // sound only when you could have missed it: another tab,
@@ -7255,7 +7922,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some((ti, pi)) = self.find_pane(id) {
                     if self.tabs[ti].panes[pi].progress != p {
                         self.tabs[ti].panes[pi].progress = p;
-                        self.request_redraw(); // the tab bar and cockpit draw it
+                        // The tab bar draws it. A hidden window defers the paint.
+                        self.request_redraw();
                     }
                 }
             }
@@ -7277,6 +7945,8 @@ impl ApplicationHandler<UserEvent> for App {
                             let body = self.tabs[ti].label();
                             self.toast_from_pty(title, &body);
                         }
+                        // Attention and the toast are already recorded. The
+                        // paint waits if the window is not showing.
                         self.request_redraw();
                     }
                 }
@@ -7297,7 +7967,7 @@ impl ApplicationHandler<UserEvent> for App {
                         self.tabs[ti].title = base;
                     }
                 }
-                self.request_redraw(); // tab titles live in the frame
+                self.request_redraw(); // tab title; deferred while the window is hidden
             }
             UserEvent::RendererReady(r) => {
                 crate::prof::mark("renderer ready");
@@ -7407,76 +8077,83 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        // quake toggle: summon Bayan from anywhere / tuck it away again
+        // quake toggle: summon Bayan from anywhere / tuck it away again.
+        // Hiding latches before the paint schedule below, so this turn
+        // does not arm a blink or a busy-dot wake.
         if QUAKE_HIT.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            if let Some(w) = &self.window {
-                if self.focused && w.is_visible().unwrap_or(true) {
+            let visible = self
+                .window
+                .as_ref()
+                .is_some_and(|w| w.is_visible().unwrap_or(true));
+            if self.focused && visible {
+                self.hidden.set(true);
+                if let Some(w) = &self.window {
                     w.set_visible(false);
-                } else {
-                    w.set_visible(true);
-                    w.set_minimized(false);
-                    w.focus_window();
-                    self.apply_opacity(); // set_visible wipes the layered bit
                 }
+            } else {
+                self.reveal_window();
             }
         }
         // a toast/tray click summons (never hides — that's the quake key)
         if SUMMON_HIT.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            if let Some(w) = &self.window {
-                w.set_visible(true);
-                w.set_minimized(false);
-                w.focus_window();
-                self.apply_opacity(); // set_visible wipes the layered bit
-            }
+            self.reveal_window();
         }
         // High Contrast or the text-size slider changed. Re-read now; a
         // rebuild applies it on the next frame, without restarting.
         if A11Y_DIRTY.swap(false, std::sync::atomic::Ordering::Relaxed) {
             self.reload_a11y();
         }
-        // busy dots decay after ~2s of quiet: keep repainting on a slow
-        // heartbeat only while any background tab is (or just was) active
-        let any_busy = self
+        self.observe_window();
+        self.release_minimized_if_restored();
+        // Busy dots, blink, smooth scroll, and the scrollbar are paints.
+        // None of them are scheduled while the window is not showing, so
+        // the loop can Wait. The screen reader is not a paint and still
+        // wakes. A background tab's grid is not painted here either; the
+        // pulse only refreshes the tab-bar dot, and only while visible.
+        let shown = self.shown();
+        let background_busy = self
             .tabs
             .iter()
             .enumerate()
             .any(|(i, t)| t.busy(i == self.active));
-        let mut wake: Option<Instant> = None;
-        if any_busy {
-            wake = Some(Instant::now() + std::time::Duration::from_millis(600));
-            self.request_redraw();
-        }
-        // cursor blink: wake exactly at the next phase flip (or the 15s
-        // park); an idle window schedules nothing and truly sleeps
-        let (blink_on, blink_wake) = self.cursor_blink_state();
-        if blink_on != self.blink_drawn_on {
-            self.request_redraw();
-        }
-        if let Some(b) = blink_wake {
-            wake = Some(wake.map_or(b, |w| w.min(b)));
-        }
-        if let Some(t) = self.tick_smooth_scroll() {
-            wake = Some(wake.map_or(t, |w| w.min(t)));
-        }
-        // a scrollbar that auto-hides wakes once, then the next frame drops
-        // it and the window goes back to sleeping
-        let tick = self
-            .bars
-            .tick(self.config.scrollbar.autohide_on(), Instant::now());
-        if tick.redraw {
-            self.request_redraw();
-        }
-        if let Some(t) = tick.wake {
-            wake = Some(wake.map_or(t, |w| w.min(t)));
-        }
-        if let Some(until) = self.config_notice.as_ref().and_then(|notice| notice.until) {
-            if Instant::now() >= until {
-                self.config_notice = None;
+        let blink = if shown {
+            let (blink_on, blink_wake) = self.cursor_blink_state();
+            if blink_on != self.blink_drawn_on {
                 self.request_redraw();
-            } else {
-                wake = Some(wake.map_or(until, |w| w.min(until)));
             }
-        }
+            blink_wake
+        } else {
+            None
+        };
+        let scroll = if shown {
+            self.tick_smooth_scroll()
+        } else {
+            None
+        };
+        let scrollbar = if shown {
+            let tick = self
+                .bars
+                .tick(self.config.scrollbar.autohide_on(), Instant::now());
+            if tick.redraw {
+                self.request_redraw();
+            }
+            tick.wake
+        } else {
+            None
+        };
+        let notice = if shown {
+            let until = self.config_notice.as_ref().and_then(|notice| notice.until);
+            match until {
+                Some(until) if Instant::now() >= until => {
+                    self.config_notice = None;
+                    self.request_redraw();
+                    None
+                }
+                until => until,
+            }
+        } else {
+            None
+        };
         // The burst is spoken once the hold elapses, and a stamp that
         // arrived inside the 10 Hz window is published when that window ends.
         let now = Instant::now();
@@ -7485,14 +8162,27 @@ impl ApplicationHandler<UserEvent> for App {
         {
             self.publish_reader();
         }
-        let soon = match (self.reader_deadline, self.reader_tree_at) {
+        let reader = match (self.reader_deadline, self.reader_tree_at) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        if let Some(at) = soon {
-            wake = Some(wake.map_or(at, |w| w.min(at)));
+        let plan = plan_idle(
+            now,
+            BUSY_PULSE,
+            WakeInputs {
+                shown,
+                background_busy,
+                blink,
+                scroll,
+                scrollbar,
+                notice,
+                reader,
+            },
+        );
+        if plan.pulse_redraw {
+            self.request_redraw();
         }
-        match wake {
+        match plan.wake {
             Some(t) => el.set_control_flow(ControlFlow::WaitUntil(t)),
             None => el.set_control_flow(ControlFlow::Wait),
         }
@@ -7532,22 +8222,44 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseWheel { delta, .. } => self.mouse_wheel(delta),
             WindowEvent::KeyboardInput { event, .. } => self.key_input(&event, el),
             WindowEvent::Ime(ime) => self.ime_input(ime),
-            WindowEvent::RedrawRequested => self.redraw(),
+            // winit does not emit this on Windows today. Handle it anyway:
+            // a build that starts sending it, and every other backend,
+            // must stop painting while the window is covered.
+            WindowEvent::Occluded(occluded) => self.set_occluded(occluded),
+            // Do not enter `redraw` while the window is not showing. The
+            // idle perf gate counts entries to `redraw`; an OS paint of a
+            // minimized window has to miss that function entirely.
+            WindowEvent::RedrawRequested => {
+                // Drop the OS paint while hidden. Restore asks again.
+                if self.shown() {
+                    self.redraw();
+                }
+            }
             WindowEvent::ThemeChanged(theme) => {
-                // The registry DWORD is the app theme. winit's value covers a
-                // read that fails (the key is missing, or this is not Windows).
-                let event = match theme::read_apps_use_light_theme() {
-                    Some(value) => theme::SystemThemeEvent::ImmersiveColorSet {
-                        apps_use_light_theme: Some(value),
-                    },
-                    None => theme::SystemThemeEvent::Winit {
-                        light: matches!(theme, winit::window::Theme::Light),
-                    },
-                };
-                self.on_system_theme(event);
+                // winit emits this from WM_SETTINGCHANGE only while the
+                // window's preferred theme is unset. Do not call set_theme.
+                self.on_theme_changed(
+                    matches!(theme, winit::window::Theme::Light),
+                    theme::read_apps_use_light_theme(),
+                );
             }
             _ => {}
         }
+    }
+}
+
+/// The event `WindowEvent::ThemeChanged` becomes. `registry` is
+/// `AppsUseLightTheme`. winit only emits the event while the window's
+/// preferred theme is unset, so this function does not take one.
+pub(crate) fn theme_event_from(
+    winit_light: bool,
+    registry: Option<u32>,
+) -> theme::SystemThemeEvent {
+    match registry {
+        Some(value) => theme::SystemThemeEvent::ImmersiveColorSet {
+            apps_use_light_theme: Some(value),
+        },
+        None => theme::SystemThemeEvent::Winit { light: winit_light },
     }
 }
 
@@ -7578,12 +8290,17 @@ fn blur_forgets_held_keys(focused: bool, held: &mut Vec<winit::keyboard::Physica
 /// documents for this mitigation, and leaves System32, the application
 /// directory, and PATH in place for DirectX and GL.
 ///
-/// ConPTY does not depend on this call. `CreatePseudoConsole`,
-/// `ResizePseudoConsole`, and `ClosePseudoConsole` come from `kernel32.dll`
-/// opened with `LoadLibraryExW(L"kernel32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32)`.
-/// A bundled `conpty.dll` is loaded only by the absolute path beside this
-/// executable, and only after `OpenConsole.exe` in that same directory
-/// verifies. The bare name is never passed to the loader.
+/// Neither ConPTY load depends on this call. The inbox fallback binds
+/// `CreatePseudoConsole`, `ResizePseudoConsole`, and `ClosePseudoConsole`
+/// from `kernel32.dll` opened with `LoadLibraryExW(L"kernel32.dll", NULL,
+/// LOAD_LIBRARY_SEARCH_SYSTEM32)`. When the pinned Microsoft pair beside
+/// the executable verifies, `psuedocon::load_bundled` passes that
+/// `conpty.dll` full path to `LoadLibraryExW` with
+/// `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32`
+/// (`0x900`), and `PsuedoCon::new` uses those exports. A bare-name
+/// `conpty.dll` is still never requested. An elevated process, or a failed
+/// elevation query, skips the pinned pair and stays on kernel32; a failed
+/// open of the pinned host does the same.
 ///
 /// NEW-04 (partly): the application directory still precedes System32 for a
 /// bare name, so a `d3d12.dll` planted beside `bayan.exe` (a Downloads
@@ -7688,6 +8405,7 @@ struct Startup {
     /// detect a second time.
     shells: Option<Vec<shells::Shell>>,
     elevated: bool,
+    maximized: bool,
 }
 
 fn main() -> std::process::ExitCode {
@@ -7805,6 +8523,7 @@ fn dispatch() -> Result<(), String> {
                 command: if elevated { None } else { launch.command },
                 shells,
                 elevated,
+                maximized: launch.maximized,
             })
         }
     }
@@ -7817,6 +8536,201 @@ fn cli_start_dir(
     args: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> Result<Option<String>, String> {
     cli::start_directory(args)
+}
+
+/// The subclass and the call-wnd hook both go through this. A message
+/// that is not a settings change leaves the dirty bit alone.
+fn note_a11y_message(message: u32) {
+    if a11y::message_triggers_reread(message) {
+        A11Y_DIRTY.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `SetWindowSubclass` procedure. `DefSubclassProc` keeps the message
+/// moving; a null hwnd is the unit test, which has no window to forward to.
+unsafe extern "system" fn a11y_subclass_proc(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+    _id: usize,
+    _data: usize,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_NCDESTROY;
+    note_a11y_message(msg);
+    if msg == WM_NCDESTROY && !hwnd.is_null() {
+        if let Some(api) = comctl_fns() {
+            // SAFETY: this hwnd was subclassed with this procedure and id.
+            // Removing it on WM_NCDESTROY is the documented order, before
+            // the default subclass procedure runs.
+            unsafe { (api.remove)(hwnd, Some(a11y_subclass_proc), A11Y_SUBCLASS_ID) };
+        }
+        unhook_a11y();
+    }
+    if hwnd.is_null() {
+        return 0;
+    }
+    if let Some(api) = comctl_fns() {
+        // SAFETY: DefSubclassProc was loaded from the same System32
+        // comctl32 that installed this subclass. The pointers belong to
+        // this call.
+        unsafe { (api.def)(hwnd, msg, wparam, lparam) }
+    } else {
+        0
+    }
+}
+
+unsafe extern "system" fn a11y_call_hook(
+    code: i32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    if code >= 0 {
+        // SAFETY: for WH_CALLWNDPROC, lParam is a pointer to a CWPSTRUCT
+        // that lives for this call.
+        let cwp = &*(lparam as *const windows_sys::Win32::UI::WindowsAndMessaging::CWPSTRUCT);
+        note_a11y_message(cwp.message);
+        let ours = A11Y_HWND.load(std::sync::atomic::Ordering::Relaxed);
+        if cwp.message == windows_sys::Win32::UI::WindowsAndMessaging::WM_NCDESTROY
+            && cwp.hwnd == ours
+            && !ours.is_null()
+        {
+            unhook_a11y();
+        }
+    }
+    // SAFETY: a null hook handle asks CallNextHookEx to walk the chain
+    // without naming ours. Documented.
+    windows_sys::Win32::UI::WindowsAndMessaging::CallNextHookEx(
+        std::ptr::null_mut(),
+        code,
+        wparam,
+        lparam,
+    )
+}
+
+/// Prefer `SetWindowSubclass` (it sees messages sent to this hwnd). When
+/// comctl32 v6 is not the active context the export is missing, and the
+/// thread's `WH_CALLWNDPROC` hook is the path that still sees a sent
+/// `WM_SETTINGCHANGE`.
+fn install_a11y_watch(hwnd: windows_sys::Win32::Foundation::HWND) {
+    A11Y_HWND.store(hwnd, std::sync::atomic::Ordering::Relaxed);
+    if try_set_window_subclass(hwnd) {
+        return;
+    }
+    if !A11Y_HOOK
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .is_null()
+    {
+        return;
+    }
+    // SAFETY: the hook procedure is 'static. A null module with the
+    // current thread id installs a thread hook, which is what a sent
+    // message to this window needs. GetCurrentThreadId takes no pointers.
+    let installed = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SetWindowsHookExW(
+            windows_sys::Win32::UI::WindowsAndMessaging::WH_CALLWNDPROC,
+            Some(a11y_call_hook),
+            std::ptr::null_mut(),
+            windows_sys::Win32::System::Threading::GetCurrentThreadId(),
+        )
+    };
+    if installed.is_null() {
+        eprintln!("bayan: could not watch High Contrast changes");
+    } else {
+        A11Y_HOOK.store(installed, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn unhook_a11y() {
+    let hook = A11Y_HOOK.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
+    if hook.is_null() {
+        return;
+    }
+    // SAFETY: `hook` is the HHOOK returned by SetWindowsHookExW for this
+    // thread, or it was already taken. UnhookWindowsHookEx releases it.
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx(hook);
+    }
+}
+
+type SetSubclassFn = unsafe extern "system" fn(
+    windows_sys::Win32::Foundation::HWND,
+    windows_sys::Win32::UI::Shell::SUBCLASSPROC,
+    usize,
+    usize,
+) -> i32;
+type DefSubclassFn = unsafe extern "system" fn(
+    windows_sys::Win32::Foundation::HWND,
+    u32,
+    windows_sys::Win32::Foundation::WPARAM,
+    windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::LRESULT;
+type RemoveSubclassFn = unsafe extern "system" fn(
+    windows_sys::Win32::Foundation::HWND,
+    windows_sys::Win32::UI::Shell::SUBCLASSPROC,
+    usize,
+) -> i32;
+
+struct ComctlFns {
+    set: SetSubclassFn,
+    def: DefSubclassFn,
+    remove: RemoveSubclassFn,
+}
+
+fn comctl_fns() -> Option<&'static ComctlFns> {
+    use std::sync::OnceLock;
+    static FNS: OnceLock<Option<ComctlFns>> = OnceLock::new();
+    FNS.get_or_init(load_comctl).as_ref()
+}
+
+fn load_comctl() -> Option<ComctlFns> {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
+    let wide: Vec<u16> = "comctl32.dll"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: the path is a null-terminated UTF-16 string. SEARCH_SYSTEM32
+    // refuses a comctl32 planted next to the executable. The module stays
+    // loaded: the subclass pointers need it for the process lifetime.
+    let lib = unsafe {
+        LoadLibraryExW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    };
+    if lib.is_null() {
+        return None;
+    }
+    let proc_of = |name: &[u8]| {
+        // SAFETY: `name` is a null-terminated ANSI export. The pointer is
+        // null or that export in the System32 module.
+        unsafe { GetProcAddress(lib, name.as_ptr()) }
+    };
+    let set = proc_of(b"SetWindowSubclass\0")?;
+    let def = proc_of(b"DefSubclassProc\0")?;
+    let remove = proc_of(b"RemoveWindowSubclass\0")?;
+    // SAFETY: each name is the export of that exact ABI. A function
+    // pointer is the same size as every other function pointer.
+    let (set, def, remove) = unsafe {
+        (
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, SetSubclassFn>(set),
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, DefSubclassFn>(def),
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, RemoveSubclassFn>(remove),
+        )
+    };
+    Some(ComctlFns { set, def, remove })
+}
+
+fn try_set_window_subclass(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
+    let Some(api) = comctl_fns() else {
+        return false;
+    };
+    // SAFETY: hwnd is this window's live handle. The procedure and id are
+    // the pair RemoveWindowSubclass uses on WM_NCDESTROY.
+    unsafe { (api.set)(hwnd, Some(a11y_subclass_proc), A11Y_SUBCLASS_ID, 0) != 0 }
 }
 
 fn run(startup: Startup) -> Result<(), String> {
@@ -7838,9 +8752,9 @@ fn run(startup: Startup) -> Result<(), String> {
             // SAFETY: winit's msg hook is handed a pointer to the MSG being
             // dispatched, valid for the duration of the callback. It is only read.
             let m = unsafe { &*(msg as *const MSG) };
-            if a11y::message_triggers_reread(m.message) {
-                A11Y_DIRTY.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
+            // WM_SETTINGCHANGE, WM_SYSCOLORCHANGE and WM_THEMECHANGED are
+            // sent, not posted, so this hook never observes them. The
+            // window subclass does.
             if m.message == WM_HOTKEY && m.wParam == QUAKE_ID {
                 QUAKE_HIT.store(true, std::sync::atomic::Ordering::Relaxed);
                 return true; // consumed
@@ -7931,7 +8845,6 @@ fn run(startup: Startup) -> Result<(), String> {
     if let Some(v) = dev_hook("BAYAN_LANG") {
         lang::set(lang::Lang::from_config(v.to_str()));
     }
-    term::set_osc52_read(cfg.osc52_read_enabled());
     let config_path = config::config_path();
     let baseline_bytes = std::fs::read(&config_path).ok();
     let reload_proxy = proxy.clone();
@@ -7949,6 +8862,7 @@ fn run(startup: Startup) -> Result<(), String> {
     app.shell_profiles = startup.shells.unwrap_or_default();
     app.shell_profiles_ready = shells_ready;
     app.start_profile_command = startup.profile_command;
+    app.start_maximized = startup.maximized;
     app.start_command = startup.command;
     app.elevated = startup.elevated;
     // App::new starts neutral so a test never reads the machine's High
@@ -8005,8 +8919,203 @@ fn osc52_pane_is_focused(tabs: &[(usize, &[u64])], active: usize, source: u64) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn identical_vertices_still_redraw_after_an_atlas_upload() {
+        assert!(super::frame_unchanged(true, b"quads", b"quads", false));
+        assert!(!super::frame_unchanged(true, b"quads", b"quads", true));
+        assert!(!super::frame_unchanged(false, b"quads", b"quads", false));
+        assert!(!super::frame_unchanged(true, b"old", b"new", false));
+    }
+
+    #[test]
+    fn occluded_minimized_or_hidden_is_not_paintable() {
+        assert!(super::window_paints(false, false, false));
+        assert!(!super::window_paints(true, false, false), "occluded");
+        assert!(!super::window_paints(false, true, false), "minimized");
+        assert!(!super::window_paints(false, false, true), "hidden");
+        assert!(!super::window_paints(true, true, true));
+    }
+
+    #[test]
+    fn minimized_is_a_zero_size_or_the_iconic_bit() {
+        assert!(super::minimized_now(true, Some(false)), "0×0 is minimized");
+        assert!(super::minimized_now(true, None));
+        assert!(
+            super::minimized_now(false, Some(true)),
+            "iconic wins over a stale size"
+        );
+        assert!(!super::minimized_now(false, Some(false)));
+        assert!(
+            !super::minimized_now(false, None),
+            "a failed query is not minimized"
+        );
+        assert!(super::minimized_cleared(false, Some(false)));
+        assert!(!super::minimized_cleared(true, Some(false)), "still 0×0");
+        assert!(!super::minimized_cleared(false, Some(true)));
+        assert!(
+            !super::minimized_cleared(false, None),
+            "unknown iconic state keeps the latch"
+        );
+    }
+
+    #[test]
+    fn restore_paints_once_when_the_window_becomes_visible() {
+        assert!(super::became_shown(false, true));
+        assert!(
+            !super::became_shown(true, true),
+            "a resize is not a restore"
+        );
+        assert!(!super::became_shown(true, false));
+        assert!(!super::became_shown(false, false));
+    }
+
+    /// Bell, cwd, title, and the active tab's PTY all ask for a frame.
+    /// While the window is hidden that ask is deferred. A background tab's
+    /// grid never paints on its own chunk.
+    #[test]
+    fn paint_gate_defers_when_hidden_and_skips_a_background_grid() {
+        use super::PaintGate;
+        assert_eq!(super::gate_paint(false, true), PaintGate::Defer);
+        assert_eq!(super::gate_paint(false, false), PaintGate::Defer);
+        assert_eq!(super::gate_paint(true, true), PaintGate::Redraw);
+        assert_eq!(super::gate_paint(true, false), PaintGate::Skip);
+
+        // A burst of PTY, bell, and title events while minimized must not
+        // enter redraw. Restore is `became_shown`, not a stored dirty bit.
+        let mut redraws = 0u32;
+        let mut dirty = false;
+        for on_screen in [true, false, true] {
+            match super::gate_paint(false, on_screen) {
+                PaintGate::Redraw => redraws += 1,
+                PaintGate::Defer => dirty = true,
+                PaintGate::Skip => {}
+            }
+        }
+        assert_eq!(redraws, 0);
+        assert!(dirty);
+    }
+
+    #[test]
+    fn minimized_busy_tab_arms_no_timer_and_does_not_pulse() {
+        let now = Instant::now();
+        let plan = super::plan_idle(
+            now,
+            super::BUSY_PULSE,
+            super::WakeInputs {
+                shown: false,
+                background_busy: true,
+                blink: Some(now + Duration::from_millis(530)),
+                scroll: Some(now + Duration::from_millis(8)),
+                scrollbar: Some(now + Duration::from_millis(100)),
+                notice: Some(now + Duration::from_secs(8)),
+                reader: None,
+            },
+        );
+        assert!(!plan.pulse_redraw);
+        assert_eq!(plan.wake, None, "ControlFlow::Wait, no visual timer");
+    }
+
+    #[test]
+    fn visible_busy_background_tab_keeps_the_dot_pulse() {
+        let now = Instant::now();
+        let soon = now + Duration::from_millis(50);
+        let plan = super::plan_idle(
+            now,
+            super::BUSY_PULSE,
+            super::WakeInputs {
+                shown: true,
+                background_busy: true,
+                blink: Some(soon),
+                scroll: None,
+                scrollbar: None,
+                notice: None,
+                reader: None,
+            },
+        );
+        assert!(plan.pulse_redraw);
+        assert_eq!(plan.wake, Some(soon), "the earlier blink wins over 600ms");
+    }
+
+    #[test]
+    fn a_reader_deadline_still_wakes_a_hidden_window() {
+        let now = Instant::now();
+        let at = now + Duration::from_millis(100);
+        let plan = super::plan_idle(
+            now,
+            super::BUSY_PULSE,
+            super::WakeInputs {
+                shown: false,
+                background_busy: true,
+                blink: Some(now + Duration::from_millis(10)),
+                scroll: None,
+                scrollbar: None,
+                notice: None,
+                reader: Some(at),
+            },
+        );
+        assert!(!plan.pulse_redraw);
+        assert_eq!(plan.wake, Some(at));
+    }
+
+    #[test]
+    fn an_idle_visible_window_waits_without_a_timer() {
+        let plan = super::plan_idle(
+            Instant::now(),
+            super::BUSY_PULSE,
+            super::WakeInputs {
+                shown: true,
+                background_busy: false,
+                blink: None,
+                scroll: None,
+                scrollbar: None,
+                notice: None,
+                reader: None,
+            },
+        );
+        assert!(!plan.pulse_redraw);
+        assert_eq!(plan.wake, None);
+    }
+
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn subclass_proc_sets_the_dirty_flag_for_each_live_message() {
+        for msg in [
+            a11y::WM_SETTINGCHANGE,
+            a11y::WM_SYSCOLORCHANGE,
+            a11y::WM_THEMECHANGED,
+        ] {
+            A11Y_DIRTY.store(false, std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: a null hwnd is the test's stand-in. The procedure
+            // records the message and returns without calling DefSubclassProc.
+            unsafe {
+                a11y_subclass_proc(std::ptr::null_mut(), msg, 0, 0, 0, 0);
+            }
+            assert!(
+                A11Y_DIRTY.swap(false, std::sync::atomic::Ordering::Relaxed),
+                "{msg:#x} did not ask for a re-read"
+            );
+        }
+        A11Y_DIRTY.store(false, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: a null hwnd returns before DefSubclassProc. WM_PAINT is
+        // not a settings message, so the dirty bit stays clear.
+        unsafe {
+            a11y_subclass_proc(std::ptr::null_mut(), 0x000F, 0, 0, 0, 0);
+        }
+        assert!(!A11Y_DIRTY.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn the_window_installs_the_accessibility_watch() {
+        let src = include_str!("main.rs");
+        let head = src.split_once("mod tests").expect("test module").0;
+        let needle = concat!("install_a11y", "_watch(h);");
+        assert!(
+            head.contains(needle),
+            "the window never installs the accessibility watch"
+        );
+    }
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -8289,6 +9398,32 @@ mod tests {
         );
     }
 
+    /// winit 0.30 emits `ThemeChanged` from `WM_SETTINGCHANGE` only while
+    /// the window's preferred theme is unset. The registry sample wins;
+    /// winit's own light/dark is the fallback. `on_theme_changed` is the
+    /// function the event arm calls.
+    #[test]
+    fn theme_changed_follows_the_registry_while_preferred_theme_is_unset() {
+        assert!(theme_event_from(false, Some(1)).is_light());
+        assert!(!theme_event_from(true, Some(0)).is_light());
+        assert!(theme_event_from(true, None).is_light());
+        assert!(!theme_event_from(false, None).is_light());
+        assert!(!theme_event_from(true, Some(2)).is_light());
+
+        let cfg = config::UserConfig {
+            system_apps_light: Some(false),
+            ..Default::default()
+        };
+        let mut app = app_for_theme(cfg);
+        app.on_theme_changed(false, Some(1));
+        assert_eq!(app.config.system_apps_light, Some(true));
+        assert_eq!(app.renderer.as_ref().map(|r| r.bg), Some(theme::LIGHT.bg));
+        app.on_theme_changed(true, None);
+        assert_eq!(app.renderer.as_ref().map(|r| r.bg), Some(theme::LIGHT.bg));
+        app.on_theme_changed(false, None);
+        assert_eq!(app.renderer.as_ref().map(|r| r.bg), Some(theme::DARK.bg));
+    }
+
     #[test]
     fn the_cwd_argument_opens_a_local_folder_and_refuses_the_rest() {
         let os = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
@@ -8387,9 +9522,9 @@ mod tests {
         assert!(lua_card_window(&short, 0).2);
 
         let now = std::time::Instant::now();
-        assert!(lua_enter_ready(None, now));
-        assert!(!lua_enter_ready(Some(now + LUA_APPROVE_DELAY), now));
-        assert!(lua_enter_ready(
+        assert!(approval_ready(None, now));
+        assert!(!approval_ready(Some(now + LUA_APPROVE_DELAY), now));
+        assert!(approval_ready(
             Some(now - std::time::Duration::from_millis(1)),
             now
         ));
@@ -9162,6 +10297,159 @@ mod tests {
         assert!(find_match(&mut t, "needle (", &None, Direction::Left).is_none());
     }
 
+    #[test]
+    fn regex_search_is_explicit_handles_errors_and_matches_real_history() {
+        use alacritty_terminal::{
+            event::VoidListener,
+            term::{Config, Term},
+            vte::ansi::Processor,
+        };
+        let mut t = Term::new(
+            Config::default(),
+            &TermSize { cols: 40, rows: 2 },
+            VoidListener,
+        );
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut t, "host 123\r\nمرحبا 456\r\ntail\r\n".as_bytes());
+        assert!(find_match(&mut t, r"host \d+", &None, Direction::Left).is_none());
+        let found = find_match_mode(&mut t, r"host \d+", &None, Direction::Left, true).unwrap();
+        assert!(found.start().line.0 < 0, "must search scrollback too");
+        assert!(find_match_mode(&mut t, r"مرحبا \d+", &None, Direction::Left, true).is_some());
+        assert!(find_match_mode(&mut t, "[", &None, Direction::Left, true).is_none());
+        let seed = SearchState::from_selection(Some("a.b"), false);
+        assert!(!seed.regex, "selected text remains literal");
+    }
+
+    #[test]
+    fn search_pasted_or_committed_text_is_bounded_and_never_submits_a_command() {
+        let mut st = SearchState::from_selection(Some("old"), false);
+        st.push("مرحبا\r\n\x03");
+        assert_eq!(st.query, "oldمرحبا");
+        assert!(st.selected_needle.is_none());
+        st.push(&"س".repeat(5000));
+        assert_eq!(st.query.chars().count(), 4096);
+        st.push("extra");
+        assert_eq!(st.query.chars().count(), 4096);
+    }
+
+    #[test]
+    fn exported_history_keeps_logical_arabic_wraps_and_the_selection() {
+        use alacritty_terminal::{
+            event::VoidListener,
+            term::{Config, Term},
+            vte::ansi::Processor,
+        };
+        let mut t = Term::new(
+            Config::default(),
+            &TermSize { cols: 12, rows: 2 },
+            VoidListener,
+        );
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut t, "مرحبا\r\nabcdefghijklmnop\r\nlast".as_bytes());
+        t.selection = Some(Selection::new(
+            SelectionType::Lines,
+            Point::new(Line(0), Column(0)),
+            Side::Left,
+        ));
+        let before = t.selection_to_string();
+        let text = copyclean::history_text(&t, false);
+        assert!(
+            text.starts_with("مرحبا\nabcdefghijklmnop\nlast"),
+            "{text:?}"
+        );
+        assert_eq!(t.selection_to_string(), before);
+        assert!(!text.contains('\x1b'));
+    }
+
+    /// The bar's count on a real Term: literal and regex, the position of
+    /// the current hit, and a pattern that does not compile.
+    #[test]
+    fn the_hit_count_follows_the_mode_and_the_current_hit() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let size = TermSize { cols: 40, rows: 6 };
+        let mut t = Term::new(Config::default(), &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        for line in ["error 404 here", "ok", "error 500 there", "a.b", "axb"] {
+            p.advance(&mut t, line.as_bytes());
+            p.advance(&mut t, b"\r\n");
+        }
+
+        let m = find_match_mode(&mut t, "error [0-9]+", &None, Direction::Left, true)
+            .expect("regex hit");
+        assert_eq!(m.start().line.0, 2, "Enter finds the lower hit first");
+        let c = count_matches(&t, "error [0-9]+", &Some(m), true).unwrap();
+        assert_eq!((c.at, c.total, c.capped), (Some(2), 2, false));
+        let none = count_matches(&t, "error [0-9]+", &None, true).unwrap();
+        assert_eq!((none.at, none.total), (None, 2));
+
+        // the same text is one literal hit and two regex hits
+        assert_eq!(count_matches(&t, "a.b", &None, false).unwrap().total, 1);
+        assert_eq!(count_matches(&t, "a.b", &None, true).unwrap().total, 2);
+        assert_eq!(count_matches(&t, "absent", &None, false).unwrap().total, 0);
+
+        // an unclosed group is a literal hit count of zero and a bad regex
+        assert_eq!(count_matches(&t, "error (", &None, false).unwrap().total, 0);
+        assert!(count_matches(&t, "error (", &None, true).is_none());
+    }
+
+    /// A screen of one-character hits stops at the cap and says so.
+    #[test]
+    fn the_hit_count_stops_at_the_cap() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let size = TermSize { cols: 80, rows: 30 };
+        let mut t = Term::new(Config::default(), &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        for _ in 0..29 {
+            p.advance(&mut t, "x ".repeat(39).as_bytes());
+            p.advance(&mut t, b"\r\n");
+        }
+        let c = count_matches(&t, "x", &None, false).unwrap();
+        assert_eq!((c.total, c.capped), (SEARCH_COUNT_CAP, true));
+        let few = count_matches(&t, &"x ".repeat(20), &None, false).unwrap();
+        assert!(!few.capped && few.total > 0);
+    }
+
+    #[test]
+    fn the_search_bar_tail_names_the_count() {
+        let c = |at, total, capped| SearchStatus::Counted(SearchCount { at, total, capped });
+        lang::set(lang::Lang::En); // thread-local under cfg(test)
+        assert_eq!(search_tail(SearchStatus::Idle), "");
+        assert_eq!(search_tail(c(Some(2), 17, false)), "  \u{2066}2/17\u{2069}");
+        assert_eq!(search_tail(c(None, 1000, true)), "  \u{2066}1000+\u{2069}");
+        assert_eq!(search_tail(c(None, 0, false)), "  no matches");
+        assert_eq!(search_tail(SearchStatus::BadPattern), "  invalid pattern");
+        lang::set(lang::Lang::Ar);
+        assert_eq!(search_tail(c(None, 0, false)), "  لا نتائج");
+    }
+
+    #[test]
+    fn a_new_window_keeps_the_elevation_rule_and_a_copy_keeps_its_shell() {
+        assert_eq!(new_window_args(false), ["--new-window"]);
+        assert_eq!(new_window_args(true), ["--elevated"]);
+        // both are launches the parser accepts, and neither carries a
+        // folder, a profile or a command
+        for elevated in [false, true] {
+            let cli::CliAction::Launch(launch) = cli::parse(new_window_args(elevated)).unwrap()
+            else {
+                panic!("not a launch");
+            };
+            assert_eq!(launch.elevated, elevated);
+            assert!(launch.directory.is_none() && launch.command.is_none());
+        }
+        assert_eq!(
+            duplicate_command("cmd.exe", false).as_deref(),
+            Some("cmd.exe")
+        );
+        assert_eq!(duplicate_command("cmd.exe", true), None, "a mux pane");
+        assert_eq!(duplicate_command("  ", false), None);
+    }
+
     /// A background tab's shell exiting must not move focus to a different
     /// tab than the one the user was looking at.
     #[test]
@@ -9669,13 +10957,14 @@ mod m38_tests {
             },
         ];
         let rows = shell_menu_rows(&detected, "cmd.exe");
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.len(), 5);
         assert!(rows[2].0 == PaletteRow::Shell(detected[2].command.clone()));
         assert_eq!(rows[1].1, "Command Prompt · الافتراضية");
         assert_eq!(rows[3].1, "WSL · Ubuntu");
         // detection has not reported yet: PowerShell and cmd stand in
         let early = shell_menu_rows(&[], "powershell.exe");
-        assert_eq!(early.len(), 2);
+        assert_eq!(early.len(), 3);
+        assert!(early[2].0 == PaletteRow::OpenSsh);
         assert!(early[1].0 == PaletteRow::Shell("cmd.exe".into()));
         assert_eq!(early[0].1, "PowerShell · الافتراضية");
     }

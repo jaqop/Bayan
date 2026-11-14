@@ -33,7 +33,7 @@ selection and BiDi paths must do.
 | `localpath.rs` | no-follow walk: is a drive path local in every component, links read but not followed (link probe, new-tab cwd) |
 | `mru.rs` | most-recently-used tab order for Ctrl+Tab, walkable within one group |
 | `shells.rs` | installed-shell detection (ported from EasyTer's `profiles.py`) |
-| `cli.rs` | argv: `#45`'s `-d`/`--cwd`, plus profile, `--` command, `--elevated`, handoff, help, version |
+| `cli.rs` | argv: `#45`'s `-d`/`--cwd`, plus profile, `--` command, `--maximized`, `--elevated`, handoff, help, version |
 | `context_menu.rs` | per-user Explorer "Open Bayan here" (HKCU only, behind `RegistryStore`) |
 | `elevate.rs` | `--elevated` → `ShellExecuteW` verb `runas` only; argv is `--elevated` and optional `-p <name>` |
 | `jumplist.rs` | taskbar Jump List (`ICustomDestinationList`) and the explicit AppUserModelID |
@@ -51,14 +51,15 @@ selection and BiDi paths must do.
 | `a11y.rs` | High Contrast color mapping and the system text-size multiplier, pure and tested; the Win32 read sits behind `read_snapshot` |
 | `toast.rs` | `Shell_NotifyIcon` balloons as native toasts, zero WinRT |
 | `screen_reader.rs` | screen-reader tree: each pane is a document in logical order, with the caret, the selection, and a coalesced live region (AccessKit, which speaks UIA on Windows) |
-| `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, the passthrough flag choice, and vendored `conpty_resolve.rs` |
+| `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-842 tests across the tree. `render.rs` and `term.rs` (100 each) and
-`link.rs` (66) carry the most; `lua_host.rs` has 46, `shellint.rs` 24,
-`images.rs` 23, `localpath.rs` 21, `mux.rs` 16, `config_watch.rs` 14,
-`screen_reader.rs` 11 and `ssh.rs` 7. Three more in `term.rs` are
-`#[ignore]`d probes, run by hand (see Measuring).
+915 tests, of which 7 are ignored by the default suite (908 run). That is
+`cargo test --locked --all-targets` on Windows (`running 915 tests`,
+`908 passed; 7 ignored`) and the same lines the CI summary counts with
+`--list`. Explicit native host probes and measurement probes are the
+ignored ones; see their annotations and Measuring. Milestone write-ups
+below record what that change proved, not this total.
 
 ## Measuring
 
@@ -76,6 +77,21 @@ Measure before optimizing, in release builds:
   SendInput (only while Bayan has the foreground) and summarises the
   `BAYAN_PROFILE` latency lines. It covers winit's key event to the PTY echo
   and to the GPU submit; the OS input queue and the display are outside it.
+
+CI gates two of these on every pull request (the `perf` job):
+`process_chunk` as a share of vte per corpus, and private megabytes once
+the scrollback is full. `scripts/perf_gate.py` compares the probes'
+`PROBE` lines with `perf/baseline.json` and fails on anything more than
+10% worse. The baseline is the hosted runner's own figures, not the
+author's machine. When a change makes a figure 10% better the job says
+so: raise the baseline in the same pull request, or the gain can be given
+back unnoticed. The job also starts a release build five times with
+`BAYAN_PROFILE`. Hosted runners differ by almost 2x on the same code, so
+milliseconds are only a backstop (twice the slowest job seen); the real
+check is `first frame presented` over `gpu ready` within one start, which
+held at 1.07 to 1.09 everywhere and fails above 1.24 (`perf/README.md`
+has the figures). Key-to-frame latency is not gated; it
+needs typed input.
 
 Figures from 2026-11-10 on the author's machine (22bc5d6 + this harness):
 `process_chunk` 83 / 49 / 100 MB/s for plain / SGR / Arabic, which is 57 / 27 /
@@ -188,33 +204,6 @@ bypasses DWM's blur, so the layered-window transparency Bayan already has and
 the accent blur are mutually exclusive. The existing `opacity` setting is the
 only transparency available on this path.
 
-**ConPTY passthrough is a bundled OpenConsole, not bit 0x8.** Inbox
-kernel32 still strips DCS and APC on Windows 11 24H2/25H2, so Sixel and
-Kitty do not arrive and primary DA stays `CSI ? 6 c`. Bit `0x8` was
-`--passthrough` on old OpenConsole and is `PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES`
-on conpty.dll 1.22+; do not set it. The host that passes VT through is
-`<exe_dir>\conpty.dll` plus `<exe_dir>\OpenConsole.exe`, file version 1.22
-or newer, loaded by that absolute path (`LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
-LOAD_LIBRARY_SEARCH_SYSTEM32`). A DLL alone, a bare name, the current
-directory, and `PATH` are not a host. If that `CreatePseudoConsole` fails,
-the pane opens on kernel32. DA advertises Sixel (`CSI ? 64 ; 4 c`) only
-after a bundled pseudoconsole has been created. A missing or older
-version keeps the inbox flags and does not fail the spawn. `OpenConsole.exe`
-is only the absolute path beside `bayan.exe`: not PATH, not the current
-directory. It must have a trusted Authenticode signature (or match the
-pinned SHA-256, which is empty until one is set). An elevated window
-also refuses the file or its directory when a standard user can write
-them. A miss, a bad signature, or a host that does not start falls back
-to kernel32 with no error. The binaries
-are not in the repo. Image caps (`max_bytes`, `max_width`, `max_height`,
-the pane and session budgets) apply to Sixel and Kitty and are reapplied
-to open panes on reload. A mux reattach runs the tail through
-`mux::replay_bytes` first: queries, including Kitty `a=q`, are removed,
-and a Kitty command that would answer is forced to `q=2`, so replay does
-not write into the live session. Do not move the cursor for an image:
-conhost, and a host that is not actually passing DCS through, would
-desync the rows.
-
 **Elevation is a UAC prompt and nothing else.** `--elevated` calls
 `ShellExecuteW` with verb `runas` and exits. The new process receives
 `--elevated` and, if a profile was named, `-p <name>` only. It resolves
@@ -246,10 +235,28 @@ give cmd the nonce in any form. `git-bash.exe`, `bash -c`, and
 `BAYAN_PROMPT_NONCE` and is unset before a child inherits it. Do not write
 the user's rc files. An elevated token must not source `~/.bashrc`,
 `~/.bash_profile`, `~/.inputrc`, or the zsh home files: set `INPUTRC` and
-`HISTFILE` to `/dev/null`. Elevated Git Bash is `--noprofile` and must
-not source `/etc/profile` (its `git-prompt.sh` runs user files); set
-`PATH` and `MSYSTEM` from the bash install. Elevated WSL bash still reads the
-distro profile with `HOME` pointed at the rcfile directory. A failed
+`HISTFILE` to `/dev/null`. Git Bash protection is mandatory even when
+prompt marks are disabled; startup-file creation failures refuse the spawn.
+Elevated Git Bash passes `--noprofile` and `-p`, with long options before
+`-i` and must not source `/etc/profile` (its `git-prompt.sh` runs user
+files). Login or not, the rcfile restores `HOME` from `BAYAN_SI_HOME`
+with `/usr/bin/cygpath` and then unsets that variable. `PATH` and
+`MSYSTEM` come from `/ucrt64` before `/mingw64`. Do not
+replace `PS1`: the system prompt (cwd, branch, window title) stays, and
+the OSC mark is appended. Elevated WSL bash still reads the distro
+profile with `HOME` pointed at the rcfile directory, after clearing
+inherited `XDG_DATA_DIRS`, `XDG_CONFIG_HOME`, `BASH_COMPLETION_USER_FILE`
+and `BASH_COMPLETION_COMPAT_DIR`. Once `HOME` is real again,
+`BASH_COMPLETION_USER_DIR` is the integration directory for both Git Bash
+and WSL. The WSL loaders `_comp_load` and `__load_completion` compute a
+safe `PATH` before `local`, and never leave it empty (the fallback is
+`/usr/sbin:/usr/bin:/sbin:/bin`). Entries that are not absolute, are under
+`/mnt`, or are not a root-owned directory (the entry and its parent,
+following links) with no group or world write are dropped, using
+`/usr/bin/stat`. The command name is passed without its directory, so
+`/mnt/c/.../bin/zzcmd` and `./zzcmd` do not load a completion from that
+folder. System completions such as ssh still load from the remaining
+`PATH`. A failed
 elevation query is treated as elevated. `shellint` takes the `elevated` flag `Session::spawn` is given, which is
 `elevate::process_is_elevated`, the one token query in the tree.
 The script directory comes from `SHGetKnownFolderPath(FOLDERID_ProgramData)`
@@ -257,6 +264,26 @@ when elevated, never from the `PROGRAMDATA` environment variable. It is a
 random name with a DACL that is not world-writable, and zsh's `ZDOTDIR` is
 restored to the user's value before the first prompt. Only a directory
 whose name we minted is deleted.
+
+**No Lua value may carry `__close` or `__gc`.** When the instruction hook
+ends a call, mlua clears the Lua stack from inside the hook, which closes
+every to-be-closed slot of the running function with hooks off. A
+`__close` handler that loops there never returns, and `__gc` always runs
+unhooked. So the sandbox's `setmetatable` installs a private snapshot of
+the table it is given and refuses those two fields, and `getmetatable("")`
+returns `false`. Do not hand a script a live metatable, a userdata, or the
+original `setmetatable`. Rejecting `<close>` in the bytecode was the first
+fix and missed the closing value of a generic `for`, which needs no
+`<close>`.
+
+**The mux pipe is overlapped at both ends.** The window and the server
+each park one thread in a read and write from another. On a synchronous
+handle Windows serializes the two, so the write waits for the read and
+nothing is ever sent. `mux::os::PipeEnd` does every read, write and
+connect with its own `OVERLAPPED` and event. Do not swap it for
+`std::fs::File`. The server never writes to a pipe from its event loop:
+frames go to a bounded queue per window, and a window that fills it is
+disconnected with its sessions left detached.
 
 **Start-directory precedence, in order:** a restored session's saved cwd, then
 the launcher's directory (a shortcut's "Start in"), then `USERPROFILE`. The
@@ -303,6 +330,19 @@ the GPU submit entirely when the quad set is byte-identical to the last frame,
 so a still terminal stops rendering. Anything that churns state every frame
 silently destroys both. The atlas grows a new texture-array *page* when one
 fills — it does not wipe.
+
+**A minimized, hidden, or occluded window does not enter `redraw`.**
+`request_redraw` is the only call to `Window::request_redraw`. When the
+window is not showing it returns without asking winit, so `RedrawRequested`
+does not call `redraw` (the idle perf gate counts entries there, and presents
+inside it, and both must stay zero while minimized with a busy background
+tab). PTY reads, bells, toasts, and attention still run. The ~600ms busy-dot
+pulse is scheduled only while the window is showing; a background tab's grid
+is not a reason to paint. Restoring, unoccluding, or summoning calls
+`request_redraw` once the window is showing again, and cursor blink is armed
+from the next wait. There is no dirty flag: those paths ask explicitly. Do
+not add another direct `redraw()` or `Window::request_redraw` for a hidden
+state.
 
 ## Build, test, verify
 
@@ -359,6 +399,7 @@ key identity or typed text:
 | `BAYAN_POSH=1` | open the oh-my-posh prompt picker at startup |
 | `BAYAN_TOAST=<title\|1>` | fire a sample toast at startup (M19 A/B loops without rebuilding) |
 | `BAYAN_ATLAS_STRESS=1` | shape a large spread of unique glyphs to force page-1 atlas growth |
+| `BAYAN_ATLAS_RESET=1` | fill the real allocator to its eight-page cap once per renderer, before frame geometry; verify the white texel, backgrounds, cursor and text survive the reset |
 | `BAYAN_PROFILE=1` | startup timeline marks to `%TEMP%\bayan_profile.log` (EasyTer's `EASYTER_PROFILE` pattern), zero cost when unset. Key presses log modifiers only, never the key. Also key-to-frame latency samples and a summary every 25 (see Measuring) |
 
 Start with `Start-Process -PassThru`, sleep ~6s for GPU init, capture the

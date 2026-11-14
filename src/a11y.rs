@@ -33,6 +33,9 @@ pub type Rgb = (u8, u8, u8);
 pub const WM_SETTINGCHANGE: u32 = 0x001A;
 /// `WM_SYSCOLORCHANGE`.
 pub const WM_SYSCOLORCHANGE: u32 = 0x0015;
+/// `WM_THEMECHANGED`. A high-contrast theme switch can arrive as this
+/// instead of, or as well as, `WM_SETTINGCHANGE`.
+pub const WM_THEMECHANGED: u32 = 0x031A;
 
 /// `HCF_HIGHCONTRASTON`.
 pub const HCF_HIGHCONTRASTON: u32 = 0x0000_0001;
@@ -135,10 +138,12 @@ impl A11ySnapshot {
     }
 }
 
-/// The message hook's predicate: these two messages mean the contrast
-/// mode, the system colors, or the text-size slider may have moved.
+/// Sent (not posted) window messages that mean High Contrast, the system
+/// colors, or the text-size slider may have moved. winit's message hook
+/// only sees the posted queue, so the window subclass and the thread's
+/// `WH_CALLWNDPROC` hook are what call this.
 pub fn message_triggers_reread(message: u32) -> bool {
-    message == WM_SETTINGCHANGE || message == WM_SYSCOLORCHANGE
+    message == WM_SETTINGCHANGE || message == WM_SYSCOLORCHANGE || message == WM_THEMECHANGED
 }
 
 /// `HCF_HIGHCONTRASTON`. Other flags (`HCF_AVAILABLE`, hot-key bits) do
@@ -256,46 +261,78 @@ pub fn map_terminal(
     }
 }
 
-/// The hook sets the dirty bit; `about_to_wait` polls it and re-reads.
-/// Held as values so a test can run the same steps the window runs.
-/// The window itself uses an atomic, because the message hook cannot
-/// borrow this value.
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone, Debug, PartialEq)]
-pub struct A11yWatch {
-    pub snapshot: A11ySnapshot,
-    dirty: bool,
+/// WCAG contrast floor for a cell's foreground against its own background
+/// while High Contrast is driving the grid. Light themes otherwise leave
+/// bright ANSI colors sitting on `COLOR_WINDOW`.
+pub const MIN_CELL_CONTRAST: f32 = 4.5;
+
+fn srgb_channel(c: u8) -> f32 {
+    let s = c as f32 / 255.0;
+    if s <= 0.04045 {
+        s / 12.92
+    } else {
+        ((s + 0.055) / 1.055).powf(2.4)
+    }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-impl A11yWatch {
-    pub fn new(snapshot: A11ySnapshot) -> Self {
-        Self {
-            snapshot,
-            dirty: false,
+/// Relative luminance, WCAG 2.
+pub fn relative_luminance((r, g, b): Rgb) -> f32 {
+    0.2126 * srgb_channel(r) + 0.7152 * srgb_channel(g) + 0.0722 * srgb_channel(b)
+}
+
+/// Contrast ratio. 1 is identical, 21 is black on white.
+pub fn contrast_ratio(a: Rgb, b: Rgb) -> f32 {
+    let la = relative_luminance(a);
+    let lb = relative_luminance(b);
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+fn mix_channel(from: u8, to: u8, t: f32) -> u8 {
+    (from as f32 + (to as f32 - from as f32) * t)
+        .round()
+        .clamp(0.0, 255.0) as u8
+}
+
+fn mix(from: Rgb, to: Rgb, t: f32) -> Rgb {
+    (
+        mix_channel(from.0, to.0, t),
+        mix_channel(from.1, to.1, t),
+        mix_channel(from.2, to.2, t),
+    )
+}
+
+/// Move `fg` toward black or white, whichever contrasts more with `bg`,
+/// until the ratio reaches `minimum`. A color that already clears the
+/// floor is returned unchanged, and a red that has to move stays red.
+pub fn ensure_contrast(fg: Rgb, bg: Rgb, minimum: f32) -> Rgb {
+    if contrast_ratio(fg, bg) >= minimum {
+        return fg;
+    }
+    let black = (0, 0, 0);
+    let white = (255, 255, 255);
+    let toward = if contrast_ratio(black, bg) >= contrast_ratio(white, bg) {
+        black
+    } else {
+        white
+    };
+    let mut lo = 0.0;
+    let mut hi = 1.0;
+    let mut best = toward;
+    for _ in 0..16 {
+        let t = (lo + hi) * 0.5;
+        let mixed = mix(fg, toward, t);
+        if contrast_ratio(mixed, bg) >= minimum {
+            best = mixed;
+            hi = t;
+        } else {
+            lo = t;
         }
     }
-
-    pub fn on_message(&mut self, message: u32) {
-        if message_triggers_reread(message) {
-            self.dirty = true;
-        }
-    }
-
-    /// Re-read when a settings message arrived. Returns whether the
-    /// snapshot changed. Any other message leaves `read` uncalled.
-    pub fn poll<F>(&mut self, read: F) -> bool
-    where
-        F: FnOnce() -> A11ySnapshot,
-    {
-        if !self.dirty {
-            return false;
-        }
-        self.dirty = false;
-        let next = read();
-        let changed = next != self.snapshot;
-        self.snapshot = next;
-        changed
+    if contrast_ratio(best, bg) < minimum {
+        toward
+    } else {
+        best
     }
 }
 
@@ -562,42 +599,37 @@ mod tests {
     }
 
     #[test]
-    fn settings_change_triggers_a_reread() {
-        let mut watch = A11yWatch::new(A11ySnapshot::neutral());
-        let mut reads = 0;
-        assert!(!watch.poll(|| {
-            reads += 1;
-            A11ySnapshot::neutral()
-        }));
-        assert_eq!(reads, 0, "an idle poll must not re-read");
-
-        watch.on_message(0x000F); // WM_PAINT
-        assert!(!watch.poll(|| {
-            reads += 1;
-            A11ySnapshot::neutral()
-        }));
-        assert_eq!(reads, 0, "paint is not a settings change");
-
-        watch.on_message(WM_SETTINGCHANGE);
-        let enlarged = A11ySnapshot {
-            text_scale: 1.5,
-            ..A11ySnapshot::neutral()
-        };
-        assert!(watch.poll(|| {
-            reads += 1;
-            enlarged
-        }));
-        assert_eq!(reads, 1);
-        assert_eq!(watch.snapshot.text_scale, 1.5);
-
-        // A second settings message re-reads even when the value is unchanged.
-        watch.on_message(WM_SYSCOLORCHANGE);
-        assert!(!watch.poll(|| {
-            reads += 1;
-            enlarged
-        }));
-        assert_eq!(reads, 2, "syscolor change must re-read");
-        assert_eq!(watch.snapshot, enlarged);
+    fn light_high_contrast_cell_colors_keep_a_readable_ratio() {
+        let white = (255, 255, 255);
+        let bright = [
+            (255, 255, 255),
+            (0xee, 0xfb, 0xfa),
+            (0xc2, 0xb7, 0x96),
+            (0x7e, 0xe4, 0xd5),
+            (0x7e, 0xe0, 0x6d),
+            (0xdc, 0xc9, 0x8f),
+        ];
+        for fg in bright {
+            let drawn = ensure_contrast(fg, white, MIN_CELL_CONTRAST);
+            assert!(
+                contrast_ratio(drawn, white) >= MIN_CELL_CONTRAST,
+                "{fg:?} -> {drawn:?} is only {}",
+                contrast_ratio(drawn, white)
+            );
+        }
+        // A red that has to darken stays red.
+        let red = ensure_contrast((255, 80, 80), white, MIN_CELL_CONTRAST);
+        assert!(red.0 > red.1 && red.0 > red.2, "{red:?} left red");
+        // A pair that already clears the floor is not repainted.
+        assert_eq!(
+            ensure_contrast((0, 0, 0), white, MIN_CELL_CONTRAST),
+            (0, 0, 0)
+        );
+        // The three live messages, and not a paint.
+        assert!(message_triggers_reread(WM_SETTINGCHANGE));
+        assert!(message_triggers_reread(WM_SYSCOLORCHANGE));
+        assert!(message_triggers_reread(WM_THEMECHANGED));
+        assert!(!message_triggers_reread(0x000F));
     }
 
     #[test]
@@ -622,9 +654,12 @@ mod tests {
             COLOR_WINDOW, COLOR_WINDOWTEXT,
         };
         use windows_sys::Win32::UI::Accessibility::HCF_HIGHCONTRASTON;
-        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_SETTINGCHANGE, WM_SYSCOLORCHANGE};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_THEMECHANGED,
+        };
         assert_eq!(super::WM_SETTINGCHANGE, WM_SETTINGCHANGE);
         assert_eq!(super::WM_SYSCOLORCHANGE, WM_SYSCOLORCHANGE);
+        assert_eq!(super::WM_THEMECHANGED, WM_THEMECHANGED);
         assert_eq!(super::HCF_HIGHCONTRASTON, HCF_HIGHCONTRASTON);
         assert_eq!(super::COLOR_WINDOW, COLOR_WINDOW);
         assert_eq!(super::COLOR_WINDOWTEXT, COLOR_WINDOWTEXT);

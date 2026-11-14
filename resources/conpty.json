@@ -1,0 +1,22 @@
+{
+  "package": "Microsoft.Windows.Console.ConPTY",
+  "version": "1.25.261109001",
+  "publisher": "Microsoft Corporation",
+  "architectures": {
+    "x86_64": {
+      "runtime": "x64",
+      "conpty.dll": "e971856f89748dc3b458125e9afdd79b5e9574a7c937676116d3cbbd3b71f492",
+      "OpenConsole.exe": "b17e48b07ef153b420f0a6e178bacd31fb4c3390e21ae746586213fc0719a775"
+    },
+    "aarch64": {
+      "runtime": "arm64",
+      "conpty.dll": "3608cef830a1c4fbbf3981594ad3f64ebe2df6db98fe43a48a4ca7d2875d8959",
+      "OpenConsole.exe": "c04334f450b5731930b63a28ac4da8a058367242dbcf2fb9b323ea25e5a23252"
+    },
+    "x86": {
+      "runtime": "x86",
+      "conpty.dll": "914c7eb6840a5cb477e5f2fdd26610ba4272803b96866123cb87e21a8a2366cd",
+      "OpenConsole.exe": "6ae4b24b04947cc6c497eecd034f576fecd212ec9cd70baf113e2eabe885a103"
+    }
+  }
+}

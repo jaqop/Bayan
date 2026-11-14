@@ -342,6 +342,25 @@ pub(crate) fn selection_rows<T: EventListener>(term: &Term<T>) -> Vec<CopyRow> {
     rows
 }
 
+/// Full retained history plus the screen, without changing the selection
+/// or viewport. Restore each visual Claude row before joining soft wraps.
+pub(crate) fn history_text<T: EventListener>(term: &Term<T>, claude: bool) -> String {
+    let last = Column(term.columns().saturating_sub(1));
+    let rows: Vec<_> = (-(term.grid().history_size() as i32)..term.screen_lines() as i32)
+        .map(|i| {
+            let line = Line(i);
+            let text = cells_to_string(term, line, Column(0), last);
+            CopyRow {
+                has_padding: row_has_padding(&text, 0),
+                text,
+                wrapped: row_wraps(term, line),
+                col: 0,
+            }
+        })
+        .collect();
+    clipboard_text("", &rows, true, claude)
+}
+
 fn row_wraps<T>(term: &Term<T>, line: Line) -> bool {
     let row = &term.grid()[line];
     let len = row.line_length().0;

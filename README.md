@@ -882,8 +882,8 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       key means the same) tracks light and dark. `"dark"` and `"light"`
       lock the pair in `theme.rs`; a named scheme, or any hand-set
       `bg`/`fg`/`palette`, is not replaced when Windows changes. The
-      signal is winit's `ThemeChanged` and `WM_SETTINGCHANGE` whose
-      lParam is `ImmersiveColorSet`; both read
+      signal is winit's `ThemeChanged` (emitted while the window's
+      preferred theme is unset). It reads
       `HKCU\...\Personalize\AppsUseLightTheme` (DWORD 1 is light, anything
       else including a missing value is dark). The terminal palette, the
       tab bar (it already derives from the page colour), and
@@ -991,7 +991,17 @@ DACL allows only the current user's SID, the first instance is created with
 `FILE_FLAG_FIRST_PIPE_INSTANCE`, and the mode includes
 `PIPE_REJECT_REMOTE_CLIENTS`. The client opens the pipe with identification
 QoS and accepts it only when the owner and the server process are that same
-SID, so another account cannot sit on the name and read keystrokes. An
+SID, so another account cannot sit on the name and read keystrokes. Both
+ends are opened with `FILE_FLAG_OVERLAPPED`. The first version used
+synchronous handles, with one thread reading each end while another wrote
+it; Windows serializes I/O on a synchronous handle, so a write waits for
+the read already pending and the first `Spawn` would never have left the
+window. It passed CI because no test sent a frame through a real pipe;
+one does now, in both directions, with both reads parked first. The
+server writes each window's frames on that window's own thread from a
+queue of 1024, so a window that stops reading cannot stall the others;
+when its queue fills it is disconnected and its sessions stay in the
+server, detached. An
 elevated window does not start the server and does not connect: the pipe
 name is only the user SID, and a normal process of that user must not be
 able to ask an admin server to spawn a program. Several windows can connect
@@ -1098,12 +1108,49 @@ receives it: it would have to live in `PROMPT`, which every child
 inherits, so cmd's marks carry no nonce and are not trusted. An
 elevated token (Run as administrator) does not source user rc files, sets
 `INPUTRC` and `HISTFILE` to `/dev/null` so `~/.inputrc` cannot run a
-macro. Elevated Git Bash is started with `--noprofile` and does not read
-`/etc/profile`: that file runs `git-prompt.sh`, which executes
-`~/.config/git/git-prompt.sh` and `~/bash_completion.d/*.bash` as
-administrator. `PATH` and `MSYSTEM` are set from the Git install instead. Elevated WSL bash still reads the
-distro's `/etc/profile`, with `HOME` pointed at the rcfile directory for
-that read and restored afterwards. Elevated zsh ends `.zlogin` with
+macro. Elevated Git Bash is started with `--noprofile` before `-i` and
+does not read `/etc/profile`: that file runs `git-prompt.sh`, which
+executes `~/.config/git/git-prompt.sh` and `~/bash_completion.d/*.bash` as
+administrator. `HOME` is an empty directory in the integration folder
+until the rcfile restores it, including a non-login `bash.exe -i`.
+`PATH` and `MSYSTEM` come from the Git
+install, preferring `/ucrt64` (Git for Windows 2.56) over `/mingw64`.
+Git's own prompt is kept. Elevated WSL bash still reads the distro's
+`/etc/profile`, with `HOME` pointed at the rcfile directory for that
+read. Inherited `XDG_DATA_DIRS`, `XDG_CONFIG_HOME`,
+`BASH_COMPLETION_USER_FILE` and `BASH_COMPLETION_COMPAT_DIR` are cleared
+first. After `HOME` returns, `BASH_COMPLETION_USER_DIR` stays on the
+integration directory. Tab completion then runs with a `PATH` that was
+filtered before it was made local, and is never empty: `/mnt` entries,
+relative entries, and directories that are not root-owned or that are
+group- or world-writable are removed, and a command path is reduced to
+its name so a completion beside `/mnt/c/.../bin` or `./zzcmd` is not
+sourced. ssh and the other system completions still load. Each `PATH`
+entry is resolved through its symlinks and its trailing slash before it is
+judged, so a root-owned link to `/mnt/c` is refused for where it points,
+and `/x/bin/` is checked against its parent `/x` (it used to be checked
+against itself, twice). The command the loader is given is found by
+position, the first argument after the options, because
+`_comp_load [-D] [--] cmd [args...]` may carry more after it; taking the
+last word left a `/mnt/c/.../cmd` path whole whenever one argument
+followed. `_comp_realcommand` (bash-completion 2.12 and later) is wrapped
+too: it follows a command's links to its real path and the loader looks
+for completions beside that, so a real path whose directory fails the
+same test is reported as no real path. `PATH` is split with `read`, not
+by an unquoted expansion, so an entry such as `/usr/*` is not globbed
+into a list of directories. Reproduced before the fix against a stand-in
+for the 2.12 loader on Linux bash 5.2, with planted completions: a
+symlinked command, a trailing-slash entry under a user-owned parent, and
+a command followed by one argument each sourced the planted file; after
+it none does and a legitimate completion still loads. The stand-in was
+written for the test; bash-completion's own file was read, not run.
+`the_completion_filter_refuses_each_planted_shape` runs every branch in a
+real bash with `/usr/bin/stat` replaced by a function, because under Git
+Bash no directory is owned by uid 0 and the older planted test passed
+through the empty-`PATH` fallback alone. Removing the `/mnt` case, the
+uid test, the mode test or the fallback each changes a line it asserts
+(checked by hand on Linux). Not run here: a WSL distro, an elevated
+token, or the real bash-completion package. Elevated zsh ends `.zlogin` with
 `unsetopt rcs`, so exit does not read `~/.zlogout`. oh-my-posh is not inited from the user
 profile. A failed elevation query is treated as elevated. Elevated scripts
 are created under the real ProgramData folder
@@ -1155,8 +1202,125 @@ keyboard protocol in new panes. When one of those changes, the notice
 names it. `osc52` is config-file
 only (there is no settings-panel row). Leave it out or set `"off"`.
 `"copy"` lets a focused window accept OSC 52 clipboard writes from the
-focused pane; no value enables a clipboard read. The decode backstop is
-64 KiB, and one scan sees about 48–51 KiB.
+focused pane. Reads are separately disabled by default: `"osc52_read": true`
+allows a focused pane to request a one-time Arabic/English confirmation.
+Enter approves that request; Esc refuses without returning clipboard data.
+Each new request needs consent, and requests during other overlays or copy
+mode are ignored. The clipboard is read only after approval, with a 64 KiB
+limit and no broadcast to other panes. Copy decoding has a 64 KiB backstop;
+one scan sees about 48–51 KiB.
+
+Reliable query/reply transport needs the pinned Microsoft console host:
+run `powershell -File scripts/install-conpty.ps1 -OutputDirectory <Bayan-folder>`.
+It installs the verified `conpty.dll` / `OpenConsole.exe` pair and license.
+Bayan checks both hashes, Microsoft's publisher, and cached revocation state,
+and keeps the verified files locked. Rejection falls back to Windows' inbox
+ConPTY, which can strip OSC 52 queries/replies. Elevated Bayan never loads
+the optional bundle. This is not a signed Bayan installer or an automatic
+update service. External links in elevated windows are refused; open them
+from a normal window instead.
+
+### Search, export, and session identity
+
+`Ctrl+F` searches literal text. `Ctrl+Shift+F` opens regular-expression
+search, marked `[.*]`; Enter finds the previous match and Shift+Enter the
+next. An invalid expression clears the highlight. Pasting into either
+search field uses Ctrl+V and never sends the query to the shell. Queries
+are limited to 4096 characters.
+
+After Enter the bar shows where the hit sits among all hits, top of the
+scrollback first: `2/17`, `لا نتائج`, or `تعبير غير صالح` for a regular
+expression that does not compile. The count walks the scrollback under the
+terminal lock, so it stops at 1000 and shows `1000+`. It runs on Enter,
+not on each keystroke, and editing the query clears it. Proven on a real
+`Term`: `a.b` counts 1 as literal and 2 as a regex, the position follows
+the current hit, an unclosed group is reported, and a screen of
+one-character hits stops at the cap.
+
+`Ctrl+Shift+S` exports the focused pane's retained scrollback and screen
+to a new UTF-8 file in `~/.bayan/exports/`. The notice shows its path.
+It preserves logical Arabic and soft-wrapped lines without moving the
+viewport or changing the selection. It contains text, not ANSI sequences
+or images. Export is explicit; this is not automatic disk session logging.
+
+### Full screen, clear, reset, new window, duplicate tab
+
+Five more actions, each with a row in the shortcuts editor, a line in the
+command palette and a `keybinds` key:
+
+| Action | Default | `keybinds` key |
+|---|---|---|
+| Full screen | F11 | `fullscreen` |
+| Clear scrollback | Ctrl+Shift+H | `clear-scrollback` |
+| Reset terminal modes | Ctrl+Shift+J | `reset-terminal` |
+| New window | Ctrl+Shift+N | `new-window` |
+| Duplicate tab | Ctrl+Shift+T | `duplicate-tab` |
+
+- **Full screen** is winit's borderless mode on the monitor the window is
+  on. The saved window rectangle ignores it, the way it ignores maximized,
+  and the resize edges are off. F11 no longer reaches the program; a
+  program that wants it needs the action rebound.
+- **Clear scrollback** feeds `ESC [ 3 J` to the pane's own parser through
+  the reader's counted feed, so the dropped lines count as evicted and
+  OSC 133 marks and images keep their rows. The screen stays. On the
+  alternate screen it does nothing: that screen has no history.
+- **Reset terminal modes** is deliberately not RIS (`ESC c`). ConPTY keeps
+  its own copy of the screen and of the color state and sends only what
+  changed, so a view cleared or recolored behind its back stays wrong
+  until the program repaints. The reset sends what a program should have
+  sent on exit: cursor shown, mouse tracking and focus reports off, cursor
+  keys and keypad normal, bracketed paste off, an open synchronized update
+  closed, and the kitty keyboard stack popped (Ctrl+Shift+K's job, still
+  there on its own). It does not fix colors or a wrong character set;
+  those live in ConPTY.
+- **New window** starts a second Bayan process with `--new-window`, the
+  jump list's launch. An elevated window starts its child with
+  `--elevated` and nothing else. There is still one window per process.
+- **Duplicate tab** opens a tab with the focused pane's own command line
+  (the one a restored session starts it with) in that pane's folder. A
+  pane that lives in the mux server gets an ordinary new tab instead.
+
+With 30 actions the shortcuts editor takes its two columns in a 900px
+window as well as the default one.
+
+Proven by tests: clearing drops the history, keeps the screen text and
+cursor, and a prompt mark made before it still names its row; the mode
+reset turns each leftover mode off and leaves the text, the cursor
+position and the color; the new-window argv parses as a plain or an
+elevated launch with no folder or command. Not run here: any of it on a
+live window. Full screen in particular (the custom chrome and the layered
+window under borderless full screen) has only been type-checked. Tests ran
+as `x86_64-pc-windows-gnu` under wine on Linux, where the same 13 tests
+that need a real Windows fail on `main` too.
+
+Assign persistent colors by exact tab name (Ctrl+Shift+R renames a tab),
+SSH title, or folder title in config.json:
+
+```json
+{
+  "session_colors": { "production": "#fb1153", "staging": "#22aa44" },
+  "osc52_read": false
+}
+```
+
+The colored strip is separate from busy/progress indicators and never
+changes program output. Changes reload live. Windows High Contrast takes
+precedence. Pin a descriptive tab name when distinguishing hosts: a color
+is a visual reminder, not verification of the connected machine.
+
+Clipboard reads remain blocked, including when `osc52_read` is enabled.
+An experimental per-request consent path is preserved separately: the live
+inbox-ConPTY test did not carry the query or its reply to the program, so
+that experiment is not part of the adopted feature set.
+
+New panes advertise `TERM=xterm-256color` and `COLORTERM=truecolor`, using
+a common remote terminfo entry. SSH does not install files on a server.
+Use a remote tmux session for work that must survive an SSH/VPN disconnect;
+local splits alone do not provide that persistence.
+
+Bayan sends no usage telemetry. Local session state, explicit exports,
+and opt-in diagnostic measurements stay on this computer. SSH and programs
+the user runs retain their own network behavior.
 
 ## Inline images
 
@@ -1191,57 +1355,15 @@ that turns them on. Direct transmission (`t=d`) accepts raw RGB (`f=24`),
 RGBA (`f=32`) and PNG (`f=100`), including chunked `m=1` / `m=0`. iTerm2
 payloads are PNG.
 
-Inbox ConPTY (kernel32 `CreatePseudoConsole`, System32 `conhost.exe`)
-parses DCS and APC and does not forward them, so Sixel and Kitty graphics
-do not arrive on Windows 11 24H2/25H2 (builds 26100 and 26200). OSC is
-forwarded, which is why OSC 7, 9, 52 and 133 already work, and why an
-iTerm2 `OSC 1337` is not stripped the way DCS and APC are. A 96×48 PNG
-(224 base64 bytes) printed with `cmd /c type` arrived intact through
-conhost on Windows 11 26200; larger payloads against conhost's OSC limits
-have not been checked (see wezterm#3624 and Rio#1764).
-
-Bit `0x8` is not how that changes. It was `PSEUDOCONSOLE_PASSTHROUGH_MODE`
-(`--passthrough`) on older OpenConsole, and on build 26100 passing it is a
-measured no-op (microsoft/terminal#7019). The ConPTY rewrite
-(microsoft/terminal#17510, Windows Terminal 1.22, August 2024) passes VT
-through by default, and the same bit is now
-`PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES`. Bayan therefore does not set it.
-Passthrough is "a `conpty.dll` whose file version is 1.22 or newer, loaded
-by absolute path from the directory that contains `bayan.exe`, and only
-when `OpenConsole.exe` is in that same directory." The current directory
-and `PATH` are not searched. A `conpty.dll` with no `OpenConsole.exe`
-beside it is ignored, which is the planted-DLL case the loader test still
-rejects. If `CreatePseudoConsole` on that DLL fails, the pane is opened
-with kernel32 and Sixel is not advertised. Primary DA stays alacritty's
-VT102 reply (`CSI ? 6 c`) until that host is actually up; then it is
-`CSI ? 64 ; 4 c` (parameter 4 is Sixel, the `64` is the level). A DLL
-older than 1.22, or one with no version resource, is not passthrough
-and is not an error: the pane still opens on kernel32. `OpenConsole.exe`
-is that directory's file only. Bayan does not search PATH or the current
-directory for it. The file has to carry a trusted Authenticode signature
-(the optional SHA-256 pin in the loader is empty, so a signature is
-required). An elevated window also leaves the pair unused when the file
-or the directory is writable by a standard user. A missing file, a failed
-check, or a host that does not start is kernel32, with no error shown. Sixel and Kitty
-use the same caps as iTerm2 (`max_bytes`, `max_width`, `max_height`, and
-the pane and session budgets). A mux reattach feeds the saved tail
-through the replay filter first, so a Kitty graphics query is dropped
-and a command that would answer is quieted (`q=2`) instead of being
-written into the live session.
-
-The pair is the MIT-licensed `Microsoft.Windows.Console.ConPTY` redistributable
-from microsoft/terminal (not committed here). WezTerm's known-good match
-is 1.24.2604.02001: 1.22 passes DCS, and 1.22 also had alt-screen and
-`pwsh` exit bugs that 1.24 fixed (wezterm#7774). Copy
-`runtimes/win-x64/native/conpty.dll` and
-`build/native/runtimes/x64/OpenConsole.exe` from the `.nupkg` next to
-`bayan.exe` (the arm64 pair on arm64). Both files, same version. Shipping
-them is a packaging decision: about 1.2 MB per architecture, and the
-install directory has to be one only the user can write, the same rule as
-the rest of the exe directory. Inbox conhost on current Windows 11 does
-not include the rewrite (the Windows 11 24H2 cutoff was before #17510;
-the in-box sync was expected at a later major release, and as of August
-2026 the built-in console's Sixel was still Insider-only).
+ConPTY is created **without** `PSEUDOCONSOLE_PASSTHROUGH_MODE` (`0x8`).
+The flags are inherit-cursor, the resize quirk, and Win32 input mode
+(`vendor/portable-pty/src/win/psuedocon.rs`). In that mode conhost parses
+DCS and APC and does not forward them, so a real Windows console host will
+not deliver Sixel or Kitty graphics. OSC is forwarded, which is why OSC 7,
+9, 52 and 133 already work, so an iTerm2 `OSC 1337` is not stripped the way
+DCS and APC are. A 96×48 PNG (224 base64 bytes) printed with `cmd /c type`
+arrived intact through conhost on Windows 11 26200; larger payloads against
+conhost's OSC limits have not been checked (see wezterm#3624 and Rio#1764).
 
 **The image never moves the cursor.** The first build reserved the image's
 rows the way the protocols ask (`ESC D` per row). Under ConPTY that was
@@ -1253,11 +1375,8 @@ disappeared. Now the image stays on the rows it arrived on and the text
 conhost prints next draws over it (images are drawn first, and a cell with
 the default background draws nothing). The cost: conhost's repaint clears
 lines with EL, and EL clears an iTerm or Sixel image it touches, so a resize
-repaint or `cls` (also all EL) removes the image. Reserving rows is still
-not done when the bundled OpenConsole is the host: that host does not
-repaint the way inbox conhost does, so the reservation is the right
-follow-up once a live `img2sixel` shows the prompt painting over the
-image. It is not bit `0x8`.
+repaint or `cls` (also all EL) removes the image. Reserving rows is worth
+revisiting only with `PSEUDOCONSOLE_PASSTHROUGH_MODE`.
 
 PNG payloads (iTerm2 and Kitty `f=100`, chunked uploads included) and Sixel
 are decoded on the reader thread before the terminal lock is taken. For a
@@ -1304,11 +1423,23 @@ The sandbox is Lua 5.4 via mlua, with `string`, `table`, `math`, and
 `utf8` only. `io`, `os`, `debug`, and `package` are absent. `require`,
 `loadfile`, `dofile`, and `string.dump` are removed, and `load` accepts
 text chunks only. A metatable with `__gc` is rejected, because Lua 5.4
-runs finalizers with the instruction hook switched off. `<close>` is
-rejected too: after the budget aborts a call, the `__close` handler
-runs with that hook off, and setting `__close` after `setmetatable`
-still arms it. Every chunk, including one passed to `load`, is refused
-if its bytecode contains `OP_TBC`. The hook also
+runs finalizers with the instruction hook switched off. `__close` is
+rejected for the same reason: when the budget aborts a call, mlua clears
+the Lua stack from inside the hook, and that runs the `__close` of every
+to-be-closed slot in the running function with the hook off. The first
+fix refused any chunk whose bytecode contained `OP_TBC`, the instruction
+behind `<close>`. It missed the fourth value of a generic `for`, which is
+to-be-closed with no `OP_TBC` at all: `for _ in f, nil, nil, obj do while
+true do end end` with a spinning `obj.__close` had not returned after 20 s
+against a 100 ms deadline. The scanner is gone. `setmetatable` now gives
+the object a private snapshot of the metatable, so a script never holds a
+live one and cannot add `__close` after the check, and `getmetatable("")`
+returns `false` so the shared string metatable is out of reach too. With
+no value able to carry `__close`, `<close>` and the `for` closing value
+have nothing to run; a script that tries gets Lua's own "non-closable
+value" error. The cost is that a metamethod assigned after `setmetatable`
+is not seen until `setmetatable` is called again. Methods reached through
+`__index` stay live. The hook also
 cannot interrupt one C call, so `string.find`, `match`, `gmatch`, and
 `gsub` first bound the matcher's worst case for that subject and pattern
 (start positions times the ways the subject splits among the `*` `+` `-`
@@ -1468,6 +1599,35 @@ end
 
 ## Build
 
+The Windows suite is 915 tests, 7 ignored by the default run (908
+executed). CI on `e63bb89` printed `running 915 tests` and
+`test result: ok. 908 passed; 0 failed; 7 ignored`. Counts inside a
+milestone are what that change proved, not this total.
+
+Atlas and probe fixes (2026-11-13): resetting a full glyph atlas reserves
+page 0's white texel again and reuses every cleared page. GPU sync copies
+only changed pages, except when texture growth requires restoring them all;
+an atlas upload forces a present even when the quad geometry is identical.
+Shell/theme probes accept at most 1 MiB of stdout and share one deadline
+for process exit and pipe drain. On Windows they enter a kill-on-close job
+before running, so a descendant holding stdout cannot survive a timed-out
+probe. Lua-spawn supervision keeps its existing behavior and shares that
+same low-level job implementation.
+
+Seven regression tests cover these cases, including real Windows child
+processes. `BAYAN_ATLAS_RESET=1` in a debug build (or a release built with
+`dev-hooks`) forces the allocator through its page cap for a live GUI check.
+The checked window retained Arabic, colored backgrounds, selection/copy,
+font/theme switching and config hot reload after these resets.
+
+A minimized, quake-hidden, or occluded window does not paint. PTY output is
+still read, and bells, toasts, and the tab attention dot are still recorded;
+the frame is drawn once when the window is shown again, and cursor blink
+resumes from that frame. While the window is up, a busy background tab keeps
+the 600ms tab-bar dot and does not repaint its own grid on every read. The
+decision is `gate_paint` / `plan_idle` / `minimized_now` (eight unit tests).
+Nothing visible means `ControlFlow::Wait`, not a timer.
+
 Bayan now starts with one fresh tab. To opt into reopening saved tabs and panes,
 set `"restore_tabs": true` in config. Window position and size still persist.
 
@@ -1476,7 +1636,9 @@ in that folder; a relative one is taken from the current folder. It goes through
 the same gate as every start folder, and a UNC path, a mapped network drive or a
 missing folder stops Bayan with an error instead of opening somewhere else. With
 `restore_tabs` on, the saved tabs come back and the folder opens as the active
-extra tab. `-p <name>` (or `--profile`) starts that tab in a detected shell
+extra tab. `-M` (or `--maximized`) opens the window maximized whatever state
+was saved; the saved rectangle is kept for "restore down". `--elevated` refuses
+it, like every argument other than `-p`. `-p <name>` (or `--profile`) starts that tab in a detected shell
 profile, by its name or its command (`PowerShell`, `PowerShell سريع`,
 `cmd.exe`). `-- <command>...` runs that program in the tab instead.
 `--help` and `--version` print and exit. An unknown argument is an error.

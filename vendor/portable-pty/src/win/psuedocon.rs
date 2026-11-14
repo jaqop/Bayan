@@ -1,4 +1,5 @@
 use super::conpty_resolve::{self, ConptyLoader, SystemLoader};
+use super::conpty_bundle;
 use super::WinChild;
 use crate::cmdbuilder::CommandBuilder;
 use crate::win::procthreadattr::ProcThreadAttributeList;
@@ -9,7 +10,6 @@ use std::ffi::OsString;
 use std::io::Error as IoError;
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::{mem, ptr};
 use winapi::shared::minwindef::DWORD;
@@ -24,13 +24,11 @@ use winapi::um::winnt::HANDLE;
 
 pub type HPCON = HANDLE;
 
-pub const PSUEDOCONSOLE_INHERIT_CURSOR: DWORD = conpty_resolve::PSEUDOCONSOLE_INHERIT_CURSOR;
-pub const PSEUDOCONSOLE_RESIZE_QUIRK: DWORD = conpty_resolve::PSEUDOCONSOLE_RESIZE_QUIRK;
-pub const PSEUDOCONSOLE_WIN32_INPUT_MODE: DWORD = conpty_resolve::PSEUDOCONSOLE_WIN32_INPUT_MODE;
-/// Historical `--passthrough` bit. Not passed to a 1.22+ conpty.dll: there
-/// it means glyph width. See [`conpty_resolve::create_flags`].
+pub const PSUEDOCONSOLE_INHERIT_CURSOR: DWORD = 0x1;
+pub const PSEUDOCONSOLE_RESIZE_QUIRK: DWORD = 0x2;
+pub const PSEUDOCONSOLE_WIN32_INPUT_MODE: DWORD = 0x4;
 #[allow(dead_code)]
-pub const PSEUDOCONSOLE_PASSTHROUGH_MODE: DWORD = conpty_resolve::PSEUDOCONSOLE_PASSTHROUGH_MODE;
+pub const PSEUDOCONSOLE_PASSTHROUGH_MODE: DWORD = 0x8;
 
 // The upstream struct came from the `shared_library!` macro, whose `open`
 // is `LoadLibraryW` of whatever path it is given — including the bare name
@@ -43,140 +41,71 @@ struct ConPtyFuncs {
     ResizePseudoConsole: unsafe extern "system" fn(HPCON, COORD) -> HRESULT,
     ClosePseudoConsole: unsafe extern "system" fn(HPCON),
     _module: usize,
-    flags: u32,
-    passthrough: bool,
+    _verified_pair: Option<conpty_bundle::VerifiedPair>,
 }
 
-fn bind_api(
-    resolved: conpty_resolve::ResolvedConpty<*mut std::ffi::c_void, *mut std::ffi::c_void>,
-    flags: u32,
-    passthrough: bool,
-) -> ConPtyFuncs {
-    // SAFETY: the three pointers came from GetProcAddress on a module this
-    // process keeps mapped. Each symbol has the stdcall/C signature of the
-    // ConPTY export it was looked up by.
-    unsafe {
-        ConPtyFuncs {
-            CreatePseudoConsole: mem::transmute(resolved.create_pseudo_console),
-            ResizePseudoConsole: mem::transmute(resolved.resize_pseudo_console),
-            ClosePseudoConsole: mem::transmute(resolved.close_pseudo_console),
-            _module: resolved.module as usize,
-            flags,
-            passthrough,
-        }
-    }
-}
-
-fn load_kernel32() -> ConPtyFuncs {
+fn load_conpty() -> ConPtyFuncs {
+    // kernel32 only, via LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32).
+    // Do not probe conpty.dll. A sideload was how a DLL next to bayan.exe,
+    // in the CWD, or on PATH became the ConPTY host.
     let resolved = conpty_resolve::resolve_conpty(&SystemLoader).unwrap_or_else(|err| {
         panic!(
             "this system does not support conpty. Windows 10 October 2018 or newer is required: {}",
             err
         )
     });
-    let plan = conpty_resolve::create_flags(conpty_resolve::ConptyCapability::Inbox);
-    bind_api(resolved, plan.flags, plan.passthrough)
-}
-
-/// Absolute `<exe>\conpty.dll` when `<exe>\OpenConsole.exe` is that same
-/// directory, both files verify, and an elevated token is not about to run
-/// a user-writable copy. Anything else is `None`: kernel32 is the host.
-/// A bare name, PATH, and the current directory are never consulted.
-fn load_bundled() -> Option<ConPtyFuncs> {
-    let exe = std::env::current_exe().ok()?;
-    let dll = conpty_resolve::bundled_host_path(&exe, "conpty.dll")?;
-    let console = conpty_resolve::bundled_host_path(&exe, "OpenConsole.exe")?;
-    let dll_str = dll.to_str()?;
-    let console_str = console.to_str()?;
-    let elevated = conpty_resolve::running_elevated();
-    if !conpty_resolve::host_file_ok(console_str, elevated)
-        || !conpty_resolve::host_file_ok(dll_str, elevated)
-    {
-        log::debug!("conpty: bundled OpenConsole was not accepted; using kernel32");
-        return None;
-    }
-    if elevated {
-        let dir = exe.parent()?.to_str()?;
-        if conpty_resolve::path_user_writable(dir).unwrap_or(true) {
-            log::debug!("conpty: exe directory is user-writable; using kernel32");
-            return None;
+    unsafe {
+        ConPtyFuncs {
+            CreatePseudoConsole: mem::transmute(resolved.create_pseudo_console),
+            ResizePseudoConsole: mem::transmute(resolved.resize_pseudo_console),
+            ClosePseudoConsole: mem::transmute(resolved.close_pseudo_console),
+            _module: resolved.module as usize,
+            _verified_pair: None,
         }
     }
-    let probe = conpty_resolve::BundleProbe {
-        dll_is_file: true,
-        open_console_is_file: true,
-        version: conpty_resolve::read_file_version(dll_str),
-    };
-    let capability = conpty_resolve::capability_from_probe(probe);
-    if capability != conpty_resolve::ConptyCapability::BundledRewrite {
-        return None;
-    }
-    // Full path plus DLL_LOAD_DIR | SYSTEM32. Not a bare name, so the
-    // current directory and PATH are not searched for this load.
-    let module = SystemLoader
-        .load_library_ex(dll_str, conpty_resolve::BUNDLED_LOAD_FLAGS)
-        .ok()?;
+}
+
+fn load_bundled() -> Option<ConPtyFuncs> {
+    let pair = conpty_bundle::verify_pair(&std::env::current_exe().ok()?, conpty_bundle::running_elevated())?;
+    let module = SystemLoader.load_library_ex(pair.paths[0].to_str()?, 0x0000_0900).ok()?;
     let create = SystemLoader.get_proc_address(module, "CreatePseudoConsole");
     let resize = SystemLoader.get_proc_address(module, "ResizePseudoConsole");
     let close = SystemLoader.get_proc_address(module, "ClosePseudoConsole");
     let (Ok(create), Ok(resize), Ok(close)) = (create, resize, close) else {
-        // SAFETY: `module` is the handle LoadLibraryExW just returned, and
-        // we are not going to call through it.
-        unsafe { FreeLibrary(module) };
+        // SAFETY: no export was called; release the module we just opened.
+        unsafe { FreeLibrary(module as _) };
         return None;
     };
-    let plan = conpty_resolve::create_flags(capability);
-    log::info!(
-        "conpty: using bundled {} (version {:?}), passthrough {}",
-        dll_str,
-        probe.version,
-        plan.passthrough
-    );
-    Some(bind_api(
-        conpty_resolve::ResolvedConpty {
-            module,
-            create_pseudo_console: create,
-            resize_pseudo_console: resize,
-            close_pseudo_console: close,
-        },
-        plan.flags,
-        plan.passthrough,
-    ))
-}
-
-struct ConPtyHosts {
-    bundle: Option<ConPtyFuncs>,
-    kernel: ConPtyFuncs,
-}
-
-fn load_hosts() -> ConPtyHosts {
-    ConPtyHosts {
-        bundle: load_bundled(),
-        kernel: load_kernel32(),
-    }
-}
-
-lazy_static! {
-    static ref CONPTY: ConPtyHosts = load_hosts();
-}
-
-/// Set once a bundled 1.22+ pseudoconsole has been created. Inbox sessions
-/// leave it false, which is what primary DA reads before advertising Sixel.
-static PASSTHROUGH_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-pub(crate) fn passthrough_active() -> bool {
-    PASSTHROUGH_ACTIVE.load(Ordering::Acquire)
+    // SAFETY: these exports have the same documented ABI as kernel32's.
+    Some(unsafe { ConPtyFuncs {
+        CreatePseudoConsole: mem::transmute(create),
+        ResizePseudoConsole: mem::transmute(resize),
+        ClosePseudoConsole: mem::transmute(close),
+        _module: module as usize,
+        _verified_pair: Some(pair),
+    } })
 }
 
 #[link(name = "kernel32")]
-extern "system" {
-    fn FreeLibrary(module: *mut std::ffi::c_void) -> i32;
+extern "system" { fn FreeLibrary(module: *mut std::ffi::c_void) -> i32; }
+
+lazy_static! {
+    static ref CONPTY: ConPtyFuncs = load_conpty();
+    static ref BUNDLED_CONPTY: Option<ConPtyFuncs> = load_bundled();
+}
+
+/// Set once a pseudoconsole has been created on the pinned 1.22+ host.
+/// Inbox sessions leave it false; primary DA reads it before advertising Sixel.
+static PASSTHROUGH_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn passthrough_active() -> bool {
+    PASSTHROUGH_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
 }
 
 pub struct PsuedoCon {
     con: HPCON,
-    resize: unsafe extern "system" fn(HPCON, COORD) -> HRESULT,
-    close: unsafe extern "system" fn(HPCON),
+    api: &'static ConPtyFuncs,
 }
 
 unsafe impl Send for PsuedoCon {}
@@ -184,77 +113,35 @@ unsafe impl Sync for PsuedoCon {}
 
 impl Drop for PsuedoCon {
     fn drop(&mut self) {
-        // SAFETY: `con` was returned by this host's CreatePseudoConsole, and
-        // `close` is that host's ClosePseudoConsole.
-        unsafe { (self.close)(self.con) };
+        unsafe { (self.api.ClosePseudoConsole)(self.con) };
     }
-}
-
-fn open_with(
-    api: &ConPtyFuncs,
-    size: COORD,
-    input: &FileDescriptor,
-    output: &FileDescriptor,
-) -> Result<PsuedoCon, HRESULT> {
-    let mut con: HPCON = INVALID_HANDLE_VALUE;
-    // SAFETY: the handles are the read end of the input pipe and the write
-    // end of the output pipe, both live for this call. `api.flags` is the
-    // plan for this host. On failure `con` is left untouched and not closed.
-    let result = unsafe {
-        (api.CreatePseudoConsole)(
-            size,
-            input.as_raw_handle() as _,
-            output.as_raw_handle() as _,
-            api.flags,
-            &mut con,
-        )
-    };
-    if result != S_OK {
-        return Err(result);
-    }
-    if api.passthrough {
-        PASSTHROUGH_ACTIVE.store(true, Ordering::Release);
-    }
-    Ok(PsuedoCon {
-        con,
-        resize: api.ResizePseudoConsole,
-        close: api.ClosePseudoConsole,
-    })
 }
 
 impl PsuedoCon {
     pub fn new(size: COORD, input: FileDescriptor, output: FileDescriptor) -> Result<Self, Error> {
-        let hosts = &*CONPTY;
-        debug_assert_eq!(
-            hosts.kernel.flags,
-            PSUEDOCONSOLE_INHERIT_CURSOR
-                | PSEUDOCONSOLE_RESIZE_QUIRK
-                | PSEUDOCONSOLE_WIN32_INPUT_MODE
-        );
-        if let Some(bundle) = &hosts.bundle {
-            match open_with(bundle, size, &input, &output) {
-                Ok(con) => return Ok(con),
-                Err(hr) => {
-                    // A host that did not start is inbox. No dialog, no panic.
-                    let fallback = conpty_resolve::capability_after_launch(true, false);
-                    log::debug!(
-                        "bundled CreatePseudoConsole failed (HRESULT {hr:#x}); {fallback:?}; using kernel32"
-                    );
-                }
+        // Microsoft's 1.22+ rewrite passes VT through by default. Bit 0x8
+        // now means grapheme width, not the historical passthrough option.
+        if let Some(api) = BUNDLED_CONPTY.as_ref() {
+            if let Ok(con) = Self::open(api, size, &input, &output, PSUEDOCONSOLE_INHERIT_CURSOR) {
+                log::info!("conpty: pinned Microsoft host active");
+                PASSTHROUGH_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
+                return Ok(con);
             }
         }
-        match open_with(&hosts.kernel, size, &input, &output) {
-            Ok(con) => Ok(con),
-            Err(hr) => {
-                bail!("failed to create psuedo console: HRESULT {}", hr)
-            }
-        }
+        Self::open(&CONPTY, size, &input, &output,
+            PSUEDOCONSOLE_INHERIT_CURSOR | PSEUDOCONSOLE_RESIZE_QUIRK | PSEUDOCONSOLE_WIN32_INPUT_MODE)
+    }
+
+    fn open(api: &'static ConPtyFuncs, size: COORD, input: &FileDescriptor, output: &FileDescriptor, flags: DWORD) -> Result<Self, Error> {
+        let mut con: HPCON = INVALID_HANDLE_VALUE;
+        // SAFETY: live pipe handles and output pointer, matched ConPTY ABI.
+        let result = unsafe { (api.CreatePseudoConsole)(size, input.as_raw_handle() as _, output.as_raw_handle() as _, flags, &mut con) };
+        ensure!(result == S_OK, "failed to create pseudo console: HRESULT {}", result);
+        Ok(Self { con, api })
     }
 
     pub fn resize(&self, size: COORD) -> Result<(), Error> {
-        // SAFETY: `con` is this host's pseudoconsole and `resize` is its
-        // ResizePseudoConsole.
-        let result = unsafe { (self.resize)(self.con, size) };
+        let result = unsafe { (self.api.ResizePseudoConsole)(self.con, size) };
         ensure!(
             result == S_OK,
             "failed to resize console to {}x{}: HRESULT: {}",

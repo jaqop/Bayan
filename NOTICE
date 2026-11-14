@@ -5,6 +5,18 @@ This product includes third-party material distributed under its own terms.
 Bayan itself is MIT licensed; see LICENSE.
 
 --------------------------------------------------------------------------
+Optional pinned Microsoft ConPTY host — MIT
+--------------------------------------------------------------------------
+
+scripts/install-conpty.ps1 obtains conpty.dll and OpenConsole.exe from the
+Microsoft.Windows.Console.ConPTY NuGet package. These files are built from
+https://github.com/microsoft/terminal, Copyright (c) Microsoft Corporation,
+under the MIT license. Keep the Windows Terminal MIT license and this notice
+with a distribution containing the pair. Their exact pinned version and
+SHA-256 values are recorded in resources/conpty.json. Runtime verification
+does not accept arbitrary signed replacements.
+
+--------------------------------------------------------------------------
 Bundled fonts — SIL Open Font License 1.1
 --------------------------------------------------------------------------
 
@@ -20,20 +32,6 @@ Amiri is bundled so that connected Arabic renders correctly from a fresh
 clone, with no font installation step. Kawkab Mono is bundled so every
 user has a monospaced Arabic font to pick in Settings → Arabic font, even
 on a PC that has none installed. It is redistributed unmodified.
-
---------------------------------------------------------------------------
-Optional ConPTY pair — MIT, not included
---------------------------------------------------------------------------
-
-Bayan does not redistribute `conpty.dll` or `OpenConsole.exe`. If you
-place a matched pair from the `Microsoft.Windows.Console.ConPTY` package
-next to `bayan.exe`, Bayan loads that DLL by its absolute path so Sixel
-and Kitty graphics can pass through ConPTY. Those binaries are built from
-the Windows Terminal project (https://github.com/microsoft/terminal),
-which is MIT licensed, Copyright (c) Microsoft Corporation. Shipping them
-with Bayan is a packaging choice: keep the MIT notice and the copyright
-line with the files, ship `conpty.dll` and `OpenConsole.exe` together,
-and do not substitute a DLL from any other directory.
 
 --------------------------------------------------------------------------
 Lua 5.4 — MIT
