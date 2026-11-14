@@ -17,6 +17,8 @@ mod conpty_bundle;
 mod procthreadattr;
 mod psuedocon;
 
+pub(crate) use psuedocon::passthrough_active;
+
 use filedescriptor::OwnedHandle;
 
 #[derive(Debug)]
