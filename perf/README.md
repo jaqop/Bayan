@@ -168,10 +168,30 @@ and 0 redraws on those runs.
 The typed cmd-profile cat, first hosted run (43714995789 on e87874a):
 64.11 s, peak private 597.5 MB. Those are `cat_time` and `cat_memory`;
 one run, not yet the median of three. 64 s is about eight times the
-author's machine (7.17 to 8.96 s) on the same code. The runner draws on
-WARP, and the reader takes the same terminal lock the frame is drawn
-under, so a slow software frame may be holding the reader back. That is
-a lead, not a measurement.
+author's machine (7.17 to 8.96 s) on the same code, and the runner grew
+about 300 MB during the cat where the author's machine grows 30 to 50 MB
+(roughly the 10k-line scrollback).
+
+What it is not, measured on the author's machine on 2026-11-15 (cat only,
+same release + dev-hooks binary):
+
+| Run | cmd exit | last frame | redraws/presents | private start → peak |
+|---|---|---|---|---|
+| hardware adapter, 4 cores | 7.53 s | 7.76 s | 9/6 | 397 → 428 MB |
+| WARP (`force_fallback_adapter`, `d3d10warp.dll` loaded), 4 cores | 8.00 s | 8.12 s | 9/6 | 340 → 391 MB |
+| WARP, 2 cores | | 13.20 s | | peak 385 MB |
+| WARP, 4 cores, a UIA client reading the tree | 8.06 s | 8.39 s | 12/9 | 341 → 395 MB |
+
+Cores are a process affinity mask inherited by cmd and conhost. The
+frame holds the terminal lock only while `draw_pane` lays out the pane;
+the WARP rasterization in `gpu.render` runs after the lock is dropped.
+So WARP, four cores, and an accessibility client do not explain 64 s.
+The runner is Windows Server 2025 (`windows-2025-vs2026`, build 26100)
+with the inbox console host, as is this machine (26200); the plain
+`type` outside Bayan took under 4 s there. The idle step now prints a
+`large cat split:` line (cmd exit, last frame, frame counts, start
+memory, and whether an accessibility client asked for the tree) so the
+next hosted run says which side the time is on.
 
 Scripts: `scripts/measure-tap-latency.ps1`, `scripts/measure-idle.ps1`.
 `scripts/measure-latency.ps1` stays the local SendInput tool.

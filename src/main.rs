@@ -8405,6 +8405,7 @@ impl ApplicationHandler<UserEvent> for App {
                 accesskit_winit::WindowEvent::InitialTreeRequested => {
                     // The next consider must build even if the stamp matches
                     // a tree we never managed to send.
+                    crate::prof::mark("accessibility client");
                     self.reader_seen_client = true;
                     self.reader_pace = screen_reader::TreePace::default();
                     self.publish_reader();

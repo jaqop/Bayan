@@ -332,6 +332,11 @@ function Invoke-LargeCat {
             }
             Start-Sleep -Milliseconds 100
         }
+        # Which end came last: cmd's exit (the reader) or the last frame (the UI).
+        $cmdS = ($doneAt - $started).TotalSeconds.ToString('0.00', $inv)
+        $frameS = ($changed - $started).TotalSeconds.ToString('0.00', $inv)
+        $a11y = [bool](Select-String -LiteralPath $run.log -SimpleMatch 'accessibility client' -Quiet)
+        Write-Host "large cat split: cmd_exit_s=$cmdS last_frame_s=$frameS frames=$($last.redraws)/$($last.presents) base_private=$(Format-Mb $base) a11y_client=$a11y"
         if ($doneAt -gt $changed) { $changed = $doneAt }
         $seconds = ($changed - $started).TotalSeconds.ToString('0.00', $inv)
         if ($changed -le $started) { throw 'large cat: no frame after the first output' }
