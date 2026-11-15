@@ -290,9 +290,15 @@ function Invoke-LargeCat {
         $writer.Dispose()
     }
     $mb = [Math]::Round((Get-Item -LiteralPath $file).Length / 1e6)
+    # Read it once first: an on-access scan of a fresh 16 MB file can hold the first
+    # open for seconds, and the settle loop would end before any output.
+    $direct = (& cmd.exe /d /c type "$file" | Measure-Object -Line).Lines
+    if ($direct -ne 200000) { throw "large cat: cmd type outside Bayan read $direct lines" }
     $proc = $null
     try {
-        $proc = Start-Process -FilePath $exe -ArgumentList @('--', 'cmd.exe', '/d', '/k', 'type', ('"' + $file + '"')) -PassThru -WindowStyle Normal -RedirectStandardError $run.stderr
+        # cmd /c exits when type is done; the pane stays (inbox ConPTY keeps the pipe open).
+        # Frames can pause for seconds mid-flood, so quiet counters alone do not mean done.
+        $proc = Start-Process -FilePath $exe -ArgumentList @('--', 'cmd.exe', '/d', '/c', 'type', ('"' + $file + '"')) -PassThru -WindowStyle Normal -RedirectStandardError $run.stderr
         $deadline = [DateTime]::UtcNow.AddSeconds(180)
         Wait-Mark $proc $run.log $run.stderr ' ms  first pty output' $deadline
         $started = [DateTime]::UtcNow
@@ -300,29 +306,41 @@ function Invoke-LargeCat {
         $peak = $base
         $last = $null
         $changed = $started
+        $doneAt = $null
         while ($true) {
             if ([DateTime]::UtcNow -ge $deadline) { throw 'large cat did not settle within 180s' }
             $proc.Refresh()
-            if ($proc.HasExited) { throw "Bayan exited during the cat: $($proc.ExitCode)" }
+            if ($proc.HasExited) {
+                if ($doneAt) { break }
+                throw "Bayan exited during the cat: $($proc.ExitCode)"
+            }
             $peak = [Math]::Max($peak, (Get-Process -Id $proc.Id).PrivateMemorySize64)
             $now = Read-Counters $run.counters
             if ($null -eq $last -or $now.redraws -ne $last.redraws -or $now.presents -ne $last.presents) {
                 $last = $now
                 $changed = [DateTime]::UtcNow
-            } elseif (([DateTime]::UtcNow - $changed).TotalSeconds -ge 3) {
+            }
+            if (-not $doneAt) {
+                $cmd = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($proc.Id) AND Name='cmd.exe'")
+                if ($cmd.Count -eq 0) { $doneAt = [DateTime]::UtcNow }
+            } elseif (([DateTime]::UtcNow - $changed).TotalSeconds -ge 2 -and ([DateTime]::UtcNow - $doneAt).TotalSeconds -ge 2) {
                 break
             }
             Start-Sleep -Milliseconds 100
         }
+        if ($doneAt -gt $changed) { $changed = $doneAt }
         $seconds = ($changed - $started).TotalSeconds.ToString('0.00', $inv)
         if ($changed -le $started) { throw 'large cat: no frame after the first output' }
         # The 10k-line scrollback alone is ~33 MB; less growth means the file never reached the grid.
         if (($peak - $base) -lt 16MB) {
             # Evidence for the log: the same type outside Bayan, Bayan's stderr, and its marks.
-            $direct = (& cmd.exe /d /c type "$file" | Measure-Object -Line).Lines
+            # Late or stuck: watch 15 s more.
+            $late = $peak
+            for ($i = 0; $i -lt 150; $i++) { Start-Sleep -Milliseconds 100; $proc.Refresh(); if ($proc.HasExited) { break }; $late = [Math]::Max($late, (Get-Process -Id $proc.Id).PrivateMemorySize64) }
+            $responding = $proc.Responding
             $err = if (Test-Path -LiteralPath $run.stderr) { Get-Content -LiteralPath $run.stderr -Raw } else { '' }
             $marks = if (Test-Path -LiteralPath $run.log) { (Get-Content -LiteralPath $run.log -Tail 20) -join ' | ' } else { '' }
-            throw "large cat: private memory rose only $(Format-Mb ($peak - $base)) MB; the file's output did not arrive. file=$file; cmd type outside Bayan: $direct lines; stderr: $err; marks: $marks"
+            throw "large cat: private memory rose only $(Format-Mb ($peak - $base)) MB; the file's output did not arrive. 15 s later +$(Format-Mb ($late - $base)) MB; responding=$responding; frames=$($last.redraws)/$($last.presents); stderr: $err; marks: $marks"
         }
         $peakMb = Format-Mb $peak
         Write-Host "large cat ${mb} MB seconds=$seconds peak_private=$peakMb"
