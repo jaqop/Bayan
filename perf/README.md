@@ -86,7 +86,7 @@ Same `bayan.exe` as the startup step (`cargo build --locked --release
 | `idle_redraw minimized` | `BAYAN_IDLE_BUSY=1` keeps a background tab busy; the script calls `ShowWindow(SW_MINIMIZE)`. | **Report-only.** `MINIMIZED_REDRAW_REQUIRED` in `scripts/perf_gate.py` is the one-line switch. A missing or malformed line still fails. Non-zero counts do not, until that flag is true. The 600 ms busy-dot pulse and wakeup/title/bell redraws while minimized are stopped by a separate change; this probe is ready for that change. |
 | `idle_redraw tabs10` | `BAYAN_TABS=10`: ten `cmd /d /q` tabs, the first active. Same 5 s window once the counters settle. | presents and redraws must both be 0. Required. |
 | `tabs_memory private 10 tabs` | private MB of that ten-tab window after the 5 s. | Lower is better, 10%. |
-| `cat_time 16 MB seconds` | `cmd /d /c type` of a 16,000,000-byte ASCII file (200k lines), read once by the script first so an on-access scan is not timed. From `first pty output` to the later of cmd's exit and the last change in the frame counters, once both are 2 s past. Scrollbar autohide is off so its delayed hide frame is not counted. Fails if private memory rises less than 16 MB (the file never reached the scrollback). | Lower is better. 100%, a backstop like startup. |
+| `cat_time 16 MB seconds` | `type` of a 16,000,000-byte ASCII file (200k lines) in the `Command Prompt` profile (`-p`), typed by `BAYAN_TYPE` with `& exit`; the script reads the file once first so an on-access scan is not timed. From `first pty output` (cmd's prompt, so cmd start-up is included) to the later of cmd's exit and the last change in the frame counters, once both are 2 s past. Scrollbar autohide is off so its delayed hide frame is not counted. Fails if private memory rises less than 16 MB (the file never reached the scrollback). | Lower is better. 100%, a backstop like startup. |
 | `cat_memory 16 MB peak private` | peak private MB during that cat, sampled every 100 ms. | Lower is better, 10%. |
 
 `BAYAN_FRAME_COUNTERS=1` (with `BAYAN_PROFILE`) writes
@@ -144,10 +144,21 @@ read all 200,000 lines). Installing the pinned OpenConsole pair did not
 change that, so the console host was not the cause. Locally the same
 loop read 5.08 s, 2.24 s and 0.02 s on the same binary.
 
+The second version (`-- cmd.exe /d /c type`) still read +0.2 MB on the
+runner, with no `cmd.exe` child at all. The runner's `runneradmin` token
+is elevated, and an elevated Bayan drops a `--` command by design
+(`main.rs`, `command: if elevated { None }`) and opens its elevated
+default shell. So the cat opens the cmd profile with `-p`, which an
+elevated launch accepts, and types the command. The same holds for the
+other probes' `-- cmd.exe /d /q`: on the runner the quiet window, ten
+tabs, latency and startup run the elevated default shell, not cmd, and
+their baselines are what that shell measured.
+
 The author's machine, 2026-11-15, release + dev-hooks, rustc 1.100: one
 quiet tab 393.6 MB private; ten tabs 420.2 MB (+27 MB for nine more
-tabs), 0/0 redraws. The reworked cat, three runs: 6.68, 6.44, 6.37 s,
-peak private 428.6 to 431.4 MB.
+tabs), 0/0 redraws. The cat as `cmd /c`, three runs: 6.68, 6.44, 6.37 s,
+peak private 428.6 to 431.4 MB; as the typed cmd profile: 8.51, 7.17,
+8.96 s, peak 428.9 to 429.3 MB.
 
 First hosted run (43694739816 on b7dceeb): one quiet tab 291.2 MB, ten
 tabs 313.8 MB (+22.6 MB), 0/0 redraws; two later runs read 314.2 and
