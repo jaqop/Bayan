@@ -719,7 +719,9 @@ mod prof {
     impl Drop for Span {
         fn drop(&mut self) {
             let Some((kind, at)) = self.0 else { return };
-            static TALLY: std::sync::Mutex<(Option<Instant>, [(u64, Duration); 2])> =
+            // When the last mark went out, then (count, time) per kind.
+            type Tally = (Option<Instant>, [(u64, Duration); 2]);
+            static TALLY: std::sync::Mutex<Tally> =
                 std::sync::Mutex::new((None, [(0, Duration::ZERO); 2]));
             let mut t = TALLY
                 .lock()
