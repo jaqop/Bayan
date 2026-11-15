@@ -86,7 +86,7 @@ Same `bayan.exe` as the startup step (`cargo build --locked --release
 | `idle_redraw minimized` | `BAYAN_IDLE_BUSY=1` keeps a background tab busy; the script calls `ShowWindow(SW_MINIMIZE)`. | **Report-only.** `MINIMIZED_REDRAW_REQUIRED` in `scripts/perf_gate.py` is the one-line switch. A missing or malformed line still fails. Non-zero counts do not, until that flag is true. The 600 ms busy-dot pulse and wakeup/title/bell redraws while minimized are stopped by a separate change; this probe is ready for that change. |
 | `idle_redraw tabs10` | `BAYAN_TABS=10`: ten `cmd /d /q` tabs, the first active. Same 5 s window once the counters settle. | presents and redraws must both be 0. Required. |
 | `tabs_memory private 10 tabs` | private MB of that ten-tab window after the 5 s. | Lower is better, 10%. |
-| `cat_time 16 MB seconds` | `cmd /d /k type` of a 16,000,000-byte ASCII file (200k lines). From `first pty output` to the last change in the frame counters, once they hold still for 3 s. Scrollbar autohide is off so its delayed hide frame is not counted. Conhost is in the path. | Lower is better. 100%, a backstop like startup. |
+| `cat_time 16 MB seconds` | `cmd /d /k type` of a 16,000,000-byte ASCII file (200k lines). From `first pty output` to the last change in the frame counters, once they hold still for 3 s. Scrollbar autohide is off so its delayed hide frame is not counted. The idle step installs the pinned OpenConsole pair beside `bayan.exe` (as the release zip ships); on inbox conhost only the last screens arrive. | Lower is better. 100%, a backstop like startup. |
 | `cat_memory 16 MB peak private` | peak private MB during that cat, sampled every 100 ms. | Lower is better, 10%. |
 
 `BAYAN_FRAME_COUNTERS=1` (with `BAYAN_PROFILE`) writes
@@ -148,7 +148,15 @@ read 0.46 s with a peak of 291.2 MB, the quiet tab's figure exactly: the
 file's output never reached the scrollback, so that line is not a
 measurement and `cat_time` / `cat_memory` stay on the local figures. The
 probe now fails when private memory rises less than 16 MB during the
-cat. The minimized window read 0 presents and 0 redraws on that run.
+cat. Its evidence on the next run: `cmd /d /c type` of the same file gave
+all 200,000 lines outside Bayan, and Bayan spawned and read output. So the
+lines were lost between cmd and Bayan, in the console host. The perf job
+builds `target/release` without the pinned host, so the runner's inbox
+conhost carries it. The likely cause (not yet proven) is that this conhost
+sends what is on screen at each frame and drops what scrolled past in
+between. On the author's machine the same binary with no pair beside it
+gets every line from Windows 11 26200's inbox conhost. The idle step now
+installs the pair first; if the cat then fills the scrollback, that was it. The minimized window read 0 presents and 0 redraws on that run.
 
 Scripts: `scripts/measure-tap-latency.ps1`, `scripts/measure-idle.ps1`.
 `scripts/measure-latency.ps1` stays the local SendInput tool.

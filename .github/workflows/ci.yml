@@ -138,9 +138,14 @@ jobs:
         run: |
           ./scripts/measure-tap-latency.ps1 -BinaryPath target/release/bayan.exe -OutputPath latency.log
       # Same bayan.exe. Quiet private memory, then the two 5s redraw windows.
+      # The pinned host goes beside it here, as in the release zip. On the
+      # runner's inbox conhost the 16 MB cat never reached the scrollback
+      # (lines lost in the host; see perf/README.md).
+      # Startup and latency above stay on the inbox host they were baselined on.
       - name: Idle memory and redraws
         shell: pwsh
         run: |
+          ./scripts/install-conpty.ps1 -OutputDirectory target/release
           ./scripts/measure-idle.ps1 -BinaryPath target/release/bayan.exe -OutputPath idle.log
       - name: Gate
         shell: bash
