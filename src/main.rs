@@ -619,7 +619,7 @@ fn dev_hook(_name: &str) -> Option<std::ffi::OsString> {
 mod prof {
     use std::io::Write;
     use std::sync::OnceLock;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     static T0: OnceLock<Instant> = OnceLock::new();
 
@@ -658,6 +658,52 @@ mod prof {
     pub fn output_read() {
         if on() {
             latency().output_read(Instant::now());
+        }
+    }
+
+    /// One PTY read on the reader thread: time blocked in `read`, waiting
+    /// for the terminal lock, and holding it. Summed and marked about once
+    /// a second, so a slow flood says which of the three it waited on.
+    pub fn reader_read(bytes: usize, read_wait: Duration, lock_wait: Duration, held: Duration) {
+        if !on() {
+            return;
+        }
+        struct Tally {
+            since: Option<Instant>,
+            reads: u64,
+            bytes: u64,
+            read_wait: Duration,
+            lock_wait: Duration,
+            held: Duration,
+        }
+        static TALLY: std::sync::Mutex<Tally> = std::sync::Mutex::new(Tally {
+            since: None,
+            reads: 0,
+            bytes: 0,
+            read_wait: Duration::ZERO,
+            lock_wait: Duration::ZERO,
+            held: Duration::ZERO,
+        });
+        let mut t = TALLY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let since = *t.since.get_or_insert_with(Instant::now);
+        t.reads += 1;
+        t.bytes += bytes as u64;
+        t.read_wait += read_wait;
+        t.lock_wait += lock_wait;
+        t.held += held;
+        if since.elapsed() >= Duration::from_secs(1) {
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+            mark(&format!(
+                "reader reads={} bytes={} read_wait_ms={:.0} lock_wait_ms={:.0} held_ms={:.0}",
+                t.reads,
+                t.bytes,
+                ms(t.read_wait),
+                ms(t.lock_wait),
+                ms(t.held)
+            ));
+            t.since = Some(Instant::now());
         }
     }
 

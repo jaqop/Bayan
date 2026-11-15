@@ -337,6 +337,9 @@ function Invoke-LargeCat {
         $frameS = ($changed - $started).TotalSeconds.ToString('0.00', $inv)
         $a11y = [bool](Select-String -LiteralPath $run.log -SimpleMatch 'accessibility client' -Quiet)
         Write-Host "large cat split: cmd_exit_s=$cmdS last_frame_s=$frameS frames=$($last.redraws)/$($last.presents) base_private=$(Format-Mb $base) a11y_client=$a11y"
+        # The reader's running totals: blocked in read, waiting for the term lock, holding it.
+        $reader = Select-String -LiteralPath $run.log -SimpleMatch 'reader reads=' | Select-Object -Last 1
+        if ($reader) { Write-Host "large cat $($reader.Line.Trim())" }
         if ($doneAt -gt $changed) { $changed = $doneAt }
         $seconds = ($changed - $started).TotalSeconds.ToString('0.00', $inv)
         if ($changed -le $started) { throw 'large cat: no frame after the first output' }
