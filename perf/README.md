@@ -84,6 +84,10 @@ Same `bayan.exe` as the startup step (`cargo build --locked --release
 | `idle_memory private` | `Get-Process` `PrivateMemorySize64` of the Bayan process, one quiet `cmd /d /q` tab, 5 s after the prompt settles. Working set is printed and not gated. cmd and ConPTY are not included. | Lower is better. Median of three hosted runs. 10% when the spread is narrow; wider when it is not, and the spread is recorded here. |
 | `idle_redraw visible` | blink off (`cursor_blink: false`), one quiet tab, 5 s. | presents and redraws must both be 0. |
 | `idle_redraw minimized` | `BAYAN_IDLE_BUSY=1` keeps a background tab busy; the script calls `ShowWindow(SW_MINIMIZE)`. | **Report-only.** `MINIMIZED_REDRAW_REQUIRED` in `scripts/perf_gate.py` is the one-line switch. A missing or malformed line still fails. Non-zero counts do not, until that flag is true. The 600 ms busy-dot pulse and wakeup/title/bell redraws while minimized are stopped by a separate change; this probe is ready for that change. |
+| `idle_redraw tabs10` | `BAYAN_TABS=10`: ten `cmd /d /q` tabs, the first active. Same 5 s window once the counters settle. | presents and redraws must both be 0. Required. |
+| `tabs_memory private 10 tabs` | private MB of that ten-tab window after the 5 s. | Lower is better, 10%. |
+| `cat_time 16 MB seconds` | `cmd /d /k type` of a 16,000,000-byte ASCII file (200k lines). From `first pty output` to the last change in the frame counters, once they hold still for 3 s. Scrollbar autohide is off so its delayed hide frame is not counted. Conhost is in the path. | Lower is better. 100%, a backstop like startup. |
+| `cat_memory 16 MB peak private` | peak private MB during that cat, sampled every 100 ms. | Lower is better, 10%. |
 
 `BAYAN_FRAME_COUNTERS=1` (with `BAYAN_PROFILE`) writes
 `%TEMP%\bayan_frame_counters.txt` as `redraws=N presents=M` on each
@@ -122,6 +126,21 @@ Three complete `windows-latest` runs of the same probe code (runs
   while a background tab is busy, and that redraw wakes the loop again,
   minimized or not. The confirmation run read 846 redraws in the same
   window.
+
+### Ten tabs and a large cat
+
+The cat does not wait for the shell to exit. On inbox ConPTY a child's
+exit leaves conhost running and the output pipe open, so the reader never
+sees EOF and the pane stays (the same on e63bb89, before this probe). The
+end is read from the frame counters instead.
+
+First figures, the author's machine, 2026-11-15, release + dev-hooks,
+rustc 1.100: one quiet tab 393.6 MB private; ten tabs 420.2 MB (+27 MB
+for nine more tabs), 0/0 redraws; cat 5.08 s, peak private 708.1 MB.
+That peak is about 314 MB over the quiet tab while the default scrollback
+is 10,000 lines (+33 MB in the scrollback probe), so most of it is not
+the history. The baseline values are these local figures until the first
+hosted run replaces them.
 
 Scripts: `scripts/measure-tap-latency.ps1`, `scripts/measure-idle.ps1`.
 `scripts/measure-latency.ps1` stays the local SendInput tool.

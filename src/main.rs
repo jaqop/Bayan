@@ -4229,16 +4229,22 @@ impl App {
     /// The command matches `-- argv` when that is how this process started,
     /// so the probe's `cmd /d /q` is the busy tab too.
     fn arm_idle_busy(&mut self) {
+        self.spawn_start_like_tab();
+        if self.tabs.len() >= 2 {
+            self.switch_tab(0);
+        }
+        self.idle_busy = true;
+    }
+
+    /// A tab running this process's `-- argv` when it started with one, else
+    /// the configured shell. The probes' extra tabs are `cmd /d /q` too.
+    fn spawn_start_like_tab(&mut self) {
         if let Some(argv) = self.start_command.clone() {
             let command = argv.join(" ");
             self.spawn_tab_command(None, &command, Some(&argv));
         } else {
             self.spawn_tab(None);
         }
-        if self.tabs.len() >= 2 {
-            self.switch_tab(0);
-        }
-        self.idle_busy = true;
     }
 
     /// Keep the background tab inside `Tab::busy`'s 2s window and push a
@@ -5283,6 +5289,19 @@ impl App {
         // producing output, so the minimized-redraw probe has a busy tab.
         if dev_hook("BAYAN_IDLE_BUSY").is_some() {
             self.arm_idle_busy();
+        }
+        // BAYAN_TABS=<n>: n tabs in all, for the many-tabs memory probe.
+        // The first tab stays active so the others are background tabs.
+        if let Some(v) = dev_hook("BAYAN_TABS") {
+            match v.to_str().and_then(|s| s.parse::<usize>().ok()) {
+                Some(n) if n >= 1 => {
+                    for _ in self.tabs.len()..n.min(32) {
+                        self.spawn_start_like_tab();
+                    }
+                    self.switch_tab(0);
+                }
+                _ => eprintln!("bayan: BAYAN_TABS ignored (want a positive count)"),
+            }
         }
         crate::prof::mark("session spawned");
         // the window exists now; if it is already focused and a pane has
