@@ -308,6 +308,15 @@ function Invoke-LargeCat {
         $started = [DateTime]::UtcNow
         $base = (Get-Process -Id $proc.Id).PrivateMemorySize64
         $peak = $base
+        # CPU seconds per process over the cat, against wall time x cores: does
+        # WARP (inside Bayan) leave conhost short of CPU, or is the frame blocked?
+        $cpu0 = @{}
+        $kids = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($proc.Id)" | Where-Object { $_.Name -in 'conhost.exe', 'OpenConsole.exe', 'cmd.exe' })
+        foreach ($p in @($proc.Id) + @($kids | ForEach-Object ProcessId)) {
+            $gp = Get-Process -Id $p -ErrorAction SilentlyContinue
+            if ($gp) { $cpu0[$p] = $gp.TotalProcessorTime.TotalSeconds }
+        }
+        $cpuLast = @{} + $cpu0
         $last = $null
         $changed = $started
         $doneAt = $null
@@ -319,6 +328,10 @@ function Invoke-LargeCat {
                 throw "Bayan exited during the cat: $($proc.ExitCode)"
             }
             $peak = [Math]::Max($peak, (Get-Process -Id $proc.Id).PrivateMemorySize64)
+            foreach ($p in @($cpu0.Keys)) {
+                $gp = Get-Process -Id $p -ErrorAction SilentlyContinue
+                if ($gp) { $cpuLast[$p] = $gp.TotalProcessorTime.TotalSeconds }
+            }
             $now = Read-Counters $run.counters
             if ($null -eq $last -or $now.redraws -ne $last.redraws -or $now.presents -ne $last.presents) {
                 $last = $now
@@ -342,6 +355,12 @@ function Invoke-LargeCat {
         if ($reader) { Write-Host "large cat $($reader.Line.Trim())" }
         $ui = Select-String -LiteralPath $run.log -SimpleMatch ' ui redraws=' | Select-Object -Last 1
         if ($ui) { Write-Host "large cat $($ui.Line.Trim())" }
+        $wall = ($doneAt - $started).TotalSeconds
+        $cpuParts = foreach ($p in $cpu0.Keys) {
+            $name = if ($p -eq $proc.Id) { 'bayan' } else { ($kids | Where-Object ProcessId -eq $p).Name -replace '\.exe$', '' }
+            '{0}={1}' -f $name, ($cpuLast[$p] - $cpu0[$p]).ToString('0.0', $inv)
+        }
+        Write-Host "large cat cpu_s: $($cpuParts -join ' ') wall_s=$($wall.ToString('0.0', $inv)) cores=$([Environment]::ProcessorCount)"
         if ($doneAt -gt $changed) { $changed = $doneAt }
         $seconds = ($changed - $started).TotalSeconds.ToString('0.00', $inv)
         if ($changed -le $started) { throw 'large cat: no frame after the first output' }
