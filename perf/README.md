@@ -139,8 +139,16 @@ rustc 1.100: one quiet tab 393.6 MB private; ten tabs 420.2 MB (+27 MB
 for nine more tabs), 0/0 redraws; cat 5.08 s, peak private 708.1 MB.
 That peak is about 314 MB over the quiet tab while the default scrollback
 is 10,000 lines (+33 MB in the scrollback probe), so most of it is not
-the history. The baseline values are these local figures until the first
-hosted run replaces them.
+the history.
+
+First hosted run (43694739816 on b7dceeb, 2026-11-15): one quiet tab
+291.2 MB, ten tabs 313.8 MB (+22.6 MB), 0/0 redraws. `tabs_memory` is
+that figure; one run, not yet the median of three. The same run's cat
+read 0.46 s with a peak of 291.2 MB, the quiet tab's figure exactly: the
+file's output never reached the scrollback, so that line is not a
+measurement and `cat_time` / `cat_memory` stay on the local figures. The
+probe now fails when private memory rises less than 16 MB during the
+cat. The minimized window read 0 presents and 0 redraws on that run.
 
 Scripts: `scripts/measure-tap-latency.ps1`, `scripts/measure-idle.ps1`.
 `scripts/measure-latency.ps1` stays the local SendInput tool.

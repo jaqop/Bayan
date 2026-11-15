@@ -296,7 +296,8 @@ function Invoke-LargeCat {
         $deadline = [DateTime]::UtcNow.AddSeconds(180)
         Wait-Mark $proc $run.log $run.stderr ' ms  first pty output' $deadline
         $started = [DateTime]::UtcNow
-        $peak = 0L
+        $base = (Get-Process -Id $proc.Id).PrivateMemorySize64
+        $peak = $base
         $last = $null
         $changed = $started
         while ($true) {
@@ -315,6 +316,8 @@ function Invoke-LargeCat {
         }
         $seconds = ($changed - $started).TotalSeconds.ToString('0.00', $inv)
         if ($changed -le $started) { throw 'large cat: no frame after the first output' }
+        # The 10k-line scrollback alone is ~33 MB; less growth means the file never reached the grid.
+        if (($peak - $base) -lt 16MB) { throw "large cat: private memory rose only $(Format-Mb ($peak - $base)) MB; the file's output did not arrive" }
         $peakMb = Format-Mb $peak
         Write-Host "large cat ${mb} MB seconds=$seconds peak_private=$peakMb"
         "PROBE cat mb=$mb seconds=$seconds peak_private=$peakMb MB" | Tee-Object -FilePath $output -Append

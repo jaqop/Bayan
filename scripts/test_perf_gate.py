@@ -28,7 +28,7 @@ PROBE latency render p50=100.0 p95=130.0 n=50
 PROBE idle_memory private=291.3 MB working_set=125.0 MB
 PROBE idle_redraw visible presents=0 redraws=0 window_s=5
 PROBE idle_redraw minimized presents=0 redraws=0 window_s=5
-PROBE tabs_memory tabs=10 private=420.2 MB working_set=227.8 MB
+PROBE tabs_memory tabs=10 private=313.8 MB working_set=128.6 MB
 PROBE idle_redraw tabs10 presents=0 redraws=0 window_s=5
 PROBE cat mb=16 seconds=5.08 peak_private=708.1 MB
 """
@@ -157,7 +157,7 @@ class Gate(unittest.TestCase):
 
     def test_ten_tabs_and_cat_parse(self):
         got = perf_gate.parse(PROBES)
-        self.assertEqual(got["tabs_memory"], {"private 10 tabs": 420.2})
+        self.assertEqual(got["tabs_memory"], {"private 10 tabs": 313.8})
         self.assertEqual(got["idle_redraw"]["tabs10 redraws"], 0.0)
         self.assertEqual(got["cat_time"], {"16 MB seconds": 5.08})
         self.assertEqual(got["cat_memory"], {"16 MB peak private": 708.1})
