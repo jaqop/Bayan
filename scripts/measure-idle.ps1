@@ -317,7 +317,13 @@ function Invoke-LargeCat {
         $seconds = ($changed - $started).TotalSeconds.ToString('0.00', $inv)
         if ($changed -le $started) { throw 'large cat: no frame after the first output' }
         # The 10k-line scrollback alone is ~33 MB; less growth means the file never reached the grid.
-        if (($peak - $base) -lt 16MB) { throw "large cat: private memory rose only $(Format-Mb ($peak - $base)) MB; the file's output did not arrive" }
+        if (($peak - $base) -lt 16MB) {
+            # Evidence for the log: the same type outside Bayan, Bayan's stderr, and its marks.
+            $direct = (& cmd.exe /d /c type "$file" | Measure-Object -Line).Lines
+            $err = if (Test-Path -LiteralPath $run.stderr) { Get-Content -LiteralPath $run.stderr -Raw } else { '' }
+            $marks = if (Test-Path -LiteralPath $run.log) { (Get-Content -LiteralPath $run.log -Tail 20) -join ' | ' } else { '' }
+            throw "large cat: private memory rose only $(Format-Mb ($peak - $base)) MB; the file's output did not arrive. file=$file; cmd type outside Bayan: $direct lines; stderr: $err; marks: $marks"
+        }
         $peakMb = Format-Mb $peak
         Write-Host "large cat ${mb} MB seconds=$seconds peak_private=$peakMb"
         "PROBE cat mb=$mb seconds=$seconds peak_private=$peakMb MB" | Tee-Object -FilePath $output -Append
