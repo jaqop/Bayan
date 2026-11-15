@@ -296,9 +296,13 @@ function Invoke-LargeCat {
     if ($direct -ne 200000) { throw "large cat: cmd type outside Bayan read $direct lines" }
     $proc = $null
     try {
-        # cmd /c exits when type is done; the pane stays (inbox ConPTY keeps the pipe open).
-        # Frames can pause for seconds mid-flood, so quiet counters alone do not mean done.
-        $proc = Start-Process -FilePath $exe -ArgumentList @('--', 'cmd.exe', '/d', '/c', 'type', ('"' + $file + '"')) -PassThru -WindowStyle Normal -RedirectStandardError $run.stderr
+        # An elevated Bayan drops a `--` command (the hosted runner's token is elevated),
+        # so open the cmd profile and type the command; `exit` ends cmd when type is done.
+        # The pane stays (inbox ConPTY keeps the pipe open), and frames can pause for
+        # seconds mid-flood, so quiet counters alone do not mean done.
+        $env:BAYAN_TYPE = 'type "' + $file + '" & exit' + "`r"
+        $proc = Start-Process -FilePath $exe -ArgumentList @('-p', '"Command Prompt"') -PassThru -WindowStyle Normal -RedirectStandardError $run.stderr
+        Remove-Item Env:BAYAN_TYPE
         $deadline = [DateTime]::UtcNow.AddSeconds(180)
         Wait-Mark $proc $run.log $run.stderr ' ms  first pty output' $deadline
         $started = [DateTime]::UtcNow
