@@ -340,6 +340,8 @@ function Invoke-LargeCat {
         # The reader's running totals: blocked in read, waiting for the term lock, holding it.
         $reader = Select-String -LiteralPath $run.log -SimpleMatch 'reader reads=' | Select-Object -Last 1
         if ($reader) { Write-Host "large cat $($reader.Line.Trim())" }
+        $ui = Select-String -LiteralPath $run.log -SimpleMatch ' ui redraws=' | Select-Object -Last 1
+        if ($ui) { Write-Host "large cat $($ui.Line.Trim())" }
         if ($doneAt -gt $changed) { $changed = $doneAt }
         $seconds = ($changed - $started).TotalSeconds.ToString('0.00', $inv)
         if ($changed -le $started) { throw 'large cat: no frame after the first output' }

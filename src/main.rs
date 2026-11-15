@@ -707,6 +707,40 @@ mod prof {
         }
     }
 
+    /// Times a stretch of the UI thread while profiling: `redraw()` as a
+    /// whole (0) and `gpu.render` inside it (1). Summed and marked about
+    /// once a second beside the reader's tally.
+    pub struct Span(Option<(usize, Instant)>);
+
+    pub fn span(kind: usize) -> Span {
+        Span(on().then(|| (kind, Instant::now())))
+    }
+
+    impl Drop for Span {
+        fn drop(&mut self) {
+            let Some((kind, at)) = self.0 else { return };
+            static TALLY: std::sync::Mutex<(Option<Instant>, [(u64, Duration); 2])> =
+                std::sync::Mutex::new((None, [(0, Duration::ZERO); 2]));
+            let mut t = TALLY
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let since = *t.0.get_or_insert_with(Instant::now);
+            t.1[kind].0 += 1;
+            t.1[kind].1 += at.elapsed();
+            if kind == 0 && since.elapsed() >= Duration::from_secs(1) {
+                let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+                mark(&format!(
+                    "ui redraws={} redraw_ms={:.0} renders={} render_ms={:.0}",
+                    t.1[0].0,
+                    ms(t.1[0].1),
+                    t.1[1].0,
+                    ms(t.1[1].1)
+                ));
+                t.0 = Some(Instant::now());
+            }
+        }
+    }
+
     /// A frame went to the GPU.
     pub fn frame_presented() {
         if !on() {
@@ -7407,6 +7441,7 @@ impl App {
     /// front of that count.
     fn redraw(&mut self) {
         crate::prof::note_redraw();
+        let _span = crate::prof::span(0);
         // Before a client, this is a flag check. After one, an unchanged
         // stamp does not walk the grid; a flood builds at about 10 Hz.
         self.publish_reader();
@@ -7958,7 +7993,11 @@ impl App {
                 verts: &sprite.verts,
             })
             .collect();
-        if !gpu.render(&verts, &quads, bg) {
+        let rendered = {
+            let _span = crate::prof::span(1);
+            gpu.render(&verts, &quads, bg)
+        };
+        if !rendered {
             // Retry once after reconfiguring, without spinning on occlusion.
             // `request_redraw` no-ops while the window is not showing, so a
             // surface that comes back occluded does not schedule another entry.
