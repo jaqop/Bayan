@@ -162,9 +162,16 @@ peak private 428.6 to 431.4 MB; as the typed cmd profile: 8.51, 7.17,
 
 First hosted run (43694739816 on b7dceeb): one quiet tab 291.2 MB, ten
 tabs 313.8 MB (+22.6 MB), 0/0 redraws; two later runs read 314.2 and
-313.9. `tabs_memory` is 313.8. `cat_time` / `cat_memory` stay on
-provisional figures until a hosted run of the reworked cat. The
-minimized window read 0 presents and 0 redraws on those runs.
+313.9. `tabs_memory` is 313.8. The minimized window read 0 presents
+and 0 redraws on those runs.
+
+The typed cmd-profile cat, first hosted run (43714995789 on e87874a):
+64.11 s, peak private 597.5 MB. Those are `cat_time` and `cat_memory`;
+one run, not yet the median of three. 64 s is about eight times the
+author's machine (7.17 to 8.96 s) on the same code. The runner draws on
+WARP, and the reader takes the same terminal lock the frame is drawn
+under, so a slow software frame may be holding the reader back. That is
+a lead, not a measurement.
 
 Scripts: `scripts/measure-tap-latency.ps1`, `scripts/measure-idle.ps1`.
 `scripts/measure-latency.ps1` stays the local SendInput tool.

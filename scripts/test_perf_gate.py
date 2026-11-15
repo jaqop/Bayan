@@ -30,7 +30,7 @@ PROBE idle_redraw visible presents=0 redraws=0 window_s=5
 PROBE idle_redraw minimized presents=0 redraws=0 window_s=5
 PROBE tabs_memory tabs=10 private=313.8 MB working_set=128.6 MB
 PROBE idle_redraw tabs10 presents=0 redraws=0 window_s=5
-PROBE cat mb=16 seconds=5.08 peak_private=708.1 MB
+PROBE cat mb=16 seconds=64.11 peak_private=597.5 MB
 """
 
 STARTUP = """
@@ -159,8 +159,8 @@ class Gate(unittest.TestCase):
         got = perf_gate.parse(PROBES)
         self.assertEqual(got["tabs_memory"], {"private 10 tabs": 313.8})
         self.assertEqual(got["idle_redraw"]["tabs10 redraws"], 0.0)
-        self.assertEqual(got["cat_time"], {"16 MB seconds": 5.08})
-        self.assertEqual(got["cat_memory"], {"16 MB peak private": 708.1})
+        self.assertEqual(got["cat_time"], {"16 MB seconds": 64.11})
+        self.assertEqual(got["cat_memory"], {"16 MB peak private": 597.5})
 
     def test_ten_tab_redraw_is_required_not_report_only(self):
         base = {"idle_redraw": {"tabs10 presents": 0, "tabs10 redraws": 0}}
