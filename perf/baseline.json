@@ -5,7 +5,8 @@
     "startup_ratio": 0.15,
     "latency": 1.0,
     "idle_memory": 0.1,
-    "idle_redraw": 0.0
+    "idle_redraw": 0.0,
+    "cat_time": 1.0
   },
   "throughput": {
     "ascii": 78,
@@ -33,6 +34,17 @@
     "visible presents": 0,
     "visible redraws": 0,
     "minimized presents": 0,
-    "minimized redraws": 0
+    "minimized redraws": 0,
+    "tabs10 presents": 0,
+    "tabs10 redraws": 0
+  },
+  "tabs_memory": {
+    "private 10 tabs": 313.8
+  },
+  "cat_time": {
+    "16 MB seconds": 64.11
+  },
+  "cat_memory": {
+    "16 MB peak private": 597.5
   }
 }

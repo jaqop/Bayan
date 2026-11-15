@@ -84,7 +84,9 @@ Measure before optimizing, in release builds:
   same binary. Private bytes after a quiet tab, then two 5 s windows
   (`BAYAN_FRAME_COUNTERS` writes `%TEMP%\bayan_frame_counters.txt`).
   The minimized window is report-only until `MINIMIZED_REDRAW_REQUIRED`
-  in `scripts/perf_gate.py` is flipped.
+  in `scripts/perf_gate.py` is flipped. The same script opens ten quiet
+  tabs (`BAYAN_TABS=10`: private memory, zero redraws) and runs `type` on
+  a 16 MB file (seconds to the last frame, peak private memory).
 
 CI gates these on every pull request (the `perf` job).
 `scripts/perf_gate.py` compares the probes' `PROBE` lines with
@@ -391,6 +393,7 @@ key identity or typed text:
 | `BAYAN_TYPE=<text>` | feed text into the first pane's PTY — the hook for ligature and shaping checks. Not the latency probe: it skips `key_sent` |
 | `BAYAN_TAP=<n>` | after the prompt is quiet, call `type_key` `n` times (`a`, then Backspace, 150 ms apart). CI key->frame path. Capped at 200 |
 | `BAYAN_IDLE_BUSY=1` | open a second tab, leave it in the background, and keep pumping output so the minimized redraw probe has a busy tab |
+| `BAYAN_TABS=<n>` | open tabs until there are `n` (capped at 32), each running this start's `-- argv` when there is one, then switch back to the first. The many-tabs memory probe |
 | `BAYAN_FRAME_COUNTERS=1` | with `BAYAN_PROFILE`, atomically replace `%TEMP%\bayan_frame_counters.txt` (`redraws=N presents=M`) on each redraw entry and successful present. The latency probe leaves this unset |
 | `BAYAN_PASTE=<text>` | once the renderer is ready, put text on the clipboard and right-click the focused pane's centre through the real right-click path (`right_click_owner` → `mouse::right_click`) — right-click paste without injecting mouse input. Overwrites the clipboard |
 | `BAYAN_PALETTE=<query\|1>` | open the command palette at startup, pre-filtered by the query (`1` opens it empty) |

@@ -29,6 +29,9 @@ $WindowSeconds = 5
 $exe = (Resolve-Path -LiteralPath $BinaryPath).Path
 $output = [IO.Path]::GetFullPath($OutputPath)
 if (Test-Path -LiteralPath $output) { throw 'Use a fresh idle log path' }
+# Read once: each run points TEMP at its own folder, so a later
+# GetTempPath() would nest every run inside the one before it.
+$baseTemp = [IO.Path]::GetTempPath()
 
 Add-Type -TypeDefinition @'
 using System;
@@ -97,14 +100,14 @@ function Stop-Owned($proc) {
 $names = @(
     'USERPROFILE', 'HOME', 'TEMP', 'TMP',
     'BAYAN_PROFILE', 'BAYAN_SHOW_NOW', 'BAYAN_FRAME_COUNTERS',
-    'BAYAN_IDLE_BUSY', 'BAYAN_TAP', 'BAYAN_TYPE'
+    'BAYAN_IDLE_BUSY', 'BAYAN_TAP', 'BAYAN_TYPE', 'BAYAN_TABS'
 )
 $saved = @{}
 foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
 $failed = $false
 
 function Invoke-QuietWindow {
-    $root = Join-Path ([IO.Path]::GetTempPath()) ('bayan-idle-' + [Guid]::NewGuid().ToString('N'))
+    $root = Join-Path $baseTemp ('bayan-idle-' + [Guid]::NewGuid().ToString('N'))
     $runHome = Join-Path $root 'home'
     $temp = Join-Path $root 'temp'
     New-Item -ItemType Directory -Path $runHome, (Join-Path $runHome '.bayan'), $temp -Force | Out-Null
@@ -150,7 +153,7 @@ function Invoke-QuietWindow {
 }
 
 function Invoke-MinimizedWindow {
-    $root = Join-Path ([IO.Path]::GetTempPath()) ('bayan-idle-min-' + [Guid]::NewGuid().ToString('N'))
+    $root = Join-Path $baseTemp ('bayan-idle-min-' + [Guid]::NewGuid().ToString('N'))
     $runHome = Join-Path $root 'home'
     $temp = Join-Path $root 'temp'
     New-Item -ItemType Directory -Path $runHome, (Join-Path $runHome '.bayan'), $temp -Force | Out-Null
@@ -209,11 +212,194 @@ function Invoke-MinimizedWindow {
     }
 }
 
+# A fresh home (cursor blink off), temp directory and profile log for one
+# owned process. Returns the paths; the caller sets its own extra hooks.
+function New-ProbeRun([string]$prefix, [string]$config = '{"cursor_blink":false}') {
+    $root = Join-Path $baseTemp ($prefix + [Guid]::NewGuid().ToString('N'))
+    $runHome = Join-Path $root 'home'
+    $temp = Join-Path $root 'temp'
+    New-Item -ItemType Directory -Path $runHome, (Join-Path $runHome '.bayan'), $temp -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $runHome '.bayan\config.json'), $config)
+    $env:USERPROFILE = $runHome
+    $env:HOME = $runHome
+    $env:TEMP = $temp
+    $env:TMP = $temp
+    $env:BAYAN_PROFILE = '1'
+    $env:BAYAN_SHOW_NOW = '1'
+    $env:BAYAN_FRAME_COUNTERS = '1'
+    foreach ($name in 'BAYAN_IDLE_BUSY', 'BAYAN_TAP', 'BAYAN_TYPE', 'BAYAN_TABS') {
+        Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+    }
+    return @{
+        root = $root
+        temp = $temp
+        log = Join-Path $temp 'bayan_profile.log'
+        counters = Join-Path $temp 'bayan_frame_counters.txt'
+        stderr = Join-Path $root 'stderr.txt'
+    }
+}
+
+# Ten `cmd /d /q` tabs, the first active and nine in the background. Once
+# the frame counters settle: private memory, and redraws over 5s.
+function Invoke-TenTabs {
+    $run = New-ProbeRun 'bayan-idle-tabs-'
+    $env:BAYAN_TABS = '10'
+    $proc = $null
+    try {
+        $proc = Start-Process -FilePath $exe -ArgumentList @('--', 'cmd.exe', '/d', '/q') -PassThru -WindowStyle Normal -RedirectStandardError $run.stderr
+        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+        Wait-Mark $proc $run.log $run.stderr ' ms  renderer ready' $deadline
+        Wait-Mark $proc $run.log $run.stderr ' ms  first pty output' $deadline
+        $start = Wait-Stable $proc $run.counters $deadline
+        Start-Sleep -Seconds $WindowSeconds
+        $proc.Refresh()
+        if ($proc.HasExited) { throw "Bayan exited during the ten-tab window: $($proc.ExitCode)" }
+        $end = Read-Counters $run.counters
+        $mem = Get-Process -Id $proc.Id
+        $private = Format-Mb $mem.PrivateMemorySize64
+        $working = Format-Mb $mem.WorkingSet64
+        $presents = $end.presents - $start.presents
+        $redraws = $end.redraws - $start.redraws
+        if ($presents -lt 0 -or $redraws -lt 0) { throw 'frame counters went backwards' }
+        Write-Host "ten tabs private=$private working_set=$working presents=$presents redraws=$redraws"
+        @(
+            "PROBE tabs_memory tabs=10 private=$private MB working_set=$working MB"
+            "PROBE idle_redraw tabs10 presents=$presents redraws=$redraws window_s=$WindowSeconds"
+        ) | Tee-Object -FilePath $output -Append
+    } finally {
+        Stop-Owned $proc
+    }
+}
+
+# `type` of a 16 MB ASCII file through the real ConPTY path, in `cmd /k`.
+# A shell's exit does not close the pane on inbox ConPTY (conhost keeps the
+# pipe open), so the end is the last frame: the time from `first pty output`
+# to the last change in the frame counters, once they have held still for
+# 3s. Scrollbar autohide is off so its delayed hide frame is not counted.
+# Private bytes are sampled every 100 ms and the peak is gated. Conhost is in
+# the middle, so this is end to end, not Bayan alone (the reader throughput
+# probe is that).
+function Invoke-LargeCat {
+    $run = New-ProbeRun 'bayan-idle-cat-' '{"cursor_blink":false,"scrollbar":{"autohide":false}}'
+    $file = Join-Path $run.temp 'cat-16mb.txt'
+    $writer = [IO.StreamWriter]::new($file, $false, [Text.UTF8Encoding]::new($false))
+    try {
+        $filler = 'the quick brown fox jumps over the lazy dog 0123456789 abcdefghijklmnop'
+        for ($i = 0; $i -lt 200000; $i++) { $writer.Write($i.ToString('000000', $inv)); $writer.Write(' '); $writer.WriteLine($filler) }
+    } finally {
+        $writer.Dispose()
+    }
+    $mb = [Math]::Round((Get-Item -LiteralPath $file).Length / 1e6)
+    # Read it once first: an on-access scan of a fresh 16 MB file can hold the first
+    # open for seconds, and the settle loop would end before any output.
+    $direct = (& cmd.exe /d /c type "$file" | Measure-Object -Line).Lines
+    if ($direct -ne 200000) { throw "large cat: cmd type outside Bayan read $direct lines" }
+    $proc = $null
+    try {
+        # An elevated Bayan drops a `--` command (the hosted runner's token is elevated),
+        # so open the cmd profile and type the command; `exit` ends cmd when type is done.
+        # The pane stays (inbox ConPTY keeps the pipe open), and frames can pause for
+        # seconds mid-flood, so quiet counters alone do not mean done.
+        $env:BAYAN_TYPE = 'type "' + $file + '" & exit' + "`r"
+        $proc = Start-Process -FilePath $exe -ArgumentList @('-p', '"Command Prompt"') -PassThru -WindowStyle Normal -RedirectStandardError $run.stderr
+        Remove-Item Env:BAYAN_TYPE
+        $deadline = [DateTime]::UtcNow.AddSeconds(180)
+        Wait-Mark $proc $run.log $run.stderr ' ms  first pty output' $deadline
+        $started = [DateTime]::UtcNow
+        $base = (Get-Process -Id $proc.Id).PrivateMemorySize64
+        $peak = $base
+        # CPU seconds per process over the cat, against wall time x cores: does
+        # WARP (inside Bayan) leave conhost short of CPU, or is the frame blocked?
+        $cpu0 = @{}
+        $kids = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($proc.Id)" | Where-Object { $_.Name -in 'conhost.exe', 'OpenConsole.exe', 'cmd.exe' })
+        foreach ($p in @($proc.Id) + @($kids | ForEach-Object ProcessId)) {
+            $gp = Get-Process -Id $p -ErrorAction SilentlyContinue
+            if ($gp) { $cpu0[$p] = $gp.TotalProcessorTime.TotalSeconds }
+        }
+        $cpuLast = @{} + $cpu0
+        $last = $null
+        $changed = $started
+        $doneAt = $null
+        while ($true) {
+            if ([DateTime]::UtcNow -ge $deadline) { throw 'large cat did not settle within 180s' }
+            $proc.Refresh()
+            if ($proc.HasExited) {
+                if ($doneAt) { break }
+                throw "Bayan exited during the cat: $($proc.ExitCode)"
+            }
+            $peak = [Math]::Max($peak, (Get-Process -Id $proc.Id).PrivateMemorySize64)
+            foreach ($p in @($cpu0.Keys)) {
+                $gp = Get-Process -Id $p -ErrorAction SilentlyContinue
+                if ($gp) { $cpuLast[$p] = $gp.TotalProcessorTime.TotalSeconds }
+            }
+            $now = Read-Counters $run.counters
+            if ($null -eq $last -or $now.redraws -ne $last.redraws -or $now.presents -ne $last.presents) {
+                $last = $now
+                $changed = [DateTime]::UtcNow
+            }
+            if (-not $doneAt) {
+                $cmd = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($proc.Id) AND Name='cmd.exe'")
+                if ($cmd.Count -eq 0) { $doneAt = [DateTime]::UtcNow }
+            } elseif (([DateTime]::UtcNow - $changed).TotalSeconds -ge 2 -and ([DateTime]::UtcNow - $doneAt).TotalSeconds -ge 2) {
+                break
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        # Which end came last: cmd's exit (the reader) or the last frame (the UI).
+        $cmdS = ($doneAt - $started).TotalSeconds.ToString('0.00', $inv)
+        $frameS = ($changed - $started).TotalSeconds.ToString('0.00', $inv)
+        $a11y = [bool](Select-String -LiteralPath $run.log -SimpleMatch 'accessibility client' -Quiet)
+        Write-Host "large cat split: cmd_exit_s=$cmdS last_frame_s=$frameS frames=$($last.redraws)/$($last.presents) base_private=$(Format-Mb $base) a11y_client=$a11y"
+        # The reader's running totals: blocked in read, waiting for the term lock, holding it.
+        $reader = Select-String -LiteralPath $run.log -SimpleMatch 'reader reads=' | Select-Object -Last 1
+        if ($reader) { Write-Host "large cat $($reader.Line.Trim())" }
+        $ui = Select-String -LiteralPath $run.log -SimpleMatch ' ui redraws=' | Select-Object -Last 1
+        if ($ui) { Write-Host "large cat $($ui.Line.Trim())" }
+        $wall = ($doneAt - $started).TotalSeconds
+        $cpuParts = foreach ($p in $cpu0.Keys) {
+            $name = if ($p -eq $proc.Id) { 'bayan' } else { ($kids | Where-Object ProcessId -eq $p).Name -replace '\.exe$', '' }
+            '{0}={1}' -f $name, ($cpuLast[$p] - $cpu0[$p]).ToString('0.0', $inv)
+        }
+        Write-Host "large cat cpu_s: $($cpuParts -join ' ') wall_s=$($wall.ToString('0.0', $inv)) cores=$([Environment]::ProcessorCount)"
+        if ($doneAt -gt $changed) { $changed = $doneAt }
+        $seconds = ($changed - $started).TotalSeconds.ToString('0.00', $inv)
+        if ($changed -le $started) { throw 'large cat: no frame after the first output' }
+        # The 10k-line scrollback alone is ~33 MB; less growth means the file never reached the grid.
+        if (($peak - $base) -lt 16MB) {
+            # Evidence for the log: the same type outside Bayan, Bayan's stderr, and its marks.
+            # Late or stuck: watch 15 s more.
+            $late = $peak
+            for ($i = 0; $i -lt 150; $i++) { Start-Sleep -Milliseconds 100; $proc.Refresh(); if ($proc.HasExited) { break }; $late = [Math]::Max($late, (Get-Process -Id $proc.Id).PrivateMemorySize64) }
+            $responding = $proc.Responding
+            $err = if (Test-Path -LiteralPath $run.stderr) { Get-Content -LiteralPath $run.stderr -Raw } else { '' }
+            $marks = if (Test-Path -LiteralPath $run.log) { (Get-Content -LiteralPath $run.log -Tail 20) -join ' | ' } else { '' }
+            throw "large cat: private memory rose only $(Format-Mb ($peak - $base)) MB; the file's output did not arrive. 15 s later +$(Format-Mb ($late - $base)) MB; responding=$responding; frames=$($last.redraws)/$($last.presents); stderr: $err; marks: $marks"
+        }
+        $peakMb = Format-Mb $peak
+        Write-Host "large cat ${mb} MB seconds=$seconds peak_private=$peakMb"
+        "PROBE cat mb=$mb seconds=$seconds peak_private=$peakMb MB" | Tee-Object -FilePath $output -Append
+    } finally {
+        Stop-Owned $proc
+    }
+}
+
 try {
     try {
         Invoke-QuietWindow
     } catch {
         Write-Host "idle visible/memory failed: $_"
+        $failed = $true
+    }
+    try {
+        Invoke-TenTabs
+    } catch {
+        Write-Host "ten tabs failed: $_"
+        $failed = $true
+    }
+    try {
+        Invoke-LargeCat
+    } catch {
+        Write-Host "large cat failed: $_"
         $failed = $true
     }
     try {
