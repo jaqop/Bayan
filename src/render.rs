@@ -4325,9 +4325,11 @@ impl Renderer {
         dir: ParagraphDir,
         hover: Option<(usize, usize)>,
     ) -> Option<(i32, i32)> {
+        // A box's left border may come first (`│ > …`, `╰─❯`). Claude's own
+        // prompt row is left as it was: its logical-prompt mapping keys on it.
         let prompt_col = cells
             .iter()
-            .find(|c| c.c != ' ')
+            .find(|c| c.c != ' ' && (claude || !matches!(c.c, '\u{2500}'..='\u{257f}')))
             .filter(|c| matches!(c.c, '>' | '❯' | '›'))
             .map(|c| c.col);
         let logical_prompt = claude
@@ -4343,11 +4345,13 @@ impl Renderer {
         while i < cells.len() {
             if cells[i].c == ' ' && !(logical_prompt && i > 0 && cells[i - 1].c == '\u{a0}') {
                 self.draw_line_grid(out, clip, x0, y, &cells[i..i + 1], hover);
+                self.note_grid_geometry(x0, &cells[i..i + 1]);
                 i += 1;
                 continue;
             }
             if border(&cells[i]) {
                 self.draw_line_grid(out, clip, x0, y, &cells[i..i + 1], hover);
+                self.note_grid_geometry(x0, &cells[i..i + 1]);
                 i += 1;
                 continue;
             }
@@ -4406,9 +4410,27 @@ impl Renderer {
                 cursor = mapped.or(cursor);
             } else {
                 self.draw_line_grid(out, clip, x0, y, field, hover);
+                self.note_grid_geometry(x0, field);
             }
         }
         cursor
+    }
+
+    /// Cells a field row draws on the grid record their column boxes, the
+    /// way shaped fields do, so `hit_cell` answers a click on a border or a
+    /// Latin field instead of leaving it to whole-line shaping.
+    fn note_grid_geometry(&mut self, x0: i32, cells: &[CellInfo]) {
+        let Some((pane, row)) = self.mapping_context else {
+            return;
+        };
+        for ci in cells {
+            let left = x0 + (ci.col as f32 * self.cell_w).round() as i32;
+            let right = x0 + ((ci.col + ci.w) as f32 * self.cell_w).round() as i32;
+            self.cell_geometry
+                .entry((pane, row, ci.col))
+                .or_default()
+                .push((left, right - left, false));
+        }
     }
 
     /// One grid line, in the same cell order `display_iter` feeds a row.
@@ -9160,6 +9182,94 @@ mod tests {
         assert!(
             (expected - actual).abs() <= 1.0,
             "Arabic moved the border from {expected} to {actual}"
+        );
+    }
+
+    /// Grid-drawn cells of a field row (borders, box glyphs) answer
+    /// `hit_cell` with their own column, so a click there does not fall
+    /// back to whole-line shaping and land cells away.
+    #[test]
+    fn primary_screen_field_rows_click_on_their_grid_cells() {
+        use alacritty_terminal::{
+            event::VoidListener,
+            term::{Config, Term},
+            vte::ansi::Processor,
+        };
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 80, rows: 4 };
+        let rect = (0, 0, 1000, 120);
+        for (bytes, col) in [
+            ("\x1b[2;1H\x1b[31m├\x1b[0m── ملف.txt", 0),
+            ("\x1b[2;1H│ 1. Trust (سلام abc مرحبا)\x1b[2;41H\x1b[31m│", 40),
+        ] {
+            let mut t = Term::new(Config::default(), &size, VoidListener);
+            let mut processor: Processor = Processor::new();
+            processor.advance(&mut t, bytes.as_bytes());
+            let view = PaneView {
+                rect,
+                focused: false,
+                cursor: crate::config::CursorStyle::Block,
+                cursor_on: false,
+                bordered: false,
+                claude: false,
+                claude_from: None,
+                search_match: None,
+                marks: &[],
+                link_hover: None,
+                link_tip: None,
+                reorder: true,
+                line_dir: &[],
+                bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+                scroll_px: 0,
+                peek_dir: ParagraphDir::Default,
+            };
+            r.begin_frame();
+            let mut out = Vec::new();
+            r.draw_pane(&mut out, &view, &t);
+            let red = c4(r.ansi_rgb(AnsiColor::Named(NamedColor::Red)), 255);
+            let x = out
+                .iter()
+                .filter(|v| v.color == red)
+                .map(|v| v.pos[0])
+                .fold(f32::INFINITY, f32::min);
+            assert!(x.is_finite(), "{bytes:?}: no red glyph drawn");
+            assert_eq!(
+                r.hit_cell(rect, 1, x as f64 + 1.0).map(|h| h.0),
+                Some(col),
+                "{bytes:?}"
+            );
+        }
+    }
+
+    /// A prompt glyph after a box's left border (`│ > …`, Gemini's input)
+    /// stays on its column instead of joining the Arabic field.
+    #[test]
+    fn boxed_prompt_glyph_stays_on_its_column() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let marker = (250, 10, 10);
+        let mut cells = row_cells("│ > مرحبا      │", 0);
+        cells[2].fg = marker;
+        let mut out = Vec::new();
+        r.draw_line_tui(
+            &mut out,
+            (0, 0, 1000, 120),
+            100,
+            40,
+            &cells,
+            false,
+            None,
+            ParagraphDir::Rtl,
+            None,
+        );
+        let x = out
+            .iter()
+            .filter(|v| v.color == c4(marker, 255))
+            .map(|v| v.pos[0])
+            .fold(f32::INFINITY, f32::min);
+        let grid = 100.0 + 2.0 * r.cell_w;
+        assert!(
+            x.is_finite() && (x - grid).abs() < r.cell_w,
+            "prompt at {x}, its column starts at {grid}"
         );
     }
 

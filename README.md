@@ -973,9 +973,18 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       trade-off. Gemini CLI and Codex CLI 0.170 were also checked: both
       emit logical Arabic, so neither belongs in Claude mode. Proven by
       `primary_screen_box_rows_take_the_field_path`,
-      `primary_screen_box_border_stays_on_its_column` (border 425.9 → 415
-      before, equal after), `snapshot_and_paint_agree_on_the_tui_path`, and
-      a live capture of the same Gemini dialog.
+      `primary_screen_box_border_stays_on_its_column` (the border at 415
+      instead of 425.9 before the change, equal after),
+      `snapshot_and_paint_agree_on_the_tui_path`, and a live capture of the
+      same Gemini dialog. The review of that change found two more, now
+      fixed: a field row's grid cells (borders, spaces, Latin fields)
+      recorded no click geometry, so a click on `tree`'s `├` or a box's
+      closing `│` fell back to whole-line shaping and landed up to 8 columns
+      off (`primary_screen_field_rows_click_on_their_grid_cells`); and a
+      prompt glyph after a box's left border (`│ > …`) joined the Arabic
+      field and moved past the text in an RTL row
+      (`boxed_prompt_glyph_stays_on_its_column`). Claude mode's own prompt
+      row is unchanged.
 
 ## SSH tabs and the session multiplexer
 
