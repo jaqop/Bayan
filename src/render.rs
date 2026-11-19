@@ -1644,6 +1644,9 @@ fn line_wrapped_into<T: alacritty_terminal::event::EventListener>(
     term.grid()[prev][col].flags.contains(Flags::WRAPLINE)
 }
 
+/// Today's alternate-screen / Claude rule on its own; the tests compare
+/// [`tui_path`] against it.
+#[cfg(test)]
 fn is_tui_row(cells: &[CellInfo]) -> bool {
     tui_row(
         cells.len(),
@@ -1652,14 +1655,40 @@ fn is_tui_row(cells: &[CellInfo]) -> bool {
     )
 }
 
-/// The same test for a mouse snapshot. A click has to follow the path
-/// `draw_pane` took, or a right-aligned row and a TUI field disagree.
-pub(crate) fn snap_is_tui(cells: &[SnapCell]) -> bool {
-    tui_row(
+/// Whether a row with Arabic draws as TUI fields instead of one shaped
+/// line. The primary screen joins only on Box Drawing: inline TUIs (Gemini
+/// CLI, `tree`) draw boxes there, while Powerline glyphs (private use)
+/// build shell prompts that must stay one line.
+fn tui_path(claude: bool, alt: bool, cells: &[CellInfo]) -> bool {
+    tui_path_at(
         cells.len(),
         |i| (cells[i].col, cells[i].w, cells[i].c),
-        true,
+        claude,
+        alt,
     )
+}
+
+/// [`tui_path`] for a mouse snapshot, so a click follows the drawn path.
+pub(crate) fn snap_tui_path(claude: bool, alt: bool, cells: &[SnapCell]) -> bool {
+    tui_path_at(
+        cells.len(),
+        |i| (cells[i].col, cells[i].w, cells[i].c),
+        claude,
+        alt,
+    )
+}
+
+fn tui_path_at(
+    n: usize,
+    at: impl Fn(usize) -> (usize, usize, char),
+    claude: bool,
+    alt: bool,
+) -> bool {
+    if claude || alt {
+        tui_row(n, &at, true)
+    } else {
+        (0..n).any(|i| matches!(at(i).2, '\u{2500}'..='\u{257f}'))
+    }
 }
 
 fn tui_row(n: usize, at: impl Fn(usize) -> (usize, usize, char), prompt_start: bool) -> bool {
@@ -4589,9 +4618,11 @@ impl Renderer {
         dir: ParagraphDir,
         hover: Option<(usize, usize)>,
     ) -> Option<(i32, i32)> {
+        // A box's left border may come first (`│ > …`, `╰─❯`). Claude's own
+        // prompt row is left as it was: its logical-prompt mapping keys on it.
         let prompt_col = cells
             .iter()
-            .find(|c| c.c != ' ')
+            .find(|c| c.c != ' ' && (claude || !matches!(c.c, '\u{2500}'..='\u{257f}')))
             .filter(|c| matches!(c.c, '>' | '❯' | '›'))
             .map(|c| c.col);
         let logical_prompt = claude
@@ -4607,11 +4638,13 @@ impl Renderer {
         while i < cells.len() {
             if cells[i].c == ' ' && !(logical_prompt && i > 0 && cells[i - 1].c == '\u{a0}') {
                 self.draw_line_grid(out, clip, x0, y, &cells[i..i + 1], hover);
+                self.note_grid_geometry(x0, &cells[i..i + 1]);
                 i += 1;
                 continue;
             }
             if border(&cells[i]) {
                 self.draw_line_grid(out, clip, x0, y, &cells[i..i + 1], hover);
+                self.note_grid_geometry(x0, &cells[i..i + 1]);
                 i += 1;
                 continue;
             }
@@ -4670,9 +4703,27 @@ impl Renderer {
                 cursor = mapped.or(cursor);
             } else {
                 self.draw_line_grid(out, clip, x0, y, field, hover);
+                self.note_grid_geometry(x0, field);
             }
         }
         cursor
+    }
+
+    /// Cells a field row draws on the grid record their column boxes, the
+    /// way shaped fields do, so `hit_cell` answers a click on a border or a
+    /// Latin field instead of leaving it to whole-line shaping.
+    fn note_grid_geometry(&mut self, x0: i32, cells: &[CellInfo]) {
+        let Some((pane, row)) = self.mapping_context else {
+            return;
+        };
+        for ci in cells {
+            let left = x0 + (ci.col as f32 * self.cell_w).round() as i32;
+            let right = x0 + ((ci.col + ci.w) as f32 * self.cell_w).round() as i32;
+            self.cell_geometry
+                .entry((pane, row, ci.col))
+                .or_default()
+                .push((left, right - left, false));
+        }
     }
 
     /// One grid line, in the same cell order `display_iter` feeds a row.
@@ -4834,8 +4885,9 @@ impl Renderer {
             let col = if on_row { Some(ccol) } else { None };
             // Alternate-screen rows stay in their grid columns: a TUI
             // positioned the cells. The primary screen's prose aligns
-            // an RTL paragraph to the pane's right edge.
-            if (row_claude || alt) && is_tui_row(cells) {
+            // an RTL paragraph to the pane's right edge, but an inline
+            // TUI that draws boxes there takes the same field path.
+            if tui_path(row_claude, alt, cells) {
                 self.draw_line_tui(out, clip, px, y, cells, row_claude, col, dir, hover)
             } else {
                 self.whole_bidi_rows.insert((view.rect, key), wraps);
@@ -9437,6 +9489,211 @@ mod tests {
                 (expected - actual).abs() <= 1.0,
                 "Arabic moved the status from {expected} to {actual}, claude={claude}"
             );
+        }
+    }
+
+    /// On the primary screen only Box Drawing makes a row TUI fields:
+    /// prose gaps, Powerline prompts, and block-element bars stay one line.
+    #[test]
+    fn primary_screen_box_rows_take_the_field_path() {
+        let p = |t: &str| tui_path(false, false, &row_cells(t, 0));
+        assert!(p("│ 1. Trust folder (سلام abc مرحبا) │"));
+        assert!(p("╭── سلام"));
+        assert!(p("├── ملف.txt"));
+        assert!(p("───── مرحبا"));
+        assert!(!p("مرحبا بالعالم  هذا نثر"));
+        assert!(!p("مرحبا   STATUS"));
+        assert!(!p("\u{e0b0} C:\\سلام"));
+        assert!(!p("████ تحميل"));
+        for (claude, alt) in [(true, false), (false, true), (true, true)] {
+            for t in [
+                "│ مرحبا بالعالم │",
+                "مرحبا   STATUS",
+                "مرحبا بالعالم  هذا نثر",
+            ] {
+                let cells = row_cells(t, 0);
+                assert_eq!(
+                    tui_path(claude, alt, &cells),
+                    is_tui_row(&cells),
+                    "{t:?} claude={claude} alt={alt}"
+                );
+            }
+        }
+    }
+
+    /// An inline TUI (Gemini CLI's dialogs) draws boxes on the primary
+    /// screen. Arabic inside the box must not drag its closing border.
+    #[test]
+    fn primary_screen_box_border_stays_on_its_column() {
+        use alacritty_terminal::{
+            event::VoidListener,
+            term::{Config, Term},
+            vte::ansi::Processor,
+        };
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 80, rows: 4 };
+        let mut border_x = |prefix: &str| {
+            let mut t = Term::new(Config::default(), &size, VoidListener);
+            let bytes = format!("\x1b[2;1H│ {prefix}\x1b[2;41H\x1b[31m│");
+            let mut processor: Processor = Processor::new();
+            processor.advance(&mut t, bytes.as_bytes());
+            let view = PaneView {
+                rect: (0, 0, 1000, 120),
+                focused: false,
+                cursor: crate::config::CursorStyle::Block,
+                cursor_on: false,
+                bordered: false,
+                claude: false,
+                claude_from: None,
+                search_match: None,
+                marks: &[],
+                link_hover: None,
+                link_tip: None,
+                reorder: true,
+                line_dir: &[],
+                bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+                scroll_px: 0,
+                peek_dir: ParagraphDir::Default,
+            };
+            let mut out = Vec::new();
+            r.draw_pane(&mut out, &view, &t);
+            let red = c4(r.ansi_rgb(AnsiColor::Named(NamedColor::Red)), 255);
+            out.iter()
+                .filter(|v| v.color == red)
+                .map(|v| v.pos[0])
+                .fold(f32::INFINITY, f32::min)
+        };
+        let expected = border_x("");
+        let actual = border_x("1. Trust (سلام abc مرحبا)");
+        assert!(expected.is_finite() && actual.is_finite());
+        assert!(
+            (expected - actual).abs() <= 1.0,
+            "Arabic moved the border from {expected} to {actual}"
+        );
+    }
+
+    /// Grid-drawn cells of a field row (borders, box glyphs) answer
+    /// `hit_cell` with their own column, so a click there does not fall
+    /// back to whole-line shaping and land cells away.
+    #[test]
+    fn primary_screen_field_rows_click_on_their_grid_cells() {
+        use alacritty_terminal::{
+            event::VoidListener,
+            term::{Config, Term},
+            vte::ansi::Processor,
+        };
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 80, rows: 4 };
+        let rect = (0, 0, 1000, 120);
+        for (bytes, col) in [
+            ("\x1b[2;1H\x1b[31m├\x1b[0m── ملف.txt", 0),
+            ("\x1b[2;1H│ 1. Trust (سلام abc مرحبا)\x1b[2;41H\x1b[31m│", 40),
+        ] {
+            let mut t = Term::new(Config::default(), &size, VoidListener);
+            let mut processor: Processor = Processor::new();
+            processor.advance(&mut t, bytes.as_bytes());
+            let view = PaneView {
+                rect,
+                focused: false,
+                cursor: crate::config::CursorStyle::Block,
+                cursor_on: false,
+                bordered: false,
+                claude: false,
+                claude_from: None,
+                search_match: None,
+                marks: &[],
+                link_hover: None,
+                link_tip: None,
+                reorder: true,
+                line_dir: &[],
+                bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+                scroll_px: 0,
+                peek_dir: ParagraphDir::Default,
+            };
+            r.begin_frame();
+            let mut out = Vec::new();
+            r.draw_pane(&mut out, &view, &t);
+            let red = c4(r.ansi_rgb(AnsiColor::Named(NamedColor::Red)), 255);
+            let x = out
+                .iter()
+                .filter(|v| v.color == red)
+                .map(|v| v.pos[0])
+                .fold(f32::INFINITY, f32::min);
+            assert!(x.is_finite(), "{bytes:?}: no red glyph drawn");
+            assert_eq!(
+                r.hit_cell(rect, 1, x as f64 + 1.0).map(|h| h.0),
+                Some(col),
+                "{bytes:?}"
+            );
+        }
+    }
+
+    /// A prompt glyph after a box's left border (`│ > …`, Gemini's input)
+    /// stays on its column instead of joining the Arabic field.
+    #[test]
+    fn boxed_prompt_glyph_stays_on_its_column() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let marker = (250, 10, 10);
+        let mut cells = row_cells("│ > مرحبا      │", 0);
+        cells[2].fg = marker;
+        let mut out = Vec::new();
+        r.draw_line_tui(
+            &mut out,
+            (0, 0, 1000, 120),
+            100,
+            40,
+            &cells,
+            false,
+            None,
+            ParagraphDir::Rtl,
+            None,
+        );
+        let x = out
+            .iter()
+            .filter(|v| v.color == c4(marker, 255))
+            .map(|v| v.pos[0])
+            .fold(f32::INFINITY, f32::min);
+        let grid = 100.0 + 2.0 * r.cell_w;
+        assert!(
+            x.is_finite() && (x - grid).abs() < r.cell_w,
+            "prompt at {x}, its column starts at {grid}"
+        );
+    }
+
+    /// A click resolves through the path the row was drawn with.
+    #[test]
+    fn snapshot_and_paint_agree_on_the_tui_path() {
+        let texts = [
+            "│ 1. Trust folder (سلام abc مرحبا) │",
+            "╭── سلام",
+            "├── ملف.txt",
+            "───── مرحبا",
+            "مرحبا بالعالم  هذا نثر",
+            "مرحبا   STATUS",
+            "\u{e0b0} C:\\سلام",
+            "████ تحميل",
+        ];
+        for t in texts {
+            let snaps: Vec<SnapCell> = t
+                .chars()
+                .enumerate()
+                .map(|(i, c)| SnapCell {
+                    col: i,
+                    w: 1,
+                    c,
+                    zw: vec![],
+                    fg: AnsiColor::Named(NamedColor::Foreground),
+                    bg: AnsiColor::Named(NamedColor::Background),
+                    flags: Flags::empty(),
+                })
+                .collect();
+            for (claude, alt) in [(false, false), (true, false), (false, true)] {
+                assert_eq!(
+                    snap_tui_path(claude, alt, &snaps),
+                    tui_path(claude, alt, &row_cells(t, 0)),
+                    "{t:?} claude={claude} alt={alt}"
+                );
+            }
         }
     }
 

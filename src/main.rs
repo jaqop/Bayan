@@ -6040,9 +6040,9 @@ impl App {
             } else {
                 stamped
             };
-            // Same split as draw_pane: TUI fields and the alternate screen
-            // are not flush-right.
-            let align_edge = reorder && !alt && !((claude || alt) && render::snap_is_tui(&cells));
+            // Same split as draw_pane (`render::tui_path`): TUI fields and
+            // the alternate screen are not flush-right.
+            let align_edge = reorder && !alt && !render::snap_tui_path(claude, alt, &cells);
             let shaped = rects.get(hit.pane).and_then(|rect| {
                 self.renderer
                     .as_mut()
@@ -6104,9 +6104,10 @@ impl App {
                 }
             });
             let cells = render::snapshot_row(&t, row as usize);
-            // Same split as draw_pane: TUI fields and the alternate screen
-            // are not flush-right, so a click must not assume they are.
-            let align_edge = reorder && !alt && !((claude || alt) && render::snap_is_tui(&cells));
+            // Same split as draw_pane (`render::tui_path`): TUI fields and
+            // the alternate screen are not flush-right, so a click must not
+            // assume they are.
+            let align_edge = reorder && !alt && !render::snap_tui_path(claude, alt, &cells);
             (
                 cols,
                 row,
