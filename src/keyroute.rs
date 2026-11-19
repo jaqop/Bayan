@@ -512,8 +512,7 @@ impl App {
                 return;
             }
         }
-        let rtl = self.copy_cursor_rtl();
-        let Some(cmd) = copymode::command(event.physical_key, &event.logical_key, ctrl, shift, rtl)
+        let Some(cmd) = copymode::command(event.physical_key, &event.logical_key, ctrl, shift)
         else {
             return;
         };
@@ -534,31 +533,22 @@ impl App {
             }
         }
         if let Some(s) = self.session() {
-            copymode::apply(&mut s.term.lock(), cmd);
+            use alacritty_terminal::vi_mode::ViMotion;
+            let mut term = s.term.lock();
+            match cmd {
+                Cmd::Motion(motion @ (ViMotion::Left | ViMotion::Right)) => {
+                    let layout = self.renderer.as_ref().zip(
+                        self.tabs
+                            .get(self.active)
+                            .and_then(|tab| self.pane_rects().get(tab.focused).copied()),
+                    );
+                    copymode::move_horizontal(&mut term, layout, motion);
+                }
+                _ => copymode::apply(&mut term, cmd),
+            }
         }
         self.invalidate_focused_links();
         self.request_redraw();
-    }
-
-    /// Whether the copy-mode cursor sits on a cell the last frame laid right
-    /// to left. It asks the shaped layout, never the column index, because on
-    /// an RTL row the logical column is not the visual x.
-    fn copy_cursor_rtl(&self) -> bool {
-        let (Some(r), Some(t)) = (self.renderer.as_ref(), self.tabs.get(self.active)) else {
-            return false;
-        };
-        let Some(rect) = self.pane_rects().get(t.focused).copied() else {
-            return false;
-        };
-        let Some(s) = self.session() else {
-            return false;
-        };
-        let (row, col) = {
-            let t = s.term.lock();
-            let p = t.vi_mode_cursor.point;
-            (p.line.0 + t.grid().display_offset() as i32, p.column.0)
-        };
-        row >= 0 && r.cell_rtl(rect, row as usize, col)
     }
 
     /// Esc dismisses. Enter dismisses a refusal and opens only a confirm

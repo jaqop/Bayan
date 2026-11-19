@@ -393,17 +393,33 @@ impl App {
         let Some((pi, row, col, side)) = self.pane_cell_at(position) else {
             return;
         };
-        if pi != self.sel_pane {
+        let layout = self
+            .renderer
+            .as_ref()
+            .zip(self.pane_rects().get(pi).copied());
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let Some(pane) = tab.panes.get_mut(pi) else {
+            return;
+        };
+        if Some(pane.id) != self.sel_pane {
             return;
         }
-        if let Some(s) = self.session() {
-            let mut t = s.term.lock();
-            let off = t.grid().display_offset() as i32;
-            let point = Point::new(Line(crate::scroll::grid_line(row, off)), Column(col));
-            if let Some(sel) = t.selection.as_mut() {
-                sel.update(point, side);
-            }
+        let mut term = pane.session.term.lock();
+        let off = term.grid().display_offset() as i32;
+        let point = Point::new(Line(crate::scroll::grid_line(row, off)), Column(col));
+        if let Some(sel) = term.selection.as_mut() {
+            sel.update(point, side);
         }
+        pane.visual_selection =
+            self.drag_anchor
+                .zip(layout)
+                .and_then(|(anchor, (renderer, rect))| {
+                    let visual = renderer.mouse_drag_cells(rect, &term, anchor, (point, side))?;
+                    Some((term.selection.clone()?, visual))
+                });
+        drop(term);
         self.request_redraw();
     }
 
@@ -1024,15 +1040,22 @@ impl App {
             t.focused = pi;
         }
         self.sync_focus(None);
-        self.sel_pane = pi;
         let n = self.clicks.click(Instant::now(), (row, col));
         let ty = selection_type(n);
-        if let Some(s) = self.session() {
-            let mut t = s.term.lock();
-            let off = t.grid().display_offset() as i32;
+        let Some(pane) = self.focused_pane_mut() else {
+            return;
+        };
+        pane.visual_selection = None;
+        let id = pane.id;
+        let point = {
+            let mut term = pane.session.term.lock();
+            let off = term.grid().display_offset() as i32;
             let point = Point::new(Line(crate::scroll::grid_line(row, off)), Column(col));
-            t.selection = Some(Selection::new(ty, point, side));
-        }
+            term.selection = Some(Selection::new(ty, point, side));
+            point
+        };
+        self.sel_pane = Some(id);
+        self.drag_anchor = (ty == SelectionType::Simple).then_some((point, side));
         self.mouse.selecting = true;
         self.clear_link_hover();
         if n >= 2 && self.config.copy_on_select_on() {
@@ -1059,6 +1082,8 @@ impl App {
             return;
         }
         self.mouse.selecting = false;
+        self.sel_pane = None;
+        self.drag_anchor = None;
         // EasyTer convention: auto-copy the selection on release (the
         // settings panel can turn this off; explicit Ctrl+C / Ctrl+Shift+C
         // always copy)
