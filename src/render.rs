@@ -1662,6 +1662,42 @@ pub(crate) fn snap_is_tui(cells: &[SnapCell]) -> bool {
     )
 }
 
+/// Whether a row with Arabic draws as TUI fields instead of one shaped
+/// line. The primary screen joins only on Box Drawing: inline TUIs (Gemini
+/// CLI, `tree`) draw boxes there, while Powerline glyphs (private use)
+/// build shell prompts that must stay one line.
+fn tui_path(claude: bool, alt: bool, cells: &[CellInfo]) -> bool {
+    tui_path_at(
+        cells.len(),
+        |i| (cells[i].col, cells[i].w, cells[i].c),
+        claude,
+        alt,
+    )
+}
+
+/// [`tui_path`] for a mouse snapshot, so a click follows the drawn path.
+pub(crate) fn snap_tui_path(claude: bool, alt: bool, cells: &[SnapCell]) -> bool {
+    tui_path_at(
+        cells.len(),
+        |i| (cells[i].col, cells[i].w, cells[i].c),
+        claude,
+        alt,
+    )
+}
+
+fn tui_path_at(
+    n: usize,
+    at: impl Fn(usize) -> (usize, usize, char),
+    claude: bool,
+    alt: bool,
+) -> bool {
+    if claude || alt {
+        tui_row(n, &at, true)
+    } else {
+        (0..n).any(|i| matches!(at(i).2, '\u{2500}'..='\u{257f}'))
+    }
+}
+
 fn tui_row(n: usize, at: impl Fn(usize) -> (usize, usize, char), prompt_start: bool) -> bool {
     let mut end = n;
     while end > 0 && at(end - 1).2 == ' ' {
@@ -4483,8 +4519,9 @@ impl Renderer {
             let col = if on_row { Some(ccol) } else { None };
             // Alternate-screen rows stay in their grid columns: a TUI
             // positioned the cells. The primary screen's prose aligns
-            // an RTL paragraph to the pane's right edge.
-            if (row_claude || alt) && is_tui_row(cells) {
+            // an RTL paragraph to the pane's right edge, but an inline
+            // TUI that draws boxes there takes the same field path.
+            if tui_path(row_claude, alt, cells) {
                 self.draw_line_tui(out, clip, px, y, cells, row_claude, col, dir, hover)
             } else {
                 self.draw_line_bidi(
@@ -9051,6 +9088,86 @@ mod tests {
                 "Arabic moved the status from {expected} to {actual}, claude={claude}"
             );
         }
+    }
+
+    /// On the primary screen only Box Drawing makes a row TUI fields:
+    /// prose gaps, Powerline prompts, and block-element bars stay one line.
+    #[test]
+    fn primary_screen_box_rows_take_the_field_path() {
+        let p = |t: &str| tui_path(false, false, &row_cells(t, 0));
+        assert!(p("│ 1. Trust folder (سلام abc مرحبا) │"));
+        assert!(p("╭── سلام"));
+        assert!(p("├── ملف.txt"));
+        assert!(p("───── مرحبا"));
+        assert!(!p("مرحبا بالعالم  هذا نثر"));
+        assert!(!p("مرحبا   STATUS"));
+        assert!(!p("\u{e0b0} C:\\سلام"));
+        assert!(!p("████ تحميل"));
+        for (claude, alt) in [(true, false), (false, true), (true, true)] {
+            for t in [
+                "│ مرحبا بالعالم │",
+                "مرحبا   STATUS",
+                "مرحبا بالعالم  هذا نثر",
+            ] {
+                let cells = row_cells(t, 0);
+                assert_eq!(
+                    tui_path(claude, alt, &cells),
+                    is_tui_row(&cells),
+                    "{t:?} claude={claude} alt={alt}"
+                );
+            }
+        }
+    }
+
+    /// An inline TUI (Gemini CLI's dialogs) draws boxes on the primary
+    /// screen. Arabic inside the box must not drag its closing border.
+    #[test]
+    fn primary_screen_box_border_stays_on_its_column() {
+        use alacritty_terminal::{
+            event::VoidListener,
+            term::{Config, Term},
+            vte::ansi::Processor,
+        };
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let size = crate::term::TermSize { cols: 80, rows: 4 };
+        let mut border_x = |prefix: &str| {
+            let mut t = Term::new(Config::default(), &size, VoidListener);
+            let bytes = format!("\x1b[2;1H│ {prefix}\x1b[2;41H\x1b[31m│");
+            let mut processor: Processor = Processor::new();
+            processor.advance(&mut t, bytes.as_bytes());
+            let view = PaneView {
+                rect: (0, 0, 1000, 120),
+                focused: false,
+                cursor: crate::config::CursorStyle::Block,
+                cursor_on: false,
+                bordered: false,
+                claude: false,
+                claude_from: None,
+                search_match: None,
+                marks: &[],
+                link_hover: None,
+                link_tip: None,
+                reorder: true,
+                line_dir: &[],
+                bidi_mode: crate::bidi_ctl::BidiReorder::Full,
+                scroll_px: 0,
+                peek_dir: ParagraphDir::Default,
+            };
+            let mut out = Vec::new();
+            r.draw_pane(&mut out, &view, &t);
+            let red = c4(r.ansi_rgb(AnsiColor::Named(NamedColor::Red)), 255);
+            out.iter()
+                .filter(|v| v.color == red)
+                .map(|v| v.pos[0])
+                .fold(f32::INFINITY, f32::min)
+        };
+        let expected = border_x("");
+        let actual = border_x("1. Trust (سلام abc مرحبا)");
+        assert!(expected.is_finite() && actual.is_finite());
+        assert!(
+            (expected - actual).abs() <= 1.0,
+            "Arabic moved the border from {expected} to {actual}"
+        );
     }
 
     #[test]
