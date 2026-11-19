@@ -947,6 +947,9 @@ struct PendingPaste {
 struct Pane {
     id: u64,
     session: Session,
+    /// A native selection change invalidates the visual ranges associated
+    /// with that mouse drag, including after history moves or a resize.
+    visual_selection: Option<(Selection, render::VisualSelection)>,
     /// the command line it was started with, so a restored session brings
     /// a Command Prompt tab back as Command Prompt
     command: String,
@@ -957,6 +960,13 @@ struct Pane {
     /// Set when the ConPTY lives in the mux server. `armed` is cleared to
     /// detach: the session's kill hook then leaves the remote process running.
     mux: Option<MuxBind>,
+}
+
+impl Pane {
+    fn visual_selection(&self, native: Option<&Selection>) -> Option<&render::VisualSelection> {
+        let (snapshot, visual) = self.visual_selection.as_ref()?;
+        (native == Some(snapshot)).then_some(visual)
+    }
 }
 
 struct MuxBind {
@@ -2115,7 +2125,8 @@ struct App {
     /// A focus loss drops all of them together.
     mouse: mouse::Route,
     /// the pane a mouse selection started in (drags don't cross panes)
-    sel_pane: usize,
+    sel_pane: Option<u64>,
+    drag_anchor: Option<(Point, Side)>,
     /// divider being dragged (between pane i and i+1)
     drag_divider: Option<usize>,
     /// Per-pane scrollbar: hover, thumb drag, and when it was last scrolled.
@@ -2429,7 +2440,8 @@ impl App {
             ime_spot: None,
             ime_area_reset: false,
             mouse: mouse::Route::default(),
-            sel_pane: 0,
+            sel_pane: None,
+            drag_anchor: None,
             drag_divider: None,
             bars: scrollbar::Bars::default(),
             cockpit: false,
@@ -3429,12 +3441,19 @@ impl App {
                 self.remove_pane(ti, pi, el);
             }
             Search | SearchRegex => {
-                let selected = self
-                    .session()
-                    .and_then(|s| s.term.lock().selection_to_string());
+                let (selected, restore) = self.focused_pane().map_or((None, false), |pane| {
+                    let term = pane.session.term.lock();
+                    match pane.visual_selection(term.selection.as_ref()) {
+                        Some(visual) => (
+                            Some(copyclean::visual_selection_text(&term, visual, false)),
+                            false,
+                        ),
+                        None => (term.selection_to_string(), true),
+                    }
+                });
                 self.search = Some(SearchState::from_selection(
                     selected.as_deref(),
-                    self.claude_active(),
+                    restore && self.claude_active(),
                 ));
                 if action == SearchRegex {
                     if let Some(st) = self.search.as_mut() {
@@ -4137,16 +4156,23 @@ impl App {
         self.request_redraw();
     }
 
+    fn focused_pane(&self) -> Option<&Pane> {
+        let tab = self.tabs.get(self.active)?;
+        tab.panes.get(tab.focused)
+    }
+
+    fn focused_pane_mut(&mut self) -> Option<&mut Pane> {
+        let tab = self.tabs.get_mut(self.active)?;
+        tab.panes.get_mut(tab.focused)
+    }
+
     /// The focused pane's session in the active tab.
     fn session(&self) -> Option<&Session> {
-        let t = self.tabs.get(self.active)?;
-        t.panes.get(t.focused).map(|p| &p.session)
+        self.focused_pane().map(|pane| &pane.session)
     }
 
     fn session_mut(&mut self) -> Option<&mut Session> {
-        let t = self.tabs.get_mut(self.active)?;
-        let f = t.focused;
-        t.panes.get_mut(f).map(|p| &mut p.session)
+        self.focused_pane_mut().map(|pane| &mut pane.session)
     }
 
     /// OSC 52 may write only from the focused pane of the active tab.
@@ -4208,6 +4234,7 @@ impl App {
             Ok(session) => Some(Pane {
                 id,
                 session,
+                visual_selection: None,
                 command: command.to_string(),
                 last_output: None,
                 progress: None,
@@ -4501,6 +4528,7 @@ impl App {
         Some(Pane {
             id,
             session,
+            visual_selection: None,
             command: command.to_string(),
             last_output: None,
             progress: None,
@@ -5830,7 +5858,7 @@ impl App {
         if let Some((source_row, col, side)) = r.flow_hit(rect, geom_row, pos.x) {
             return Some((hit.pane, source_row as i32, col, side));
         }
-        if let Some((col, side)) = r.hit_cell(rect, geom_row, pos.x) {
+        if let Some((col, side)) = r.shaped_selection_hit(rect, geom_row, pos.x) {
             return Some((hit.pane, row, col, side));
         }
         let side = if hit.left { Side::Left } else { Side::Right };
@@ -6563,12 +6591,12 @@ impl App {
     }
 
     fn has_selection(&self) -> bool {
-        self.session().is_some_and(|s| {
-            s.term
-                .lock()
-                .selection
-                .as_ref()
-                .is_some_and(|sel| !sel.is_empty())
+        self.focused_pane().is_some_and(|pane| {
+            let term = pane.session.term.lock();
+            match pane.visual_selection(term.selection.as_ref()) {
+                Some(visual) => !visual.points.is_empty(),
+                None => term.selection.as_ref().is_some_and(|sel| !sel.is_empty()),
+            }
         })
     }
 
@@ -6587,34 +6615,36 @@ impl App {
     }
 
     fn copy_clipboard(&mut self, clear: bool, force_clean: bool) -> bool {
-        let Some(session) = self.session() else {
+        let Some(pane) = self.focused_pane() else {
             return false;
         };
+        let claude = self.claude_active();
+        let clean = force_clean || self.config.clean_copy().enabled(claude);
         let text = {
-            let mut t = session.term.lock();
-            let txt = t.selection_to_string();
-            let rows = copyclean::selection_rows(&t);
+            let mut t = pane.session.term.lock();
+            let visual = pane.visual_selection(t.selection.as_ref());
+            let text = match visual {
+                Some(selection) => Some(copyclean::visual_selection_text(&t, selection, clean)),
+                None => t.selection_to_string().map(|raw| {
+                    let rows = copyclean::selection_rows(&t);
+                    copyclean::clipboard_text(&raw, &rows, clean, claude)
+                }),
+            };
             if clear {
                 t.selection = None;
             }
-            txt.map(|raw| (raw, rows))
+            text
         };
-        // claude_active locks the term too; take it only after the guard above
-        let claude = self.claude_active();
-        let clean = force_clean || self.config.clean_copy().enabled(claude);
-        match text {
-            Some((raw, rows)) if !raw.is_empty() => {
-                // Claude rows hold VISUAL-order Arabic: restore logical so a
-                // paste elsewhere reads correctly (M7 gap closed). Clean copy
-                // runs that same restore; it does not reorder by visual x.
-                let s = copyclean::clipboard_text(&raw, &rows, clean, claude);
-                if s.is_empty() {
-                    return false;
-                }
-                self.set_clipboard(s);
-                true
+        if clear {
+            if let Some(pane) = self.focused_pane_mut() {
+                pane.visual_selection = None;
             }
-            _ => false,
+        }
+        if let Some(text) = text.filter(|text| !text.is_empty()) {
+            self.set_clipboard(text);
+            true
+        } else {
+            false
         }
     }
 
@@ -7609,7 +7639,8 @@ impl App {
                         &image_snaps,
                     ));
                     let rows = t.screen_lines();
-                    renderer.draw_pane(&mut verts, &view, &t);
+                    let visual = pane.visual_selection(t.selection.as_ref());
+                    renderer.draw_pane_with_selection(&mut verts, &view, &t, visual);
                     // Smooth scroll's sub-line remainder is the fraction's
                     // unit: lines in [0, 1) added to display_offset. Zero on
                     // the alternate screen and with smooth scroll off.
@@ -11396,6 +11427,7 @@ mod scroll_app_tests {
             panes: vec![Pane {
                 id: 0,
                 session,
+                visual_selection: None,
                 command: String::new(),
                 last_output: None,
                 progress: None,
