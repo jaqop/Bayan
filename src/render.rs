@@ -1644,17 +1644,10 @@ fn line_wrapped_into<T: alacritty_terminal::event::EventListener>(
     term.grid()[prev][col].flags.contains(Flags::WRAPLINE)
 }
 
+/// Today's alternate-screen / Claude rule on its own; the tests compare
+/// [`tui_path`] against it.
+#[cfg(test)]
 fn is_tui_row(cells: &[CellInfo]) -> bool {
-    tui_row(
-        cells.len(),
-        |i| (cells[i].col, cells[i].w, cells[i].c),
-        true,
-    )
-}
-
-/// The same test for a mouse snapshot. A click has to follow the path
-/// `draw_pane` took, or a right-aligned row and a TUI field disagree.
-pub(crate) fn snap_is_tui(cells: &[SnapCell]) -> bool {
     tui_row(
         cells.len(),
         |i| (cells[i].col, cells[i].w, cells[i].c),
@@ -9168,6 +9161,43 @@ mod tests {
             (expected - actual).abs() <= 1.0,
             "Arabic moved the border from {expected} to {actual}"
         );
+    }
+
+    /// A click resolves through the path the row was drawn with.
+    #[test]
+    fn snapshot_and_paint_agree_on_the_tui_path() {
+        let texts = [
+            "│ 1. Trust folder (سلام abc مرحبا) │",
+            "╭── سلام",
+            "├── ملف.txt",
+            "───── مرحبا",
+            "مرحبا بالعالم  هذا نثر",
+            "مرحبا   STATUS",
+            "\u{e0b0} C:\\سلام",
+            "████ تحميل",
+        ];
+        for t in texts {
+            let snaps: Vec<SnapCell> = t
+                .chars()
+                .enumerate()
+                .map(|(i, c)| SnapCell {
+                    col: i,
+                    w: 1,
+                    c,
+                    zw: vec![],
+                    fg: AnsiColor::Named(NamedColor::Foreground),
+                    bg: AnsiColor::Named(NamedColor::Background),
+                    flags: Flags::empty(),
+                })
+                .collect();
+            for (claude, alt) in [(false, false), (true, false), (false, true)] {
+                assert_eq!(
+                    snap_tui_path(claude, alt, &snaps),
+                    tui_path(claude, alt, &row_cells(t, 0)),
+                    "{t:?} claude={claude} alt={alt}"
+                );
+            }
+        }
     }
 
     #[test]
