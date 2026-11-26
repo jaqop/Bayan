@@ -3059,6 +3059,39 @@ impl<T> LockExt<T> for Mutex<T> {
     }
 }
 
+/// Meta half of the frame photograph, shared by the full and facts-only
+/// fills. Marks convert to grid space here; the finish announcement keeps
+/// its global row so eviction cannot drop it.
+fn fill_meta(
+    m: &mut SessionMeta,
+    frame: &mut crate::pane_frame::PaneFrame,
+    cell_px: Option<(u32, u32)>,
+) {
+    frame.marks.clear();
+    frame.marks.extend(
+        m.marks
+            .iter()
+            .filter(|c| c.abs >= m.evicted)
+            .map(|c| ((c.abs - m.evicted) as usize, c.exit)),
+    );
+    frame.last_finished = m
+        .marks
+        .iter()
+        .rev()
+        .find(|mark| mark.exit.is_some())
+        .map(|mark| (mark.abs, mark.exit));
+    frame.running_cmd.clone_from(&m.running_cmd);
+    frame.cwd.clone_from(&m.cwd);
+    frame.bidi = m.bidi.clone();
+    frame.evicted = m.evicted;
+    frame.bidi_reorder = m.bidi_reorder;
+    frame.tracked_alt = m.alt_track.on();
+    if let Some((cw, ch)) = cell_px {
+        m.images.set_cell_px(cw, ch);
+        frame.images = m.images.snapshot();
+    }
+}
+
 /// BAYAN-014: a Session that goes away for any reason takes its shell with
 /// it. Killing a child that already exited is a harmless error.
 impl Drop for Session {
@@ -3549,6 +3582,34 @@ impl Session {
     /// The command line passed to [`Session::spawn`], for shell-specific quoting.
     pub fn shell(&self) -> &str {
         &self.shell
+    }
+
+    /// Fill the pane's frame photograph: grid facts and cells, then meta
+    /// facts, under term then meta — the reader's order, held only for the
+    /// copy. Shaping and drawing consume the frame without locks.
+    /// `cell_px` publishes the cell size to the image store before its
+    /// snapshot; `None` (renderer still warming) leaves images untouched.
+    pub fn fill_frame(
+        &self,
+        frame: &mut crate::pane_frame::PaneFrame,
+        cell_px: Option<(u32, u32)>,
+    ) {
+        let t = self.term.lock();
+        frame.capture_grid(&t);
+        let mut m = self.meta.lock_or_recover();
+        fill_meta(&mut m, frame, cell_px);
+        frame.claude_from_grid = m.claude_from_abs.map(|start| {
+            start as i64 - frame.evicted as i64 - frame.history as i64 + frame.display_offset as i64
+        });
+    }
+
+    /// Meta facts only, no term lock and no cell copy: the cockpit reads
+    /// every tab's focused pane, and a background tab must not pay for a
+    /// grid photograph it will not draw. Grid fields stay stale until a
+    /// full [`Self::fill_frame`].
+    pub fn fill_facts(&self, frame: &mut crate::pane_frame::PaneFrame) {
+        let mut m = self.meta.lock_or_recover();
+        fill_meta(&mut m, frame, None);
     }
 
     /// Terminate the shell (closing a tab must not leave orphans).

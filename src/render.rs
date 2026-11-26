@@ -1630,7 +1630,7 @@ pub fn viewport_row_layout<T: alacritty_terminal::event::EventListener>(
 
 /// The previous grid row ended in a soft wrap, so this viewport row is the
 /// same paragraph. `display_offset` is the scroll into history.
-fn line_wrapped_into<T: alacritty_terminal::event::EventListener>(
+pub(crate) fn line_wrapped_into<T: alacritty_terminal::event::EventListener>(
     term: &Term<T>,
     viewport_row: usize,
     display_offset: i32,
@@ -4676,6 +4676,8 @@ impl Renderer {
     }
 
     /// One grid line, in the same cell order `display_iter` feeds a row.
+    /// Test helper: production draws from the frame photograph.
+    #[cfg(test)]
     fn cells_of_line<T: alacritty_terminal::event::EventListener>(
         &self,
         term: &Term<T>,
@@ -4709,6 +4711,36 @@ impl Renderer {
                 bg,
                 style,
                 ul: cell.underline_color().map_or(fg, |c| self.ansi_rgb(c)),
+            });
+        }
+        cells
+    }
+
+    /// The frame photograph's raw cells through the same theme mapping
+    /// `cells_of_line` applies: the peek row draws identically whether its
+    /// cells came from a live grid or the frame.
+    fn cells_of_frame(&self, raw: &[crate::pane_frame::FrameCell]) -> Vec<CellInfo> {
+        let mut cells = Vec::new();
+        for fc in raw {
+            let (fg, bg, style) = self.cell_paint(fc.fg, fc.bg, fc.flags);
+            let ch = if fc.flags.intersects(Flags::HIDDEN) {
+                ' '
+            } else {
+                fc.c
+            };
+            cells.push(CellInfo {
+                col: fc.col,
+                w: fc.w(),
+                c: ch,
+                zw: if fc.zw.is_empty() {
+                    None
+                } else {
+                    Some(fc.zw.clone())
+                },
+                fg,
+                bg,
+                style,
+                ul: fc.ul.map_or(fg, |c| self.ansi_rgb(c)),
             });
         }
         cells
@@ -4849,7 +4881,9 @@ impl Renderer {
         }
     }
 
-    /// Draw one pane's terminal into its rect.
+    /// Draw one pane's terminal into its rect. Test adapter: production
+    /// draws from the pane's frame photograph; a bare `Term` is captured
+    /// into a fresh frame here so the render tests keep their seam.
     #[cfg(test)]
     pub fn draw_pane<T: alacritty_terminal::event::EventListener>(
         &mut self,
@@ -4857,14 +4891,16 @@ impl Renderer {
         view: &PaneView,
         term: &Term<T>,
     ) {
-        self.draw_pane_with_selection(out, view, term, None);
+        let mut frame = crate::pane_frame::PaneFrame::new();
+        frame.capture_grid(term);
+        self.draw_pane_with_selection(out, view, &frame, None);
     }
 
-    pub(crate) fn draw_pane_with_selection<T: alacritty_terminal::event::EventListener>(
+    pub(crate) fn draw_pane_with_selection(
         &mut self,
         out: &mut Vec<Vertex>,
         view: &PaneView,
-        term: &Term<T>,
+        frame: &crate::pane_frame::PaneFrame,
         visual_selection: Option<&VisualSelection>,
     ) {
         self.cell_geometry
@@ -4873,11 +4909,10 @@ impl Renderer {
         self.flow_cells.retain(|(pane, _, _), _| *pane != view.rect);
         let (px, py, pw, ph) = view.rect;
         let clip = view.rect;
-        let rows = term.screen_lines();
-        let history = term.grid().history_size();
-        let content = term.renderable_content();
-        let cursor = content.cursor;
-        let selection = content.selection;
+        let rows = frame.rows;
+        let history = frame.history as usize;
+        let cursor = frame.cursor;
+        let selection = frame.selection_range;
         let selected = |point| match visual_selection {
             Some(visual) => visual.points.contains(&point),
             None => selection.is_some_and(|range| range.contains(point)),
@@ -4885,7 +4920,7 @@ impl Renderer {
         // scrolled into history: viewport row = grid line + display offset.
         // `shift` is the sub-line remainder, in pixels downward. Zero keeps
         // every y on the row it had before smooth scroll.
-        let off = content.display_offset as i32;
+        let off = frame.display_offset as i32;
         self.pane_offsets.insert(view.rect, off);
         self.rtl_rows.retain(|(pane, _)| *pane != view.rect);
         self.whole_bidi_rows
@@ -4895,9 +4930,7 @@ impl Renderer {
         let shift = view.scroll_px.max(0);
         let cell_h = self.cell_h;
         let y_at = |row: i32| crate::scroll::content_y(py, row, cell_h, shift);
-        let alt = term
-            .mode()
-            .contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
+        let alt = frame.alt_screen;
 
         // collect the visible grid; paint non-default cell backgrounds as
         // pixel-snapped rects (EasyTer lesson: snap both edges so adjacent
@@ -4906,75 +4939,71 @@ impl Renderer {
         lines.resize_with(rows, Vec::new);
         let mut sel_cells: Vec<(usize, usize, usize)> = Vec::new(); // (vrow, col, w)
         let mut hit_cells: Vec<(usize, usize, usize)> = Vec::new();
-        for cell in content.display_iter {
-            let vrow = cell.point.line.0 + off;
-            if vrow < 0 || vrow as usize >= rows {
-                continue;
-            }
-            let li = vrow as usize;
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
-            }
-            let col = cell.point.column.0;
-            let w = if cell.flags.contains(Flags::WIDE_CHAR) {
-                2
-            } else {
-                1
-            };
-            // text attributes -> style bits (weight/slant shape into the run;
-            // under/strike draw as rects; DIM fades the color; HIDDEN blanks).
-            // cell_paint is shared with the mouse hit-test so a click resolves
-            // through the same shaped run this frame drew.
-            let (mut fg, mut bg, style) = self.cell_paint(cell.fg, cell.bg, cell.flags);
-            let ch = if cell.flags.intersects(Flags::HIDDEN) {
-                ' '
-            } else {
-                cell.c
-            };
-            if selected(cell.point) {
-                sel_cells.push((li, col, w));
-                // The overlay path is translucent and sits on top of the
-                // glyphs. High Contrast needs an opaque system selection
-                // with system text, painted as the cell itself.
-                if self.grid_follows_hc {
-                    fg = self.chrome.selection_text;
-                    bg = self.chrome.selection;
+        for (li, span) in frame.row_spans.iter().enumerate() {
+            for fc in &frame.cells[span.start..span.end] {
+                let point = alacritty_terminal::index::Point::new(
+                    alacritty_terminal::index::Line(li as i32 - off),
+                    alacritty_terminal::index::Column(fc.col),
+                );
+                let col = fc.col;
+                let w = fc.w();
+                // text attributes -> style bits (weight/slant shape into the run;
+                // under/strike draw as rects; DIM fades the color; HIDDEN blanks).
+                // cell_paint is shared with the mouse hit-test so a click resolves
+                // through the same shaped run this frame drew.
+                let (mut fg, mut bg, style) = self.cell_paint(fc.fg, fc.bg, fc.flags);
+                let ch = if fc.flags.intersects(Flags::HIDDEN) {
+                    ' '
+                } else {
+                    fc.c
+                };
+                if selected(point) {
+                    sel_cells.push((li, col, w));
+                    // The overlay path is translucent and sits on top of the
+                    // glyphs. High Contrast needs an opaque system selection
+                    // with system text, painted as the cell itself.
+                    if self.grid_follows_hc {
+                        fg = self.chrome.selection_text;
+                        bg = self.chrome.selection;
+                    }
                 }
+                if self.grid_follows_hc {
+                    fg = self.cached_cell_contrast(fg, bg);
+                }
+                if view
+                    .search_match
+                    .is_some_and(|m| *m.start() <= point && point <= *m.end())
+                {
+                    hit_cells.push((li, col, w));
+                }
+                let zw = if fc.zw.is_empty() {
+                    None
+                } else {
+                    Some(fc.zw.clone())
+                };
+                let ul = fc.ul.map_or(fg, |c| self.ansi_rgb(c));
+                lines[li].push(CellInfo {
+                    col,
+                    w,
+                    c: ch,
+                    zw,
+                    fg,
+                    bg,
+                    style,
+                    ul,
+                });
             }
-            if self.grid_follows_hc {
-                fg = self.cached_cell_contrast(fg, bg);
-            }
-            if view
-                .search_match
-                .is_some_and(|m| *m.start() <= cell.point && cell.point <= *m.end())
-            {
-                hit_cells.push((li, col, w));
-            }
-            let zw = cell.zerowidth().map(|z| z.to_vec());
-            let ul = cell.underline_color().map_or(fg, |c| self.ansi_rgb(c));
-            lines[li].push(CellInfo {
-                col,
-                w,
-                c: ch,
-                zw,
-                fg,
-                bg,
-                style,
-                ul,
-            });
         }
 
         self.claude_draft_rows
             .retain(|(pane, _), _| *pane != view.rect);
         if view.claude {
-            self.record_claude_draft(view.rect, &lines, term.columns().saturating_sub(1));
+            self.record_claude_draft(view.rect, &lines, frame.columns.saturating_sub(1));
         }
 
         let native_cursor_row = cursor.point.line.0 + off;
         let native_ccol = cursor.point.column.0;
-        let continued_rows: Vec<_> = (0..=rows)
-            .map(|row| line_wrapped_into(term, row, off))
-            .collect();
+        let continued_rows = &frame.wrapped;
         // Positioned TUIs and visual-order application output retain their
         // grid. Prose reflow is view-only and keeps the same row budget.
         if view.reorder
@@ -4982,8 +5011,8 @@ impl Renderer {
             && !view.claude
             && view.line_dir.iter().all(|d| *d == ParagraphDir::Default)
         {
-            for row in flow::reflow(&mut lines, &continued_rows, term.columns()) {
-                let cols = term.columns();
+            for row in flow::reflow(&mut lines, continued_rows, frame.columns) {
+                let cols = frame.columns;
                 self.flow_rows.insert((view.rect, row), cols);
                 for cell in &lines[row] {
                     self.flow_cells.insert(
@@ -5038,7 +5067,7 @@ impl Renderer {
         // here, so the frame matches the unshifted viewport.
         if shift > 0 && off >= 0 && (off as usize) < history {
             let line = alacritty_terminal::index::Line(-(off + 1));
-            let extra = self.cells_of_line(term, line);
+            let extra = self.cells_of_frame(&frame.peek);
             for c in &extra {
                 let point = alacritty_terminal::index::Point::new(
                     line,
@@ -13705,7 +13734,9 @@ mod paragraph_align {
         );
 
         let mut shaded = Vec::new();
-        renderer.draw_pane_with_selection(&mut shaded, &view, &term, Some(&forward));
+        let mut frame = crate::pane_frame::PaneFrame::new();
+        frame.capture_grid(&term);
+        renderer.draw_pane_with_selection(&mut shaded, &view, &frame, Some(&forward));
         let color = c4(SELECTION_RGBA.0, SELECTION_RGBA.1 as u8);
         assert_eq!(shaded.iter().filter(|v| v.color == color).count(), 6 * 6);
     }
