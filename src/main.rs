@@ -57,6 +57,7 @@ mod mouse;
 mod mru;
 mod mux;
 mod osc7;
+mod pane_frame;
 mod persist;
 mod plugins;
 mod posh;
@@ -99,19 +100,6 @@ fn frame_unchanged(
 ) -> bool {
     same_size && !resources_changed && previous == current
 }
-
-/// Meta copied off a pane before the term lock: command marks in grid
-/// space, the running command, the BiDi snapshot, and evicted lines.
-/// The `Arc` is the snapshot. Cloning it does not copy the stamp list.
-type PaneSnap = (
-    Vec<(usize, Option<i32>)>,
-    String,
-    std::sync::Arc<bidi_ctl::BidiState>,
-    u64,
-    Option<u64>,
-    Option<bidi_ctl::BidiReorder>,
-    bool,
-);
 
 /// The Windows caret rhythm; kitty's idea on top: stop after 15s idle.
 const BLINK_MS: u128 = 530;
@@ -947,6 +935,10 @@ struct PendingPaste {
 struct Pane {
     id: u64,
     session: Session,
+    /// The frame photograph: filled once per redraw, read by every consumer
+    /// in that frame without locks. Retained across frames; a refill, not a
+    /// construction.
+    frame: pane_frame::PaneFrame,
     /// A native selection change invalidates the visual ranges associated
     /// with that mouse drag, including after history moves or a resize.
     visual_selection: Option<(Selection, render::VisualSelection)>,
@@ -4074,12 +4066,12 @@ impl App {
                     .panes
                     .get(t.focused)
                     .map(|p| {
-                        let m = p.session.meta.lock_or_recover();
+                        let f = &p.frame;
                         // BAYAN-012: running_cmd is screen text and the cwd
                         // a program report; both go through chrome_text
-                        if !m.running_cmd.is_empty() {
-                            format!("▶ {}", chrome_text(&m.running_cmd))
-                        } else if let Some(cwd) = &m.cwd {
+                        if !f.running_cmd.is_empty() {
+                            format!("▶ {}", chrome_text(&f.running_cmd))
+                        } else if let Some(cwd) = &f.cwd {
                             format!("{} · {}", tr("خامل", "idle"), chrome_text(cwd))
                         } else {
                             tr("خامل", "idle").to_string()
@@ -4234,6 +4226,7 @@ impl App {
             Ok(session) => Some(Pane {
                 id,
                 session,
+                frame: pane_frame::PaneFrame::new(),
                 visual_selection: None,
                 command: command.to_string(),
                 last_output: None,
@@ -4528,6 +4521,7 @@ impl App {
         Some(Pane {
             id,
             session,
+            frame: pane_frame::PaneFrame::new(),
             visual_selection: None,
             command: command.to_string(),
             last_output: None,
@@ -5504,7 +5498,9 @@ impl App {
     }
 
     /// Claude restoration for one pane. Term lock, then meta, never both:
-    /// the same order as every other pane read.
+    /// the same order as every other pane read. Input paths call this
+    /// between frames, so it reads live state; the redraw's reader path
+    /// runs the same policy over the frame photograph.
     fn pane_claude(&self, pane: &Pane) -> bool {
         let term_alt = pane
             .session
@@ -5512,15 +5508,26 @@ impl App {
             .lock()
             .mode()
             .contains(TermMode::ALT_SCREEN);
-        let (bidi_state, running, pane_mode, tracked_alt) = {
-            let m = pane.session.meta.lock_or_recover();
-            (
-                m.bidi.clone(),
-                m.running_cmd.clone(),
-                m.bidi_reorder,
-                m.alt_track.on(),
-            )
-        };
+        let m = pane.session.meta.lock_or_recover();
+        self.claude_from_facts(
+            &m.bidi,
+            &m.running_cmd,
+            m.bidi_reorder,
+            m.alt_track.on(),
+            term_alt,
+        )
+    }
+
+    /// The Claude-restoration policy over one pane's facts — one
+    /// implementation for the live query and the frame photograph alike.
+    fn claude_from_facts(
+        &self,
+        bidi_state: &bidi_ctl::BidiState,
+        running: &str,
+        pane_mode: Option<bidi_ctl::BidiReorder>,
+        tracked_alt: bool,
+        term_alt: bool,
+    ) -> bool {
         // Idle explicit mode (a command that forgot to reset) must not
         // suppress restoration at the prompt. A live explicit mode still does.
         // The pane's BiDi mode (off / alt screen) is the same kind of gate.
@@ -5535,7 +5542,7 @@ impl App {
         if !self.auto_follow {
             return self.claude_manual;
         }
-        bidi::cmd_is_claude(&running)
+        bidi::cmd_is_claude(running)
     }
 
     /// Pixel offset of one pane. Zero on the alt screen and when smooth
@@ -5625,8 +5632,7 @@ impl App {
         if let Some(tab) = self.tabs.get(self.active) {
             h = screen_reader::stamp_mix(h, tab.focused as u64);
             for pane in &tab.panes {
-                let term = pane.session.term.lock();
-                h = screen_reader::stamp_mix(h, screen_reader::pane_stamp(&term));
+                h = screen_reader::stamp_mix(h, screen_reader::pane_stamp(&pane.frame));
             }
         }
         h = match &self.palette {
@@ -5701,25 +5707,23 @@ impl App {
         if let Some(tab) = self.tabs.get(active) {
             let count = tab.panes.len();
             for (pi, pane) in tab.panes.iter().enumerate() {
-                let claude = self.pane_claude(pane);
-                // Copy under the lock, then restore BiDi and build nodes
-                // after it is released. A reader must not stall the PTY.
-                let raw = {
-                    let term = pane.session.term.lock();
-                    screen_reader::copy_pane(&term)
-                };
+                let claude = self.claude_from_facts(
+                    &pane.frame.bidi,
+                    &pane.frame.running_cmd,
+                    pane.frame.bidi_reorder,
+                    pane.frame.tracked_alt,
+                    pane.frame.alt_screen,
+                );
+                // The photograph was taken at the top of this redraw; BiDi
+                // restoration and node building read it without locks.
+                // A reader must not stall the PTY.
+                let raw = screen_reader::copy_pane(&pane.frame);
                 let text = screen_reader::pane_text(raw, claude);
                 if pi == focused {
                     focused_id = Some(pane.id);
                     focused_lines = text.lines.iter().map(|line| line.text.clone()).collect();
-                    let meta = pane.session.meta.lock_or_recover();
-                    running = meta.running_cmd.clone();
-                    finished = meta
-                        .marks
-                        .iter()
-                        .rev()
-                        .find(|mark| mark.exit.is_some())
-                        .map(|mark| (mark.abs, mark.exit));
+                    running = pane.frame.running_cmd.clone();
+                    finished = pane.frame.last_finished;
                 }
                 bodies.push(screen_reader::PaneItem {
                     index: pi,
@@ -7372,6 +7376,30 @@ impl App {
     /// front of that count.
     fn redraw(&mut self) {
         crate::prof::note_redraw();
+        // One photograph per pane per frame: the active tab's panes get the
+        // full frame (draw, screen reader, scrollbar); every other tab's
+        // focused pane gets meta facts only (cockpit) — a background tab
+        // must not pay for a grid it will not draw. Every consumer below
+        // reads these values; none takes the session locks.
+        let cell_px = self.renderer.as_ref().map(|r| {
+            (
+                r.cell_w.round().max(1.0) as u32,
+                r.cell_h.round().max(1.0) as u32,
+            )
+        });
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            for pane in &mut tab.panes {
+                pane.session.fill_frame(&mut pane.frame, cell_px);
+            }
+        }
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            if i == self.active {
+                continue;
+            }
+            if let Some(pane) = tab.panes.get_mut(tab.focused) {
+                pane.session.fill_facts(&mut pane.frame);
+            }
+        }
         // Before a client, this is a flag check. After one, an unchanged
         // stamp does not walk the grid; a flood builds at about 10 Hz.
         self.publish_reader();
@@ -7480,7 +7508,7 @@ impl App {
         }
         let mut verts: Vec<gpu::Vertex> = Vec::new();
         let mut sprites: Vec<render::ImageSprite> = Vec::new();
-        match (self.renderer.as_mut(), self.tabs.get(self.active)) {
+        match (self.renderer.as_mut(), self.tabs.get_mut(self.active)) {
             (Some(renderer), Some(tab)) if !rects.is_empty() => {
                 if dev_hook("BAYAN_ATLAS_RESET").is_some() {
                     renderer.stress_reset_atlas();
@@ -7491,83 +7519,52 @@ impl App {
                 let (auto_follow, claude_manual) = (self.auto_follow, self.claude_manual);
                 let mut focused_claude = false;
                 let mut focused_copy = false;
-                for (pi, (pane, rect)) in tab.panes.iter().zip(&rects).enumerate() {
+                for (pi, (pane, rect)) in tab.panes.iter_mut().zip(&rects).enumerate() {
                     if !rect_visible(rect) {
                         continue; // a pane zoomed away is not drawn
                     }
                     let focused = pi == tab.focused;
-                    // meta snapshot BEFORE the term lock (lock order term>meta
-                    // only applies when holding both; here they don't overlap)
-                    let (
-                        marks,
-                        running_cmd,
-                        bidi_state,
-                        evicted,
-                        claude_from,
-                        pane_mode,
-                        tracked_alt,
-                    ): PaneSnap = {
-                        let m = pane.session.meta.lock_or_recover();
-                        (
-                            // global -> grid space: subtract the evictions
-                            m.marks
-                                .iter()
-                                .filter(|c| c.abs >= m.evicted)
-                                .map(|c| ((c.abs - m.evicted) as usize, c.exit))
-                                .collect(),
-                            m.running_cmd.clone(),
-                            m.bidi.clone(),
-                            m.evicted,
-                            m.claude_from_abs,
-                            m.bidi_reorder,
-                            m.alt_track.on(),
-                        )
-                    };
-                    // Cell size is published before the term lock. Taking meta
-                    // again while `term` is held deadlocks the reader, which
-                    // locks term and then meta.
-                    let cw = renderer.cell_w.round().max(1.0) as u32;
-                    let ch = renderer.cell_h.round().max(1.0) as u32;
-                    let image_snaps = {
-                        let mut m = pane.session.meta.lock_or_recover();
-                        m.images.set_cell_px(cw, ch);
-                        m.images.snapshot()
-                    };
-                    let t = pane.session.term.lock();
+                    // The photograph was filled at the top of this redraw;
+                    // every fact below reads it — no session locks here.
+                    let frame = &pane.frame;
                     // Explicit BDSM suppresses reordering for the whole pane,
                     // Claude restoration included, and only while the command
                     // is running or the alt screen is up. honor_bdsm defaults on.
                     // The Arc is the frame's snapshot: cloning it does not copy
                     // the stamp list. alt_off also counts ?47 and ?1047.
-                    let term_alt = t.mode().contains(TermMode::ALT_SCREEN);
-                    let mode = pane_mode.unwrap_or_else(|| self.config.bidi_mode());
-                    let alt = mode.effective_alt(term_alt, tracked_alt);
-                    let (reorder, use_stamps) = bidi_state.presentation(
+                    let mode = frame
+                        .bidi_reorder
+                        .unwrap_or_else(|| self.config.bidi_mode());
+                    let alt = mode.effective_alt(frame.alt_screen, frame.tracked_alt);
+                    let (reorder, use_stamps) = frame.bidi.presentation(
                         mode,
                         self.config.honor_bdsm(),
-                        !running_cmd.is_empty(),
+                        !frame.running_cmd.is_empty(),
                         alt,
                     );
                     let claude_pane = reorder
                         && if !auto_follow {
                             claude_manual
                         } else {
-                            bidi::cmd_is_claude(&running_cmd)
+                            bidi::cmd_is_claude(&frame.running_cmd)
                         };
                     // copy mode: a solid block that does not blink, so the
                     // cursor reads as the selection's, not the shell's
-                    let copy_mode = t.mode().contains(TermMode::VI);
+                    let copy_mode = frame.vi_mode;
                     if focused {
                         focused_claude = claude_pane;
                         focused_copy = copy_mode;
                     }
-                    let history = t.grid().history_size() as u64;
-                    let off = t.grid().display_offset() as u64;
+                    let history = frame.history;
+                    let off = frame.display_offset;
                     let line_dir: Vec<bidi_ctl::ParagraphDir> = if use_stamps {
-                        (0..t.screen_lines())
+                        (0..frame.rows)
                             .map(|li| {
-                                bidi_state.direction_at(bidi_ctl::viewport_line_abs(
-                                    evicted, history, off, li as u64,
+                                frame.bidi.direction_at(bidi_ctl::viewport_line_abs(
+                                    frame.evicted,
+                                    history,
+                                    off,
+                                    li as u64,
                                 ))
                             })
                             .collect()
@@ -7575,7 +7572,9 @@ impl App {
                         Vec::new()
                     };
                     let peek_dir = if use_stamps {
-                        bidi_state.direction_at(bidi_ctl::peek_line_abs(evicted, history, off))
+                        frame
+                            .bidi
+                            .direction_at(bidi_ctl::peek_line_abs(frame.evicted, history, off))
                     } else {
                         bidi_ctl::ParagraphDir::Default
                     };
@@ -7604,9 +7603,7 @@ impl App {
                         claude_from: if alt || !auto_follow {
                             None
                         } else {
-                            claude_from.map(|start| {
-                                start as i64 - evicted as i64 - history as i64 + off as i64
-                            })
+                            frame.claude_from_grid
                         },
                         reorder,
                         bidi_mode: mode,
@@ -7616,7 +7613,7 @@ impl App {
                         } else {
                             None
                         },
-                        marks: &marks,
+                        marks: &frame.marks,
                         link_hover,
                         link_tip,
                         peek_dir,
@@ -7633,14 +7630,14 @@ impl App {
                         *rect,
                         renderer.cell_w,
                         renderer.cell_h,
-                        evicted.saturating_add(history),
+                        frame.evicted.saturating_add(history),
                         off,
                         view.scroll_px,
-                        &image_snaps,
+                        &frame.images,
                     ));
-                    let rows = t.screen_lines();
-                    let visual = pane.visual_selection(t.selection.as_ref());
-                    renderer.draw_pane_with_selection(&mut verts, &view, &t, visual);
+                    let rows = frame.rows;
+                    let visual = pane.visual_selection(frame.selection.as_ref());
+                    renderer.draw_pane_with_selection(&mut verts, &view, frame, visual);
                     // Smooth scroll's sub-line remainder is the fraction's
                     // unit: lines in [0, 1) added to display_offset. Zero on
                     // the alternate screen and with smooth scroll off.
@@ -11427,6 +11424,7 @@ mod scroll_app_tests {
             panes: vec![Pane {
                 id: 0,
                 session,
+                frame: pane_frame::PaneFrame::new(),
                 visual_selection: None,
                 command: String::new(),
                 last_output: None,
