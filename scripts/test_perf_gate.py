@@ -13,8 +13,8 @@ import perf_gate  # noqa: E402
 
 LOG = """
 PROBE throughput ascii  64 MB: process_chunk   117.0 MB/s, vte alone   148.1 MB/s (79% of vte)
-PROBE throughput sgr    64 MB: process_chunk    88.0 MB/s, vte alone   172.5 MB/s (51% of vte)
-PROBE throughput arabic 64 MB: process_chunk   151.0 MB/s, vte alone   206.8 MB/s (73% of vte)
+PROBE throughput sgr    64 MB: process_chunk    72.5 MB/s, vte alone   172.5 MB/s (42% of vte)
+PROBE throughput arabic 64 MB: process_chunk   157.2 MB/s, vte alone   206.8 MB/s (76% of vte)
 PROBE scrollback  10000 lines x 120 cols: +  33.0 MB once full, +  33.1 MB after as much again (history 10000)
 PROBE scrollback 100000 lines x 120 cols: + 303.0 MB once full, + 303.2 MB after as much again (history 100000)
 test term::measure::measure_reader_throughput ... ok
@@ -45,7 +45,7 @@ STARTUP = """
 """
 
 BASE = {
-    "throughput": {"ascii": 79, "sgr": 51, "arabic": 73},
+    "throughput": {"ascii": 79, "sgr": 42, "arabic": 76},
     "scrollback": {"10000": 33, "100000": 303},
 }
 
@@ -53,7 +53,7 @@ BASE = {
 class Gate(unittest.TestCase):
     def test_the_best_of_several_runs_is_kept(self):
         got = perf_gate.parse(LOG)
-        self.assertEqual(got["throughput"], {"ascii": 79.0, "sgr": 51.0, "arabic": 73.0})
+        self.assertEqual(got["throughput"], {"ascii": 79.0, "sgr": 42.0, "arabic": 76.0})
         self.assertEqual(got["scrollback"], {"10000": 33.0, "100000": 303.0})
 
     def test_the_baseline_itself_passes(self):
@@ -62,11 +62,11 @@ class Gate(unittest.TestCase):
         self.assertEqual(len(rows), 5)
 
     def test_a_slower_reader_fails_and_ten_percent_is_the_edge(self):
-        slow = {"throughput": {"ascii": 70.0, "sgr": 51.0, "arabic": 73.0}, "scrollback": BASE["scrollback"]}
+        slow = {"throughput": {"ascii": 70.0, "sgr": 42.0, "arabic": 76.0}, "scrollback": BASE["scrollback"]}
         failures, _, _ = perf_gate.compare(BASE, slow, 0.10)
         self.assertEqual(len(failures), 1)
         self.assertIn("throughput ascii", failures[0])
-        edge = {"throughput": {"ascii": 71.2, "sgr": 46.0, "arabic": 66.0}, "scrollback": BASE["scrollback"]}
+        edge = {"throughput": {"ascii": 71.2, "sgr": 38.0, "arabic": 69.0}, "scrollback": BASE["scrollback"]}
         self.assertEqual(perf_gate.compare(BASE, edge, 0.10)[0], [])
 
     def test_more_memory_fails_and_less_is_a_gain(self):
