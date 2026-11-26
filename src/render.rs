@@ -4676,6 +4676,8 @@ impl Renderer {
     }
 
     /// One grid line, in the same cell order `display_iter` feeds a row.
+    /// Test helper: production draws from the frame photograph.
+    #[cfg(test)]
     fn cells_of_line<T: alacritty_terminal::event::EventListener>(
         &self,
         term: &Term<T>,

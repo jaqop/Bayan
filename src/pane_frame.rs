@@ -191,14 +191,14 @@ impl PaneFrame {
 
         // Wrap flags: rows + 1, the previous grid row's last-column flag.
         self.wrapped.resize(rows + 1, false);
-        for row in 0..=rows {
-            self.wrapped[row] = crate::render::line_wrapped_into(term, row, off as i32);
+        for (row, slot) in self.wrapped.iter_mut().enumerate() {
+            *slot = crate::render::line_wrapped_into(term, row, off as i32);
         }
 
-        // The peek row: one history line above the viewport, same raw walk
-        // the draw path's cells_of_line does, minus the theme mapping.
+        // The peek row: one history line above the viewport, the same raw
+        // walk cells_of_frame paints, minus the theme mapping.
         let mut pn = 0usize;
-        if (off as usize) < self.history as usize {
+        if off < self.history as usize {
             let line = Line(-(off as i32 + 1));
             let row = &term.grid()[line];
             for col in 0..columns {
