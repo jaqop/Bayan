@@ -11215,7 +11215,7 @@ mod scroll_app_tests {
     }
 
     fn display_offset(app: &App) -> usize {
-        app.tabs[0].panes[0].session.display_offset() as usize
+        app.tabs[0].panes[0].session.scroll_facts().offset as usize
     }
 
     fn stale_fraction(app: &mut App, id: u64) {

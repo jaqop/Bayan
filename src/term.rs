@@ -3116,6 +3116,15 @@ pub struct ClaudeFacts {
     pub term_alt: bool,
 }
 
+/// The drag's renderer layout and anchor, paired for the selection intent.
+pub(crate) type DragLayout<'a> = (
+    (&'a crate::render::Renderer, crate::render::Rect),
+    (
+        alacritty_terminal::index::Point,
+        alacritty_terminal::index::Side,
+    ),
+);
+
 /// One visible row's hit-test photograph: the cells, the painter's
 /// direction, and the gates the click column needs.
 pub struct RowSnapshot {
@@ -3710,11 +3719,6 @@ impl Session {
         self.term.lock().selection.clone()
     }
 
-    /// The scroll into history, in lines.
-    pub fn display_offset(&self) -> u64 {
-        self.term.lock().grid().display_offset() as u64
-    }
-
     /// Live viewport facts: scrollbar geometry, output following, page steps.
     pub fn scroll_facts(&self) -> ScrollFacts {
         let t = self.term.lock();
@@ -3789,13 +3793,7 @@ impl Session {
         row: i32,
         col: usize,
         side: alacritty_terminal::index::Side,
-        drag: Option<(
-            (&crate::render::Renderer, crate::render::Rect),
-            (
-                alacritty_terminal::index::Point,
-                alacritty_terminal::index::Side,
-            ),
-        )>,
+        drag: Option<DragLayout<'_>>,
     ) -> Option<(Selection, crate::render::VisualSelection)> {
         let mut t = self.term.lock();
         let off = t.grid().display_offset() as i32;
