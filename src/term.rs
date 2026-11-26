@@ -3103,6 +3103,19 @@ pub struct ScrollFacts {
     pub alt: bool,
 }
 
+/// The facts the Claude-restoration policy and the click hit-test need,
+/// copied out under term then meta — the reader's order, never nested long.
+#[derive(Clone)]
+pub struct ClaudeFacts {
+    pub bidi: Arc<crate::bidi_ctl::BidiState>,
+    pub running_cmd: String,
+    pub bidi_reorder: Option<crate::bidi_ctl::BidiReorder>,
+    pub tracked_alt: bool,
+    pub evicted: u64,
+    pub claude_from_abs: Option<u64>,
+    pub term_alt: bool,
+}
+
 /// BAYAN-014: a Session that goes away for any reason takes its shell with
 /// it. Killing a child that already exited is a harmless error.
 impl Drop for Session {
@@ -3677,6 +3690,21 @@ impl Session {
         }
     }
 
+    /// The Claude-policy and hit-test facts, live.
+    pub fn claude_facts(&self) -> ClaudeFacts {
+        let term_alt = self.term.lock().mode().contains(TermMode::ALT_SCREEN);
+        let m = self.meta.lock_or_recover();
+        ClaudeFacts {
+            bidi: m.bidi.clone(),
+            running_cmd: m.running_cmd.clone(),
+            bidi_reorder: m.bidi_reorder,
+            tracked_alt: m.alt_track.on(),
+            evicted: m.evicted,
+            claude_from_abs: m.claude_from_abs,
+            term_alt,
+        }
+    }
+
     // ---- intents: the lock lives here, callers send plain data ----
 
     /// Scroll by whole lines (positive = toward older history).
@@ -3771,6 +3799,14 @@ impl Session {
     /// Re-apply image limits after a config reload.
     pub fn apply_image_limits(&self, limits: crate::images::ImageLimits) {
         self.meta.lock_or_recover().apply_image_limits(limits);
+    }
+
+    /// Cycle the pane's reorder toggle: full → alt-screen off → off.
+    /// The config mode is the default for a pane never toggled.
+    pub fn cycle_bidi_reorder(&self, config_mode: crate::bidi_ctl::BidiReorder) {
+        let mut m = self.meta.lock_or_recover();
+        let next = m.bidi_reorder.unwrap_or(config_mode).cycle();
+        m.bidi_reorder = Some(next);
     }
 
     /// Enter copy mode: drop the selection, toggle vi.

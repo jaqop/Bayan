@@ -3351,7 +3351,7 @@ impl App {
             PaletteRow::Shell(command) => {
                 let cwd = self
                     .session()
-                    .and_then(|s| s.meta.lock_or_recover().spawn_cwd());
+                    .and_then(|s| s.spawn_cwd());
                 let before = self.tabs.len();
                 self.spawn_tab_command(cwd, &command, None);
                 if self.tabs.len() == before && self.blocked_link.is_none() {
@@ -3416,7 +3416,7 @@ impl App {
                 // that directory exists — a stale OSC 7 must not become the cwd
                 let cwd = self
                     .session()
-                    .and_then(|s| s.meta.lock_or_recover().spawn_cwd());
+                    .and_then(|s| s.spawn_cwd());
                 self.spawn_tab(cwd);
                 self.request_redraw();
             }
@@ -3514,7 +3514,7 @@ impl App {
             DuplicateTab => {
                 let Some((cwd, command)) = self.tabs.get(self.active).and_then(|tab| {
                     let pane = tab.panes.get(tab.focused)?;
-                    let cwd = pane.session.meta.lock_or_recover().spawn_cwd();
+                    let cwd = pane.session.spawn_cwd();
                     Some((cwd, duplicate_command(&pane.command, pane.mux.is_some())))
                 }) else {
                     return;
@@ -3741,7 +3741,7 @@ impl App {
     /// The focused pane's running command, if any (drives the close guard).
     fn running_command(&self, ti: usize, pi: usize) -> Option<String> {
         let pane = self.tabs.get(ti)?.panes.get(pi)?;
-        let cmd = pane.session.meta.lock_or_recover().running_cmd.clone();
+        let cmd = pane.session.running_cmd();
         (!cmd.is_empty()).then_some(cmd)
     }
 
@@ -3750,7 +3750,7 @@ impl App {
         self.tabs
             .iter()
             .flat_map(|t| &t.panes)
-            .filter(|p| !p.session.meta.lock_or_recover().running_cmd.is_empty())
+            .filter(|p| !p.session.running_cmd().is_empty())
             .count()
     }
 
@@ -3906,10 +3906,7 @@ impl App {
         let limits = self.image_budget.limits();
         for tab in &self.tabs {
             for pane in &tab.panes {
-                pane.session
-                    .meta
-                    .lock_or_recover()
-                    .apply_image_limits(limits);
+                pane.session.apply_image_limits(limits);
             }
         }
     }
@@ -4434,7 +4431,7 @@ impl App {
         };
         let cwd = self
             .session()
-            .and_then(|s| s.meta.lock_or_recover().spawn_cwd());
+            .and_then(|s| s.spawn_cwd());
         if self.config.mux_enabled() && self.spawn_mux_command(cwd.clone(), &launch) {
             return;
         }
@@ -4796,7 +4793,7 @@ impl App {
         }
         let cwd = self
             .session()
-            .and_then(|s| s.meta.lock_or_recover().spawn_cwd());
+            .and_then(|s| s.spawn_cwd());
         let Some(pane) = self.spawn_pane(cwd.as_deref()) else {
             return;
         };
@@ -4823,7 +4820,7 @@ impl App {
         let running = t
             .panes
             .iter()
-            .any(|p| !p.session.meta.lock_or_recover().running_cmd.is_empty());
+            .any(|p| !p.session.running_cmd().is_empty());
         if self.config.confirm_close_on() && running {
             self.pending_close = Some(CloseTarget::Tab(ti));
             self.request_redraw();
@@ -4986,7 +4983,7 @@ impl App {
     fn new_group(&mut self) {
         let cwd = self
             .session()
-            .and_then(|s| s.meta.lock_or_recover().spawn_cwd());
+            .and_then(|s| s.spawn_cwd());
         self.spawn_group = Some(self.groups.add());
         self.spawn_tab(cwd);
         self.spawn_group = None;
@@ -5081,9 +5078,7 @@ impl App {
                                 // BAYAN-015: a poisoned meta lock is this pane's
                                 // state, not a reason to abort the save.
                                 p.session
-                                    .meta
-                                    .lock_or_recover()
-                                    .cwd
+                                    .cwd()
                                     .as_deref()
                                     .and_then(term::accept_local_cwd)
                             })
@@ -5402,7 +5397,7 @@ impl App {
 
     fn term_mode(&self) -> TermMode {
         self.session()
-            .map_or(TermMode::empty(), |s| *s.term.lock().mode())
+            .map_or(TermMode::empty(), |s| s.mode_flags())
     }
 
     fn note_held_away(&mut self, event: &KeyEvent) {
@@ -5502,19 +5497,13 @@ impl App {
     /// between frames, so it reads live state; the redraw's reader path
     /// runs the same policy over the frame photograph.
     fn pane_claude(&self, pane: &Pane) -> bool {
-        let term_alt = pane
-            .session
-            .term
-            .lock()
-            .mode()
-            .contains(TermMode::ALT_SCREEN);
-        let m = pane.session.meta.lock_or_recover();
+        let f = pane.session.claude_facts();
         self.claude_from_facts(
-            &m.bidi,
-            &m.running_cmd,
-            m.bidi_reorder,
-            m.alt_track.on(),
-            term_alt,
+            &f.bidi,
+            &f.running_cmd,
+            f.bidi_reorder,
+            f.tracked_alt,
+            f.term_alt,
         )
     }
 
@@ -5579,7 +5568,7 @@ impl App {
                     .map(|t| {
                         t.panes
                             .iter()
-                            .filter(|p| !p.session.meta.lock_or_recover().running_cmd.is_empty())
+                            .filter(|p| !p.session.running_cmd().is_empty())
                             .count()
                     })
                     .unwrap_or(0);
@@ -5873,7 +5862,7 @@ impl App {
         let Some((ti, pi)) = self.find_pane(id) else {
             return TermMode::empty();
         };
-        *self.tabs[ti].panes[pi].session.term.lock().mode()
+        self.tabs[ti].panes[pi].session.mode_flags()
     }
 
     fn write_pane(&mut self, id: u64, bytes: &[u8]) {
@@ -6230,12 +6219,7 @@ impl App {
     /// OSC 7 (PR5) writes the same field and this is the only reader.
     fn pane_link_cwd(&self, id: u64) -> Option<String> {
         let (ti, pi) = self.find_pane(id)?;
-        let raw = self.tabs[ti].panes[pi]
-            .session
-            .meta
-            .lock_or_recover()
-            .cwd
-            .clone();
+        let raw = self.tabs[ti].panes[pi].session.cwd();
         link::cwd_hook(raw.as_deref())
     }
 
@@ -6498,7 +6482,7 @@ impl App {
             self.write_pane(out.pane, &out.bytes);
         }
         if let Some((ti, pi)) = self.find_pane(id) {
-            self.tabs[ti].panes[pi].session.term.lock().selection = None;
+            self.tabs[ti].panes[pi].session.clear_selection();
         }
         true
     }
@@ -6683,10 +6667,7 @@ impl App {
         let Some(session) = self.session_mut() else {
             return;
         };
-        let mut meta = session.meta.lock_or_recover();
-        let next = meta.bidi_reorder.unwrap_or(config_mode).cycle();
-        meta.bidi_reorder = Some(next);
-        drop(meta);
+        session.cycle_bidi_reorder(config_mode);
         self.request_redraw();
     }
 
@@ -6694,7 +6675,7 @@ impl App {
     fn focused_bidi_mode(&self) -> bidi_ctl::BidiReorder {
         let stored = self
             .session()
-            .map(|s| s.meta.lock_or_recover().bidi_reorder);
+            .map(|s| s.bidi_reorder());
         stored.flatten().unwrap_or_else(|| self.config.bidi_mode())
     }
 
@@ -7249,11 +7230,7 @@ impl App {
                                           // bracketed-paste mode
         for pi in self.broadcast_targets() {
             let session = &mut self.tabs[self.active].panes[pi].session;
-            let bracketed = session
-                .term
-                .lock()
-                .mode()
-                .contains(TermMode::BRACKETED_PASTE);
+            let bracketed = session.mode_flags().contains(TermMode::BRACKETED_PASTE);
             session.write(term::normalize_paste(txt, bracketed).as_bytes());
         }
         if let Some(s) = self.session_mut() {
@@ -7266,7 +7243,7 @@ impl App {
             self.drop_smooth(id);
         }
         if let Some(s) = self.session() {
-            s.term.lock().scroll_display(Scroll::Delta(n));
+            s.scroll_display_by(n);
         }
         self.invalidate_focused_links();
         self.request_redraw();
@@ -7971,22 +7948,12 @@ impl App {
             let now = Instant::now();
             self.tabs[ti].panes[pi].last_output = Some(now);
             self.last_pty = Some(now);
-            let (alt, following) = {
-                let t = self.tabs[ti].panes[pi].session.term.lock();
-                (
-                    t.mode().contains(TermMode::ALT_SCREEN),
-                    t.grid().display_offset() == 0,
-                )
-            };
+            let f = self.tabs[ti].panes[pi].session.scroll_facts();
+            let (alt, following) = (f.alt, f.offset == 0);
             let was_alt = self.alt_seen.insert(id, alt).unwrap_or(false);
             scroll::apply_alt_screen(&mut self.smooth, id, was_alt, alt);
             scroll::apply_output(&mut self.smooth, id, following, now);
-            let ris = {
-                let mut meta = self.tabs[ti].panes[pi].session.meta.lock_or_recover();
-                let ris = meta.saw_ris;
-                meta.saw_ris = false;
-                ris
-            };
+            let ris = self.tabs[ti].panes[pi].session.take_ris();
             if ris {
                 self.mouse.note_ris(id);
             }
