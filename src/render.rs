@@ -2499,6 +2499,17 @@ pub(crate) struct VisualSelection {
     pub(crate) claude_word_wraps: std::collections::BTreeSet<alacritty_terminal::index::Line>,
 }
 
+/// The stored visual range, only while the native selection still matches
+/// the snapshot it was built from. One implementation for the pane query
+/// and the copy/seed intents that validate under the term lock.
+pub(crate) fn validated_visual<'a>(
+    native: Option<&alacritty_terminal::selection::Selection>,
+    stored: Option<&'a (alacritty_terminal::selection::Selection, VisualSelection)>,
+) -> Option<&'a VisualSelection> {
+    let (snapshot, visual) = stored?;
+    (native == Some(snapshot)).then_some(visual)
+}
+
 /// Generational cap: on overflow the hot map becomes the cold one and a
 /// fresh hot map starts — the working set survives, stale runs age out
 /// without a clear-everything stall (EasyTer's LRU lesson, generational).

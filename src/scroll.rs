@@ -81,6 +81,27 @@ pub(crate) fn wheel_plan(
     }
 }
 
+/// The display offset that brings the previous/next prompt to the top of
+/// the view (EasyTer's _jump_command math). `abs_top` = absolute line of
+/// the viewport's first row.
+pub(crate) fn jump_offset(marks: &[usize], hist: usize, off: usize, dir: i32) -> Option<usize> {
+    let abs_top = hist as i64 - off as i64;
+    let target = if dir < 0 {
+        marks
+            .iter()
+            .map(|&a| a as i64)
+            .filter(|&a| a < abs_top)
+            .max()
+    } else {
+        marks
+            .iter()
+            .map(|&a| a as i64)
+            .filter(|&a| a > abs_top)
+            .min()
+    }?;
+    Some((hist as i64 - target + 1).clamp(0, hist as i64) as usize)
+}
+
 impl PaneScroll {
     #[cfg(test)]
     pub(crate) fn with_subline(subline: f32) -> Self {
