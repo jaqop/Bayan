@@ -769,7 +769,7 @@ use std::time::Instant;
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
-use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::selection::Selection;
 use alacritty_terminal::term::search::{Match, RegexSearch};
 use alacritty_terminal::term::TermMode;
 use winit::application::ApplicationHandler;
@@ -3321,9 +3321,7 @@ impl App {
             // the SAME dispatch a keybinding uses, not a parallel copy
             PaletteRow::Builtin(a) => self.perform_action(a, el),
             PaletteRow::Shell(command) => {
-                let cwd = self
-                    .session()
-                    .and_then(|s| s.spawn_cwd());
+                let cwd = self.session().and_then(|s| s.spawn_cwd());
                 let before = self.tabs.len();
                 self.spawn_tab_command(cwd, &command, None);
                 if self.tabs.len() == before && self.blocked_link.is_none() {
@@ -3386,9 +3384,7 @@ impl App {
             NewTab => {
                 // new tab inherits the active pane's directory, and only if
                 // that directory exists — a stale OSC 7 must not become the cwd
-                let cwd = self
-                    .session()
-                    .and_then(|s| s.spawn_cwd());
+                let cwd = self.session().and_then(|s| s.spawn_cwd());
                 self.spawn_tab(cwd);
                 self.request_redraw();
             }
@@ -4379,9 +4375,7 @@ impl App {
                 return;
             }
         };
-        let cwd = self
-            .session()
-            .and_then(|s| s.spawn_cwd());
+        let cwd = self.session().and_then(|s| s.spawn_cwd());
         if self.config.mux_enabled() && self.spawn_mux_command(cwd.clone(), &launch) {
             return;
         }
@@ -4741,9 +4735,7 @@ impl App {
         {
             return;
         }
-        let cwd = self
-            .session()
-            .and_then(|s| s.spawn_cwd());
+        let cwd = self.session().and_then(|s| s.spawn_cwd());
         let Some(pane) = self.spawn_pane(cwd.as_deref()) else {
             return;
         };
@@ -4767,10 +4759,7 @@ impl App {
         let Some(t) = self.tabs.get(ti) else {
             return;
         };
-        let running = t
-            .panes
-            .iter()
-            .any(|p| !p.session.running_cmd().is_empty());
+        let running = t.panes.iter().any(|p| !p.session.running_cmd().is_empty());
         if self.config.confirm_close_on() && running {
             self.pending_close = Some(CloseTarget::Tab(ti));
             self.request_redraw();
@@ -4931,9 +4920,7 @@ impl App {
     /// Ctrl+Shift+G: a new group, opened on one fresh tab in the active
     /// pane's directory (the same start NewTab gives).
     fn new_group(&mut self) {
-        let cwd = self
-            .session()
-            .and_then(|s| s.spawn_cwd());
+        let cwd = self.session().and_then(|s| s.spawn_cwd());
         self.spawn_group = Some(self.groups.add());
         self.spawn_tab(cwd);
         self.spawn_group = None;
@@ -5027,10 +5014,7 @@ impl App {
                                 // don't persist a path we would refuse to start in.
                                 // BAYAN-015: a poisoned meta lock is this pane's
                                 // state, not a reason to abort the save.
-                                p.session
-                                    .cwd()
-                                    .as_deref()
-                                    .and_then(term::accept_local_cwd)
+                                p.session.cwd().as_deref().and_then(term::accept_local_cwd)
                             })
                             .collect(),
                         weights,
@@ -5346,8 +5330,7 @@ impl App {
     }
 
     fn term_mode(&self) -> TermMode {
-        self.session()
-            .map_or(TermMode::empty(), |s| s.mode_flags())
+        self.session().map_or(TermMode::empty(), |s| s.mode_flags())
     }
 
     fn note_held_away(&mut self, event: &KeyEvent) {
@@ -5938,7 +5921,7 @@ impl App {
         if row < 0 {
             let snap = self.tabs[self.active].panes[hit.pane]
                 .session
-                .peek_row_snapshot(row, mode, honor, &f);
+                .peek_row_snapshot(row, mode, &f);
             let (cols, alt, cells) = (snap.cols, snap.alt, snap.cells);
             // Same gate as a fully visible row: explicit BDSM (`CSI 8 l`),
             // and the `off` and `alt_off` modes, do not reorder, so the
@@ -6580,9 +6563,7 @@ impl App {
 
     /// The focused pane's effective BiDi mode: its toggle, or the config.
     fn focused_bidi_mode(&self) -> bidi_ctl::BidiReorder {
-        let stored = self
-            .session()
-            .map(|s| s.bidi_reorder());
+        let stored = self.session().map(|s| s.bidi_reorder());
         stored.flatten().unwrap_or_else(|| self.config.bidi_mode())
     }
 
@@ -10490,6 +10471,7 @@ mod tests {
     fn exported_history_keeps_logical_arabic_wraps_and_the_selection() {
         use alacritty_terminal::{
             event::VoidListener,
+            selection::SelectionType,
             term::{Config, Term},
             vte::ansi::Processor,
         };

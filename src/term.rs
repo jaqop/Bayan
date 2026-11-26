@@ -3663,7 +3663,7 @@ impl Session {
     // directly; production code goes through the intents above ----
 
     #[cfg(test)]
-    pub(crate) fn test_term(&self) -> alacritty_terminal::sync::FairMutexGuard<'_, Term<EventProxy>> {
+    pub(crate) fn test_term(&self) -> impl std::ops::DerefMut<Target = Term<EventProxy>> + '_ {
         self.term.lock()
     }
 
@@ -3879,7 +3879,9 @@ impl Session {
         let mut t = self.term.lock();
         let visual = crate::render::validated_visual(t.selection.as_ref(), visual_snapshot);
         let text = match visual {
-            Some(selection) => Some(crate::copyclean::visual_selection_text(&t, selection, clean)),
+            Some(selection) => Some(crate::copyclean::visual_selection_text(
+                &t, selection, clean,
+            )),
             None => t.selection_to_string().map(|raw| {
                 let rows = crate::copyclean::selection_rows(&t);
                 crate::copyclean::clipboard_text(&raw, &rows, clean, claude)
@@ -3934,10 +3936,7 @@ impl Session {
             alacritty_terminal::index::Side::Left,
         );
         sel.update(
-            alacritty_terminal::index::Point::new(
-                alacritty_terminal::index::Line(last),
-                Column(0),
-            ),
+            alacritty_terminal::index::Point::new(alacritty_terminal::index::Line(last), Column(0)),
             alacritty_terminal::index::Side::Right,
         );
         t.selection = Some(sel);
@@ -3969,7 +3968,6 @@ impl Session {
         &self,
         row: i32,
         mode: crate::bidi_ctl::BidiReorder,
-        honor: bool,
         facts: &ClaudeFacts,
     ) -> PeekSnapshot {
         let t = self.term.lock();
@@ -4042,7 +4040,7 @@ impl Session {
         &self,
         query: &str,
         hl: &Option<alacritty_terminal::term::search::Match>,
-        dir: alacritty_terminal::term::search::Direction,
+        dir: alacritty_terminal::index::Direction,
         regex: bool,
     ) -> (
         Option<alacritty_terminal::term::search::Match>,
@@ -4104,7 +4102,12 @@ impl Session {
     /// Sub-line scrollback: pixel deltas move now, a wheel notch queues.
     /// The read–compute–apply stays atomic under one lock; the fractional
     /// state is the caller's, passed in and updated in place.
-    pub fn smooth_scroll(&self, st: &mut crate::scroll::PaneScroll, lines: f32, pixel: bool) -> i32 {
+    pub fn smooth_scroll(
+        &self,
+        st: &mut crate::scroll::PaneScroll,
+        lines: f32,
+        pixel: bool,
+    ) -> i32 {
         let mut t = self.term.lock();
         let offset = t.grid().display_offset() as i32;
         let history = t.grid().history_size() as i32;
