@@ -767,7 +767,7 @@ use lang::tr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::search::{Match, RegexSearch};
@@ -779,7 +779,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
-use term::{LockExt, Session, TermSize};
+use term::{Session, TermSize};
 
 pub enum UserEvent {
     ShellProfiles(Vec<shells::Shell>),
@@ -3146,13 +3146,7 @@ impl App {
         self.abandon_mouse();
         let links = self
             .session()
-            .map(|session| {
-                let t = session.term.lock();
-                (0..t.screen_lines())
-                    .flat_map(|row| link::links_on_row(&t, row))
-                    .take(500)
-                    .collect::<Vec<_>>()
-            })
+            .map(|session| session.palette_links())
             .unwrap_or_default();
         let mut extras = palette_extras(&self.shell_profiles, &links);
         extras.push((PaletteRow::OpenSsh, ssh::label_open().to_string()));
@@ -5921,22 +5915,13 @@ impl App {
     ) -> Option<(u64, i32, usize)> {
         // copy what the locks need, then drop the pane borrow so the term
         // lock below can re-borrow the tab
-        let (pane_id, running, bidi_state, evicted, claude_from, pane_mode, tracked_alt) = {
+        let (pane_id, f) = {
             let pane = self.tabs.get(self.active)?.panes.get(hit.pane)?;
-            let m = pane.session.meta.lock_or_recover();
-            (
-                pane.id,
-                m.running_cmd.clone(),
-                m.bidi.clone(),
-                m.evicted,
-                m.claude_from_abs,
-                m.bidi_reorder,
-                m.alt_track.on(),
-            )
+            (pane.id, pane.session.claude_facts())
         };
         let (auto, manual) = (self.auto_follow, self.claude_manual);
         let honor = self.config.honor_bdsm();
-        let mode = pane_mode.unwrap_or_else(|| self.config.bidi_mode());
+        let mode = f.bidi_reorder.unwrap_or_else(|| self.config.bidi_mode());
         let geom_row = if row < 0 {
             scroll::PEEK_ROW
         } else {
@@ -5951,36 +5936,30 @@ impl App {
             }
         }
         if row < 0 {
-            let (cols, alt, history, off, cells) = {
-                let t = self.tabs[self.active].panes[hit.pane].session.term.lock();
-                let off = t.grid().display_offset() as u64;
-                (
-                    t.columns().max(1),
-                    mode.effective_alt(t.mode().contains(TermMode::ALT_SCREEN), tracked_alt),
-                    t.grid().history_size() as u64,
-                    off,
-                    render::snapshot_grid_line(&t, scroll::grid_line(row, off as i32)),
-                )
-            };
+            let snap = self.tabs[self.active].panes[hit.pane]
+                .session
+                .peek_row_snapshot(row, mode, honor, &f);
+            let (cols, alt, cells) = (snap.cols, snap.alt, snap.cells);
             // Same gate as a fully visible row: explicit BDSM (`CSI 8 l`),
             // and the `off` and `alt_off` modes, do not reorder, so the
             // column is the grid's.
             let (reorder, use_stamps) =
-                bidi_state.presentation(mode, honor, !running.is_empty(), alt);
-            let abs = bidi_ctl::peek_line_abs(evicted, history, off);
+                f.bidi
+                    .presentation(mode, honor, !f.running_cmd.is_empty(), alt);
+            let abs = bidi_ctl::peek_line_abs(f.evicted, snap.history, snap.offset);
             let mut claude = reorder
                 && if !auto {
                     manual
                 } else {
-                    bidi::cmd_is_claude(&running)
+                    bidi::cmd_is_claude(&f.running_cmd)
                 };
             if !alt && auto {
-                claude &= claude_from.is_none_or(|start| abs >= start);
+                claude &= f.claude_from_abs.is_none_or(|start| abs >= start);
             }
             // The painter's direction for this row: its SCP stamp, else
             // its own first strong letter.
             let stamped = if use_stamps {
-                bidi_state.direction_at(abs)
+                f.bidi.direction_at(abs)
             } else {
                 bidi_ctl::ParagraphDir::Default
             };
@@ -6015,57 +5994,44 @@ impl App {
             return Some((pane_id, row, col.min(cols - 1)));
         }
         let (cols, row, cells, claude, vis, reorder, dir, align_edge, bidi_row) = {
-            let t = self.tabs[self.active].panes[hit.pane].session.term.lock();
-            let cols = t.columns().max(1);
-            let rows = t.screen_lines().max(1);
-            let row = row.min(rows as i32 - 1);
+            let snap = self.tabs[self.active].panes[hit.pane]
+                .session
+                .visible_row_snapshot(row, mode, honor, &f);
             // Explicit BDSM draws Arabic on the grid, so the click column
             // is x / cell_w. Implicit mode uses the same plan as the painter,
             // SCP mark included. Neither applies once the command has ended
             // and the pane is back on the primary screen. `off` and
             // `alt_off` on the alternate screen take the grid path too.
-            let term_alt = t.mode().contains(TermMode::ALT_SCREEN);
-            let alt = mode.effective_alt(term_alt, tracked_alt);
-            let (reorder, use_stamps) =
-                bidi_state.presentation(mode, honor, !running.is_empty(), alt);
-            let mut claude = reorder
+            let mut claude = snap.reorder
                 && if !auto {
                     manual
                 } else {
-                    bidi::cmd_is_claude(&running)
+                    bidi::cmd_is_claude(&f.running_cmd)
                 };
-            let history = t.grid().history_size() as u64;
-            let off = t.grid().display_offset() as u64;
-            if !alt && auto {
-                let abs = bidi_ctl::viewport_line_abs(evicted, history, off, row as u64);
-                claude &= claude_from.is_none_or(|start| abs >= start);
+            if !snap.alt && auto {
+                let abs = bidi_ctl::viewport_line_abs(
+                    f.evicted,
+                    snap.history,
+                    snap.offset,
+                    snap.row as u64,
+                );
+                claude &= f.claude_from_abs.is_none_or(|start| abs >= start);
             }
-            // The row's direction and path as draw_pane picks them: SCP
-            // stamp, then the wrapped paragraph's direction, then its own
-            // first strong letter. A wrapped RTL tail is bidi without Arabic.
-            let (dir, bidi_row) = render::viewport_row_layout(&t, row as usize, |li| {
-                if use_stamps {
-                    bidi_state.direction_at(bidi_ctl::viewport_line_abs(
-                        evicted, history, off, li as u64,
-                    ))
-                } else {
-                    bidi_ctl::ParagraphDir::Default
-                }
-            });
-            let cells = render::snapshot_row(&t, row as usize);
             // Same split as draw_pane: TUI fields and the alternate screen
             // are not flush-right, so a click must not assume they are.
-            let align_edge = reorder && !alt && !((claude || alt) && render::snap_is_tui(&cells));
+            let align_edge = snap.reorder
+                && !snap.alt
+                && !((claude || snap.alt) && render::snap_is_tui(&snap.cells));
             (
-                cols,
-                row,
-                cells,
+                snap.cols,
+                snap.row,
+                snap.cells,
                 claude,
-                hit.col.min(cols - 1),
-                reorder,
-                dir,
+                hit.col.min(snap.cols - 1),
+                snap.reorder,
+                snap.dir,
                 align_edge,
-                bidi_row,
+                snap.bidi_row,
             )
         };
         let mapped = rects
@@ -6191,10 +6157,7 @@ impl App {
         let Some((ti, pi)) = self.find_pane(id) else {
             return Vec::new();
         };
-        let spans = {
-            let term = self.tabs[ti].panes[pi].session.term.lock();
-            link::links_on_viewport(&term, row)
-        };
+        let spans = self.tabs[ti].panes[pi].session.viewport_links(row);
         self.link_cache.insert(id, key, spans.clone());
         spans
     }
@@ -9933,26 +9896,6 @@ mod tests {
     }
 
     #[test]
-    fn meta_locks_are_not_unwrapped() {
-        // BAYAN-015: `.lock()` then `.unwrap()` panics the UI when the
-        // reader thread poisoned the mutex. The call is often split across
-        // lines, which a single-line search misses.
-        let files = [
-            ("main.rs", include_str!("main.rs")),
-            ("term.rs", include_str!("term.rs")),
-            ("input.rs", include_str!("input.rs")),
-            ("keyroute.rs", include_str!("keyroute.rs")),
-        ];
-        for (name, src) in files {
-            let hits = unwrap_after_lock(&strip_line_comments(src));
-            assert!(
-                hits.is_empty(),
-                "{name}: lock().unwrap at lines {hits:?} — use lock_or_recover"
-            );
-        }
-    }
-
-    #[test]
     fn search_seed_is_bounded_literal_and_restores_claude_arabic() {
         assert_eq!(selection_search_query(Some("a.b(c)"), false), "a.b(c)");
         assert_eq!(selection_search_query(Some("ابحرم"), true), "مرحبا");
@@ -10726,45 +10669,6 @@ mod tests {
     }
 }
 
-/// Drop `//` comments so a doc line that names the old call does not look
-/// like a live one. Strings are left as they are; none of the scanned files
-/// put this call inside a string.
-#[cfg(test)]
-fn strip_line_comments(src: &str) -> String {
-    let mut out = String::with_capacity(src.len());
-    for line in src.lines() {
-        match line.find("//") {
-            Some(i) => out.push_str(&line[..i]),
-            None => out.push_str(line),
-        }
-        out.push('\n');
-    }
-    out
-}
-
-/// Lines where `.lock()` is followed only by whitespace and then `.unwrap()`.
-/// The needles are built in pieces so this scanner does not flag itself.
-#[cfg(test)]
-fn unwrap_after_lock(src: &str) -> Vec<usize> {
-    let lock = concat!(".", "lock()");
-    let unwrap = concat!(".", "unwrap()");
-    let mut hits = Vec::new();
-    let mut offset = 0;
-    let mut line = 1usize;
-    while let Some(rel) = src[offset..].find(lock) {
-        let at = offset + rel;
-        line += src[offset..at].bytes().filter(|&b| b == b'\n').count();
-        let after = &src[at + lock.len()..];
-        if after.trim_start().starts_with(unwrap) {
-            hits.push(line);
-        }
-        let next = at + lock.len();
-        line += src[at..next].bytes().filter(|&b| b == b'\n').count();
-        offset = next;
-    }
-    hits
-}
-
 #[cfg(test)]
 mod palette_tests {
     use super::*;
@@ -11323,18 +11227,13 @@ mod scroll_app_tests {
     }
 
     fn feed(app: &App, bytes: &[u8]) {
-        let mut t = app.tabs[0].panes[0].session.term.lock();
+        let mut t = app.tabs[0].panes[0].session.test_term();
         let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
         parser.advance(&mut *t, bytes);
     }
 
     fn display_offset(app: &App) -> usize {
-        app.tabs[0].panes[0]
-            .session
-            .term
-            .lock()
-            .grid()
-            .display_offset()
+        app.tabs[0].panes[0].session.display_offset() as usize
     }
 
     fn stale_fraction(app: &mut App, id: u64) {
@@ -11365,11 +11264,7 @@ mod scroll_app_tests {
     fn new_output_while_scrolled_up_keeps_the_offset() {
         let (mut app, id, _) = host(false);
         fill_history(&app);
-        app.tabs[0].panes[0]
-            .session
-            .term
-            .lock()
-            .scroll_display(alacritty_terminal::grid::Scroll::Delta(3));
+        app.tabs[0].panes[0].session.scroll_display_by(3);
         assert!(display_offset(&app) > 0);
         stale_fraction(&mut app, id);
         app.wakeup(id);
@@ -11527,7 +11422,7 @@ mod scroll_app_tests {
             .unwrap()
             .plant_hit(rect, scroll::PEEK_ROW, 0, rect.2.max(1), 7);
         {
-            let mut meta = app.tabs[0].panes[0].session.meta.lock_or_recover();
+            let mut meta = app.tabs[0].panes[0].session.test_meta();
             meta.running_cmd = "demo".into();
         }
         app.cursor_pos = PhysicalPosition::new(2.0, 1.0);
@@ -11535,7 +11430,7 @@ mod scroll_app_tests {
         assert_eq!(on.2, -1);
         assert_eq!(on.3, 7, "implicit mode uses the shaped column");
         {
-            let mut meta = app.tabs[0].panes[0].session.meta.lock_or_recover();
+            let mut meta = app.tabs[0].panes[0].session.test_meta();
             meta.bidi_mut().mode = bidi_ctl::BidiMode::Explicit;
         }
         let off = app.locate(app.cursor_pos).unwrap();

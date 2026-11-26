@@ -3019,8 +3019,8 @@ impl EventListener for EventProxy {
 }
 
 pub struct Session {
-    pub term: Arc<FairMutex<Term<EventProxy>>>,
-    pub meta: Arc<Mutex<SessionMeta>>,
+    term: Arc<FairMutex<Term<EventProxy>>>,
+    meta: Arc<Mutex<SessionMeta>>,
     writer: crate::pty_writer::PtyWriter,
     /// Set while a `PtyWriteFailed` is in flight (see [`first_report`]).
     write_error: Arc<AtomicBool>,
@@ -3114,6 +3114,29 @@ pub struct ClaudeFacts {
     pub evicted: u64,
     pub claude_from_abs: Option<u64>,
     pub term_alt: bool,
+}
+
+/// One visible row's hit-test photograph: the cells, the painter's
+/// direction, and the gates the click column needs.
+pub struct RowSnapshot {
+    pub cols: usize,
+    pub row: i32,
+    pub alt: bool,
+    pub reorder: bool,
+    pub history: u64,
+    pub offset: u64,
+    pub cells: Vec<crate::render::SnapCell>,
+    pub dir: crate::bidi_ctl::ParagraphDir,
+    pub bidi_row: bool,
+}
+
+/// The peek row's hit-test photograph (the history line above the viewport).
+pub struct PeekSnapshot {
+    pub cols: usize,
+    pub alt: bool,
+    pub history: u64,
+    pub offset: u64,
+    pub cells: Vec<crate::render::SnapCell>,
 }
 
 /// BAYAN-014: a Session that goes away for any reason takes its shell with
@@ -3636,6 +3659,19 @@ impl Session {
         fill_meta(&mut m, frame, None);
     }
 
+    // ---- test-only raw guards: the scroll-app tests drive the grid
+    // directly; production code goes through the intents above ----
+
+    #[cfg(test)]
+    pub(crate) fn test_term(&self) -> alacritty_terminal::sync::FairMutexGuard<'_, Term<EventProxy>> {
+        self.term.lock()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_meta(&self) -> std::sync::MutexGuard<'_, SessionMeta> {
+        self.meta.lock_or_recover()
+    }
+
     // ---- live queries: one lock each, facts copied out ----
 
     /// The term mode flags, live. Input paths between frames need the
@@ -3911,6 +3947,92 @@ impl Session {
     /// The whole scrollback as text, for the export file.
     pub fn history_text(&self, claude: bool) -> String {
         crate::copyclean::history_text(&self.term.lock(), claude)
+    }
+
+    /// Link spans across the viewport, for the palette (capped at 500).
+    pub fn palette_links(&self) -> Vec<crate::link::LinkSpan> {
+        let t = self.term.lock();
+        (0..t.screen_lines())
+            .flat_map(|row| crate::link::links_on_row(&t, row))
+            .take(500)
+            .collect()
+    }
+
+    /// Link spans on one viewport row (hover/underline cache miss).
+    pub fn viewport_links(&self, vrow: i32) -> Vec<crate::link::LinkSpan> {
+        crate::link::links_on_viewport(&self.term.lock(), vrow)
+    }
+
+    /// The peek row's hit-test photograph. The presentation gates run
+    /// inside the lock, on the same facts the painter would use.
+    pub fn peek_row_snapshot(
+        &self,
+        row: i32,
+        mode: crate::bidi_ctl::BidiReorder,
+        honor: bool,
+        facts: &ClaudeFacts,
+    ) -> PeekSnapshot {
+        let t = self.term.lock();
+        let off = t.grid().display_offset() as u64;
+        let term_alt = t.mode().contains(TermMode::ALT_SCREEN);
+        let alt = mode.effective_alt(term_alt, facts.tracked_alt);
+        let history = t.grid().history_size() as u64;
+        let cells =
+            crate::render::snapshot_grid_line(&t, crate::scroll::grid_line(row, off as i32));
+        PeekSnapshot {
+            cols: t.columns().max(1),
+            alt,
+            history,
+            offset: off,
+            cells,
+        }
+    }
+
+    /// One visible row's hit-test photograph: cells, painter direction, and
+    /// the reorder/alt gates — the same plan draw_pane uses, under one lock.
+    pub fn visible_row_snapshot(
+        &self,
+        row: i32,
+        mode: crate::bidi_ctl::BidiReorder,
+        honor: bool,
+        facts: &ClaudeFacts,
+    ) -> RowSnapshot {
+        let t = self.term.lock();
+        let cols = t.columns().max(1);
+        let rows = t.screen_lines().max(1);
+        let row = row.min(rows as i32 - 1);
+        let term_alt = t.mode().contains(TermMode::ALT_SCREEN);
+        let alt = mode.effective_alt(term_alt, facts.tracked_alt);
+        let (reorder, use_stamps) =
+            facts
+                .bidi
+                .presentation(mode, honor, !facts.running_cmd.is_empty(), alt);
+        let history = t.grid().history_size() as u64;
+        let off = t.grid().display_offset() as u64;
+        let (dir, bidi_row) = crate::render::viewport_row_layout(&t, row as usize, |li| {
+            if use_stamps {
+                facts.bidi.direction_at(crate::bidi_ctl::viewport_line_abs(
+                    facts.evicted,
+                    history,
+                    off,
+                    li as u64,
+                ))
+            } else {
+                crate::bidi_ctl::ParagraphDir::Default
+            }
+        });
+        let cells = crate::render::snapshot_row(&t, row as usize);
+        RowSnapshot {
+            cols,
+            row,
+            alt,
+            reorder,
+            history,
+            offset: off,
+            cells,
+            dir,
+            bidi_row,
+        }
     }
 
     /// Find the next/previous search hit, center it, and count hits against
