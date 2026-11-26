@@ -343,7 +343,7 @@ fn ctrl_letter(key: &Key) -> Option<char> {
 
 /// The literal-text search core, GUI-free so a real Term can exercise it in
 /// tests: step past the current hit, search in `dir`, wrap from the far end.
-fn find_match<T: alacritty_terminal::event::EventListener>(
+pub(crate) fn find_match<T: alacritty_terminal::event::EventListener>(
     t: &mut alacritty_terminal::term::Term<T>,
     query: &str,
     hl: &Option<Match>,
@@ -359,7 +359,7 @@ const SEARCH_COUNT_CAP: usize = 1000;
 
 /// Where the current hit sits among all hits, top of the scrollback first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SearchCount {
+pub(crate) struct SearchCount {
     /// 1-based position of the current hit. `None` when there is no current
     /// hit or it lies past the cap.
     at: Option<usize>,
@@ -381,7 +381,7 @@ enum SearchStatus {
 
 /// Count the hits of `query` over the whole scrollback, literal or regex
 /// as [`find_match_mode`] reads it. `None` is a pattern that does not compile.
-fn count_matches<T>(
+pub(crate) fn count_matches<T>(
     t: &alacritty_terminal::term::Term<T>,
     query: &str,
     hl: &Option<Match>,
@@ -461,7 +461,7 @@ fn duplicate_command(pane_command: &str, in_mux: bool) -> Option<String> {
     (!in_mux && !pane_command.trim().is_empty()).then(|| pane_command.to_string())
 }
 
-fn find_match_mode<T: alacritty_terminal::event::EventListener>(
+pub(crate) fn find_match_mode<T: alacritty_terminal::event::EventListener>(
     t: &mut alacritty_terminal::term::Term<T>,
     query: &str,
     hl: &Option<Match>,
@@ -503,27 +503,6 @@ fn find_match_mode<T: alacritty_terminal::event::EventListener>(
         };
         t.search_next(&mut rs, wrap, dir, side, None)
     })
-}
-
-/// The display offset that brings the previous/next prompt to the top of
-/// the view (EasyTer's _jump_command math). `abs_top` = absolute line of
-/// the viewport's first row.
-fn jump_offset(marks: &[usize], hist: usize, off: usize, dir: i32) -> Option<usize> {
-    let abs_top = hist as i64 - off as i64;
-    let target = if dir < 0 {
-        marks
-            .iter()
-            .map(|&a| a as i64)
-            .filter(|&a| a < abs_top)
-            .max()
-    } else {
-        marks
-            .iter()
-            .map(|&a| a as i64)
-            .filter(|&a| a > abs_top)
-            .min()
-    }?;
-    Some((hist as i64 - target + 1).clamp(0, hist as i64) as usize)
 }
 
 /// Minimum gap between two toasts a PROGRAM asked for. Terminal output is
@@ -956,8 +935,7 @@ struct Pane {
 
 impl Pane {
     fn visual_selection(&self, native: Option<&Selection>) -> Option<&render::VisualSelection> {
-        let (snapshot, visual) = self.visual_selection.as_ref()?;
-        (native == Some(snapshot)).then_some(visual)
+        render::validated_visual(native, self.visual_selection.as_ref())
     }
 }
 
@@ -1088,7 +1066,7 @@ fn broadcast_targets(on: bool, panes: usize, focused: usize) -> Vec<usize> {
 /// Global rows `[start, end)` to the grid lines of their first and last
 /// row, for the current history size. Rows already pushed out of the
 /// scrollback are dropped from the top; nothing left is `None`.
-fn output_lines(
+pub(crate) fn output_lines(
     start: u64,
     end: u64,
     evicted: u64,
@@ -3434,14 +3412,7 @@ impl App {
             }
             Search | SearchRegex => {
                 let (selected, restore) = self.focused_pane().map_or((None, false), |pane| {
-                    let term = pane.session.term.lock();
-                    match pane.visual_selection(term.selection.as_ref()) {
-                        Some(visual) => (
-                            Some(copyclean::visual_selection_text(&term, visual, false)),
-                            false,
-                        ),
-                        None => (term.selection_to_string(), true),
-                    }
+                    pane.session.selection_seed(pane.visual_selection.as_ref())
                 });
                 self.search = Some(SearchState::from_selection(
                     selected.as_deref(),
@@ -4122,22 +4093,7 @@ impl App {
     /// Scroll to the previous (dir<0) or next command prompt (OSC 133 marks).
     fn jump_command(&mut self, dir: i32) {
         let Some(s) = self.session() else { return };
-        {
-            let mut t = s.term.lock();
-            let hist = t.grid().history_size();
-            let off = t.grid().display_offset();
-            let marks: Vec<usize> = {
-                let m = s.meta.lock_or_recover();
-                m.marks
-                    .iter()
-                    .filter(|c| c.abs >= m.evicted)
-                    .map(|c| (c.abs - m.evicted) as usize)
-                    .collect()
-            };
-            if let Some(new_off) = jump_offset(&marks, hist, off, dir) {
-                t.scroll_display(Scroll::Delta(new_off as i32 - off as i32));
-            }
-        }
+        s.jump_to_command(dir);
         if let Some(id) = self.focused_pane_id() {
             self.drop_smooth(id);
         }
@@ -6580,10 +6536,10 @@ impl App {
 
     fn has_selection(&self) -> bool {
         self.focused_pane().is_some_and(|pane| {
-            let term = pane.session.term.lock();
-            match pane.visual_selection(term.selection.as_ref()) {
+            let sel = pane.session.selection();
+            match pane.visual_selection(sel.as_ref()) {
                 Some(visual) => !visual.points.is_empty(),
-                None => term.selection.as_ref().is_some_and(|sel| !sel.is_empty()),
+                None => sel.as_ref().is_some_and(|sel| !sel.is_empty()),
             }
         })
     }
@@ -6608,21 +6564,9 @@ impl App {
         };
         let claude = self.claude_active();
         let clean = force_clean || self.config.clean_copy().enabled(claude);
-        let text = {
-            let mut t = pane.session.term.lock();
-            let visual = pane.visual_selection(t.selection.as_ref());
-            let text = match visual {
-                Some(selection) => Some(copyclean::visual_selection_text(&t, selection, clean)),
-                None => t.selection_to_string().map(|raw| {
-                    let rows = copyclean::selection_rows(&t);
-                    copyclean::clipboard_text(&raw, &rows, clean, claude)
-                }),
-            };
-            if clear {
-                t.selection = None;
-            }
-            text
-        };
+        let text = pane
+            .session
+            .copy_text(pane.visual_selection.as_ref(), clean, claude, clear);
         if clear {
             if let Some(pane) = self.focused_pane_mut() {
                 pane.visual_selection = None;
@@ -6773,27 +6717,8 @@ impl App {
         let Some(s) = self.session() else {
             return;
         };
-        let range = {
-            let m = s.meta.lock_or_recover();
-            term::last_output_range(&m.marks).map(|r| (r, m.evicted))
-        };
-        let Some(((start, end), evicted)) = range else {
+        if !s.select_last_output() {
             return;
-        };
-        {
-            let mut t = s.term.lock();
-            let history = t.grid().history_size() as u64;
-            let Some((first, last)) = output_lines(start, end, evicted, history, t.screen_lines())
-            else {
-                return;
-            };
-            let mut sel = Selection::new(
-                SelectionType::Lines,
-                Point::new(Line(first), Column(0)),
-                Side::Left,
-            );
-            sel.update(Point::new(Line(last), Column(0)), Side::Right);
-            t.selection = Some(sel);
         }
         self.copy_selection(false);
         self.request_redraw();
@@ -6805,7 +6730,7 @@ impl App {
         let Some(session) = self.session() else {
             return;
         };
-        let text = copyclean::history_text(&session.term.lock(), claude);
+        let text = session.history_text(claude);
         let result = (|| -> std::io::Result<std::path::PathBuf> {
             let dir = config::bayan_dir().join("exports");
             std::fs::create_dir_all(&dir)?;
@@ -7261,28 +7186,12 @@ impl App {
         let Some(session) = self.session() else {
             return;
         };
-        let (found, status) = {
-            let mut t = session.term.lock();
-            let hl = self.search.as_ref().and_then(|s| s.hl.clone());
-            let regex = self.search.as_ref().is_some_and(|s| s.regex);
-            let m = if regex {
-                find_match_mode(&mut t, &query, &hl, dir, true)
-            } else {
-                find_match(&mut t, &query, &hl, dir)
-            };
-            if let Some(m) = &m {
-                // bring the hit into view, roughly centered
-                let cur = t.grid().display_offset() as i32;
-                let want = (-(m.start().line.0) + t.screen_lines() as i32 / 2)
-                    .clamp(0, t.grid().history_size() as i32);
-                t.scroll_display(Scroll::Delta(want - cur));
-            }
-            // count against the hit just found, so the bar reads 2/17
-            let status = match count_matches(&t, &query, &m, regex) {
-                Some(c) => SearchStatus::Counted(c),
-                None => SearchStatus::BadPattern,
-            };
-            (m, status)
+        let hl = self.search.as_ref().and_then(|s| s.hl.clone());
+        let regex = self.search.as_ref().is_some_and(|s| s.regex);
+        let (found, count) = session.search_step(&query, &hl, dir, regex);
+        let status = match count {
+            Some(c) => SearchStatus::Counted(c),
+            None => SearchStatus::BadPattern,
         };
         if let Some(id) = self.focused_pane_id() {
             self.drop_smooth(id);
@@ -10393,6 +10302,7 @@ mod tests {
 
     #[test]
     fn jump_offset_walks_prompts() {
+        use crate::scroll::jump_offset;
         // prompts at absolute lines 10, 40, 80; history 100, at the bottom
         let marks = [10usize, 40, 80];
         // viewport top = 100: previous prompt is 80 -> off = 100-80+1 = 21

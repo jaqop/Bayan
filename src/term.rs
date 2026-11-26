@@ -3809,6 +3809,141 @@ impl Session {
         m.bidi_reorder = Some(next);
     }
 
+    /// Scroll to the previous (dir<0) or next command prompt (OSC 133
+    /// marks). Marks and evictions stay behind the seam; term then meta,
+    /// the reader's order.
+    pub fn jump_to_command(&self, dir: i32) {
+        let mut t = self.term.lock();
+        let hist = t.grid().history_size();
+        let off = t.grid().display_offset();
+        let marks: Vec<usize> = {
+            let m = self.meta.lock_or_recover();
+            m.marks
+                .iter()
+                .filter(|c| c.abs >= m.evicted)
+                .map(|c| (c.abs - m.evicted) as usize)
+                .collect()
+        };
+        if let Some(new_off) = crate::scroll::jump_offset(&marks, hist, off, dir) {
+            t.scroll_display(Scroll::Delta(new_off as i32 - off as i32));
+        }
+    }
+
+    /// The selection's text for the clipboard: the validated visual range
+    /// when one is current, else the raw selection cleaned. `clear` drops
+    /// the native selection afterwards. One lock, so the text matches the
+    /// range it was read from.
+    pub fn copy_text(
+        &self,
+        visual_snapshot: Option<&(Selection, crate::render::VisualSelection)>,
+        clean: bool,
+        claude: bool,
+        clear: bool,
+    ) -> Option<String> {
+        let mut t = self.term.lock();
+        let visual = crate::render::validated_visual(t.selection.as_ref(), visual_snapshot);
+        let text = match visual {
+            Some(selection) => Some(crate::copyclean::visual_selection_text(&t, selection, clean)),
+            None => t.selection_to_string().map(|raw| {
+                let rows = crate::copyclean::selection_rows(&t);
+                crate::copyclean::clipboard_text(&raw, &rows, clean, claude)
+            }),
+        };
+        if clear {
+            t.selection = None;
+        }
+        text
+    }
+
+    /// The search seed from the current selection: the visual range's text
+    /// when one is current (no Claude restore), else the raw selection text
+    /// (restore applies).
+    pub fn selection_seed(
+        &self,
+        visual_snapshot: Option<&(Selection, crate::render::VisualSelection)>,
+    ) -> (Option<String>, bool) {
+        let t = self.term.lock();
+        match crate::render::validated_visual(t.selection.as_ref(), visual_snapshot) {
+            Some(visual) => (
+                Some(crate::copyclean::visual_selection_text(&t, visual, false)),
+                false,
+            ),
+            None => (t.selection_to_string(), true),
+        }
+    }
+
+    /// Select what the last finished command printed, read between its OSC
+    /// 133 marks. False without shell integration or a finished command.
+    pub fn select_last_output(&self) -> bool {
+        let range = {
+            let m = self.meta.lock_or_recover();
+            last_output_range(&m.marks).map(|r| (r, m.evicted))
+        };
+        let Some(((start, end), evicted)) = range else {
+            return false;
+        };
+        let mut t = self.term.lock();
+        let history = t.grid().history_size() as u64;
+        let Some((first, last)) =
+            crate::output_lines(start, end, evicted, history, t.screen_lines())
+        else {
+            return false;
+        };
+        let mut sel = Selection::new(
+            alacritty_terminal::selection::SelectionType::Lines,
+            alacritty_terminal::index::Point::new(
+                alacritty_terminal::index::Line(first),
+                Column(0),
+            ),
+            alacritty_terminal::index::Side::Left,
+        );
+        sel.update(
+            alacritty_terminal::index::Point::new(
+                alacritty_terminal::index::Line(last),
+                Column(0),
+            ),
+            alacritty_terminal::index::Side::Right,
+        );
+        t.selection = Some(sel);
+        true
+    }
+
+    /// The whole scrollback as text, for the export file.
+    pub fn history_text(&self, claude: bool) -> String {
+        crate::copyclean::history_text(&self.term.lock(), claude)
+    }
+
+    /// Find the next/previous search hit, center it, and count hits against
+    /// it — one lock for the whole step, so the bar's count matches the hit
+    /// just found. The search core lives GUI-free at the crate root.
+    pub fn search_step(
+        &self,
+        query: &str,
+        hl: &Option<alacritty_terminal::term::search::Match>,
+        dir: alacritty_terminal::term::search::Direction,
+        regex: bool,
+    ) -> (
+        Option<alacritty_terminal::term::search::Match>,
+        Option<crate::SearchCount>,
+    ) {
+        let mut t = self.term.lock();
+        let m = if regex {
+            crate::find_match_mode(&mut t, query, hl, dir, true)
+        } else {
+            crate::find_match(&mut t, query, hl, dir)
+        };
+        if let Some(m) = &m {
+            // bring the hit into view, roughly centered
+            let cur = t.grid().display_offset() as i32;
+            let want = (-(m.start().line.0) + t.screen_lines() as i32 / 2)
+                .clamp(0, t.grid().history_size() as i32);
+            t.scroll_display(Scroll::Delta(want - cur));
+        }
+        // count against the hit just found, so the bar reads 2/17
+        let count = crate::count_matches(&t, query, &m, regex);
+        (m, count)
+    }
+
     /// Enter copy mode: drop the selection, toggle vi.
     pub fn enter_copy_mode(&self) {
         let mut t = self.term.lock();
