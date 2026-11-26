@@ -3780,6 +3780,34 @@ impl Session {
         t.toggle_vi_mode();
     }
 
+    /// Leave copy mode: vi off (when on), selection gone, view at the
+    /// prompt, where typing would have taken it anyway.
+    pub fn exit_copy_mode(&self) {
+        let mut t = self.term.lock();
+        if t.mode().contains(TermMode::VI) {
+            t.toggle_vi_mode();
+        }
+        t.selection = None;
+        t.scroll_display(Scroll::Bottom);
+    }
+
+    /// Apply a copy-mode command. Horizontal motions map through the
+    /// renderer's shaped layout when it is current; the lock stays here.
+    pub fn copy_mode_apply(
+        &self,
+        cmd: crate::copymode::Cmd,
+        layout: Option<(&crate::render::Renderer, crate::render::Rect)>,
+    ) {
+        use alacritty_terminal::vi_mode::ViMotion;
+        let mut t = self.term.lock();
+        match cmd {
+            crate::copymode::Cmd::Motion(motion @ (ViMotion::Left | ViMotion::Right)) => {
+                crate::copymode::move_horizontal(&mut t, layout, motion);
+            }
+            _ => crate::copymode::apply(&mut t, cmd),
+        }
+    }
+
     /// Sub-line scrollback: pixel deltas move now, a wheel notch queues.
     /// The read–compute–apply stays atomic under one lock; the fractional
     /// state is the caller's, passed in and updated in place.
