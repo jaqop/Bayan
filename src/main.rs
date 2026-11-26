@@ -7572,9 +7572,11 @@ impl App {
                         Vec::new()
                     };
                     let peek_dir = if use_stamps {
-                        frame
-                            .bidi
-                            .direction_at(bidi_ctl::peek_line_abs(frame.evicted, history, off))
+                        frame.bidi.direction_at(bidi_ctl::peek_line_abs(
+                            frame.evicted,
+                            history,
+                            off,
+                        ))
                     } else {
                         bidi_ctl::ParagraphDir::Default
                     };

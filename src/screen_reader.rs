@@ -23,10 +23,12 @@ use accesskit::{
     Live, Node, NodeId, Role, TextDirection, TextPosition, TextSelection, TreeId, TreeInfo,
     TreeUpdate,
 };
+#[cfg(test)]
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::index::Point;
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::cell::Flags;
+#[cfg(test)]
 use alacritty_terminal::term::Term;
 
 use crate::bidi;

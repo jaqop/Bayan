@@ -3599,8 +3599,7 @@ impl Session {
         let mut m = self.meta.lock_or_recover();
         fill_meta(&mut m, frame, cell_px);
         frame.claude_from_grid = m.claude_from_abs.map(|start| {
-            start as i64 - frame.evicted as i64 - frame.history as i64
-                + frame.display_offset as i64
+            start as i64 - frame.evicted as i64 - frame.history as i64 + frame.display_offset as i64
         });
     }
 

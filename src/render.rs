@@ -13732,7 +13732,9 @@ mod paragraph_align {
         );
 
         let mut shaded = Vec::new();
-        renderer.draw_pane_with_selection(&mut shaded, &view, &term, Some(&forward));
+        let mut frame = crate::pane_frame::PaneFrame::new();
+        frame.capture_grid(&term);
+        renderer.draw_pane_with_selection(&mut shaded, &view, &frame, Some(&forward));
         let color = c4(SELECTION_RGBA.0, SELECTION_RGBA.1 as u8);
         assert_eq!(shaded.iter().filter(|v| v.color == color).count(), 6 * 6);
     }

@@ -182,7 +182,7 @@ impl PaneFrame {
                 start = n;
                 last_vrow = Some(li);
             }
-            put_cell(&mut self.cells, &mut n, cell.point.column.0, cell);
+            put_cell(&mut self.cells, &mut n, cell.point.column.0, &cell);
         }
         if let Some(prev) = last_vrow {
             self.row_spans[prev] = start..n;
