@@ -3,21 +3,30 @@
 What the `perf` CI job compares against. Figures are from GitHub's hosted
 `windows-latest` runner, not the author's machine.
 
-| Probe | Baseline | From (three runs on 7803919 + the gate, 2026-11-13) |
+| Probe | Baseline | From |
 |---|---|---|
-| throughput ascii | 78% of vte | 77, 78, 77 |
-| throughput sgr | 36% of vte | 35, 36, 36 |
-| throughput arabic | 70% of vte | 71, 69, 68 |
-| scrollback 10000 | 32.7 MB | 32.7, 32.7, 32.7 |
-| scrollback 100000 | 302.0 MB | 301.9, 302.0, 302.0 |
+| throughput ascii | 78% of vte | 77, 78, 77 (three runs on 7803919 + the gate, 2026-11-13) |
+| throughput sgr | 42% of vte | 42, 42, 41 (best of three per job, raised 2026-11-26; see below) |
+| throughput arabic | 76% of vte | 76, 71, 81 (best of three per job, raised 2026-11-26; see below) |
+| scrollback 10000 | 32.7 MB | 32.7, 32.7, 32.7 (three runs on 7803919 + the gate, 2026-11-13) |
+| scrollback 100000 | 302.0 MB | 301.9, 302.0, 302.0 (three runs on 7803919 + the gate, 2026-11-13) |
 
-The SGR share is 36% here and 51% on the author's machine: the ratio is
+The SGR share is 42% here and 51% on the author's machine: the ratio is
 steady on one machine, not the same number on every machine. If GitHub
 moves the runner to different hardware and a ratio shifts with no code
 change, re-measure and update this file in a pull request of its own.
 
 Raise a figure when a change improves it by more than the tolerance; the
 job prints a note when that happens.
+
+The sgr and arabic figures were raised on 2026-11-26 from three hosted
+jobs: 44563757376 and 44565454669 (2026-11-19) and 45892354616
+(2026-11-26), the first and last on 2658507. Each figure is the best of
+the job's three runs; the baseline is the median of the three jobs.
+Arabic is the noisy corpus: its best-of-three read 71 to 81 while the
+reader rate held at 110 to 122 MB/s and the vte-alone denominator moved,
+so the median keeps the gain without failing a quiet job. The floors are
+37.8% for sgr and 68.4% for arabic.
 
 ## Startup
 
@@ -51,8 +60,8 @@ The first start of each job is cold and is not what the gate reads: up to
 617 ms to the first frame and 3.9 s to a ready renderer. A hosted runner
 has no GPU; the window opens on WARP.
 
-The SGR throughput share read 35 to 41% across five jobs, the widest of
-the three corpora. Its floor is 32.4%.
+The SGR throughput share read 35 to 42% across hosted jobs, the widest of
+the three corpora. Its floor is 37.8%.
 
 ## Validation and local runs
 
