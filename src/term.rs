@@ -11,6 +11,7 @@ use std::time::Instant;
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Column;
+use alacritty_terminal::selection::Selection;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Osc52, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
@@ -3092,6 +3093,16 @@ fn fill_meta(
     }
 }
 
+/// Live viewport facts, copied out under one lock. The scrollbar, output
+/// following, and page steps read these between frames.
+#[derive(Clone, Copy)]
+pub struct ScrollFacts {
+    pub rows: usize,
+    pub history: u64,
+    pub offset: u64,
+    pub alt: bool,
+}
+
 /// BAYAN-014: a Session that goes away for any reason takes its shell with
 /// it. Killing a child that already exited is a harmless error.
 impl Drop for Session {
@@ -3610,6 +3621,216 @@ impl Session {
     pub fn fill_facts(&self, frame: &mut crate::pane_frame::PaneFrame) {
         let mut m = self.meta.lock_or_recover();
         fill_meta(&mut m, frame, None);
+    }
+
+    // ---- live queries: one lock each, facts copied out ----
+
+    /// The term mode flags, live. Input paths between frames need the
+    /// current value, not the last photograph.
+    pub fn mode_flags(&self) -> TermMode {
+        *self.term.lock().mode()
+    }
+
+    /// The directory a new tab or split should start in.
+    pub fn spawn_cwd(&self) -> Option<String> {
+        self.meta.lock_or_recover().spawn_cwd()
+    }
+
+    /// The command line currently executing ("" = idle).
+    pub fn running_cmd(&self) -> String {
+        self.meta.lock_or_recover().running_cmd.clone()
+    }
+
+    /// The last OSC-reported working directory.
+    pub fn cwd(&self) -> Option<String> {
+        self.meta.lock_or_recover().cwd.clone()
+    }
+
+    /// The pane's reorder toggle, when the user set one.
+    pub fn bidi_reorder(&self) -> Option<crate::bidi_ctl::BidiReorder> {
+        self.meta.lock_or_recover().bidi_reorder
+    }
+
+    /// Idle at an interactive prompt (OSC 133 B seen, no command running).
+    pub fn at_prompt(&self) -> bool {
+        self.meta.lock_or_recover().at_prompt
+    }
+
+    /// The native selection, cloned.
+    pub fn selection(&self) -> Option<Selection> {
+        self.term.lock().selection.clone()
+    }
+
+    /// The scroll into history, in lines.
+    pub fn display_offset(&self) -> u64 {
+        self.term.lock().grid().display_offset() as u64
+    }
+
+    /// Live viewport facts: scrollbar geometry, output following, page steps.
+    pub fn scroll_facts(&self) -> ScrollFacts {
+        let t = self.term.lock();
+        ScrollFacts {
+            rows: t.screen_lines(),
+            history: t.grid().history_size() as u64,
+            offset: t.grid().display_offset() as u64,
+            alt: t.mode().contains(TermMode::ALT_SCREEN),
+        }
+    }
+
+    // ---- intents: the lock lives here, callers send plain data ----
+
+    /// Scroll by whole lines (positive = toward older history).
+    pub fn scroll_display_by(&self, lines: i32) {
+        self.term.lock().scroll_display(Scroll::Delta(lines));
+    }
+
+    /// Scroll to a whole-line offset (thumb drag): clamped to history,
+    /// atomic read–compare–apply, returns whether the view moved.
+    pub fn scroll_display_to(&self, offset: usize) -> bool {
+        let mut t = self.term.lock();
+        let cur = t.grid().display_offset();
+        let history = t.grid().history_size();
+        let next = offset.min(history);
+        if next == cur {
+            false
+        } else {
+            t.scroll_display(Scroll::Delta(next as i32 - cur as i32));
+            true
+        }
+    }
+
+    /// Press-start a selection at a viewport cell; returns the grid point.
+    pub fn start_selection(
+        &self,
+        ty: alacritty_terminal::selection::SelectionType,
+        row: i32,
+        col: usize,
+        side: alacritty_terminal::index::Side,
+    ) -> alacritty_terminal::index::Point {
+        let mut t = self.term.lock();
+        let off = t.grid().display_offset() as i32;
+        let point = alacritty_terminal::index::Point::new(
+            alacritty_terminal::index::Line(crate::scroll::grid_line(row, off)),
+            Column(col),
+        );
+        t.selection = Some(Selection::new(ty, point, side));
+        point
+    }
+
+    /// Drag-extend the selection at a viewport cell. The visual mapping
+    /// needs the renderer's frame maps and the live grid atomically, so
+    /// the renderer is passed in; the lock stays here.
+    pub fn extend_selection_drag(
+        &self,
+        row: i32,
+        col: usize,
+        side: alacritty_terminal::index::Side,
+        drag: Option<(
+            (&crate::render::Renderer, crate::render::Rect),
+            (
+                alacritty_terminal::index::Point,
+                alacritty_terminal::index::Side,
+            ),
+        )>,
+    ) -> Option<(Selection, crate::render::VisualSelection)> {
+        let mut t = self.term.lock();
+        let off = t.grid().display_offset() as i32;
+        let point = alacritty_terminal::index::Point::new(
+            alacritty_terminal::index::Line(crate::scroll::grid_line(row, off)),
+            Column(col),
+        );
+        if let Some(sel) = t.selection.as_mut() {
+            sel.update(point, side);
+        }
+        drag.and_then(|((renderer, rect), anchor)| {
+            let visual = renderer.mouse_drag_cells(rect, &t, anchor, (point, side))?;
+            Some((t.selection.clone()?, visual))
+        })
+    }
+
+    /// Typing snaps the viewport to the bottom and drops the selection.
+    pub fn snap_to_bottom(&self) {
+        let mut t = self.term.lock();
+        t.selection = None;
+        t.scroll_display(Scroll::Bottom);
+    }
+
+    /// A program mouse press drops the native selection.
+    pub fn clear_selection(&self) {
+        self.term.lock().selection = None;
+    }
+
+    /// Take-and-clear the RIS flag: one PTY read contained `ESC c`.
+    pub fn take_ris(&self) -> bool {
+        let mut m = self.meta.lock_or_recover();
+        let saw = m.saw_ris;
+        m.saw_ris = false;
+        saw
+    }
+
+    /// Re-apply image limits after a config reload.
+    pub fn apply_image_limits(&self, limits: crate::images::ImageLimits) {
+        self.meta.lock_or_recover().apply_image_limits(limits);
+    }
+
+    /// Enter copy mode: drop the selection, toggle vi.
+    pub fn enter_copy_mode(&self) {
+        let mut t = self.term.lock();
+        t.selection = None;
+        t.toggle_vi_mode();
+    }
+
+    /// Sub-line scrollback: pixel deltas move now, a wheel notch queues.
+    /// The read–compute–apply stays atomic under one lock; the fractional
+    /// state is the caller's, passed in and updated in place.
+    pub fn smooth_scroll(&self, st: &mut crate::scroll::PaneScroll, lines: f32, pixel: bool) -> i32 {
+        let mut t = self.term.lock();
+        let offset = t.grid().display_offset() as i32;
+        let history = t.grid().history_size() as i32;
+        st.note_motion(Instant::now());
+        let next = if pixel {
+            st.apply_pixels(offset, history, lines)
+        } else {
+            st.queue_lines(lines);
+            offset
+        };
+        let delta = next - offset;
+        if delta != 0 {
+            // Term::scroll_display, not the grid's: in copy mode this
+            // keeps the vi cursor inside the viewport.
+            t.scroll_display(crate::scroll::display_delta(offset, next));
+        }
+        delta
+    }
+
+    /// Spend a pending notch and round onto a whole line before navigation.
+    pub fn snap_smooth(&self, st: &mut crate::scroll::PaneScroll) -> i32 {
+        let mut t = self.term.lock();
+        let offset = t.grid().display_offset() as i32;
+        let history = t.grid().history_size() as i32;
+        let (next, _) = st.commit_for_navigation(offset, history);
+        let delta = next - offset;
+        if delta != 0 {
+            t.scroll_display(crate::scroll::display_delta(offset, next));
+        }
+        delta
+    }
+
+    /// Ease wheel notches. `None` on the alt screen: the caller drops the
+    /// fraction, the integer path owns that screen.
+    pub fn tick_smooth(&self, st: &mut crate::scroll::PaneScroll, dt_ms: f32) -> Option<i32> {
+        let mut t = self.term.lock();
+        if t.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let offset = t.grid().display_offset() as i32;
+        let history = t.grid().history_size() as i32;
+        let next = st.tick(offset, history, dt_ms);
+        let delta = next - t.grid().display_offset() as i32;
+        if delta != 0 {
+            t.scroll_display(crate::scroll::display_delta(offset, next));
+        }
+        Some(delta)
     }
 
     /// Terminate the shell (closing a tab must not leave orphans).
