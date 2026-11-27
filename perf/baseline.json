@@ -1,6 +1,7 @@
 {
   "tolerance": 0.1,
   "tolerances": {
+    "throughput": 0.15,
     "startup": 1.0,
     "startup_ratio": 0.15,
     "latency": 1.0,
