@@ -29,6 +29,15 @@ impl Mru {
         self.walk = 0;
     }
 
+    /// Relabel every stored index through `map` (a tab reorder). The walk
+    /// state is reset: a reorder ends any in-flight Ctrl walk.
+    pub fn remap(&mut self, map: &dyn Fn(usize) -> usize) {
+        for i in &mut self.order {
+            *i = map(*i);
+        }
+        self.walk = 0;
+    }
+
     /// Tab `idx` closed: drop it and slide the higher indices down.
     pub fn removed(&mut self, idx: usize) {
         self.order.retain(|&i| i != idx);
@@ -113,6 +122,18 @@ mod tests {
         // alternating Ctrl+Tab flips between the two most recent, like a browser
         assert_eq!(m.step(true, 3), Some(1));
         m.release(1);
+    }
+
+    #[test]
+    fn remap_relabels_history_after_a_tab_reorder() {
+        let mut m = Mru::new();
+        m.touch(0);
+        m.touch(1);
+        m.touch(2); // history: 2, 1, 0
+        // swap tabs 0 and 2 (a reorder): history becomes 0, 1, 2
+        m.remap(&|i| if i == 0 { 2 } else if i == 2 { 0 } else { i });
+        assert_eq!(m.most_recent(&[0, 1, 2]), Some(0));
+        assert_eq!(m.step(true, 3), Some(1));
     }
 
     #[test]

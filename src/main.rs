@@ -3538,6 +3538,8 @@ impl App {
             CopyLastOutput => self.copy_last_output(),
             NewGroup => self.new_group(),
             NextGroup => self.step_group(false),
+            MoveTabBack => self.move_active_tab(true),
+            MoveTabForward => self.move_active_tab(false),
             PrevGroup => self.step_group(true),
             CopyMode => self.toggle_copy_mode(),
             CopyClean => {
@@ -5014,6 +5016,32 @@ impl App {
         self.spawn_group = None;
         // a failed spawn leaves the new group empty: drop it again
         self.groups.prune(&self.tab_groups());
+        self.request_redraw();
+    }
+
+    /// Reorder the active tab one slot within its group (Phase C): swap it
+    /// with its neighbour in the tab vector, follow it, and remap the MRU.
+    /// Groups ride along with their tabs; the bar order is the tab order.
+    fn move_active_tab(&mut self, back: bool) {
+        let (vis, pos) = self.visible_tabs();
+        if vis.is_empty() {
+            return;
+        }
+        let target = if back {
+            pos.saturating_sub(1)
+        } else {
+            (pos + 1).min(vis.len() - 1)
+        };
+        if target == pos {
+            return;
+        }
+        let from = self.active;
+        let to = vis[target];
+        self.tabs.swap(from, to);
+        self.active = to;
+        self.mru
+            .remap(&|i| if i == from { to } else if i == to { from } else { i });
+        self.save_state();
         self.request_redraw();
     }
 
