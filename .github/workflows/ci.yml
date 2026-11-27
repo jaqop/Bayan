@@ -148,6 +148,21 @@ jobs:
           set -euo pipefail
           python scripts/perf_gate.py probe.log startup.log latency.log idle.log --print
           python scripts/perf_gate.py probe.log startup.log latency.log idle.log | tee -a "$GITHUB_STEP_SUMMARY"
+      # The Rust port (tools/perf-gate) must agree with the Python gate on the
+      # same runner logs before the Python can be retired: same verdict table,
+      # same exit code. Its own unit tests run here too.
+      - name: Rust gate (equivalence with the Python gate)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --manifest-path tools/perf-gate/Cargo.toml
+          cargo test --locked --manifest-path tools/perf-gate/Cargo.toml
+          python scripts/perf_gate.py probe.log startup.log latency.log idle.log > gate-python.txt && py=0 || py=$?
+          ./tools/perf-gate/target/debug/perf-gate.exe probe.log startup.log latency.log idle.log --baseline perf/baseline.json > gate-rust.txt && rs=0 || rs=$?
+          # Python's redirected stdout is CRLF on Windows, Rust's is LF;
+          # compare content, not line endings.
+          diff --strip-trailing-cr gate-python.txt gate-rust.txt
+          test "$py" = "$rs"
 
   # The live pixel proofs run on the hosted WARP window too, so a rendering
   # regression cannot land without a captured counterexample. Scenarios are

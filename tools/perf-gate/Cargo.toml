@@ -1,0 +1,12 @@
+[package]
+name = "perf-gate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Dev-only tool: the Rust port of scripts/perf_gate.py. Not a workspace
+# member and not linked into bayan.exe, so the terminal binary stays lean.
+[dependencies]
+regex = "1"
+# preserve_order: rows follow the baseline file's order, like the Python gate
+serde_json = { version = "1", features = ["preserve_order"] }
