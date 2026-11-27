@@ -170,7 +170,11 @@ jobs:
         run: cargo build --locked --release --features dev-hooks
       - name: Live pixel proofs
         shell: pwsh
-        run: ./scripts/gui-smoke.ps1 -BinaryPath target/release/bayan.exe -KeepArtifacts
+        # -CiSafe: the hosted WARP window + inbox ConPTY render exact
+        # truecolor dimmed and drop Write-Host+CUP feeds, so only the
+        # environment-robust proofs are enforced here; the precise-color
+        # and positioned proofs run locally (full set, no -CiSafe).
+        run: ./scripts/gui-smoke.ps1 -BinaryPath target/release/bayan.exe -KeepArtifacts -CiSafe
       - name: Upload captures on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (v4.6.2)

@@ -2,6 +2,7 @@
 # over the quiet grid. Same center-ink assertion as palette (shared proof).
 $SmokeEnv = @{ BAYAN_GUARD = '1' }
 $SmokeSettle = 3.0
+$SmokeCiSafe = $true
 
 function Invoke-SmokeAssert($bmp, $geom) {
     $x0 = [int]($geom.W * 0.30); $x1 = [int]($geom.W * 0.70)

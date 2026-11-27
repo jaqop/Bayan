@@ -4,6 +4,7 @@
 # the English panel reaches the screen.
 $SmokeEnv = @{ BAYAN_SETTINGS = '1'; BAYAN_LANG = 'en' }
 $SmokeSettle = 3.0
+$SmokeCiSafe = $true
 
 function Invoke-SmokeAssert($bmp, $geom) {
     $x0 = [int]($geom.W * 0.20); $x1 = [int]($geom.W * 0.80)

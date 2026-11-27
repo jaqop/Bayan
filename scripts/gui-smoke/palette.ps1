@@ -2,6 +2,7 @@
 # quiet grid. The center band carries card ink; without the hook it is empty.
 $SmokeEnv = @{ BAYAN_PALETTE = '1' }
 $SmokeSettle = 3.0
+$SmokeCiSafe = $true
 
 function Invoke-SmokeAssert($bmp, $geom) {
     $x0 = [int]($geom.W * 0.30); $x1 = [int]($geom.W * 0.70)

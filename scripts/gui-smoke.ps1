@@ -34,7 +34,11 @@ FAIL) before it is trusted; see the plan's per-task steps.
 param(
     [string]$BinaryPath = 'target/release/bayan.exe',
     [string]$Scenario = '',
-    [switch]$KeepArtifacts
+    [switch]$KeepArtifacts,
+    # Run only scenarios marked $SmokeCiSafe: the hosted WARP window + inbox
+    # ConPTY render exact truecolor dimmed and drop Write-Host+CUP feeds, so
+    # the precise-color / positioned proofs stay local until validated there.
+    [switch]$CiSafe
 )
 $ErrorActionPreference = 'Stop'
 $exe = (Resolve-Path -LiteralPath $BinaryPath).Path
@@ -346,7 +350,9 @@ function Invoke-SmokeScenario([string]$file, [string]$exe) {
 $files = @(if ($Scenario) {
     Join-Path $scenarioDir "$Scenario.ps1"
 } else {
-    Get-ChildItem -LiteralPath $scenarioDir -Filter '*.ps1' | Sort-Object Name | ForEach-Object { $_.FullName }
+    Get-ChildItem -LiteralPath $scenarioDir -Filter '*.ps1' | Sort-Object Name |
+        Where-Object { -not $CiSafe -or (Select-String -LiteralPath $_.FullName -Pattern 'SmokeCiSafe\s*=\s*\$true' -Quiet) } |
+        ForEach-Object { $_.FullName }
 })
 if (-not $files -or -not (Test-Path -LiteralPath $files[0])) { throw "no scenarios found in $scenarioDir" }
 $allPass = $true

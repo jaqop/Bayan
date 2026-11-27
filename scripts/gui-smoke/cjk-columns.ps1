@@ -6,6 +6,7 @@ $SmokeEnv = @{
     BAYAN_TYPE = 'Write-Host "$([char]27)[10;1H│ 1. Trust folder$([char]27)[10;41H$([char]27)[38;2;255;0;0m│$([char]27)[0m"; Write-Host "$([char]27)[13;1H│ 2. (你好世界 テスト 한국어)$([char]27)[13;41H$([char]27)[38;2;255;0;0m│$([char]27)[0m"; Write-Host "$([char]27)[16;1H│ 3. plain ascii row$([char]27)[16;41H$([char]27)[38;2;255;0;0m│$([char]27)[0m"' + "`r"
 }
 $SmokeSettle = 10.0
+$SmokeCiSafe = $false # local-only: hosted WARP/inbox-ConPTY renders truecolor dimmed and drops Write-Host+CUP
 
 function Invoke-SmokeAssert($bmp, $geom) {
     $hits = @()

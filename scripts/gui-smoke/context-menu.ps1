@@ -3,6 +3,7 @@
 # region right of center, mid-window, is inside the menu and empty otherwise.
 # Proven live on the owner's Nov 19 binary before this scenario existed.
 $SmokeSettle = 4.0
+$SmokeCiSafe = $true
 
 function Invoke-SmokeInput($hwnd, $geom) {
     Send-SmokeClick $hwnd $geom 0.5 0.5 'right'
