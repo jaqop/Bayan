@@ -57,6 +57,7 @@ mod mouse;
 mod mru;
 mod mux;
 mod osc7;
+mod pane_frame;
 mod persist;
 mod plugins;
 mod posh;
@@ -99,19 +100,6 @@ fn frame_unchanged(
 ) -> bool {
     same_size && !resources_changed && previous == current
 }
-
-/// Meta copied off a pane before the term lock: command marks in grid
-/// space, the running command, the BiDi snapshot, and evicted lines.
-/// The `Arc` is the snapshot. Cloning it does not copy the stamp list.
-type PaneSnap = (
-    Vec<(usize, Option<i32>)>,
-    String,
-    std::sync::Arc<bidi_ctl::BidiState>,
-    u64,
-    Option<u64>,
-    Option<bidi_ctl::BidiReorder>,
-    bool,
-);
 
 /// The Windows caret rhythm; kitty's idea on top: stop after 15s idle.
 const BLINK_MS: u128 = 530;
@@ -355,7 +343,7 @@ fn ctrl_letter(key: &Key) -> Option<char> {
 
 /// The literal-text search core, GUI-free so a real Term can exercise it in
 /// tests: step past the current hit, search in `dir`, wrap from the far end.
-fn find_match<T: alacritty_terminal::event::EventListener>(
+pub(crate) fn find_match<T: alacritty_terminal::event::EventListener>(
     t: &mut alacritty_terminal::term::Term<T>,
     query: &str,
     hl: &Option<Match>,
@@ -371,7 +359,7 @@ const SEARCH_COUNT_CAP: usize = 1000;
 
 /// Where the current hit sits among all hits, top of the scrollback first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SearchCount {
+pub(crate) struct SearchCount {
     /// 1-based position of the current hit. `None` when there is no current
     /// hit or it lies past the cap.
     at: Option<usize>,
@@ -393,7 +381,7 @@ enum SearchStatus {
 
 /// Count the hits of `query` over the whole scrollback, literal or regex
 /// as [`find_match_mode`] reads it. `None` is a pattern that does not compile.
-fn count_matches<T>(
+pub(crate) fn count_matches<T>(
     t: &alacritty_terminal::term::Term<T>,
     query: &str,
     hl: &Option<Match>,
@@ -473,7 +461,7 @@ fn duplicate_command(pane_command: &str, in_mux: bool) -> Option<String> {
     (!in_mux && !pane_command.trim().is_empty()).then(|| pane_command.to_string())
 }
 
-fn find_match_mode<T: alacritty_terminal::event::EventListener>(
+pub(crate) fn find_match_mode<T: alacritty_terminal::event::EventListener>(
     t: &mut alacritty_terminal::term::Term<T>,
     query: &str,
     hl: &Option<Match>,
@@ -515,27 +503,6 @@ fn find_match_mode<T: alacritty_terminal::event::EventListener>(
         };
         t.search_next(&mut rs, wrap, dir, side, None)
     })
-}
-
-/// The display offset that brings the previous/next prompt to the top of
-/// the view (EasyTer's _jump_command math). `abs_top` = absolute line of
-/// the viewport's first row.
-fn jump_offset(marks: &[usize], hist: usize, off: usize, dir: i32) -> Option<usize> {
-    let abs_top = hist as i64 - off as i64;
-    let target = if dir < 0 {
-        marks
-            .iter()
-            .map(|&a| a as i64)
-            .filter(|&a| a < abs_top)
-            .max()
-    } else {
-        marks
-            .iter()
-            .map(|&a| a as i64)
-            .filter(|&a| a > abs_top)
-            .min()
-    }?;
-    Some((hist as i64 - target + 1).clamp(0, hist as i64) as usize)
 }
 
 /// Minimum gap between two toasts a PROGRAM asked for. Terminal output is
@@ -800,9 +767,9 @@ use lang::tr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
-use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::selection::Selection;
 use alacritty_terminal::term::search::{Match, RegexSearch};
 use alacritty_terminal::term::TermMode;
 use winit::application::ApplicationHandler;
@@ -812,7 +779,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
-use term::{LockExt, Session, TermSize};
+use term::{Session, TermSize};
 
 pub enum UserEvent {
     ShellProfiles(Vec<shells::Shell>),
@@ -947,6 +914,13 @@ struct PendingPaste {
 struct Pane {
     id: u64,
     session: Session,
+    /// The frame photograph: filled once per redraw, read by every consumer
+    /// in that frame without locks. Retained across frames; a refill, not a
+    /// construction.
+    frame: pane_frame::PaneFrame,
+    /// A native selection change invalidates the visual ranges associated
+    /// with that mouse drag, including after history moves or a resize.
+    visual_selection: Option<(Selection, render::VisualSelection)>,
     /// the command line it was started with, so a restored session brings
     /// a Command Prompt tab back as Command Prompt
     command: String,
@@ -957,6 +931,12 @@ struct Pane {
     /// Set when the ConPTY lives in the mux server. `armed` is cleared to
     /// detach: the session's kill hook then leaves the remote process running.
     mux: Option<MuxBind>,
+}
+
+impl Pane {
+    fn visual_selection(&self, native: Option<&Selection>) -> Option<&render::VisualSelection> {
+        render::validated_visual(native, self.visual_selection.as_ref())
+    }
 }
 
 struct MuxBind {
@@ -1086,7 +1066,7 @@ fn broadcast_targets(on: bool, panes: usize, focused: usize) -> Vec<usize> {
 /// Global rows `[start, end)` to the grid lines of their first and last
 /// row, for the current history size. Rows already pushed out of the
 /// scrollback are dropped from the top; nothing left is `None`.
-fn output_lines(
+pub(crate) fn output_lines(
     start: u64,
     end: u64,
     evicted: u64,
@@ -2115,7 +2095,8 @@ struct App {
     /// A focus loss drops all of them together.
     mouse: mouse::Route,
     /// the pane a mouse selection started in (drags don't cross panes)
-    sel_pane: usize,
+    sel_pane: Option<u64>,
+    drag_anchor: Option<(Point, Side)>,
     /// divider being dragged (between pane i and i+1)
     drag_divider: Option<usize>,
     /// Per-pane scrollbar: hover, thumb drag, and when it was last scrolled.
@@ -2429,7 +2410,8 @@ impl App {
             ime_spot: None,
             ime_area_reset: false,
             mouse: mouse::Route::default(),
-            sel_pane: 0,
+            sel_pane: None,
+            drag_anchor: None,
             drag_divider: None,
             bars: scrollbar::Bars::default(),
             cockpit: false,
@@ -3164,13 +3146,7 @@ impl App {
         self.abandon_mouse();
         let links = self
             .session()
-            .map(|session| {
-                let t = session.term.lock();
-                (0..t.screen_lines())
-                    .flat_map(|row| link::links_on_row(&t, row))
-                    .take(500)
-                    .collect::<Vec<_>>()
-            })
+            .map(|session| session.palette_links())
             .unwrap_or_default();
         let mut extras = palette_extras(&self.shell_profiles, &links);
         extras.push((PaletteRow::OpenSsh, ssh::label_open().to_string()));
@@ -3345,9 +3321,7 @@ impl App {
             // the SAME dispatch a keybinding uses, not a parallel copy
             PaletteRow::Builtin(a) => self.perform_action(a, el),
             PaletteRow::Shell(command) => {
-                let cwd = self
-                    .session()
-                    .and_then(|s| s.meta.lock_or_recover().spawn_cwd());
+                let cwd = self.session().and_then(|s| s.spawn_cwd());
                 let before = self.tabs.len();
                 self.spawn_tab_command(cwd, &command, None);
                 if self.tabs.len() == before && self.blocked_link.is_none() {
@@ -3410,9 +3384,7 @@ impl App {
             NewTab => {
                 // new tab inherits the active pane's directory, and only if
                 // that directory exists — a stale OSC 7 must not become the cwd
-                let cwd = self
-                    .session()
-                    .and_then(|s| s.meta.lock_or_recover().spawn_cwd());
+                let cwd = self.session().and_then(|s| s.spawn_cwd());
                 self.spawn_tab(cwd);
                 self.request_redraw();
             }
@@ -3429,12 +3401,12 @@ impl App {
                 self.remove_pane(ti, pi, el);
             }
             Search | SearchRegex => {
-                let selected = self
-                    .session()
-                    .and_then(|s| s.term.lock().selection_to_string());
+                let (selected, restore) = self.focused_pane().map_or((None, false), |pane| {
+                    pane.session.selection_seed(pane.visual_selection.as_ref())
+                });
                 self.search = Some(SearchState::from_selection(
                     selected.as_deref(),
-                    self.claude_active(),
+                    restore && self.claude_active(),
                 ));
                 if action == SearchRegex {
                     if let Some(st) = self.search.as_mut() {
@@ -3503,7 +3475,7 @@ impl App {
             DuplicateTab => {
                 let Some((cwd, command)) = self.tabs.get(self.active).and_then(|tab| {
                     let pane = tab.panes.get(tab.focused)?;
-                    let cwd = pane.session.meta.lock_or_recover().spawn_cwd();
+                    let cwd = pane.session.spawn_cwd();
                     Some((cwd, duplicate_command(&pane.command, pane.mux.is_some())))
                 }) else {
                     return;
@@ -3730,7 +3702,7 @@ impl App {
     /// The focused pane's running command, if any (drives the close guard).
     fn running_command(&self, ti: usize, pi: usize) -> Option<String> {
         let pane = self.tabs.get(ti)?.panes.get(pi)?;
-        let cmd = pane.session.meta.lock_or_recover().running_cmd.clone();
+        let cmd = pane.session.running_cmd();
         (!cmd.is_empty()).then_some(cmd)
     }
 
@@ -3739,7 +3711,7 @@ impl App {
         self.tabs
             .iter()
             .flat_map(|t| &t.panes)
-            .filter(|p| !p.session.meta.lock_or_recover().running_cmd.is_empty())
+            .filter(|p| !p.session.running_cmd().is_empty())
             .count()
     }
 
@@ -3895,10 +3867,7 @@ impl App {
         let limits = self.image_budget.limits();
         for tab in &self.tabs {
             for pane in &tab.panes {
-                pane.session
-                    .meta
-                    .lock_or_recover()
-                    .apply_image_limits(limits);
+                pane.session.apply_image_limits(limits);
             }
         }
     }
@@ -4055,12 +4024,12 @@ impl App {
                     .panes
                     .get(t.focused)
                     .map(|p| {
-                        let m = p.session.meta.lock_or_recover();
+                        let f = &p.frame;
                         // BAYAN-012: running_cmd is screen text and the cwd
                         // a program report; both go through chrome_text
-                        if !m.running_cmd.is_empty() {
-                            format!("▶ {}", chrome_text(&m.running_cmd))
-                        } else if let Some(cwd) = &m.cwd {
+                        if !f.running_cmd.is_empty() {
+                            format!("▶ {}", chrome_text(&f.running_cmd))
+                        } else if let Some(cwd) = &f.cwd {
                             format!("{} · {}", tr("خامل", "idle"), chrome_text(cwd))
                         } else {
                             tr("خامل", "idle").to_string()
@@ -4114,22 +4083,7 @@ impl App {
     /// Scroll to the previous (dir<0) or next command prompt (OSC 133 marks).
     fn jump_command(&mut self, dir: i32) {
         let Some(s) = self.session() else { return };
-        {
-            let mut t = s.term.lock();
-            let hist = t.grid().history_size();
-            let off = t.grid().display_offset();
-            let marks: Vec<usize> = {
-                let m = s.meta.lock_or_recover();
-                m.marks
-                    .iter()
-                    .filter(|c| c.abs >= m.evicted)
-                    .map(|c| (c.abs - m.evicted) as usize)
-                    .collect()
-            };
-            if let Some(new_off) = jump_offset(&marks, hist, off, dir) {
-                t.scroll_display(Scroll::Delta(new_off as i32 - off as i32));
-            }
-        }
+        s.jump_to_command(dir);
         if let Some(id) = self.focused_pane_id() {
             self.drop_smooth(id);
         }
@@ -4137,16 +4091,23 @@ impl App {
         self.request_redraw();
     }
 
+    fn focused_pane(&self) -> Option<&Pane> {
+        let tab = self.tabs.get(self.active)?;
+        tab.panes.get(tab.focused)
+    }
+
+    fn focused_pane_mut(&mut self) -> Option<&mut Pane> {
+        let tab = self.tabs.get_mut(self.active)?;
+        tab.panes.get_mut(tab.focused)
+    }
+
     /// The focused pane's session in the active tab.
     fn session(&self) -> Option<&Session> {
-        let t = self.tabs.get(self.active)?;
-        t.panes.get(t.focused).map(|p| &p.session)
+        self.focused_pane().map(|pane| &pane.session)
     }
 
     fn session_mut(&mut self) -> Option<&mut Session> {
-        let t = self.tabs.get_mut(self.active)?;
-        let f = t.focused;
-        t.panes.get_mut(f).map(|p| &mut p.session)
+        self.focused_pane_mut().map(|pane| &mut pane.session)
     }
 
     /// OSC 52 may write only from the focused pane of the active tab.
@@ -4208,6 +4169,8 @@ impl App {
             Ok(session) => Some(Pane {
                 id,
                 session,
+                frame: pane_frame::PaneFrame::new(),
+                visual_selection: None,
                 command: command.to_string(),
                 last_output: None,
                 progress: None,
@@ -4412,9 +4375,7 @@ impl App {
                 return;
             }
         };
-        let cwd = self
-            .session()
-            .and_then(|s| s.meta.lock_or_recover().spawn_cwd());
+        let cwd = self.session().and_then(|s| s.spawn_cwd());
         if self.config.mux_enabled() && self.spawn_mux_command(cwd.clone(), &launch) {
             return;
         }
@@ -4501,6 +4462,8 @@ impl App {
         Some(Pane {
             id,
             session,
+            frame: pane_frame::PaneFrame::new(),
+            visual_selection: None,
             command: command.to_string(),
             last_output: None,
             progress: None,
@@ -4772,9 +4735,7 @@ impl App {
         {
             return;
         }
-        let cwd = self
-            .session()
-            .and_then(|s| s.meta.lock_or_recover().spawn_cwd());
+        let cwd = self.session().and_then(|s| s.spawn_cwd());
         let Some(pane) = self.spawn_pane(cwd.as_deref()) else {
             return;
         };
@@ -4798,10 +4759,7 @@ impl App {
         let Some(t) = self.tabs.get(ti) else {
             return;
         };
-        let running = t
-            .panes
-            .iter()
-            .any(|p| !p.session.meta.lock_or_recover().running_cmd.is_empty());
+        let running = t.panes.iter().any(|p| !p.session.running_cmd().is_empty());
         if self.config.confirm_close_on() && running {
             self.pending_close = Some(CloseTarget::Tab(ti));
             self.request_redraw();
@@ -4962,9 +4920,7 @@ impl App {
     /// Ctrl+Shift+G: a new group, opened on one fresh tab in the active
     /// pane's directory (the same start NewTab gives).
     fn new_group(&mut self) {
-        let cwd = self
-            .session()
-            .and_then(|s| s.meta.lock_or_recover().spawn_cwd());
+        let cwd = self.session().and_then(|s| s.spawn_cwd());
         self.spawn_group = Some(self.groups.add());
         self.spawn_tab(cwd);
         self.spawn_group = None;
@@ -5058,12 +5014,7 @@ impl App {
                                 // don't persist a path we would refuse to start in.
                                 // BAYAN-015: a poisoned meta lock is this pane's
                                 // state, not a reason to abort the save.
-                                p.session
-                                    .meta
-                                    .lock_or_recover()
-                                    .cwd
-                                    .as_deref()
-                                    .and_then(term::accept_local_cwd)
+                                p.session.cwd().as_deref().and_then(term::accept_local_cwd)
                             })
                             .collect(),
                         weights,
@@ -5379,8 +5330,7 @@ impl App {
     }
 
     fn term_mode(&self) -> TermMode {
-        self.session()
-            .map_or(TermMode::empty(), |s| *s.term.lock().mode())
+        self.session().map_or(TermMode::empty(), |s| s.mode_flags())
     }
 
     fn note_held_away(&mut self, event: &KeyEvent) {
@@ -5476,23 +5426,30 @@ impl App {
     }
 
     /// Claude restoration for one pane. Term lock, then meta, never both:
-    /// the same order as every other pane read.
+    /// the same order as every other pane read. Input paths call this
+    /// between frames, so it reads live state; the redraw's reader path
+    /// runs the same policy over the frame photograph.
     fn pane_claude(&self, pane: &Pane) -> bool {
-        let term_alt = pane
-            .session
-            .term
-            .lock()
-            .mode()
-            .contains(TermMode::ALT_SCREEN);
-        let (bidi_state, running, pane_mode, tracked_alt) = {
-            let m = pane.session.meta.lock_or_recover();
-            (
-                m.bidi.clone(),
-                m.running_cmd.clone(),
-                m.bidi_reorder,
-                m.alt_track.on(),
-            )
-        };
+        let f = pane.session.claude_facts();
+        self.claude_from_facts(
+            &f.bidi,
+            &f.running_cmd,
+            f.bidi_reorder,
+            f.tracked_alt,
+            f.term_alt,
+        )
+    }
+
+    /// The Claude-restoration policy over one pane's facts — one
+    /// implementation for the live query and the frame photograph alike.
+    fn claude_from_facts(
+        &self,
+        bidi_state: &bidi_ctl::BidiState,
+        running: &str,
+        pane_mode: Option<bidi_ctl::BidiReorder>,
+        tracked_alt: bool,
+        term_alt: bool,
+    ) -> bool {
         // Idle explicit mode (a command that forgot to reset) must not
         // suppress restoration at the prompt. A live explicit mode still does.
         // The pane's BiDi mode (off / alt screen) is the same kind of gate.
@@ -5507,7 +5464,7 @@ impl App {
         if !self.auto_follow {
             return self.claude_manual;
         }
-        bidi::cmd_is_claude(&running)
+        bidi::cmd_is_claude(running)
     }
 
     /// Pixel offset of one pane. Zero on the alt screen and when smooth
@@ -5544,7 +5501,7 @@ impl App {
                     .map(|t| {
                         t.panes
                             .iter()
-                            .filter(|p| !p.session.meta.lock_or_recover().running_cmd.is_empty())
+                            .filter(|p| !p.session.running_cmd().is_empty())
                             .count()
                     })
                     .unwrap_or(0);
@@ -5597,8 +5554,7 @@ impl App {
         if let Some(tab) = self.tabs.get(self.active) {
             h = screen_reader::stamp_mix(h, tab.focused as u64);
             for pane in &tab.panes {
-                let term = pane.session.term.lock();
-                h = screen_reader::stamp_mix(h, screen_reader::pane_stamp(&term));
+                h = screen_reader::stamp_mix(h, screen_reader::pane_stamp(&pane.frame));
             }
         }
         h = match &self.palette {
@@ -5673,25 +5629,23 @@ impl App {
         if let Some(tab) = self.tabs.get(active) {
             let count = tab.panes.len();
             for (pi, pane) in tab.panes.iter().enumerate() {
-                let claude = self.pane_claude(pane);
-                // Copy under the lock, then restore BiDi and build nodes
-                // after it is released. A reader must not stall the PTY.
-                let raw = {
-                    let term = pane.session.term.lock();
-                    screen_reader::copy_pane(&term)
-                };
+                let claude = self.claude_from_facts(
+                    &pane.frame.bidi,
+                    &pane.frame.running_cmd,
+                    pane.frame.bidi_reorder,
+                    pane.frame.tracked_alt,
+                    pane.frame.alt_screen,
+                );
+                // The photograph was taken at the top of this redraw; BiDi
+                // restoration and node building read it without locks.
+                // A reader must not stall the PTY.
+                let raw = screen_reader::copy_pane(&pane.frame);
                 let text = screen_reader::pane_text(raw, claude);
                 if pi == focused {
                     focused_id = Some(pane.id);
                     focused_lines = text.lines.iter().map(|line| line.text.clone()).collect();
-                    let meta = pane.session.meta.lock_or_recover();
-                    running = meta.running_cmd.clone();
-                    finished = meta
-                        .marks
-                        .iter()
-                        .rev()
-                        .find(|mark| mark.exit.is_some())
-                        .map(|mark| (mark.abs, mark.exit));
+                    running = pane.frame.running_cmd.clone();
+                    finished = pane.frame.last_finished;
                 }
                 bodies.push(screen_reader::PaneItem {
                     index: pi,
@@ -5830,7 +5784,7 @@ impl App {
         if let Some((source_row, col, side)) = r.flow_hit(rect, geom_row, pos.x) {
             return Some((hit.pane, source_row as i32, col, side));
         }
-        if let Some((col, side)) = r.hit_cell(rect, geom_row, pos.x) {
+        if let Some((col, side)) = r.shaped_selection_hit(rect, geom_row, pos.x) {
             return Some((hit.pane, row, col, side));
         }
         let side = if hit.left { Side::Left } else { Side::Right };
@@ -5841,7 +5795,7 @@ impl App {
         let Some((ti, pi)) = self.find_pane(id) else {
             return TermMode::empty();
         };
-        *self.tabs[ti].panes[pi].session.term.lock().mode()
+        self.tabs[ti].panes[pi].session.mode_flags()
     }
 
     fn write_pane(&mut self, id: u64, bytes: &[u8]) {
@@ -5944,22 +5898,13 @@ impl App {
     ) -> Option<(u64, i32, usize)> {
         // copy what the locks need, then drop the pane borrow so the term
         // lock below can re-borrow the tab
-        let (pane_id, running, bidi_state, evicted, claude_from, pane_mode, tracked_alt) = {
+        let (pane_id, f) = {
             let pane = self.tabs.get(self.active)?.panes.get(hit.pane)?;
-            let m = pane.session.meta.lock_or_recover();
-            (
-                pane.id,
-                m.running_cmd.clone(),
-                m.bidi.clone(),
-                m.evicted,
-                m.claude_from_abs,
-                m.bidi_reorder,
-                m.alt_track.on(),
-            )
+            (pane.id, pane.session.claude_facts())
         };
         let (auto, manual) = (self.auto_follow, self.claude_manual);
         let honor = self.config.honor_bdsm();
-        let mode = pane_mode.unwrap_or_else(|| self.config.bidi_mode());
+        let mode = f.bidi_reorder.unwrap_or_else(|| self.config.bidi_mode());
         let geom_row = if row < 0 {
             scroll::PEEK_ROW
         } else {
@@ -5974,36 +5919,30 @@ impl App {
             }
         }
         if row < 0 {
-            let (cols, alt, history, off, cells) = {
-                let t = self.tabs[self.active].panes[hit.pane].session.term.lock();
-                let off = t.grid().display_offset() as u64;
-                (
-                    t.columns().max(1),
-                    mode.effective_alt(t.mode().contains(TermMode::ALT_SCREEN), tracked_alt),
-                    t.grid().history_size() as u64,
-                    off,
-                    render::snapshot_grid_line(&t, scroll::grid_line(row, off as i32)),
-                )
-            };
+            let snap = self.tabs[self.active].panes[hit.pane]
+                .session
+                .peek_row_snapshot(row, mode, &f);
+            let (cols, alt, cells) = (snap.cols, snap.alt, snap.cells);
             // Same gate as a fully visible row: explicit BDSM (`CSI 8 l`),
             // and the `off` and `alt_off` modes, do not reorder, so the
             // column is the grid's.
             let (reorder, use_stamps) =
-                bidi_state.presentation(mode, honor, !running.is_empty(), alt);
-            let abs = bidi_ctl::peek_line_abs(evicted, history, off);
+                f.bidi
+                    .presentation(mode, honor, !f.running_cmd.is_empty(), alt);
+            let abs = bidi_ctl::peek_line_abs(f.evicted, snap.history, snap.offset);
             let mut claude = reorder
                 && if !auto {
                     manual
                 } else {
-                    bidi::cmd_is_claude(&running)
+                    bidi::cmd_is_claude(&f.running_cmd)
                 };
             if !alt && auto {
-                claude &= claude_from.is_none_or(|start| abs >= start);
+                claude &= f.claude_from_abs.is_none_or(|start| abs >= start);
             }
             // The painter's direction for this row: its SCP stamp, else
             // its own first strong letter.
             let stamped = if use_stamps {
-                bidi_state.direction_at(abs)
+                f.bidi.direction_at(abs)
             } else {
                 bidi_ctl::ParagraphDir::Default
             };
@@ -6038,58 +5977,45 @@ impl App {
             return Some((pane_id, row, col.min(cols - 1)));
         }
         let (cols, row, cells, claude, vis, reorder, dir, align_edge, bidi_row) = {
-            let t = self.tabs[self.active].panes[hit.pane].session.term.lock();
-            let cols = t.columns().max(1);
-            let rows = t.screen_lines().max(1);
-            let row = row.min(rows as i32 - 1);
+            let snap = self.tabs[self.active].panes[hit.pane]
+                .session
+                .visible_row_snapshot(row, mode, honor, &f);
             // Explicit BDSM draws Arabic on the grid, so the click column
             // is x / cell_w. Implicit mode uses the same plan as the painter,
             // SCP mark included. Neither applies once the command has ended
             // and the pane is back on the primary screen. `off` and
             // `alt_off` on the alternate screen take the grid path too.
-            let term_alt = t.mode().contains(TermMode::ALT_SCREEN);
-            let alt = mode.effective_alt(term_alt, tracked_alt);
-            let (reorder, use_stamps) =
-                bidi_state.presentation(mode, honor, !running.is_empty(), alt);
-            let mut claude = reorder
+            let mut claude = snap.reorder
                 && if !auto {
                     manual
                 } else {
-                    bidi::cmd_is_claude(&running)
+                    bidi::cmd_is_claude(&f.running_cmd)
                 };
-            let history = t.grid().history_size() as u64;
-            let off = t.grid().display_offset() as u64;
-            if !alt && auto {
-                let abs = bidi_ctl::viewport_line_abs(evicted, history, off, row as u64);
-                claude &= claude_from.is_none_or(|start| abs >= start);
+            if !snap.alt && auto {
+                let abs = bidi_ctl::viewport_line_abs(
+                    f.evicted,
+                    snap.history,
+                    snap.offset,
+                    snap.row as u64,
+                );
+                claude &= f.claude_from_abs.is_none_or(|start| abs >= start);
             }
-            // The row's direction and path as draw_pane picks them: SCP
-            // stamp, then the wrapped paragraph's direction, then its own
-            // first strong letter. A wrapped RTL tail is bidi without Arabic.
-            let (dir, bidi_row) = render::viewport_row_layout(&t, row as usize, |li| {
-                if use_stamps {
-                    bidi_state.direction_at(bidi_ctl::viewport_line_abs(
-                        evicted, history, off, li as u64,
-                    ))
-                } else {
-                    bidi_ctl::ParagraphDir::Default
-                }
-            });
-            let cells = render::snapshot_row(&t, row as usize);
             // Same split as draw_pane (`render::tui_path`): TUI fields and
             // the alternate screen are not flush-right, so a click must not
             // assume they are.
-            let align_edge = reorder && !alt && !render::snap_tui_path(claude, alt, &cells);
+            let align_edge = snap.reorder
+                && !snap.alt
+                && !render::snap_tui_path(claude, snap.alt, &snap.cells);
             (
-                cols,
-                row,
-                cells,
+                snap.cols,
+                snap.row,
+                snap.cells,
                 claude,
-                hit.col.min(cols - 1),
-                reorder,
-                dir,
+                hit.col.min(snap.cols - 1),
+                snap.reorder,
+                snap.dir,
                 align_edge,
-                bidi_row,
+                snap.bidi_row,
             )
         };
         let mapped = rects
@@ -6199,12 +6125,7 @@ impl App {
     /// OSC 7 (PR5) writes the same field and this is the only reader.
     fn pane_link_cwd(&self, id: u64) -> Option<String> {
         let (ti, pi) = self.find_pane(id)?;
-        let raw = self.tabs[ti].panes[pi]
-            .session
-            .meta
-            .lock_or_recover()
-            .cwd
-            .clone();
+        let raw = self.tabs[ti].panes[pi].session.cwd();
         link::cwd_hook(raw.as_deref())
     }
 
@@ -6220,10 +6141,7 @@ impl App {
         let Some((ti, pi)) = self.find_pane(id) else {
             return Vec::new();
         };
-        let spans = {
-            let term = self.tabs[ti].panes[pi].session.term.lock();
-            link::links_on_viewport(&term, row)
-        };
+        let spans = self.tabs[ti].panes[pi].session.viewport_links(row);
         self.link_cache.insert(id, key, spans.clone());
         spans
     }
@@ -6467,7 +6385,7 @@ impl App {
             self.write_pane(out.pane, &out.bytes);
         }
         if let Some((ti, pi)) = self.find_pane(id) {
-            self.tabs[ti].panes[pi].session.term.lock().selection = None;
+            self.tabs[ti].panes[pi].session.clear_selection();
         }
         true
     }
@@ -6564,12 +6482,12 @@ impl App {
     }
 
     fn has_selection(&self) -> bool {
-        self.session().is_some_and(|s| {
-            s.term
-                .lock()
-                .selection
-                .as_ref()
-                .is_some_and(|sel| !sel.is_empty())
+        self.focused_pane().is_some_and(|pane| {
+            let sel = pane.session.selection();
+            match pane.visual_selection(sel.as_ref()) {
+                Some(visual) => !visual.points.is_empty(),
+                None => sel.as_ref().is_some_and(|sel| !sel.is_empty()),
+            }
         })
     }
 
@@ -6588,34 +6506,24 @@ impl App {
     }
 
     fn copy_clipboard(&mut self, clear: bool, force_clean: bool) -> bool {
-        let Some(session) = self.session() else {
+        let Some(pane) = self.focused_pane() else {
             return false;
         };
-        let text = {
-            let mut t = session.term.lock();
-            let txt = t.selection_to_string();
-            let rows = copyclean::selection_rows(&t);
-            if clear {
-                t.selection = None;
-            }
-            txt.map(|raw| (raw, rows))
-        };
-        // claude_active locks the term too; take it only after the guard above
         let claude = self.claude_active();
         let clean = force_clean || self.config.clean_copy().enabled(claude);
-        match text {
-            Some((raw, rows)) if !raw.is_empty() => {
-                // Claude rows hold VISUAL-order Arabic: restore logical so a
-                // paste elsewhere reads correctly (M7 gap closed). Clean copy
-                // runs that same restore; it does not reorder by visual x.
-                let s = copyclean::clipboard_text(&raw, &rows, clean, claude);
-                if s.is_empty() {
-                    return false;
-                }
-                self.set_clipboard(s);
-                true
+        let text = pane
+            .session
+            .copy_text(pane.visual_selection.as_ref(), clean, claude, clear);
+        if clear {
+            if let Some(pane) = self.focused_pane_mut() {
+                pane.visual_selection = None;
             }
-            _ => false,
+        }
+        if let Some(text) = text.filter(|text| !text.is_empty()) {
+            self.set_clipboard(text);
+            true
+        } else {
+            false
         }
     }
 
@@ -6650,18 +6558,13 @@ impl App {
         let Some(session) = self.session_mut() else {
             return;
         };
-        let mut meta = session.meta.lock_or_recover();
-        let next = meta.bidi_reorder.unwrap_or(config_mode).cycle();
-        meta.bidi_reorder = Some(next);
-        drop(meta);
+        session.cycle_bidi_reorder(config_mode);
         self.request_redraw();
     }
 
     /// The focused pane's effective BiDi mode: its toggle, or the config.
     fn focused_bidi_mode(&self) -> bidi_ctl::BidiReorder {
-        let stored = self
-            .session()
-            .map(|s| s.meta.lock_or_recover().bidi_reorder);
+        let stored = self.session().map(|s| s.bidi_reorder());
         stored.flatten().unwrap_or_else(|| self.config.bidi_mode())
     }
 
@@ -6759,27 +6662,8 @@ impl App {
         let Some(s) = self.session() else {
             return;
         };
-        let range = {
-            let m = s.meta.lock_or_recover();
-            term::last_output_range(&m.marks).map(|r| (r, m.evicted))
-        };
-        let Some(((start, end), evicted)) = range else {
+        if !s.select_last_output() {
             return;
-        };
-        {
-            let mut t = s.term.lock();
-            let history = t.grid().history_size() as u64;
-            let Some((first, last)) = output_lines(start, end, evicted, history, t.screen_lines())
-            else {
-                return;
-            };
-            let mut sel = Selection::new(
-                SelectionType::Lines,
-                Point::new(Line(first), Column(0)),
-                Side::Left,
-            );
-            sel.update(Point::new(Line(last), Column(0)), Side::Right);
-            t.selection = Some(sel);
         }
         self.copy_selection(false);
         self.request_redraw();
@@ -6791,7 +6675,7 @@ impl App {
         let Some(session) = self.session() else {
             return;
         };
-        let text = copyclean::history_text(&session.term.lock(), claude);
+        let text = session.history_text(claude);
         let result = (|| -> std::io::Result<std::path::PathBuf> {
             let dir = config::bayan_dir().join("exports");
             std::fs::create_dir_all(&dir)?;
@@ -7216,11 +7100,7 @@ impl App {
                                           // bracketed-paste mode
         for pi in self.broadcast_targets() {
             let session = &mut self.tabs[self.active].panes[pi].session;
-            let bracketed = session
-                .term
-                .lock()
-                .mode()
-                .contains(TermMode::BRACKETED_PASTE);
+            let bracketed = session.mode_flags().contains(TermMode::BRACKETED_PASTE);
             session.write(term::normalize_paste(txt, bracketed).as_bytes());
         }
         if let Some(s) = self.session_mut() {
@@ -7233,7 +7113,7 @@ impl App {
             self.drop_smooth(id);
         }
         if let Some(s) = self.session() {
-            s.term.lock().scroll_display(Scroll::Delta(n));
+            s.scroll_display_by(n);
         }
         self.invalidate_focused_links();
         self.request_redraw();
@@ -7251,28 +7131,12 @@ impl App {
         let Some(session) = self.session() else {
             return;
         };
-        let (found, status) = {
-            let mut t = session.term.lock();
-            let hl = self.search.as_ref().and_then(|s| s.hl.clone());
-            let regex = self.search.as_ref().is_some_and(|s| s.regex);
-            let m = if regex {
-                find_match_mode(&mut t, &query, &hl, dir, true)
-            } else {
-                find_match(&mut t, &query, &hl, dir)
-            };
-            if let Some(m) = &m {
-                // bring the hit into view, roughly centered
-                let cur = t.grid().display_offset() as i32;
-                let want = (-(m.start().line.0) + t.screen_lines() as i32 / 2)
-                    .clamp(0, t.grid().history_size() as i32);
-                t.scroll_display(Scroll::Delta(want - cur));
-            }
-            // count against the hit just found, so the bar reads 2/17
-            let status = match count_matches(&t, &query, &m, regex) {
-                Some(c) => SearchStatus::Counted(c),
-                None => SearchStatus::BadPattern,
-            };
-            (m, status)
+        let hl = self.search.as_ref().and_then(|s| s.hl.clone());
+        let regex = self.search.as_ref().is_some_and(|s| s.regex);
+        let (found, count) = session.search_step(&query, &hl, dir, regex);
+        let status = match count {
+            Some(c) => SearchStatus::Counted(c),
+            None => SearchStatus::BadPattern,
         };
         if let Some(id) = self.focused_pane_id() {
             self.drop_smooth(id);
@@ -7343,6 +7207,30 @@ impl App {
     /// front of that count.
     fn redraw(&mut self) {
         crate::prof::note_redraw();
+        // One photograph per pane per frame: the active tab's panes get the
+        // full frame (draw, screen reader, scrollbar); every other tab's
+        // focused pane gets meta facts only (cockpit) — a background tab
+        // must not pay for a grid it will not draw. Every consumer below
+        // reads these values; none takes the session locks.
+        let cell_px = self.renderer.as_ref().map(|r| {
+            (
+                r.cell_w.round().max(1.0) as u32,
+                r.cell_h.round().max(1.0) as u32,
+            )
+        });
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            for pane in &mut tab.panes {
+                pane.session.fill_frame(&mut pane.frame, cell_px);
+            }
+        }
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            if i == self.active {
+                continue;
+            }
+            if let Some(pane) = tab.panes.get_mut(tab.focused) {
+                pane.session.fill_facts(&mut pane.frame);
+            }
+        }
         // Before a client, this is a flag check. After one, an unchanged
         // stamp does not walk the grid; a flood builds at about 10 Hz.
         self.publish_reader();
@@ -7451,7 +7339,7 @@ impl App {
         }
         let mut verts: Vec<gpu::Vertex> = Vec::new();
         let mut sprites: Vec<render::ImageSprite> = Vec::new();
-        match (self.renderer.as_mut(), self.tabs.get(self.active)) {
+        match (self.renderer.as_mut(), self.tabs.get_mut(self.active)) {
             (Some(renderer), Some(tab)) if !rects.is_empty() => {
                 if dev_hook("BAYAN_ATLAS_RESET").is_some() {
                     renderer.stress_reset_atlas();
@@ -7462,83 +7350,52 @@ impl App {
                 let (auto_follow, claude_manual) = (self.auto_follow, self.claude_manual);
                 let mut focused_claude = false;
                 let mut focused_copy = false;
-                for (pi, (pane, rect)) in tab.panes.iter().zip(&rects).enumerate() {
+                for (pi, (pane, rect)) in tab.panes.iter_mut().zip(&rects).enumerate() {
                     if !rect_visible(rect) {
                         continue; // a pane zoomed away is not drawn
                     }
                     let focused = pi == tab.focused;
-                    // meta snapshot BEFORE the term lock (lock order term>meta
-                    // only applies when holding both; here they don't overlap)
-                    let (
-                        marks,
-                        running_cmd,
-                        bidi_state,
-                        evicted,
-                        claude_from,
-                        pane_mode,
-                        tracked_alt,
-                    ): PaneSnap = {
-                        let m = pane.session.meta.lock_or_recover();
-                        (
-                            // global -> grid space: subtract the evictions
-                            m.marks
-                                .iter()
-                                .filter(|c| c.abs >= m.evicted)
-                                .map(|c| ((c.abs - m.evicted) as usize, c.exit))
-                                .collect(),
-                            m.running_cmd.clone(),
-                            m.bidi.clone(),
-                            m.evicted,
-                            m.claude_from_abs,
-                            m.bidi_reorder,
-                            m.alt_track.on(),
-                        )
-                    };
-                    // Cell size is published before the term lock. Taking meta
-                    // again while `term` is held deadlocks the reader, which
-                    // locks term and then meta.
-                    let cw = renderer.cell_w.round().max(1.0) as u32;
-                    let ch = renderer.cell_h.round().max(1.0) as u32;
-                    let image_snaps = {
-                        let mut m = pane.session.meta.lock_or_recover();
-                        m.images.set_cell_px(cw, ch);
-                        m.images.snapshot()
-                    };
-                    let t = pane.session.term.lock();
+                    // The photograph was filled at the top of this redraw;
+                    // every fact below reads it — no session locks here.
+                    let frame = &pane.frame;
                     // Explicit BDSM suppresses reordering for the whole pane,
                     // Claude restoration included, and only while the command
                     // is running or the alt screen is up. honor_bdsm defaults on.
                     // The Arc is the frame's snapshot: cloning it does not copy
                     // the stamp list. alt_off also counts ?47 and ?1047.
-                    let term_alt = t.mode().contains(TermMode::ALT_SCREEN);
-                    let mode = pane_mode.unwrap_or_else(|| self.config.bidi_mode());
-                    let alt = mode.effective_alt(term_alt, tracked_alt);
-                    let (reorder, use_stamps) = bidi_state.presentation(
+                    let mode = frame
+                        .bidi_reorder
+                        .unwrap_or_else(|| self.config.bidi_mode());
+                    let alt = mode.effective_alt(frame.alt_screen, frame.tracked_alt);
+                    let (reorder, use_stamps) = frame.bidi.presentation(
                         mode,
                         self.config.honor_bdsm(),
-                        !running_cmd.is_empty(),
+                        !frame.running_cmd.is_empty(),
                         alt,
                     );
                     let claude_pane = reorder
                         && if !auto_follow {
                             claude_manual
                         } else {
-                            bidi::cmd_is_claude(&running_cmd)
+                            bidi::cmd_is_claude(&frame.running_cmd)
                         };
                     // copy mode: a solid block that does not blink, so the
                     // cursor reads as the selection's, not the shell's
-                    let copy_mode = t.mode().contains(TermMode::VI);
+                    let copy_mode = frame.vi_mode;
                     if focused {
                         focused_claude = claude_pane;
                         focused_copy = copy_mode;
                     }
-                    let history = t.grid().history_size() as u64;
-                    let off = t.grid().display_offset() as u64;
+                    let history = frame.history;
+                    let off = frame.display_offset;
                     let line_dir: Vec<bidi_ctl::ParagraphDir> = if use_stamps {
-                        (0..t.screen_lines())
+                        (0..frame.rows)
                             .map(|li| {
-                                bidi_state.direction_at(bidi_ctl::viewport_line_abs(
-                                    evicted, history, off, li as u64,
+                                frame.bidi.direction_at(bidi_ctl::viewport_line_abs(
+                                    frame.evicted,
+                                    history,
+                                    off,
+                                    li as u64,
                                 ))
                             })
                             .collect()
@@ -7546,7 +7403,11 @@ impl App {
                         Vec::new()
                     };
                     let peek_dir = if use_stamps {
-                        bidi_state.direction_at(bidi_ctl::peek_line_abs(evicted, history, off))
+                        frame.bidi.direction_at(bidi_ctl::peek_line_abs(
+                            frame.evicted,
+                            history,
+                            off,
+                        ))
                     } else {
                         bidi_ctl::ParagraphDir::Default
                     };
@@ -7575,9 +7436,7 @@ impl App {
                         claude_from: if alt || !auto_follow {
                             None
                         } else {
-                            claude_from.map(|start| {
-                                start as i64 - evicted as i64 - history as i64 + off as i64
-                            })
+                            frame.claude_from_grid
                         },
                         reorder,
                         bidi_mode: mode,
@@ -7587,7 +7446,7 @@ impl App {
                         } else {
                             None
                         },
-                        marks: &marks,
+                        marks: &frame.marks,
                         link_hover,
                         link_tip,
                         peek_dir,
@@ -7604,13 +7463,14 @@ impl App {
                         *rect,
                         renderer.cell_w,
                         renderer.cell_h,
-                        evicted.saturating_add(history),
+                        frame.evicted.saturating_add(history),
                         off,
                         view.scroll_px,
-                        &image_snaps,
+                        &frame.images,
                     ));
-                    let rows = t.screen_lines();
-                    renderer.draw_pane(&mut verts, &view, &t);
+                    let rows = frame.rows;
+                    let visual = pane.visual_selection(frame.selection.as_ref());
+                    renderer.draw_pane_with_selection(&mut verts, &view, frame, visual);
                     // Smooth scroll's sub-line remainder is the fraction's
                     // unit: lines in [0, 1) added to display_offset. Zero on
                     // the alternate screen and with smooth scroll off.
@@ -7942,22 +7802,12 @@ impl App {
             let now = Instant::now();
             self.tabs[ti].panes[pi].last_output = Some(now);
             self.last_pty = Some(now);
-            let (alt, following) = {
-                let t = self.tabs[ti].panes[pi].session.term.lock();
-                (
-                    t.mode().contains(TermMode::ALT_SCREEN),
-                    t.grid().display_offset() == 0,
-                )
-            };
+            let f = self.tabs[ti].panes[pi].session.scroll_facts();
+            let (alt, following) = (f.alt, f.offset == 0);
             let was_alt = self.alt_seen.insert(id, alt).unwrap_or(false);
             scroll::apply_alt_screen(&mut self.smooth, id, was_alt, alt);
             scroll::apply_output(&mut self.smooth, id, following, now);
-            let ris = {
-                let mut meta = self.tabs[ti].panes[pi].session.meta.lock_or_recover();
-                let ris = meta.saw_ris;
-                meta.saw_ris = false;
-                ris
-            };
+            let ris = self.tabs[ti].panes[pi].session.take_ris();
             if ris {
                 self.mouse.note_ris(id);
             }
@@ -10028,26 +9878,6 @@ mod tests {
     }
 
     #[test]
-    fn meta_locks_are_not_unwrapped() {
-        // BAYAN-015: `.lock()` then `.unwrap()` panics the UI when the
-        // reader thread poisoned the mutex. The call is often split across
-        // lines, which a single-line search misses.
-        let files = [
-            ("main.rs", include_str!("main.rs")),
-            ("term.rs", include_str!("term.rs")),
-            ("input.rs", include_str!("input.rs")),
-            ("keyroute.rs", include_str!("keyroute.rs")),
-        ];
-        for (name, src) in files {
-            let hits = unwrap_after_lock(&strip_line_comments(src));
-            assert!(
-                hits.is_empty(),
-                "{name}: lock().unwrap at lines {hits:?} — use lock_or_recover"
-            );
-        }
-    }
-
-    #[test]
     fn search_seed_is_bounded_literal_and_restores_claude_arabic() {
         assert_eq!(selection_search_query(Some("a.b(c)"), false), "a.b(c)");
         assert_eq!(selection_search_query(Some("ابحرم"), true), "مرحبا");
@@ -10397,6 +10227,7 @@ mod tests {
 
     #[test]
     fn jump_offset_walks_prompts() {
+        use crate::scroll::jump_offset;
         // prompts at absolute lines 10, 40, 80; history 100, at the bottom
         let marks = [10usize, 40, 80];
         // viewport top = 100: previous prompt is 80 -> off = 100-80+1 = 21
@@ -10641,6 +10472,7 @@ mod tests {
     fn exported_history_keeps_logical_arabic_wraps_and_the_selection() {
         use alacritty_terminal::{
             event::VoidListener,
+            selection::SelectionType,
             term::{Config, Term},
             vte::ansi::Processor,
         };
@@ -10818,45 +10650,6 @@ mod tests {
         let start = Point::new(Line(top), Column(0));
         assert_eq!(step_point(start, cols, top, bottom, Direction::Left), start);
     }
-}
-
-/// Drop `//` comments so a doc line that names the old call does not look
-/// like a live one. Strings are left as they are; none of the scanned files
-/// put this call inside a string.
-#[cfg(test)]
-fn strip_line_comments(src: &str) -> String {
-    let mut out = String::with_capacity(src.len());
-    for line in src.lines() {
-        match line.find("//") {
-            Some(i) => out.push_str(&line[..i]),
-            None => out.push_str(line),
-        }
-        out.push('\n');
-    }
-    out
-}
-
-/// Lines where `.lock()` is followed only by whitespace and then `.unwrap()`.
-/// The needles are built in pieces so this scanner does not flag itself.
-#[cfg(test)]
-fn unwrap_after_lock(src: &str) -> Vec<usize> {
-    let lock = concat!(".", "lock()");
-    let unwrap = concat!(".", "unwrap()");
-    let mut hits = Vec::new();
-    let mut offset = 0;
-    let mut line = 1usize;
-    while let Some(rel) = src[offset..].find(lock) {
-        let at = offset + rel;
-        line += src[offset..at].bytes().filter(|&b| b == b'\n').count();
-        let after = &src[at + lock.len()..];
-        if after.trim_start().starts_with(unwrap) {
-            hits.push(line);
-        }
-        let next = at + lock.len();
-        line += src[at..next].bytes().filter(|&b| b == b'\n').count();
-        offset = next;
-    }
-    hits
 }
 
 #[cfg(test)]
@@ -11397,6 +11190,8 @@ mod scroll_app_tests {
             panes: vec![Pane {
                 id: 0,
                 session,
+                frame: pane_frame::PaneFrame::new(),
+                visual_selection: None,
                 command: String::new(),
                 last_output: None,
                 progress: None,
@@ -11415,18 +11210,13 @@ mod scroll_app_tests {
     }
 
     fn feed(app: &App, bytes: &[u8]) {
-        let mut t = app.tabs[0].panes[0].session.term.lock();
+        let mut t = app.tabs[0].panes[0].session.test_term();
         let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
         parser.advance(&mut *t, bytes);
     }
 
     fn display_offset(app: &App) -> usize {
-        app.tabs[0].panes[0]
-            .session
-            .term
-            .lock()
-            .grid()
-            .display_offset()
+        app.tabs[0].panes[0].session.scroll_facts().offset as usize
     }
 
     fn stale_fraction(app: &mut App, id: u64) {
@@ -11457,11 +11247,7 @@ mod scroll_app_tests {
     fn new_output_while_scrolled_up_keeps_the_offset() {
         let (mut app, id, _) = host(false);
         fill_history(&app);
-        app.tabs[0].panes[0]
-            .session
-            .term
-            .lock()
-            .scroll_display(alacritty_terminal::grid::Scroll::Delta(3));
+        app.tabs[0].panes[0].session.scroll_display_by(3);
         assert!(display_offset(&app) > 0);
         stale_fraction(&mut app, id);
         app.wakeup(id);
@@ -11619,7 +11405,7 @@ mod scroll_app_tests {
             .unwrap()
             .plant_hit(rect, scroll::PEEK_ROW, 0, rect.2.max(1), 7);
         {
-            let mut meta = app.tabs[0].panes[0].session.meta.lock_or_recover();
+            let mut meta = app.tabs[0].panes[0].session.test_meta();
             meta.running_cmd = "demo".into();
         }
         app.cursor_pos = PhysicalPosition::new(2.0, 1.0);
@@ -11627,7 +11413,7 @@ mod scroll_app_tests {
         assert_eq!(on.2, -1);
         assert_eq!(on.3, 7, "implicit mode uses the shaped column");
         {
-            let mut meta = app.tabs[0].panes[0].session.meta.lock_or_recover();
+            let mut meta = app.tabs[0].panes[0].session.test_meta();
             meta.bidi_mut().mode = bidi_ctl::BidiMode::Explicit;
         }
         let off = app.locate(app.cursor_pos).unwrap();

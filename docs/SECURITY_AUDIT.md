@@ -259,7 +259,7 @@ On OSC 133 `D`, a missing or non-integer code stays `None` (`src/term.rs:219`). 
 
 `restore_state` (`src/main.rs:1506`) spawns a shell per saved tab and up to three more panes (`cwds.take(3)`). There is no cap on the number of tabs. A tampered `session.json` is a process bomb at startup, and each cwd is an independent BAYAN-003 probe. Weights are checked for finite and positive (`src/main.rs:1526`); the tab count is not.
 
-`quit` (`src/main.rs:665`) removes the tray icon and saves state. It does not call `Session::kill`. There is no `Drop` for `Session`. Closing the ConPTY handle on process exit usually tears the child down; the Git Bash launcher case this repo already documents is the one that detaches. That path is a leak, not a sandbox escape.
+`quit` (`src/main.rs:665`) removes the tray icon and saves state. It does not call `Session::kill`. (2026-11-27 correction: `Drop` for `Session` now exists — the BAYAN-014 comment in `src/term.rs` — killing the child, clearing the text-area grid, and removing the integration dir.) Closing the ConPTY handle on process exit usually tears the child down; the Git Bash launcher case this repo already documents is the one that detaches. That path is a leak, not a sandbox escape.
 
 **Fix.** Cap restored tabs (for example 16) and panes. `kill` and wait in `quit`, and implement `Drop` so a panic does not orphan the console.
 
@@ -313,7 +313,7 @@ These were looked at because they are the usual terminal bugs. They are not find
 - **The oh-my-posh path injected at PowerShell startup is single-quoted.** **Tested:** `C:\themes\o'$(calc).omp.json` becomes `'C:\themes\o''$(calc).omp.json'`, which is the correct PowerShell literal escape. BAYAN-005 is the other writer, the profile rewriter, which does not do this.
 - **Bracketed-paste breakout** via an embedded `\x1b[201~` is stripped when the mode is on (existing `paste_normalizes_newlines_and_blocks_injection` test). BAYAN-002 is that the default shell never turns the mode on, and CR skips the confirm.
 - **Plugin JSON** that is malformed is skipped and does not panic (existing tests in `plugins.rs`). Isolation of a bad theme is real. The gap is the `send` field (BAYAN-007), not the loader.
-- **Lock order.** The reader takes `term` then `meta`. Redraw drops `meta` before taking `term` (`src/main.rs:1892`). `jump_command` takes `term` then `meta`. No inversion found.
+- **Lock order.** The reader takes `term` then `meta`. `Session::fill_frame` takes the same order to fill the pane's frame photograph; the draw path, screen reader, cockpit, and scrollbar read the photograph without locks (2026-11-27). `jump_command` takes `term` then `meta`. No inversion found. Line numbers in this section are as of the 2026-10-31 audit and have drifted.
 - **`unsafe` review.** Five sites, none taking PTY bytes:
   - `toast.rs:54` zeroes `NOTIFYICONDATAW`, sets `cbSize` and the fields it uses, then calls `Shell_NotifyIconW`. Ordinary Win32.
   - `shells.rs:68` `GetShortPathNameW` into a 260-unit buffer; `n == 0` or `n >= len` falls back to the long path. The length check is right.
