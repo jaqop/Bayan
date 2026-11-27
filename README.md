@@ -1634,6 +1634,34 @@ executed). CI on `e63bb89` printed `running 915 tests` and
 `test result: ok. 908 passed; 0 failed; 7 ignored`. Counts inside a
 milestone are what that change proved, not this total.
 
+### Live smoke harness
+
+`scripts/gui-smoke.ps1` turns the one-off live captures this README records
+into re-runnable pixel assertions, locally and on CI (`gui smoke` job). It
+launches a `--features dev-hooks` release in a fresh profile (deterministic
+config, fixed 1000×700 window), drives it with the existing `BAYAN_*` hooks
+or a real click, captures the PID-owned HWND with a DPI-aware `PrintWindow`,
+asserts pixels, and stops only the process it started. The user's `~/.bayan`
+is never read or written.
+
+Run it against a dev-hooks release:
+
+```
+cargo build --locked --release --features dev-hooks
+pwsh scripts/gui-smoke.ps1 -BinaryPath target/release/bayan.exe
+```
+
+Ten scenarios pass, each proven non-vacuous (a wrong-expectation variant
+fails): `selftest-red` (the capture path sees real pixels), `arabic-connected`
+(shaped Arabic ink vs a spaces feed), `rtl-flush-right` (RTL paragraph flush
+right), `cyrillic-ltr` (Cyrillic stays left — universality), `tui-border-columns`
+and `cjk-columns` (Arabic / CJK fields keep the closing border on its grid
+column, PR #100's measurement automated), `context-menu` (a real right-click
+opens the menu), `palette`, `guard-card`, `settings-english` (overlay ink over
+a quiet grid). Scenarios are isolated: the driver resets scenario functions
+and clears every `BAYAN_*` hook per scenario, so one cannot leak into the next.
+A failed scenario keeps its PNG; on CI the captures upload as artifacts.
+
 Atlas and probe fixes (2026-11-13): resetting a full glyph atlas reserves
 page 0's white texel again and reuses every cleared page. GPU sync copies
 only changed pages, except when texture growth requires restoring them all;
