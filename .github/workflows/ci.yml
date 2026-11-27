@@ -168,16 +168,19 @@ jobs:
           key: release-probes
       - name: Build the dev-hooks release
         run: cargo build --locked --release --features dev-hooks
-      # The pinned Microsoft 1.22+ host passes VT through (DCS/APC included);
-      # without it the session falls back to inbox ConPTY, which dims exact
-      # truecolor and drops Write-Host+CUP feeds. Install it next to the
-      # binary so the proofs exercise the same path users get.
+      # Install the pinned Microsoft 1.22+ host next to the binary so the
+      # session matches the path users get (it passes VT through by default).
       - name: Install and verify pinned Microsoft console host
         shell: pwsh
         run: ./scripts/install-conpty.ps1 -OutputDirectory target/release
       - name: Live pixel proofs
         shell: pwsh
-        run: ./scripts/gui-smoke.ps1 -BinaryPath target/release/bayan.exe -KeepArtifacts
+        # -CiSafe: even with the pinned host, the hosted WARP window +
+        # PrintWindow render exact truecolor dimmed and ConPTY drops
+        # Write-Host+CUP feeds, so the precise-color/positioned proofs stay
+        # local (full set, no -CiSafe); the six environment-robust proofs are
+        # enforced here.
+        run: ./scripts/gui-smoke.ps1 -BinaryPath target/release/bayan.exe -KeepArtifacts -CiSafe
       - name: Upload captures on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (v4.6.2)
