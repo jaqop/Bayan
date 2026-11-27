@@ -49,8 +49,14 @@ function Format-Mb([long]$bytes) {
 function Read-Counters([string]$path) {
     for ($i = 0; $i -lt 20; $i++) {
         if (Test-Path -LiteralPath $path) {
-            $text = Get-Content -LiteralPath $path -Raw
-            if ($text -match 'redraws=(\d+) presents=(\d+)') {
+            # Bayan replaces this file with MoveFileExW on every increment;
+            # a read concurrent with the replace is a sharing violation, and
+            # the next iteration's read is the retry (the latency probe's
+            # profile-log pattern). Without this the cat probe dies on a
+            # loaded runner with "being used by another process".
+            $text = $null
+            try { $text = Get-Content -LiteralPath $path -Raw -ErrorAction Stop } catch { $text = $null }
+            if ($text -and $text -match 'redraws=(\d+) presents=(\d+)') {
                 return @{ redraws = [int64]$Matches[1]; presents = [int64]$Matches[2] }
             }
         }
