@@ -4473,7 +4473,7 @@ mod tests {
         let expected: Vec<String> = ["--noprofile", "--norc", "-p"]
             .into_iter()
             .map(String::from)
-            .chain(args.into_iter())
+            .chain(args)
             .collect();
         assert_eq!(prepared.args, expected);
         // the inherited environment is filtered separately, before the
