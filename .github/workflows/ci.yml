@@ -140,12 +140,13 @@ jobs:
           set -euo pipefail
           ./tools/perf-gate/target/debug/perf-gate.exe latency --binary target/release/bayan.exe --output latency.log
       # Same bayan.exe. Quiet private memory, the minimized + ten-tab redraw
-      # windows, and the 16 MB cat.
+      # windows, and the 16 MB cat. The ps1 stays here for now: the Rust
+      # `perf-gate idle` minimize path stalled on the hosted session (it is
+      # fine locally); under investigation before CI switches to it.
       - name: Idle memory and redraws
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          ./tools/perf-gate/target/debug/perf-gate.exe idle --binary target/release/bayan.exe --output idle.log
+          ./scripts/measure-idle.ps1 -BinaryPath target/release/bayan.exe -OutputPath idle.log
       - name: Gate
         shell: bash
         run: |
