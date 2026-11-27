@@ -6003,9 +6003,8 @@ impl App {
             // Same split as draw_pane (`render::tui_path`): TUI fields and
             // the alternate screen are not flush-right, so a click must not
             // assume they are.
-            let align_edge = snap.reorder
-                && !snap.alt
-                && !render::snap_tui_path(claude, snap.alt, &snap.cells);
+            let align_edge =
+                snap.reorder && !snap.alt && !render::snap_tui_path(claude, snap.alt, &snap.cells);
             (
                 snap.cols,
                 snap.row,
