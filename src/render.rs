@@ -510,9 +510,11 @@ pub struct ImageSprite {
 /// history down into the pane, and `scroll_px` is smooth scroll's sub-line
 /// shift on top of it. The quad is clipped to `clip`.
 ///
-/// The image stays on its logical cell. Texture coordinates run left to
-/// right, so an RTL paragraph does not reverse the pixels. Anchoring the
-/// quad to the right edge of an RTL paragraph is a later decision.
+/// Texture coordinates run left to right, so an RTL paragraph does not
+/// reverse the pixels. On an RTL row the quad is anchored under the *visual*
+/// caret: the logical column is mirrored through the row width, so the image
+/// sits where the cursor actually draws (Phase A2). `rtl_of` reports whether
+/// an absolute line is an RTL paragraph; `pane_cols` is the row width.
 pub fn image_sprites(
     clip: Rect,
     cell_w: f32,
@@ -521,6 +523,8 @@ pub fn image_sprites(
     display_offset: u64,
     scroll_px: i32,
     snaps: &[crate::images::ImageSnap],
+    pane_cols: usize,
+    rtl_of: &dyn Fn(u64) -> bool,
 ) -> Vec<ImageSprite> {
     if !(cell_w > 0.0 && cell_h > 0.0) {
         return Vec::new();
@@ -531,7 +535,12 @@ pub fn image_sprites(
             continue;
         }
         let vrow = snap.line as i64 - screen_top as i64 + display_offset as i64;
-        let x = clip.0 as f32 + snap.col as f32 * cell_w;
+        let col = if rtl_of(snap.line) {
+            pane_cols.saturating_sub(snap.col + snap.cols)
+        } else {
+            snap.col
+        };
+        let x = clip.0 as f32 + col as f32 * cell_w;
         let y = clip.1 as f32 + vrow as f32 * cell_h + scroll_px.max(0) as f32;
         let w = snap.cols as f32 * cell_w;
         let h = snap.rows as f32 * cell_h;
