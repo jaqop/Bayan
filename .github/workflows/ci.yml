@@ -122,8 +122,8 @@ jobs:
             cargo test --locked --release -- --ignored measure_reader_throughput --nocapture --test-threads=1 2>&1 | tee -a probe.log
             cargo test --locked --release -- --ignored measure_scrollback_memory --nocapture --test-threads=1 2>&1 | tee -a probe.log
           done
-      # Five starts of a release build with BAYAN_PROFILE, each stopped only
-      # after all required marks arrive; files and PIDs belong to that run. The gate takes the fastest:
+      # Five starts of a release build with BAYAN_PROFILE, each stopped after
+      # its marks arrive or its deadline passes; files and PIDs belong to that run. The gate takes the fastest:
       # the first start of a job is cold (fonts, shader cache) and several
       # times slower. A hosted runner does open the window, on WARP.
       - name: Startup marks
