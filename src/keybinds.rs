@@ -43,10 +43,12 @@ pub enum Action {
     ResetTerminal,
     NewWindow,
     DuplicateTab,
+    MoveTabBack,
+    MoveTabForward,
 }
 
 impl Action {
-    pub const ALL: [Action; 30] = [
+    pub const ALL: [Action; 32] = [
         Action::NewTab,
         Action::ClosePane,
         Action::Search,
@@ -77,6 +79,8 @@ impl Action {
         Action::ResetTerminal,
         Action::NewWindow,
         Action::DuplicateTab,
+        Action::MoveTabBack,
+        Action::MoveTabForward,
     ];
 
     /// The config.json key.
@@ -112,6 +116,8 @@ impl Action {
             Action::ResetTerminal => "reset-terminal",
             Action::NewWindow => "new-window",
             Action::DuplicateTab => "duplicate-tab",
+            Action::MoveTabBack => "move-tab-back",
+            Action::MoveTabForward => "move-tab-forward",
         }
     }
 
@@ -167,6 +173,10 @@ impl Action {
             }
             Action::NewWindow => crate::lang::pick(lang, "نافذة جديدة", "New window"),
             Action::DuplicateTab => crate::lang::pick(lang, "تكرار التبويب", "Duplicate tab"),
+            Action::MoveTabBack => crate::lang::pick(lang, "نقل التبويب لليسار", "Move tab left"),
+            Action::MoveTabForward => {
+                crate::lang::pick(lang, "نقل التبويب لليمين", "Move tab right")
+            }
         }
     }
 
@@ -228,6 +238,21 @@ impl Action {
             Action::ResetTerminal => c(true, true, Letter('j')),
             Action::NewWindow => c(true, true, Letter('n')),
             Action::DuplicateTab => c(true, true, Letter('t')),
+            // Ctrl+Alt+arrows: reorder the active tab within its group.
+            // Ctrl+Shift+arrows are the shell's word selection and
+            // Alt+arrows move pane focus, so Ctrl+Alt is the free slot.
+            Action::MoveTabBack => Chord {
+                ctrl: true,
+                shift: false,
+                alt: true,
+                key: Left,
+            },
+            Action::MoveTabForward => Chord {
+                ctrl: true,
+                shift: false,
+                alt: true,
+                key: Right,
+            },
         }
     }
 }
