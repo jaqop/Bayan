@@ -159,7 +159,9 @@ jobs:
           cargo test --locked --manifest-path tools/perf-gate/Cargo.toml
           python scripts/perf_gate.py probe.log startup.log latency.log idle.log > gate-python.txt && py=0 || py=$?
           ./tools/perf-gate/target/debug/perf-gate.exe probe.log startup.log latency.log idle.log --baseline perf/baseline.json > gate-rust.txt && rs=0 || rs=$?
-          diff gate-python.txt gate-rust.txt
+          # Python's redirected stdout is CRLF on Windows, Rust's is LF;
+          # compare content, not line endings.
+          diff --strip-trailing-cr gate-python.txt gate-rust.txt
           test "$py" = "$rs"
 
   # Enforces the rust-version declared in Cargo.toml. That floor is set by the
