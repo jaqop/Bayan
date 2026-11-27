@@ -106,7 +106,7 @@ pub fn connect_if_enabled(
 }
 
 /// One detached or attached session, as the protocol carries it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionSnap {
     pub id: u64,
     pub title: String,
@@ -154,6 +154,34 @@ pub enum Effect {
     Stop { id: u64 },
     Write { id: u64, bytes: Vec<u8> },
     Resize { id: u64, cols: u16, rows: u16 },
+    /// Write the session's metadata + output tail to disk so a later
+    /// reconnect can replay history even if the live slot is gone.
+    Persist { snap: SessionSnap },
+}
+
+/// Disk-backed session tails (Phase A3). Bounded by [`TAIL_MAX`]; the live
+/// pipe remains the source of truth while the server is up.
+pub fn saved_dir() -> std::path::PathBuf {
+    crate::config::bayan_dir().join("mux")
+}
+
+pub fn save_to(dir: &std::path::Path, snap: &SessionSnap) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let json = serde_json::to_vec(snap).map_err(std::io::Error::other)?;
+    std::fs::write(dir.join(format!("{}.json", snap.id)), json)
+}
+
+pub fn load_from(dir: &std::path::Path, id: u64) -> Option<SessionSnap> {
+    let bytes = std::fs::read(dir.join(format!("{id}.json"))).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+pub fn save_saved(snap: &SessionSnap) {
+    let _ = save_to(&saved_dir(), snap);
+}
+
+pub fn load_saved(id: u64) -> Option<SessionSnap> {
+    load_from(&saved_dir(), id)
 }
 
 #[derive(Debug)]
@@ -336,6 +364,9 @@ fn reduce(hub: &mut MuxHub, gate: &mut Gate, client: u64, msg: Message) -> Outco
         },
         Message::Detach { id } => {
             if hub.detach(id) {
+                if let Some(slot) = hub.slots.get(&id) {
+                    effects.push(Effect::Persist { snap: MuxHub::snap_of(id, slot) });
+                }
                 replies.push(Message::Detached { id });
             } else {
                 replies.push(Message::Missing { id });
@@ -1597,6 +1628,7 @@ mod os {
                         });
                     }
                 }
+                Effect::Persist { snap } => save_saved(&snap),
             }
         }
         Ok(())
@@ -2814,6 +2846,36 @@ mod tests {
             .any(|e| matches!(e, Effect::Stop { id } if *id == detached)));
         srv.transact(Message::Kill { id: detached });
         assert!(srv.exit_now);
+    }
+
+    #[test]
+    fn detach_emits_a_persist_effect() {
+        let mut hub = MuxHub::new();
+        let mut gate = Gate { ever_had: false };
+        let id = hub.spawn(&sample_spec("ssh.exe"), 1).expect("spawn");
+        let out = reduce(&mut hub, &mut gate, 1, Message::Detach { id });
+        assert!(out
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::Persist { snap } if snap.id == id)));
+    }
+
+    #[test]
+    fn saved_tail_round_trips_through_disk() {
+        let dir = std::env::temp_dir().join(format!("bayan-mux-test-{}", std::process::id()));
+        let snap = SessionSnap {
+            id: 7,
+            title: "t".into(),
+            command: "ssh.exe".into(),
+            cols: 80,
+            rows: 24,
+            screen: b"hello\x1b[0m".to_vec(),
+        };
+        save_to(&dir, &snap).expect("save");
+        let back = load_from(&dir, 7).expect("load");
+        assert_eq!(back, snap);
+        assert!(load_from(&dir, 8).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
