@@ -2621,6 +2621,8 @@ pub struct Renderer {
     pub cell_h: f32,
     /// tab under the pointer, so a truncated title can show the rest
     pub hover_tab: Option<usize>,
+    /// x of the insertion caret for an engaged tab reorder drag (Phase C2)
+    pub drag_tab_x: Option<i32>,
     /// fitted tab titles, keyed by (title, avail bits). A still frame must
     /// not re-measure prefixes into the shaped-run cache.
     title_fit: std::collections::HashMap<(String, u32), String>,
@@ -2843,6 +2845,7 @@ impl Renderer {
             cell_w,
             cell_h: metrics.line_height,
             hover_tab: None,
+            drag_tab_x: None,
             title_fit: std::collections::HashMap::new(),
         }
     }
@@ -8130,6 +8133,23 @@ impl Renderer {
             }
         }
 
+        // Phase C2: the insertion caret for an engaged tab reorder drag.
+        if let Some(x) = self.drag_tab_x {
+            let caret = self.accent_color(crate::theme::bar_accent(
+                crate::theme::BarAccent::Amber,
+                page_dark,
+            ));
+            push_rect(
+                out,
+                whole,
+                x - 1,
+                TAB_TOP,
+                2,
+                oy - TAB_TOP - 4,
+                c4(caret, 255),
+            );
+        }
+
         if let Some((tx, full)) = tip {
             self.draw_title_tip(out, whole, width, tx, &full);
         }
@@ -13330,6 +13350,44 @@ mod cache_tests {
             }),
             "⏸ 5%"
         );
+    }
+
+    /// Phase C2: an engaged tab drag draws a 2px insertion caret at
+    /// `drag_tab_x`; clearing the field on release removes it.
+    #[test]
+    fn tab_bar_draws_the_drag_insertion_caret() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let top = TAB_TOP as f32;
+        let h = (r.tab_bar_h().round() as i32 - TAB_TOP - 4) as f32;
+        let carets = |r: &mut Renderer| -> Vec<f32> {
+            let tab = TabInfo {
+                title: "بيان".into(),
+                color: None,
+                busy: false,
+                attention: false,
+                active: true,
+                progress: None,
+            };
+            let mut out = Vec::new();
+            r.draw_chrome(&mut out, 800, 400, &[tab], None, false, None);
+            out.chunks(6)
+                .filter(|q| {
+                    q[0].pos[1] == top
+                        && q[1].pos[0] - q[0].pos[0] == 2.0
+                        && q[5].pos[1] - q[0].pos[1] == h
+                })
+                .map(|q| q[0].pos[0])
+                .collect()
+        };
+        assert!(carets(&mut r).is_empty(), "no caret without a drag");
+        r.drag_tab_x = Some(120);
+        assert_eq!(
+            carets(&mut r),
+            vec![119.0],
+            "caret at the slot's leading edge"
+        );
+        r.drag_tab_x = None;
+        assert!(carets(&mut r).is_empty(), "caret cleared on release");
     }
 
     /// Solid rects always reference page 0 (the white texel lives there).

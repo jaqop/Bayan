@@ -113,6 +113,35 @@ pub(crate) fn tab_index_at(spans: &[(usize, i32, i32)], x: f64) -> Option<usize>
         .map(|&(i, ..)| i)
 }
 
+/// The visible slot a dragged tab should take for a pointer at `x` over the
+/// drawn `spans`: the left half of a tab inserts before it, the right half
+/// after it; past either end of the drawn row clamps to that end. The result
+/// is in the spans' own index space (the visible tab list), so a scrolled bar
+/// that only draws tabs 2..4 drops within 2..4.
+pub(crate) fn tab_drop_target(spans: &[(usize, i32, i32)], x: f64) -> usize {
+    let Some(&(first, fx, _)) = spans.first() else {
+        return 0;
+    };
+    let &(last, lx, lw) = spans.last().expect("non-empty");
+    if x < fx as f64 {
+        return first;
+    }
+    if x >= (lx + lw) as f64 {
+        return last;
+    }
+    match tab_index_at(spans, x) {
+        Some(k) => {
+            let &(_, sx, sw) = spans.iter().find(|&&(i, ..)| i == k).expect("span");
+            if x < sx as f64 + sw as f64 / 2.0 {
+                k
+            } else {
+                (k + 1).min(last)
+            }
+        }
+        None => last,
+    }
+}
+
 /// A second press on the empty title strip within the window maximises
 /// instead of starting a move.
 pub(crate) fn strip_double_click(last: Option<Instant>, now: Instant) -> bool {
@@ -774,6 +803,29 @@ mod tests {
         assert_eq!(tab_control(2, 0, 1), Some(TabControl::NewTab));
         assert_eq!(tab_control(3, 0, 1), Some(TabControl::ShellMenu));
         assert_eq!(tab_control(4, 0, 1), None);
+    }
+
+    #[test]
+    fn drag_drop_target_inserts_before_or_after_the_hovered_tab() {
+        let spans = [(0, 0, 100), (1, 100, 100), (2, 200, 100)];
+        assert_eq!(tab_drop_target(&spans, -5.0), 0);
+        assert_eq!(tab_drop_target(&spans, 350.0), 2);
+        assert_eq!(tab_drop_target(&spans, 10.0), 0);
+        assert_eq!(tab_drop_target(&spans, 60.0), 1);
+        assert_eq!(tab_drop_target(&spans, 140.0), 1);
+        assert_eq!(tab_drop_target(&spans, 160.0), 2);
+        assert_eq!(tab_drop_target(&spans, 210.0), 2);
+        assert_eq!(tab_drop_target(&spans, 290.0), 2);
+        assert_eq!(tab_drop_target(&[], 50.0), 0);
+    }
+
+    #[test]
+    fn drag_drop_target_clamps_to_a_scrolled_row() {
+        let spans = [(2, 0, 100), (3, 100, 100), (4, 200, 100)];
+        assert_eq!(tab_drop_target(&spans, -5.0), 2);
+        assert_eq!(tab_drop_target(&spans, 350.0), 4);
+        assert_eq!(tab_drop_target(&spans, 60.0), 3);
+        assert_eq!(tab_drop_target(&spans, 290.0), 4);
     }
 
     #[test]
