@@ -3,8 +3,13 @@
 
 use std::path::PathBuf;
 
+mod probe;
+
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    if probe::is_probe(&argv) {
+        std::process::exit(probe::startup(&argv[1..]));
+    }
     let print = argv.iter().any(|a| a == "--print");
     let baseline_arg = argv.windows(2).find(|w| w[0] == "--baseline").map(|w| w[1].clone());
     let logs: Vec<&String> = argv.iter()

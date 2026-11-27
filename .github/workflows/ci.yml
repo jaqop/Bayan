@@ -127,11 +127,12 @@ jobs:
       # the first start of a job is cold (fonts, shader cache) and several
       # times slower. A hosted runner does open the window, on WARP.
       - name: Startup marks
-        shell: pwsh
+        shell: bash
         run: |
+          set -euo pipefail
           cargo build --locked --release --features dev-hooks
-          if ($LASTEXITCODE -ne 0) { throw 'Startup probe build failed' }
-          ./scripts/measure-startup.ps1 -BinaryPath target/release/bayan.exe -OutputPath startup.log
+          cargo build --locked --manifest-path tools/perf-gate/Cargo.toml
+          ./tools/perf-gate/target/debug/perf-gate.exe startup --binary target/release/bayan.exe --output startup.log
       # Same bayan.exe. BAYAN_TAP injects 50 keys; no second cargo build.
       - name: Key-to-frame latency
         shell: pwsh
