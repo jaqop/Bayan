@@ -271,6 +271,12 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       (`ESC [ ? NUL u`). The encoder
       masks the kitty bits out of `TermMode` so a hostile push cannot make
       a key emit CSI u. Set `kitty_protocol` to true to enable the encoder.
+      A PTY-level characterization test
+      (`kitty_csi_u_input_is_dropped_by_conpty_characterization`) shows
+      ConPTY's input translation currently drops a CSI u written to the
+      master (the raw-stdin child receives nothing), so the protocol stays
+      default-off until a host forwards it byte-intact; the test flips if
+      that ever changes and prompts re-evaluating the default.
       On, the crate is [alacritty commit `542147067dd016fc5f49120ef0ba605a98a4e3a7`](https://github.com/alacritty/alacritty/commit/542147067dd016fc5f49120ef0ba605a98a4e3a7)
       (`0.26.1-dev`, the fix for [alacritty#9071](https://github.com/alacritty/alacritty/issues/9071)).
       Published 0.26.0's `push_keyboard_mode` evicts from `title_stack` and
