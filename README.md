@@ -1636,8 +1636,9 @@ milestone are what that change proved, not this total.
 
 ### Live smoke harness
 
-`scripts/gui-smoke.ps1` turns the one-off live captures this README records
-into re-runnable pixel assertions, locally and on CI (`gui smoke` job). It
+`perf-gate gui-smoke` (tools/perf-gate) turns the one-off live captures this
+README records into re-runnable pixel assertions, locally and on CI
+(`gui smoke` job). It
 launches a `--features dev-hooks` release in a fresh profile (deterministic
 config, fixed 1000×700 window), drives it with the existing `BAYAN_*` hooks
 or a real click, captures the PID-owned HWND with a DPI-aware `PrintWindow`,
@@ -1648,10 +1649,11 @@ Run it against a dev-hooks release:
 
 ```
 cargo build --locked --release --features dev-hooks
-pwsh scripts/gui-smoke.ps1 -BinaryPath target/release/bayan.exe
+cargo build --locked --manifest-path tools/perf-gate/Cargo.toml
+tools/perf-gate/target/debug/perf-gate.exe gui-smoke --binary target/release/bayan.exe
 ```
 
-Ten scenarios pass, each proven non-vacuous (a wrong-expectation variant
+Eleven scenarios pass, each proven non-vacuous (a wrong-expectation variant
 fails): `selftest-red` (the capture path sees real pixels), `arabic-connected`
 (shaped Arabic ink vs a spaces feed), `rtl-flush-right` (RTL paragraph flush
 right), `cyrillic-ltr` (Cyrillic stays left — universality), `tui-border-columns`
