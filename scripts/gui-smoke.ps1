@@ -19,6 +19,10 @@ A scenario file (scripts/gui-smoke/<name>.ps1) defines:
 $geom carries Dpi, W, H of the captured client area. Coordinates scale
 by Dpi/96; nothing is hard-coded in screen pixels.
 
+A scenario that needs real input defines Invoke-SmokeInput($hwnd, $geom),
+called after settle and before capture; Send-SmokeClick delivers a real
+left/right click at a fraction of the client area.
+
 An A/B scenario also defines $SmokeEnv2 (and optionally $SmokeConfig2,
 flat config keys merged for the second launch, and $SmokeSettle2). The
 first process is stopped, the second launched in a fresh temp directory,
@@ -49,7 +53,12 @@ public class GuiSmokeNative {
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdc, uint flags);
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hWnd, out RECT r);
+    [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr hWnd, ref POINT p);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, IntPtr e);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
 }
 '@
 # PerMonitorV2 (-4): PrintWindow pixels then match the window's own DPI.
@@ -152,6 +161,22 @@ function Get-SmokeCapture($hwnd) {
     return @{ Bmp = $bmp; Geom = @{ Dpi = $dpi; W = $w; H = $h } }
 }
 
+# A real click at a fraction of the client area, through the same
+# SetCursorPos + mouse_event path a user's mouse takes. Scenarios that
+# need input define Invoke-SmokeInput($hwnd, $geom) and call this.
+function Send-SmokeClick($hwnd, $geom, [double]$fx, [double]$fy, [string]$button) {
+    $pt = New-Object GuiSmokeNative+POINT
+    $pt.X = [int]($geom.W * $fx); $pt.Y = [int]($geom.H * $fy)
+    [GuiSmokeNative]::ClientToScreen($hwnd, [ref]$pt) | Out-Null
+    [GuiSmokeNative]::SetCursorPos($pt.X, $pt.Y) | Out-Null
+    Start-Sleep -Milliseconds 250
+    $down = 0x0002; $up = 0x0004
+    if ($button -eq 'right') { $down = 0x0008; $up = 0x0010 }
+    [GuiSmokeNative]::mouse_event($down, 0, 0, 0, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 100
+    [GuiSmokeNative]::mouse_event($up, 0, 0, 0, [IntPtr]::Zero)
+}
+
 function Wait-SmokeReady($p, [string]$log, [string]$stderr) {
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     while ([DateTime]::UtcNow -lt $deadline -and -not $p.HasExited) {
@@ -221,6 +246,16 @@ function Invoke-SmokeScenario([string]$file, [string]$exe) {
         if ($p.HasExited) { throw "Bayan exited during settle with $($p.ExitCode)" }
         $hwnd = Get-SmokeHwnd $p.Id
         if ($hwnd -eq [IntPtr]::Zero) { throw "no visible window owned by PID $($p.Id)" }
+        if (Get-Command Invoke-SmokeInput -ErrorAction SilentlyContinue) {
+            $r0 = New-Object GuiSmokeNative+RECT
+            [GuiSmokeNative]::GetClientRect($hwnd, [ref]$r0) | Out-Null
+            $d0 = [GuiSmokeNative]::GetDpiForWindow($hwnd)
+            if ($d0 -lt 96) { $d0 = 96 }
+            $geom0 = @{ Dpi = $d0; W = ($r0.R - $r0.L); H = ($r0.B - $r0.T) }
+            [GuiSmokeNative]::SetForegroundWindow($hwnd) | Out-Null
+            Start-Sleep -Milliseconds 400
+            Invoke-SmokeInput $hwnd $geom0
+        }
         $cap = Get-SmokeCapture $hwnd
         $bmp = $cap.Bmp
         $geom = $cap.Geom

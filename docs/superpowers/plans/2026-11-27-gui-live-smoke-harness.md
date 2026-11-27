@@ -65,6 +65,8 @@
 **Files:**
 - Create: `scripts/gui-smoke/groups-chip.ps1`, `settings-english.ps1`, `palette.ps1`, `guard-card.ps1`, `progress-bar.ps1`, `atlas-stress.ps1`
 
+- [x] **Step 0 (owner request 2026-11-27): `context-menu` + real input.** The driver gains `Invoke-SmokeInput` + `Send-SmokeClick` (SetCursorPos + mouse_event, client-fraction coordinates via ClientToScreen). A real right-click at the pane center must open the M39 menu: ink in the right-of-center band where the quiet grid has none. PASS on the merged-main build; the no-click variant FAILed (`region uniform`), proving the assertion sees the menu. The behavior was first proven live on the owner's Nov 19 binary with an ad-hoc probe.
+
 - [ ] **Step 1:** `groups-chip` (`BAYAN_GROUPS=1`): chip ink at the bar's leading edge; exactly one tab label region carries ink.
 - [ ] **Step 2:** `settings-english` (`BAYAN_SETTINGS=1 BAYAN_LANG=en`): label ink left of center, control ink right — the mirrored ledger.
 - [ ] **Step 3:** `palette` (`BAYAN_PALETTE=1`) and `guard-card` (`BAYAN_GUARD=1`): card region ink over a quiet grid.
