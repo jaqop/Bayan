@@ -96,6 +96,19 @@ states in prose):
 | `progress-bar` | OSC 9;4;60 fed as bytes | green bar pixels under the tab (M32's proof, re-runnable) |
 | `atlas-stress` | `BAYAN_ATLAS_STRESS=1` | CJK, Latin, Arabic regions all carry ink in one frame |
 
+## Multilingual parity (owner scope clarification, 2026-11-27)
+
+Bayan is a universal terminal: Arabic/BiDi is the differentiator, not the
+boundary. CJK (Chinese, Korean, Japanese) and Cyrillic (Russian) must
+render, fall back, take input, and be tested as cleanly as Arabic. The
+scenario set therefore grows a multilingual matrix (plan Task 5, after
+the current fixes): CJK wide-glyph column alignment, a mixed
+Arabic+CJK+Latin line, Russian prose staying LTR and left-aligned, and
+physical-key chords on a Cyrillic layout. Font determinism for CJK needs
+an owner decision (bundled faces are Arabic+Latin only today; CJK rides
+system fallback, which CI's windows image provides but a bare machine
+may not).
+
 ## Determinism rules
 
 - Bundled fonts only; fixed size, padding, window rect; blink off; smooth

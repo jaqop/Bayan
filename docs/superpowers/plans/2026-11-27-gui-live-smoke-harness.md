@@ -82,3 +82,13 @@
 - [ ] **Step 2:** actionlint clean; push to a branch; the job runs green on `windows-latest` (WARP).
 - [ ] **Step 3:** README milestone entry: what the harness proves, the scenario list, how to run it locally, and which former "not verified on screen" items it now covers.
 - [ ] **Step 4: Commit** — `"The live smoke harness runs on CI: eleven pixel-asserted scenarios on the hosted WARP window"`
+
+### Task 5: Multilingual parity matrix (owner scope clarification 2026-11-27 — after the current fixes)
+
+Bayan is universal: CJK and Cyrillic get the same pixel-proof discipline as Arabic.
+
+- [ ] **Step 1:** `cjk-columns` — a CJK line (double-width cells) beside an ASCII ruler line; assert column alignment via positioned marks, and that a mixed Arabic+CJK+Latin line keeps every script's ink in its own cells.
+- [ ] **Step 2:** `cyrillic-ltr` — Russian prose echo; the ink band must be LEFT-aligned (mirror of `rtl-flush-right`), proving the BiDi path does not misfire on Cyrillic.
+- [ ] **Step 3:** `cyrillic-chords` — physical-key chord guarantee on a Russian layout (needs the SendInput extension; coordinate with the key-routing/IME milestone).
+- [ ] **Step 4:** Font-fallback decision for determinism: owner chooses between relying on the CI image's CJK faces (documented) or bundling a subset (size/license). Until then the CJK scenarios gate on detected coverage and report-only when absent.
+- [ ] **Step 5: Commit** — `"The live matrix speaks CJK and Cyrillic too: wide-glyph columns, mixed scripts, and LTR Cyrillic"`
