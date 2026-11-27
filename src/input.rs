@@ -1055,8 +1055,14 @@ impl App {
                 return;
             }
             if let Some(s) = self.pane_swap.take() {
-                if s.engaged && s.target != s.src {
-                    self.swap_panes(s.src, s.target);
+                if s.engaged {
+                    match self.pane_at(self.cursor_pos) {
+                        // over another pane: exchange the two slots (C3a)
+                        Some(t) if t != s.src => self.swap_panes(s.src, t),
+                        // off the pane grid: pull the pane into a new tab (C3b)
+                        None => self.detach_pane(self.active, s.src),
+                        _ => {}
+                    }
                 }
                 self.cancel_pane_swap();
                 self.request_redraw();
