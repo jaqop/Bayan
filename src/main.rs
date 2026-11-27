@@ -7570,15 +7570,13 @@ impl App {
                         &frame.images,
                         frame.columns,
                         &|line| {
-                            let vrow = line as i64
-                                - (frame.evicted.saturating_add(history)) as i64
+                            let vrow = line as i64 - (frame.evicted.saturating_add(history)) as i64
                                 + off as i64;
                             if vrow < 0 || vrow as usize >= frame.rows {
                                 return false;
                             }
                             let span = frame.row_spans[vrow as usize].clone();
-                            let text: String =
-                                frame.cells[span].iter().map(|c| c.c).collect();
+                            let text: String = frame.cells[span].iter().map(|c| c.c).collect();
                             crate::bidi::line_is_rtl_visual(&text)
                         },
                     ));

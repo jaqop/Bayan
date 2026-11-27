@@ -515,6 +515,7 @@ pub struct ImageSprite {
 /// caret: the logical column is mirrored through the row width, so the image
 /// sits where the cursor actually draws (Phase A2). `rtl_of` reports whether
 /// an absolute line is an RTL paragraph; `pane_cols` is the row width.
+#[allow(clippy::too_many_arguments)]
 pub fn image_sprites(
     clip: Rect,
     cell_w: f32,

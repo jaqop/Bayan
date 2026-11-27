@@ -676,7 +676,12 @@ fn kitty_csi_u_input_is_dropped_by_conpty_characterization() {
     cmd.arg("6");
     let pty = native_pty_system();
     let pair = pty
-        .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .expect("openpty");
     let mut reader = pair.master.try_clone_reader().expect("pty reader");
     let input = std::sync::Arc::new(std::sync::Mutex::new(
