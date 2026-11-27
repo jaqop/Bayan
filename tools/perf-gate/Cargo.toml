@@ -10,3 +10,5 @@ publish = false
 regex = "1"
 # preserve_order: rows follow the baseline file's order, like the Python gate
 serde_json = { version = "1", features = ["preserve_order"] }
+# marker-DLL hash verification for the planted-dxcompiler check
+sha2 = "0.10"

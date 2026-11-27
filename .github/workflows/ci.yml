@@ -42,8 +42,11 @@ jobs:
       # A dxcompiler.dll beside it must not be mapped by the time the
       # renderer is ready. The file is removed before the test step.
       - name: Planted dxcompiler.dll is not loaded
-        shell: pwsh
-        run: ./scripts/assert-no-planted-dxc.ps1 -BinaryPath target/debug/bayan.exe -PlantSource tests/fixtures/marker_dxcompiler.dll
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --manifest-path tools/perf-gate/Cargo.toml
+          ./tools/perf-gate/target/debug/perf-gate.exe plant --binary target/debug/bayan.exe --source tests/fixtures/marker_dxcompiler.dll
       # Headless tests include isolated shell/PTY probes; no GUI or GPU.
       # Native signed-host round trips are explicitly run on a standard-token
       # Windows desktop: elevated runners deliberately reject that host.
