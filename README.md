@@ -958,6 +958,33 @@ specification; `src/keys.rs` carries the same key-encoding tests.
       Git Bash, a WSL distro, or an elevated token — this tree was checked
       with `cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings`
       and `cargo fmt --check`.
+- [x] **Inline TUI borders next to Arabic** — measured 2026-11-19: Gemini
+      CLI 0.68 draws its trust dialog on the primary screen, and on the row
+      holding an Arabic folder name the closing `│` sat at x=1597 against
+      1611 on the rows around it (one cell, 1650 px window). The narrow
+      Arabic pulled the rest of the whole-line shape left. The field path
+      that keeps borders on the grid already existed but ran only on the
+      alternate screen and in Claude mode. `render::tui_path` now also sends
+      a primary-screen row with Box Drawing (`U+2500..=U+257F`) there, and
+      the click snapshot uses the same function. Powerline glyphs (private
+      use) and Block Elements are left out, because shell prompts and
+      progress bars are built from them and must stay one line. The
+      lam-alef shift inside a field is unchanged; that is the dual engine's
+      trade-off. Gemini CLI and Codex CLI 0.170 were also checked: both
+      emit logical Arabic, so neither belongs in Claude mode. Proven by
+      `primary_screen_box_rows_take_the_field_path`,
+      `primary_screen_box_border_stays_on_its_column` (the border at 415
+      instead of 425.9 before the change, equal after),
+      `snapshot_and_paint_agree_on_the_tui_path`, and a live capture of the
+      same Gemini dialog. The review of that change found two more, now
+      fixed: a field row's grid cells (borders, spaces, Latin fields)
+      recorded no click geometry, so a click on `tree`'s `├` or a box's
+      closing `│` fell back to whole-line shaping and landed up to 8 columns
+      off (`primary_screen_field_rows_click_on_their_grid_cells`); and a
+      prompt glyph after a box's left border (`│ > …`) joined the Arabic
+      field and moved past the text in an RTL row
+      (`boxed_prompt_glyph_stays_on_its_column`). Claude mode's own prompt
+      row is unchanged.
 
 ## SSH tabs and the session multiplexer
 
@@ -1530,7 +1557,10 @@ stay as they are, and the corner chip reads `BiDi 1` or `BiDi 0` until the
 pane is back on `full`. An RTL paragraph (SCP 2, or auto when the first
 strong character is Arabic) is drawn flush with the pane's right edge on
 the primary screen. LTR paragraphs, TUI fields, and the alternate screen
-stay on the left.
+stay on the left. On the primary screen, a row with Box Drawing characters
+(`U+2500..=U+257F`) is drawn as TUI fields, so an inline TUI's borders
+(Gemini CLI's dialogs, `tree`) stay on their columns. Powerline prompts and
+Block Elements are not included.
 
 ```json
 { "bidi": { "mode": "alt_off" } }

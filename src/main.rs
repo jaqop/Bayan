@@ -6052,9 +6052,9 @@ impl App {
             } else {
                 stamped
             };
-            // Same split as draw_pane: TUI fields and the alternate screen
-            // are not flush-right.
-            let align_edge = reorder && !alt && !((claude || alt) && render::snap_is_tui(&cells));
+            // Same split as draw_pane (`render::tui_path`): TUI fields and
+            // the alternate screen are not flush-right.
+            let align_edge = reorder && !alt && !render::snap_tui_path(claude, alt, &cells);
             let shaped = rects.get(hit.pane).and_then(|rect| {
                 self.renderer
                     .as_mut()
@@ -6101,11 +6101,11 @@ impl App {
                 );
                 claude &= f.claude_from_abs.is_none_or(|start| abs >= start);
             }
-            // Same split as draw_pane: TUI fields and the alternate screen
-            // are not flush-right, so a click must not assume they are.
-            let align_edge = snap.reorder
-                && !snap.alt
-                && !((claude || snap.alt) && render::snap_is_tui(&snap.cells));
+            // Same split as draw_pane (`render::tui_path`): TUI fields and
+            // the alternate screen are not flush-right, so a click must not
+            // assume they are.
+            let align_edge =
+                snap.reorder && !snap.alt && !render::snap_tui_path(claude, snap.alt, &snap.cells);
             (
                 snap.cols,
                 snap.row,
