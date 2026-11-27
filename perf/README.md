@@ -85,11 +85,12 @@ finite and nonnegative. Each startup run must have a positive GPU mark,
 then the first frame and renderer-ready mark in chronological order. A missing
 or malformed policy/log fails instead of silently turning the gate green.
 
-`scripts/measure-startup.ps1` waits for all three marks, uses a fresh home and
-temporary directory for each run, and stops only the process it launched.
-It uses `cmd.exe /d /q` to avoid executing a user's AutoRun. It does not kill
-other Bayan windows or remove the user's profile log. The same script runs
-locally and on CI. Run it against a release build with `--features dev-hooks`.
+`perf-gate startup` (tools/perf-gate) waits for all three marks, uses a fresh
+home and temporary directory for each run, and stops only the process it
+launched. It uses `cmd.exe /d /q` to avoid executing a user's AutoRun. It does
+not kill other Bayan windows or remove the user's profile log. The same
+subcommand runs locally and on CI. Run it against a release build with
+`--features dev-hooks`.
 
 A run that misses its deadline is logged as a stalled start and skipped, not
 fatal: a cold start on a loaded hosted runner can outlast 30 s with no code
@@ -223,5 +224,5 @@ with the inbox console host, as is this machine (26200); the plain
 memory, and whether an accessibility client asked for the tree) so the
 next hosted run says which side the time is on.
 
-Scripts: `scripts/measure-tap-latency.ps1`, `scripts/measure-idle.ps1`.
+Subcommands: `perf-gate latency`, `perf-gate idle` (tools/perf-gate).
 `scripts/measure-latency.ps1` stays the local SendInput tool.

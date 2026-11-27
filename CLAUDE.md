@@ -76,11 +76,11 @@ Measure before optimizing, in release builds:
   SendInput (only while Bayan has the foreground) and summarises the
   `BAYAN_PROFILE` latency lines. It covers winit's key event to the PTY echo
   and to the GPU submit; the OS input queue and the display are outside it.
-  CI does not use SendInput. `scripts\measure-tap-latency.ps1` sets
+  CI does not use SendInput. `perf-gate latency` sets
   `BAYAN_TAP` so the process calls `keyroute::type_key` (the same function
   a winit press reaches, timed from that call). `BAYAN_TYPE` is not the
   latency path: it writes the PTY and never calls `key_sent`.
-- **Idle memory and idle redraws**, CI: `scripts\measure-idle.ps1` on that
+- **Idle memory and idle redraws**, CI: `perf-gate idle` on that
   same binary. Private bytes after a quiet tab, then two 5 s windows
   (`BAYAN_FRAME_COUNTERS` writes `%TEMP%\bayan_frame_counters.txt`).
   The minimized window is report-only until `MINIMIZED_REDRAW_REQUIRED`
