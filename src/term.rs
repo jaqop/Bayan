@@ -102,19 +102,6 @@ fn is_under(path: &str, root: &str) -> bool {
     p == r || p.starts_with(&format!("{r}\\"))
 }
 
-/// The PowerShell family gets UTF-8, the prompt theme and OSC 133 marks.
-/// Git Bash and WSL bash/zsh get the same marks from `shellint`; cmd gets
-/// A and B with no exit code and no nonce, so they are untrusted. Anything
-/// else launches bare, and the
-/// mark-driven features degrade gracefully.
-fn is_powershell(shell: &str) -> bool {
-    // `shell` is a COMMAND LINE now, not a program name: detection emits
-    // "powershell.exe -NoProfile", "wsl.exe -d Ubuntu", "…bash.exe --login -i".
-    let (prog, _) = split_command(shell);
-    let base = prog.rsplit(['\\', '/']).next().unwrap_or(&prog).to_string();
-    base.eq_ignore_ascii_case("powershell.exe") || base.eq_ignore_ascii_case("pwsh.exe")
-}
-
 /// Split a stored command line into program + arguments.
 ///
 /// Splitting on the first space is WRONG: a hand-edited config may hold
@@ -168,73 +155,12 @@ fn split_command_with(cmd: &str, exists: impl Fn(&str) -> bool) -> (String, Vec<
     )
 }
 
-/// OSC 133 prompt wrapper injected into PowerShell (EasyTer's __et_wrap,
-/// ported): D=command end (exit code), A=prompt start, 9;9=cwd report,
-/// B=input begins. Command detection — and Claude mode's auto-enable —
-/// depend on these marks. `__by_osc7` adds the standard OSC 7 `file://`
-/// report beside 9;9 (empty host, so `file:///C:/…`); cmd/clink has the
-/// matching snippet in the README, because cmd is launched bare.
-const PS_HEAD: &str = "function global:__by_osc7{if($PWD.Provider.Name -ne 'FileSystem'){return ''};\
-$p=$PWD.ProviderPath.Replace('\\','/');if($p -match '^[A-Za-z]:'){$p='/'+$p};$e='';\
-foreach($x in [Text.Encoding]::UTF8.GetBytes($p)){if($x -eq 47 -or ($x -ge 48 -and $x -le 57) -or ($x -ge 65 -and $x -le 90) -or ($x -ge 97 -and $x -le 122) -or $x -eq 45 -or $x -eq 46 -or $x -eq 95 -or $x -eq 126 -or $x -eq 58){$e+=[char]$x}else{$e+=('%{0:X2}' -f $x)}};[char]27+']7;file://'+$e+[char]7};\
-function global:__by_wrap{if(-not $global:__BY_SI){$global:__BY_SI=$true;\
-$global:__BY_OP=$function:prompt;function global:prompt{\
-$c=$global:LASTEXITCODE;if($null -eq $c){if($?){$c=0}else{$c=1}};\
-\"$([char]27)]133;D;$c;";
-
-const PS_MID: &str = "$([char]7)$([char]27)]133;A;";
-
-const PS_TAIL: &str = "$([char]7)\
-$([char]27)]9;9;$($PWD.ProviderPath)$([char]7)$(__by_osc7)\"\
-+(& $global:__BY_OP)+\"$([char]27)]133;B;";
-
-const PS_END: &str = "$([char]7)\"}}}; __by_wrap";
-
-/// The PowerShell prompt wrapper injected at spawn.
-///
-/// `nonce` is embedded in OSC 133 D, A and B (`D;<exit>;<nonce>`,
-/// `A;<nonce>`, `B;<nonce>`). B carries it since NEW-02: "at prompt" decides
-/// whether a dropped path is typed straight in, so output must not set it.
-/// A report from a running command is stored only after an A that carries
-/// the same nonce, so a spoofed `133;D` cannot authorize the OSC 7 that
-/// follows it. Hex is safe inside the double-quoted prompt string. An empty
-/// nonce keeps the old "any A/D" rule for tests. cmd's `PROMPT` emits A and
-/// B only, without the nonce, so a clink OSC 7 is still accepted while the
-/// pane is already idle and never on the strength of those marks.
-pub(crate) fn shell_integration_ps(nonce: &str) -> String {
-    // `nonce` is spliced in as text: the live session passes NONCE_PS_EXPR,
-    // tests pass a literal
-    let mut s = String::with_capacity(
-        PS_HEAD.len() + PS_MID.len() + PS_TAIL.len() + PS_END.len() + nonce.len() * 3,
-    );
-    s.push_str(PS_HEAD);
-    s.push_str(nonce);
-    s.push_str(PS_MID);
-    s.push_str(nonce);
-    s.push_str(PS_TAIL);
-    s.push_str(nonce);
-    s.push_str(PS_END);
-    s
-}
-
 /// R-08: the environment variable the nonce travels in. The setup script
 /// copies it into `$global:__BY_N` FIRST and removes it from the process
 /// environment, so the nonce is never on the PowerShell command line (which
 /// the process list shows to every same-user process) and no program the
 /// shell later starts inherits it. The prompt reads it from the variable.
 pub(crate) const NONCE_ENV: &str = "BAYAN_PROMPT_NONCE";
-
-/// What the prompt wrapper splices in where the nonce goes: expanded inside
-/// its double-quoted strings at every prompt.
-pub(crate) const NONCE_PS_EXPR: &str = "$($global:__BY_N)";
-
-/// The first statement of the setup script: take the nonce, drop the env var.
-pub(crate) fn nonce_capture_ps() -> String {
-    format!(
-        "$global:__BY_N=$env:{NONCE_ENV};\
-         Remove-Item Env:{NONCE_ENV} -ErrorAction SilentlyContinue;"
-    )
-}
 
 #[link(name = "advapi32")]
 extern "system" {
@@ -956,27 +882,6 @@ pub(crate) fn sanitize_elevated_environment(cmd: &mut CommandBuilder, elevated: 
     }
     cmd.env("INPUTRC", "/dev/null");
     cmd.env("HISTFILE", "/dev/null");
-}
-
-fn prepare_elevated_shell(
-    cmd: &mut CommandBuilder,
-    program: &str,
-    args: &[String],
-    elevated: bool,
-    marks: bool,
-    nonce: &str,
-) -> Result<Option<crate::shellint::Plan>, String> {
-    sanitize_elevated_environment(cmd, elevated);
-    if !elevated {
-        return Ok(None);
-    }
-    let protected = crate::shellint::elevated_bash_startup(program, args, marks, nonce)?;
-    if crate::shellint::is_bash_program(program) && protected.is_none() {
-        // Explicit commands keep their arguments, but not startup-file or
-        // environment-function execution before those commands.
-        cmd.args(["--noprofile", "--norc", "-p"]);
-    }
-    Ok(protected)
 }
 
 /// Longest cwd we will store or start a process in. Real Windows paths fit;
@@ -2454,92 +2359,6 @@ pub fn posh_config_span(profile_text: &str) -> Option<std::ops::Range<usize>> {
     None
 }
 
-/// The user's oh-my-posh theme: POSH_THEME env first, else auto-detected
-/// from the PowerShell profile. Lets Bayan skip the profile (-NoProfile is
-/// the single biggest avoidable startup cost — the EasyTer lesson) while
-/// keeping the prompt the user actually uses.
-/// Expand the environment references a hand-written $PROFILE may hold.
-/// Bayan checks the config path on disk before injecting it, and a
-/// portable profile stores "$env:USERPROFILE\\.poshthemes\\..." rather than
-/// an absolute path — checking that literally always fails, which silently
-/// drops the prompt. (Self-inflicted: making the profile portable is what
-/// exposed this.)
-fn expand_env(path: &str) -> String {
-    let mut out = path.to_string();
-    for (needle, var) in [
-        ("$env:USERPROFILE", "USERPROFILE"),
-        ("$env:HOME", "USERPROFILE"),
-        ("$HOME", "USERPROFILE"),
-        ("%USERPROFILE%", "USERPROFILE"),
-        ("$env:LOCALAPPDATA", "LOCALAPPDATA"),
-    ] {
-        if let Some(v) = std::env::var_os(var).and_then(|v| v.into_string().ok()) {
-            out = out.replace(needle, &v);
-        }
-    }
-    // a leading ~ is the other common shorthand
-    if let Some(rest) = out.strip_prefix("~") {
-        if let Some(h) = std::env::var_os("USERPROFILE").and_then(|v| v.into_string().ok()) {
-            out = format!("{h}{rest}");
-        }
-    }
-    out
-}
-
-/// The `-Command` script for a PowerShell Bayan starts itself.
-///
-/// UTF-8 and the prompt marks stay. The oh-my-posh line is omitted when
-/// `elevated` is set, even if `theme` is `Some`: that path comes from
-/// `$PROFILE` or `POSH_THEME`, and `oh-my-posh` would be resolved from the
-/// user's `PATH`. A theme `command` segment or a planted binary would then
-/// run as administrator, with no confirm card.
-pub(crate) fn powershell_setup(elevated: bool, theme: Option<&str>, capture_nonce: bool) -> String {
-    let mut setup = String::new();
-    if capture_nonce {
-        setup.push_str(&nonce_capture_ps());
-    }
-    setup.push_str(
-        "$OutputEncoding=[Console]::InputEncoding=[Console]::OutputEncoding=\
-         [Text.UTF8Encoding]::new();",
-    );
-    if !elevated {
-        if let Some(theme) = theme.filter(|theme| !theme.is_empty()) {
-            setup.push_str(&format!(
-                " $ErrorActionPreference='SilentlyContinue'; \
-                 & {{oh-my-posh init powershell --config '{}' | Invoke-Expression}} 2>$null; \
-                 $ErrorActionPreference='Continue';",
-                powershell_escape_single(theme)
-            ));
-        }
-    }
-    if capture_nonce {
-        setup.push(' ');
-        setup.push_str(&shell_integration_ps(NONCE_PS_EXPR));
-    }
-    setup
-}
-
-fn detect_posh_theme() -> Option<String> {
-    if let Ok(t) = std::env::var("POSH_THEME") {
-        if !t.is_empty() && std::path::Path::new(&t).exists() {
-            return Some(t);
-        }
-    }
-    let home = std::env::var("USERPROFILE").ok()?;
-    for rel in POSH_PROFILES {
-        let p = std::path::Path::new(&home).join(rel);
-        if let Ok(text) = std::fs::read_to_string(&p) {
-            if let Some(cfg) = parse_posh_config(&text) {
-                let cfg = expand_env(&cfg);
-                if std::path::Path::new(&cfg).exists() {
-                    return Some(cfg);
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Grid dimensions handed to alacritty_terminal.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct TermSize {
@@ -3215,7 +3034,17 @@ impl Session {
         shell_integration: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let prompt_nonce = fresh_prompt_nonce();
-        crate::shellint::sweep_stale_integration_dirs();
+        // The launch material — program, args, generated env, scripts — is
+        // assembled behind one seam, testable as data without a PTY.
+        let prepared = crate::shellint::prepare(
+            shell,
+            raw_argv,
+            crate::shellint::Policy {
+                enabled: shell_integration,
+                elevated,
+                nonce: prompt_nonce.clone(),
+            },
+        )?;
         let pty = native_pty_system();
         let pair = pty.openpty(PtySize {
             rows: size.rows as u16,
@@ -3223,45 +3052,16 @@ impl Session {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        // program + args, or a shell with switches would be spawned as one
-        // absurd filename ("powershell.exe -NoProfile" is not a program).
-        // A `-- command` is already split, so a path with spaces stays one
-        // argument instead of going through that splitter again.
-        let (prog, args) = if let Some(argv) = raw_argv {
-            let Some(prog) = argv.first().filter(|prog| !prog.is_empty()) else {
-                return Err("missing command".into());
-            };
-            (prog.clone(), argv[1..].to_vec())
-        } else {
-            split_command(shell)
-        };
-        // N-03: a saved `wsl.exe -d Ubuntu` must not search Bayan's folder.
-        let Some(prog) = crate::shells::resolve_spawn_program(prog) else {
-            return Err(
-                "refusing to spawn wsl.exe by a bare name; System32\\wsl.exe is not there".into(),
-            );
-        };
-        let prog = if elevated {
-            crate::shells::resolve_elevated_pwsh(
-                prog.as_str(),
-                crate::link::known_program_files().as_deref(),
-                |path| path.is_file(),
-            )?
-        } else {
-            prog
-        };
-        let mut cmd = CommandBuilder::new(&prog);
-        let protected_bash = prepare_elevated_shell(
-            &mut cmd,
-            &prog,
-            &args,
-            elevated,
-            shell_integration,
-            &prompt_nonce,
-        )?;
-        let protection_required = protected_bash.is_some();
-        for a in &args {
-            cmd.arg(a);
+        let mut cmd = CommandBuilder::new(&prepared.program);
+        // Filter the inherited environment BEFORE applying the generated
+        // integration env: the strip removes BAYAN_ prefixes, and the nonce
+        // variable (BAYAN_PROMPT_NONCE) must survive it.
+        sanitize_elevated_environment(&mut cmd, elevated);
+        for arg in &prepared.args {
+            cmd.arg(arg);
+        }
+        for (key, value) in &prepared.env {
+            cmd.env(key, value);
         }
         // what programs key their terminal features on: Claude Code, ripgrep,
         // delta and the rest read these before deciding what to emit
@@ -3279,62 +3079,6 @@ impl Session {
         if let Some(d) = &dir {
             cmd.cwd(d);
         }
-        // A raw command is the program the user named. The PowerShell,
-        // bash, zsh and cmd wrappers belong to a shell Bayan itself launched.
-        // Opt-out and a failed nonce both leave that shell unmarked.
-        let wrap = raw_argv.is_none();
-        let integrate = crate::shellint::injection_allowed(shell_integration, &prompt_nonce);
-        let mut applied = false;
-        let mut integration_scripts = crate::shellint::IntegrationDir(None);
-        if wrap && is_powershell(shell) {
-            // -NoProfile: the profile is seconds of avoidable startup (it
-            // re-runs oh-my-posh, chcp, modules). Self-provide what it gave
-            // us: UTF-8 (Arabic!) and the user's prompt theme, auto-detected.
-            cmd.args(["-NoProfile", "-NoExit", "-Command"]);
-            // R-08: the nonce rides in the environment, is taken before
-            // anything else runs, and is then removed, so it is in neither
-            // the command line nor any child's environment.
-            if integrate {
-                cmd.env(NONCE_ENV, &prompt_nonce);
-            }
-            // Elevated: do not read POSH_THEME or $PROFILE, and do not name
-            // oh-my-posh. The setup string is `powershell_setup`. NEW-05:
-            // with no random nonce, or `"shell_integration": false`, the
-            // wrapper is left out, so the pane runs without prompt marks
-            // instead of trusting marks anyone could forge.
-            let theme = if elevated { None } else { detect_posh_theme() };
-            let setup = powershell_setup(elevated, theme.as_deref(), integrate);
-            cmd.arg(setup);
-        } else if wrap || protection_required {
-            if let Some(plan) = protected_bash.or_else(|| {
-                crate::shellint::plan(shell, shell_integration, elevated, &prompt_nonce)
-            }) {
-                if let Some(done) = crate::shellint::startup_materialization(
-                    crate::shellint::materialize(&plan),
-                    protection_required,
-                )? {
-                    let argv = cmd.get_argv_mut();
-                    let prog = argv.first().cloned();
-                    argv.clear();
-                    if let Some(prog) = prog {
-                        argv.push(prog);
-                    }
-                    for arg in done.args {
-                        argv.push(arg.into());
-                    }
-                    for (key, value) in done.env {
-                        cmd.env(key, value);
-                    }
-                    integration_scripts = crate::shellint::IntegrationDir(done.dir);
-                    applied = true;
-                }
-            }
-        }
-        if wrap && !applied && shell_family(shell) == ShellFamily::Cmd {
-            // UTF-8 code page so Arabic paths survive. Marks, when they
-            // were applied above, already include this chcp.
-            cmd.args(["/K", "chcp 65001>nul"]);
-        }
         let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
         let child = pair.slave.spawn_command(cmd)?;
@@ -3348,7 +3092,7 @@ impl Session {
             kitty_protocol,
             prompt_nonce,
             images,
-            integration: integration_scripts,
+            integration: prepared.scripts,
             io: SessionIo {
                 reader,
                 writer,
@@ -4429,37 +4173,6 @@ fn paste_spoof_label(c: char) -> Option<&'static str> {
 
 /// Which quoting rules a spawned command line needs. Unknown programs follow
 /// PowerShell, because that is the shell Bayan starts when nothing else matches.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ShellFamily {
-    PowerShell,
-    Cmd,
-    Posix,
-    Fish,
-    /// Nushell raw strings. Not PowerShell: `'` is not the quote character.
-    Nu,
-}
-
-fn shell_family(shell: &str) -> ShellFamily {
-    let (prog, _) = split_command(shell);
-    let base = prog.rsplit(['\\', '/']).next().unwrap_or(&prog);
-    let name = base.to_ascii_lowercase();
-    let name = match name.strip_suffix(".exe") {
-        Some(stripped) => stripped.to_string(),
-        None => name,
-    };
-    match name.as_str() {
-        "powershell" | "pwsh" => ShellFamily::PowerShell,
-        "cmd" => ShellFamily::Cmd,
-        "fish" => ShellFamily::Fish,
-        "nu" => ShellFamily::Nu,
-        "bash" | "sh" | "zsh" | "wsl" | "dash" => ShellFamily::Posix,
-        // `git-bash.exe` is bash. Matching the substring "bash" would also
-        // catch `notbash`, so the hyphen is part of the rule.
-        n if n.ends_with("-bash") => ShellFamily::Posix,
-        _ => ShellFamily::PowerShell,
-    }
-}
-
 /// PowerShell single-quote characters. U+2018..=U+201B are quotes too: a
 /// dropped file named `a’;calc;’.txt` otherwise runs `calc`.
 fn is_powershell_single_quote(c: char) -> bool {
@@ -4468,7 +4181,7 @@ fn is_powershell_single_quote(c: char) -> bool {
 
 /// Double every PowerShell single quote, ASCII and smart. Shared by drop
 /// quoting and the oh-my-posh `--config '…'` argument, which is the same literal.
-fn powershell_escape_single(s: &str) -> String {
+pub(crate) fn powershell_escape_single(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if is_powershell_single_quote(c) {
@@ -4524,12 +4237,12 @@ pub fn dropped_path_arg(path: &std::path::Path, shell: &str) -> Option<String> {
     if p.len() > 3 && p.ends_with('\\') {
         p.pop();
     }
-    let quoted = match shell_family(shell) {
-        ShellFamily::PowerShell => format!("'{}'", powershell_escape_single(&p)),
-        ShellFamily::Posix => format!("'{}'", p.replace('\'', r"'\''")),
-        ShellFamily::Fish => format!("'{}'", quote_fish(&p)),
-        ShellFamily::Nu => quote_nu(&p),
-        ShellFamily::Cmd => {
+    let quoted = match crate::shellint::shell_family(shell) {
+        crate::shellint::ShellFamily::PowerShell => format!("'{}'", powershell_escape_single(&p)),
+        crate::shellint::ShellFamily::Posix => format!("'{}'", p.replace('\'', r"'\''")),
+        crate::shellint::ShellFamily::Fish => format!("'{}'", quote_fish(&p)),
+        crate::shellint::ShellFamily::Nu => quote_nu(&p),
+        crate::shellint::ShellFamily::Cmd => {
             // `%VAR%` and delayed-expansion `!VAR!` survive double quotes.
             // `"` cannot occur in a Windows filename; if it did, it would
             // close the quotes. Refuse rather than hand the shell a breakout.
@@ -4628,6 +4341,10 @@ pub fn regex_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shellint::{
+        expand_env, is_powershell, nonce_capture_ps, powershell_setup, shell_family,
+        shell_integration_ps, ShellFamily, NONCE_PS_EXPR,
+    };
 
     #[test]
     fn spawn_directory_falls_back_without_faking_a_shell_report() {
@@ -4738,19 +4455,30 @@ mod tests {
         let mut cmd = CommandBuilder::new("bash.exe");
         cmd.env_clear();
         cmd.env("BASH_ENV", "untrusted-file");
-        let protected =
-            prepare_elevated_shell(&mut cmd, "bash.exe", &args, true, false, NONCE_OFF).unwrap();
-        assert!(
-            protected.is_none(),
-            "an explicit command does not get a prompt wrapper"
-        );
-        cmd.args(&args);
-        let expected: Vec<std::ffi::OsString> = ["bash.exe", "--noprofile", "--norc", "-p"]
-            .into_iter()
-            .map(Into::into)
-            .chain(args.into_iter().map(Into::into))
+        // prepare adds the protected-startup flags before the command bytes;
+        // raw argv keeps the command's own arguments verbatim.
+        let argv: Vec<String> = std::iter::once("bash.exe".to_string())
+            .chain(args.iter().cloned())
             .collect();
-        assert_eq!(cmd.get_argv(), &expected);
+        let prepared = crate::shellint::prepare(
+            "bash.exe",
+            Some(&argv),
+            crate::shellint::Policy {
+                enabled: false,
+                elevated: true,
+                nonce: NONCE_OFF.into(),
+            },
+        )
+        .unwrap();
+        let expected: Vec<String> = ["--noprofile", "--norc", "-p"]
+            .into_iter()
+            .map(String::from)
+            .chain(args.into_iter())
+            .collect();
+        assert_eq!(prepared.args, expected);
+        // the inherited environment is filtered separately, before the
+        // generated integration env is applied
+        sanitize_elevated_environment(&mut cmd, true);
         assert!(cmd.get_env("BASH_ENV").is_none());
     }
 
@@ -7635,17 +7363,9 @@ mod tests {
     }
 
     #[test]
-    fn spawn_checks_shell_integration_before_injecting_the_powershell_wrapper() {
-        let src = include_str!("term.rs");
-        let spawn = src.split("pub fn spawn(").nth(1).expect("spawn");
-        let body = spawn.split("pub fn shell(").next().unwrap_or(spawn);
-        let gate = body.find("injection_allowed").expect("gate");
-        // The wrapper is written by `powershell_setup`, and only when the
-        // gate's answer is passed in.
-        let wrapper = body
-            .find("powershell_setup(elevated, theme.as_deref(), integrate)")
-            .expect("wrapper");
-        assert!(gate < wrapper);
+    fn the_powershell_wrapper_carries_marks_only_when_integration_is_on() {
+        // The integration gate now lives inside shellint::prepare; the
+        // wrapper's own contract is asserted as data, not by scanning spawn.
         assert!(!powershell_setup(false, None, false).contains("133;"));
         assert!(powershell_setup(false, None, true).contains("133;"));
     }
