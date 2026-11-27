@@ -135,14 +135,19 @@ jobs:
           ./tools/perf-gate/target/debug/perf-gate.exe startup --binary target/release/bayan.exe --output startup.log
       # Same bayan.exe. BAYAN_TAP injects 50 keys; no second cargo build.
       - name: Key-to-frame latency
-        shell: pwsh
+        shell: bash
         run: |
-          ./scripts/measure-tap-latency.ps1 -BinaryPath target/release/bayan.exe -OutputPath latency.log
-      # Same bayan.exe. Quiet private memory, then the two 5s redraw windows.
+          set -euo pipefail
+          ./tools/perf-gate/target/debug/perf-gate.exe latency --binary target/release/bayan.exe --output latency.log
+      # Same bayan.exe. Quiet private memory, the minimized + ten-tab redraw
+      # windows, and the 16 MB cat. The minimize ShowWindow runs on a thread
+      # with a timeout so a busy hosted UI thread can never stall the probe;
+      # minimized redraws are report-only either way.
       - name: Idle memory and redraws
-        shell: pwsh
+        shell: bash
         run: |
-          ./scripts/measure-idle.ps1 -BinaryPath target/release/bayan.exe -OutputPath idle.log
+          set -euo pipefail
+          ./tools/perf-gate/target/debug/perf-gate.exe idle --binary target/release/bayan.exe --output idle.log
       # The Rust gate (tools/perf-gate) is the gate; the Python original was
       # retired after byte-equivalence was proven on runner logs (PR #109).
       - name: Gate
@@ -172,18 +177,12 @@ jobs:
           key: release-probes
       - name: Build the dev-hooks release
         run: cargo build --locked --release --features dev-hooks
-      # Install the pinned Microsoft 1.22+ host next to the binary so the
-      # session matches the path users get (it passes VT through by default).
-      - name: Install and verify pinned Microsoft console host
-        shell: pwsh
-        run: ./scripts/install-conpty.ps1 -OutputDirectory target/release
       - name: Live pixel proofs
         shell: pwsh
-        # -CiSafe: even with the pinned host, the hosted WARP window +
-        # PrintWindow render exact truecolor dimmed and ConPTY drops
-        # Write-Host+CUP feeds, so the precise-color/positioned proofs stay
-        # local (full set, no -CiSafe); the six environment-robust proofs are
-        # enforced here.
+        # -CiSafe: the hosted WARP window + inbox ConPTY render exact
+        # truecolor dimmed and drop Write-Host+CUP feeds, so only the
+        # environment-robust proofs are enforced here; the precise-color
+        # and positioned proofs run locally (full set, no -CiSafe).
         run: ./scripts/gui-smoke.ps1 -BinaryPath target/release/bayan.exe -KeepArtifacts -CiSafe
       - name: Upload captures on failure
         if: failure()
