@@ -28,6 +28,9 @@ PROBE latency render p50=100.0 p95=130.0 n=50
 PROBE idle_memory private=291.3 MB working_set=125.0 MB
 PROBE idle_redraw visible presents=0 redraws=0 window_s=5
 PROBE idle_redraw minimized presents=0 redraws=0 window_s=5
+PROBE tabs_memory tabs=10 private=313.8 MB working_set=128.6 MB
+PROBE idle_redraw tabs10 presents=0 redraws=0 window_s=5
+PROBE cat mb=16 seconds=64.11 peak_private=597.5 MB
 """
 
 STARTUP = """
@@ -152,6 +155,35 @@ class Gate(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertIn("limit 100%", failures[0])
 
+    def test_ten_tabs_and_cat_parse(self):
+        got = perf_gate.parse(PROBES)
+        self.assertEqual(got["tabs_memory"], {"private 10 tabs": 313.8})
+        self.assertEqual(got["idle_redraw"]["tabs10 redraws"], 0.0)
+        self.assertEqual(got["cat_time"], {"16 MB seconds": 64.11})
+        self.assertEqual(got["cat_memory"], {"16 MB peak private": 597.5})
+
+    def test_ten_tab_redraw_is_required_not_report_only(self):
+        base = {"idle_redraw": {"tabs10 presents": 0, "tabs10 redraws": 0}}
+        bad = {"idle_redraw": {"tabs10 presents": 0.0, "tabs10 redraws": 1.0}}
+        failures, _, _ = perf_gate.compare(base, bad, 0.10)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("tabs10 redraws", failures[0])
+
+    def test_cat_time_is_a_wide_backstop_and_cat_memory_is_ten_percent(self):
+        base = {"tolerances": {"cat_time": 1.0}, "cat_time": {"16 MB seconds": 5.0},
+                "cat_memory": {"16 MB peak private": 100.0}}
+        ok = {"cat_time": {"16 MB seconds": 10.0}, "cat_memory": {"16 MB peak private": 110.0}}
+        self.assertEqual(perf_gate.compare(base, ok, 0.10)[0], [])
+        bad = {"cat_time": {"16 MB seconds": 10.1}, "cat_memory": {"16 MB peak private": 111.0}}
+        failures, _, _ = perf_gate.compare(base, bad, 0.10)
+        self.assertEqual(len(failures), 2)
+
+    def test_a_malformed_cat_or_tabs_line_is_rejected(self):
+        for line in ("PROBE cat mb=16 seconds=fast peak_private=1 MB",
+                     "PROBE tabs_memory tabs=10 private=? MB working_set=1 MB"):
+            with self.subTest(line=line), self.assertRaises(ValueError):
+                perf_gate.parse(PROBES + line + "\n")
+
     def test_a_short_latency_sample_is_not_a_pass(self):
         bad = PROBES.replace("n=50", "n=39", 1)
         with self.assertRaises(ValueError):
@@ -179,7 +211,8 @@ class CommandLineGate(unittest.TestCase):
     def test_an_empty_or_missing_policy_group_never_passes(self):
         self.assertNotEqual(self.run_gate({}).returncode, 0)
         baseline = json.loads((pathlib.Path(__file__).resolve().parent.parent / "perf/baseline.json").read_text())
-        for group in ("throughput", "scrollback", "startup", "startup_ratio", "latency", "idle_memory", "idle_redraw"):
+        for group in ("throughput", "scrollback", "startup", "startup_ratio", "latency", "idle_memory", "idle_redraw",
+                      "tabs_memory", "cat_time", "cat_memory"):
             broken = copy.deepcopy(baseline)
             del broken[group]
             with self.subTest(group=group):

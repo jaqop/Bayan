@@ -34,7 +34,14 @@ runner, not the code.
       is better. Working set is printed by the probe and not gated.
   idle_redraw: presents and redraws over a 5s window. The baseline is 0
       and any increase fails. `minimized` is report-only until
-      `MINIMIZED_REDRAW_REQUIRED` is set.
+      `MINIMIZED_REDRAW_REQUIRED` is set. `tabs10` is the same 5s window
+      with ten quiet tabs open, and is required.
+  tabs_memory: private MB with ten quiet `cmd` tabs open (`BAYAN_TABS`).
+      Lower is better.
+  cat_time: seconds from the first PTY read to the pane's exit while
+      `cmd /c type` prints a 16 MB ASCII file. Conhost is in the path and
+      runners vary, so the tolerance is a wide backstop, like startup.
+  cat_memory: peak private MB during that cat, sampled every 100 ms.
 
     python scripts/perf_gate.py probe.log startup.log latency.log idle.log
     python scripts/perf_gate.py probe.log startup.log latency.log idle.log --print
@@ -52,7 +59,9 @@ STARTUP = re.compile(rf"(?<![\w.+-])({NUMBER}) ms  ([a-z][a-z ]*[a-z])\s*$", re.
 LATENCY = re.compile(rf"PROBE latency key->frame p50=({NUMBER}) p95=({NUMBER}) n=(\d+)\s*$", re.IGNORECASE | re.MULTILINE)
 LATENCY_RENDER = re.compile(rf"PROBE latency render p50=({NUMBER}) p95=({NUMBER}) n=(\d+)\s*$", re.IGNORECASE | re.MULTILINE)
 IDLE_MEMORY = re.compile(rf"PROBE idle_memory private=({NUMBER}) MB working_set=({NUMBER}) MB\s*$", re.IGNORECASE | re.MULTILINE)
-IDLE_REDRAW = re.compile(r"PROBE idle_redraw (visible|minimized) presents=(\d+) redraws=(\d+) window_s=(\d+)\s*$", re.IGNORECASE | re.MULTILINE)
+IDLE_REDRAW = re.compile(r"PROBE idle_redraw (visible|minimized|tabs10) presents=(\d+) redraws=(\d+) window_s=(\d+)\s*$", re.IGNORECASE | re.MULTILINE)
+TABS_MEMORY = re.compile(rf"PROBE tabs_memory tabs=(\d+) private=({NUMBER}) MB working_set=({NUMBER}) MB\s*$", re.IGNORECASE | re.MULTILINE)
+CAT = re.compile(rf"PROBE cat mb=(\d+) seconds=({NUMBER}) peak_private=({NUMBER}) MB\s*$", re.IGNORECASE | re.MULTILINE)
 MIN_LATENCY_SAMPLES = 40
 # One-line switch. Flip to True once minimized redraws are stopped. Until
 # then a non-zero minimized window is printed and does not fail the job.
@@ -69,7 +78,12 @@ REQUIRED = {
         "visible redraws",
         "minimized presents",
         "minimized redraws",
+        "tabs10 presents",
+        "tabs10 redraws",
     },
+    "tabs_memory": {"private 10 tabs"},
+    "cat_time": {"16 MB seconds"},
+    "cat_memory": {"16 MB peak private"},
 }
 
 
@@ -137,6 +151,10 @@ def parse(text):
             raise ValueError("malformed PROBE idle_memory line")
         if "PROBE idle_redraw" in line and not IDLE_REDRAW.search(line):
             raise ValueError("malformed PROBE idle_redraw line")
+        if "PROBE tabs_memory" in line and not TABS_MEMORY.search(line):
+            raise ValueError("malformed PROBE tabs_memory line")
+        if "PROBE cat" in line and not CAT.search(line):
+            raise ValueError("malformed PROBE cat line")
         if re.search(r"\s+ms  [a-z][a-z ]*[a-z]\s*$", line, re.IGNORECASE) and not STARTUP.search(line):
             raise ValueError("malformed startup mark")
     for kind, chunk_rate, vte_rate, pct in THROUGHPUT.findall(text):
@@ -201,6 +219,20 @@ def parse(text):
         for key, raw in ((f"{which} presents", presents), (f"{which} redraws", redraws)):
             value = float(int(raw))
             redraw[key] = max(value, redraw.get(key, 0.0))
+    tabs, cat_time, cat_memory = {}, {}, {}
+    for count, private, working in TABS_MEMORY.findall(text):
+        number(float(working), "tabs_memory working_set")
+        key = f"private {int(count)} tabs"
+        value = number(float(private), "tabs_memory private")
+        tabs[key] = max(value, tabs.get(key, 0.0))
+    for mb, seconds, peak in CAT.findall(text):
+        cat_time[f"{int(mb)} MB seconds"] = max(
+            number(float(seconds), "cat seconds"), cat_time.get(f"{int(mb)} MB seconds", 0.0)
+        )
+        cat_memory[f"{int(mb)} MB peak private"] = max(
+            number(float(peak), "cat peak_private"),
+            cat_memory.get(f"{int(mb)} MB peak private", 0.0),
+        )
     return {
         "throughput": throughput,
         "scrollback": scrollback,
@@ -210,6 +242,9 @@ def parse(text):
         "latency_render": render,
         "idle_memory": memory,
         "idle_redraw": redraw,
+        "tabs_memory": tabs,
+        "cat_time": cat_time,
+        "cat_memory": cat_memory,
     }
 
 
@@ -226,6 +261,9 @@ def compare(baseline, measured, tolerance):
         ("latency", "ms", False, False),
         ("idle_memory", "MB", False, True),
         ("idle_redraw", "count", False, False),
+        ("tabs_memory", "MB", False, True),
+        ("cat_time", "s", False, False),
+        ("cat_memory", "MB", False, True),
     )
     for group, unit, higher_is_better, report_gains in checks:
         group_tolerance = float(baseline.get("tolerances", {}).get(group, tolerance))

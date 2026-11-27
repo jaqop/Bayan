@@ -586,7 +586,7 @@ fn dev_hook(_name: &str) -> Option<std::ffi::OsString> {
 mod prof {
     use std::io::Write;
     use std::sync::OnceLock;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     static T0: OnceLock<Instant> = OnceLock::new();
 
@@ -625,6 +625,88 @@ mod prof {
     pub fn output_read() {
         if on() {
             latency().output_read(Instant::now());
+        }
+    }
+
+    /// One PTY read on the reader thread: time blocked in `read`, waiting
+    /// for the terminal lock, and holding it. Summed and marked about once
+    /// a second, so a slow flood says which of the three it waited on.
+    pub fn reader_read(bytes: usize, read_wait: Duration, lock_wait: Duration, held: Duration) {
+        if !on() {
+            return;
+        }
+        struct Tally {
+            since: Option<Instant>,
+            reads: u64,
+            bytes: u64,
+            read_wait: Duration,
+            lock_wait: Duration,
+            held: Duration,
+        }
+        static TALLY: std::sync::Mutex<Tally> = std::sync::Mutex::new(Tally {
+            since: None,
+            reads: 0,
+            bytes: 0,
+            read_wait: Duration::ZERO,
+            lock_wait: Duration::ZERO,
+            held: Duration::ZERO,
+        });
+        let mut t = TALLY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let since = *t.since.get_or_insert_with(Instant::now);
+        t.reads += 1;
+        t.bytes += bytes as u64;
+        t.read_wait += read_wait;
+        t.lock_wait += lock_wait;
+        t.held += held;
+        if since.elapsed() >= Duration::from_secs(1) {
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+            mark(&format!(
+                "reader reads={} bytes={} read_wait_ms={:.0} lock_wait_ms={:.0} held_ms={:.0}",
+                t.reads,
+                t.bytes,
+                ms(t.read_wait),
+                ms(t.lock_wait),
+                ms(t.held)
+            ));
+            t.since = Some(Instant::now());
+        }
+    }
+
+    /// Times a stretch of the UI thread while profiling: `redraw()` as a
+    /// whole (0) and `gpu.render` inside it (1). Summed and marked about
+    /// once a second beside the reader's tally.
+    pub struct Span(Option<(usize, Instant)>);
+
+    pub fn span(kind: usize) -> Span {
+        Span(on().then(|| (kind, Instant::now())))
+    }
+
+    impl Drop for Span {
+        fn drop(&mut self) {
+            let Some((kind, at)) = self.0 else { return };
+            // When the last mark went out, then (count, time) per kind.
+            type Tally = (Option<Instant>, [(u64, Duration); 2]);
+            static TALLY: std::sync::Mutex<Tally> =
+                std::sync::Mutex::new((None, [(0, Duration::ZERO); 2]));
+            let mut t = TALLY
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let since = *t.0.get_or_insert_with(Instant::now);
+            t.1[kind].0 += 1;
+            t.1[kind].1 += at.elapsed();
+            if kind == 0 && since.elapsed() >= Duration::from_secs(1) {
+                let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+                mark(&format!(
+                    "ui redraws={} redraw_ms={:.0} renders={} render_ms={:.0}",
+                    t.1[0].0,
+                    ms(t.1[0].1),
+                    t.1[1].0,
+                    ms(t.1[1].1)
+                ));
+                t.0 = Some(Instant::now());
+            }
         }
     }
 
@@ -4192,16 +4274,22 @@ impl App {
     /// The command matches `-- argv` when that is how this process started,
     /// so the probe's `cmd /d /q` is the busy tab too.
     fn arm_idle_busy(&mut self) {
+        self.spawn_start_like_tab();
+        if self.tabs.len() >= 2 {
+            self.switch_tab(0);
+        }
+        self.idle_busy = true;
+    }
+
+    /// A tab running this process's `-- argv` when it started with one, else
+    /// the configured shell. The probes' extra tabs are `cmd /d /q` too.
+    fn spawn_start_like_tab(&mut self) {
         if let Some(argv) = self.start_command.clone() {
             let command = argv.join(" ");
             self.spawn_tab_command(None, &command, Some(&argv));
         } else {
             self.spawn_tab(None);
         }
-        if self.tabs.len() >= 2 {
-            self.switch_tab(0);
-        }
-        self.idle_busy = true;
     }
 
     /// Keep the background tab inside `Tab::busy`'s 2s window and push a
@@ -5234,6 +5322,19 @@ impl App {
         // producing output, so the minimized-redraw probe has a busy tab.
         if dev_hook("BAYAN_IDLE_BUSY").is_some() {
             self.arm_idle_busy();
+        }
+        // BAYAN_TABS=<n>: n tabs in all, for the many-tabs memory probe.
+        // The first tab stays active so the others are background tabs.
+        if let Some(v) = dev_hook("BAYAN_TABS") {
+            match v.to_str().and_then(|s| s.parse::<usize>().ok()) {
+                Some(n) if n >= 1 => {
+                    for _ in self.tabs.len()..n.min(32) {
+                        self.spawn_start_like_tab();
+                    }
+                    self.switch_tab(0);
+                }
+                _ => eprintln!("bayan: BAYAN_TABS ignored (want a positive count)"),
+            }
         }
         crate::prof::mark("session spawned");
         // the window exists now; if it is already focused and a pane has
@@ -7206,6 +7307,7 @@ impl App {
     /// front of that count.
     fn redraw(&mut self) {
         crate::prof::note_redraw();
+        let _span = crate::prof::span(0);
         // One photograph per pane per frame: the active tab's panes get the
         // full frame (draw, screen reader, scrollbar); every other tab's
         // focused pane gets meta facts only (cockpit) — a background tab
@@ -7753,7 +7855,11 @@ impl App {
                 verts: &sprite.verts,
             })
             .collect();
-        if !gpu.render(&verts, &quads, bg) {
+        let rendered = {
+            let _span = crate::prof::span(1);
+            gpu.render(&verts, &quads, bg)
+        };
+        if !rendered {
             // Retry once after reconfiguring, without spinning on occlusion.
             // `request_redraw` no-ops while the window is not showing, so a
             // surface that comes back occluded does not schedule another entry.
@@ -8236,6 +8342,7 @@ impl ApplicationHandler<UserEvent> for App {
                 accesskit_winit::WindowEvent::InitialTreeRequested => {
                     // The next consider must build even if the stamp matches
                     // a tree we never managed to send.
+                    crate::prof::mark("accessibility client");
                     self.reader_seen_client = true;
                     self.reader_pace = screen_reader::TreePace::default();
                     self.publish_reader();

@@ -3216,9 +3216,11 @@ impl Session {
             let mut carry: Vec<u8> = Vec::new();
             let mut buf = [0u8; PTY_READ];
             loop {
+                let read_at = std::time::Instant::now();
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        let got_at = std::time::Instant::now();
                         crate::prof::output_read();
                         // Lift and decode images before taking the terminal
                         // lock. A large sixel or PNG must not freeze the UI
@@ -3238,7 +3240,9 @@ impl Session {
                             // on the UI thread takes the same order. The
                             // batch opens and closes under the term lock,
                             // so only this read's events are collected.
+                            let lock_at = std::time::Instant::now();
                             let mut t = term2.lock();
+                            let locked_at = std::time::Instant::now();
                             let mut m = meta2.lock_or_recover();
                             let mut p = parser2.lock_or_recover();
                             m.image_in = filter;
@@ -3255,7 +3259,15 @@ impl Session {
                             }
                             let replies = std::mem::take(&mut ev.pty_replies);
                             let out = batch.lock_or_recover().finish(ev.clean_claude, replies);
-                            (ev, out, p.sync_timeout().sync_timeout())
+                            let sync = p.sync_timeout().sync_timeout();
+                            drop((p, m, t));
+                            crate::prof::reader_read(
+                                n,
+                                got_at - read_at,
+                                locked_at - lock_at,
+                                locked_at.elapsed(),
+                            );
+                            (ev, out, sync)
                         };
                         if let Some(deadline) = sync_deadline {
                             let _ = sync_tx.send(deadline);

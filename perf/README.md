@@ -93,6 +93,10 @@ Same `bayan.exe` as the startup step (`cargo build --locked --release
 | `idle_memory private` | `Get-Process` `PrivateMemorySize64` of the Bayan process, one quiet `cmd /d /q` tab, 5 s after the prompt settles. Working set is printed and not gated. cmd and ConPTY are not included. | Lower is better. Median of three hosted runs. 10% when the spread is narrow; wider when it is not, and the spread is recorded here. |
 | `idle_redraw visible` | blink off (`cursor_blink: false`), one quiet tab, 5 s. | presents and redraws must both be 0. |
 | `idle_redraw minimized` | `BAYAN_IDLE_BUSY=1` keeps a background tab busy; the script calls `ShowWindow(SW_MINIMIZE)`. | **Report-only.** `MINIMIZED_REDRAW_REQUIRED` in `scripts/perf_gate.py` is the one-line switch. A missing or malformed line still fails. Non-zero counts do not, until that flag is true. The 600 ms busy-dot pulse and wakeup/title/bell redraws while minimized are stopped by a separate change; this probe is ready for that change. |
+| `idle_redraw tabs10` | `BAYAN_TABS=10`: ten `cmd /d /q` tabs, the first active. Same 5 s window once the counters settle. | presents and redraws must both be 0. Required. |
+| `tabs_memory private 10 tabs` | private MB of that ten-tab window after the 5 s. | Lower is better, 10%. |
+| `cat_time 16 MB seconds` | `type` of a 16,000,000-byte ASCII file (200k lines) in the `Command Prompt` profile (`-p`), typed by `BAYAN_TYPE` with `& exit`; the script reads the file once first so an on-access scan is not timed. From `first pty output` (cmd's prompt, so cmd start-up is included) to the later of cmd's exit and the last change in the frame counters, once both are 2 s past. Scrollbar autohide is off so its delayed hide frame is not counted. Fails if private memory rises less than 16 MB (the file never reached the scrollback). | Lower is better. 100%, a backstop like startup. |
+| `cat_memory 16 MB peak private` | peak private MB during that cat, sampled every 100 ms. | Lower is better, 10%. |
 
 `BAYAN_FRAME_COUNTERS=1` (with `BAYAN_PROFILE`) writes
 `%TEMP%\bayan_frame_counters.txt` as `redraws=N presents=M` on each
@@ -131,6 +135,72 @@ Three complete `windows-latest` runs of the same probe code (runs
   while a background tab is busy, and that redraw wakes the loop again,
   minimized or not. The confirmation run read 846 redraws in the same
   window.
+
+### Ten tabs and a large cat
+
+The cat waits for cmd, not for the pane. On inbox ConPTY a child's exit
+leaves conhost running and the output pipe open, so the reader never sees
+EOF and the pane stays (the same on e63bb89, before this probe). The
+script waits for Bayan's child `cmd.exe` to exit, then for the frame
+counters to hold still.
+
+The first version ended at 3 s with no frame and was wrong twice over.
+The frame counters can hold still for seconds while a flood is still
+arriving, and on the hosted runner the first open of the fresh file was
+held up long enough that the loop ended before any output (private
+memory rose 1.9 to 3.6 MB on three runs; the same `type` outside Bayan
+read all 200,000 lines). Installing the pinned OpenConsole pair did not
+change that, so the console host was not the cause. Locally the same
+loop read 5.08 s, 2.24 s and 0.02 s on the same binary.
+
+The second version (`-- cmd.exe /d /c type`) still read +0.2 MB on the
+runner, with no `cmd.exe` child at all. The runner's `runneradmin` token
+is elevated, and an elevated Bayan drops a `--` command by design
+(`main.rs`, `command: if elevated { None }`) and opens its elevated
+default shell. So the cat opens the cmd profile with `-p`, which an
+elevated launch accepts, and types the command. The same holds for the
+other probes' `-- cmd.exe /d /q`: on the runner the quiet window, ten
+tabs, latency and startup run the elevated default shell, not cmd, and
+their baselines are what that shell measured.
+
+The author's machine, 2026-11-15, release + dev-hooks, rustc 1.100: one
+quiet tab 393.6 MB private; ten tabs 420.2 MB (+27 MB for nine more
+tabs), 0/0 redraws. The cat as `cmd /c`, three runs: 6.68, 6.44, 6.37 s,
+peak private 428.6 to 431.4 MB; as the typed cmd profile: 8.51, 7.17,
+8.96 s, peak 428.9 to 429.3 MB.
+
+First hosted run (43694739816 on b7dceeb): one quiet tab 291.2 MB, ten
+tabs 313.8 MB (+22.6 MB), 0/0 redraws; two later runs read 314.2 and
+313.9. `tabs_memory` is 313.8. The minimized window read 0 presents
+and 0 redraws on those runs.
+
+The typed cmd-profile cat, first hosted run (43714995789 on e87874a):
+64.11 s, peak private 597.5 MB. Those are `cat_time` and `cat_memory`;
+one run, not yet the median of three. 64 s is about eight times the
+author's machine (7.17 to 8.96 s) on the same code, and the runner grew
+about 300 MB during the cat where the author's machine grows 30 to 50 MB
+(roughly the 10k-line scrollback).
+
+What it is not, measured on the author's machine on 2026-11-15 (cat only,
+same release + dev-hooks binary):
+
+| Run | cmd exit | last frame | redraws/presents | private start → peak |
+|---|---|---|---|---|
+| hardware adapter, 4 cores | 7.53 s | 7.76 s | 9/6 | 397 → 428 MB |
+| WARP (`force_fallback_adapter`, `d3d10warp.dll` loaded), 4 cores | 8.00 s | 8.12 s | 9/6 | 340 → 391 MB |
+| WARP, 2 cores | | 13.20 s | | peak 385 MB |
+| WARP, 4 cores, a UIA client reading the tree | 8.06 s | 8.39 s | 12/9 | 341 → 395 MB |
+
+Cores are a process affinity mask inherited by cmd and conhost. The
+frame holds the terminal lock only while `draw_pane` lays out the pane;
+the WARP rasterization in `gpu.render` runs after the lock is dropped.
+So WARP, four cores, and an accessibility client do not explain 64 s.
+The runner is Windows Server 2025 (`windows-2025-vs2026`, build 26100)
+with the inbox console host, as is this machine (26200); the plain
+`type` outside Bayan took under 4 s there. The idle step now prints a
+`large cat split:` line (cmd exit, last frame, frame counts, start
+memory, and whether an accessibility client asked for the tree) so the
+next hosted run says which side the time is on.
 
 Scripts: `scripts/measure-tap-latency.ps1`, `scripts/measure-idle.ps1`.
 `scripts/measure-latency.ps1` stays the local SendInput tool.
