@@ -640,3 +640,98 @@ impl Drop for Restore {
         let _ = std::fs::remove_dir_all(&self.temp);
     }
 }
+
+/// A3 characterization: a kitty CSI u chord written to the pty master is
+/// currently DROPPED by ConPTY's input translation (the raw-stdin fixture
+/// receives nothing). This pins the limitation that keeps
+/// `keyboard.kitty_protocol` default-off. If a future ConPTY forwards CSI u
+/// byte-intact, this test flips and prompts re-evaluating default-on.
+/// Deterministic (no SendInput): the child hex-dumps stdin.
+#[test]
+#[ignore = "needs the pinned Microsoft pair beside the test exe and a python; CI runs explicitly"]
+fn kitty_csi_u_input_is_dropped_by_conpty_characterization() {
+    use std::io::Write;
+    let exe = std::env::current_exe().expect("current exe");
+    let dir = exe.parent().expect("exe dir");
+    let parent = dir.parent().expect("target dir");
+    // The vendored pty loads the bundled host from beside the running exe;
+    // CI installs it into target/debug, one level above deps/.
+    let mut copied = Vec::new();
+    for name in ["conpty.dll", "OpenConsole.exe"] {
+        let src = parent.join(name);
+        let dst = dir.join(name);
+        if src.exists() && !dst.exists() {
+            std::fs::copy(&src, &dst).expect("copy pinned pair beside test exe");
+            copied.push(dst);
+        }
+    }
+    let temp = std::env::temp_dir().join(format!("bayan-kitty-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&temp);
+    let out = temp.join("raw.hex");
+    let python = std::env::var("BAYAN_PYTHON").unwrap_or_else(|_| "python".into());
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/raw_input.py");
+    let mut cmd = CommandBuilder::new(python);
+    cmd.arg(fixture);
+    cmd.arg(&out);
+    cmd.arg("6");
+    let pty = native_pty_system();
+    let pair = pty
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    let mut reader = pair.master.try_clone_reader().expect("pty reader");
+    let input = std::sync::Arc::new(std::sync::Mutex::new(
+        pair.master.take_writer().expect("pty input"),
+    ));
+    let drain_input = input.clone();
+    let drain = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut q = Vec::new();
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    q.extend_from_slice(&buf[..n]);
+                    if q.windows(4).any(|w| w == b"\x1b[6n") {
+                        if let Ok(mut w) = drain_input.lock() {
+                            let _ = w.write_all(b"\x1b[1;1R");
+                            let _ = w.flush();
+                        }
+                        q.clear();
+                    }
+                    if q.len() > 3 {
+                        q.drain(..q.len() - 3);
+                    }
+                }
+            }
+        }
+    });
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn fixture");
+    drop(pair.slave);
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    // Shift+Enter under the kitty protocol: CSI 13;2u.
+    {
+        let mut w = input.lock().expect("input lock");
+        w.write_all(b"\x1b[13;2u").expect("write CSI u");
+        w.flush().expect("flush CSI u");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(pair.master);
+    let _ = drain.join();
+    let hex = std::fs::read_to_string(&out).unwrap_or_default();
+    for p in copied {
+        let _ = std::fs::remove_file(p);
+    }
+    let _ = std::fs::remove_dir_all(&temp);
+    assert!(hex.contains("start"), "fixture did not run; saw: {hex}");
+    assert!(
+        !hex.contains("1b5b31333b3275"),
+        "ConPTY now forwards CSI u byte-intact; re-evaluate kitty_protocol default-on. saw: {hex}"
+    );
+}

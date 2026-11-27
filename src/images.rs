@@ -3520,7 +3520,8 @@ mod tests {
             rgba: Arc::from(vec![0u8; 16]),
         };
         let clip = (10, 20, 80, 40);
-        let sprites = crate::render::image_sprites(clip, 10.0, 10.0, 0, 0, 0, &[snap]);
+        let sprites =
+            crate::render::image_sprites(clip, 10.0, 10.0, 0, 0, 0, &[snap], 8, &|_| false);
         assert_eq!(sprites.len(), 1);
         assert_eq!(sprites[0].verts.len(), 6);
         for v in &sprites[0].verts {
@@ -3548,7 +3549,7 @@ mod tests {
             height: 1,
             rgba: Arc::from(vec![0u8; 4]),
         };
-        let off = crate::render::image_sprites(clip, 10.0, 10.0, 0, 0, 0, &[below]);
+        let off = crate::render::image_sprites(clip, 10.0, 10.0, 0, 0, 0, &[below], 8, &|_| false);
         assert_eq!(off.len(), 1);
         assert_eq!(off[0].cookie, 2);
         assert!(off[0].verts.is_empty());
@@ -3580,7 +3581,9 @@ mod tests {
         assert_eq!(on_ltr[0].col, on_rtl[0].col);
 
         let quad = |snaps: &[ImageSnap]| {
-            crate::render::image_sprites((0, 0, 400, 80), 10.0, 20.0, 0, 0, 0, snaps)
+            crate::render::image_sprites((0, 0, 400, 80), 10.0, 20.0, 0, 0, 0, snaps, 40, &|_| {
+                false
+            })
         };
         let rtl_quad = quad(&on_rtl);
         let ltr_quad = quad(&on_ltr);
@@ -3611,6 +3614,61 @@ mod tests {
             .map(|v| v.pos[0])
             .fold(f32::MAX, f32::min);
         assert_eq!(ltr_left, left);
+    }
+
+    #[test]
+    fn rtl_anchor_mirrors_the_quad_to_the_visual_caret() {
+        // Phase A2: on an RTL row the quad anchors under the visual caret,
+        // i.e. the logical column is mirrored through the row width. Pixels
+        // still run left to right (not reversed).
+        let snap = ImageSnap {
+            cookie: 1,
+            line: 0,
+            col: 0,
+            cols: 2,
+            rows: 1,
+            width: 2,
+            height: 1,
+            rgba: Arc::from(vec![255, 0, 0, 255, 0, 0, 255, 255]),
+        };
+        let rtl = crate::render::image_sprites(
+            (0, 0, 100, 20),
+            10.0,
+            20.0,
+            0,
+            0,
+            0,
+            std::slice::from_ref(&snap),
+            10,
+            &|_| true,
+        );
+        let left = rtl[0]
+            .verts
+            .iter()
+            .map(|v| v.pos[0])
+            .fold(f32::MAX, f32::min);
+        assert_eq!(
+            left, 80.0,
+            "logical col 0 of a 2-cell image on a 10-col RTL row anchors at visual col 8"
+        );
+        let ltr = crate::render::image_sprites(
+            (0, 0, 100, 20),
+            10.0,
+            20.0,
+            0,
+            0,
+            0,
+            &[snap],
+            10,
+            &|_| false,
+        );
+        let ltr_left = ltr[0]
+            .verts
+            .iter()
+            .map(|v| v.pos[0])
+            .fold(f32::MAX, f32::min);
+        assert_eq!(ltr_left, 0.0);
+        assert_eq!(rtl[0].rgba, ltr[0].rgba, "pixels are not reversed");
     }
 
     #[test]

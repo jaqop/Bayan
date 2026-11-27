@@ -7568,6 +7568,17 @@ impl App {
                         off,
                         view.scroll_px,
                         &frame.images,
+                        frame.columns,
+                        &|line| {
+                            let vrow = line as i64 - (frame.evicted.saturating_add(history)) as i64
+                                + off as i64;
+                            if vrow < 0 || vrow as usize >= frame.rows {
+                                return false;
+                            }
+                            let span = frame.row_spans[vrow as usize].clone();
+                            let text: String = frame.cells[span].iter().map(|c| c.c).collect();
+                            crate::bidi::line_is_rtl_visual(&text)
+                        },
                     ));
                     let rows = frame.rows;
                     let visual = pane.visual_selection(frame.selection.as_ref());

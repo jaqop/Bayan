@@ -448,6 +448,54 @@ fn scenarios() -> Vec<Scenario> {
             click: None,
             assert: Box::new(assert_ink_region(0.10, 0.20, 0.90, 0.80)),
         },
+        Scenario {
+            // A1: Kitty graphics (t=d raw RGB) must survive the pinned ConPTY
+            // host's VT passthrough and land as pixels. Requires the pinned
+            // conhost beside the binary (inbox conhost strips APC).
+            name: "kitty-image",
+            env: vec![("BAYAN_TYPE", "Write-Host \"$([char]27)_Ga=T,f=24,s=2,v=2,i=1;/wAA/wAA/wAA/wAA$([char]27)\\\"\r".into())],
+            settle: 6,
+            ci_safe: false,
+            click: None,
+            assert: Box::new(|b, _dpi| {
+                let mut n = 0;
+                for y in 0..b.h {
+                    for x in 0..b.w {
+                        let (r, g, bl) = b.pixel(x, y);
+                        if (r as i32 - 255).abs() <= 4 && g <= 4 && bl <= 4 {
+                            n += 1;
+                        }
+                    }
+                }
+                if n < 4 {
+                    Err(format!("kitty image drew only {n} red pixels (want >= 4); APC not delivered?"))
+                } else {
+                    Ok(())
+                }
+            }),
+        },
+        Scenario {
+            // Phase B: agents (Pi) wrap redraws in synchronized output
+            // (DEC 2026). Bayan must accept the private mode and render the
+            // wrapped update correctly (no glitch / dropped frame).
+            name: "sync-output",
+            env: vec![("BAYAN_TYPE", "Write-Host \"$([char]27)[?2026h$([char]27)[48;2;255;0;0m$([char]27)[2J$([char]27)[?2026l\"\r".into())],
+            settle: 10,
+            ci_safe: false,
+            click: None,
+            assert: Box::new(|b, dpi| {
+                let top = (60.0 * dpi as f64 / 96.0) as usize;
+                let gh = b.h - top;
+                let x = (b.w as f64 * 0.5) as usize;
+                let y = top + (gh as f64 * 0.5) as usize;
+                let (r, g, bl) = b.pixel(x, y);
+                if (r as i32 - 255).abs() > 2 || g > 2 || bl > 2 {
+                    Err(format!("DEC 2026-wrapped redraw lost pixels: ({r},{g},{bl})"))
+                } else {
+                    Ok(())
+                }
+            }),
+        },
     ]
 }
 
