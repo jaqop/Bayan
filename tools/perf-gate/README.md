@@ -1,6 +1,7 @@
 # perf-gate (Rust)
 
-The Rust port of `scripts/perf_gate.py`: parse the `PROBE` lines the ignored
+The perf gate, in Rust (formerly `scripts/perf_gate.py`, retired after
+byte-equivalence was proven): parse the `PROBE` lines the ignored
 `measure_` tests print, validate against `perf/baseline.json`, fail a change
 that makes the reader slower or the scrollback heavier.
 
@@ -25,7 +26,9 @@ The lookbehind `(?<![\w.+-])` in the Python startup regex has no equivalent in
 the `regex` crate; matches are post-filtered by their preceding character
 instead, which is semantically identical.
 
-## Cutover
+## Cutover (done)
 
-`scripts/perf_gate.py` remains the CI gate until this crate is wired into the
-workflow and proven green there; only then is the Python retired.
+This crate is the CI gate. PR #109 proved byte-equivalence with the Python
+original on real runner logs (identical verdict table and exit code); the
+cutover then made it the gate and retired `scripts/perf_gate.py` and
+`scripts/test_perf_gate.py`.

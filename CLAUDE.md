@@ -57,8 +57,8 @@ selection and BiDi paths must do.
 Test counts come from `cargo test -- --list` and the CI test summary, not
 manual totals in this file. Explicit native host probes and measurement
 probes are ignored by the default suite; see their annotations and Measuring.
-`scripts/test_perf_gate.py` is the perf job's unittest and is not part of
-that cargo count.
+`tools/perf-gate` (`cargo test --manifest-path tools/perf-gate/Cargo.toml`)
+is the perf job's gate test and is not part of that cargo count.
 
 ## Measuring
 
@@ -84,12 +84,12 @@ Measure before optimizing, in release builds:
   same binary. Private bytes after a quiet tab, then two 5 s windows
   (`BAYAN_FRAME_COUNTERS` writes `%TEMP%\bayan_frame_counters.txt`).
   The minimized window is report-only until `MINIMIZED_REDRAW_REQUIRED`
-  in `scripts/perf_gate.py` is flipped. The same script opens ten quiet
+  in `tools/perf-gate/src/lib.rs` is flipped. The same script opens ten quiet
   tabs (`BAYAN_TABS=10`: private memory, zero redraws) and runs `type` on
   a 16 MB file (seconds to the last frame, peak private memory).
 
 CI gates these on every pull request (the `perf` job).
-`scripts/perf_gate.py` compares the probes' `PROBE` lines with
+`tools/perf-gate` compares the probes' `PROBE` lines with
 `perf/baseline.json`. The baseline is the hosted runner's own figures,
 not the author's machine. Reader throughput is a share of vte per corpus,
 and scrollback is private megabytes once full; both fail more than 10%
