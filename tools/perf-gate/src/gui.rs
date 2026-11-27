@@ -448,6 +448,32 @@ fn scenarios() -> Vec<Scenario> {
             click: None,
             assert: Box::new(assert_ink_region(0.10, 0.20, 0.90, 0.80)),
         },
+        Scenario {
+            // A1: Kitty graphics (t=d raw RGB) must survive the pinned ConPTY
+            // host's VT passthrough and land as pixels. Requires the pinned
+            // conhost beside the binary (inbox conhost strips APC).
+            name: "kitty-image",
+            env: vec![("BAYAN_TYPE", "Write-Host \"$([char]27)_Ga=T,f=24,s=2,v=2,i=1;/wAA/wAA/wAA/wAA$([char]27)\\\"\r".into())],
+            settle: 6,
+            ci_safe: false,
+            click: None,
+            assert: Box::new(|b, _dpi| {
+                let mut n = 0;
+                for y in 0..b.h {
+                    for x in 0..b.w {
+                        let (r, g, bl) = b.pixel(x, y);
+                        if (r as i32 - 255).abs() <= 4 && g <= 4 && bl <= 4 {
+                            n += 1;
+                        }
+                    }
+                }
+                if n < 4 {
+                    Err(format!("kitty image drew only {n} red pixels (want >= 4); APC not delivered?"))
+                } else {
+                    Ok(())
+                }
+            }),
+        },
     ]
 }
 
