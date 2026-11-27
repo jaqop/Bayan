@@ -6,7 +6,8 @@
 $SmokeEnv = @{
     BAYAN_TYPE = 'echo مرحبا بالعالم هذا نثر طويل يكفي' + "`r"
 }
-$SmokeSettle = 6.0
+$SmokeSettle = 10.0
+$SmokeCiSafe = $true
 
 function Invoke-SmokeAssert($bmp, $geom) {
     $w = $geom.W; $h = $geom.H

@@ -149,6 +149,40 @@ jobs:
           python scripts/perf_gate.py probe.log startup.log latency.log idle.log --print
           python scripts/perf_gate.py probe.log startup.log latency.log idle.log | tee -a "$GITHUB_STEP_SUMMARY"
 
+  # The live pixel proofs run on the hosted WARP window too, so a rendering
+  # regression cannot land without a captured counterexample. Scenarios are
+  # isolated (fresh profile, cleared BAYAN_* hooks, reset scenario functions)
+  # and each was proven non-vacuous locally before being enforced here.
+  gui-smoke:
+    name: gui smoke (live pixel proofs)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 (v5.1.0)
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: release-probes
+      - name: Build the dev-hooks release
+        run: cargo build --locked --release --features dev-hooks
+      - name: Live pixel proofs
+        shell: pwsh
+        # -CiSafe: the hosted WARP window + inbox ConPTY render exact
+        # truecolor dimmed and drop Write-Host+CUP feeds, so only the
+        # environment-robust proofs are enforced here; the precise-color
+        # and positioned proofs run locally (full set, no -CiSafe).
+        run: ./scripts/gui-smoke.ps1 -BinaryPath target/release/bayan.exe -KeepArtifacts -CiSafe
+      - name: Upload captures on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (v4.6.2)
+        with:
+          name: gui-smoke-captures
+          path: ${{ runner.temp }}/bayan-smoke-*/*.png
+          if-no-files-found: ignore
+
   # Enforces the rust-version declared in Cargo.toml. That floor is set by the
   # dependency graph (cosmic-text 0.19 wants 1.89), not by our own source, so
   # without this job the declaration is a comment nobody checks.
