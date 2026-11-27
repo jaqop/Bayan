@@ -181,18 +181,21 @@ jobs:
       - name: Build the dev-hooks release
         run: cargo build --locked --release --features dev-hooks
       - name: Live pixel proofs
-        shell: pwsh
-        # -CiSafe: the hosted WARP window + inbox ConPTY render exact
-        # truecolor dimmed and drop Write-Host+CUP feeds, so only the
-        # environment-robust proofs are enforced here; the precise-color
-        # and positioned proofs run locally (full set, no -CiSafe).
-        run: ./scripts/gui-smoke.ps1 -BinaryPath target/release/bayan.exe -KeepArtifacts -CiSafe
+        shell: bash
+        # --ci-safe: the hosted WARP window renders exact truecolor dimmed and
+        # drops Write-Host+CUP feeds, so only the environment-robust proofs are
+        # enforced here; the precise-color/positioned proofs run locally (full
+        # set, no --ci-safe).
+        run: |
+          set -euo pipefail
+          cargo build --locked --manifest-path tools/perf-gate/Cargo.toml
+          ./tools/perf-gate/target/debug/perf-gate.exe gui-smoke --binary target/release/bayan.exe --ci-safe
       - name: Upload captures on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (v4.6.2)
         with:
           name: gui-smoke-captures
-          path: ${{ runner.temp }}/bayan-smoke-*/*.png
+          path: ${{ runner.temp }}/bayan-smoke-*/*.bmp
           if-no-files-found: ignore
 
   # Enforces the rust-version declared in Cargo.toml. That floor is set by the

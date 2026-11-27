@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 
+mod gui;
 mod idle;
 mod plant;
 mod probe;
@@ -11,6 +12,9 @@ fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.first().map(|s| s.as_str()) == Some("idle") {
         std::process::exit(idle::idle(&argv[1..]));
+    }
+    if argv.first().map(|s| s.as_str()) == Some("gui-smoke") {
+        std::process::exit(gui::run(&argv[1..]));
     }
     if argv.first().map(|s| s.as_str()) == Some("plant") {
         std::process::exit(plant::plant(&argv[1..]));
