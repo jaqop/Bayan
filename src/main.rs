@@ -993,6 +993,22 @@ struct PendingPaste {
 }
 
 /// One terminal pane (a tab holds one or more).
+/// The focused pane index after pane `removed` leaves a tab that keeps
+/// `remaining` panes (Phase C3b): a focus past the removal shifts down one;
+/// the removed pane's own focus falls to the nearest surviving pane.
+fn focused_after_remove(focused: usize, removed: usize, remaining: usize) -> usize {
+    if remaining == 0 {
+        return 0;
+    }
+    if focused > removed {
+        focused - 1
+    } else if focused == removed {
+        removed.min(remaining - 1)
+    } else {
+        focused
+    }
+}
+
 struct Pane {
     id: u64,
     session: Session,
@@ -5149,20 +5165,24 @@ impl App {
         Some(mouse::cell_at(pos.x, pos.y, &rects, r.cell_w as f64, r.cell_h as f64)?.pane)
     }
 
-    /// Phase C3a: a pane swap drag tracks the pane under the pointer and
-    /// outlines it; release over a different pane exchanges the two slots.
+    /// Phase C3a/C3b: a pane drag tracks the pane under the pointer and
+    /// outlines it (swap preview). Off the pane grid the outline drops and
+    /// the drag becomes a detach intent (release pulls the pane into a tab).
     fn pane_swap_motion(&mut self, position: PhysicalPosition<f64>) {
         let Some(mut s) = self.pane_swap else {
             return;
         };
-        if let Some(pi) = self.pane_at(position) {
+        let over = self.pane_at(position);
+        if let Some(pi) = over {
             s.target = pi;
-            s.engaged = pi != s.src;
         }
-        let rect = self.pane_rects().get(s.target).copied();
+        s.engaged = over != Some(s.src);
+        let outline = over
+            .filter(|&pi| pi != s.src)
+            .and_then(|pi| self.pane_rects().get(pi).copied());
         self.pane_swap = Some(s);
         if let Some(r) = self.renderer.as_mut() {
-            r.pane_swap_rect = if s.engaged { rect } else { None };
+            r.pane_swap_rect = outline;
         }
         self.request_redraw();
     }
@@ -5188,6 +5208,39 @@ impl App {
         if let Some(r) = self.renderer.as_mut() {
             r.pane_swap_rect = None;
         }
+    }
+
+    /// Phase C3b: pull pane `pi` of tab `ti` out into a new tab, keeping its
+    /// live session. The source tree renumbers (`Node::remove`); a tab keeps
+    /// at least one pane, so detaching the only pane is a no-op.
+    fn detach_pane(&mut self, ti: usize, pi: usize) {
+        if matches!(
+            self.pending_close,
+            Some(CloseTarget::Pane(..)) | Some(CloseTarget::Tab(_))
+        ) {
+            self.pending_close = None;
+        }
+        let pane = {
+            let Some(t) = self.tabs.get_mut(ti) else {
+                return;
+            };
+            if pi >= t.panes.len() || t.panes.len() < 2 {
+                return;
+            }
+            let pane = t.panes.remove(pi);
+            t.layout.remove(pi);
+            t.focused = focused_after_remove(t.focused, pi, t.panes.len());
+            t.zoomed = false;
+            if t.panes.len() < 2 {
+                t.broadcast = false;
+            }
+            pane
+        };
+        dismiss_paste_for(&mut self.pending_paste, &[pane.id]);
+        // a new tab in the same group adopts the live pane (no session kill)
+        self.adopt_tab(None, pane, None);
+        self.save_state();
+        self.request_redraw();
     }
 
     /// Move the active tab into group `gid` (`None`: a new group). The
@@ -10882,6 +10935,21 @@ mod tests {
         assert_eq!(active_after_remove(2, 2, 2), (1, true));
         assert_eq!(active_after_remove(0, 0, 2), (0, true));
         assert_eq!(active_after_remove(5, 0, 0), (0, false));
+    }
+
+    /// Detaching a pane renumbers the source tab; focus follows the pane the
+    /// user was on, or the nearest survivor when that pane itself leaves.
+    #[test]
+    fn detaching_a_pane_keeps_focus_on_the_right_survivor() {
+        // a focus past the removal slides down one
+        assert_eq!(focused_after_remove(2, 0, 2), 1);
+        // a focus before the removal stays put
+        assert_eq!(focused_after_remove(0, 2, 2), 0);
+        // the removed pane was focused: fall to the nearest survivor
+        assert_eq!(focused_after_remove(1, 1, 2), 1);
+        assert_eq!(focused_after_remove(2, 2, 2), 1);
+        assert_eq!(focused_after_remove(0, 0, 2), 0);
+        assert_eq!(focused_after_remove(0, 0, 0), 0);
     }
 
     /// The toast trigger is untrusted output: a program can ask for

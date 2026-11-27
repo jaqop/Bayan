@@ -49,9 +49,18 @@ different pane exchanges their layout slots. Delivered in two increments:
   reuses C2's press/track/release shape; the outline is renderer state drawn
   after the grid, cleared on release or cancel (`abandon_mouse`). Proof:
   `layout::tests::swap_*` + `chrome_outlines_the_pane_swap_target`.
-- **C3b — detach (next):** pull a pane out into a new tab. Moves a live PTY
-  between tabs and renumbers the source tree (`Node::remove`); design follows
-  once C3a lands.
+- **C3b — detach (this increment):** the same `Ctrl+Alt+drag` released **off
+  the pane grid** (e.g. onto the tab bar) pulls the source pane out into a new
+  tab in the same group, keeping its live session — `adopt_tab` moves the
+  `Pane`, no `session.kill()`. The source tree renumbers (`Node::remove`) and
+  focus follows `focused_after_remove`; zoom/broadcast drop as appropriate. A
+  tab keeps at least one pane, so detaching the only pane is a no-op (which
+  also means the source tab never empties — no tab removal or MRU shift).
+  While dragging, the swap outline shows over a target pane and clears off the
+  grid, signalling the detach. Proof: `detaching_a_pane_keeps_focus_on_the_right_survivor`
+  + the existing `Node::remove`/`adopt_tab` paths; full suite + clippy green
+  locally. A live SendInput drag is not CI-enforced (hosted injected input is
+  unreliable); the gesture is exercised locally.
 
 ## Standing constraints
 
