@@ -474,6 +474,28 @@ fn scenarios() -> Vec<Scenario> {
                 }
             }),
         },
+        Scenario {
+            // Phase B: agents (Pi) wrap redraws in synchronized output
+            // (DEC 2026). Bayan must accept the private mode and render the
+            // wrapped update correctly (no glitch / dropped frame).
+            name: "sync-output",
+            env: vec![("BAYAN_TYPE", "Write-Host \"$([char]27)[?2026h$([char]27)[48;2;255;0;0m$([char]27)[2J$([char]27)[?2026l\"\r".into())],
+            settle: 10,
+            ci_safe: false,
+            click: None,
+            assert: Box::new(|b, dpi| {
+                let top = (60.0 * dpi as f64 / 96.0) as usize;
+                let gh = b.h - top;
+                let x = (b.w as f64 * 0.5) as usize;
+                let y = top + (gh as f64 * 0.5) as usize;
+                let (r, g, bl) = b.pixel(x, y);
+                if (r as i32 - 255).abs() > 2 || g > 2 || bl > 2 {
+                    Err(format!("DEC 2026-wrapped redraw lost pixels: ({r},{g},{bl})"))
+                } else {
+                    Ok(())
+                }
+            }),
+        },
     ]
 }
 
