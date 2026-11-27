@@ -94,6 +94,15 @@ lazy_static! {
     static ref BUNDLED_CONPTY: Option<ConPtyFuncs> = load_bundled();
 }
 
+/// Set once a pseudoconsole has been created on the pinned 1.22+ host.
+/// Inbox sessions leave it false; primary DA reads it before advertising Sixel.
+static PASSTHROUGH_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn passthrough_active() -> bool {
+    PASSTHROUGH_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub struct PsuedoCon {
     con: HPCON,
     api: &'static ConPtyFuncs,
@@ -115,6 +124,7 @@ impl PsuedoCon {
         if let Some(api) = BUNDLED_CONPTY.as_ref() {
             if let Ok(con) = Self::open(api, size, &input, &output, PSUEDOCONSOLE_INHERIT_CURSOR) {
                 log::info!("conpty: pinned Microsoft host active");
+                PASSTHROUGH_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
                 return Ok(con);
             }
         }

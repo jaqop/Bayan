@@ -54,18 +54,11 @@ selection and BiDi paths must do.
 | `conpty_load.rs` | test-only: the planted-`conpty.dll` probe, with vendored `conpty_resolve.rs` |
 | `latency.rs` | key-to-frame latency samples for `BAYAN_PROFILE` runs (times only, never the key) |
 
-915 tests, of which 7 are ignored by the default suite (908 run). That is
-`cargo test --locked --all-targets` on Windows (`running 915 tests`,
-`908 passed; 7 ignored`) and the same lines the CI summary counts with
-`--list`, measured on bayan-plus before the latency gate's
-`the_counter_file_is_one_line` and
-`the_tap_waits_out_a_quiet_prompt_then_alternates`, and before
-`gpu::tests::the_adapter_line_names_the_backend_and_device_type`.
-Explicit native host
-probes and measurement probes are the ignored ones; see their annotations
-and Measuring. Milestone write-ups below record what that change proved,
-not this total. `scripts/test_perf_gate.py` is the perf job's unittest
-and is not part of that cargo count.
+Test counts come from `cargo test -- --list` and the CI test summary, not
+manual totals in this file. Explicit native host probes and measurement
+probes are ignored by the default suite; see their annotations and Measuring.
+`scripts/test_perf_gate.py` is the perf job's unittest and is not part of
+that cargo count.
 
 ## Measuring
 
@@ -345,19 +338,6 @@ the GPU submit entirely when the quad set is byte-identical to the last frame,
 so a still terminal stops rendering. Anything that churns state every frame
 silently destroys both. The atlas grows a new texture-array *page* when one
 fills — it does not wipe.
-
-**A minimized, hidden, or occluded window does not enter `redraw`.**
-`request_redraw` is the only call to `Window::request_redraw`. When the
-window is not showing it returns without asking winit, so `RedrawRequested`
-does not call `redraw` (the idle perf gate counts entries there, and presents
-inside it, and both must stay zero while minimized with a busy background
-tab). PTY reads, bells, toasts, and attention still run. The ~600ms busy-dot
-pulse is scheduled only while the window is showing; a background tab's grid
-is not a reason to paint. Restoring, unoccluding, or summoning calls
-`request_redraw` once the window is showing again, and cursor blink is armed
-from the next wait. There is no dirty flag: those paths ask explicitly. Do
-not add another direct `redraw()` or `Window::request_redraw` for a hidden
-state.
 
 ## Build, test, verify
 
