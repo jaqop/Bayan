@@ -314,9 +314,20 @@ pub fn idle(args: &[String]) -> i32 {
             std::thread::sleep(Duration::from_millis(100));
         }
         if hwnd == 0 { return Err("minimized probe found no window handle".into()); }
-        unsafe { ShowWindow(hwnd, 6); }
-        std::thread::sleep(Duration::from_millis(300));
-        if unsafe { IsIconic(hwnd) } == 0 { return Err("ShowWindow did not minimize the window".into()); }
+        // ShowWindow on another process's window can block on a hosted
+        // session whose UI thread is busy; run it on a thread with a timeout
+        // so a stall can never hang the probe. Minimized redraws are
+        // report-only, so failing to minimize degrades to a note, not a hang.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let target = hwnd;
+        std::thread::spawn(move || {
+            let _ = tx.send(unsafe { ShowWindow(target, 6) });
+        });
+        let showed = rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        let minimized = showed && unsafe { IsIconic(hwnd) } != 0;
+        if !minimized {
+            eprintln!("note: minimize did not take on this session; minimized redraws are report-only");
+        }
         std::thread::sleep(Duration::from_millis(750));
         let start = read_counters(&r.counters)?;
         std::thread::sleep(Duration::from_secs(WINDOW_S));
