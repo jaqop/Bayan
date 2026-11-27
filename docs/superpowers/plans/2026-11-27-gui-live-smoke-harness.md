@@ -54,11 +54,11 @@
 **Files:**
 - Create: `scripts/gui-smoke/arabic-connected.ps1`, `rtl-flush-right.ps1`, `tui-border-columns.ps1`, `ligatures-ab.ps1`
 
-- [ ] **Step 1: `arabic-connected`** — `BAYAN_TYPE="echo مرحبا بالعالم\r"`; assert ink in the run region and inter-letter ink density above a floor (connected forms), with the density floor proven non-vacuous against a spaces-only feed.
-- [ ] **Step 2: `rtl-flush-right`** — Arabic prose; `Find-ColorX` on the text row: rightmost ink within one cell of the pane's right edge, no ink in the leftmost two cells.
-- [ ] **Step 3: `tui-border-columns`** — feed PR #100's Gemini shape as bytes (box rows, one holding an Arabic field); assert the closing `│` x equal ±1 px across the Arabic row and its neighbors. This is the 1597-vs-1611 measurement, automated.
-- [ ] **Step 4: `ligatures-ab`** — capture `echo -> => !=` with ligatures on and off (two launches, config differs); `Assert-SameBitmap` must FAIL on the run region (the point: the frames differ), pass elsewhere.
-- [ ] **Step 5: Run all four; prove each non-vacuous; commit** — `"Live pixel proofs for connected Arabic, RTL flush-right, inline TUI border columns, and ligatures A/B"`
+- [x] **Step 1: `arabic-connected`** — positioned A/B (row 12): Arabic prose vs a spaces feed; the Arabic capture must dominate the band's ink (>2x, floor 100). Letter-connection IDENTITY stays pinned by the render unit tests; this pins that shaped Arabic reaches the window. Band 0.62-0.67H excludes the next prompt row. (2026-11-27: PASS, A=459 B=0; inverted-ratio proof FAILed as required.)
+- [x] **Step 2: `rtl-flush-right`** — Arabic prose echo; find ink row-bands; one must start past mid-window and touch the right edge (the mixed command-echo line cannot). (2026-11-27: PASS, band x 884-996 of 1000; true-inverse proof FAILed as required.)
+- [x] **Step 3: `tui-border-columns`** — three NON-adjacent box rows (10/13/16, adjacent │ glyphs touch vertically), middle one an Arabic field, truecolor-red closing borders at column 41; the three red marks must share one x (±2 px). (2026-11-27: PASS, x=680 thrice; a border shifted to column 45 was caught at x=747.)
+- [ ] **Step 4: `ligatures-ab` — DEFERRED.** No bundled font carries `calt` ligatures (Kawkab Mono and Amiri are the bundled faces); Cascadia Code is installed here but not guaranteed on CI. Needs an owner decision: bundle a ligature font (license + size) or gate the scenario on an installed one. The A/B driver support ($SmokeEnv2/$SmokeConfig2) is already in place for it.
+- [x] **Step 5: Run the three; prove each non-vacuous; commit** — `"Live pixel proofs for connected Arabic, RTL flush-right, and inline TUI border columns"`
 
 ### Task 3: Chrome scenario set
 

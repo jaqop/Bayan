@@ -19,6 +19,11 @@ A scenario file (scripts/gui-smoke/<name>.ps1) defines:
 $geom carries Dpi, W, H of the captured client area. Coordinates scale
 by Dpi/96; nothing is hard-coded in screen pixels.
 
+An A/B scenario also defines $SmokeEnv2 (and optionally $SmokeConfig2,
+flat config keys merged for the second launch, and $SmokeSettle2). The
+first process is stopped, the second launched in a fresh temp directory,
+and Invoke-SmokeAssert2($bmpA, $bmpB, $geom) compares the two captures.
+
 Every assertion must be proven non-vacuous once (wrong expectation ->
 FAIL) before it is trusted; see the plan's per-task steps.
 #>
@@ -100,13 +105,25 @@ function Assert-SameBitmap($a, $b) {
     }
 }
 
+# Count pixels differing from the corner background, over a sampled grid.
+function Get-InkCount($bmp, [int]$x0, [int]$y0, [int]$x1, [int]$y1) {
+    $bg = $bmp.GetPixel($x0, $y0)
+    $n = 0
+    for ($y = $y0; $y -le $y1; $y += 2) {
+        for ($x = $x0; $x -le $x1; $x += 2) {
+            $c = $bmp.GetPixel($x, $y)
+            if ([math]::Abs($c.R - $bg.R) -gt 12 -or [math]::Abs($c.G - $bg.G) -gt 12 -or [math]::Abs($c.B - $bg.B) -gt 12) { $n++ }
+        }
+    }
+    return $n
+}
+
 function Get-SmokeHwnd([int]$ProcessId) {
-    $found = [IntPtr]::Zero
     $cb = [GuiSmokeNative+EnumWindowsProc] {
         param($hWnd, $lParam)
-        $pid2 = 0
-        [GuiSmokeNative]::GetWindowThreadProcessId($hWnd, [ref]$pid2) | Out-Null
-        if ($pid2 -eq $ProcessId -and [GuiSmokeNative]::IsWindowVisible($hWnd)) {
+        $owner = 0
+        [GuiSmokeNative]::GetWindowThreadProcessId($hWnd, [ref]$owner) | Out-Null
+        if ($owner -eq $ProcessId -and [GuiSmokeNative]::IsWindowVisible($hWnd)) {
             $script:smokeHwnd = $hWnd
             return $false
         }
@@ -115,6 +132,39 @@ function Get-SmokeHwnd([int]$ProcessId) {
     $script:smokeHwnd = [IntPtr]::Zero
     [GuiSmokeNative]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null
     return $script:smokeHwnd
+}
+
+function Get-SmokeCapture($hwnd) {
+    $rect = New-Object GuiSmokeNative+RECT
+    [GuiSmokeNative]::GetClientRect($hwnd, [ref]$rect) | Out-Null
+    $w = $rect.R - $rect.L; $h = $rect.B - $rect.T
+    if ($w -lt 100 -or $h -lt 100) { throw "client rect too small: ${w}x${h}" }
+    $bmp = New-Object System.Drawing.Bitmap $w, $h
+    $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+    $hdc = $gfx.GetHdc()
+    # PW_RENDERFULLCONTENT = 2: captures the DWM surface of a GPU window.
+    $ok = [GuiSmokeNative]::PrintWindow($hwnd, $hdc, 2)
+    $gfx.ReleaseHdc()
+    $gfx.Dispose()
+    if (-not $ok) { $bmp.Dispose(); throw 'PrintWindow refused the capture' }
+    $dpi = [GuiSmokeNative]::GetDpiForWindow($hwnd)
+    if ($dpi -lt 96) { $dpi = 96 }
+    return @{ Bmp = $bmp; Geom = @{ Dpi = $dpi; W = $w; H = $h } }
+}
+
+function Wait-SmokeReady($p, [string]$log, [string]$stderr) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ([DateTime]::UtcNow -lt $deadline -and -not $p.HasExited) {
+        if (Test-Path -LiteralPath $log) {
+            $text = $null
+            try { $text = Get-Content -LiteralPath $log -Raw -ErrorAction Stop } catch { $text = $null }
+            if ($text -and $text -match ' ms  renderer ready') { return }
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    $p.Refresh()
+    if ($p.HasExited) { throw "Bayan exited before capture with $($p.ExitCode): $(Get-Content -LiteralPath $stderr -Raw)" }
+    throw 'window never reached renderer ready'
 }
 
 function Invoke-SmokeScenario([string]$file, [string]$exe) {
@@ -126,6 +176,7 @@ function Invoke-SmokeScenario([string]$file, [string]$exe) {
     foreach ($n in $names) { $saved[$n] = [Environment]::GetEnvironmentVariable($n, 'Process') }
     $p = $null
     $bmp = $null
+    $bmp2 = $null
     $failed = $null
     try {
         $runHome = Join-Path $runRoot 'home'
@@ -133,19 +184,24 @@ function Invoke-SmokeScenario([string]$file, [string]$exe) {
         New-Item -ItemType Directory -Path $runHome, $runTemp -Force | Out-Null
         $bayanDir = Join-Path $runHome '.bayan'
         New-Item -ItemType Directory -Path $bayanDir -Force | Out-Null
+        $configPath = Join-Path $bayanDir 'config.json'
         # Deterministic chrome: bundled font, fixed metrics, still cursor.
         @{
             font_family = 'Kawkab Mono'; font_size = 16.0; padding = 0; opacity = 1.0
             cursor_blink = $false; shell = 'powershell.exe'; scroll = @{ smooth = $false }
-        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $bayanDir 'config.json') -Encoding UTF8
+        } | ConvertTo-Json | Set-Content -LiteralPath $configPath -Encoding UTF8
         @{
             tabs = @(); active = 0
             window = @{ x = 50; y = 50; w = 1000; h = 700; maximized = $false }
         } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $bayanDir 'session.json') -Encoding UTF8
 
-        # The scenario defines $SmokeEnv, $SmokeSettle, Invoke-SmokeAssert.
+        # The scenario defines $SmokeEnv, $SmokeSettle, Invoke-SmokeAssert,
+        # and optionally $SmokeEnv2 / $SmokeConfig2 / Invoke-SmokeAssert2.
         $SmokeEnv = @{}
+        $SmokeEnv2 = $null
+        $SmokeConfig2 = $null
         $SmokeSettle = 2.0
+        $SmokeSettle2 = $null
         . $file
         foreach ($k in $SmokeEnv.Keys) {
             $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process')
@@ -157,47 +213,55 @@ function Invoke-SmokeScenario([string]$file, [string]$exe) {
         $env:TMP = $runTemp
         $env:BAYAN_PROFILE = '1'
         $env:BAYAN_SHOW_NOW = '1'
-        $log = Join-Path $runTemp 'bayan_profile.log'
         $stderr = Join-Path $runRoot 'stderr.txt'
         $p = Start-Process -FilePath $exe -PassThru -WindowStyle Normal -RedirectStandardError $stderr
-        $deadline = [DateTime]::UtcNow.AddSeconds(30)
-        $ready = $false
-        while ([DateTime]::UtcNow -lt $deadline -and -not $p.HasExited) {
-            if (Test-Path -LiteralPath $log) {
-                $text = $null
-                try { $text = Get-Content -LiteralPath $log -Raw -ErrorAction Stop } catch { $text = $null }
-                if ($text -and $text -match ' ms  renderer ready') { $ready = $true; break }
-            }
-            Start-Sleep -Milliseconds 200
-        }
-        $p.Refresh()
-        if ($p.HasExited) { throw "Bayan exited before capture with $($p.ExitCode): $(Get-Content -LiteralPath $stderr -Raw)" }
-        if (-not $ready) { throw 'window never reached renderer ready' }
+        Wait-SmokeReady $p (Join-Path $runTemp 'bayan_profile.log') $stderr
         Start-Sleep -Seconds $SmokeSettle
         $p.Refresh()
         if ($p.HasExited) { throw "Bayan exited during settle with $($p.ExitCode)" }
-
         $hwnd = Get-SmokeHwnd $p.Id
         if ($hwnd -eq [IntPtr]::Zero) { throw "no visible window owned by PID $($p.Id)" }
-        $rect = New-Object GuiSmokeNative+RECT
-        [GuiSmokeNative]::GetClientRect($hwnd, [ref]$rect) | Out-Null
-        $w = $rect.R - $rect.L; $h = $rect.B - $rect.T
-        if ($w -lt 100 -or $h -lt 100) { throw "client rect too small: ${w}x${h}" }
-        $bmp = New-Object System.Drawing.Bitmap $w, $h
-        $gfx = [System.Drawing.Graphics]::FromImage($bmp)
-        $hdc = $gfx.GetHdc()
-        # PW_RENDERFULLCONTENT = 2: captures the DWM surface of a GPU window.
-        $ok = [GuiSmokeNative]::PrintWindow($hwnd, $hdc, 2)
-        $gfx.ReleaseHdc()
-        $gfx.Dispose()
-        if (-not $ok) { throw 'PrintWindow refused the capture' }
-        $dpi = [GuiSmokeNative]::GetDpiForWindow($hwnd)
-        if ($dpi -lt 96) { $dpi = 96 }
-        $geom = @{ Dpi = $dpi; W = $w; H = $h }
+        $cap = Get-SmokeCapture $hwnd
+        $bmp = $cap.Bmp
+        $geom = $cap.Geom
         $p.Refresh()
         if ($p.HasExited) { throw 'Bayan exited during capture' }
 
         Invoke-SmokeAssert $bmp $geom
+
+        if ($SmokeEnv2) {
+            if (-not (Get-Command Invoke-SmokeAssert2 -ErrorAction SilentlyContinue)) { throw '$SmokeEnv2 needs Invoke-SmokeAssert2' }
+            Stop-Process -Id $p.Id -ErrorAction Stop
+            $p.WaitForExit(5000) | Out-Null
+            if ($SmokeConfig2) {
+                $cfg = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+                foreach ($k in $SmokeConfig2.Keys) {
+                    if ($cfg.PSObject.Properties[$k]) { $cfg.$k = $SmokeConfig2[$k] }
+                    else { $cfg | Add-Member -NotePropertyName $k -NotePropertyValue $SmokeConfig2[$k] }
+                }
+                $cfg | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configPath -Encoding UTF8
+            }
+            $runTemp2 = Join-Path $runRoot 'temp2'
+            New-Item -ItemType Directory -Path $runTemp2 -Force | Out-Null
+            $env:TEMP = $runTemp2
+            $env:TMP = $runTemp2
+            foreach ($k in $SmokeEnv2.Keys) {
+                if (-not $saved.ContainsKey($k)) { $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process') }
+                [Environment]::SetEnvironmentVariable($k, [string]$SmokeEnv2[$k], 'Process')
+            }
+            $stderr2 = Join-Path $runRoot 'stderr2.txt'
+            $p = Start-Process -FilePath $exe -PassThru -WindowStyle Normal -RedirectStandardError $stderr2
+            Wait-SmokeReady $p (Join-Path $runTemp2 'bayan_profile.log') $stderr2
+            $settle2 = if ($SmokeSettle2) { $SmokeSettle2 } else { $SmokeSettle }
+            Start-Sleep -Seconds $settle2
+            $p.Refresh()
+            if ($p.HasExited) { throw 'Bayan (B) exited during settle' }
+            $hwnd2 = Get-SmokeHwnd $p.Id
+            if ($hwnd2 -eq [IntPtr]::Zero) { throw "no visible window owned by PID $($p.Id) (B)" }
+            $cap2 = Get-SmokeCapture $hwnd2
+            $bmp2 = $cap2.Bmp
+            Invoke-SmokeAssert2 $bmp $bmp2 $geom
+        }
 
         $p.Refresh()
         if ($p.HasExited) { throw 'Bayan exited during assertions' }
@@ -211,13 +275,16 @@ function Invoke-SmokeScenario([string]$file, [string]$exe) {
             $p.WaitForExit(5000) | Out-Null
         }
         foreach ($n in $saved.Keys) { [Environment]::SetEnvironmentVariable($n, $saved[$n], 'Process') }
-        if ($bmp) {
-            if ($failed -or $KeepArtifacts) {
-                $png = Join-Path $runRoot "$name.png"
-                $bmp.Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
-                if ($failed) { Write-Host "  artifact: $png" }
+        foreach ($pair in @(@($bmp, "$name.png"), @($bmp2, "$name-b.png"))) {
+            $b = $pair[0]
+            if ($b) {
+                if ($failed -or $KeepArtifacts) {
+                    $png = Join-Path $runRoot $pair[1]
+                    $b.Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
+                    if ($failed) { Write-Host "  artifact: $png" }
+                }
+                $b.Dispose()
             }
-            $bmp.Dispose()
         }
         if (-not $failed -and -not $KeepArtifacts) {
             Remove-Item -LiteralPath $runRoot -Recurse -Force -ErrorAction SilentlyContinue
