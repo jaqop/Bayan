@@ -8439,6 +8439,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
         // The minimized probe's background tab, then the latency tap.
         // The pump refreshes last_output before the busy-dot check below.
+        // Neither asks for a frame: request_redraw stays gated by shown().
         self.pump_idle_busy();
         let (tap_send, tap_wake) = self.poll_tap();
         if let Some(backspace) = tap_send {

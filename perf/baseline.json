@@ -3,7 +3,7 @@
   "tolerances": {
     "startup": 1.0,
     "startup_ratio": 0.15,
-    "latency": 1.0,
+    "latency": 0.3,
     "idle_memory": 0.1,
     "idle_redraw": 0.0
   },

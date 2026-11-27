@@ -21,6 +21,13 @@ param(
     [ValidateRange(15, 180)][int]$TimeoutSeconds = 90
 )
 $ErrorActionPreference = 'Stop'
+
+function Add-AdapterLine([string]$stderr, [string]$output) {
+    if ([string]::IsNullOrEmpty($stderr) -or -not (Test-Path -LiteralPath $stderr)) { return }
+    $lines = @(Get-Content -LiteralPath $stderr | Where-Object { $_ -match '^bayan: wgpu adapter ' })
+    if ($lines.Count -gt 0) { $lines | Tee-Object -FilePath $output -Append }
+}
+
 $inv = [Globalization.CultureInfo]::InvariantCulture
 $exe = (Resolve-Path -LiteralPath $BinaryPath).Path
 $output = [IO.Path]::GetFullPath($OutputPath)
@@ -41,6 +48,7 @@ $names = @('USERPROFILE', 'HOME', 'TEMP', 'TMP', 'BAYAN_PROFILE', 'BAYAN_SHOW_NO
 $saved = @{}
 foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
 $p = $null
+$stderr = $null
 try {
     $runHome = Join-Path $runRoot 'home'
     $runTemp = Join-Path $runRoot 'temp'
@@ -118,5 +126,6 @@ try {
         Stop-Process -Id $p.Id -ErrorAction Stop
         if (-not $p.WaitForExit(5000)) { throw 'Owned latency process did not exit' }
     }
+    Add-AdapterLine $stderr $output
     foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process') }
 }

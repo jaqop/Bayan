@@ -5,6 +5,13 @@ param(
     [ValidateRange(1,120)][int]$TimeoutSeconds = 30
 )
 $ErrorActionPreference = 'Stop'
+
+function Add-AdapterLine([string]$stderr, [string]$output) {
+    if ([string]::IsNullOrEmpty($stderr) -or -not (Test-Path -LiteralPath $stderr)) { return }
+    $lines = @(Get-Content -LiteralPath $stderr | Where-Object { $_ -match '^bayan: wgpu adapter ' })
+    if ($lines.Count -gt 0) { $lines | Tee-Object -FilePath $output -Append }
+}
+
 $exe = (Resolve-Path -LiteralPath $BinaryPath).Path
 $output = [IO.Path]::GetFullPath($OutputPath)
 if (Test-Path -LiteralPath $output) { throw 'Use a fresh startup log path' }
@@ -51,6 +58,8 @@ try {
                 Stop-Process -Id $p.Id -ErrorAction Stop
                 if (-not $p.WaitForExit(5000)) { throw 'Owned startup process did not exit' }
             }
+            # stderr is the process log. The gate prints the adapter from it.
+            Add-AdapterLine $stderr $output
         }
     }
 } finally {

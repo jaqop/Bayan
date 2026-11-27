@@ -49,7 +49,9 @@ and anything after the first frame short of 400 ms. `renderer ready` minus
 
 The first start of each job is cold and is not what the gate reads: up to
 617 ms to the first frame and 3.9 s to a ready renderer. A hosted runner
-has no GPU; the window opens on WARP.
+has no GPU; the window opens on WARP. The process logs the selected
+adapter once (`bayan: wgpu adapter name=... backend=... device_type=...`),
+and the gate prints that line. WARP is software: `device_type=Cpu`.
 
 The SGR throughput share read 35 to 41% across five jobs, the widest of
 the three corpora. Its floor is 32.4%.
@@ -79,11 +81,11 @@ Same `bayan.exe` as the startup step (`cargo build --locked --release
 
 | Probe | What it measures | Gate |
 |---|---|---|
-| `latency key->frame p95` | 50 keys via `BAYAN_TAP` (`a`, Backspace, 150 ms apart) through `type_key`. Not `BAYAN_TYPE` (that writes the PTY and skips `key_sent`) and not SendInput. | n < 40 fails. Lower is better. Tolerance is 100% over the slowest hosted p95, the same shape as startup, because WARP + ConPTY + cmd echo move together. |
+| `latency key->frame p95` | 50 keys via `BAYAN_TAP` (`a`, Backspace, 150 ms apart) through `type_key`. Not `BAYAN_TYPE` (that writes the PTY and skips `key_sent`) and not SendInput. | n < 40 fails. Lower is better. Tolerance is 30% over the 155 ms baseline, so the job fails above 201.5 ms. |
 | `latency render` | per sample, key->frame minus key->pty-output. Printed so the spread is on the job log. | Not required. Add it with a tighter tolerance only when three hosted runs show it is stable. |
 | `idle_memory private` | `Get-Process` `PrivateMemorySize64` of the Bayan process, one quiet `cmd /d /q` tab, 5 s after the prompt settles. Working set is printed and not gated. cmd and ConPTY are not included. | Lower is better. Median of three hosted runs. 10% when the spread is narrow; wider when it is not, and the spread is recorded here. |
 | `idle_redraw visible` | blink off (`cursor_blink: false`), one quiet tab, 5 s. | presents and redraws must both be 0. |
-| `idle_redraw minimized` | `BAYAN_IDLE_BUSY=1` keeps a background tab busy; the script calls `ShowWindow(SW_MINIMIZE)`. | **Report-only.** `MINIMIZED_REDRAW_REQUIRED` in `scripts/perf_gate.py` is the one-line switch. A missing or malformed line still fails. Non-zero counts do not, until that flag is true. The 600 ms busy-dot pulse and wakeup/title/bell redraws while minimized are stopped by a separate change; this probe is ready for that change. |
+| `idle_redraw minimized` | `BAYAN_IDLE_BUSY=1` keeps a background tab busy; the script calls `ShowWindow(SW_MINIMIZE)`. | **Required.** Presents and redraws must both be 0. `MINIMIZED_REDRAW_REQUIRED` in `scripts/perf_gate.py` is true. A missing or malformed line fails. |
 
 `BAYAN_FRAME_COUNTERS=1` (with `BAYAN_PROFILE`) writes
 `%TEMP%\bayan_frame_counters.txt` as `redraws=N presents=M` on each
@@ -102,11 +104,10 @@ Three complete `windows-latest` runs of the same probe code (runs
 | 43520662670 | 128.5 | 154.7 | 46 | 111.2 | 141.9 | 291.4 | 125.1 | 0/0 | 0/643 |
 | 43520674052 | 102.0 | 127.0 | 46 | 88.2 | 107.4 | 291.3 | 124.9 | 0/0 | 0/822 |
 
-- **Latency.** Slowest p95 is 154.7 ms. The baseline is 155 ms and the
-  tolerance is 100%, so the job fails above 310 ms. The same binary, on
-  three earlier runs whose idle step did not start, read p95 134.5, 140.6
-  and 179.1. 179 is inside the 310 ms band. A tighter band would fail a
-  quiet runner change.
+- **Latency.** Slowest p95 on these three runs is 154.7 ms. The baseline
+  stays 155 ms. The tolerance is 30%, so the job fails above 201.5 ms.
+  The same binary, on three earlier runs whose idle step did not start,
+  read p95 134.5, 140.6 and 179.1. 179.1 is inside the 201.5 ms band.
 - **Render gap** (key->frame minus key->pty-output), p95: 132.4, 141.9,
   107.4 on the three runs, and 120.8, 129.8, 151.7 on the earlier ones.
   That is the same kind of spread as key->frame, not a stable remainder,
@@ -115,13 +116,17 @@ Three complete `windows-latest` runs of the same probe code (runs
   spread is 0.3 MB, so the tolerance stays 10% (fail above 320.4 MB).
   Working set was 124.8, 125.1, 124.9 and is not gated.
 - **Visible redraw** was 0 presents and 0 redraws on all three.
-- **Minimized redraw** was 0 presents (the swapchain is occluded) and
-  733, 643, and 822 redraws. Report-only until `MINIMIZED_REDRAW_REQUIRED`.
-  A 600 ms pulse would be about eight entries in five seconds. The count
-  is ~150/s because `about_to_wait` calls `request_redraw` on every wait
-  while a background tab is busy, and that redraw wakes the loop again,
-  minimized or not. The confirmation run read 846 redraws in the same
-  window.
+- **Minimized redraw** on those runs was 0 presents (the swapchain is
+  occluded) and 733, 643, and 822 redraws. That was the event-loop spin
+  from before #91, not the 600 ms busy-dot pulse. A 600 ms pulse would be
+  about eight entries in five seconds. What happened instead is
+  `about_to_wait` called `request_redraw` on every wait while a background
+  tab was busy, and that redraw woke the loop again, so `redraw` kept
+  being entered at about 150 times a second even while minimized. The
+  confirmation run read 846 redraws in the same window. #91 stops the
+  spin: a minimized, hidden, or occluded window does not enter `redraw`.
+  The gate now requires both counts to be 0 (`MINIMIZED_REDRAW_REQUIRED`
+  is true) for the minimized window with `BAYAN_IDLE_BUSY=1`.
 
 Scripts: `scripts/measure-tap-latency.ps1`, `scripts/measure-idle.ps1`.
 `scripts/measure-latency.ps1` stays the local SendInput tool.

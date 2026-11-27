@@ -28,13 +28,17 @@ runner, not the code.
 
   latency: key->frame p95 in milliseconds, from `BAYAN_TAP` (not
       SendInput). Lower is better. The sample count is part of the line;
-      fewer than 40 samples fails. Hosted runners vary, so the tolerance
-      is a wide backstop, the same shape as startup.
+      fewer than 40 samples fails. The hosted tolerance is 30% over the
+      155 ms baseline (fail above 201.5 ms).
   idle_memory: private MB of the Bayan process after a quiet tab. Lower
       is better. Working set is printed by the probe and not gated.
   idle_redraw: presents and redraws over a 5s window. The baseline is 0
-      and any increase fails. `minimized` is report-only until
-      `MINIMIZED_REDRAW_REQUIRED` is set.
+      and any increase fails, including `minimized`.
+      `MINIMIZED_REDRAW_REQUIRED` is that switch; it is true.
+
+The process logs `bayan: wgpu adapter name=... backend=... device_type=...`
+once at startup. This script prints that line (WARP is `device_type=Cpu`)
+so the CI log shows which adapter the runner opened.
 
     python scripts/perf_gate.py probe.log startup.log latency.log idle.log
     python scripts/perf_gate.py probe.log startup.log latency.log idle.log --print
@@ -53,10 +57,11 @@ LATENCY = re.compile(rf"PROBE latency key->frame p50=({NUMBER}) p95=({NUMBER}) n
 LATENCY_RENDER = re.compile(rf"PROBE latency render p50=({NUMBER}) p95=({NUMBER}) n=(\d+)\s*$", re.IGNORECASE | re.MULTILINE)
 IDLE_MEMORY = re.compile(rf"PROBE idle_memory private=({NUMBER}) MB working_set=({NUMBER}) MB\s*$", re.IGNORECASE | re.MULTILINE)
 IDLE_REDRAW = re.compile(r"PROBE idle_redraw (visible|minimized) presents=(\d+) redraws=(\d+) window_s=(\d+)\s*$", re.IGNORECASE | re.MULTILINE)
+ADAPTER = re.compile(r'^bayan: wgpu adapter name="((?:\\.|[^"\\])*)" backend=(\S+) device_type=(\S+)\s*$', re.MULTILINE)
 MIN_LATENCY_SAMPLES = 40
-# One-line switch. Flip to True once minimized redraws are stopped. Until
-# then a non-zero minimized window is printed and does not fail the job.
-MINIMIZED_REDRAW_REQUIRED = False
+# One-line switch. True: a minimized window must present and redraw 0 times.
+# False would print a non-zero minimized window and not fail the job.
+MINIMIZED_REDRAW_REQUIRED = True
 REQUIRED = {
     "throughput": {"ascii", "sgr", "arabic"},
     "scrollback": {"10000", "100000"},
@@ -71,6 +76,34 @@ REQUIRED = {
         "minimized redraws",
     },
 }
+
+
+def debug_quoted(text):
+    """Undo Rust's `Debug` escapes inside the adapter name."""
+    out = []
+    i = 0
+    while i < len(text):
+        if text[i] == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            out.append({"\\": "\\", '"': '"', "n": "\n", "r": "\r", "t": "\t"}.get(nxt, nxt))
+            i += 2
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def adapter_report(text):
+    """Unique adapter lines, in log order. Missing is printed, not a failure:
+    a malformed line is rejected by `parse` instead."""
+    seen = []
+    for name, backend, device_type in ADAPTER.findall(text):
+        line = f"wgpu adapter: name={debug_quoted(name)} backend={backend} device_type={device_type}"
+        if line not in seen:
+            seen.append(line)
+    if not seen:
+        return "wgpu adapter: no line in the probe logs"
+    return "\n".join(seen)
 
 
 def allows_zero(group):
@@ -137,6 +170,8 @@ def parse(text):
             raise ValueError("malformed PROBE idle_memory line")
         if "PROBE idle_redraw" in line and not IDLE_REDRAW.search(line):
             raise ValueError("malformed PROBE idle_redraw line")
+        if line.startswith("bayan: wgpu adapter ") and not ADAPTER.search(line):
+            raise ValueError("malformed wgpu adapter line")
         if re.search(r"\s+ms  [a-z][a-z ]*[a-z]\s*$", line, re.IGNORECASE) and not STARTUP.search(line):
             raise ValueError("malformed startup mark")
     for kind, chunk_rate, vte_rate, pct in THROUGHPUT.findall(text):
@@ -281,9 +316,11 @@ def checked_main(argv):
         print(__doc__)
         return 2
     logs = [a for a in argv[1:] if not a.startswith("--")]
-    measured = parse(
-        "\n".join(pathlib.Path(a).read_text(encoding="utf-8", errors="replace") for a in logs)
-    )
+    text = "\n".join(pathlib.Path(a).read_text(encoding="utf-8", errors="replace") for a in logs)
+    measured = parse(text)
+    # Before the table and before --print, so the CI log shows the adapter
+    # even when a later metric fails. A malformed adapter line fails in parse.
+    print(adapter_report(text))
     validate_measured(measured)
     if "--print" in argv:
         print(json.dumps(measured, indent=2, sort_keys=True))

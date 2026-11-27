@@ -42,6 +42,7 @@ STARTUP = """
 2026-11-13T13:50:01.2Z      99.7 ms  gpu ready
 2026-11-13T13:50:01.2Z     107.1 ms  first frame presented
 2026-11-13T13:50:01.3Z     138.4 ms  renderer ready
+bayan: wgpu adapter name="Microsoft Basic Render Driver" backend=Dx12 device_type=Cpu
 """
 
 BASE = {
@@ -129,14 +130,18 @@ class Gate(unittest.TestCase):
         self.assertIn("visible presents", failures[0])
         self.assertIn("must be 0", failures[0])
 
-    def test_minimized_redraw_is_report_only_until_the_switch(self):
-        self.assertFalse(perf_gate.MINIMIZED_REDRAW_REQUIRED)
+    def test_minimized_redraw_is_required(self):
+        self.assertTrue(perf_gate.MINIMIZED_REDRAW_REQUIRED)
         base = {"idle_redraw": {"minimized presents": 0, "minimized redraws": 0}}
-        noisy = {"idle_redraw": {"minimized presents": 4.0, "minimized redraws": 9.0}}
+        quiet = {"idle_redraw": {"minimized presents": 0.0, "minimized redraws": 0.0}}
+        self.assertEqual(perf_gate.compare(base, quiet, 0.10)[0], [])
+        noisy = {"idle_redraw": {"minimized presents": 0.0, "minimized redraws": 1.0}}
         failures, notes, rows = perf_gate.compare(base, noisy, 0.10)
-        self.assertEqual(failures, [])
-        self.assertTrue(any("report-only" in note for note in notes))
-        self.assertTrue(all(row[-1] == "report-only" for row in rows))
+        self.assertEqual(len(failures), 1)
+        self.assertIn("minimized redraws", failures[0])
+        self.assertIn("must be 0", failures[0])
+        self.assertFalse(any("report-only" in note for note in notes))
+        self.assertTrue(any(row[-1] == "FAIL" for row in rows))
 
     def test_idle_memory_eleven_percent_fails_and_ten_percent_passes(self):
         base = {"idle_memory": {"private": 100.0}}
@@ -145,12 +150,17 @@ class Gate(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertIn("idle_memory private", failures[0])
 
+    def test_the_hosted_latency_tolerance_is_thirty_percent(self):
+        baseline = json.loads((pathlib.Path(__file__).resolve().parent.parent / "perf/baseline.json").read_text())
+        self.assertEqual(baseline["tolerances"]["latency"], 0.3)
+        self.assertEqual(baseline["latency"]["key->frame p95"], 155)
+
     def test_latency_p95_over_the_ceiling_fails(self):
-        base = {"tolerances": {"latency": 1.0}, "latency": {"key->frame p95": 30}}
-        self.assertEqual(perf_gate.compare(base, {"latency": {"key->frame p95": 60.0}}, 0.10)[0], [])
-        failures, _, _ = perf_gate.compare(base, {"latency": {"key->frame p95": 60.1}}, 0.10)
+        base = {"tolerances": {"latency": 0.3}, "latency": {"key->frame p95": 155}}
+        self.assertEqual(perf_gate.compare(base, {"latency": {"key->frame p95": 201.5}}, 0.10)[0], [])
+        failures, _, _ = perf_gate.compare(base, {"latency": {"key->frame p95": 201.6}}, 0.10)
         self.assertEqual(len(failures), 1)
-        self.assertIn("limit 100%", failures[0])
+        self.assertIn("limit 30%", failures[0])
 
     def test_a_short_latency_sample_is_not_a_pass(self):
         bad = PROBES.replace("n=50", "n=39", 1)
@@ -222,7 +232,7 @@ class CommandLineGate(unittest.TestCase):
         baseline["latency_ceiling"] = 1
         self.assertNotEqual(self.run_gate(baseline).returncode, 0)
 
-    def test_visible_redraw_of_one_fails_and_a_noisy_minimized_window_does_not(self):
+    def test_visible_or_minimized_redraw_of_one_fails(self):
         visible = (LOG + STARTUP + PROBES).replace(
             "idle_redraw visible presents=0 redraws=0",
             "idle_redraw visible presents=1 redraws=0",
@@ -233,8 +243,26 @@ class CommandLineGate(unittest.TestCase):
             "idle_redraw minimized presents=4 redraws=9",
         )
         result = self.run_gate(log=minimized)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("minimized redraws", result.stdout)
+        self.assertNotIn("report-only", result.stdout)
+
+    def test_the_adapter_line_is_printed_and_a_broken_one_fails(self):
+        result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("report-only", result.stdout)
+        self.assertIn(
+            "wgpu adapter: name=Microsoft Basic Render Driver backend=Dx12 device_type=Cpu",
+            result.stdout,
+        )
+        quoted = (LOG + STARTUP + PROBES).replace(
+            'name="Microsoft Basic Render Driver"',
+            r'name="Driver \"WARP\""',
+        )
+        quoted_result = self.run_gate(log=quoted)
+        self.assertEqual(quoted_result.returncode, 0, quoted_result.stdout + quoted_result.stderr)
+        self.assertIn('name=Driver "WARP"', quoted_result.stdout)
+        broken = (LOG + STARTUP + PROBES).replace("device_type=Cpu", "device_type=")
+        self.assertNotEqual(self.run_gate(log=broken).returncode, 0)
 
     def test_malformed_startup_number_cannot_be_read_as_a_numeric_suffix(self):
         bad = STARTUP.replace(" ms  ", "e2 ms  ")

@@ -83,8 +83,8 @@ Measure before optimizing, in release builds:
 - **Idle memory and idle redraws**, CI: `scripts\measure-idle.ps1` on that
   same binary. Private bytes after a quiet tab, then two 5 s windows
   (`BAYAN_FRAME_COUNTERS` writes `%TEMP%\bayan_frame_counters.txt`).
-  The minimized window is report-only until `MINIMIZED_REDRAW_REQUIRED`
-  in `scripts/perf_gate.py` is flipped.
+  The minimized window, with `BAYAN_IDLE_BUSY=1`, must present and redraw
+  zero times. `MINIMIZED_REDRAW_REQUIRED` in `scripts/perf_gate.py` is true.
 
 CI gates these on every pull request (the `perf` job).
 `scripts/perf_gate.py` compares the probes' `PROBE` lines with
@@ -95,11 +95,11 @@ worse, and a 10% improvement is reported so the baseline can be raised.
 Startup milliseconds are a backstop at twice the slowest job seen. The
 tighter check is `first frame presented` over `gpu ready` within one
 start, which held at 1.07 to 1.09 and fails above 1.24. Key-to-frame p95
-is gated too, from `BAYAN_TAP` (not SendInput): baseline 155 ms, fail
-above 310 ms, and fewer than 40 samples fails. Idle private memory fails
-above 320.4 MB. A visible idle window must present and redraw zero times.
-The minimized window is measured and report-only until
-`MINIMIZED_REDRAW_REQUIRED` is set. `perf/README.md` has the hosted runs.
+is gated, from `BAYAN_TAP` (not SendInput): baseline 155 ms, tolerance
+30%, fail above 201.5 ms, and fewer than 40 samples fails. Idle private
+memory fails above 320.4 MB. A visible idle window, and a minimized one
+with a busy background tab, must each present and redraw zero times.
+`perf/README.md` has the hosted runs.
 
 Figures from 2026-11-10 on the author's machine (22bc5d6 + this harness):
 `process_chunk` 83 / 49 / 100 MB/s for plain / SGR / Arabic, which is 57 / 27 /
