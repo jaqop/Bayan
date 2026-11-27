@@ -2138,6 +2138,15 @@ struct TabDrag {
     engaged: bool,
 }
 
+/// A Ctrl+Alt+left press in a pane arms a swap drag (Phase C3a): release over
+/// another pane exchanges their layout slots. `target` follows the pointer.
+#[derive(Clone, Copy)]
+struct PaneSwap {
+    src: usize,
+    target: usize,
+    engaged: bool,
+}
+
 struct App {
     /// the prompt picker, when open
     posh: Option<PoshPicker>,
@@ -2194,6 +2203,8 @@ struct App {
     drag_divider: Option<usize>,
     /// a tab reorder drag armed by a left press on the bar (Phase C2)
     tab_drag: Option<TabDrag>,
+    /// a pane swap drag armed by Ctrl+Alt+left press in a pane (Phase C3a)
+    pane_swap: Option<PaneSwap>,
     /// Per-pane scrollbar: hover, thumb drag, and when it was last scrolled.
     bars: scrollbar::Bars,
     /// the agent cockpit overlay (Ctrl+Shift+D): one glance at every tab
@@ -2509,6 +2520,7 @@ impl App {
             drag_anchor: None,
             drag_divider: None,
             tab_drag: None,
+            pane_swap: None,
             bars: scrollbar::Bars::default(),
             cockpit: false,
             cockpit_sel: 0,
@@ -5130,6 +5142,54 @@ impl App {
         }
     }
 
+    /// The pane whose rect holds `pos`, if any (Phase C3a hit test).
+    fn pane_at(&self, pos: PhysicalPosition<f64>) -> Option<usize> {
+        let r = self.renderer.as_ref()?;
+        let rects = self.pane_rects();
+        Some(mouse::cell_at(pos.x, pos.y, &rects, r.cell_w as f64, r.cell_h as f64)?.pane)
+    }
+
+    /// Phase C3a: a pane swap drag tracks the pane under the pointer and
+    /// outlines it; release over a different pane exchanges the two slots.
+    fn pane_swap_motion(&mut self, position: PhysicalPosition<f64>) {
+        let Some(mut s) = self.pane_swap else {
+            return;
+        };
+        if let Some(pi) = self.pane_at(position) {
+            s.target = pi;
+            s.engaged = pi != s.src;
+        }
+        let rect = self.pane_rects().get(s.target).copied();
+        self.pane_swap = Some(s);
+        if let Some(r) = self.renderer.as_mut() {
+            r.pane_swap_rect = if s.engaged { rect } else { None };
+        }
+        self.request_redraw();
+    }
+
+    /// Phase C3a: exchange two panes' layout slots (their sessions stay put).
+    fn swap_panes(&mut self, a: usize, b: usize) {
+        let swapped = self.tabs.get_mut(self.active).is_some_and(|t| {
+            if a >= t.panes.len() || b >= t.panes.len() {
+                return false;
+            }
+            t.layout.swap(a, b);
+            true
+        });
+        if swapped {
+            self.save_state();
+            self.request_redraw();
+        }
+    }
+
+    /// Cancel a pane swap drag and drop its outline.
+    fn cancel_pane_swap(&mut self) {
+        self.pane_swap = None;
+        if let Some(r) = self.renderer.as_mut() {
+            r.pane_swap_rect = None;
+        }
+    }
+
     /// Move the active tab into group `gid` (`None`: a new group). The
     /// view follows the tab; a group it leaves empty is dropped.
     fn move_tab_to_group(&mut self, gid: Option<u32>) {
@@ -6088,6 +6148,7 @@ impl App {
         self.emit_mouse(outs);
         self.clear_link_hover();
         self.cancel_tab_drag();
+        self.cancel_pane_swap();
     }
 
     fn focus_pane_at(&mut self, pi: usize) {

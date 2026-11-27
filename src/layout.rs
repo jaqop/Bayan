@@ -269,6 +269,38 @@ impl Node {
         }
     }
 
+    /// Exchange the positions of panes `a` and `b` in the tree (Phase C3):
+    /// each takes the other's slot and size. The pane set is unchanged, so
+    /// `valid_for` still holds. A no-op when `a == b` or either is absent.
+    pub fn swap(&mut self, a: usize, b: usize) {
+        fn has(node: &Node, id: usize) -> bool {
+            match node {
+                Node::Leaf(i) => *i == id,
+                Node::Split { children, .. } => children.iter().any(|c| has(c, id)),
+            }
+        }
+        if a == b || !has(self, a) || !has(self, b) {
+            return;
+        }
+        fn walk(node: &mut Node, a: usize, b: usize) {
+            match node {
+                Node::Leaf(i) => {
+                    if *i == a {
+                        *i = b;
+                    } else if *i == b {
+                        *i = a;
+                    }
+                }
+                Node::Split { children, .. } => {
+                    for c in children {
+                        walk(c, a, b);
+                    }
+                }
+            }
+        }
+        walk(self, a, b);
+    }
+
     /// Every divider in `content`, outermost splits first.
     pub fn dividers_spaced(&self, content: Rect, gaps: Gaps) -> Vec<Divider> {
         let mut out = Vec::new();
@@ -673,5 +705,30 @@ mod tests {
         // 6px into a pane is past the 4px slop
         assert_eq!(divider_at(&ds, x as f64 - 6.0, 40.0, 4.0), None);
         assert_eq!(divider_at(&ds, (x + w) as f64 + 6.0, 40.0, 4.0), None);
+    }
+
+    #[test]
+    fn swap_exchanges_two_panes_across_nested_splits() {
+        let mut t = Node::flat(Row, &[1.0, 1.0, 1.0], 3);
+        t.split(2, Column, 3); // nest pane 3 under pane 2's slot
+        assert!(t.valid_for(4));
+        let before = t.rects_spaced(C, 4, Gaps::HAIRLINE);
+        t.swap(0, 3);
+        assert!(t.valid_for(4), "swap keeps every pane exactly once");
+        let after = t.rects_spaced(C, 4, Gaps::HAIRLINE);
+        assert_eq!(after[0], before[3], "pane 0 takes pane 3's slot");
+        assert_eq!(after[3], before[0], "pane 3 takes pane 0's slot");
+        assert_eq!(after[1], before[1], "untouched panes stay put");
+        assert_eq!(after[2], before[2]);
+    }
+
+    #[test]
+    fn swap_with_self_or_an_absent_pane_is_a_no_op() {
+        let mut t = Node::flat(Row, &[1.0, 1.0], 2);
+        let before = t.rects_spaced(C, 2, Gaps::HAIRLINE);
+        t.swap(1, 1);
+        t.swap(0, 9);
+        assert!(t.valid_for(2));
+        assert_eq!(t.rects_spaced(C, 2, Gaps::HAIRLINE), before);
     }
 }

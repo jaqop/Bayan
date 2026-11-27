@@ -2633,6 +2633,8 @@ pub struct Renderer {
     pub hover_tab: Option<usize>,
     /// x of the insertion caret for an engaged tab reorder drag (Phase C2)
     pub drag_tab_x: Option<i32>,
+    /// rect of the pane a swap drag would drop onto, outlined (Phase C3a)
+    pub pane_swap_rect: Option<Rect>,
     /// fitted tab titles, keyed by (title, avail bits). A still frame must
     /// not re-measure prefixes into the shaped-run cache.
     title_fit: std::collections::HashMap<(String, u32), String>,
@@ -2856,6 +2858,7 @@ impl Renderer {
             cell_h: metrics.line_height,
             hover_tab: None,
             drag_tab_x: None,
+            pane_swap_rect: None,
             title_fit: std::collections::HashMap::new(),
         }
     }
@@ -8160,6 +8163,23 @@ impl Renderer {
             );
         }
 
+        // Phase C3a: outline the pane a swap drag would drop onto. Drawn here,
+        // after the grid, so the border sits on top of the pane content.
+        if let Some((x, y, w, h)) = self.pane_swap_rect {
+            let c = c4(
+                self.accent_color(crate::theme::bar_accent(
+                    crate::theme::BarAccent::Amber,
+                    page_dark,
+                )),
+                255,
+            );
+            let t = 2;
+            push_rect(out, whole, x, y, w, t, c);
+            push_rect(out, whole, x, y + h - t, w, t, c);
+            push_rect(out, whole, x, y, t, h, c);
+            push_rect(out, whole, x + w - t, y, t, h, c);
+        }
+
         if let Some((tx, full)) = tip {
             self.draw_title_tip(out, whole, width, tx, &full);
         }
@@ -13398,6 +13418,46 @@ mod cache_tests {
         );
         r.drag_tab_x = None;
         assert!(carets(&mut r).is_empty(), "caret cleared on release");
+    }
+
+    /// Phase C3a: a pane swap drag outlines the target pane with a 2px
+    /// border; clearing the field removes it.
+    #[test]
+    fn chrome_outlines_the_pane_swap_target() {
+        let mut r = Renderer::new(1.0, &crate::config::UserConfig::default(), 0.0);
+        let strips = |r: &mut Renderer| -> Vec<(f32, f32, f32, f32)> {
+            let tab = TabInfo {
+                title: "x".into(),
+                color: None,
+                busy: false,
+                attention: false,
+                active: true,
+                progress: None,
+            };
+            let mut out = Vec::new();
+            r.draw_chrome(&mut out, 800, 400, &[tab], None, false, None);
+            out.chunks(6)
+                .map(|q| {
+                    (
+                        q[0].pos[0],
+                        q[0].pos[1],
+                        q[1].pos[0] - q[0].pos[0],
+                        q[5].pos[1] - q[0].pos[1],
+                    )
+                })
+                .filter(|&t| {
+                    t == (10.0, 40.0, 200.0, 2.0)
+                        || t == (10.0, 138.0, 200.0, 2.0)
+                        || t == (10.0, 40.0, 2.0, 100.0)
+                        || t == (208.0, 40.0, 2.0, 100.0)
+                })
+                .collect()
+        };
+        assert!(strips(&mut r).is_empty(), "no outline without a drag");
+        r.pane_swap_rect = Some((10, 40, 200, 100));
+        assert_eq!(strips(&mut r).len(), 4, "four border strips");
+        r.pane_swap_rect = None;
+        assert!(strips(&mut r).is_empty(), "outline cleared on release");
     }
 
     /// Solid rects always reference page 0 (the white texel lives there).

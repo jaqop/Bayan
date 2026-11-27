@@ -35,11 +35,23 @@ A press that never crosses the threshold is just a click (no reorder).
   drag is not enforced in CI (the hosted harness's injected input is
   unreliable); the gesture is verified locally.
 
-## C3. Pane swap-detach (next increment)
+## C3. Pane swap-detach (owner chose: modifier-held drag, swap first)
 
-Drag a pane by its header to swap it with another pane in the tab, or pull it
-out into a new tab. Design follows once C2 lands; it reuses the same
-press/threshold/release shape and the layout's pane tree.
+Panes have no header, and adding one would clutter the bar (owner lightweight
+principle), so the grab is a **modifier-held drag**: `Ctrl+Alt+left` press in a
+pane arms a swap, the pane under the pointer is outlined, and release over a
+different pane exchanges their layout slots. Delivered in two increments:
+
+- **C3a — swap (this increment):** `Node::swap(a, b)` exchanges two leaves in
+  the layout tree (each takes the other's slot and size; the pane set is
+  unchanged so `valid_for` holds; a no-op if either leaf is absent). Sessions,
+  focus and selection stay with their pane — only the tree moves. The gesture
+  reuses C2's press/track/release shape; the outline is renderer state drawn
+  after the grid, cleared on release or cancel (`abandon_mouse`). Proof:
+  `layout::tests::swap_*` + `chrome_outlines_the_pane_swap_target`.
+- **C3b — detach (next):** pull a pane out into a new tab. Moves a live PTY
+  between tabs and renumbers the source tree (`Node::remove`); design follows
+  once C3a lands.
 
 ## Standing constraints
 
