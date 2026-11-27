@@ -25,3 +25,22 @@ _Avoid_: window, workspace
 An owned, immutable photograph of one **Pane**'s display state, taken once
 per frame. Every consumer in that frame reads the same photograph.
 _Avoid_: snapshot (alone), pane state, PaneSnap
+
+**prepare**:
+Assemble everything a shell launch needs — the resolved program, its
+arguments, the generated environment, and the startup scripts — before the
+PTY exists. One seam owns the security-critical ordering, so it is testable
+as data without a console.
+_Avoid_: spawn setup, launch protocol
+
+**PreparedLaunch**:
+The result of **prepare**: program, args, env, the session nonce, and the
+armed script directory. Pure data plus one RAII guard; dropping it removes
+the scripts, and on success the guard moves into the **Session**.
+_Avoid_: launch plan, spawn args
+
+**Policy**:
+The caller's switches for **prepare**: integration enabled, elevated, and
+the nonce (minted by the **Session** from the OS RNG). Tests inject a known
+nonce to assert where it does and does not go.
+_Avoid_: launch options, config

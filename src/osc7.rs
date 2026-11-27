@@ -354,7 +354,7 @@ mod tests {
 
     #[test]
     fn powershell_prompt_emits_osc7() {
-        let s = crate::term::shell_integration_ps("abc123");
+        let s = crate::shellint::shell_integration_ps("abc123");
         assert!(
             s.contains("]7;file://"),
             "PowerShell prompt must emit OSC 7"
