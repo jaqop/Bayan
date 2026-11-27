@@ -2582,7 +2582,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(prepared.env.is_empty(), "no nonce variable without integration");
+        assert!(
+            prepared.env.is_empty(),
+            "no nonce variable without integration"
+        );
         assert!(
             !prepared.args.join(" ").contains("133;"),
             "NEW-05: opt-out leaves the wrapper out"
@@ -2644,7 +2647,8 @@ mod tests {
                 nonce: NONCE_OFF.into(),
             },
         )
-        .unwrap_err();
+        .err()
+        .unwrap();
         assert!(err.contains("refusing elevated Bash"), "{err}");
     }
 

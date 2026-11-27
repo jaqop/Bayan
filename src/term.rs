@@ -3090,7 +3090,7 @@ impl Session {
             scrollback,
             shell: shell.to_string(),
             kitty_protocol,
-            prompt_nonce,
+            prompt_nonce: prepared.nonce,
             images,
             integration: prepared.scripts,
             io: SessionIo {
