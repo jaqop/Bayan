@@ -1,4 +1,5 @@
 /target
+tools/perf-gate/target
 
 # Agent skills are vendored copies of upstream repos — skills-lock.json
 # restores them with `skills experimental_install`, so the trees stay out.
