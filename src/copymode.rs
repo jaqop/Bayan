@@ -1,12 +1,11 @@
 //! Copy mode (Ctrl+Shift+X, WezTerm's chord): select and copy scrollback
 //! from the keyboard alone. It runs on alacritty_terminal's vi mode, which
 //! already owns the cursor, the motions, the viewport following the cursor
-//! and the selection tracking it; this module only maps keys to that.
+//! and the selection tracking it.
 //!
 //! Keys resolve by PHYSICAL key, so an Arabic layout keeps them (the same
-//! rule as every chord in `keybinds.rs`). The horizontal keys move the way
-//! they point: on a cell laid right to left, Left is the next logical
-//! column, so the arrows and h/l swap there.
+//! rule as every chord in `keybinds.rs`). The arrows and h/l use the
+//! painted cell order when the renderer has reordered the row.
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -37,29 +36,22 @@ pub(crate) enum Cmd {
 
 /// The command for a press, or None for a key copy mode ignores. Copy
 /// mode is modal: an ignored key is swallowed, never typed into the shell.
-/// `rtl`: the cell under the cursor is laid right to left.
 pub(crate) fn command(
     physical: PhysicalKey,
     logical: &Key,
     ctrl: bool,
     shift: bool,
-    rtl: bool,
 ) -> Option<Cmd> {
     use Cmd::*;
     use ViMotion as M;
-    let (left, right) = if rtl {
-        (M::Right, M::Left)
-    } else {
-        (M::Left, M::Right)
-    };
     if let Key::Named(named) = logical {
         let cmd = match named {
             NamedKey::Escape => Exit,
             NamedKey::Enter => CopyAndExit,
             NamedKey::ArrowUp => Motion(M::Up),
             NamedKey::ArrowDown => Motion(M::Down),
-            NamedKey::ArrowLeft => Motion(left),
-            NamedKey::ArrowRight => Motion(right),
+            NamedKey::ArrowLeft => Motion(M::Left),
+            NamedKey::ArrowRight => Motion(M::Right),
             NamedKey::Home if ctrl => Top,
             NamedKey::End if ctrl => Bottom,
             NamedKey::Home => Motion(M::First),
@@ -86,8 +78,8 @@ pub(crate) fn command(
         ('y', _) => CopyAndExit,
         ('v', false) => Select(SelectionType::Simple),
         ('v', true) => Select(SelectionType::Lines),
-        ('h', false) => Motion(left),
-        ('l', false) => Motion(right),
+        ('h', false) => Motion(M::Left),
+        ('l', false) => Motion(M::Right),
         ('j', false) => Motion(M::Down),
         ('k', false) => Motion(M::Up),
         ('h', true) => Motion(M::High),
@@ -132,6 +124,7 @@ pub(crate) fn apply<T: EventListener>(t: &mut Term<T>, cmd: Cmd) {
                     t.selection = Some(sel);
                 }
             }
+            return;
         }
         Cmd::Top => {
             let p = Point::new(t.topmost_line(), Column(0));
@@ -146,6 +139,21 @@ pub(crate) fn apply<T: EventListener>(t: &mut Term<T>, cmd: Cmd) {
         Cmd::CopyAndExit | Cmd::Exit => {}
     }
     snap_to_arabic_text(t);
+}
+
+pub(crate) fn move_horizontal<T: EventListener>(
+    t: &mut Term<T>,
+    layout: Option<(&crate::render::Renderer, crate::render::Rect)>,
+    motion: ViMotion,
+) {
+    let target = layout.and_then(|(renderer, pane)| {
+        renderer.visual_horizontal_target(pane, t, motion == ViMotion::Right)
+    });
+    if let Some(point) = target {
+        t.vi_goto_point(point);
+    } else {
+        apply(t, Cmd::Motion(motion));
+    }
 }
 
 /// A cursor past the last character of a row the renderer shapes as
@@ -181,42 +189,38 @@ mod tests {
     use super::*;
     use winit::keyboard::{KeyCode, SmolStr};
 
-    fn letter(code: KeyCode, ctrl: bool, shift: bool, rtl: bool) -> Option<Cmd> {
+    fn letter(code: KeyCode, ctrl: bool, shift: bool) -> Option<Cmd> {
         // the logical char is what an Arabic layout produces: the physical
         // key must win over it
         let logical = Key::Character(SmolStr::new("ض"));
-        command(PhysicalKey::Code(code), &logical, ctrl, shift, rtl)
+        command(PhysicalKey::Code(code), &logical, ctrl, shift)
     }
 
-    fn named(key: NamedKey, ctrl: bool, rtl: bool) -> Option<Cmd> {
+    fn named(key: NamedKey, ctrl: bool) -> Option<Cmd> {
         command(
             PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified),
             &Key::Named(key),
             ctrl,
             false,
-            rtl,
         )
     }
 
     #[test]
     fn letters_resolve_by_physical_key_on_an_arabic_layout() {
         assert_eq!(
-            letter(KeyCode::KeyJ, false, false, false),
+            letter(KeyCode::KeyJ, false, false),
             Some(Cmd::Motion(ViMotion::Down))
         );
         assert_eq!(
-            letter(KeyCode::KeyK, false, false, false),
+            letter(KeyCode::KeyK, false, false),
             Some(Cmd::Motion(ViMotion::Up))
         );
+        assert_eq!(letter(KeyCode::KeyY, false, false), Some(Cmd::CopyAndExit));
+        assert_eq!(letter(KeyCode::KeyQ, false, false), Some(Cmd::Exit));
+        assert_eq!(letter(KeyCode::KeyG, false, false), Some(Cmd::Top));
+        assert_eq!(letter(KeyCode::KeyG, false, true), Some(Cmd::Bottom));
         assert_eq!(
-            letter(KeyCode::KeyY, false, false, false),
-            Some(Cmd::CopyAndExit)
-        );
-        assert_eq!(letter(KeyCode::KeyQ, false, false, false), Some(Cmd::Exit));
-        assert_eq!(letter(KeyCode::KeyG, false, false, false), Some(Cmd::Top));
-        assert_eq!(letter(KeyCode::KeyG, false, true, false), Some(Cmd::Bottom));
-        assert_eq!(
-            letter(KeyCode::Digit4, false, true, false),
+            letter(KeyCode::Digit4, false, true),
             Some(Cmd::Motion(ViMotion::Last))
         );
     }
@@ -224,55 +228,35 @@ mod tests {
     #[test]
     fn v_picks_the_selection_kind_by_modifier() {
         assert_eq!(
-            letter(KeyCode::KeyV, false, false, false),
+            letter(KeyCode::KeyV, false, false),
             Some(Cmd::Select(SelectionType::Simple))
         );
         assert_eq!(
-            letter(KeyCode::KeyV, false, true, false),
+            letter(KeyCode::KeyV, false, true),
             Some(Cmd::Select(SelectionType::Lines))
         );
         assert_eq!(
-            letter(KeyCode::KeyV, true, false, false),
+            letter(KeyCode::KeyV, true, false),
             Some(Cmd::Select(SelectionType::Block))
         );
     }
 
     #[test]
-    fn horizontal_keys_move_the_way_they_point_on_rtl_cells() {
-        for rtl in [false, true] {
-            let (l, r) = if rtl {
-                (ViMotion::Right, ViMotion::Left)
-            } else {
-                (ViMotion::Left, ViMotion::Right)
-            };
-            assert_eq!(
-                named(NamedKey::ArrowLeft, false, rtl),
-                Some(Cmd::Motion(l)),
-                "rtl={rtl}"
-            );
-            assert_eq!(
-                named(NamedKey::ArrowRight, false, rtl),
-                Some(Cmd::Motion(r)),
-                "rtl={rtl}"
-            );
-            assert_eq!(
-                letter(KeyCode::KeyH, false, false, rtl),
-                Some(Cmd::Motion(l)),
-                "rtl={rtl}"
-            );
-            assert_eq!(
-                letter(KeyCode::KeyL, false, false, rtl),
-                Some(Cmd::Motion(r)),
-                "rtl={rtl}"
-            );
+    fn horizontal_keys_keep_their_screen_direction() {
+        for (key, letter_key, motion) in [
+            (NamedKey::ArrowLeft, KeyCode::KeyH, ViMotion::Left),
+            (NamedKey::ArrowRight, KeyCode::KeyL, ViMotion::Right),
+        ] {
+            assert_eq!(named(key, false), Some(Cmd::Motion(motion)));
+            assert_eq!(letter(letter_key, false, false), Some(Cmd::Motion(motion)));
         }
         // vertical keys and word motions keep reading order
         assert_eq!(
-            named(NamedKey::ArrowUp, false, true),
+            named(NamedKey::ArrowUp, false),
             Some(Cmd::Motion(ViMotion::Up))
         );
         assert_eq!(
-            letter(KeyCode::KeyW, false, false, true),
+            letter(KeyCode::KeyW, false, false),
             Some(Cmd::Motion(ViMotion::SemanticRight))
         );
     }
@@ -424,19 +408,16 @@ mod tests {
 
     #[test]
     fn enter_escape_and_ctrl_c_leave_and_other_ctrl_keys_are_swallowed() {
-        assert_eq!(named(NamedKey::Enter, false, false), Some(Cmd::CopyAndExit));
-        assert_eq!(named(NamedKey::Escape, false, false), Some(Cmd::Exit));
+        assert_eq!(named(NamedKey::Enter, false), Some(Cmd::CopyAndExit));
+        assert_eq!(named(NamedKey::Escape, false), Some(Cmd::Exit));
+        assert_eq!(letter(KeyCode::KeyC, true, false), Some(Cmd::CopyAndExit));
+        assert_eq!(letter(KeyCode::KeyT, true, false), None);
+        assert_eq!(named(NamedKey::Home, true), Some(Cmd::Top));
         assert_eq!(
-            letter(KeyCode::KeyC, true, false, false),
-            Some(Cmd::CopyAndExit)
-        );
-        assert_eq!(letter(KeyCode::KeyT, true, false, false), None);
-        assert_eq!(named(NamedKey::Home, true, false), Some(Cmd::Top));
-        assert_eq!(
-            named(NamedKey::Home, false, false),
+            named(NamedKey::Home, false),
             Some(Cmd::Motion(ViMotion::First))
         );
-        assert_eq!(named(NamedKey::Tab, false, false), None);
-        assert_eq!(letter(KeyCode::KeyZ, false, false, false), None);
+        assert_eq!(named(NamedKey::Tab, false), None);
+        assert_eq!(letter(KeyCode::KeyZ, false, false), None);
     }
 }

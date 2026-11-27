@@ -8,12 +8,10 @@
 //! left-press order live in `chrome.rs`; link, program and selection
 //! ownership in `link::click_owner` and `mouse::right_click`.
 
-use crate::term::LockExt;
 use std::time::Instant;
 
-use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point, Side};
-use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::index::Side;
+use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::TermMode;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -393,17 +391,22 @@ impl App {
         let Some((pi, row, col, side)) = self.pane_cell_at(position) else {
             return;
         };
-        if pi != self.sel_pane {
+        let layout = self
+            .renderer
+            .as_ref()
+            .zip(self.pane_rects().get(pi).copied());
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let Some(pane) = tab.panes.get_mut(pi) else {
+            return;
+        };
+        if Some(pane.id) != self.sel_pane {
             return;
         }
-        if let Some(s) = self.session() {
-            let mut t = s.term.lock();
-            let off = t.grid().display_offset() as i32;
-            let point = Point::new(Line(crate::scroll::grid_line(row, off)), Column(col));
-            if let Some(sel) = t.selection.as_mut() {
-                sel.update(point, side);
-            }
-        }
+        pane.visual_selection =
+            pane.session
+                .extend_selection_drag(row, col, side, layout.zip(self.drag_anchor));
         self.request_redraw();
     }
 
@@ -560,11 +563,7 @@ impl App {
                     self.drop_smooth(pane);
                 }
                 if let Some((ti, pi)) = self.find_pane(pane) {
-                    self.tabs[ti].panes[pi]
-                        .session
-                        .term
-                        .lock()
-                        .scroll_display(Scroll::Delta(lines));
+                    self.tabs[ti].panes[pi].session.scroll_display_by(lines);
                 }
                 self.link_cache.invalidate_pane(pane);
                 self.request_redraw();
@@ -580,25 +579,9 @@ impl App {
             return;
         };
         let mut st = self.smooth.remove(&id).unwrap_or_default();
-        let delta = {
-            let mut term = self.tabs[ti].panes[pi].session.term.lock();
-            let offset = term.grid().display_offset() as i32;
-            let history = term.grid().history_size() as i32;
-            st.note_motion(Instant::now());
-            let next = if pixel {
-                st.apply_pixels(offset, history, lines)
-            } else {
-                st.queue_lines(lines);
-                offset
-            };
-            let delta = next - offset;
-            if delta != 0 {
-                // Term::scroll_display, not the grid's: in copy mode this
-                // keeps the vi cursor inside the viewport.
-                term.scroll_display(crate::scroll::display_delta(offset, next));
-            }
-            delta
-        };
+        let delta = self.tabs[ti].panes[pi]
+            .session
+            .smooth_scroll(&mut st, lines, pixel);
         if st.idle() {
             self.smooth.remove(&id);
         } else {
@@ -619,7 +602,7 @@ impl App {
     /// Spend a pending notch and round onto a line before a copy-mode key,
     /// so the vi cursor is not left between two rows.
     pub(crate) fn snap_smooth(&mut self, id: u64) {
-        let Some(st) = self.smooth.remove(&id) else {
+        let Some(mut st) = self.smooth.remove(&id) else {
             return;
         };
         if st.idle() {
@@ -628,17 +611,7 @@ impl App {
         let Some((ti, pi)) = self.find_pane(id) else {
             return;
         };
-        let delta = {
-            let mut term = self.tabs[ti].panes[pi].session.term.lock();
-            let offset = term.grid().display_offset() as i32;
-            let history = term.grid().history_size() as i32;
-            let (next, _) = st.commit_for_navigation(offset, history);
-            let delta = next - offset;
-            if delta != 0 {
-                term.scroll_display(crate::scroll::display_delta(offset, next));
-            }
-            delta
-        };
+        let delta = self.tabs[ti].panes[pi].session.snap_smooth(&mut st);
         if delta != 0 {
             self.link_cache.invalidate_pane(id);
             self.request_redraw();
@@ -676,21 +649,9 @@ impl App {
                     continue;
                 };
                 let old_sub = st.subline;
-                let delta = {
-                    let mut term = self.tabs[ti].panes[pi].session.term.lock();
-                    if term.mode().contains(TermMode::ALT_SCREEN) {
-                        drop(term);
-                        self.smooth.remove(&id);
-                        continue;
-                    }
-                    let offset = term.grid().display_offset() as i32;
-                    let history = term.grid().history_size() as i32;
-                    let next = st.tick(offset, history, dt);
-                    let delta = next - term.grid().display_offset() as i32;
-                    if delta != 0 {
-                        term.scroll_display(crate::scroll::display_delta(offset, next));
-                    }
-                    delta
+                let Some(delta) = self.tabs[ti].panes[pi].session.tick_smooth(&mut st, dt) else {
+                    self.smooth.remove(&id);
+                    continue;
                 };
                 if delta != 0 {
                     self.link_cache.invalidate_pane(id);
@@ -734,8 +695,8 @@ impl App {
                 return;
             };
             // term, then meta — the lock order the reader uses too.
-            let mode = *session.term.lock().mode();
-            let at_prompt = session.meta.lock_or_recover().at_prompt;
+            let mode = session.mode_flags();
+            let at_prompt = session.at_prompt();
             (arg, mode, at_prompt)
         };
         let alt = mode.contains(TermMode::ALT_SCREEN);
@@ -1024,15 +985,16 @@ impl App {
             t.focused = pi;
         }
         self.sync_focus(None);
-        self.sel_pane = pi;
         let n = self.clicks.click(Instant::now(), (row, col));
         let ty = selection_type(n);
-        if let Some(s) = self.session() {
-            let mut t = s.term.lock();
-            let off = t.grid().display_offset() as i32;
-            let point = Point::new(Line(crate::scroll::grid_line(row, off)), Column(col));
-            t.selection = Some(Selection::new(ty, point, side));
-        }
+        let Some(pane) = self.focused_pane_mut() else {
+            return;
+        };
+        pane.visual_selection = None;
+        let id = pane.id;
+        let point = pane.session.start_selection(ty, row, col, side);
+        self.sel_pane = Some(id);
+        self.drag_anchor = (ty == SelectionType::Simple).then_some((point, side));
         self.mouse.selecting = true;
         self.clear_link_hover();
         if n >= 2 && self.config.copy_on_select_on() {
@@ -1059,6 +1021,8 @@ impl App {
             return;
         }
         self.mouse.selecting = false;
+        self.sel_pane = None;
+        self.drag_anchor = None;
         // EasyTer convention: auto-copy the selection on release (the
         // settings panel can turn this off; explicit Ctrl+C / Ctrl+Shift+C
         // always copy)
@@ -1091,18 +1055,14 @@ impl App {
             return None;
         }
         let pane = self.tabs.get(self.active)?.panes.get(index)?;
-        let (alt, total, viewport, offset, id) = {
-            let t = pane.session.term.lock();
-            let viewport = t.screen_lines();
-            let history = t.grid().history_size();
-            (
-                t.mode().contains(TermMode::ALT_SCREEN),
-                history + viewport,
-                viewport,
-                t.grid().display_offset(),
-                pane.id,
-            )
-        };
+        let f = pane.session.scroll_facts();
+        let (alt, total, viewport, offset, id) = (
+            f.alt,
+            f.history as usize + f.rows,
+            f.rows,
+            f.offset as usize,
+            pane.id,
+        );
         let content = self.content_rect()?;
         let room = scrollbar::room_px(index, &rects, side, content, self.padding_physical());
         let place = scrollbar::Place::new(total, viewport, offset);
@@ -1234,11 +1194,7 @@ impl App {
         // a track click lands on a whole line: drop smooth scroll's
         // sub-line remainder and any notch still easing
         self.snap_smooth(id);
-        self.tabs[ti].panes[pi]
-            .session
-            .term
-            .lock()
-            .scroll_display(Scroll::Delta(delta));
+        self.tabs[ti].panes[pi].session.scroll_display_by(delta);
         self.link_cache.invalidate_pane(id);
         self.request_redraw();
     }
@@ -1250,18 +1206,7 @@ impl App {
         // the thumb names a whole line; an easing wheel notch must not
         // keep moving the view under the drag
         self.drop_smooth(id);
-        let changed = {
-            let mut term = self.tabs[ti].panes[pi].session.term.lock();
-            let cur = term.grid().display_offset();
-            let history = term.grid().history_size();
-            let next = offset.min(history);
-            if next == cur {
-                false
-            } else {
-                term.scroll_display(Scroll::Delta(next as i32 - cur as i32));
-                true
-            }
-        };
+        let changed = self.tabs[ti].panes[pi].session.scroll_display_to(offset);
         if changed {
             self.link_cache.invalidate_pane(id);
             self.request_redraw();

@@ -11,6 +11,7 @@ use std::time::Instant;
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Column;
+use alacritty_terminal::selection::Selection;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Osc52, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
@@ -3018,8 +3019,8 @@ impl EventListener for EventProxy {
 }
 
 pub struct Session {
-    pub term: Arc<FairMutex<Term<EventProxy>>>,
-    pub meta: Arc<Mutex<SessionMeta>>,
+    term: Arc<FairMutex<Term<EventProxy>>>,
+    meta: Arc<Mutex<SessionMeta>>,
     writer: crate::pty_writer::PtyWriter,
     /// Set while a `PtyWriteFailed` is in flight (see [`first_report`]).
     write_error: Arc<AtomicBool>,
@@ -3057,6 +3058,94 @@ impl<T> LockExt<T> for Mutex<T> {
         self.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// Meta half of the frame photograph, shared by the full and facts-only
+/// fills. Marks convert to grid space here; the finish announcement keeps
+/// its global row so eviction cannot drop it.
+fn fill_meta(
+    m: &mut SessionMeta,
+    frame: &mut crate::pane_frame::PaneFrame,
+    cell_px: Option<(u32, u32)>,
+) {
+    frame.marks.clear();
+    frame.marks.extend(
+        m.marks
+            .iter()
+            .filter(|c| c.abs >= m.evicted)
+            .map(|c| ((c.abs - m.evicted) as usize, c.exit)),
+    );
+    frame.last_finished = m
+        .marks
+        .iter()
+        .rev()
+        .find(|mark| mark.exit.is_some())
+        .map(|mark| (mark.abs, mark.exit));
+    frame.running_cmd.clone_from(&m.running_cmd);
+    frame.cwd.clone_from(&m.cwd);
+    frame.bidi = m.bidi.clone();
+    frame.evicted = m.evicted;
+    frame.bidi_reorder = m.bidi_reorder;
+    frame.tracked_alt = m.alt_track.on();
+    if let Some((cw, ch)) = cell_px {
+        m.images.set_cell_px(cw, ch);
+        frame.images = m.images.snapshot();
+    }
+}
+
+/// Live viewport facts, copied out under one lock. The scrollbar, output
+/// following, and page steps read these between frames.
+#[derive(Clone, Copy)]
+pub struct ScrollFacts {
+    pub rows: usize,
+    pub history: u64,
+    pub offset: u64,
+    pub alt: bool,
+}
+
+/// The facts the Claude-restoration policy and the click hit-test need,
+/// copied out under term then meta — the reader's order, never nested long.
+#[derive(Clone)]
+pub struct ClaudeFacts {
+    pub bidi: Arc<crate::bidi_ctl::BidiState>,
+    pub running_cmd: String,
+    pub bidi_reorder: Option<crate::bidi_ctl::BidiReorder>,
+    pub tracked_alt: bool,
+    pub evicted: u64,
+    pub claude_from_abs: Option<u64>,
+    pub term_alt: bool,
+}
+
+/// The drag's renderer layout and anchor, paired for the selection intent.
+pub(crate) type DragLayout<'a> = (
+    (&'a crate::render::Renderer, crate::render::Rect),
+    (
+        alacritty_terminal::index::Point,
+        alacritty_terminal::index::Side,
+    ),
+);
+
+/// One visible row's hit-test photograph: the cells, the painter's
+/// direction, and the gates the click column needs.
+pub struct RowSnapshot {
+    pub cols: usize,
+    pub row: i32,
+    pub alt: bool,
+    pub reorder: bool,
+    pub history: u64,
+    pub offset: u64,
+    pub cells: Vec<crate::render::SnapCell>,
+    pub dir: crate::bidi_ctl::ParagraphDir,
+    pub bidi_row: bool,
+}
+
+/// The peek row's hit-test photograph (the history line above the viewport).
+pub struct PeekSnapshot {
+    pub cols: usize,
+    pub alt: bool,
+    pub history: u64,
+    pub offset: u64,
+    pub cells: Vec<crate::render::SnapCell>,
 }
 
 /// BAYAN-014: a Session that goes away for any reason takes its shell with
@@ -3561,6 +3650,521 @@ impl Session {
     /// The command line passed to [`Session::spawn`], for shell-specific quoting.
     pub fn shell(&self) -> &str {
         &self.shell
+    }
+
+    /// Fill the pane's frame photograph: grid facts and cells, then meta
+    /// facts, under term then meta — the reader's order, held only for the
+    /// copy. Shaping and drawing consume the frame without locks.
+    /// `cell_px` publishes the cell size to the image store before its
+    /// snapshot; `None` (renderer still warming) leaves images untouched.
+    pub fn fill_frame(
+        &self,
+        frame: &mut crate::pane_frame::PaneFrame,
+        cell_px: Option<(u32, u32)>,
+    ) {
+        let t = self.term.lock();
+        frame.capture_grid(&t);
+        let mut m = self.meta.lock_or_recover();
+        fill_meta(&mut m, frame, cell_px);
+        frame.claude_from_grid = m.claude_from_abs.map(|start| {
+            start as i64 - frame.evicted as i64 - frame.history as i64 + frame.display_offset as i64
+        });
+    }
+
+    /// Meta facts only, no term lock and no cell copy: the cockpit reads
+    /// every tab's focused pane, and a background tab must not pay for a
+    /// grid photograph it will not draw. Grid fields stay stale until a
+    /// full [`Self::fill_frame`].
+    pub fn fill_facts(&self, frame: &mut crate::pane_frame::PaneFrame) {
+        let mut m = self.meta.lock_or_recover();
+        fill_meta(&mut m, frame, None);
+    }
+
+    // ---- test-only raw guards: the scroll-app tests drive the grid
+    // directly; production code goes through the intents above ----
+
+    #[cfg(test)]
+    pub(crate) fn test_term(&self) -> impl std::ops::DerefMut<Target = Term<EventProxy>> + '_ {
+        self.term.lock()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_meta(&self) -> std::sync::MutexGuard<'_, SessionMeta> {
+        self.meta.lock_or_recover()
+    }
+
+    // ---- live queries: one lock each, facts copied out ----
+
+    /// The term mode flags, live. Input paths between frames need the
+    /// current value, not the last photograph.
+    pub fn mode_flags(&self) -> TermMode {
+        *self.term.lock().mode()
+    }
+
+    /// The directory a new tab or split should start in.
+    pub fn spawn_cwd(&self) -> Option<String> {
+        self.meta.lock_or_recover().spawn_cwd()
+    }
+
+    /// The command line currently executing ("" = idle).
+    pub fn running_cmd(&self) -> String {
+        self.meta.lock_or_recover().running_cmd.clone()
+    }
+
+    /// The last OSC-reported working directory.
+    pub fn cwd(&self) -> Option<String> {
+        self.meta.lock_or_recover().cwd.clone()
+    }
+
+    /// The pane's reorder toggle, when the user set one.
+    pub fn bidi_reorder(&self) -> Option<crate::bidi_ctl::BidiReorder> {
+        self.meta.lock_or_recover().bidi_reorder
+    }
+
+    /// Idle at an interactive prompt (OSC 133 B seen, no command running).
+    pub fn at_prompt(&self) -> bool {
+        self.meta.lock_or_recover().at_prompt
+    }
+
+    /// The native selection, cloned.
+    pub fn selection(&self) -> Option<Selection> {
+        self.term.lock().selection.clone()
+    }
+
+    /// Live viewport facts: scrollbar geometry, output following, page steps.
+    pub fn scroll_facts(&self) -> ScrollFacts {
+        let t = self.term.lock();
+        ScrollFacts {
+            rows: t.screen_lines(),
+            history: t.grid().history_size() as u64,
+            offset: t.grid().display_offset() as u64,
+            alt: t.mode().contains(TermMode::ALT_SCREEN),
+        }
+    }
+
+    /// The Claude-policy and hit-test facts, live.
+    pub fn claude_facts(&self) -> ClaudeFacts {
+        let term_alt = self.term.lock().mode().contains(TermMode::ALT_SCREEN);
+        let m = self.meta.lock_or_recover();
+        ClaudeFacts {
+            bidi: m.bidi.clone(),
+            running_cmd: m.running_cmd.clone(),
+            bidi_reorder: m.bidi_reorder,
+            tracked_alt: m.alt_track.on(),
+            evicted: m.evicted,
+            claude_from_abs: m.claude_from_abs,
+            term_alt,
+        }
+    }
+
+    // ---- intents: the lock lives here, callers send plain data ----
+
+    /// Scroll by whole lines (positive = toward older history).
+    pub fn scroll_display_by(&self, lines: i32) {
+        self.term.lock().scroll_display(Scroll::Delta(lines));
+    }
+
+    /// Scroll to a whole-line offset (thumb drag): clamped to history,
+    /// atomic read–compare–apply, returns whether the view moved.
+    pub fn scroll_display_to(&self, offset: usize) -> bool {
+        let mut t = self.term.lock();
+        let cur = t.grid().display_offset();
+        let history = t.grid().history_size();
+        let next = offset.min(history);
+        if next == cur {
+            false
+        } else {
+            t.scroll_display(Scroll::Delta(next as i32 - cur as i32));
+            true
+        }
+    }
+
+    /// Press-start a selection at a viewport cell; returns the grid point.
+    pub fn start_selection(
+        &self,
+        ty: alacritty_terminal::selection::SelectionType,
+        row: i32,
+        col: usize,
+        side: alacritty_terminal::index::Side,
+    ) -> alacritty_terminal::index::Point {
+        let mut t = self.term.lock();
+        let off = t.grid().display_offset() as i32;
+        let point = alacritty_terminal::index::Point::new(
+            alacritty_terminal::index::Line(crate::scroll::grid_line(row, off)),
+            Column(col),
+        );
+        t.selection = Some(Selection::new(ty, point, side));
+        point
+    }
+
+    /// Drag-extend the selection at a viewport cell. The visual mapping
+    /// needs the renderer's frame maps and the live grid atomically, so
+    /// the renderer is passed in; the lock stays here.
+    pub fn extend_selection_drag(
+        &self,
+        row: i32,
+        col: usize,
+        side: alacritty_terminal::index::Side,
+        drag: Option<DragLayout<'_>>,
+    ) -> Option<(Selection, crate::render::VisualSelection)> {
+        let mut t = self.term.lock();
+        let off = t.grid().display_offset() as i32;
+        let point = alacritty_terminal::index::Point::new(
+            alacritty_terminal::index::Line(crate::scroll::grid_line(row, off)),
+            Column(col),
+        );
+        if let Some(sel) = t.selection.as_mut() {
+            sel.update(point, side);
+        }
+        drag.and_then(|((renderer, rect), anchor)| {
+            let visual = renderer.mouse_drag_cells(rect, &t, anchor, (point, side))?;
+            Some((t.selection.clone()?, visual))
+        })
+    }
+
+    /// Typing snaps the viewport to the bottom and drops the selection.
+    pub fn snap_to_bottom(&self) {
+        let mut t = self.term.lock();
+        t.selection = None;
+        t.scroll_display(Scroll::Bottom);
+    }
+
+    /// A program mouse press drops the native selection.
+    pub fn clear_selection(&self) {
+        self.term.lock().selection = None;
+    }
+
+    /// Take-and-clear the RIS flag: one PTY read contained `ESC c`.
+    pub fn take_ris(&self) -> bool {
+        let mut m = self.meta.lock_or_recover();
+        let saw = m.saw_ris;
+        m.saw_ris = false;
+        saw
+    }
+
+    /// Re-apply image limits after a config reload.
+    pub fn apply_image_limits(&self, limits: crate::images::ImageLimits) {
+        self.meta.lock_or_recover().apply_image_limits(limits);
+    }
+
+    /// Cycle the pane's reorder toggle: full → alt-screen off → off.
+    /// The config mode is the default for a pane never toggled.
+    pub fn cycle_bidi_reorder(&self, config_mode: crate::bidi_ctl::BidiReorder) {
+        let mut m = self.meta.lock_or_recover();
+        let next = m.bidi_reorder.unwrap_or(config_mode).cycle();
+        m.bidi_reorder = Some(next);
+    }
+
+    /// Scroll to the previous (dir<0) or next command prompt (OSC 133
+    /// marks). Marks and evictions stay behind the seam; term then meta,
+    /// the reader's order.
+    pub fn jump_to_command(&self, dir: i32) {
+        let mut t = self.term.lock();
+        let hist = t.grid().history_size();
+        let off = t.grid().display_offset();
+        let marks: Vec<usize> = {
+            let m = self.meta.lock_or_recover();
+            m.marks
+                .iter()
+                .filter(|c| c.abs >= m.evicted)
+                .map(|c| (c.abs - m.evicted) as usize)
+                .collect()
+        };
+        if let Some(new_off) = crate::scroll::jump_offset(&marks, hist, off, dir) {
+            t.scroll_display(Scroll::Delta(new_off as i32 - off as i32));
+        }
+    }
+
+    /// The selection's text for the clipboard: the validated visual range
+    /// when one is current, else the raw selection cleaned. `clear` drops
+    /// the native selection afterwards. One lock, so the text matches the
+    /// range it was read from.
+    pub fn copy_text(
+        &self,
+        visual_snapshot: Option<&(Selection, crate::render::VisualSelection)>,
+        clean: bool,
+        claude: bool,
+        clear: bool,
+    ) -> Option<String> {
+        let mut t = self.term.lock();
+        let visual = crate::render::validated_visual(t.selection.as_ref(), visual_snapshot);
+        let text = match visual {
+            Some(selection) => Some(crate::copyclean::visual_selection_text(
+                &t, selection, clean,
+            )),
+            None => t.selection_to_string().map(|raw| {
+                let rows = crate::copyclean::selection_rows(&t);
+                crate::copyclean::clipboard_text(&raw, &rows, clean, claude)
+            }),
+        };
+        if clear {
+            t.selection = None;
+        }
+        text
+    }
+
+    /// The search seed from the current selection: the visual range's text
+    /// when one is current (no Claude restore), else the raw selection text
+    /// (restore applies).
+    pub fn selection_seed(
+        &self,
+        visual_snapshot: Option<&(Selection, crate::render::VisualSelection)>,
+    ) -> (Option<String>, bool) {
+        let t = self.term.lock();
+        match crate::render::validated_visual(t.selection.as_ref(), visual_snapshot) {
+            Some(visual) => (
+                Some(crate::copyclean::visual_selection_text(&t, visual, false)),
+                false,
+            ),
+            None => (t.selection_to_string(), true),
+        }
+    }
+
+    /// Select what the last finished command printed, read between its OSC
+    /// 133 marks. False without shell integration or a finished command.
+    pub fn select_last_output(&self) -> bool {
+        let range = {
+            let m = self.meta.lock_or_recover();
+            last_output_range(&m.marks).map(|r| (r, m.evicted))
+        };
+        let Some(((start, end), evicted)) = range else {
+            return false;
+        };
+        let mut t = self.term.lock();
+        let history = t.grid().history_size() as u64;
+        let Some((first, last)) =
+            crate::output_lines(start, end, evicted, history, t.screen_lines())
+        else {
+            return false;
+        };
+        let mut sel = Selection::new(
+            alacritty_terminal::selection::SelectionType::Lines,
+            alacritty_terminal::index::Point::new(
+                alacritty_terminal::index::Line(first),
+                Column(0),
+            ),
+            alacritty_terminal::index::Side::Left,
+        );
+        sel.update(
+            alacritty_terminal::index::Point::new(alacritty_terminal::index::Line(last), Column(0)),
+            alacritty_terminal::index::Side::Right,
+        );
+        t.selection = Some(sel);
+        true
+    }
+
+    /// The whole scrollback as text, for the export file.
+    pub fn history_text(&self, claude: bool) -> String {
+        crate::copyclean::history_text(&self.term.lock(), claude)
+    }
+
+    /// Link spans across the viewport, for the palette (capped at 500).
+    pub fn palette_links(&self) -> Vec<crate::link::LinkSpan> {
+        let t = self.term.lock();
+        (0..t.screen_lines())
+            .flat_map(|row| crate::link::links_on_row(&t, row))
+            .take(500)
+            .collect()
+    }
+
+    /// Link spans on one viewport row (hover/underline cache miss).
+    pub fn viewport_links(&self, vrow: i32) -> Vec<crate::link::LinkSpan> {
+        crate::link::links_on_viewport(&self.term.lock(), vrow)
+    }
+
+    /// The peek row's hit-test photograph. The presentation gates run
+    /// inside the lock, on the same facts the painter would use.
+    pub fn peek_row_snapshot(
+        &self,
+        row: i32,
+        mode: crate::bidi_ctl::BidiReorder,
+        facts: &ClaudeFacts,
+    ) -> PeekSnapshot {
+        let t = self.term.lock();
+        let off = t.grid().display_offset() as u64;
+        let term_alt = t.mode().contains(TermMode::ALT_SCREEN);
+        let alt = mode.effective_alt(term_alt, facts.tracked_alt);
+        let history = t.grid().history_size() as u64;
+        let cells =
+            crate::render::snapshot_grid_line(&t, crate::scroll::grid_line(row, off as i32));
+        PeekSnapshot {
+            cols: t.columns().max(1),
+            alt,
+            history,
+            offset: off,
+            cells,
+        }
+    }
+
+    /// One visible row's hit-test photograph: cells, painter direction, and
+    /// the reorder/alt gates — the same plan draw_pane uses, under one lock.
+    pub fn visible_row_snapshot(
+        &self,
+        row: i32,
+        mode: crate::bidi_ctl::BidiReorder,
+        honor: bool,
+        facts: &ClaudeFacts,
+    ) -> RowSnapshot {
+        let t = self.term.lock();
+        let cols = t.columns().max(1);
+        let rows = t.screen_lines().max(1);
+        let row = row.min(rows as i32 - 1);
+        let term_alt = t.mode().contains(TermMode::ALT_SCREEN);
+        let alt = mode.effective_alt(term_alt, facts.tracked_alt);
+        let (reorder, use_stamps) =
+            facts
+                .bidi
+                .presentation(mode, honor, !facts.running_cmd.is_empty(), alt);
+        let history = t.grid().history_size() as u64;
+        let off = t.grid().display_offset() as u64;
+        let (dir, bidi_row) = crate::render::viewport_row_layout(&t, row as usize, |li| {
+            if use_stamps {
+                facts.bidi.direction_at(crate::bidi_ctl::viewport_line_abs(
+                    facts.evicted,
+                    history,
+                    off,
+                    li as u64,
+                ))
+            } else {
+                crate::bidi_ctl::ParagraphDir::Default
+            }
+        });
+        let cells = crate::render::snapshot_row(&t, row as usize);
+        RowSnapshot {
+            cols,
+            row,
+            alt,
+            reorder,
+            history,
+            offset: off,
+            cells,
+            dir,
+            bidi_row,
+        }
+    }
+
+    /// Find the next/previous search hit, center it, and count hits against
+    /// it — one lock for the whole step, so the bar's count matches the hit
+    /// just found. The search core lives GUI-free at the crate root.
+    pub fn search_step(
+        &self,
+        query: &str,
+        hl: &Option<alacritty_terminal::term::search::Match>,
+        dir: alacritty_terminal::index::Direction,
+        regex: bool,
+    ) -> (
+        Option<alacritty_terminal::term::search::Match>,
+        Option<crate::SearchCount>,
+    ) {
+        let mut t = self.term.lock();
+        let m = if regex {
+            crate::find_match_mode(&mut t, query, hl, dir, true)
+        } else {
+            crate::find_match(&mut t, query, hl, dir)
+        };
+        if let Some(m) = &m {
+            // bring the hit into view, roughly centered
+            let cur = t.grid().display_offset() as i32;
+            let want = (-(m.start().line.0) + t.screen_lines() as i32 / 2)
+                .clamp(0, t.grid().history_size() as i32);
+            t.scroll_display(Scroll::Delta(want - cur));
+        }
+        // count against the hit just found, so the bar reads 2/17
+        let count = crate::count_matches(&t, query, &m, regex);
+        (m, count)
+    }
+
+    /// Enter copy mode: drop the selection, toggle vi.
+    pub fn enter_copy_mode(&self) {
+        let mut t = self.term.lock();
+        t.selection = None;
+        t.toggle_vi_mode();
+    }
+
+    /// Leave copy mode: vi off (when on), selection gone, view at the
+    /// prompt, where typing would have taken it anyway.
+    pub fn exit_copy_mode(&self) {
+        let mut t = self.term.lock();
+        if t.mode().contains(TermMode::VI) {
+            t.toggle_vi_mode();
+        }
+        t.selection = None;
+        t.scroll_display(Scroll::Bottom);
+    }
+
+    /// Apply a copy-mode command. Horizontal motions map through the
+    /// renderer's shaped layout when it is current; the lock stays here.
+    pub fn copy_mode_apply(
+        &self,
+        cmd: crate::copymode::Cmd,
+        layout: Option<(&crate::render::Renderer, crate::render::Rect)>,
+    ) {
+        use alacritty_terminal::vi_mode::ViMotion;
+        let mut t = self.term.lock();
+        match cmd {
+            crate::copymode::Cmd::Motion(motion @ (ViMotion::Left | ViMotion::Right)) => {
+                crate::copymode::move_horizontal(&mut t, layout, motion);
+            }
+            _ => crate::copymode::apply(&mut t, cmd),
+        }
+    }
+
+    /// Sub-line scrollback: pixel deltas move now, a wheel notch queues.
+    /// The read–compute–apply stays atomic under one lock; the fractional
+    /// state is the caller's, passed in and updated in place.
+    pub fn smooth_scroll(
+        &self,
+        st: &mut crate::scroll::PaneScroll,
+        lines: f32,
+        pixel: bool,
+    ) -> i32 {
+        let mut t = self.term.lock();
+        let offset = t.grid().display_offset() as i32;
+        let history = t.grid().history_size() as i32;
+        st.note_motion(Instant::now());
+        let next = if pixel {
+            st.apply_pixels(offset, history, lines)
+        } else {
+            st.queue_lines(lines);
+            offset
+        };
+        let delta = next - offset;
+        if delta != 0 {
+            // Term::scroll_display, not the grid's: in copy mode this
+            // keeps the vi cursor inside the viewport.
+            t.scroll_display(crate::scroll::display_delta(offset, next));
+        }
+        delta
+    }
+
+    /// Spend a pending notch and round onto a whole line before navigation.
+    pub fn snap_smooth(&self, st: &mut crate::scroll::PaneScroll) -> i32 {
+        let mut t = self.term.lock();
+        let offset = t.grid().display_offset() as i32;
+        let history = t.grid().history_size() as i32;
+        let (next, _) = st.commit_for_navigation(offset, history);
+        let delta = next - offset;
+        if delta != 0 {
+            t.scroll_display(crate::scroll::display_delta(offset, next));
+        }
+        delta
+    }
+
+    /// Ease wheel notches. `None` on the alt screen: the caller drops the
+    /// fraction, the integer path owns that screen.
+    pub fn tick_smooth(&self, st: &mut crate::scroll::PaneScroll, dt_ms: f32) -> Option<i32> {
+        let mut t = self.term.lock();
+        if t.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let offset = t.grid().display_offset() as i32;
+        let history = t.grid().history_size() as i32;
+        let next = st.tick(offset, history, dt_ms);
+        let delta = next - t.grid().display_offset() as i32;
+        if delta != 0 {
+            t.scroll_display(crate::scroll::display_delta(offset, next));
+        }
+        Some(delta)
     }
 
     /// Terminate the shell (closing a tab must not leave orphans).

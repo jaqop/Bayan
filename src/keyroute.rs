@@ -8,7 +8,6 @@
 //! key, so an Arabic layout keeps them all. The byte encoding itself lives
 //! in `keys.rs` and `kitty.rs`; the keymap in `keybinds.rs`.
 
-use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::TermMode;
 use std::time::Instant;
 use winit::event::{ElementState, Ime, KeyEvent};
@@ -348,11 +347,7 @@ impl App {
             let Some(pane) = self.tabs[self.active].panes.get_mut(pi) else {
                 continue;
             };
-            {
-                let mut t = pane.session.term.lock();
-                t.selection = None;
-                t.scroll_display(Scroll::Bottom);
-            }
+            pane.session.snap_to_bottom();
             pane.session.write(bytes);
         }
         self.invalidate_focused_links();
@@ -412,7 +407,7 @@ impl App {
             if let Some(dir) = page_direction(key) {
                 let rows = self
                     .session()
-                    .map_or(self.size.rows, |s| s.term.lock().screen_lines())
+                    .map_or(self.size.rows, |s| s.scroll_facts().rows)
                     as i32;
                 self.scroll_lines(dir * rows);
                 return;
@@ -466,9 +461,7 @@ impl App {
                 self.snap_smooth(id);
             }
             if let Some(s) = self.session() {
-                let mut t = s.term.lock();
-                t.selection = None;
-                t.toggle_vi_mode();
+                s.enter_copy_mode();
             }
             self.clear_link_hover();
             self.request_redraw();
@@ -484,12 +477,7 @@ impl App {
             self.drop_smooth(id);
         }
         if let Some(s) = self.session() {
-            let mut t = s.term.lock();
-            if t.mode().contains(TermMode::VI) {
-                t.toggle_vi_mode();
-            }
-            t.selection = None;
-            t.scroll_display(Scroll::Bottom);
+            s.exit_copy_mode();
         }
         self.invalidate_focused_links();
         self.request_redraw();
@@ -512,8 +500,7 @@ impl App {
                 return;
             }
         }
-        let rtl = self.copy_cursor_rtl();
-        let Some(cmd) = copymode::command(event.physical_key, &event.logical_key, ctrl, shift, rtl)
+        let Some(cmd) = copymode::command(event.physical_key, &event.logical_key, ctrl, shift)
         else {
             return;
         };
@@ -534,31 +521,15 @@ impl App {
             }
         }
         if let Some(s) = self.session() {
-            copymode::apply(&mut s.term.lock(), cmd);
+            let layout = self.renderer.as_ref().zip(
+                self.tabs
+                    .get(self.active)
+                    .and_then(|tab| self.pane_rects().get(tab.focused).copied()),
+            );
+            s.copy_mode_apply(cmd, layout);
         }
         self.invalidate_focused_links();
         self.request_redraw();
-    }
-
-    /// Whether the copy-mode cursor sits on a cell the last frame laid right
-    /// to left. It asks the shaped layout, never the column index, because on
-    /// an RTL row the logical column is not the visual x.
-    fn copy_cursor_rtl(&self) -> bool {
-        let (Some(r), Some(t)) = (self.renderer.as_ref(), self.tabs.get(self.active)) else {
-            return false;
-        };
-        let Some(rect) = self.pane_rects().get(t.focused).copied() else {
-            return false;
-        };
-        let Some(s) = self.session() else {
-            return false;
-        };
-        let (row, col) = {
-            let t = s.term.lock();
-            let p = t.vi_mode_cursor.point;
-            (p.line.0 + t.grid().display_offset() as i32, p.column.0)
-        };
-        row >= 0 && r.cell_rtl(rect, row as usize, col)
     }
 
     /// Esc dismisses. Enter dismisses a refusal and opens only a confirm
@@ -706,29 +677,21 @@ impl App {
         // Broadcast: every other pane of the tab gets the key too, encoded
         // for its own modes, and snaps to its bottom like the focused one.
         for pi in self.broadcast_targets() {
-            let mode = *self.tabs[self.active].panes[pi].session.term.lock().mode();
+            let mode = self.tabs[self.active].panes[pi].session.mode_flags();
             let Some(other) = self.encode_routed(&event, false, mode) else {
                 continue;
             };
             let id = self.tabs[self.active].panes[pi].id;
             self.drop_smooth(id);
             let session = &mut self.tabs[self.active].panes[pi].session;
-            {
-                let mut t = session.term.lock();
-                t.selection = None;
-                t.scroll_display(Scroll::Bottom);
-            }
+            session.snap_to_bottom();
             session.write(&other);
         }
         if let Some(id) = self.focused_pane_id() {
             self.drop_smooth(id);
         }
         if let Some(s) = self.session_mut() {
-            {
-                let mut t = s.term.lock();
-                t.selection = None;
-                t.scroll_display(Scroll::Bottom);
-            }
+            s.snap_to_bottom();
             s.write(&bytes);
             crate::prof::key_sent(arrived);
         }
@@ -786,7 +749,7 @@ impl App {
         // a broadcast press owes its release to every pane that asked for
         // event types, not only the focused one
         for pi in self.broadcast_targets() {
-            let mode = *self.tabs[self.active].panes[pi].session.term.lock().mode();
+            let mode = self.tabs[self.active].panes[pi].session.mode_flags();
             if !mode.contains(TermMode::REPORT_EVENT_TYPES) {
                 continue;
             }

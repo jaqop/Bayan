@@ -342,6 +342,57 @@ pub(crate) fn selection_rows<T: EventListener>(term: &Term<T>) -> Vec<CopyRow> {
     rows
 }
 
+/// The painter supplies the selected source cells in logical order, including
+/// the full-row restoration of Claude output. Preserve hard line breaks and
+/// join soft wraps even when a drag skipped cells on either side of a wrap.
+pub(crate) fn visual_selection_text<T: EventListener>(
+    term: &Term<T>,
+    selection: &crate::render::VisualSelection,
+    clean: bool,
+) -> String {
+    let mut rows: Vec<CopyRow> = Vec::new();
+    let mut previous: Option<Line> = None;
+    for point in &selection.logical {
+        if previous != Some(point.line) {
+            if let (Some(line), Some(row)) = (previous, rows.last_mut()) {
+                let adjacent = point.line.0 == line.0 + 1;
+                let claude_wrap = adjacent && selection.claude_word_wraps.contains(&line);
+                row.wrapped = adjacent && (claude_wrap || row_wraps(term, line));
+                if claude_wrap {
+                    row.text.push(' ');
+                }
+            }
+            rows.push(CopyRow {
+                text: String::new(),
+                wrapped: false,
+                col: point.column.0,
+                has_padding: false,
+            });
+            previous = Some(point.line);
+        }
+        let text = &mut rows.last_mut().unwrap().text;
+        let cell = &term.grid()[point.line][point.column];
+        if cell.flags.contains(Flags::HIDDEN) {
+            text.push(' ');
+        } else {
+            text.push(cell.c);
+            text.extend(cell.zerowidth().into_iter().flatten());
+        }
+    }
+    if clean {
+        return assemble(&rows, false);
+    }
+    let mut text = String::new();
+    let count = rows.len();
+    for (index, row) in rows.into_iter().enumerate() {
+        text.push_str(&row.text);
+        if !row.wrapped && index + 1 < count {
+            text.push('\n');
+        }
+    }
+    text
+}
+
 /// Full retained history plus the screen, without changing the selection
 /// or viewport. Restore each visual Claude row before joining soft wraps.
 pub(crate) fn history_text<T: EventListener>(term: &Term<T>, claude: bool) -> String {

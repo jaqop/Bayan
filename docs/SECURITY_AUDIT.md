@@ -42,7 +42,7 @@ There is no Critical finding. Nothing here is unauthenticated remote code execut
 
 ## Remediation status
 
-The four High findings are fixed on top of this audit. Medium and below are unchanged. The original finding text is kept as the record of what was wrong.
+The four High findings are fixed on top of this audit. BAYAN-005 through BAYAN-016 were fixed in the 2026-10-31 security pass (3620944, re-verified in ca57612); BAYAN-017 is accepted. The original finding text below is kept as the record of what was wrong; a finding's own "Not done" line can predate that pass.
 
 | ID | Status |
 |---|---|
@@ -50,7 +50,19 @@ The four High findings are fixed on top of this audit. Medium and below are unch
 | BAYAN-002 | **Fixed.** The paste guard treats CR, LF, CRLF, NEL, U+2028, and U+2029 as line breaks, and any other control except tab as confirm-first, including C1 and the bidi overrides U+202E / U+2066..=U+2069 plus U+200B and U+FEFF. The confirm card shows the reason and a preview (␍ ␛). A confirmed paste strips every ESC, every other C0, and every C1, so a nested `\x1b[201~` cannot close bracketed paste. The size cap counts characters. |
 | BAYAN-003 | **Fixed.** `accept_local_cwd` accepts only a drive-letter path and rejects UNC, `\\?\`, `\\.\`, and `\??\` before any filesystem probe. `scan_cwd`, `Session::spawn`, and `save_state` all use it. |
 | BAYAN-004 | **Fixed.** A drop is quoted for the shell that pane was spawned with: PowerShell single quotes (ASCII `'` and U+2018..=U+201B each doubled), cmd double quotes (refuse `%` `!` `"`), POSIX single quotes for Git Bash, `git-bash.exe`, and WSL, and fish with `\` doubled before `'` is escaped. nushell takes a raw string (`r#'…'#`). A drop onto the alt screen, when the shell is not at its prompt, or when the name contains a bidi override or zero-width character, opens the confirm card. Control characters are not typed. |
-| BAYAN-005 … BAYAN-017 | Open |
+| BAYAN-005 | **Fixed.** A theme name outside `[A-Za-z0-9._-]` never reaches `$PROFILE` (`posh::is_safe_theme_name`). |
+| BAYAN-006 | **Fixed.** Picker previews render on a worker, and only for the featured, selected, or highlighted theme; a theme with a `command` segment is never previewed. oh-my-posh runs by absolute path. |
+| BAYAN-007 | **Fixed.** Plugin actions are badged, cannot reuse a built-in label, and wait on the paste-guard confirm card before typing into the focused pane. |
+| BAYAN-008 | **Fixed.** A WSL distro name outside `[A-Za-z0-9._-]`, or one starting with `-`, is skipped (`shells::is_safe_distro_name`). |
+| BAYAN-009 | **Fixed.** Workflows default to `permissions: contents: read` (release: `{}`, with `contents: write` only on the tag-push draft job), and every action is SHA-pinned. |
+| BAYAN-010 | **Fixed.** `BAYAN_*` hooks compile only into debug builds or `--features dev-hooks`; the profile log no longer records keys. |
+| BAYAN-011 | **Fixed.** A config keybind must pass `Chord::is_bindable`. |
+| BAYAN-012 | **Fixed.** Text from the PTY passes `chrome_text` before it is drawn in the chrome. |
+| BAYAN-013 | **Fixed.** An OSC 133 D without an exit code is `CmdOutcome::Unknown`, not success. |
+| BAYAN-014 | **Fixed.** Restore starts at most `MAX_RESTORED_TABS` (16) tabs; quit and `Drop` kill the shells. |
+| BAYAN-015 | **Fixed.** Meta and parser locks go through `lock_or_recover`. |
+| BAYAN-016 | **Fixed.** `split_command` ends the program at a word-final `.exe` that exists. |
+| BAYAN-017 | **Accepted.** `ttf-parser` 0.25.1 is still locked; no patched release exists. It parses installed fonts, not PTY bytes. Revisit when `fontdb` moves to `skrifa`. |
 
 ## Findings
 
@@ -140,7 +152,7 @@ The path is **not** interpolated into the PowerShell `-Command` string. This is 
 
 ### BAYAN-004 — High — drag-and-drop is not a shell literal
 
-**Status: Fixed.** `dropped_path_arg(path, shell)` quotes for the command line that pane was spawned with (`Session::shell`), not for whatever the settings say after a later change. PowerShell and pwsh, and any unrecognized program: single quotes, with `'` and the smart quotes U+2018..=U+201B each doubled (PowerShell treats those four as `'`), so `$(…)`, backticks, `&`, and a name like `a’;calc;’.txt` stay literal. The same escape is used for the oh-my-posh `--config` argument. cmd: double quotes, which stop `&` from being a separator; a name containing `%`, `!`, or `"` is refused because those still expand or break the quotes. The spawn path uses `shell_family`, so `C:\Windows\System32\cmd.exe` gets the cmd setup, not only the exact string `cmd.exe`. Git Bash, `git-bash.exe`, and WSL (`bash`, `sh`, `zsh`, `wsl`, `dash`, and a base name ending in `-bash`): POSIX single quotes (`'` → `'\''`). fish doubles `\` and then escapes `'`, because fish collapses `\\` and `'\''` is a syntax error there. nushell (`nu.exe`) takes a raw string (`r#'…'#`, with enough `#` that the name cannot close it) rather than PowerShell quotes. Any control character refuses the drop for every family. A drop while the alt screen is on, while the shell has not reported OSC 133 B, or whose name contains a bidi override or zero-width character, is held on the confirm card; if the program asked for bracketed paste, the quoted path is wrapped. Tests: `dropped_paths_are_quoted_for_the_running_shell`, `powershell_doubles_smart_single_quotes`, `shell_family_quotes_git_bash_fish_and_cmd`, `fish_doubles_backslash_before_escaping_quote`, `nu_quotes_with_a_raw_string`, `drop_off_prompt_confirms_and_bracketed_wraps`. Not done: a safe name at a cooked prompt is still typed immediately, quoted. OSC 133 B is not authenticated.
+**Status: Fixed.** `dropped_path_arg(path, shell)` quotes for the command line that pane was spawned with (`Session::shell`), not for whatever the settings say after a later change. PowerShell and pwsh, and any unrecognized program: single quotes, with `'` and the smart quotes U+2018..=U+201B each doubled (PowerShell treats those four as `'`), so `$(…)`, backticks, `&`, and a name like `a’;calc;’.txt` stay literal. The same escape is used for the oh-my-posh `--config` argument. cmd: double quotes, which stop `&` from being a separator; a name containing `%`, `!`, or `"` is refused because those still expand or break the quotes. The spawn path uses `shell_family`, so `C:\Windows\System32\cmd.exe` gets the cmd setup, not only the exact string `cmd.exe`. Git Bash, `git-bash.exe`, and WSL (`bash`, `sh`, `zsh`, `wsl`, `dash`, and a base name ending in `-bash`): POSIX single quotes (`'` → `'\''`). fish doubles `\` and then escapes `'`, because fish collapses `\\` and `'\''` is a syntax error there. nushell (`nu.exe`) takes a raw string (`r#'…'#`, with enough `#` that the name cannot close it) rather than PowerShell quotes. Any control character refuses the drop for every family. A drop while the alt screen is on, while the shell has not reported OSC 133 B, or whose name contains a bidi override or zero-width character, is held on the confirm card; if the program asked for bracketed paste, the quoted path is wrapped. Tests: `dropped_paths_are_quoted_for_the_running_shell`, `powershell_doubles_smart_single_quotes`, `shell_family_quotes_git_bash_fish_and_cmd`, `fish_doubles_backslash_before_escaping_quote`, `nu_quotes_with_a_raw_string`, `drop_off_prompt_confirms_and_bracketed_wraps`. Not done: a safe name at a cooked prompt is still typed immediately, quoted. OSC 133 B carries the session nonce since the 2026-10-31 pass (NEW-02).
 
 `dropped_path_arg` (`src/term.rs:701`) rewrites slashes and, only when the path contains a space or a tab, wraps it in double quotes with `\"` for embedded quotes. `WindowEvent::DroppedFile` (`src/main.rs:2380`) writes that string to the focused PTY immediately, with no paste guard. The trailing byte is a space, not CR, so the line is not submitted by the drop itself. It runs on the next Enter, which is how a dropped path is used.
 
@@ -247,7 +259,7 @@ On OSC 133 `D`, a missing or non-integer code stays `None` (`src/term.rs:219`). 
 
 `restore_state` (`src/main.rs:1506`) spawns a shell per saved tab and up to three more panes (`cwds.take(3)`). There is no cap on the number of tabs. A tampered `session.json` is a process bomb at startup, and each cwd is an independent BAYAN-003 probe. Weights are checked for finite and positive (`src/main.rs:1526`); the tab count is not.
 
-`quit` (`src/main.rs:665`) removes the tray icon and saves state. It does not call `Session::kill`. There is no `Drop` for `Session`. Closing the ConPTY handle on process exit usually tears the child down; the Git Bash launcher case this repo already documents is the one that detaches. That path is a leak, not a sandbox escape.
+`quit` (`src/main.rs:665`) removes the tray icon and saves state. It does not call `Session::kill`. (2026-11-27 correction: `Drop` for `Session` now exists — the BAYAN-014 comment in `src/term.rs` — killing the child, clearing the text-area grid, and removing the integration dir.) Closing the ConPTY handle on process exit usually tears the child down; the Git Bash launcher case this repo already documents is the one that detaches. That path is a leak, not a sandbox escape.
 
 **Fix.** Cap restored tabs (for example 16) and panes. `kill` and wait in `quit`, and implement `Drop` so a panic does not orphan the console.
 
@@ -301,7 +313,7 @@ These were looked at because they are the usual terminal bugs. They are not find
 - **The oh-my-posh path injected at PowerShell startup is single-quoted.** **Tested:** `C:\themes\o'$(calc).omp.json` becomes `'C:\themes\o''$(calc).omp.json'`, which is the correct PowerShell literal escape. BAYAN-005 is the other writer, the profile rewriter, which does not do this.
 - **Bracketed-paste breakout** via an embedded `\x1b[201~` is stripped when the mode is on (existing `paste_normalizes_newlines_and_blocks_injection` test). BAYAN-002 is that the default shell never turns the mode on, and CR skips the confirm.
 - **Plugin JSON** that is malformed is skipped and does not panic (existing tests in `plugins.rs`). Isolation of a bad theme is real. The gap is the `send` field (BAYAN-007), not the loader.
-- **Lock order.** The reader takes `term` then `meta`. Redraw drops `meta` before taking `term` (`src/main.rs:1892`). `jump_command` takes `term` then `meta`. No inversion found.
+- **Lock order.** The reader takes `term` then `meta`. `Session::fill_frame` takes the same order to fill the pane's frame photograph; the draw path, screen reader, cockpit, and scrollbar read the photograph without locks (2026-11-27). `jump_command` takes `term` then `meta`. No inversion found. Line numbers in this section are as of the 2026-10-31 audit and have drifted.
 - **`unsafe` review.** Five sites, none taking PTY bytes:
   - `toast.rs:54` zeroes `NOTIFYICONDATAW`, sets `cbSize` and the fields it uses, then calls `Shell_NotifyIconW`. Ordinary Win32.
   - `shells.rs:68` `GetShortPathNameW` into a 260-unit buffer; `n == 0` or `n >= len` falls back to the long path. The length check is right.

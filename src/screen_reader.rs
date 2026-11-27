@@ -23,11 +23,12 @@ use accesskit::{
     Live, Node, NodeId, Role, TextDirection, TextPosition, TextSelection, TreeId, TreeInfo,
     TreeUpdate,
 };
+#[cfg(test)]
 use alacritty_terminal::event::EventListener;
-use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::Point;
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::cell::Flags;
+#[cfg(test)]
 use alacritty_terminal::term::Term;
 
 use crate::bidi;
@@ -273,61 +274,47 @@ pub struct PaneText {
     pub selection: Option<((usize, usize), (usize, usize))>,
 }
 
-/// Copy the visible grid. The caller drops the terminal lock before
-/// [`pane_text`] and [`build_tree`].
-pub fn copy_pane<T: EventListener>(term: &Term<T>) -> RawPane {
-    let content = term.renderable_content();
-    let off = content.display_offset as i32;
-    let rows = term.screen_lines();
-    let columns = term.columns();
-    let wrapped = (0..rows)
-        .map(|row| {
-            term.grid()[alacritty_terminal::index::Line(row as i32 - off)]
-                [alacritty_terminal::index::Column(columns.saturating_sub(1))]
-            .flags
-            .contains(Flags::WRAPLINE)
-        })
-        .collect();
+/// Copy the visible grid out of the frame photograph. No BiDi work: that
+/// happens in [`pane_text`], long after the locks are dropped.
+pub fn copy_pane(frame: &crate::pane_frame::PaneFrame) -> RawPane {
+    let off = frame.display_offset as i32;
+    let rows = frame.rows;
+    let columns = frame.columns;
+    // The photograph's wrapped[r] is the PREVIOUS row's flag; the reader
+    // joins on a row's own flag, which is wrapped[r + 1].
+    let wrapped = frame.wrapped[1..rows + 1].to_vec();
     let mut cells = vec![Vec::new(); rows];
-    for cell in content.display_iter {
-        if cell
-            .flags
-            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-        {
-            continue;
+    for (li, span) in frame.row_spans.iter().enumerate() {
+        for fc in &frame.cells[span.start..span.end] {
+            if fc
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            let hidden = fc.flags.intersects(Flags::HIDDEN);
+            let ch = if hidden { ' ' } else { fc.c };
+            let width = fc.w();
+            let extra = if hidden {
+                String::new()
+            } else {
+                fc.zw.iter().collect()
+            };
+            cells[li].push(GridCell {
+                col: fc.col,
+                ch,
+                width,
+                extra,
+            });
         }
-        let vrow = cell.point.line.0 + off;
-        if vrow < 0 || vrow as usize >= rows {
-            continue;
-        }
-        let hidden = cell.flags.intersects(Flags::HIDDEN);
-        let ch = if hidden { ' ' } else { cell.c };
-        let width = if cell.flags.contains(Flags::WIDE_CHAR) {
-            2
-        } else {
-            1
-        };
-        let extra = if hidden {
-            String::new()
-        } else {
-            cell.zerowidth()
-                .map(|marks| marks.iter().collect())
-                .unwrap_or_default()
-        };
-        cells[vrow as usize].push(GridCell {
-            col: cell.point.column.0,
-            ch,
-            width,
-            extra,
-        });
     }
     RawPane {
         rows: cells,
         columns,
         wrapped,
-        cursor: viewport_cursor(content.cursor.point, off, rows),
-        selection: content
-            .selection
+        cursor: viewport_cursor(frame.cursor.point, off, rows),
+        selection: frame
+            .selection_range
             .and_then(|sel| viewport_selection(sel, off, rows)),
     }
 }
@@ -380,7 +367,9 @@ pub fn pane_text(raw: RawPane, claude: bool) -> PaneText {
 /// this combined helper is for tests.
 #[cfg(test)]
 fn read_pane<T: EventListener>(term: &Term<T>, claude: bool) -> PaneText {
-    pane_text(copy_pane(term), claude)
+    let mut frame = crate::pane_frame::PaneFrame::new();
+    frame.capture_grid(term);
+    pane_text(copy_pane(&frame), claude)
 }
 
 fn viewport_cursor(point: Point, off: i32, rows: usize) -> Option<(usize, usize)> {
@@ -632,12 +621,12 @@ impl TreePace {
 
 /// Cursor, scroll, and selection of one pane. Not the cells: those are
 /// what a full rebuild copies, and a stamp must stay cheap.
-pub fn pane_stamp<T: EventListener>(term: &Term<T>) -> u64 {
-    let point = term.grid().cursor.point;
+pub fn pane_stamp(frame: &crate::pane_frame::PaneFrame) -> u64 {
+    let point = frame.grid_cursor;
     let mut h = stamp_mix(0, point.line.0 as u64);
     h = stamp_mix(h, point.column.0 as u64);
-    h = stamp_mix(h, term.grid().display_offset() as u64);
-    match term.selection.as_ref().and_then(|sel| sel.to_range(term)) {
+    h = stamp_mix(h, frame.display_offset);
+    match frame.selection_range {
         Some(sel) => {
             h = stamp_mix(h, 1);
             h = stamp_mix(h, sel.start.line.0 as u64);
@@ -1248,7 +1237,9 @@ mod tests {
         parser.advance(&mut term, "مَرحبا abcdefghijklmnop عربي".as_bytes());
         parser.advance(&mut term, b"\x1b[2;3H");
         let mut view = one_pane("", (0, 0), None);
-        let mut raw = copy_pane(&term);
+        let mut frame = crate::pane_frame::PaneFrame::new();
+        frame.capture_grid(&term);
+        let mut raw = copy_pane(&frame);
         raw.selection = Some(((0, 2), (1, 5)));
         let caret = pane_text(raw.clone(), false).cursor.unwrap();
         assert_eq!(caret, (0, 12));
