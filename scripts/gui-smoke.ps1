@@ -227,9 +227,22 @@ function Invoke-SmokeScenario([string]$file, [string]$exe) {
         $SmokeConfig2 = $null
         $SmokeSettle = 2.0
         $SmokeSettle2 = $null
+        # Scenarios are dot-sourced into this scope; a function one defines
+        # (e.g. context-menu's Invoke-SmokeInput right-click) would otherwise
+        # leak into every later scenario and click its grid. Reset them.
+        foreach ($fn in 'Invoke-SmokeAssert', 'Invoke-SmokeAssert2', 'Invoke-SmokeInput') {
+            if (Test-Path "Function:$fn") { Remove-Item "Function:$fn" -Force }
+        }
         . $file
+        # Isolate scenarios: a hook one sets (BAYAN_PALETTE, BAYAN_GUARD, ...)
+        # must not survive into the next launch. Clear every BAYAN_* first,
+        # then apply only this scenario's hooks plus the two base ones.
+        Get-ChildItem Env: | Where-Object { $_.Name -like 'BAYAN_*' } | ForEach-Object {
+            if (-not $saved.ContainsKey($_.Name)) { $saved[$_.Name] = $_.Value }
+            Remove-Item "Env:$($_.Name)" -Force
+        }
         foreach ($k in $SmokeEnv.Keys) {
-            $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process')
+            if (-not $saved.ContainsKey($k)) { $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process') }
             [Environment]::SetEnvironmentVariable($k, [string]$SmokeEnv[$k], 'Process')
         }
         $env:USERPROFILE = $runHome

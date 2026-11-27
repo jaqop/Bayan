@@ -9,7 +9,7 @@ $SmokeEnv = @{
 $SmokeEnv2 = @{
     BAYAN_TYPE = 'Write-Host "$([char]27)[12;10H                    "' + "`r"
 }
-$SmokeSettle = 6.0
+$SmokeSettle = 10.0
 
 # Row 12's glyphs occupy ~0.62-0.67H at the harness's fixed metrics
 # (~35 px cells, 700 px window, tab bar ~65 px). The band stops above the

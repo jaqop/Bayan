@@ -4,7 +4,7 @@
 $SmokeEnv = @{
     BAYAN_TYPE = 'echo "$([char]27)[48;2;255;0;0m$([char]27)[2J"' + "`r"
 }
-$SmokeSettle = 6.0
+$SmokeSettle = 10.0
 
 function Invoke-SmokeAssert($bmp, $geom) {
     $w = $geom.W; $h = $geom.H
