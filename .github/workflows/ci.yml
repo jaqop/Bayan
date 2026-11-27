@@ -111,7 +111,7 @@ jobs:
         with:
           key: release-probes
       - name: The gate's own tests
-        run: cargo test --locked --manifest-path tools/perf-gate/Cargo.toml
+        run: python -m unittest scripts/test_perf_gate.py
       - name: Build the probes
         run: cargo test --locked --release --no-run
       - name: Measure
@@ -139,20 +139,34 @@ jobs:
         run: |
           set -euo pipefail
           ./tools/perf-gate/target/debug/perf-gate.exe latency --binary target/release/bayan.exe --output latency.log
-      # Same bayan.exe. Quiet private memory, then the two 5s redraw windows.
+      # Same bayan.exe. Quiet private memory, the minimized + ten-tab redraw
+      # windows, and the 16 MB cat.
       - name: Idle memory and redraws
-        shell: pwsh
+        shell: bash
         run: |
-          ./scripts/measure-idle.ps1 -BinaryPath target/release/bayan.exe -OutputPath idle.log
-      # The Rust gate (tools/perf-gate) is the gate; the Python original was
-      # retired after byte-equivalence was proven on runner logs (PR #109).
+          set -euo pipefail
+          ./tools/perf-gate/target/debug/perf-gate.exe idle --binary target/release/bayan.exe --output idle.log
       - name: Gate
         shell: bash
         run: |
           set -euo pipefail
+          python scripts/perf_gate.py probe.log startup.log latency.log idle.log --print
+          python scripts/perf_gate.py probe.log startup.log latency.log idle.log | tee -a "$GITHUB_STEP_SUMMARY"
+      # The Rust port (tools/perf-gate) must agree with the Python gate on the
+      # same runner logs before the Python can be retired: same verdict table,
+      # same exit code. Its own unit tests run here too.
+      - name: Rust gate (equivalence with the Python gate)
+        shell: bash
+        run: |
+          set -euo pipefail
           cargo build --locked --manifest-path tools/perf-gate/Cargo.toml
-          ./tools/perf-gate/target/debug/perf-gate.exe probe.log startup.log latency.log idle.log --baseline perf/baseline.json --print
-          ./tools/perf-gate/target/debug/perf-gate.exe probe.log startup.log latency.log idle.log --baseline perf/baseline.json | tee -a "$GITHUB_STEP_SUMMARY"
+          cargo test --locked --manifest-path tools/perf-gate/Cargo.toml
+          python scripts/perf_gate.py probe.log startup.log latency.log idle.log > gate-python.txt && py=0 || py=$?
+          ./tools/perf-gate/target/debug/perf-gate.exe probe.log startup.log latency.log idle.log --baseline perf/baseline.json > gate-rust.txt && rs=0 || rs=$?
+          # Python's redirected stdout is CRLF on Windows, Rust's is LF;
+          # compare content, not line endings.
+          diff --strip-trailing-cr gate-python.txt gate-rust.txt
+          test "$py" = "$rs"
 
   # The live pixel proofs run on the hosted WARP window too, so a rendering
   # regression cannot land without a captured counterexample. Scenarios are
@@ -173,18 +187,12 @@ jobs:
           key: release-probes
       - name: Build the dev-hooks release
         run: cargo build --locked --release --features dev-hooks
-      # Install the pinned Microsoft 1.22+ host next to the binary so the
-      # session matches the path users get (it passes VT through by default).
-      - name: Install and verify pinned Microsoft console host
-        shell: pwsh
-        run: ./scripts/install-conpty.ps1 -OutputDirectory target/release
       - name: Live pixel proofs
         shell: pwsh
-        # -CiSafe: even with the pinned host, the hosted WARP window +
-        # PrintWindow render exact truecolor dimmed and ConPTY drops
-        # Write-Host+CUP feeds, so the precise-color/positioned proofs stay
-        # local (full set, no -CiSafe); the six environment-robust proofs are
-        # enforced here.
+        # -CiSafe: the hosted WARP window + inbox ConPTY render exact
+        # truecolor dimmed and drop Write-Host+CUP feeds, so only the
+        # environment-robust proofs are enforced here; the precise-color
+        # and positioned proofs run locally (full set, no -CiSafe).
         run: ./scripts/gui-smoke.ps1 -BinaryPath target/release/bayan.exe -KeepArtifacts -CiSafe
       - name: Upload captures on failure
         if: failure()
