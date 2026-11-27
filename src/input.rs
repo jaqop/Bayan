@@ -366,6 +366,11 @@ impl App {
             self.drag_tab_motion(position);
             return;
         }
+        // A pane swap drag owns the pointer from a Ctrl+Alt press in a pane.
+        if self.pane_swap.is_some() {
+            self.pane_swap_motion(position);
+            return;
+        }
         // A divider drag wins: its grab is wider than the gap and sits next
         // to the bar. A thumb drag otherwise owns the pointer, including
         // once it leaves the strip.
@@ -875,6 +880,19 @@ impl App {
     /// The chrome first, in `chrome::left_press` order, then the terminal.
     fn left_press(&mut self, el: &ActiveEventLoop) {
         let pos = self.cursor_pos;
+        // Ctrl+Alt+drag swaps panes (Phase C3a); claim it before chrome or
+        // the terminal so a tracking program does not hear the gesture.
+        let mods = self.mods_now();
+        if mods.ctrl && mods.alt && !mods.shift && !self.overlay_blocks_mouse() {
+            if let Some(pi) = self.pane_at(pos) {
+                self.pane_swap = Some(crate::PaneSwap {
+                    src: pi,
+                    target: pi,
+                    engaged: false,
+                });
+                return;
+            }
+        }
         match chrome::left_press(&self.chrome_hits(pos)) {
             LeftPress::Resize(dir) => {
                 if let Some(w) = self.window.as_ref() {
@@ -1033,6 +1051,14 @@ impl App {
                     self.drop_tab_drag(d);
                 }
                 self.cancel_tab_drag();
+                self.request_redraw();
+                return;
+            }
+            if let Some(s) = self.pane_swap.take() {
+                if s.engaged && s.target != s.src {
+                    self.swap_panes(s.src, s.target);
+                }
+                self.cancel_pane_swap();
                 self.request_redraw();
                 return;
             }
