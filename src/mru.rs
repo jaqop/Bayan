@@ -130,8 +130,16 @@ mod tests {
         m.touch(0);
         m.touch(1);
         m.touch(2); // history: 2, 1, 0
-        // swap tabs 0 and 2 (a reorder): history becomes 0, 1, 2
-        m.remap(&|i| if i == 0 { 2 } else if i == 2 { 0 } else { i });
+                    // swap tabs 0 and 2 (a reorder): history becomes 0, 1, 2
+        m.remap(&|i| {
+            if i == 0 {
+                2
+            } else if i == 2 {
+                0
+            } else {
+                i
+            }
+        });
         assert_eq!(m.most_recent(&[0, 1, 2]), Some(0));
         assert_eq!(m.step(true, 3), Some(1));
     }

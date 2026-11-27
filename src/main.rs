@@ -5039,8 +5039,15 @@ impl App {
         let to = vis[target];
         self.tabs.swap(from, to);
         self.active = to;
-        self.mru
-            .remap(&|i| if i == from { to } else if i == to { from } else { i });
+        self.mru.remap(&|i| {
+            if i == from {
+                to
+            } else if i == to {
+                from
+            } else {
+                i
+            }
+        });
         self.save_state();
         self.request_redraw();
     }

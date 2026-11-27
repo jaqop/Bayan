@@ -174,7 +174,9 @@ impl Action {
             Action::NewWindow => crate::lang::pick(lang, "نافذة جديدة", "New window"),
             Action::DuplicateTab => crate::lang::pick(lang, "تكرار التبويب", "Duplicate tab"),
             Action::MoveTabBack => crate::lang::pick(lang, "نقل التبويب لليسار", "Move tab left"),
-            Action::MoveTabForward => crate::lang::pick(lang, "نقل التبويب لليمين", "Move tab right"),
+            Action::MoveTabForward => {
+                crate::lang::pick(lang, "نقل التبويب لليمين", "Move tab right")
+            }
         }
     }
 
@@ -239,8 +241,18 @@ impl Action {
             // Ctrl+Alt+arrows: reorder the active tab within its group.
             // Ctrl+Shift+arrows are the shell's word selection and
             // Alt+arrows move pane focus, so Ctrl+Alt is the free slot.
-            Action::MoveTabBack => Chord { ctrl: true, shift: false, alt: true, key: Left },
-            Action::MoveTabForward => Chord { ctrl: true, shift: false, alt: true, key: Right },
+            Action::MoveTabBack => Chord {
+                ctrl: true,
+                shift: false,
+                alt: true,
+                key: Left,
+            },
+            Action::MoveTabForward => Chord {
+                ctrl: true,
+                shift: false,
+                alt: true,
+                key: Right,
+            },
         }
     }
 }
