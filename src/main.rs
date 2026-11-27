@@ -2127,6 +2127,17 @@ impl TapPlan {
     }
 }
 
+/// A left press on a tab arms a reorder drag (Phase C2). It engages past a
+/// small horizontal threshold; `target` is the visible slot the pointer would
+/// drop the tab into, and release moves it there via the keyboard primitive.
+#[derive(Clone, Copy)]
+struct TabDrag {
+    tab: usize,
+    start_x: f64,
+    target: usize,
+    engaged: bool,
+}
+
 struct App {
     /// the prompt picker, when open
     posh: Option<PoshPicker>,
@@ -2181,6 +2192,8 @@ struct App {
     drag_anchor: Option<(Point, Side)>,
     /// divider being dragged (between pane i and i+1)
     drag_divider: Option<usize>,
+    /// a tab reorder drag armed by a left press on the bar (Phase C2)
+    tab_drag: Option<TabDrag>,
     /// Per-pane scrollbar: hover, thumb drag, and when it was last scrolled.
     bars: scrollbar::Bars,
     /// the agent cockpit overlay (Ctrl+Shift+D): one glance at every tab
@@ -2495,6 +2508,7 @@ impl App {
             sel_pane: None,
             drag_anchor: None,
             drag_divider: None,
+            tab_drag: None,
             bars: scrollbar::Bars::default(),
             cockpit: false,
             cockpit_sel: 0,
@@ -5052,6 +5066,70 @@ impl App {
         self.request_redraw();
     }
 
+    /// Phase C2: a tab drag owns the pointer. Past the threshold it engages
+    /// and tracks the drop slot; the insertion caret follows the pointer.
+    fn drag_tab_motion(&mut self, position: PhysicalPosition<f64>) {
+        let Some(mut d) = self.tab_drag else {
+            return;
+        };
+        let threshold = self
+            .renderer
+            .as_ref()
+            .map_or(8.0, |r| (r.cell_w * 0.6).max(6.0) as f64);
+        if !d.engaged {
+            if (position.x - d.start_x).abs() < threshold {
+                return;
+            }
+            d.engaged = true;
+        }
+        let (labels, pos_active) = self.visible_labels();
+        let titles: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let width = self
+            .window
+            .as_ref()
+            .map_or(0, |w| w.inner_size().width as usize);
+        let spans = self
+            .renderer
+            .as_ref()
+            .map_or_else(Vec::new, |r| r.tab_rects(width, &titles, pos_active));
+        d.target = crate::chrome::tab_drop_target(&spans, position.x);
+        // the caret sits at the leading edge of the target slot, or the row's
+        // end when the target is past the last drawn tab
+        let x = spans
+            .iter()
+            .find(|&&(i, ..)| i == d.target)
+            .map(|&(_, sx, _)| sx)
+            .or_else(|| spans.last().map(|&(_, sx, sw)| sx + sw));
+        self.tab_drag = Some(d);
+        if let Some(r) = self.renderer.as_mut() {
+            r.drag_tab_x = x;
+        }
+        self.request_redraw();
+    }
+
+    /// Phase C2: release an engaged drag — step the dragged tab to its drop
+    /// slot with the keyboard primitive, so MRU, groups and the saved layout
+    /// follow the already-tested path.
+    fn drop_tab_drag(&mut self, d: TabDrag) {
+        if self.active != d.tab {
+            self.switch_tab(d.tab);
+        }
+        let (vis, pos) = self.visible_tabs();
+        let target = d.target.min(vis.len().saturating_sub(1));
+        let back = target < pos;
+        for _ in 0..pos.abs_diff(target) {
+            self.move_active_tab(back);
+        }
+    }
+
+    /// Cancel a tab drag and drop its caret (resize, focus loss, release).
+    fn cancel_tab_drag(&mut self) {
+        self.tab_drag = None;
+        if let Some(r) = self.renderer.as_mut() {
+            r.drag_tab_x = None;
+        }
+    }
+
     /// Move the active tab into group `gid` (`None`: a new group). The
     /// view follows the tab; a group it leaves empty is dropped.
     fn move_tab_to_group(&mut self, gid: Option<u32>) {
@@ -6009,6 +6087,7 @@ impl App {
         let outs = self.mouse.abandon(proto, mods);
         self.emit_mouse(outs);
         self.clear_link_hover();
+        self.cancel_tab_drag();
     }
 
     fn focus_pane_at(&mut self, pi: usize) {

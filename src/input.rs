@@ -361,6 +361,11 @@ impl App {
     /// `WindowEvent::CursorMoved`, after the modals.
     pub(crate) fn cursor_moved(&mut self, position: PhysicalPosition<f64>) {
         self.cursor_pos = position;
+        // A tab reorder drag owns the pointer from the press on the bar.
+        if self.tab_drag.is_some() {
+            self.drag_tab_motion(position);
+            return;
+        }
         // A divider drag wins: its grab is wider than the gap and sits next
         // to the bar. A thumb drag otherwise owns the pointer, including
         // once it leaves the strip.
@@ -931,7 +936,17 @@ impl App {
                     self.drag_divider = Some(i);
                 }
             }
-            LeftPress::Tab(i) => self.switch_tab(i),
+            LeftPress::Tab(i) => {
+                self.switch_tab(i);
+                // arm a reorder drag; a press that never moves is just a click
+                let (_, slot) = self.visible_tabs();
+                self.tab_drag = Some(crate::TabDrag {
+                    tab: i,
+                    start_x: pos.x,
+                    target: slot,
+                    engaged: false,
+                });
+            }
             LeftPress::CloseTab(i) => self.request_close_tab(i, el),
             LeftPress::NextGroup => self.perform_action(keybinds::Action::NextGroup, el),
             LeftPress::Blocked => {}
@@ -1011,6 +1026,16 @@ impl App {
         }
         if self.drag_divider.take().is_some() {
             return; // a resize drag copies nothing
+        }
+        if button == MouseButton::Left {
+            if let Some(d) = self.tab_drag.take() {
+                if d.engaged {
+                    self.drop_tab_drag(d);
+                }
+                self.cancel_tab_drag();
+                self.request_redraw();
+                return;
+            }
         }
         if let Some(b) = button_of(button) {
             if self.release_mouse_report(b) {
