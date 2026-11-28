@@ -29,6 +29,7 @@ pub(crate) enum ShellKind {
     Bash,
     Wsl,
     Cmd,
+    Fish,
     Unknown,
 }
 
@@ -50,6 +51,7 @@ fn program_kind(prog: &str) -> ShellKind {
         // `--rcfile`. A bare substring "bash" would also match `notbash`.
         "bash" => ShellKind::Bash,
         n if n.ends_with("-bash") && n != "git-bash" => ShellKind::Bash,
+        "fish" => ShellKind::Fish,
         // `sh` is not bash (it may be dash). Windows `zsh.exe` is not the
         // WSL case; zsh is handled inside the WSL launcher. Both stay unknown.
         _ => ShellKind::Unknown,
@@ -441,7 +443,9 @@ pub(crate) fn plan(command: &str, enabled: bool, elevated: bool, nonce: &str) ->
         ShellKind::Bash => bash_plan(&args, elevated, env),
         ShellKind::Wsl => wsl_plan(&args, elevated, env),
         ShellKind::Cmd => Some(cmd_plan(&args)),
-        ShellKind::PowerShell | ShellKind::Unknown => None,
+        // fish is recognized; its nonce-mark hook lands in the next increment
+        // (Phase 2). Until then it is started exactly as given, like Unknown.
+        ShellKind::Fish | ShellKind::PowerShell | ShellKind::Unknown => None,
     }
 }
 
@@ -2675,7 +2679,6 @@ mod tests {
     #[test]
     fn an_unknown_shell_is_never_injected() {
         for cmd in [
-            "fish.exe",
             "nu.exe",
             "dash.exe",
             "sh.exe",
@@ -2702,6 +2705,17 @@ mod tests {
         );
         assert!(plan(r"C:\Program Files\Git\git-bash.exe", true, false, NONCE).is_none());
         assert_eq!(shell_kind("cmd.exe /K chcp 65001"), ShellKind::Cmd);
+    }
+
+    #[test]
+    fn fish_is_recognized_but_not_injected_until_its_hook_lands() {
+        for cmd in ["fish", "fish.exe", r"C:\msys64\usr\bin\fish.exe", "fish -i"] {
+            assert_eq!(shell_kind(cmd), ShellKind::Fish, "{cmd}");
+            // Phase 2 increments the hook next; until then fish starts as given.
+            assert!(plan(cmd, true, false, NONCE).is_none(), "{cmd} injected");
+        }
+        // a name that merely contains fish is not the shell
+        assert_eq!(shell_kind("notfish.exe"), ShellKind::Unknown);
     }
 
     #[test]
