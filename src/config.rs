@@ -223,6 +223,30 @@ pub struct UserConfig {
     /// normal launch never starts `bayan --mux-server`.
     #[serde(default, skip_serializing_if = "MuxConfig::is_default")]
     pub mux: MuxConfig,
+    /// Output triggers: patterns matched against new pane output that fire a
+    /// notify-only action (toast or bell). Empty means the feature is off.
+    /// Untrusted output may only raise a notification — never run anything.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggers: Vec<TriggerConfig>,
+}
+
+/// One output trigger. `pattern` is a regex; `action` is `"toast"` (default)
+/// or `"bell"`; `cooldown_ms` rate-limits repeats (default 5000).
+///
+/// ```json
+/// { "triggers": [ { "pattern": "ERROR|FAIL", "action": "toast", "cooldown_ms": 5000 } ] }
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct TriggerConfig {
+    pub pattern: String,
+    pub action: String,
+    #[serde(default = "default_trigger_cooldown")]
+    pub cooldown_ms: u64,
+}
+
+fn default_trigger_cooldown() -> u64 {
+    5000
 }
 
 /// Selection copy. `clean` is `"off"`, `"on"`, or `"claude_mode"`.
@@ -822,6 +846,26 @@ mod tests {
         for s in CursorStyle::ALL {
             assert_eq!(CursorStyle::parse(s.as_str()), s);
         }
+    }
+
+    #[test]
+    fn triggers_parse_with_defaults_and_round_trip() {
+        // absent means the feature is off
+        assert!(UserConfig::default().triggers.is_empty());
+        let c: UserConfig = serde_json::from_str(
+            r#"{"triggers":[{"pattern":"ERROR","action":"bell","cooldown_ms":1000},{"pattern":"FAIL"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(c.triggers.len(), 2);
+        assert_eq!(c.triggers[0].pattern, "ERROR");
+        assert_eq!(c.triggers[0].action, "bell");
+        assert_eq!(c.triggers[0].cooldown_ms, 1000);
+        // absent action/cooldown resolve to toast / 5000
+        assert_eq!(c.triggers[1].action, "");
+        assert_eq!(c.triggers[1].cooldown_ms, 5000);
+        // empty triggers stay omitted on the way back out
+        let json = serde_json::to_string(&UserConfig::default()).unwrap();
+        assert!(!json.contains("triggers"));
     }
 
     #[test]

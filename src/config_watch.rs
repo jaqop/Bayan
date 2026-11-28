@@ -335,6 +335,12 @@ pub fn merge_reload(base: &UserConfig, live: &UserConfig, file: &UserConfig) -> 
             &mut overrode,
         ),
         mux: merge_field(&base.mux, &live.mux, &file.mux, &mut overrode),
+        triggers: merge_field(
+            &base.triggers,
+            &live.triggers,
+            &file.triggers,
+            &mut overrode,
+        ),
         keyboard: merge_field(
             &base.keyboard,
             &live.keyboard,

@@ -418,7 +418,12 @@ fn row_wraps<T>(term: &Term<T>, line: Line) -> bool {
     len > 0 && row[Column(len - 1)].flags.contains(Flags::WRAPLINE)
 }
 
-fn cells_to_string<T>(term: &Term<T>, line: Line, mut start: Column, end: Column) -> String {
+pub(crate) fn cells_to_string<T>(
+    term: &Term<T>,
+    line: Line,
+    mut start: Column,
+    end: Column,
+) -> String {
     let row = &term.grid()[line];
     if start.0 > 0 && row[start].flags.contains(Flags::WIDE_CHAR_SPACER) {
         start = Column(start.0 - 1);
