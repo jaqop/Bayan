@@ -5956,6 +5956,27 @@ impl App {
         let mut focused_id = None;
         let mut finished = None;
         let mut running = String::new();
+        // Magnifier: the focused caret's box. The renderer records it in
+        // physical pixels (ime_spot); accesskit bounds are logical window
+        // pixels, so divide by the window scale factor.
+        let caret_bounds = self
+            .renderer
+            .as_ref()
+            .and_then(|r| r.ime_spot)
+            .map(|(x, y, w, h)| {
+                let s = self
+                    .window
+                    .as_ref()
+                    .map(|w| w.scale_factor() as f32)
+                    .filter(|s| *s > 0.0)
+                    .unwrap_or(1.0);
+                (
+                    (x as f32 / s).round() as i32,
+                    (y as f32 / s).round() as i32,
+                    (w as f32 / s).round() as i32,
+                    (h as f32 / s).round() as i32,
+                )
+            });
         if let Some(tab) = self.tabs.get(active) {
             let count = tab.panes.len();
             for (pi, pane) in tab.panes.iter().enumerate() {
@@ -5981,6 +6002,7 @@ impl App {
                     index: pi,
                     name: screen_reader::pane_name(pi, count),
                     text,
+                    caret_bounds: if pi == focused { caret_bounds } else { None },
                 });
             }
         }
