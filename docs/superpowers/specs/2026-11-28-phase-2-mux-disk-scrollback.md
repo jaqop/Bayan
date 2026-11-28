@@ -18,7 +18,7 @@ a **bounded longer history** than the RAM tail and replay it on restore.
 
 ## Design
 
-Two milestone PRs: **A — reconnect-restore consumer** (this doc's core), then
+Two parts, landed together in PR #127: **A — reconnect-restore consumer** and
 **B — bounded longer disk history**.
 
 ### Id stability (correctness prerequisite)
@@ -50,16 +50,20 @@ semantics), not a resurrected process.
   then drops the route (EOF) instead of inserting a live route. No window change needed:
   `pane_from_attached` builds a session whose reader EOFs → exited pane.
 
-### PR B — bounded longer disk history
+### PR B — bounded longer disk history (implemented)
 
 - The server appends output to a per-session disk ring (`<id>.log`), bounded by
-  `DISK_HISTORY_MAX` (a few MiB), **asynchronously** via a bounded channel + writer
-  thread so the perf-critical pipe path only does a non-blocking `try_send` (drop on
-  full — never backpressure the PTY). The cat lock-tally shows the pipe dominates; disk
-  I/O must not sit on it synchronously.
-- `Effect::Persist` writes metadata; the dead-restore path replays the bounded disk ring
-  (longer than the 256 KiB RAM tail) through the existing `replay_bytes` sanitiser.
-- Perf gate before/after diff required; the reader-throughput metric is the arbiter.
+  `DISK_HISTORY_MAX` = 4 MiB (rotates once past `+ ROTATE_SLACK`), **asynchronously**
+  via a bounded `sync_channel` (`HISTORY_QUEUE` = 256) + a `bayan-mux-history` writer
+  thread. `Ev::Output` only does a non-blocking `try_send` (drop on full — never
+  backpressure the PTY). Mux is opt-in and off the perf-gate reader path (local shells),
+  so the writer does not touch the gate's reader-throughput metric.
+- At startup `load_saved_from` replays the ring (longer than the 256 KiB JSON tail, and
+  it kept growing after detach) into the dead snap through `replay_bytes`; the PR A
+  restore path then replays that longer history unchanged. `forget_saved` deletes the
+  `.log` too.
+- Tests: `read_history_tail_keeps_the_last_max_bytes`, `append_history_rotates_back_to_the_bound`,
+  `load_saved_replays_the_longer_disk_ring`.
 
 ## Security
 

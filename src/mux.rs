@@ -28,6 +28,14 @@ use std::sync::{mpsc, Arc};
 /// Output kept per session and replayed on reattach. A longer history is
 /// the file-restore work, not this pipe.
 pub const TAIL_MAX: usize = 256 * 1024;
+/// Bounded disk history per session (`<id>.log`), longer than the RAM tail so
+/// a restore replays more scrollback. The ring rotates once it exceeds this by
+/// `ROTATE_SLACK`; the cut is sanitised by `replay_bytes` on restore.
+pub const DISK_HISTORY_MAX: usize = 4 * 1024 * 1024;
+const ROTATE_SLACK: usize = 256 * 1024;
+/// Bounded queue to the disk-history writer. Full → drop (best-effort longer
+/// history; the RAM tail still guarantees `TAIL_MAX`). Never blocks the pipe.
+const HISTORY_QUEUE: usize = 256;
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_SESSIONS: usize = 32;
 /// Frames the server holds for one window before it gives up on it. PTY
@@ -217,6 +225,56 @@ pub fn forget_saved(id: u64) {
     forget_from(&saved_dir(), id);
 }
 
+/// The last `max` bytes of a session's disk history ring, if any. The start
+/// may fall mid-character/mid-escape; `replay_bytes` sanitises it on restore.
+pub fn read_history_tail(dir: &std::path::Path, id: u64, max: usize) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(dir.join(format!("{id}.log"))).ok()?;
+    if bytes.len() > max {
+        Some(bytes[bytes.len() - max..].to_vec())
+    } else {
+        Some(bytes)
+    }
+}
+
+/// Append a chunk to the ring and rotate it back to the last `max` bytes once
+/// it grows past `max + slack`. Runs on the history writer thread, never on
+/// the pipe path.
+fn append_history(dir: &std::path::Path, id: u64, bytes: &[u8], max: usize, slack: usize) {
+    use std::io::Write;
+    let path = dir.join(format!("{id}.log"));
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    if f.write_all(bytes).is_err() {
+        return;
+    }
+    drop(f);
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return;
+    };
+    if meta.len() as usize <= max + slack {
+        return;
+    }
+    if let Some(tail) = read_history_tail(dir, id, max) {
+        let _ = std::fs::write(&path, tail);
+    }
+}
+
+/// The disk-history writer: drains the bounded queue, appending each chunk to
+/// its session ring. A full queue drops chunks (best-effort), so the pipe is
+/// never backpressured by disk I/O.
+fn history_writer(rx: mpsc::Receiver<(u64, Vec<u8>)>) {
+    let dir = saved_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    while let Ok((id, bytes)) = rx.recv() {
+        append_history(&dir, id, &bytes, DISK_HISTORY_MAX, ROTATE_SLACK);
+    }
+}
+
 #[derive(Debug)]
 struct Slot {
     title: String,
@@ -275,6 +333,13 @@ impl MuxHub {
                 continue;
             };
             snap.dead = true;
+            // The disk ring holds a longer history than the JSON tail (it kept
+            // growing after detach); replay it when present.
+            if let Some(hist) = read_history_tail(dir, id, DISK_HISTORY_MAX) {
+                if !hist.is_empty() {
+                    snap.screen = replay_bytes(&hist);
+                }
+            }
             // spawn assigns `next += 1`; keep next at the max saved id so the
             // next live session lands above every restored one.
             self.next = self.next.max(id);
@@ -1469,6 +1534,12 @@ mod os {
         // Restore disk-only sessions saved by a previous server (reconnect
         // after a restart) and reserve their ids.
         hub.load_saved();
+        // Bounded longer disk history, written off the pipe path. A full queue
+        // drops chunks (best-effort) so disk I/O never backpressures the PTY.
+        let (hist_tx, hist_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(HISTORY_QUEUE);
+        let _ = std::thread::Builder::new()
+            .name("bayan-mux-history".into())
+            .spawn(move || history_writer(hist_rx));
         let mut gate = Gate { ever_had: false };
         let mut lives: HashMap<u64, Live> = HashMap::new();
         let mut clients: HashMap<u64, Link> = HashMap::new();
@@ -1524,6 +1595,8 @@ mod os {
                     }
                 }
                 Ev::Output(id, bytes) => {
+                    // Best-effort longer disk history; never blocks the pipe.
+                    let _ = hist_tx.try_send((id, bytes.clone()));
                     if let Some(client) = hub.note_output(id, &bytes) {
                         send(
                             &mut clients,
@@ -3082,6 +3155,52 @@ mod tests {
         let snap = load_from(&dir, 9).expect("load");
         assert!(!snap.dead);
         assert_eq!(snap.screen, b"hi");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_history_tail_keeps_the_last_max_bytes() {
+        let dir = std::env::temp_dir().join(format!("bayan-mux-hist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let data: Vec<u8> = (0..200u8).collect();
+        std::fs::write(dir.join("4.log"), &data).expect("write");
+        assert_eq!(
+            read_history_tail(&dir, 4, 100).unwrap(),
+            data[100..].to_vec()
+        );
+        assert_eq!(read_history_tail(&dir, 4, 500).unwrap(), data);
+        assert!(read_history_tail(&dir, 5, 100).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_history_rotates_back_to_the_bound() {
+        let dir = std::env::temp_dir().join(format!("bayan-mux-rot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        // max 100, slack 10: appending past 110 rotates to the last 100 bytes.
+        append_history(&dir, 4, &[0u8; 80], 100, 10);
+        assert_eq!(std::fs::metadata(dir.join("4.log")).unwrap().len(), 80);
+        append_history(&dir, 4, &[1u8; 80], 100, 10);
+        let after = std::fs::read(dir.join("4.log")).unwrap();
+        // 160 bytes > 110 → keep the last 100: 20 zeros then 80 ones.
+        let mut expected = vec![0u8; 20];
+        expected.extend(vec![1u8; 80]);
+        assert_eq!(after, expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_saved_replays_the_longer_disk_ring() {
+        let dir = std::env::temp_dir().join(format!("bayan-mux-ring-{}", std::process::id()));
+        // JSON tail is short; the ring holds a longer history.
+        save_to(&dir, &saved_snap(3, b"tail")).expect("save");
+        std::fs::write(dir.join("3.log"), b"a longer bounded history\r\n").expect("ring");
+        let mut hub = MuxHub::new();
+        hub.load_saved_from(&dir);
+        let listed = hub.list_detached();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].screen, b"a longer bounded history\r\n");
+        assert!(listed[0].dead);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
