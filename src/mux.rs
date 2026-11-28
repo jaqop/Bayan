@@ -114,6 +114,11 @@ pub struct SessionSnap {
     pub cols: u16,
     pub rows: u16,
     pub screen: Vec<u8>,
+    /// A disk-only session whose live shell is gone: restore replays its
+    /// saved output read-only (EOF after the tail), not a live pipe. Old
+    /// snapshots predating this field load as `false`.
+    #[serde(default)]
+    pub dead: bool,
 }
 
 /// What the window asks the server to start.
@@ -171,6 +176,11 @@ pub enum Effect {
     Persist {
         snap: SessionSnap,
     },
+    /// Delete a session's disk snapshot (on kill). A no-op when nothing was
+    /// saved. Only names `<id>.json`/`<id>.log` under `saved_dir()`.
+    Forget {
+        id: u64,
+    },
 }
 
 /// Disk-backed session tails (Phase A3). Bounded by [`TAIL_MAX`]; the live
@@ -185,10 +195,8 @@ pub fn save_to(dir: &std::path::Path, snap: &SessionSnap) -> std::io::Result<()>
     std::fs::write(dir.join(format!("{}.json", snap.id)), json)
 }
 
-// The load side awaits the reconnect-restore increment (A3 exit: reconnect
-// restores layout from disk). The save side is wired via Effect::Persist;
-// load_from is exercised by saved_tail_round_trips_through_disk meanwhile.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Read one saved snapshot. The server loads these into its dead registry at
+/// startup (`MuxHub::load_saved_from`) so a reconnect can restore history.
 pub fn load_from(dir: &std::path::Path, id: u64) -> Option<SessionSnap> {
     let bytes = std::fs::read(dir.join(format!("{id}.json"))).ok()?;
     serde_json::from_slice(&bytes).ok()
@@ -198,9 +206,15 @@ pub fn save_saved(snap: &SessionSnap) {
     let _ = save_to(&saved_dir(), snap);
 }
 
-#[allow(dead_code)] // Consumer lands with reconnect-restore; see load_from.
-pub fn load_saved(id: u64) -> Option<SessionSnap> {
-    load_from(&saved_dir(), id)
+/// Delete a session's disk files (kill cleanup). Only `<id>.json`/`<id>.log`
+/// under `dir`; the id is a u64, so there is no path to traverse.
+pub fn forget_from(dir: &std::path::Path, id: u64) {
+    let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
+    let _ = std::fs::remove_file(dir.join(format!("{id}.log")));
+}
+
+pub fn forget_saved(id: u64) {
+    forget_from(&saved_dir(), id);
 }
 
 #[derive(Debug)]
@@ -220,6 +234,10 @@ struct Slot {
 pub struct MuxHub {
     next: u64,
     slots: BTreeMap<u64, Slot>,
+    /// Disk-only sessions whose live shell is gone (server restarted). Loaded
+    /// at startup; restore replays their saved output read-only. Their ids are
+    /// reserved so a new live session never reuses one.
+    saved: BTreeMap<u64, SessionSnap>,
 }
 
 impl MuxHub {
@@ -227,6 +245,40 @@ impl MuxHub {
         Self {
             next: 0,
             slots: BTreeMap::new(),
+            saved: BTreeMap::new(),
+        }
+    }
+
+    /// Load disk snapshots saved by a previous server into the dead registry,
+    /// reserving their ids. Called once at server startup.
+    pub fn load_saved(&mut self) {
+        self.load_saved_from(&saved_dir());
+    }
+
+    pub fn load_saved_from(&mut self, dir: &std::path::Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(id) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let Some(mut snap) = load_from(dir, id) else {
+                continue;
+            };
+            snap.dead = true;
+            // spawn assigns `next += 1`; keep next at the max saved id so the
+            // next live session lands above every restored one.
+            self.next = self.next.max(id);
+            self.saved.insert(id, snap);
         }
     }
 
@@ -242,6 +294,7 @@ impl MuxHub {
             cols: slot.cols,
             rows: slot.rows,
             screen: replay_bytes(&slot.screen),
+            dead: false,
         }
     }
 
@@ -294,24 +347,36 @@ impl MuxHub {
     }
 
     fn list_detached(&self) -> Vec<SessionSnap> {
-        self.slots
+        let mut out: Vec<SessionSnap> = self
+            .slots
             .iter()
             .filter(|(_, slot)| slot.attached_to.is_none())
             .map(|(&id, slot)| Self::snap_of(id, slot))
-            .collect()
+            .collect();
+        // Disk-only sessions survive a server restart; offer them too. Their
+        // ids are reserved, so a live slot never shares one.
+        for (&id, snap) in &self.saved {
+            if !self.slots.contains_key(&id) {
+                out.push(snap.clone());
+            }
+        }
+        out
     }
 
     fn reattach(&mut self, id: u64, client: u64) -> Option<SessionSnap> {
-        let slot = self.slots.get_mut(&id)?;
-        if slot.attached_to.is_some() {
-            return None;
+        if let Some(slot) = self.slots.get_mut(&id) {
+            if slot.attached_to.is_some() {
+                return None;
+            }
+            slot.attached_to = Some(client);
+            return Some(Self::snap_of(id, slot));
         }
-        slot.attached_to = Some(client);
-        Some(Self::snap_of(id, slot))
+        // No live slot: a disk-only session restores read-only (dead).
+        self.saved.get(&id).cloned()
     }
 
     fn kill(&mut self, id: u64) -> bool {
-        self.slots.remove(&id).is_some()
+        self.slots.remove(&id).is_some() || self.saved.remove(&id).is_some()
     }
 
     fn child_gone(&mut self, id: u64) -> bool {
@@ -403,6 +468,9 @@ fn reduce(hub: &mut MuxHub, gate: &mut Gate, client: u64, msg: Message) -> Outco
         Message::Kill { id } => {
             if hub.kill(id) {
                 effects.push(Effect::Stop { id });
+                // Clean up any disk snapshot (a detached-then-killed session,
+                // or a disk-only restored one). No-op when nothing was saved.
+                effects.push(Effect::Forget { id });
                 replies.push(Message::Killed { id });
             } else {
                 replies.push(Message::Missing { id });
@@ -1025,6 +1093,7 @@ impl<'a> Reader<'a> {
             cols: self.u16()?,
             rows: self.u16()?,
             screen: self.bytes()?,
+            dead: self.u8()? != 0,
         })
     }
 }
@@ -1063,6 +1132,7 @@ fn put_snap(out: &mut Vec<u8>, snap: &SessionSnap) {
     put_u16(out, snap.cols);
     put_u16(out, snap.rows);
     put_bytes(out, &snap.screen);
+    out.push(snap.dead as u8);
 }
 
 pub fn write_frame(mut w: impl Write, msg: &Message) -> std::io::Result<()> {
@@ -1318,8 +1388,11 @@ fn finish_attached(
     command: String,
     output: mpsc::Receiver<Vec<u8>>,
     tx: mpsc::Sender<Cmd>,
+    dead: bool,
 ) -> Attached {
-    let armed = Arc::new(AtomicBool::new(true));
+    // A dead (disk-only) restore is read-only history: closing the pane must
+    // not delete the snapshot (only an explicit Kill does), so it is unarmed.
+    let armed = Arc::new(AtomicBool::new(!dead));
     let armed_kill = Arc::clone(&armed);
     let kill_tx = tx.clone();
     let resize_tx = tx.clone();
@@ -1393,6 +1466,9 @@ mod os {
     pub fn run() -> Result<(), String> {
         let (tx, rx) = mpsc::channel::<Ev>();
         let mut hub = MuxHub::new();
+        // Restore disk-only sessions saved by a previous server (reconnect
+        // after a restart) and reserve their ids.
+        hub.load_saved();
         let mut gate = Gate { ever_had: false };
         let mut lives: HashMap<u64, Live> = HashMap::new();
         let mut clients: HashMap<u64, Link> = HashMap::new();
@@ -1650,6 +1726,7 @@ mod os {
                     }
                 }
                 Effect::Persist { snap } => save_saved(&snap),
+                Effect::Forget { id } => forget_saved(id),
             }
         }
         Ok(())
@@ -1802,9 +1879,14 @@ mod os {
             }
             Message::Reattached { snap } => {
                 let id = snap.id;
+                let dead = snap.dead;
                 if let Some(tx) = lock_map(pending).remove(&id) {
                     let _ = tx.send(snap.screen.clone());
-                    lock_map(routes).insert(id, tx);
+                    if !dead {
+                        lock_map(routes).insert(id, tx);
+                    }
+                    // A dead (disk-only) restore drops the route here, so the
+                    // reader EOFs after the saved tail: a read-only history pane.
                 }
                 let _ = control.send(Message::Reattached { snap });
             }
@@ -1845,9 +1927,14 @@ mod os {
                                     if *t == token
                             )
                         })? {
-                            Message::Spawned { id, .. } => {
-                                Ok(finish_attached(id, title, command, out_rx, cmd_tx.clone()))
-                            }
+                            Message::Spawned { id, .. } => Ok(finish_attached(
+                                id,
+                                title,
+                                command,
+                                out_rx,
+                                cmd_tx.clone(),
+                                false,
+                            )),
                             Message::Fail { message, .. } => Err(message),
                             _ => Err("unexpected spawn reply".into()),
                         }
@@ -1867,13 +1954,17 @@ mod os {
                             matches!(m, Message::Reattached { snap } if snap.id == id)
                                 || matches!(m, Message::Missing { id: m } if *m == id)
                         })? {
-                            Message::Reattached { snap } => Ok(finish_attached(
-                                snap.id,
-                                snap.title,
-                                snap.command,
-                                out_rx,
-                                cmd_tx.clone(),
-                            )),
+                            Message::Reattached { snap } => {
+                                let dead = snap.dead;
+                                Ok(finish_attached(
+                                    snap.id,
+                                    snap.title,
+                                    snap.command,
+                                    out_rx,
+                                    cmd_tx.clone(),
+                                    dead,
+                                ))
+                            }
                             Message::Missing { .. } => Err("session is not detached".into()),
                             _ => Err("unexpected reattach reply".into()),
                         }
@@ -2725,6 +2816,7 @@ mod tests {
                     cols: 80,
                     rows: 24,
                     screen: b"hello\r\n\x00\xff".to_vec(),
+                    dead: false,
                 }],
             },
             Message::Reattach { id: 3 },
@@ -2736,6 +2828,7 @@ mod tests {
                     cols: 40,
                     rows: 10,
                     screen: vec![0, 1, 2, 255],
+                    dead: true,
                 },
             },
             Message::Missing { id: 9 },
@@ -2881,6 +2974,117 @@ mod tests {
             .any(|e| matches!(e, Effect::Persist { snap } if snap.id == id)));
     }
 
+    fn saved_snap(id: u64, screen: &[u8]) -> SessionSnap {
+        SessionSnap {
+            id,
+            title: format!("session {id}"),
+            command: "ssh.exe".into(),
+            cols: 80,
+            rows: 24,
+            screen: screen.to_vec(),
+            dead: false,
+        }
+    }
+
+    #[test]
+    fn load_saved_restores_dead_sessions_and_reserves_ids() {
+        let dir = std::env::temp_dir().join(format!("bayan-mux-reg-{}", std::process::id()));
+        save_to(&dir, &saved_snap(3, b"three")).expect("save 3");
+        save_to(&dir, &saved_snap(5, b"five")).expect("save 5");
+        let mut hub = MuxHub::new();
+        hub.load_saved_from(&dir);
+        let listed = hub.list_detached();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|s| s.dead), "saved sessions restore dead");
+        // A new live session must land above every restored id (no collision).
+        let live = hub.spawn(&sample_spec("ssh.exe"), 1).expect("spawn");
+        assert_eq!(live, 6);
+        // The live detached session and the two dead ones all list.
+        reduce(
+            &mut hub,
+            &mut Gate { ever_had: false },
+            1,
+            Message::Detach { id: live },
+        );
+        assert_eq!(hub.list_detached().len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reattach_dead_replays_the_saved_tail() {
+        let dir = std::env::temp_dir().join(format!("bayan-mux-dead-{}", std::process::id()));
+        save_to(&dir, &saved_snap(3, b"history\r\n")).expect("save");
+        let mut hub = MuxHub::new();
+        hub.load_saved_from(&dir);
+        let out = reduce(
+            &mut hub,
+            &mut Gate { ever_had: false },
+            1,
+            Message::Reattach { id: 3 },
+        );
+        let Some(Message::Reattached { snap }) = out.replies.first() else {
+            panic!("expected Reattached, got {:?}", out.replies);
+        };
+        assert!(snap.dead);
+        assert_eq!(snap.screen, b"history\r\n");
+        // Restoring is read-only: the session stays in the dead registry.
+        assert_eq!(hub.list_detached().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kill_saved_emits_forget_and_removes_it() {
+        let dir = std::env::temp_dir().join(format!("bayan-mux-kill-{}", std::process::id()));
+        save_to(&dir, &saved_snap(3, b"x")).expect("save");
+        let mut hub = MuxHub::new();
+        hub.load_saved_from(&dir);
+        let out = reduce(
+            &mut hub,
+            &mut Gate { ever_had: false },
+            1,
+            Message::Kill { id: 3 },
+        );
+        assert!(matches!(
+            out.replies.first(),
+            Some(Message::Killed { id: 3 })
+        ));
+        assert!(out
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::Forget { id: 3 })));
+        assert!(hub.list_detached().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_reattach_is_not_dead() {
+        let mut hub = MuxHub::new();
+        let mut gate = Gate { ever_had: false };
+        let id = hub.spawn(&sample_spec("ssh.exe"), 1).expect("spawn");
+        reduce(&mut hub, &mut gate, 1, Message::Detach { id });
+        let out = reduce(&mut hub, &mut gate, 2, Message::Reattach { id });
+        let Some(Message::Reattached { snap }) = out.replies.first() else {
+            panic!("expected Reattached");
+        };
+        assert!(!snap.dead, "a live reattach stays live");
+    }
+
+    #[test]
+    fn an_old_snapshot_without_dead_loads_as_live() {
+        let dir = std::env::temp_dir().join(format!("bayan-mux-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        // A pre-`dead` file: the field is absent and must default to false.
+        std::fs::write(
+            dir.join("9.json"),
+            r#"{"id":9,"title":"t","command":"ssh.exe","cols":80,"rows":24,"screen":[104,105]}"#,
+        )
+        .expect("write");
+        let snap = load_from(&dir, 9).expect("load");
+        assert!(!snap.dead);
+        assert_eq!(snap.screen, b"hi");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn saved_tail_round_trips_through_disk() {
         let dir = std::env::temp_dir().join(format!("bayan-mux-test-{}", std::process::id()));
@@ -2891,11 +3095,16 @@ mod tests {
             cols: 80,
             rows: 24,
             screen: b"hello\x1b[0m".to_vec(),
+            dead: false,
         };
         save_to(&dir, &snap).expect("save");
         let back = load_from(&dir, 7).expect("load");
         assert_eq!(back, snap);
         assert!(load_from(&dir, 8).is_none());
+        // forget deletes the snapshot; a second forget is a harmless no-op.
+        forget_from(&dir, 7);
+        assert!(load_from(&dir, 7).is_none());
+        forget_from(&dir, 7);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
