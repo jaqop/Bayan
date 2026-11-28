@@ -20,7 +20,7 @@ Copy mode (`copymode.rs`, alacritty vi mode) ignores numeric prefixes: `5j`,
 - Pure unit tests: digit accumulation, leading-zero, `5j`/`3w` move the right
   distance, count resets, shifted digits stay symbols.
 
-## 2. Magnifier caret boxes — PR 2 (implemented)
+## 2. Magnifier caret boxes — PR 2 (merged #129)
 
 accesskit nodes carried no bounds (`set_bounds` unused), so Windows Magnifier
 could not track the caret. Now the focused pane's document node — the tree's
@@ -37,13 +37,19 @@ could not track the caret. Now the focused pane's document node — the tree's
   node; live Magnifier tracking + the logical-pixel coordinate assumption need
   an interactive Magnifier session to confirm (NVDA not installed here).
 
-## 3. SetTextSelection — PR 3
+## 3. SetTextSelection — DEFERRED (owner decision 2026-11-28)
 
 `ActionRequested` is a no-op (`main.rs`) and the document does not advertise
-`SetTextSelection` (`screen_reader.rs`). Handle the action: reverse-map the
-requested `TextSelection` (anchor/focus `TextPosition`) to grid cells (RTL,
-wrapped lines, runs) and set the pane selection; then advertise the action.
-Needs live screen-reader (NVDA) verification.
+`SetTextSelection` (`screen_reader.rs`). Handling it needs an inverse coordinate
+mapping (TextPosition → run-node ID parse → `run_spans` inverse → logical column
+→ viewport row → absolute grid point; `PaneText` does not currently store the
+`source_rows` paragraph→row map) and then a **live-terminal selection write** —
+a security-sensitive area (selection feeds the clipboard).
+
+Deferred because it cannot be live-verified here (NVDA not installed) and the
+selection write is security-sensitive. Revisit in a dedicated session with a
+screen reader available. The a11y milestone ships vim counts (#128) + magnifier
+caret boxes (#129) for now; Phase 2 continues with output triggers/snippets.
 
 ## Standing constraints
 
