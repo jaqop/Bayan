@@ -3702,6 +3702,22 @@ impl Session {
         crate::copyclean::history_text(&self.term.lock(), claude)
     }
 
+    /// The current output position (`history_size + cursor.line`) — where a
+    /// new pane's output-trigger cursor starts, so pre-existing output does
+    /// not fire triggers. Monotonic as output advances and scrolls.
+    pub fn trigger_output_pos(&self) -> i32 {
+        let t = self.term.lock();
+        t.grid().history_size() as i32 + t.grid().cursor.point.line.0
+    }
+
+    /// The text of only the NEW output lines since `since` (an absolute grid
+    /// line), plus the new cursor (the bottommost line). Output triggers match
+    /// this under one lock. The range is floored at the oldest retained
+    /// history line; no new lines yields an empty string.
+    pub fn output_text_since(&self, since: i32) -> (String, i32) {
+        output_text_since_term(&self.term.lock(), since)
+    }
+
     /// Link spans across the viewport, for the palette (capped at 500).
     pub fn palette_links(&self) -> Vec<crate::link::LinkSpan> {
         let t = self.term.lock();
@@ -4348,6 +4364,35 @@ pub fn regex_escape(s: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// The text of only the new COMPLETE output lines since `since`, plus the new
+/// output cursor. The cursor is `history_size + cursor.line` — a monotonic
+/// count of output lines that advances as the cursor moves down and as lines
+/// scroll into history (the screen-bottom line alone is constant and cannot
+/// track new output). `since` is the previous cursor; the new complete lines
+/// are the absolute indices `[since, cursor-1]`, floored at 0. No new lines
+/// yields an empty string. Output triggers match this text.
+pub(crate) fn output_text_since_term<T: alacritty_terminal::event::EventListener>(
+    t: &Term<T>,
+    since: i32,
+) -> (String, i32) {
+    use alacritty_terminal::index::Line;
+    let history = t.grid().history_size() as i32;
+    let pos = history + t.grid().cursor.point.line.0;
+    let start = since.max(0);
+    let end = pos - 1;
+    let mut text = String::new();
+    if start > end {
+        return (text, pos);
+    }
+    let last = Column(t.columns().saturating_sub(1));
+    for abs in start..=end {
+        let line = Line(abs - history);
+        text.push_str(&crate::copyclean::cells_to_string(t, line, Column(0), last));
+        text.push('\n');
+    }
+    (text, pos)
 }
 
 #[cfg(test)]
@@ -5311,6 +5356,37 @@ mod tests {
             }
         }
         text.contains(needle)
+    }
+
+    #[test]
+    fn output_triggers_scan_only_new_lines() {
+        let (mut t, mut p, mut meta, mut carry) = test_term();
+        process_chunk(
+            &mut p,
+            &mut t,
+            &mut meta,
+            &mut carry,
+            b"first ERROR line\r\n",
+        );
+        assert!(screen_has(&t, "ERROR"), "text must reach the grid");
+        // a fresh pane starts at output position 0; the first complete line
+        // (the ERROR line) is new output since then
+        let (text, cursor) = output_text_since_term(&t, 0);
+        assert!(text.contains("ERROR"));
+        assert_eq!(cursor, 1);
+        // re-scanning from the cursor: no new complete lines, empty text
+        let (text, _) = output_text_since_term(&t, cursor);
+        assert!(text.is_empty());
+        // new output without the pattern
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"all good\r\n");
+        let (text, cursor) = output_text_since_term(&t, cursor);
+        assert!(text.contains("all good"));
+        assert!(!text.contains("ERROR"));
+        // new output with the pattern, only on the new line
+        process_chunk(&mut p, &mut t, &mut meta, &mut carry, b"second ERROR\r\n");
+        let (text, _) = output_text_since_term(&t, cursor);
+        assert!(text.contains("second ERROR"));
+        assert!(!text.contains("first ERROR"));
     }
 
     fn grid_chars(t: &Term<VoidListener>) -> String {

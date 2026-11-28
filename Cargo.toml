@@ -35,6 +35,9 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # session persistence (~/.bayan/session.json)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Output triggers: user regex patterns matched against new pane output.
+# regex-automata/syntax are already in the tree via alacritty_terminal.
+regex = "1"
 # config.lua and executable plugins. 0.12.2's rust-version is 1.88, so the
 # 1.89 MSRV job can compile it. lua54+vendored builds Lua 5.4 with the
 # platform C compiler (MSVC on Windows); LuaJIT is not used because its

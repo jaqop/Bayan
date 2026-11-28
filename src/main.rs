@@ -73,6 +73,7 @@ mod ssh;
 mod term;
 mod theme;
 mod toast;
+mod trigger;
 
 #[cfg(all(test, windows))]
 #[path = "../vendor/portable-pty/src/win/conpty_bundle.rs"]
@@ -1024,6 +1025,9 @@ struct Pane {
     command: String,
     /// when this pane last produced output — feeds the busy dot
     last_output: Option<Instant>,
+    /// absolute grid line up to which output triggers have scanned; only
+    /// newer lines are matched, so pre-existing output does not fire them
+    trigger_cursor: i32,
     /// the program's OSC 9;4 progress report, until it clears it
     progress: Option<term::Progress>,
     /// Set when the ConPTY lives in the mux server. `armed` is cleared to
@@ -2361,6 +2365,8 @@ struct App {
     reader_live: Option<String>,
     /// Vim count prefix accumulated in copy mode (`5j`, `3w`). 0 = none.
     copy_count: usize,
+    /// Compiled output triggers (notify-only). Empty = feature off.
+    triggers: trigger::TriggerSet,
     /// Resolved `-p` command line for that same tab. `None` keeps the
     /// configured shell. Ignored when `start_command` is set.
     start_profile_command: Option<String>,
@@ -2616,6 +2622,7 @@ impl App {
             reader_mark_ready: false,
             reader_live: None,
             copy_count: 0,
+            triggers: trigger::TriggerSet::compile(&[]),
         }
     }
 
@@ -3968,6 +3975,7 @@ impl App {
         let bar_moved = runtime.scrollbar != self.config.scrollbar;
         self.config = runtime;
         self.reapply_image_limits();
+        self.triggers = trigger::TriggerSet::compile(&self.config.triggers);
         if language {
             lang::set(self.config.lang());
         }
@@ -4295,16 +4303,20 @@ impl App {
             Arc::clone(&self.image_budget),
             self.config.shell_integration_on(),
         ) {
-            Ok(session) => Some(Pane {
-                id,
-                session,
-                frame: pane_frame::PaneFrame::new(),
-                visual_selection: None,
-                command: command.to_string(),
-                last_output: None,
-                progress: None,
-                mux: None,
-            }),
+            Ok(session) => {
+                let trigger_cursor = session.trigger_output_pos();
+                Some(Pane {
+                    id,
+                    session,
+                    frame: pane_frame::PaneFrame::new(),
+                    visual_selection: None,
+                    command: command.to_string(),
+                    last_output: None,
+                    trigger_cursor,
+                    progress: None,
+                    mux: None,
+                })
+            }
             Err(e) => {
                 eprintln!("bayan: spawn failed: {e}");
                 None
@@ -4594,6 +4606,7 @@ impl App {
             error
         })
         .ok()?;
+        let trigger_cursor = session.trigger_output_pos();
         Some(Pane {
             id,
             session,
@@ -4601,6 +4614,7 @@ impl App {
             visual_selection: None,
             command: command.to_string(),
             last_output: None,
+            trigger_cursor,
             progress: None,
             mux: Some(MuxBind { id: remote, armed }),
         })
@@ -7373,6 +7387,7 @@ impl App {
     fn apply_lua_outcome(&mut self, outcome: lua_host::Outcome) {
         self.json_config = outcome.persisted;
         self.config = outcome.config;
+        self.triggers = trigger::TriggerSet::compile(&self.config.triggers);
         self.keymap = keybinds::effective_map(&self.config);
         lang::set(self.config.lang());
         self.lua_plugins = outcome.plugins;
@@ -8171,6 +8186,26 @@ impl App {
             let now = Instant::now();
             self.tabs[ti].panes[pi].last_output = Some(now);
             self.last_pty = Some(now);
+            // Output triggers: scan only the new lines, fire notify-only
+            // actions. Empty set skips entirely (the feature is opt-in).
+            if !self.triggers.is_empty() {
+                let since = self.tabs[ti].panes[pi].trigger_cursor;
+                let (fired, cursor) = {
+                    let pane = &self.tabs[ti].panes[pi];
+                    self.triggers.fire(&pane.session, since, now)
+                };
+                self.tabs[ti].panes[pi].trigger_cursor = cursor;
+                for action in fired {
+                    match action {
+                        trigger::TriggerAction::Toast => {
+                            self.toast_from_pty(tr("بيان — مُشغِّل", "Bayan — trigger"), "");
+                        }
+                        trigger::TriggerAction::Bell => {
+                            let _ = self.proxy.send_event(UserEvent::Bell(id));
+                        }
+                    }
+                }
+            }
             let f = self.tabs[ti].panes[pi].session.scroll_facts();
             let (alt, following) = (f.alt, f.offset == 0);
             let was_alt = self.alt_seen.insert(id, alt).unwrap_or(false);
@@ -11579,6 +11614,7 @@ mod scroll_app_tests {
                 visual_selection: None,
                 command: String::new(),
                 last_output: None,
+                trigger_cursor: 0,
                 progress: None,
                 mux: None,
             }],
