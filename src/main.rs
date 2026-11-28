@@ -1553,6 +1553,10 @@ enum PaletteRow {
     Reattach(u64),
     /// end a detached session
     KillSession(u64),
+    /// open the saved-snippet list
+    OpenSnippets,
+    /// insert this snippet's text into the focused pane (via the paste guard)
+    Snippet(String),
 }
 
 /// Rows of the right-click menu, most used first. Each one is a keymap
@@ -1903,6 +1907,11 @@ fn plugin_row_label(label: &str) -> String {
     format!("{} — {label}", tr("إضافة", "Plugin"))
 }
 
+/// The palette row that opens the saved-snippet list.
+fn label_snippets() -> &'static str {
+    tr("قصاصات", "Snippets")
+}
+
 /// What a plugin action holds for the confirm card: its text is never typed
 /// without one (BAYAN-007).
 fn plugin_pending(label: &str, send: &str, pane: Option<u64>) -> PendingPaste {
@@ -1988,6 +1997,8 @@ struct Palette {
     ssh_menu: bool,
     /// the rows are detached mux sessions
     detached_menu: bool,
+    /// the rows are saved snippets
+    snippet_menu: bool,
     sel: usize,
     extras: Vec<(PaletteRow, String)>,
     pressed: Option<(usize, PaletteRow)>,
@@ -3284,6 +3295,7 @@ impl App {
             .unwrap_or_default();
         let mut extras = palette_extras(&self.shell_profiles, &links);
         extras.push((PaletteRow::OpenSsh, ssh::label_open().to_string()));
+        extras.push((PaletteRow::OpenSnippets, label_snippets().to_string()));
         if self.config.mux_enabled() {
             extras.push((PaletteRow::DetachSession, mux::label_detach().to_string()));
             extras.push((PaletteRow::OpenDetached, mux::label_reattach().to_string()));
@@ -3295,6 +3307,7 @@ impl App {
             shells_menu: false,
             ssh_menu: false,
             detached_menu: false,
+            snippet_menu: false,
             sel: 0,
             extras,
             pressed: None,
@@ -3380,7 +3393,7 @@ impl App {
         if self
             .palette
             .as_ref()
-            .is_some_and(|p| p.ssh_menu || p.detached_menu)
+            .is_some_and(|p| p.ssh_menu || p.detached_menu || p.snippet_menu)
         {
             let q = query.trim().to_lowercase();
             return self
@@ -3480,6 +3493,22 @@ impl App {
             PaletteRow::OpenDetached => self.open_detached_menu(),
             PaletteRow::Reattach(id) => self.reattach_session(id),
             PaletteRow::KillSession(id) => self.kill_detached(id),
+            PaletteRow::OpenSnippets => self.open_snippets_menu(),
+            PaletteRow::Snippet(text) => {
+                // User-authored text, but it still waits on the paste-guard
+                // card like a palette command (Enter sends, Esc drops).
+                self.pending_paste = Some(PendingPaste {
+                    kind: PendingKind::Paste,
+                    pane: self.focused_pane_id(),
+                    lines: text.lines().count().max(1),
+                    chars: text.chars().count(),
+                    text,
+                    reason: tr("إدراج قصاصة من اللوحة", "Insert a snippet from the palette").into(),
+                    lua: None,
+                    scroll: 0,
+                    saw_end: true,
+                });
+            }
             PaletteRow::InsertCommand(text) => {
                 self.pending_paste = Some(PendingPaste {
                     kind: PendingKind::Paste,
@@ -4459,6 +4488,35 @@ impl App {
         }
         self.mux_client = mux::connect_or_spawn(true).ok();
         self.mux_client.as_ref().is_some_and(|c| c.is_alive())
+    }
+
+    fn open_snippets_menu(&mut self) {
+        if self.config.snippets.is_empty() {
+            self.blocked_link = Some(BlockedLink {
+                reason: tr("لا قصاصات محفوظة", "No saved snippets").into(),
+                shown: tr("أضف قصاصة في ملف الإعداد", "Add a snippet in config.json").into(),
+                confirm: None,
+                is_app_error: false,
+            });
+            return;
+        }
+        self.open_palette(String::new());
+        if let Some(p) = self.palette.as_mut() {
+            p.snippet_menu = true;
+            p.extras = self
+                .config
+                .snippets
+                .iter()
+                .map(|s| {
+                    let name = if s.name.is_empty() {
+                        s.text.clone()
+                    } else {
+                        s.name.clone()
+                    };
+                    (PaletteRow::Snippet(s.text.clone()), name)
+                })
+                .collect();
+        }
     }
 
     fn open_ssh_menu(&mut self) {
@@ -11485,6 +11543,46 @@ mod m38_tests {
         assert!(early[2].0 == PaletteRow::OpenSsh);
         assert!(early[1].0 == PaletteRow::Shell("cmd.exe".into()));
         assert_eq!(early[0].1, "PowerShell · الافتراضية");
+    }
+
+    #[test]
+    fn the_snippet_menu_lists_saved_snippets_and_filters() {
+        let cfg = config::UserConfig {
+            snippets: vec![
+                config::SnippetConfig {
+                    name: "grep errors".into(),
+                    text: "grep -i error log.txt".into(),
+                },
+                config::SnippetConfig {
+                    name: String::new(),
+                    text: "ls -la".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut app = App::new(test_proxy(), cfg, None, None);
+        app.open_snippets_menu();
+        let p = app.palette.as_ref().expect("the snippet menu opens");
+        assert!(p.snippet_menu);
+        assert_eq!(p.extras.len(), 2);
+        assert!(p.extras[0].0 == PaletteRow::Snippet("grep -i error log.txt".into()));
+        assert_eq!(p.extras[0].1, "grep errors");
+        // an empty name falls back to the text itself
+        assert_eq!(p.extras[1].1, "ls -la");
+        // the rows surface through the palette filter
+        let rows = app.palette_rows("");
+        assert_eq!(rows.len(), 2);
+        let hit = app.palette_rows("grep");
+        assert_eq!(hit.len(), 1);
+        assert!(hit[0].0 == PaletteRow::Snippet("grep -i error log.txt".into()));
+    }
+
+    #[test]
+    fn no_snippets_opens_a_card_not_an_empty_menu() {
+        let mut app = App::new(test_proxy(), config::UserConfig::default(), None, None);
+        app.open_snippets_menu();
+        assert!(app.palette.is_none());
+        assert!(app.blocked_link.is_some());
     }
 
     #[test]

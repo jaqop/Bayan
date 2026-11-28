@@ -228,6 +228,10 @@ pub struct UserConfig {
     /// Untrusted output may only raise a notification — never run anything.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub triggers: Vec<TriggerConfig>,
+    /// Saved snippets: named text the palette inserts into the focused pane
+    /// (through the paste guard). Empty means none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snippets: Vec<SnippetConfig>,
 }
 
 /// One output trigger. `pattern` is a regex; `action` is `"toast"` (default)
@@ -247,6 +251,20 @@ pub struct TriggerConfig {
 
 fn default_trigger_cooldown() -> u64 {
     5000
+}
+
+/// One saved snippet: a name and the text it inserts. Snippets are
+/// user-authored (trusted) text, inserted through the paste guard like a
+/// palette command.
+///
+/// ```json
+/// { "snippets": [ { "name": "grep errors", "text": "grep -i error log.txt" } ] }
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SnippetConfig {
+    pub name: String,
+    pub text: String,
 }
 
 /// Selection copy. `clean` is `"off"`, `"on"`, or `"claude_mode"`.
@@ -866,6 +884,21 @@ mod tests {
         // empty triggers stay omitted on the way back out
         let json = serde_json::to_string(&UserConfig::default()).unwrap();
         assert!(!json.contains("triggers"));
+    }
+
+    #[test]
+    fn snippets_parse_and_round_trip() {
+        assert!(UserConfig::default().snippets.is_empty());
+        let c: UserConfig = serde_json::from_str(
+            r#"{"snippets":[{"name":"grep errors","text":"grep -i error log.txt"},{"name":"multi","text":"a\nb"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(c.snippets.len(), 2);
+        assert_eq!(c.snippets[0].name, "grep errors");
+        assert_eq!(c.snippets[0].text, "grep -i error log.txt");
+        assert_eq!(c.snippets[1].text, "a\nb");
+        let json = serde_json::to_string(&UserConfig::default()).unwrap();
+        assert!(!json.contains("snippets"));
     }
 
     #[test]

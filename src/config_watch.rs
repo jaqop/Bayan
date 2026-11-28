@@ -341,6 +341,12 @@ pub fn merge_reload(base: &UserConfig, live: &UserConfig, file: &UserConfig) -> 
             &file.triggers,
             &mut overrode,
         ),
+        snippets: merge_field(
+            &base.snippets,
+            &live.snippets,
+            &file.snippets,
+            &mut overrode,
+        ),
         keyboard: merge_field(
             &base.keyboard,
             &live.keyboard,
