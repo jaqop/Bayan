@@ -82,7 +82,7 @@ semantics). Confirmed:
   unexported var, `unset`/`set -e BAYAN_PROMPT_NONCE` **before user files run**,
   bail on empty nonce.
 
-## Fish hook design (next increment)
+## Fish hook design (landed on feat/phase-2-fish-nu)
 
 - `ShellKind::Fish` recognized (landed); `plan()` routes to `fish_plan`.
 - `fish_plan`: interactive only (no `-c`/`--command`, no script file); elevated
@@ -92,9 +92,22 @@ semantics). Confirmed:
   `fish/vendor_conf.d/bayan.fish`, which fish autoloads before user config.
 - The hook takes the nonce before user files, then emits nonce-carrying
   A/B/C/D + cwd (OSC 9;9 / OSC 7) via `fish_prompt`/`fish_preexec`/`fish_postexec`.
-- **Open verification gate:** the A/B placement around `fish_prompt` (prompt
-  start vs prompt end) must be characterized in a live REPL PTY capture before
-  landing — not guessed. Hook-string unit tests mirror the bash rc assertions.
+- **Verification gate CLOSED (2026-11-28, live fish 4.9 PTY capture):** B must
+  land AFTER the prompt text — `term.rs` records the cursor column at B as the
+  input start (`prompt_col`), exactly like bash's PS1-append. The `fish_prompt`
+  *event* fires before the prompt is drawn, so the hook wraps the `fish_prompt`
+  *function* lazily on the first event (user config has run by then) and prints
+  B after the original prompt's output; it re-wraps if a theme redefines
+  `fish_prompt`. Verified: A → cwd → prompt text → B, cursor at prompt-width+1,
+  D;0/D;1 exit codes, native marks suppressed, nonce erased from the env before
+  user config (file side-channel check). Hook-string unit tests mirror the bash
+  rc assertions.
+- **Materialize facts (verified):** MSYS2 fish reads `XDG_DATA_DIRS` entries as
+  POSIX paths only — the prepend is translated `C:\dir` → `/c/dir` at
+  materialize time. The vendor layout needs 3 safe path components
+  (`fish/vendor_conf.d/bayan.fish`), so `rel_is_safe` allows depth 3 (all
+  components still `Normal`; traversal guards unchanged) and materialize
+  creates every ancestor level with the secure DACL.
 
 ## Verification plan
 
