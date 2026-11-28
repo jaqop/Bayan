@@ -29,6 +29,8 @@ pub(crate) enum ShellKind {
     Bash,
     Wsl,
     Cmd,
+    Fish,
+    Nu,
     Unknown,
 }
 
@@ -50,6 +52,8 @@ fn program_kind(prog: &str) -> ShellKind {
         // `--rcfile`. A bare substring "bash" would also match `notbash`.
         "bash" => ShellKind::Bash,
         n if n.ends_with("-bash") && n != "git-bash" => ShellKind::Bash,
+        "fish" => ShellKind::Fish,
+        "nu" => ShellKind::Nu,
         // `sh` is not bash (it may be dash). Windows `zsh.exe` is not the
         // WSL case; zsh is handled inside the WSL launcher. Both stay unknown.
         _ => ShellKind::Unknown,
@@ -417,6 +421,11 @@ pub(crate) struct Plan {
     /// Environment variable → relative path under the secure directory.
     /// WSL learns the Windows path this way; `WSLENV` translates it.
     pub path_env: Vec<(String, String)>,
+    /// Environment variable → relative path **prepended** to the variable's
+    /// inherited colon-separated value (empty rel = the directory root). For
+    /// `XDG_DATA_DIRS`, so fish autoloads the hook without losing the user's
+    /// data dirs. Resolved at materialize time like `path_env`.
+    pub path_env_prepend: Vec<(String, String)>,
     /// Literal environment entries. Includes the nonce variable.
     pub env: Vec<(String, String)>,
     /// Create the scripts outside the user profile, with a high integrity label.
@@ -441,7 +450,13 @@ pub(crate) fn plan(command: &str, enabled: bool, elevated: bool, nonce: &str) ->
         ShellKind::Bash => bash_plan(&args, elevated, env),
         ShellKind::Wsl => wsl_plan(&args, elevated, env),
         ShellKind::Cmd => Some(cmd_plan(&args)),
-        ShellKind::PowerShell | ShellKind::Unknown => None,
+        ShellKind::Fish => fish_plan(&args, elevated, env),
+        // nu (Option B): rely on its native OSC 133/633 marks, untrusted like
+        // cmd — no injection. nu runs config.nu before vendor autoload (the
+        // nonce could not be erased before user files) and has no post-prompt
+        // hook for a trusted B, so injected nonce marks are not achievable
+        // cleanly. Native marks still parse safely (see term.rs).
+        ShellKind::Nu | ShellKind::PowerShell | ShellKind::Unknown => None,
     }
 }
 
@@ -486,6 +501,7 @@ fn bash_plan(args: &[String], elevated: bool, mut env: Vec<(String, String)>) ->
         args: bash_argv,
         files,
         path_env,
+        path_env_prepend: Vec::new(),
         env,
         wslenv_path: Vec::new(),
         wslenv_plain: Vec::new(),
@@ -549,6 +565,7 @@ fn wsl_plan(args: &[String], elevated: bool, mut env: Vec<(String, String)>) -> 
             ("BAYAN_BASH_RC".into(), "bash.sh".into()),
             ("BAYAN_ZDOTDIR".into(), "zsh".into()),
         ],
+        path_env_prepend: Vec::new(),
         env,
         wslenv_path: vec!["BAYAN_BASH_RC".into(), "BAYAN_ZDOTDIR".into()],
         wslenv_plain: plain,
@@ -564,12 +581,137 @@ fn cmd_plan(args: &[String]) -> Plan {
         args: cmd_args(args, &cmd_setup()),
         files: Vec::new(),
         path_env: Vec::new(),
+        path_env_prepend: Vec::new(),
         env: Vec::new(),
         wslenv_path: Vec::new(),
         wslenv_plain: Vec::new(),
         elevated: false,
     }
 }
+
+/// fish is interactive unless it was given a command (`-c`/`--command`), a
+/// no-execute flag, or a script file. `--init-command`/`--features` take a
+/// value but keep the shell interactive.
+fn fish_is_interactive(args: &[String]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "-c" || a == "--command" || a == "-n" || a == "--no-execute" {
+            return false;
+        }
+        if a.starts_with("--command=") {
+            return false;
+        }
+        if matches!(
+            a.as_str(),
+            "-C" | "--init-command" | "--features" | "--profile" | "-p" | "-d" | "--debug"
+        ) {
+            i += 2;
+            continue;
+        }
+        if a.starts_with("--init-command=")
+            || a.starts_with("--features=")
+            || a.starts_with("--profile=")
+            || a.starts_with("--debug=")
+        {
+            i += 1;
+            continue;
+        }
+        if let Some(flags) = a
+            .strip_prefix('-')
+            .filter(|s| !s.is_empty() && !s.starts_with('-'))
+        {
+            if flags.contains('c') || flags.contains('n') {
+                return false;
+            }
+            i += 1;
+            continue;
+        }
+        if a.starts_with("--") {
+            i += 1;
+            continue;
+        }
+        // `fish script.fish` — the file name is not a prompt.
+        return false;
+    }
+    true
+}
+
+/// fish autoloads `fish/vendor_conf.d/*.fish` from every `XDG_DATA_DIRS` entry
+/// *before* the user's config, so the hook takes the nonce out of the
+/// environment before any user file runs (the bash prelude's guarantee).
+/// `--features=no-mark-prompt` suppresses fish 4.x's native OSC 133 so the
+/// nonce-carrying marks below are the only ones. No user-home file is touched.
+fn fish_plan(args: &[String], elevated: bool, env: Vec<(String, String)>) -> Option<Plan> {
+    if !fish_is_interactive(args) {
+        return None;
+    }
+    // Elevated fish has no protected startup yet: refuse injection (fail
+    // closed) rather than run a user-writable hook with admin rights.
+    if elevated {
+        return None;
+    }
+    let mut argv = vec!["--features=no-mark-prompt".to_string()];
+    argv.extend(args.iter().cloned());
+    Some(Plan {
+        kind: ShellKind::Fish,
+        args: argv,
+        files: vec![("fish/vendor_conf.d/bayan.fish".into(), FISH_HOOK.into())],
+        path_env: Vec::new(),
+        path_env_prepend: vec![("XDG_DATA_DIRS".into(), String::new())],
+        env,
+        wslenv_path: Vec::new(),
+        wslenv_plain: Vec::new(),
+        elevated,
+    })
+}
+
+const FISH_HOOK: &str = r#"# Bayan shell integration for this pane. Deleted when the pane closes.
+# Loaded from vendor_conf.d before the user's config, so the nonce leaves the
+# environment before any user file runs.
+if set -q __bayan_si
+    return 0
+end
+set -g __bayan_si 1
+if not set -q BAYAN_PROMPT_NONCE
+    return 0
+end
+set -g __bayan_nonce $BAYAN_PROMPT_NONCE
+set -e BAYAN_PROMPT_NONCE
+if test -z "$__bayan_nonce"
+    return 0
+end
+
+function __bayan_report_cwd
+    printf '\033]9;9;%s\007' "$PWD"
+    printf '\033]7;file://%s\007' (string replace -a '\\' '/' -- "$PWD")
+end
+
+function __bayan_mark_prompt --on-event fish_prompt
+    printf '\033]133;A;%s\007' "$__bayan_nonce"
+    __bayan_report_cwd
+    # B marks where input begins, so it must land AFTER the prompt text
+    # (term.rs records the cursor column at B). The fish_prompt function
+    # runs right after this event; wrap it so B follows the prompt it
+    # draws. The user's config has run by the first prompt; re-wrap if a
+    # theme redefined fish_prompt since.
+    if functions -q fish_prompt; and not functions fish_prompt | string match -q '*__bayan_prompt_orig*'
+        functions --copy fish_prompt __bayan_prompt_orig
+        function fish_prompt
+            __bayan_prompt_orig
+            printf '\033]133;B;%s\007' "$__bayan_nonce"
+        end
+    end
+end
+
+function __bayan_mark_preexec --on-event fish_preexec
+    printf '\033]133;C;%s\007' "$__bayan_nonce"
+end
+
+function __bayan_mark_postexec --on-event fish_postexec
+    printf '\033]133;D;%s;%s\007' "$status" "$__bayan_nonce"
+end
+"#;
 
 /// `-c` / a script path is a one-shot bash, not a prompt we can mark.
 fn bash_is_interactive(args: &[String]) -> bool {
@@ -1388,13 +1530,23 @@ pub(crate) fn materialize(plan: &Plan) -> Result<Materialized, String> {
     let cleanup = IntegrationDir(Some(dir.clone()));
     for (rel, body) in &plan.files {
         let path = resolve_rel(&dir, rel).ok_or_else(|| format!("refusing path {rel}"))?;
-        if let Some(parent) = path.parent() {
-            if parent != dir {
-                match create_dir_secure(parent, elevated) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(e) => return Err(e.to_string()),
-                }
+        // Create every ancestor between dir and the file's parent, nearest
+        // first. CreateDirectoryW does not make intermediates, and fish's
+        // hook sits two levels down (fish/vendor_conf.d/bayan.fish).
+        let mut ancestors = Vec::new();
+        let mut cur = path.parent();
+        while let Some(p) = cur {
+            if p == dir {
+                break;
+            }
+            ancestors.push(p);
+            cur = p.parent();
+        }
+        for p in ancestors.into_iter().rev() {
+            match create_dir_secure(p, elevated) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.to_string()),
             }
         }
         write_secure(&path, body.as_bytes(), elevated).map_err(|e| e.to_string())?;
@@ -1418,12 +1570,51 @@ pub(crate) fn materialize(plan: &Plan) -> Result<Materialized, String> {
         }
         env.push((key.clone(), path.display().to_string()));
     }
+    for (key, rel) in &plan.path_env_prepend {
+        let path = if rel.is_empty() {
+            dir.clone()
+        } else {
+            resolve_rel(&dir, rel).ok_or_else(|| format!("refusing path {rel}"))?
+        };
+        // fish on Windows is an MSYS2 build: it reads XDG_DATA_DIRS entries
+        // as POSIX paths and silently never autoloads from Windows-form ones
+        // (verified with fish 4.9). Its own native OSC 7 still appears then,
+        // which is NOT proof the hook loaded.
+        let shown = if key == "XDG_DATA_DIRS" {
+            posix_data_dir(&path)
+        } else {
+            path.display().to_string()
+        };
+        let existing = std::env::var(key).unwrap_or_default();
+        let value = if existing.is_empty() {
+            shown
+        } else {
+            format!("{shown}:{existing}")
+        };
+        env.push((key.clone(), value));
+    }
     let dir = cleanup.disarm();
     Ok(Materialized { args, env, dir })
 }
 
 fn saved_home() -> String {
     std::env::var("HOME").unwrap_or_default()
+}
+
+/// `C:\dir` → `/c/dir`, the MSYS2 mount form fish expects in XDG_DATA_DIRS.
+fn posix_data_dir(path: &Path) -> String {
+    let s = path.display().to_string();
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (Some(drive), Some(':')) if drive.is_ascii_alphabetic() => {
+            format!(
+                "/{}{}",
+                drive.to_ascii_lowercase(),
+                s[2..].replace('\\', "/")
+            )
+        }
+        _ => s.replace('\\', "/"),
+    }
 }
 
 fn resolve_rel(dir: &Path, rel: &str) -> Option<PathBuf> {
@@ -1456,7 +1647,10 @@ fn rel_is_safe(rel: &str) -> bool {
             _ => return false,
         }
     }
-    (1..=2).contains(&n)
+    // Three levels is fish's vendor layout: fish/vendor_conf.d/bayan.fish.
+    // Every component is still Normal (no .., root, or drive), so depth
+    // cannot escape the directory.
+    (1..=3).contains(&n)
 }
 
 const DIR_PREFIX: &str = "bayan-si-";
@@ -2675,8 +2869,6 @@ mod tests {
     #[test]
     fn an_unknown_shell_is_never_injected() {
         for cmd in [
-            "fish.exe",
-            "nu.exe",
             "dash.exe",
             "sh.exe",
             r"C:\tools\custom.exe",
@@ -2702,6 +2894,433 @@ mod tests {
         );
         assert!(plan(r"C:\Program Files\Git\git-bash.exe", true, false, NONCE).is_none());
         assert_eq!(shell_kind("cmd.exe /K chcp 65001"), ShellKind::Cmd);
+    }
+
+    #[test]
+    fn fish_is_recognized_and_injected() {
+        for cmd in ["fish", "fish.exe", r"C:\msys64\usr\bin\fish.exe", "fish -i"] {
+            assert_eq!(shell_kind(cmd), ShellKind::Fish, "{cmd}");
+            let p = plan(cmd, true, false, NONCE).unwrap_or_else(|| panic!("{cmd}"));
+            assert_eq!(p.kind, ShellKind::Fish);
+        }
+        // a name that merely contains fish is not the shell
+        assert_eq!(shell_kind("notfish.exe"), ShellKind::Unknown);
+    }
+
+    #[test]
+    fn nu_is_recognized_but_uses_native_marks_without_injection() {
+        for cmd in ["nu", "nu.exe", r"C:\Program Files\nu\nu.exe", "nu -i"] {
+            assert_eq!(shell_kind(cmd), ShellKind::Nu, "{cmd}");
+            // Option B: no hook, no nonce in the environment or command line.
+            assert!(plan(cmd, true, false, NONCE).is_none(), "{cmd} injected");
+        }
+        // a name that merely contains nu is not the shell
+        assert_eq!(shell_kind("notnu.exe"), ShellKind::Unknown);
+    }
+
+    #[test]
+    fn fish_plan_injects_the_vendor_hook_and_suppresses_native_marks() {
+        let plan = plan(r"C:\msys64\usr\bin\fish.exe", true, false, NONCE).expect("fish");
+        assert_eq!(plan.kind, ShellKind::Fish);
+        assert_eq!(plan.args[0], "--features=no-mark-prompt");
+        assert_eq!(
+            plan.path_env_prepend,
+            vec![("XDG_DATA_DIRS".to_string(), String::new())]
+        );
+        assert!(plan.env.iter().any(|(k, v)| k == NONCE_ENV && v == NONCE));
+        let hook = file(&plan, "fish/vendor_conf.d/bayan.fish");
+        assert!(hook.contains(r"printf '\033]133;A;%s\007'"));
+        assert!(hook.contains(r"printf '\033]133;B;%s\007'"));
+        assert!(hook.contains(r"printf '\033]133;C;%s\007'"));
+        assert!(hook.contains(r"printf '\033]133;D;%s;%s\007'"));
+        assert!(hook.contains(r"\033]9;9;"));
+        assert!(hook.contains(r"\033]7;file://"));
+        assert!(hook.contains("if set -q __bayan_si"), "double-load guard");
+        assert!(
+            hook.contains(r#"if test -z "$__bayan_nonce""#),
+            "empty bail"
+        );
+        // The nonce leaves the environment before any function is defined,
+        // so no user file (loaded after vendor_conf.d) can read it.
+        let erase = hook.find("set -e BAYAN_PROMPT_NONCE").unwrap();
+        let first_fn = hook.find("function ").unwrap();
+        assert!(erase < first_fn, "erase the nonce before user config runs");
+        assert!(
+            !hook.contains(NONCE),
+            "nonce must not be written into the file"
+        );
+        assert!(!plan.args.iter().any(|a| a.contains(NONCE)));
+    }
+
+    #[test]
+    fn fish_b_mark_follows_the_prompt_text_not_the_prompt_event() {
+        let plan = plan(r"C:\msys64\usr\bin\fish.exe", true, false, NONCE).unwrap();
+        let hook = file(&plan, "fish/vendor_conf.d/bayan.fish");
+        // The fish_prompt event fires BEFORE the prompt text; B records the
+        // input column, so it must come from the wrapped fish_prompt function
+        // after the original prompt, never from the event handler itself.
+        let event = hook
+            .find("__bayan_mark_prompt --on-event fish_prompt")
+            .unwrap();
+        let preexec = hook.find("__bayan_mark_preexec").unwrap();
+        let event_body = &hook[event..preexec];
+        assert!(event_body.contains("133;A"));
+        // The handler prints A + cwd directly; B appears only inside the
+        // wrapped fish_prompt it defines, after the original prompt's output.
+        let wrap_at = event_body.find("function fish_prompt").unwrap();
+        assert!(
+            !event_body[..wrap_at].contains("133;B"),
+            "the handler must not print B before the prompt text"
+        );
+        assert!(event_body.contains("functions --copy fish_prompt __bayan_prompt_orig"));
+        let b = event_body.find("133;B").unwrap();
+        assert!(wrap_at < b, "B lives inside the wrapped fish_prompt");
+        let orig_call = event_body.rfind("__bayan_prompt_orig").unwrap();
+        assert!(orig_call < b, "B follows the original prompt's output");
+        assert_eq!(hook.matches("133;B").count(), 1, "exactly one B emitter");
+        // Re-wrap when a theme redefines fish_prompt after the first prompt.
+        assert!(hook.contains("string match -q '*__bayan_prompt_orig*'"));
+    }
+
+    #[test]
+    fn non_interactive_and_elevated_fish_get_no_injection() {
+        for cmd in [
+            r"C:\msys64\usr\bin\fish.exe -c echo",
+            r"C:\msys64\usr\bin\fish.exe --command=echo",
+            r"C:\msys64\usr\bin\fish.exe -n",
+            r"C:\msys64\usr\bin\fish.exe --no-execute",
+            r"C:\msys64\usr\bin\fish.exe script.fish",
+            r"C:\msys64\usr\bin\fish.exe -ic echo",
+        ] {
+            assert!(plan(cmd, true, false, NONCE).is_none(), "{cmd} injected");
+        }
+        // No protected startup for elevated fish yet: fail closed.
+        assert!(plan(r"C:\msys64\usr\bin\fish.exe", true, true, NONCE).is_none());
+    }
+
+    #[test]
+    fn fish_value_flags_keep_the_shell_interactive() {
+        for cmd in [
+            r"C:\msys64\usr\bin\fish.exe -i",
+            r"C:\msys64\usr\bin\fish.exe -C echo",
+            r"C:\msys64\usr\bin\fish.exe --init-command echo",
+            r"C:\msys64\usr\bin\fish.exe --init-command=echo",
+            r"C:\msys64\usr\bin\fish.exe --features=no-mark-prompt",
+            r"C:\msys64\usr\bin\fish.exe -d exec",
+            r"C:\msys64\usr\bin\fish.exe --debug=exec",
+            r"C:\msys64\usr\bin\fish.exe -p startup",
+            r"C:\msys64\usr\bin\fish.exe --profile startup",
+        ] {
+            let p = plan(cmd, true, false, NONCE).unwrap_or_else(|| panic!("{cmd}"));
+            assert_eq!(p.kind, ShellKind::Fish);
+        }
+    }
+
+    #[test]
+    fn posix_data_dir_translates_drive_paths() {
+        assert_eq!(
+            posix_data_dir(Path::new(r"C:\Users\Admin\bayan")),
+            "/c/Users/Admin/bayan"
+        );
+        assert_eq!(posix_data_dir(Path::new(r"D:\x")), "/d/x");
+    }
+
+    #[test]
+    fn materialize_prepends_a_posix_xdg_data_dirs_for_fish() {
+        let plan = plan(r"C:\msys64\usr\bin\fish.exe", true, false, NONCE).unwrap();
+        let done = materialize(&plan).expect("materialize fish");
+        let dir = done.dir.expect("fish integration dir");
+        let value = done
+            .env
+            .iter()
+            .find(|(k, _)| k == "XDG_DATA_DIRS")
+            .map(|(_, v)| v.clone())
+            .expect("XDG_DATA_DIRS entry");
+        // MSYS2 fish silently ignores Windows-form entries.
+        assert!(value.starts_with(&posix_data_dir(&dir)), "{value}");
+        assert!(!value.contains('\\'), "{value}");
+        if let Ok(existing) = std::env::var("XDG_DATA_DIRS") {
+            assert!(value.ends_with(&existing), "keep the user's dirs: {value}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Live characterization (ignored; needs fish at C:\msys64\usr\bin\fish.exe):
+    /// spawn fish in a PTY with the Bayan hook and a user config that defines
+    /// its own fish_prompt, then assert the ordering the trust model needs:
+    /// A → cwd → prompt text → B (B records the input column, so it must land
+    /// after the prompt), C before execution, D with the real exit code, no
+    /// native nonce-less marks, and the nonce gone from the environment.
+    /// Override the hook with BAYAN_FISH_HOOK_FILE to iterate.
+    /// Run: cargo test -- --ignored fish_hook_mark_ordering --nocapture
+    #[test]
+    #[ignore]
+    fn fish_hook_mark_ordering_characterization() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use std::io::{Read, Write};
+        let fish = r"C:\msys64\usr\bin\fish.exe";
+        if !std::path::Path::new(fish).is_file() {
+            eprintln!("fish not installed; skipping characterization");
+            return;
+        }
+        let hook = std::env::var("BAYAN_FISH_HOOK_FILE")
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_else(|| FISH_HOOK.to_string());
+        let temp = std::env::temp_dir().join(format!("bayan-fish-probe-{}", std::process::id()));
+        let conf = temp.join("fish").join("vendor_conf.d");
+        std::fs::create_dir_all(&conf).expect("conf dir");
+        std::fs::write(conf.join("bayan.fish"), &hook).expect("write hook");
+        // The vendor hook loads BEFORE this user config, so the B-after-
+        // prompt wrap must pick up the config's fish_prompt, not the default.
+        let config = temp.join("config").join("fish");
+        std::fs::create_dir_all(&config).expect("config dir");
+        std::fs::write(
+            config.join("config.fish"),
+            "set -g fish_greeting ''\nfunction fish_prompt\n    printf 'BAYAN-TEST> '\nend\n",
+        )
+        .expect("write config");
+        let posix = |p: &std::path::Path| {
+            let s = p.display().to_string();
+            let drive = s.chars().next().unwrap_or('c').to_ascii_lowercase();
+            format!("/{drive}{}", s[2..].replace('\\', "/"))
+        };
+        let nonce_check = temp.join("nonce-check.txt");
+        let mut cmd = CommandBuilder::new(fish);
+        cmd.arg("--features=no-mark-prompt,no-query-term");
+        cmd.arg("-i");
+        cmd.env("XDG_DATA_DIRS", posix(&temp));
+        cmd.env("XDG_CONFIG_HOME", posix(&temp.join("config")));
+        cmd.env("BAYAN_PROMPT_NONCE", NONCE);
+        cmd.env("TERM", "xterm-256color");
+        let path = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("C:\\msys64\\usr\\bin;{path}"));
+        let pty = native_pty_system();
+        let pair = pty
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut reader = pair.master.try_clone_reader().expect("reader");
+        let writer = std::sync::Arc::new(std::sync::Mutex::new(
+            pair.master.take_writer().expect("writer"),
+        ));
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let cap = captured.clone();
+        let reply = writer.clone();
+        let drain = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut q = Vec::new();
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        cap.lock().unwrap().extend_from_slice(&buf[..n]);
+                        q.extend_from_slice(&buf[..n]);
+                        // Answer terminal queries so fish does not block.
+                        if q.windows(4).any(|w| w == b"\x1b[6n") {
+                            let _ = reply.lock().unwrap().write_all(b"\x1b[1;1R");
+                        }
+                        if q.windows(3).any(|w| w == b"\x1b[c" || w == b"\x1b[0c") {
+                            let _ = reply.lock().unwrap().write_all(b"\x1b[?6c");
+                        }
+                        let _ = reply.lock().unwrap().flush();
+                        if q.len() > 8 {
+                            q.drain(..q.len() - 8);
+                        }
+                    }
+                }
+            }
+        });
+        let mut child = pair.slave.spawn_command(cmd).expect("spawn fish");
+        drop(pair.slave);
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        // Write the nonce check to a file: the typed command itself echoes
+        // into the capture, so only a side channel can prove the env state.
+        let nonce_cmd = format!(
+            "if set -q BAYAN_PROMPT_NONCE; echo leaked > {}; else; echo clean > {}; end\r",
+            posix(&nonce_check),
+            posix(&nonce_check)
+        );
+        for line in [
+            b"echo hello\r".as_slice(),
+            b"false\r",
+            nonce_cmd.as_bytes(),
+            b"exit\r",
+        ] {
+            let mut w = writer.lock().unwrap();
+            w.write_all(line).expect("write");
+            w.flush().expect("flush");
+            drop(w);
+            std::thread::sleep(std::time::Duration::from_millis(700));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(pair.master);
+        let _ = drain.join();
+        let bytes = captured.lock().unwrap().clone();
+        let mut s = String::new();
+        for &b in &bytes {
+            match b {
+                0x1b => s.push_str("<ESC>"),
+                0x07 => s.push_str("<BEL>"),
+                b'\r' => s.push_str("<CR>"),
+                b'\n' => s.push_str("<LF>\n"),
+                0x20..=0x7e => s.push(b as char),
+                _ => s.push_str(&format!("<{b:02x}>")),
+            }
+        }
+        eprintln!(
+            "=== fish capture ({} bytes) ===\n{s}\n=== end ===",
+            bytes.len()
+        );
+        let find = |needle: &[u8]| bytes.windows(needle.len()).position(|w| w == needle);
+        let a = find(format!("\x1b]133;A;{NONCE}\x07").as_bytes()).expect("A mark");
+        let b = find(format!("\x1b]133;B;{NONCE}\x07").as_bytes()).expect("B mark");
+        assert!(a < b, "A must precede B");
+        let between = String::from_utf8_lossy(&bytes[a..b]);
+        assert!(
+            between.contains("BAYAN-TEST>"),
+            "the prompt text must be drawn between A and B (B records the input column): {between:?}"
+        );
+        let c = find(format!("\x1b]133;C;{NONCE}\x07").as_bytes()).expect("C mark");
+        let d0 = find(format!("\x1b]133;D;0;{NONCE}\x07").as_bytes()).expect("D;0 after echo");
+        let d1 = find(format!("\x1b]133;D;1;{NONCE}\x07").as_bytes()).expect("D;1 after false");
+        assert!(b < c && c < d0 && d0 < d1, "B < C < D;0 < D;1");
+        assert!(
+            find(b"\x1b]133;A\x07").is_none() && find(b"\x1b]133;B\x07").is_none(),
+            "native nonce-less marks must stay suppressed"
+        );
+        let nonce_state = std::fs::read_to_string(&nonce_check).unwrap_or_default();
+        assert_eq!(
+            nonce_state.trim(),
+            "clean",
+            "the nonce must leave the environment before user config runs"
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// Live nu characterization (ignored; needs nu at
+    /// C:\Users\Admin\AppData\Local\Programs\nu\bin\nu.exe). Captures the raw
+    /// escape stream of a nu REPL. With no overrides it captures nu's NATIVE
+    /// OSC 133/633 marks — the Option B baseline Bayan relies on (untrusted,
+    /// like cmd). The overrides record the Option A injection path that was
+    /// explored and REJECTED (config.nu runs before vendor autoload, so the
+    /// nonce cannot be erased before user files; and nu has no post-prompt
+    /// hook for a trusted B):
+    ///   NU_HOOK_FILE   — vendor/autoload/bayan.nu contents (XDG_DATA_HOME)
+    ///   NU_CONFIG_FILE — user config.nu contents (--config-home)
+    /// Run: cargo test -- --ignored nu_mark_ordering --nocapture
+    #[test]
+    #[ignore]
+    fn nu_mark_ordering_characterization() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use std::io::{Read, Write};
+        let nu = r"C:\Users\Admin\AppData\Local\Programs\nu\bin\nu.exe";
+        if !std::path::Path::new(nu).is_file() {
+            eprintln!("nu not installed; skipping characterization");
+            return;
+        }
+        let temp = std::env::temp_dir().join(format!("bayan-nu-probe-{}", std::process::id()));
+        let data = temp.join("data").join("nushell");
+        let config = temp.join("config");
+        std::fs::create_dir_all(&config).expect("config dir");
+        let default_config = "$env.config.show_banner = false\n\
+             $env.PROMPT_COMMAND = {|| \"BAYAN-TEST> \" }\n\
+             $env.PROMPT_COMMAND_RIGHT = {|| \"\" }\n";
+        let config_body = std::env::var("NU_CONFIG_FILE")
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_else(|| default_config.to_string());
+        std::fs::write(config.join("config.nu"), &config_body).expect("write config");
+        std::fs::write(config.join("env.nu"), "").expect("write env");
+        if let Some(hook) = std::env::var("NU_HOOK_FILE")
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+        {
+            let autoload = data.join("vendor").join("autoload");
+            std::fs::create_dir_all(&autoload).expect("autoload dir");
+            std::fs::write(autoload.join("bayan.nu"), &hook).expect("write hook");
+        }
+        let mut cmd = CommandBuilder::new(nu);
+        cmd.arg("--config-home");
+        cmd.arg(config.display().to_string());
+        cmd.env("XDG_DATA_HOME", temp.join("data").display().to_string());
+        cmd.env("BAYAN_PROMPT_NONCE", NONCE);
+        cmd.env("TERM", "xterm-256color");
+        let pty = native_pty_system();
+        let pair = pty
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut reader = pair.master.try_clone_reader().expect("reader");
+        let writer = std::sync::Arc::new(std::sync::Mutex::new(
+            pair.master.take_writer().expect("writer"),
+        ));
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let cap = captured.clone();
+        let reply = writer.clone();
+        let drain = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut q = Vec::new();
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        cap.lock().unwrap().extend_from_slice(&buf[..n]);
+                        q.extend_from_slice(&buf[..n]);
+                        if q.windows(4).any(|w| w == b"\x1b[6n") {
+                            let _ = reply.lock().unwrap().write_all(b"\x1b[1;1R");
+                        }
+                        if q.windows(3).any(|w| w == b"\x1b[c" || w == b"\x1b[0c") {
+                            let _ = reply.lock().unwrap().write_all(b"\x1b[?6c");
+                        }
+                        let _ = reply.lock().unwrap().flush();
+                        if q.len() > 8 {
+                            q.drain(..q.len() - 8);
+                        }
+                    }
+                }
+            }
+        });
+        let mut child = pair.slave.spawn_command(cmd).expect("spawn nu");
+        drop(pair.slave);
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        for line in [b"echo hello\r".as_slice(), b"false\r", b"exit\r"] {
+            let mut w = writer.lock().unwrap();
+            w.write_all(line).expect("write");
+            w.flush().expect("flush");
+            drop(w);
+            std::thread::sleep(std::time::Duration::from_millis(800));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(pair.master);
+        let _ = drain.join();
+        let bytes = captured.lock().unwrap().clone();
+        let mut s = String::new();
+        for &b in &bytes {
+            match b {
+                0x1b => s.push_str("<ESC>"),
+                0x07 => s.push_str("<BEL>"),
+                b'\r' => s.push_str("<CR>"),
+                b'\n' => s.push_str("<LF>\n"),
+                0x20..=0x7e => s.push(b as char),
+                _ => s.push_str(&format!("<{b:02x}>")),
+            }
+        }
+        eprintln!(
+            "=== nu capture ({} bytes) ===\n{s}\n=== end ===",
+            bytes.len()
+        );
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
@@ -2751,12 +3370,17 @@ mod tests {
             resolve_rel(dir, "zsh/.zshrc").unwrap(),
             dir.join("zsh").join(".zshrc")
         );
+        assert_eq!(
+            resolve_rel(dir, "fish/vendor_conf.d/bayan.fish").unwrap(),
+            dir.join("fish").join("vendor_conf.d").join("bayan.fish")
+        );
         for bad in [
             "../x",
             r"..\x",
             "/etc/passwd",
             r"C:\x",
-            "a/b/c",
+            "a/b/c/d",
+            "fish/../../x",
             "",
             "a\u{0000}b",
         ] {
