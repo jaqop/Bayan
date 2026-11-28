@@ -1,0 +1,42 @@
+# Phase 2 — accessibility completion
+
+**Date:** 2026-11-28 · **Status:** approved roadmap item
+**Scope (roadmap):** SetTextSelection, magnifier caret boxes, vim count prefixes.
+
+Three independent gaps, landed as separate PRs (most tractable first):
+
+## 1. Vim count prefixes (copy mode) — PR 1
+
+Copy mode (`copymode.rs`, alacritty vi mode) ignores numeric prefixes: `5j`,
+`3w`, `10k` do nothing. Add a count accumulator.
+
+- `copymode::count_digit(physical, shift) -> Option<u8>`: unshifted physical
+  digit → 0–9 (physical-key rule, so an Arabic layout keeps it). Shifted digits
+  stay symbols (`$`, `%`, `^`) handled by `command`.
+- `App.copy_count: usize` (keyroute): `copy_mode_key` accumulates digits
+  (`1`–`9`, then `0`–`9`; leading `0` with no count stays the `First` motion).
+  A motion applies `max(1, count)` times; non-motion commands ignore the count.
+  Reset on exit, on toggle-enter, and on an unknown key. Cap at 9999.
+- Pure unit tests: digit accumulation, leading-zero, `5j`/`3w` move the right
+  distance, count resets, shifted digits stay symbols.
+
+## 2. Magnifier caret boxes — PR 2
+
+accesskit nodes carry no bounds (`set_bounds` unused), so Windows Magnifier
+cannot track the caret/selection. Give the caret/selection node a pixel rect
+from the renderer's cell→pixel geometry, passed into the tree build. Needs live
+magnifier verification.
+
+## 3. SetTextSelection — PR 3
+
+`ActionRequested` is a no-op (`main.rs`) and the document does not advertise
+`SetTextSelection` (`screen_reader.rs`). Handle the action: reverse-map the
+requested `TextSelection` (anchor/focus `TextPosition`) to grid cells (RTL,
+wrapped lines, runs) and set the pane selection; then advertise the action.
+Needs live screen-reader (NVDA) verification.
+
+## Standing constraints
+
+Pure-Rust runtime; no new deps; each change its own PR with unit tests; the
+screen-reader items (2, 3) need live a11y verification (NVDA / Magnifier) — flag
+what can be unit-tested vs. what needs a live client. Perf gate + full suite green.

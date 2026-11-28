@@ -101,6 +101,30 @@ pub(crate) fn command(
     })
 }
 
+/// An unshifted physical digit (0–9) for a vim count prefix, or None. Resolves
+/// by PHYSICAL key like every copy-mode key, so an Arabic layout keeps it.
+/// Shifted digits stay symbols (`$`, `%`, `^`) and are handled by `command`.
+pub(crate) fn count_digit(physical: PhysicalKey, shift: bool) -> Option<u8> {
+    if shift {
+        return None;
+    }
+    let PhysicalKey::Code(code) = physical else {
+        return None;
+    };
+    crate::keys::pc101_unshifted(code)?
+        .to_digit(10)
+        .map(|d| d as u8)
+}
+
+/// Fold a digit into a vim count. A leading 0 (count 0, digit 0) is not a
+/// count — it stays the `First` motion — so returns None. Caps at 9999.
+pub(crate) fn fold_count(count: usize, digit: u8) -> Option<usize> {
+    if digit == 0 && count == 0 {
+        return None;
+    }
+    Some((count * 10 + digit as usize).min(9999))
+}
+
 /// Run a command on a term in vi mode. CopyAndExit and Exit need the
 /// clipboard and the window, so the caller handles them; here they do nothing.
 pub(crate) fn apply<T: EventListener>(t: &mut Term<T>, cmd: Cmd) {
@@ -419,5 +443,66 @@ mod tests {
         );
         assert_eq!(named(NamedKey::Tab, false), None);
         assert_eq!(letter(KeyCode::KeyZ, false, false), None);
+    }
+
+    #[test]
+    fn count_digit_resolves_by_physical_key_and_ignores_shift() {
+        // an Arabic logical layout does not change the physical digit
+        assert_eq!(
+            count_digit(PhysicalKey::Code(KeyCode::Digit5), false),
+            Some(5)
+        );
+        assert_eq!(
+            count_digit(PhysicalKey::Code(KeyCode::Digit0), false),
+            Some(0)
+        );
+        assert_eq!(
+            count_digit(PhysicalKey::Code(KeyCode::Digit9), false),
+            Some(9)
+        );
+        // shifted digits are symbols ($ % ^), not counts
+        assert_eq!(count_digit(PhysicalKey::Code(KeyCode::Digit4), true), None);
+        // letters are not counts
+        assert_eq!(count_digit(PhysicalKey::Code(KeyCode::KeyJ), false), None);
+    }
+
+    #[test]
+    fn fold_count_keeps_a_leading_zero_as_the_first_motion_and_caps() {
+        assert_eq!(fold_count(0, 0), None, "leading 0 stays First");
+        assert_eq!(fold_count(0, 5), Some(5));
+        assert_eq!(fold_count(5, 0), Some(50));
+        assert_eq!(fold_count(1, 2), Some(12));
+        assert_eq!(fold_count(9999, 9), Some(9999), "cap");
+    }
+
+    #[test]
+    fn a_count_repeats_the_motion_that_distance() {
+        // 3w from the start of "one two three four" lands on "four"
+        let mut t = vi_term(b"one two three four");
+        run(&mut t, &[Cmd::Motion(ViMotion::First)]);
+        for _ in 0..3 {
+            apply(&mut t, Cmd::Motion(ViMotion::SemanticRight));
+        }
+        assert_eq!(t.vi_mode_cursor.point.column.0, 14);
+        // 5j moves five lines down (a taller term so the rows exist)
+        use alacritty_terminal::term::{Config, TermMode};
+        let size = crate::term::TermSize { cols: 20, rows: 10 };
+        let mut t = Term::new(
+            Config::default(),
+            &size,
+            alacritty_terminal::event::VoidListener,
+        );
+        let mut parser: alacritty_terminal::vte::ansi::Processor =
+            alacritty_terminal::vte::ansi::Processor::new();
+        let text: String = (0..9).map(|i| format!("line{i}\r\n")).collect();
+        parser.advance(&mut t, text.as_bytes());
+        t.toggle_vi_mode();
+        assert!(t.mode().contains(TermMode::VI));
+        run(&mut t, &[Cmd::Top]);
+        let start = t.vi_mode_cursor.point.line;
+        for _ in 0..5 {
+            apply(&mut t, Cmd::Motion(ViMotion::Down));
+        }
+        assert_eq!(t.vi_mode_cursor.point.line, start + 5);
     }
 }

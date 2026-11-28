@@ -2359,6 +2359,8 @@ struct App {
     reader_mark_ready: bool,
     /// Last live-region name. Unchanged text does not raise another event.
     reader_live: Option<String>,
+    /// Vim count prefix accumulated in copy mode (`5j`, `3w`). 0 = none.
+    copy_count: usize,
     /// Resolved `-p` command line for that same tab. `None` keeps the
     /// configured shell. Ignored when `start_command` is set.
     start_profile_command: Option<String>,
@@ -2613,6 +2615,7 @@ impl App {
             reader_mark: None,
             reader_mark_ready: false,
             reader_live: None,
+            copy_count: 0,
         }
     }
 
