@@ -457,6 +457,7 @@ impl App {
     pub(crate) fn toggle_copy_mode(&mut self) {
         let entering = !self.term_mode().contains(TermMode::VI);
         if entering {
+            self.copy_count = 0;
             if let Some(id) = self.focused_pane_id() {
                 self.snap_smooth(id);
             }
@@ -473,6 +474,7 @@ impl App {
     /// Leave copy mode: the selection goes and the view returns to the
     /// prompt, where typing would have taken it anyway.
     fn exit_copy_mode(&mut self) {
+        self.copy_count = 0;
         if let Some(id) = self.focused_pane_id() {
             self.drop_smooth(id);
         }
@@ -500,10 +502,24 @@ impl App {
                 return;
             }
         }
+        // Vim count prefix: an unshifted digit accumulates (`5j`, `3w`). A
+        // leading 0 with no count stays the First motion. Ctrl/Alt digits are
+        // chords, not counts.
+        if !ctrl && !alt {
+            if let Some(d) = copymode::count_digit(event.physical_key, shift) {
+                if let Some(next) = copymode::fold_count(self.copy_count, d) {
+                    self.copy_count = next;
+                    return;
+                }
+            }
+        }
         let Some(cmd) = copymode::command(event.physical_key, &event.logical_key, ctrl, shift)
         else {
+            self.copy_count = 0;
             return;
         };
+        let count = self.copy_count.max(1);
+        self.copy_count = 0;
         match cmd {
             Cmd::CopyAndExit => {
                 self.copy_selection(false);
@@ -526,7 +542,15 @@ impl App {
                     .get(self.active)
                     .and_then(|tab| self.pane_rects().get(tab.focused).copied()),
             );
-            s.copy_mode_apply(cmd, layout);
+            // A count repeats a motion; other commands ignore it.
+            let times = if matches!(cmd, Cmd::Motion(_)) {
+                count
+            } else {
+                1
+            };
+            for _ in 0..times {
+                s.copy_mode_apply(cmd, layout);
+            }
         }
         self.invalidate_focused_links();
         self.request_redraw();
