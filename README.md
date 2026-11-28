@@ -1515,6 +1515,10 @@ window shows «سكربتات لوا والإضافات متوقفة لأن ال
 
 ## BiDi controls and the current directory
 
+Bayan's language-agnostic BiDi test corpus ([`tests/fixtures/bidi_cases.json`](tests/fixtures/bidi_cases.json))
+is referenced as an ecosystem benchmark in the upstream
+[Ghostty BiDi discussion](https://github.com/ghostty-org/ghostty/discussions/9774).
+
 Two escape sequences from ECMA-48 / the terminal-wg "BiDi in Terminal
 Emulators" recommendation, which `alacritty_terminal` 0.26 does not act on
 (mode 8 is an unknown SM/RM parameter; `CSI Ps SP k` is not in its CSI
