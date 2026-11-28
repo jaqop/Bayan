@@ -30,6 +30,7 @@ pub(crate) enum ShellKind {
     Wsl,
     Cmd,
     Fish,
+    Nu,
     Unknown,
 }
 
@@ -52,6 +53,7 @@ fn program_kind(prog: &str) -> ShellKind {
         "bash" => ShellKind::Bash,
         n if n.ends_with("-bash") && n != "git-bash" => ShellKind::Bash,
         "fish" => ShellKind::Fish,
+        "nu" => ShellKind::Nu,
         // `sh` is not bash (it may be dash). Windows `zsh.exe` is not the
         // WSL case; zsh is handled inside the WSL launcher. Both stay unknown.
         _ => ShellKind::Unknown,
@@ -449,7 +451,12 @@ pub(crate) fn plan(command: &str, enabled: bool, elevated: bool, nonce: &str) ->
         ShellKind::Wsl => wsl_plan(&args, elevated, env),
         ShellKind::Cmd => Some(cmd_plan(&args)),
         ShellKind::Fish => fish_plan(&args, elevated, env),
-        ShellKind::PowerShell | ShellKind::Unknown => None,
+        // nu (Option B): rely on its native OSC 133/633 marks, untrusted like
+        // cmd — no injection. nu runs config.nu before vendor autoload (the
+        // nonce could not be erased before user files) and has no post-prompt
+        // hook for a trusted B, so injected nonce marks are not achievable
+        // cleanly. Native marks still parse safely (see term.rs).
+        ShellKind::Nu | ShellKind::PowerShell | ShellKind::Unknown => None,
     }
 }
 
@@ -2862,7 +2869,6 @@ mod tests {
     #[test]
     fn an_unknown_shell_is_never_injected() {
         for cmd in [
-            "nu.exe",
             "dash.exe",
             "sh.exe",
             r"C:\tools\custom.exe",
@@ -2899,6 +2905,17 @@ mod tests {
         }
         // a name that merely contains fish is not the shell
         assert_eq!(shell_kind("notfish.exe"), ShellKind::Unknown);
+    }
+
+    #[test]
+    fn nu_is_recognized_but_uses_native_marks_without_injection() {
+        for cmd in ["nu", "nu.exe", r"C:\Program Files\nu\nu.exe", "nu -i"] {
+            assert_eq!(shell_kind(cmd), ShellKind::Nu, "{cmd}");
+            // Option B: no hook, no nonce in the environment or command line.
+            assert!(plan(cmd, true, false, NONCE).is_none(), "{cmd} injected");
+        }
+        // a name that merely contains nu is not the shell
+        assert_eq!(shell_kind("notnu.exe"), ShellKind::Unknown);
     }
 
     #[test]
@@ -3182,6 +3199,126 @@ mod tests {
             nonce_state.trim(),
             "clean",
             "the nonce must leave the environment before user config runs"
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// Live nu characterization (ignored; needs nu at
+    /// C:\Users\Admin\AppData\Local\Programs\nu\bin\nu.exe). Captures the raw
+    /// escape stream of a nu REPL. With no overrides it captures nu's NATIVE
+    /// OSC 133/633 marks — the Option B baseline Bayan relies on (untrusted,
+    /// like cmd). The overrides record the Option A injection path that was
+    /// explored and REJECTED (config.nu runs before vendor autoload, so the
+    /// nonce cannot be erased before user files; and nu has no post-prompt
+    /// hook for a trusted B):
+    ///   NU_HOOK_FILE   — vendor/autoload/bayan.nu contents (XDG_DATA_HOME)
+    ///   NU_CONFIG_FILE — user config.nu contents (--config-home)
+    /// Run: cargo test -- --ignored nu_mark_ordering --nocapture
+    #[test]
+    #[ignore]
+    fn nu_mark_ordering_characterization() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use std::io::{Read, Write};
+        let nu = r"C:\Users\Admin\AppData\Local\Programs\nu\bin\nu.exe";
+        if !std::path::Path::new(nu).is_file() {
+            eprintln!("nu not installed; skipping characterization");
+            return;
+        }
+        let temp = std::env::temp_dir().join(format!("bayan-nu-probe-{}", std::process::id()));
+        let data = temp.join("data").join("nushell");
+        let config = temp.join("config");
+        std::fs::create_dir_all(&config).expect("config dir");
+        let default_config = "$env.config.show_banner = false\n\
+             $env.PROMPT_COMMAND = {|| \"BAYAN-TEST> \" }\n\
+             $env.PROMPT_COMMAND_RIGHT = {|| \"\" }\n";
+        let config_body = std::env::var("NU_CONFIG_FILE")
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_else(|| default_config.to_string());
+        std::fs::write(config.join("config.nu"), &config_body).expect("write config");
+        std::fs::write(config.join("env.nu"), "").expect("write env");
+        if let Some(hook) = std::env::var("NU_HOOK_FILE")
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+        {
+            let autoload = data.join("vendor").join("autoload");
+            std::fs::create_dir_all(&autoload).expect("autoload dir");
+            std::fs::write(autoload.join("bayan.nu"), &hook).expect("write hook");
+        }
+        let mut cmd = CommandBuilder::new(nu);
+        cmd.arg("--config-home");
+        cmd.arg(config.display().to_string());
+        cmd.env("XDG_DATA_HOME", temp.join("data").display().to_string());
+        cmd.env("BAYAN_PROMPT_NONCE", NONCE);
+        cmd.env("TERM", "xterm-256color");
+        let pty = native_pty_system();
+        let pair = pty
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut reader = pair.master.try_clone_reader().expect("reader");
+        let writer = std::sync::Arc::new(std::sync::Mutex::new(
+            pair.master.take_writer().expect("writer"),
+        ));
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let cap = captured.clone();
+        let reply = writer.clone();
+        let drain = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut q = Vec::new();
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        cap.lock().unwrap().extend_from_slice(&buf[..n]);
+                        q.extend_from_slice(&buf[..n]);
+                        if q.windows(4).any(|w| w == b"\x1b[6n") {
+                            let _ = reply.lock().unwrap().write_all(b"\x1b[1;1R");
+                        }
+                        if q.windows(3).any(|w| w == b"\x1b[c" || w == b"\x1b[0c") {
+                            let _ = reply.lock().unwrap().write_all(b"\x1b[?6c");
+                        }
+                        let _ = reply.lock().unwrap().flush();
+                        if q.len() > 8 {
+                            q.drain(..q.len() - 8);
+                        }
+                    }
+                }
+            }
+        });
+        let mut child = pair.slave.spawn_command(cmd).expect("spawn nu");
+        drop(pair.slave);
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        for line in [b"echo hello\r".as_slice(), b"false\r", b"exit\r"] {
+            let mut w = writer.lock().unwrap();
+            w.write_all(line).expect("write");
+            w.flush().expect("flush");
+            drop(w);
+            std::thread::sleep(std::time::Duration::from_millis(800));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(pair.master);
+        let _ = drain.join();
+        let bytes = captured.lock().unwrap().clone();
+        let mut s = String::new();
+        for &b in &bytes {
+            match b {
+                0x1b => s.push_str("<ESC>"),
+                0x07 => s.push_str("<BEL>"),
+                b'\r' => s.push_str("<CR>"),
+                b'\n' => s.push_str("<LF>\n"),
+                0x20..=0x7e => s.push(b as char),
+                _ => s.push_str(&format!("<{b:02x}>")),
+            }
+        }
+        eprintln!(
+            "=== nu capture ({} bytes) ===\n{s}\n=== end ===",
+            bytes.len()
         );
         let _ = std::fs::remove_dir_all(&temp);
     }

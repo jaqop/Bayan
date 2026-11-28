@@ -7316,6 +7316,35 @@ mod tests {
         }
     }
 
+    /// nu (Option B) emits native OSC 133/633 marks: ST-terminated, with
+    /// property fields (`k=i;click_events=1`), and NO nonce. They must parse
+    /// as untrusted — like cmd — recording no command blocks or exit codes and
+    /// never arming at_prompt. The `P` property mark is inert. The OSC bytes
+    /// are not rendered as cells.
+    #[test]
+    fn nu_native_marks_are_untrusted_like_cmd() {
+        let native = b"\x1b]133;A;k=i;click_events=1\x1b\\nu> \x1b]133;B\x1b\\\
+                       \x1b]133;C\x1b\\echo hi\r\n\x1b]133;D;0\x1b\\\x1b]133;P;k=r\x1b\\";
+        let s = mark_state(native);
+        assert!(
+            s.exits.is_empty(),
+            "untrusted A/D record no blocks: {:?}",
+            s.exits
+        );
+        assert!(!s.at_prompt, "untrusted B must not arm at_prompt");
+        assert!(
+            !s.screen.contains("k=i"),
+            "OSC must not render: {:?}",
+            s.screen
+        );
+        // The same frame WITH the nonce is trusted (parity check): block + exit.
+        let trusted = b"\x1b]133;A;n0nce\x1b\\nu> \x1b]133;B;n0nce\x1b\\\
+                        \x1b]133;C;n0nce\x1b\\echo hi\r\n\x1b]133;D;0;n0nce\x1b\\";
+        let s = mark_state(trusted);
+        assert_eq!(s.exits, vec![Some(0)]);
+        assert!(s.at_prompt);
+    }
+
     /// Bash and zsh print the same D/A/B frame as PowerShell, plus a C when
     /// the command starts. C is not a prompt boundary, so the blocks and
     /// the exit code match. The OSC bytes are not cells, including when the

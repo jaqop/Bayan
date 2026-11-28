@@ -113,5 +113,47 @@ semantics). Confirmed:
 
 Hook-string unit tests (nonce marks present, nonce unset before exec, cwd
 reported, elevated refusal) plus a live REPL characterization: spawn fish/nu in
-a PTY with the hook and capture the emitted OSC 133 ordering. nu follows fish
-as its own PR (secure `--config` injection + hooks).
+a PTY and capture the emitted OSC 133 ordering. fish uses an injected hook
+(Option A); nu uses its native marks with no injection (Option B, decided
+2026-11-28 — see the nu characterization section below).
+
+## nu characterization (2026-11-28, live nu 0.117 PTY) — Option A blocked
+
+Probe: `shellint::tests::nu_mark_ordering_characterization` (ignored; overrides
+`NU_HOOK_FILE` = vendor autoload, `NU_CONFIG_FILE` = user config). Findings:
+
+- **Mechanics that WORK:** `XDG_DATA_HOME` redirects `$nu.data-dir` (history +
+  config stay in the user's config-dir, so they are preserved); nu autoloads
+  `$nu.data-dir/vendor/autoload/*.nu` in the REPL. A hook there can capture the
+  nonce (`$env.BAYAN_PROMPT_NONCE?`), `hide-env` it, set
+  `shell_integration.osc133/osc633 = false` (native marks fully suppressed), and
+  emit nonce A/C/D via `hooks.pre_prompt` (D prev-exit + A + cwd) and
+  `hooks.pre_execution` (C). Escapes: `char -u '1b'` / `char -u '7'` (quoted —
+  bare `1b` parses as a filesize; `char esc`/`escape` are not named chars).
+  nu closures cannot capture `mut` variables (use an `$env` string flag).
+- **BLOCKER 1 — load order:** nu runs **config.nu BEFORE vendor autoload**
+  (file side-channel: `config-saw-nonce`). So the nonce is visible to user
+  config before the hook erases it — the bash/fish "erase before user files"
+  guarantee cannot be met via vendor autoload. `--config <secure>` (our file is
+  the config, then `source` the user's) would fix ordering but is more invasive.
+- **BLOCKER 2 — B placement:** nu has no post-prompt hook, and embedding B in
+  `PROMPT_COMMAND` breaks reedline's prompt rendering (OSC bytes counted in the
+  prompt width → the prompt fragments/wraps). Unlike fish, nu does not strip OSC
+  from prompt width, so the fish-style B-after-prompt wrap does not transfer.
+- Native nu marks (osc133 + osc633) are correctly placed (A before, B after the
+  prompt) but carry **no nonce** → untrusted, exactly like cmd.
+
+**DECIDED (owner, 2026-11-28): Option B for nu** — rely on nu's native marks at
+the untrusted tier like cmd. Zero injection, zero home writes, lightweight and
+robust across nu versions; nu gets prompt structure but no nonce-gated trusted
+cwd. fish keeps full Option A parity.
+
+**Implemented:** `ShellKind::Nu` recognized; `plan()` returns `None` for nu (no
+hook, no nonce). nu's native marks parse safely as untrusted: `find_osc133`
+handles the ST terminator and property fields (`A;k=i;click_events=1`, `P;k=r`),
+and `handle_osc133` records no blocks/exits and never arms `at_prompt` for an
+untrusted mark (bidi safety reset only) — exactly the cmd tier. Tests:
+`nu_is_recognized_but_uses_native_marks_without_injection` (shellint) and
+`nu_native_marks_are_untrusted_like_cmd` (term, with a trusted-frame parity
+check). The ignored `nu_mark_ordering_characterization` probe captures the
+native baseline and records the rejected Option A path.
