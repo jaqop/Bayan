@@ -20,7 +20,7 @@
 //! 133 finish replaces that tail with a single exit-code sentence.
 
 use accesskit::{
-    Live, Node, NodeId, Role, TextDirection, TextPosition, TextSelection, TreeId, TreeInfo,
+    Live, Node, NodeId, Rect, Role, TextDirection, TextPosition, TextSelection, TreeId, TreeInfo,
     TreeUpdate,
 };
 #[cfg(test)]
@@ -709,6 +709,10 @@ pub struct PaneItem {
     pub index: usize,
     pub name: String,
     pub text: PaneText,
+    /// The focused caret's box in logical window pixels (x, y, w, h), set only
+    /// for the focused pane. Giving the focused document node these bounds lets
+    /// Windows Magnifier track the caret. `None` leaves the node unbounded.
+    pub caret_bounds: Option<(i32, i32, i32, i32)>,
 }
 
 /// The command palette, or the right-click menu when `menu` is set.
@@ -860,6 +864,17 @@ fn pane_nodes(tab: usize, pane: &PaneItem) -> Vec<(NodeId, Node)> {
     let mut doc = Node::new(Role::Document);
     doc.set_label(pane.name.clone());
     doc.set_children(children.clone());
+    // The focused pane's document is the tree's focus node; bounding it to the
+    // caret lets Windows Magnifier follow the caret. Only the focused pane
+    // carries caret_bounds.
+    if let Some((x, y, w, h)) = pane.caret_bounds {
+        doc.set_bounds(Rect::new(
+            x as f64,
+            y as f64,
+            (x + w) as f64,
+            (y + h) as f64,
+        ));
+    }
     // No SetTextSelection: ActionRequested does not handle it, so a reader
     // must not be told it can move the selection.
     doc.set_font_family("monospace");
@@ -1169,12 +1184,28 @@ mod tests {
                     cursor: Some(cursor),
                     selection,
                 },
+                caret_bounds: None,
             }],
             focused_pane: 0,
             live: live_name().into(),
             palette: None,
             dialog: None,
         }
+    }
+
+    #[test]
+    fn the_focused_caret_bounds_reach_the_document_node_for_the_magnifier() {
+        let mut view = one_pane("hello", (0, 2), None);
+        // Without caret bounds the focused document stays unbounded.
+        let tree = build_tree(&view);
+        assert!(find(&tree, pane_node(0, 0)).bounds().is_none());
+        // With caret bounds (logical window pixels) the focused document — the
+        // tree's focus node — carries them so Windows Magnifier can track it.
+        view.panes[0].caret_bounds = Some((10, 20, 8, 16));
+        let tree = build_tree(&view);
+        assert_eq!(tree.focus, pane_node(0, 0));
+        let bounds = find(&tree, pane_node(0, 0)).bounds().expect("caret bounds");
+        assert_eq!(bounds, Rect::new(10.0, 20.0, 18.0, 36.0));
     }
 
     #[test]
@@ -1455,6 +1486,7 @@ mod tests {
                     cursor: Some((0, 2)),
                     selection: None,
                 },
+                caret_bounds: None,
             }],
             ..one_pane("x", (0, 0), None)
         };
@@ -1604,6 +1636,7 @@ mod tests {
                         cursor: Some((0, 0)),
                         selection: None,
                     },
+                    caret_bounds: None,
                 },
                 PaneItem {
                     index: 1,
@@ -1613,6 +1646,7 @@ mod tests {
                         cursor: Some((0, 0)),
                         selection: None,
                     },
+                    caret_bounds: None,
                 },
             ],
             focused_pane: 1,
@@ -1682,6 +1716,7 @@ mod tests {
                         cursor: Some((0, 0)),
                         selection: None,
                     },
+                    caret_bounds: None,
                 },
                 PaneItem {
                     index: 1,
@@ -1691,6 +1726,7 @@ mod tests {
                         cursor: Some((0, 1)),
                         selection: None,
                     },
+                    caret_bounds: None,
                 },
             ],
             focused_pane: 1,
